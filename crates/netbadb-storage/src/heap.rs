@@ -70,7 +70,8 @@ impl HeapStorage {
             *page = Page::new(page_id, PageType::Heap);
         }
         buffer.flush_all()?;
-        let transactions = TransactionManager::new(wal, buffer.clone(), None)?;
+        let next_txn_id = wal.borrow().next_txn_id();
+        let transactions = TransactionManager::new(wal, buffer.clone(), next_txn_id)?;
         Ok(Self {
             buffer,
             table,
@@ -106,14 +107,14 @@ impl HeapStorage {
         if pages.page_count() < 2 {
             return Err(crate::invalid_format("heap file has no data page"));
         }
-        let max_txn = records.iter().map(|record| record.txn_id).max();
         let wal = Rc::new(RefCell::new(wal_manager));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let header = buffer.read_page(HEADER_PAGE)?;
             validate_heap_metadata(header.page().bytes(), &table)?;
         }
-        let transactions = TransactionManager::new(wal, buffer.clone(), max_txn)?;
+        let next_txn_id = wal.borrow().next_txn_id();
+        let transactions = TransactionManager::new(wal, buffer.clone(), next_txn_id)?;
         Ok(Self {
             buffer,
             table,
@@ -260,6 +261,35 @@ impl HeapStorage {
         self.buffer.flush_all()
     }
 
+    /// Establishes a quiescent recovery boundary and starts a new bounded WAL
+    /// generation. The method never waits for transaction handles to finish.
+    pub fn checkpoint(&mut self) -> Result<(), StorageError> {
+        self.transactions.ensure_checkpoint_safe()?;
+        let written = self
+            .transactions
+            .wal()
+            .try_borrow()
+            .map_err(|_| TransactionError::WalBusy)?
+            .written_lsn();
+        if let Some(lsn) = written {
+            self.transactions
+                .wal()
+                .try_borrow_mut()
+                .map_err(|_| TransactionError::WalBusy)?
+                .flush_through(lsn)?;
+        }
+        // flush_all preserves WAL-before-page for each frame and syncs the
+        // database file before the old generation becomes recyclable.
+        self.buffer.flush_all()?;
+        let next_txn_id = self.transactions.next_txn_id();
+        self.transactions
+            .wal()
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .rotate(next_txn_id)?;
+        Ok(())
+    }
+
     pub fn close(self) -> Result<(), StorageError> {
         self.transactions.ensure_clean_close()?;
         self.flush()
@@ -288,6 +318,37 @@ impl HeapStorage {
             .try_borrow()
             .map_err(|_| TransactionError::WalBusy)?
             .durable_lsn())
+    }
+
+    #[cfg(test)]
+    fn wal_generation(&self) -> Result<u64, StorageError> {
+        Ok(self
+            .transactions
+            .wal()
+            .try_borrow()
+            .map_err(|_| TransactionError::WalBusy)?
+            .generation())
+    }
+
+    #[cfg(test)]
+    fn current_wal_path(&self) -> Result<std::path::PathBuf, StorageError> {
+        Ok(self
+            .transactions
+            .wal()
+            .try_borrow()
+            .map_err(|_| TransactionError::WalBusy)?
+            .path()
+            .to_owned())
+    }
+
+    #[cfg(test)]
+    fn inject_partial_checkpoint_rotation(&self, after_bytes: usize) -> Result<(), StorageError> {
+        self.transactions
+            .wal()
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .inject_partial_rotation_failure(after_bytes);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -518,8 +579,9 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 mod tests {
     use super::HeapStorage;
     use crate::{
-        BufferError, PageManager, SlotId, StorageError, TransactionError, TransactionState,
-        WalRecordKind, wal_path,
+        BufferError, CheckpointError, PageManager, SlotId, StorageError, TransactionError,
+        TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
+        WalRecordKind, wal_alternate_path, wal_path,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
@@ -542,7 +604,9 @@ mod tests {
 
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(wal_path(path));
+        let wal = wal_path(path);
+        let _ = std::fs::remove_file(wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
     }
 
     #[test]
@@ -1286,6 +1350,344 @@ mod tests {
             )) if txn_id == transaction.id()
         ));
         drop(transaction);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn checkpoint_requires_zero_outstanding_transactions() {
+        let path = test_path("checkpoint-outstanding");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut read_only = storage.begin_transaction().expect("begin read-only");
+
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Checkpoint(
+                CheckpointError::OutstandingTransactions { count: 1 }
+            ))
+        ));
+        read_only.commit().expect("commit read-only");
+        storage.checkpoint().expect("checkpoint after commit");
+        assert_eq!(storage.wal_generation().expect("generation"), 2);
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn close_rejects_a_live_read_only_transaction() {
+        let path = test_path("close-read-only");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let transaction = storage.begin_transaction().expect("begin read-only");
+        assert!(matches!(
+            storage.close(),
+            Err(StorageError::Transaction(
+                TransactionError::OutstandingTransactions { count: 1 }
+            ))
+        ));
+        drop(transaction);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn active_and_pending_writers_block_checkpoint() {
+        let path = test_path("checkpoint-writer-states");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin writer");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("active".into())],
+            )
+            .expect("insert row");
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Checkpoint(CheckpointError::WriterActive {
+                txn_id
+            })) if txn_id == transaction.id()
+        ));
+
+        storage
+            .transactions
+            .wal()
+            .borrow_mut()
+            .inject_flush_failure();
+        assert!(matches!(transaction.commit(), Err(StorageError::Wal(_))));
+        assert_eq!(transaction.state(), TransactionState::CommitPending);
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Checkpoint(
+                CheckpointError::WriterActive { .. }
+            ))
+        ));
+        transaction.commit().expect("retry commit");
+
+        let mut rollback = storage.begin_transaction().expect("begin rollback");
+        storage
+            .insert_in(
+                &mut rollback,
+                &[ScalarValue::Int64(2), ScalarValue::Text("rollback".into())],
+            )
+            .expect("insert rollback row");
+        storage.buffer.inject_page_sync_failure();
+        assert!(matches!(rollback.rollback(), Err(StorageError::Io(_))));
+        assert_eq!(rollback.state(), TransactionState::RollbackPending);
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Checkpoint(
+                CheckpointError::WriterActive { .. }
+            ))
+        ));
+        rollback.rollback().expect("retry rollback");
+        storage.checkpoint().expect("checkpoint quiescent storage");
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_required_state_blocks_checkpoint() {
+        let path = test_path("checkpoint-recovery-required");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin writer");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("dirty".into())],
+            )
+            .expect("insert dirty row");
+        drop(transaction);
+
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Checkpoint(CheckpointError::RecoveryRequired))
+        ));
+        storage.simulate_crash();
+        let reopened = HeapStorage::open(&path, table()).expect("recover database");
+        reopened.close().expect("close recovered database");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn logical_lsn_and_page_lsn_remain_comparable_after_checkpoint() {
+        let path = test_path("checkpoint-page-lsn");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("before".into())])
+            .expect("insert before checkpoint");
+        let old_update = storage
+            .wal_records()
+            .expect("scan old WAL")
+            .into_iter()
+            .find(|record| matches!(record.kind, WalRecordKind::PageUpdate { .. }))
+            .expect("old page update")
+            .lsn;
+        storage.checkpoint().expect("checkpoint");
+        assert!(storage.wal_records().expect("scan new WAL").is_empty());
+
+        storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("after".into())])
+            .expect("insert after checkpoint");
+        let new_records = storage.wal_records().expect("scan current WAL");
+        let new_update = new_records
+            .iter()
+            .find(|record| matches!(record.kind, WalRecordKind::PageUpdate { .. }))
+            .expect("new page update")
+            .lsn;
+        assert!(new_update > old_update);
+        assert_eq!(new_records.len(), 3);
+        storage.simulate_crash();
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("recover current generation");
+        let rows = reopened.scan().expect("scan recovered rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].1[0], ScalarValue::Int64(2));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn repeated_checkpoints_bound_wal_size_and_keep_lsn_monotonic() {
+        let path = test_path("checkpoint-bounded-growth");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut last_update = None;
+        for value in 0..20 {
+            storage
+                .insert(&[
+                    ScalarValue::Int64(value),
+                    ScalarValue::Text(format!("row-{value}")),
+                ])
+                .expect("insert row");
+            let update = storage
+                .wal_records()
+                .expect("scan WAL")
+                .into_iter()
+                .find(|record| matches!(record.kind, WalRecordKind::PageUpdate { .. }))
+                .expect("page update")
+                .lsn;
+            assert!(last_update.is_none_or(|previous| update > previous));
+            last_update = Some(update);
+            storage.checkpoint().expect("checkpoint cycle");
+        }
+        assert_eq!(storage.wal_generation().expect("generation"), 21);
+        let root = wal_path(&path);
+        let alternate = wal_alternate_path(&root);
+        let retained_bytes = [&root, &alternate]
+            .into_iter()
+            .filter_map(|candidate| std::fs::metadata(candidate).ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        let bound = 2 * (WAL_HEADER_SIZE + WAL_MAX_RECORD_SIZE + 80) as u64;
+        assert!(retained_bytes <= bound, "retained {retained_bytes} bytes");
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen checkpoints");
+        assert_eq!(reopened.scan().expect("scan rows").len(), 20);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn transaction_id_high_water_survives_checkpoint_and_reopen() {
+        let path = test_path("checkpoint-txn-id");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut first = storage.begin_transaction().expect("begin first");
+        let first_id = first.id();
+        first.commit().expect("commit first");
+        storage.checkpoint().expect("checkpoint");
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        let mut next = reopened.begin_transaction().expect("begin next");
+        assert!(next.id() > first_id);
+        next.commit().expect("commit next");
+        reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn partial_generation_creation_falls_back_to_the_last_valid_wal() {
+        let path = test_path("checkpoint-partial-generation");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("durable".into())])
+            .expect("insert row");
+        storage
+            .inject_partial_checkpoint_rotation(20)
+            .expect("inject rotation failure");
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Wal(WalError::Io(_)))
+        ));
+        storage.simulate_crash();
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("fallback to old generation");
+        assert_eq!(reopened.wal_generation().expect("generation"), 1);
+        assert_eq!(reopened.scan().expect("scan rows").len(), 1);
+        assert!(!wal_alternate_path(wal_path(&path)).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn durable_new_header_is_selected_if_rotation_stops_before_runtime_switch() {
+        let path = test_path("checkpoint-durable-new-header");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("durable".into())])
+            .expect("insert row");
+        storage
+            .inject_partial_checkpoint_rotation(WAL_HEADER_SIZE)
+            .expect("inject post-header failure");
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Wal(WalError::Io(_)))
+        ));
+        storage.simulate_crash();
+
+        let root = wal_path(&path);
+        let alternate = wal_alternate_path(&root);
+        assert!(root.exists() && alternate.exists());
+        let mut reopened = HeapStorage::open(&path, table()).expect("select durable generation");
+        assert_eq!(reopened.wal_generation().expect("generation"), 2);
+        assert_eq!(reopened.scan().expect("scan rows").len(), 1);
+        assert!(!root.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn valid_new_generation_wins_and_corrupt_newer_generation_is_rejected() {
+        let path = test_path("checkpoint-generation-selection");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("durable".into())])
+            .expect("insert row");
+        storage.checkpoint().expect("checkpoint");
+        let current = storage.current_wal_path().expect("current WAL path");
+        assert_ne!(current, wal_path(&path));
+        storage.simulate_crash();
+
+        let reopened = HeapStorage::open(&path, table()).expect("select generation 2");
+        assert_eq!(reopened.wal_generation().expect("generation"), 2);
+        reopened.simulate_crash();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&current)
+            .expect("open newer WAL");
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(4)).expect("seek version");
+        file.write_all(&99_u16.to_le_bytes())
+            .expect("corrupt newer version");
+        drop(file);
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Wal(WalError::UnsupportedVersion(99)))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_input_contains_only_post_checkpoint_records() {
+        let path = test_path("checkpoint-recovery-range");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        for value in 0..12 {
+            storage
+                .insert(&[
+                    ScalarValue::Int64(value),
+                    ScalarValue::Text(format!("old-{value}")),
+                ])
+                .expect("insert old row");
+        }
+        storage.checkpoint().expect("checkpoint old history");
+        storage
+            .insert(&[ScalarValue::Int64(20), ScalarValue::Text("new-a".into())])
+            .expect("insert new row");
+        storage
+            .insert(&[ScalarValue::Int64(21), ScalarValue::Text("new-b".into())])
+            .expect("insert new row");
+        storage.simulate_crash();
+
+        let (_, records, _) =
+            WalManager::open_for_recovery(wal_path(&path)).expect("select recovery generation");
+        assert_eq!(records.len(), 6);
+        let mut reopened = HeapStorage::open(&path, table()).expect("recover new history");
+        assert_eq!(reopened.scan().expect("scan all rows").len(), 14);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn checkpoint_after_runtime_rollback_recycles_the_completed_chain() {
+        let path = test_path("checkpoint-rollback");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage.checkpoint().expect("initial checkpoint");
+        let mut transaction = storage.begin_transaction().expect("begin rollback");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("temporary".into())],
+            )
+            .expect("insert temporary row");
+        transaction.rollback().expect("rollback transaction");
+        storage.checkpoint().expect("checkpoint rollback");
+        assert!(storage.wal_records().expect("scan WAL").is_empty());
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert!(reopened.scan().expect("scan heap").is_empty());
         cleanup(&path);
     }
 }

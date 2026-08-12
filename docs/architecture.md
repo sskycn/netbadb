@@ -130,20 +130,39 @@ migration path; the decoder returns an unsupported-version error for version
 
 ## Transaction and WAL boundary
 
-The WAL is a separate `<database>-wal` file. Appending writes a complete record
-to the file but does not imply durability. `WalManager` separately tracks the
-highest written and durable LSN, and `flush_through` advances durability with
-`sync_data`. LSN zero is reserved for “no LSN”; real LSNs are byte offsets and
-start after the 16-byte WAL file header.
+The WAL uses two alternating files, `<database>-wal` and
+`<database>-wal.next`. Appending writes a complete record to the selected
+generation but does not imply durability. `WalManager` separately tracks the
+highest written and durable logical LSN, and `flush_through` advances durability
+with `sync_data`. LSN zero is reserved for “no LSN”. Physical WAL offsets and
+logical LSNs are deliberately different:
+
+```text
+logical LSN = generation base_lsn + (physical record offset - 48)
+```
+
+The first generation starts at logical LSN 1. A new generation's base is the
+old generation's logical end, which is strictly greater than every record LSN
+that existed there. Physical offsets can therefore restart at byte 48 without
+making historical pageLSNs incomparable or reusable.
 
 The WAL file header is:
 
 ```text
 0..4    NBWL magic
-4..6    u16 WAL format version (1)
-6..8    u16 header size (16)
-8..16   reserved bytes (zero)
+4..6    u16 WAL format version (2)
+6..8    u16 header size (48)
+8..16   u64 generation ID (starts at 1)
+16..24  u64 base logical LSN (non-zero)
+24..32  u64 checkpoint LSN (zero means no prior checkpoint)
+32..40  u64 next transaction ID high-water mark (non-zero)
+40..48  reserved bytes (zero)
 ```
+
+WAL v1 is rejected explicitly; this experimental format has no migration
+framework. The data-page layout remains version 2 because its existing u64
+pageLSN already stores the logical value and its binary representation did not
+change.
 
 Every record has a 40-byte fixed header followed by a bounded payload:
 
@@ -155,7 +174,7 @@ Every record has a 40-byte fixed header followed by a bounded payload:
 7       reserved byte (zero)
 8..12   u32 total record length
 12..16  u32 payload length
-16..24  u64 LSN (the record's file offset)
+16..24  u64 logical LSN
 24..32  u64 transaction ID
 32..40  u64 prevLSN (zero only for Begin)
 40..    payload
@@ -282,9 +301,69 @@ with typed errors.
 The current model is single-writer, STEAL, NO-FORCE, WAL-protected, and supports
 synchronous physical runtime rollback plus startup crash recovery. `abort` is
 an alias for that rollback operation. Reads have no snapshot or visibility
-isolation and may observe active-writer pages. There is no MVCC, checkpoint,
-WAL recycling, bounded WAL growth, B+Tree, concurrent writer queue, or
-cross-process writer lock.
+isolation and may observe active-writer pages. There is no MVCC, fuzzy
+checkpoint, B+Tree, concurrent writer queue, or cross-process writer lock.
+
+## Checkpoint and WAL lifecycle
+
+The first checkpoint model is intentionally quiescent. `TransactionManager`
+registers every successful `Begin`, including read-only handles, and unregisters
+exactly once after durable commit, completed rollback, or clean active drop.
+Dropping a dirty/pending writer unregisters the vanished handle but changes
+runtime health to `RecoveryRequired`. Checkpoint admission requires:
+
+```text
+writer = Idle
+runtime health = Healthy
+outstanding transaction handles = 0
+```
+
+It never waits or queues. Active, CommitPending, RollbackPending, read-only
+active, and RecoveryRequired states return typed errors. Clean close enforces
+the same no-outstanding-handle safety property so no live transaction can retain
+a prevLSN into recycled history.
+
+The checkpoint order is:
+
+```text
+verify quiescence
+    → flush WAL through the highest written LSN
+    → flush every dirty buffer frame (each preserves WAL-before-page)
+    → synchronize the database file
+    → capture old logical end + next TxnId
+    → remove only the inactive older WAL slot
+    → create the inactive slot with generation + 1 and the captured metadata
+    → synchronize the new WAL file and its parent directory
+    → switch the shared WalManager to that generation
+    → delete the superseded slot and synchronize its directory entry
+```
+
+The synchronized data file is the checkpoint success foundation: every effect
+represented by retired records is already durable before creation of the next
+generation begins. `BufferPool`, `TransactionManager`, and `HeapStorage` retain
+the same shared `WalManager`, so switching cannot split WAL ownership.
+
+The two slots form a small crash-safe selection mechanism rather than a general
+segment manager. Rotation never removes the currently selected valid slot.
+Before the new header is complete, open ignores a truncated inactive header and
+uses the old generation. Once a complete new header is durable, both files may
+remain and open selects the greater generation after checking consecutive IDs,
+base/checkpoint continuity, and the TxnId high-water mark. A malformed complete
+newer candidate is a hard error. Open deletes a validated superseded generation
+before exposing the selected manager. A successful checkpoint therefore keeps
+one WAL file; a crash or cleanup failure may temporarily leave two, and the next
+open or checkpoint deterministically removes the older one.
+
+Recovery runs the existing analysis/redo/undo algorithm only over records in
+the selected latest safe generation. Old pageLSNs are not reset. Post-checkpoint
+updates receive logical LSNs above the generation base, so redo can compare them
+directly against pages written before checkpoint. The header's `next_txn_id`
+preserves transaction identity monotonicity after old records are recycled.
+
+There is no clean-shutdown marker. Scanning one bounded active generation is
+simple and deterministic; a marker would require a separate durable
+clean-to-dirty invalidation state machine before the next mutation and does not
+currently remove enough work to justify that risk.
 
 ## Embedded and server modes
 

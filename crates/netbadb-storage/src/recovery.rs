@@ -550,7 +550,7 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
 
-    use netbadb_types::{PageId, TxnId};
+    use netbadb_types::{Lsn, PageId, TxnId};
 
     use super::{RecoveryError, RecoveryManager};
     use crate::wal::page_update_kind;
@@ -572,6 +572,10 @@ mod tests {
         pages.sync().expect("sync page file");
         WalManager::create(wal_path(&path)).expect("create WAL");
         (path, page)
+    }
+
+    fn initial_physical_offset(lsn: Lsn) -> u64 {
+        crate::WAL_HEADER_SIZE as u64 + lsn.0 - 1
     }
 
     fn append_update(
@@ -613,7 +617,9 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(wal_path(path));
+        let wal = wal_path(path);
+        let _ = std::fs::remove_file(crate::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
     }
 
     #[test]
@@ -871,7 +877,7 @@ mod tests {
             .write(true)
             .open(&wal_file)
             .expect("open WAL file")
-            .set_len(commit.0 + 36)
+            .set_len(initial_physical_offset(commit) + 36)
             .expect("truncate commit");
 
         let report = recover(&path).expect("recover partial tail");
@@ -893,7 +899,8 @@ mod tests {
             .write(true)
             .open(&wal_file)
             .expect("open WAL for corruption");
-        file.seek(SeekFrom::Start(update.0)).expect("seek update");
+        file.seek(SeekFrom::Start(initial_physical_offset(update)))
+            .expect("seek update");
         file.write_all(b"FAIL").expect("corrupt update magic");
         drop(file);
         assert!(matches!(
@@ -914,7 +921,7 @@ mod tests {
         let (update, _) = append_update(&mut wal, TxnId(50), begin, &original, b"bad image");
         wal.flush_through(update).expect("flush update");
         drop(wal);
-        let after_version = update.0 + 40 + 8 + PAGE_SIZE as u64 + 4;
+        let after_version = initial_physical_offset(update) + 40 + 8 + PAGE_SIZE as u64 + 4;
         let mut file = OpenOptions::new()
             .write(true)
             .open(&wal_file)

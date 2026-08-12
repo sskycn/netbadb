@@ -17,7 +17,7 @@ pub use recovery::RecoveryError;
 pub use transaction::{Transaction, TransactionState};
 pub use wal::{
     WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
-    WalRecordKind, wal_path,
+    WalRecordKind, wal_alternate_path, wal_path,
 };
 
 use std::error::Error;
@@ -252,6 +252,7 @@ pub enum TransactionError {
         state: TransactionState,
     },
     IdExhausted,
+    OutstandingTransactionCountOverflow,
     WalBusy,
     WriterBusy {
         txn_id: netbadb_types::TxnId,
@@ -262,6 +263,9 @@ pub enum TransactionError {
     },
     UnfinishedWriter {
         txn_id: netbadb_types::TxnId,
+    },
+    OutstandingTransactions {
+        count: u64,
     },
     RecoveryRequired,
     ForeignTransaction {
@@ -280,6 +284,9 @@ impl fmt::Display for TransactionError {
                 txn_id.0
             ),
             Self::IdExhausted => formatter.write_str("transaction ID space is exhausted"),
+            Self::OutstandingTransactionCountOverflow => {
+                formatter.write_str("outstanding transaction count overflowed")
+            }
             Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
             Self::WriterBusy { txn_id } => {
                 write!(formatter, "transaction {} is the active writer", txn_id.0)
@@ -293,6 +300,10 @@ impl fmt::Display for TransactionError {
                 formatter,
                 "transaction {} still owns the database writer",
                 txn_id.0
+            ),
+            Self::OutstandingTransactions { count } => write!(
+                formatter,
+                "{count} transaction handle(s) are still outstanding"
             ),
             Self::RecoveryRequired => formatter
                 .write_str("an unfinished writer requires database recovery before writing again"),
@@ -311,6 +322,34 @@ impl fmt::Display for TransactionError {
 
 impl Error for TransactionError {}
 
+/// Errors raised when a quiescent checkpoint cannot be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointError {
+    OutstandingTransactions { count: u64 },
+    WriterActive { txn_id: netbadb_types::TxnId },
+    RecoveryRequired,
+}
+
+impl fmt::Display for CheckpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutstandingTransactions { count } => write!(
+                formatter,
+                "checkpoint requires quiescence but {count} transaction handle(s) are outstanding"
+            ),
+            Self::WriterActive { txn_id } => write!(
+                formatter,
+                "checkpoint cannot run while transaction {} owns the writer",
+                txn_id.0
+            ),
+            Self::RecoveryRequired => formatter
+                .write_str("checkpoint cannot clear a database that requires startup recovery"),
+        }
+    }
+}
+
+impl Error for CheckpointError {}
+
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
@@ -322,6 +361,7 @@ pub enum StorageError {
     Recovery(RecoveryError),
     Wal(WalError),
     Transaction(TransactionError),
+    Checkpoint(CheckpointError),
     SchemaMismatch {
         expected: String,
         actual: String,
@@ -359,6 +399,7 @@ impl fmt::Display for StorageError {
             Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
             Self::Wal(error) => write!(formatter, "write-ahead log error: {error}"),
             Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
+            Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::SchemaMismatch { expected, actual } => write!(
                 formatter,
                 "schema mismatch: expected {expected}, found {actual}"
@@ -403,6 +444,7 @@ impl Error for StorageError {
             Self::Recovery(error) => Some(error),
             Self::Wal(error) => Some(error),
             Self::Transaction(error) => Some(error),
+            Self::Checkpoint(error) => Some(error),
             _ => None,
         }
     }
@@ -453,6 +495,12 @@ impl From<WalError> for StorageError {
 impl From<TransactionError> for StorageError {
     fn from(error: TransactionError) -> Self {
         Self::Transaction(error)
+    }
+}
+
+impl From<CheckpointError> for StorageError {
+    fn from(error: CheckpointError) -> Self {
+        Self::Checkpoint(error)
     }
 }
 

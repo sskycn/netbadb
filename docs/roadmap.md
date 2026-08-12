@@ -81,13 +81,23 @@ This is a single-writer STEAL/NO-FORCE model. Reads are not isolated and may
 observe an active writer. There is still no MVCC, checkpoint, WAL recycling,
 bounded WAL growth, or concurrent-writer scheduling.
 
-## Phase 2C — Checkpoint + WAL Lifecycle (next)
+## Phase 2C — Checkpoint + WAL Lifecycle (complete)
 
-- checkpoint record and state model;
-- bounded recovery start point;
-- WAL truncation and recycling with safe retention rules;
-- clean-shutdown metadata if it materially reduces startup work;
-- recovery performance and bounded-growth tests.
+- explicit zero-outstanding-transaction quiescent checkpoints;
+- WAL format v2 generation metadata with logical base LSN, checkpoint boundary,
+  and next-TxnId high-water mark;
+- two-slot crash-safe generation selection and recycling with a previous
+  generation retained only across an interrupted cleanup;
+- bounded recovery input containing only post-checkpoint records;
+- monotonic LSN/pageLSN behavior across repeated recycling;
+- deterministic rotation-failure, generation-corruption, recovery-range,
+  TxnId, close/reopen, and bounded-growth tests.
+
+Clean-shutdown metadata is intentionally omitted because recovery already scans
+only one bounded generation, while safely invalidating a clean marker before
+the next mutation would add another persistent state machine. Phase 2C remains
+synchronous and explicit: there is no fuzzy checkpoint, background policy, WAL
+archive, replication, or PITR.
 
 ## Phase 3 — Query execution
 

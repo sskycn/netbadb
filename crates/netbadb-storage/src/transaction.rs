@@ -18,7 +18,13 @@ enum WriterState {
     RecoveryRequired,
 }
 
-type SharedWriterState = Rc<Cell<WriterState>>;
+#[derive(Debug)]
+struct TransactionRuntime {
+    writer: Cell<WriterState>,
+    outstanding: Cell<u64>,
+}
+
+type SharedRuntime = Rc<TransactionRuntime>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -39,7 +45,8 @@ pub struct Transaction {
     last_lsn: Lsn,
     wal: SharedWal,
     buffer: BufferPool,
-    writer_state: SharedWriterState,
+    runtime: SharedRuntime,
+    registered: bool,
     has_page_updates: bool,
     rollback_start_lsn: Option<Lsn>,
     rollback_complete_lsn: Option<Lsn>,
@@ -94,6 +101,7 @@ impl Transaction {
             .flush_through(commit_lsn)?;
         self.state = TransactionState::Committed;
         self.release_writer();
+        self.unregister();
         Ok(())
     }
 
@@ -188,9 +196,9 @@ impl Transaction {
 
     pub(crate) fn acquire_writer(&self) -> Result<(), StorageError> {
         self.ensure_active()?;
-        match self.writer_state.get() {
+        match self.runtime.writer.get() {
             WriterState::Idle => {
-                self.writer_state.set(WriterState::Active(self.id));
+                self.runtime.writer.set(WriterState::Active(self.id));
                 Ok(())
             }
             WriterState::Active(txn_id) if txn_id == self.id => Ok(()),
@@ -231,14 +239,24 @@ impl Transaction {
     }
 
     fn release_writer(&self) {
-        if self.writer_state.get() == WriterState::Active(self.id) {
-            self.writer_state.set(WriterState::Idle);
+        if self.runtime.writer.get() == WriterState::Active(self.id) {
+            self.runtime.writer.set(WriterState::Idle);
+        }
+    }
+
+    fn unregister(&mut self) {
+        if self.registered {
+            let outstanding = self.runtime.outstanding.get();
+            debug_assert!(outstanding > 0);
+            self.runtime.outstanding.set(outstanding.saturating_sub(1));
+            self.registered = false;
         }
     }
 
     fn finish_rollback(&mut self) {
         self.state = TransactionState::RolledBack;
         self.release_writer();
+        self.unregister();
     }
 
     fn undo_records(
@@ -308,17 +326,18 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        let owns_writer = self.writer_state.get() == WriterState::Active(self.id);
+        let owns_writer = self.runtime.writer.get() == WriterState::Active(self.id);
         if owns_writer
             && (matches!(
                 self.state,
                 TransactionState::CommitPending | TransactionState::RollbackPending
             ) || (self.state == TransactionState::Active && self.has_page_updates))
         {
-            self.writer_state.set(WriterState::RecoveryRequired);
+            self.runtime.writer.set(WriterState::RecoveryRequired);
         } else if owns_writer && self.state == TransactionState::Active {
             self.release_writer();
         }
+        self.unregister();
     }
 }
 
@@ -327,38 +346,44 @@ pub(crate) struct TransactionManager {
     wal: SharedWal,
     buffer: BufferPool,
     next_txn_id: TxnId,
-    writer_state: SharedWriterState,
+    runtime: SharedRuntime,
 }
 
 impl TransactionManager {
     pub(crate) fn new(
         wal: SharedWal,
         buffer: BufferPool,
-        records_max_txn: Option<TxnId>,
+        next_txn_id: TxnId,
     ) -> Result<Self, StorageError> {
-        let next = match records_max_txn {
-            Some(maximum) => maximum
-                .0
-                .checked_add(1)
-                .ok_or(TransactionError::IdExhausted)?,
-            None => 1,
-        };
+        if next_txn_id.0 == 0 {
+            return Err(TransactionError::IdExhausted.into());
+        }
         Ok(Self {
             wal,
             buffer,
-            next_txn_id: TxnId(next),
-            writer_state: Rc::new(Cell::new(WriterState::Idle)),
+            next_txn_id,
+            runtime: Rc::new(TransactionRuntime {
+                writer: Cell::new(WriterState::Idle),
+                outstanding: Cell::new(0),
+            }),
         })
     }
 
     pub(crate) fn begin(&mut self) -> Result<Transaction, StorageError> {
         let id = self.next_txn_id;
         let next = id.0.checked_add(1).ok_or(TransactionError::IdExhausted)?;
+        let outstanding = self
+            .runtime
+            .outstanding
+            .get()
+            .checked_add(1)
+            .ok_or(TransactionError::OutstandingTransactionCountOverflow)?;
         let begin_lsn = self
             .wal
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .append(id, None, WalRecordKind::Begin)?;
+        self.runtime.outstanding.set(outstanding);
         self.next_txn_id = TxnId(next);
         Ok(Transaction {
             id,
@@ -366,7 +391,8 @@ impl TransactionManager {
             last_lsn: begin_lsn,
             wal: Rc::clone(&self.wal),
             buffer: self.buffer.clone(),
-            writer_state: Rc::clone(&self.writer_state),
+            runtime: Rc::clone(&self.runtime),
+            registered: true,
             has_page_updates: false,
             rollback_start_lsn: None,
             rollback_complete_lsn: None,
@@ -379,9 +405,34 @@ impl TransactionManager {
         &self.wal
     }
 
+    pub(crate) fn next_txn_id(&self) -> TxnId {
+        self.next_txn_id
+    }
+
+    pub(crate) fn ensure_checkpoint_safe(&self) -> Result<(), crate::CheckpointError> {
+        match self.runtime.writer.get() {
+            WriterState::Active(txn_id) => {
+                return Err(crate::CheckpointError::WriterActive { txn_id });
+            }
+            WriterState::RecoveryRequired => {
+                return Err(crate::CheckpointError::RecoveryRequired);
+            }
+            WriterState::Idle => {}
+        }
+        let count = self.runtime.outstanding.get();
+        if count != 0 {
+            return Err(crate::CheckpointError::OutstandingTransactions { count });
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_clean_close(&self) -> Result<(), StorageError> {
-        match self.writer_state.get() {
-            WriterState::Idle => Ok(()),
+        match self.runtime.writer.get() {
+            WriterState::Idle if self.runtime.outstanding.get() == 0 => Ok(()),
+            WriterState::Idle => Err(TransactionError::OutstandingTransactions {
+                count: self.runtime.outstanding.get(),
+            }
+            .into()),
             WriterState::Active(txn_id) => {
                 Err(TransactionError::UnfinishedWriter { txn_id }.into())
             }
@@ -425,8 +476,9 @@ mod tests {
         ));
         let pages = PageManager::create(&page_path).expect("create page file");
         let buffer = BufferPool::with_wal(pages, 2, Rc::clone(&wal)).expect("buffer pool");
-        let manager =
-            TransactionManager::new(Rc::clone(&wal), buffer, None).expect("transaction manager");
+        let next_txn_id = wal.borrow().next_txn_id();
+        let manager = TransactionManager::new(Rc::clone(&wal), buffer, next_txn_id)
+            .expect("transaction manager");
         (page_path, wal_path, wal, manager)
     }
 

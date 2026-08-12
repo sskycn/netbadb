@@ -103,6 +103,12 @@ impl Database {
         Ok(())
     }
 
+    /// Creates a quiescent checkpoint and recycles the previous WAL history.
+    pub fn checkpoint(&mut self) -> Result<(), DatabaseError> {
+        self.storage.checkpoint()?;
+        Ok(())
+    }
+
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
         self.storage.close()?;
@@ -212,5 +218,28 @@ mod tests {
         assert!(result.rows.is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn embedded_database_exposes_explicit_checkpoint() {
+        let path =
+            std::env::temp_dir().join(format!("netbadb-core-checkpoint-{}", std::process::id()));
+        let mut database = Database::create(&path, table()).expect("create database");
+        database
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert");
+        database.checkpoint().expect("checkpoint database");
+        database.close().expect("close database");
+
+        let mut reopened = Database::open(&path, table()).expect("reopen database");
+        assert_eq!(
+            reopened.query("SELECT id FROM users").expect("query").rows,
+            vec![vec![ScalarValue::Int64(1)]]
+        );
+        reopened.close().expect("close reopened database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
     }
 }

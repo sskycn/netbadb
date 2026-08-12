@@ -15,9 +15,13 @@ const RECORD_FORMAT_VERSION: u16 = 1;
 const RECORD_HEADER_SIZE: usize = 40;
 const PAGE_UPDATE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE * 2;
 
-pub const WAL_FORMAT_VERSION: u16 = 1;
-pub const WAL_HEADER_SIZE: usize = 16;
+pub const WAL_FORMAT_VERSION: u16 = 2;
+pub const WAL_HEADER_SIZE: usize = 48;
 pub const WAL_MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE + PAGE_UPDATE_PAYLOAD_SIZE;
+
+const INITIAL_GENERATION: u64 = 1;
+const INITIAL_BASE_LSN: Lsn = Lsn(1);
+const INITIAL_NEXT_TXN_ID: TxnId = TxnId(1);
 
 #[derive(Debug)]
 pub enum WalError {
@@ -26,6 +30,13 @@ pub enum WalError {
     UnsupportedVersion(u16),
     InvalidHeaderSize(u16),
     InvalidReservedBytes,
+    InvalidGeneration(u64),
+    InvalidBaseLsn {
+        base_lsn: Lsn,
+        checkpoint_lsn: Option<Lsn>,
+    },
+    InvalidNextTxnId(u64),
+    GenerationConflict,
     TruncatedHeader,
     TruncatedRecord {
         lsn: Lsn,
@@ -97,6 +108,26 @@ impl fmt::Display for WalError {
             }
             Self::InvalidHeaderSize(size) => write!(formatter, "invalid WAL header size {size}"),
             Self::InvalidReservedBytes => formatter.write_str("WAL reserved bytes are non-zero"),
+            Self::InvalidGeneration(generation) => {
+                write!(formatter, "invalid WAL generation {generation}")
+            }
+            Self::InvalidBaseLsn {
+                base_lsn,
+                checkpoint_lsn,
+            } => write!(
+                formatter,
+                "WAL base LSN {} does not follow checkpoint LSN {checkpoint_lsn:?}",
+                base_lsn.0
+            ),
+            Self::InvalidNextTxnId(txn_id) => {
+                write!(
+                    formatter,
+                    "invalid next transaction ID {txn_id} in WAL header"
+                )
+            }
+            Self::GenerationConflict => {
+                formatter.write_str("WAL generation slots have inconsistent generation metadata")
+            }
             Self::TruncatedHeader => formatter.write_str("WAL header is truncated"),
             Self::TruncatedRecord { lsn } => {
                 write!(formatter, "WAL record at {} is truncated", lsn.0)
@@ -243,7 +274,13 @@ pub struct WalRecord {
 #[derive(Debug)]
 pub struct WalManager {
     file: File,
+    root_path: PathBuf,
     path: PathBuf,
+    generation: u64,
+    base_lsn: Lsn,
+    checkpoint_lsn: Option<Lsn>,
+    next_txn_id: TxnId,
+    next_offset: u64,
     next_lsn: Lsn,
     written_lsn: Option<Lsn>,
     durable_lsn: Option<Lsn>,
@@ -254,68 +291,145 @@ pub struct WalManager {
     fail_next_flush: bool,
     #[cfg(test)]
     fail_next_append_after: Option<usize>,
+    #[cfg(test)]
+    fail_next_rotation_after: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalHeader {
+    generation: u64,
+    base_lsn: Lsn,
+    checkpoint_lsn: Option<Lsn>,
+    next_txn_id: TxnId,
 }
 
 impl WalManager {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let path = path.as_ref().to_owned();
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        let mut header = [0_u8; WAL_HEADER_SIZE];
-        header[0..4].copy_from_slice(WAL_MAGIC);
-        header[4..6].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-        header[6..8].copy_from_slice(&(WAL_HEADER_SIZE as u16).to_le_bytes());
-        let initialization = (|| -> std::io::Result<()> {
-            file.write_all(&header)?;
-            file.sync_all()
-        })();
-        if let Err(error) = initialization {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
+        let root_path = path.as_ref().to_owned();
+        let alternate_path = wal_alternate_path(&root_path);
+        if alternate_path.try_exists()? {
+            return Err(WalError::GenerationConflict);
         }
-        Ok(Self {
+        let header = WalHeader {
+            generation: INITIAL_GENERATION,
+            base_lsn: INITIAL_BASE_LSN,
+            checkpoint_lsn: None,
+            next_txn_id: INITIAL_NEXT_TXN_ID,
+        };
+        let file = match create_generation_file(&root_path, header, None) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = std::fs::remove_file(&root_path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = sync_parent_directory(&root_path) {
+            drop(file);
+            let _ = std::fs::remove_file(&root_path);
+            return Err(error);
+        }
+        Self::from_scan(
             file,
-            path,
-            next_lsn: Lsn(WAL_HEADER_SIZE as u64),
-            written_lsn: None,
-            durable_lsn: None,
-            last_by_txn: HashMap::new(),
-            txn_states: HashMap::new(),
-            poisoned: false,
-            #[cfg(test)]
-            fail_next_flush: false,
-            #[cfg(test)]
-            fail_next_append_after: None,
-        })
+            root_path.clone(),
+            root_path,
+            header,
+            &[],
+            WAL_HEADER_SIZE as u64,
+        )
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let path = path.as_ref().to_owned();
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let scan = scan_file(&mut file, TailPolicy::Reject)?;
-        Ok(Self::from_scan(file, path, &scan.records, scan.valid_end))
+        let (manager, _, _) = Self::open_selected(path.as_ref(), TailPolicy::Reject)?;
+        Ok(manager)
     }
 
     pub(crate) fn open_for_recovery(
         path: impl AsRef<Path>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
-        let path = path.as_ref().to_owned();
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let scan = scan_file(&mut file, TailPolicy::AllowIncompleteFinalRecord)?;
+        Self::open_selected(path.as_ref(), TailPolicy::AllowIncompleteFinalRecord)
+    }
+
+    fn open_selected(
+        root_path: &Path,
+        tail_policy: TailPolicy,
+    ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
+        let root_path = root_path.to_owned();
+        let alternate_path = wal_alternate_path(&root_path);
+        let mut candidates = Vec::new();
+        let mut failures = Vec::new();
+        for path in [&root_path, &alternate_path] {
+            if !path.try_exists()? {
+                continue;
+            }
+            let length = std::fs::metadata(path)?.len();
+            if length < WAL_HEADER_SIZE as u64 {
+                failures.push((path.to_owned(), None, WalError::TruncatedHeader));
+                continue;
+            }
+            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+            let header = match read_header(&mut file) {
+                Ok(header) => header,
+                Err(error) => {
+                    failures.push((path.to_owned(), None, error));
+                    continue;
+                }
+            };
+            match scan_file(&mut file, tail_policy) {
+                Ok(scan) => candidates.push((path.to_owned(), file, header, scan)),
+                Err(error) => failures.push((path.to_owned(), Some(header.generation), error)),
+            }
+        }
+        if candidates.is_empty() {
+            return Err(failures.into_iter().next().map_or_else(
+                || WalError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                |(_, _, error)| error,
+            ));
+        }
+        candidates.sort_unstable_by_key(|(_, _, header, _)| header.generation);
+        validate_generation_candidates(&candidates)?;
+        let selected_generation = candidates
+            .last()
+            .map(|(_, _, header, _)| header.generation)
+            .ok_or(WalError::GenerationConflict)?;
+        let mut ignored_failure_paths = Vec::new();
+        for (path, generation, error) in failures {
+            let blocks_open = match generation {
+                Some(generation) => generation >= selected_generation,
+                None => !matches!(error, WalError::TruncatedHeader),
+            };
+            if blocks_open {
+                return Err(error);
+            }
+            ignored_failure_paths.push(path);
+        }
+        let (path, file, header, scan) = candidates.pop().ok_or(WalError::GenerationConflict)?;
+        let mut superseded_paths = candidates
+            .iter()
+            .map(|(path, _, _, _)| path.clone())
+            .collect::<Vec<_>>();
+        superseded_paths.extend(ignored_failure_paths);
+        drop(candidates);
         if scan.incomplete_tail {
             file.set_len(scan.valid_end)?;
             file.sync_data()?;
         }
+        for superseded in superseded_paths {
+            std::fs::remove_file(&superseded)?;
+            sync_parent_directory(&superseded)?;
+        }
         let records = scan.records;
-        let manager = Self::from_scan(file, path, &records, scan.valid_end);
+        let manager = Self::from_scan(file, root_path, path, header, &records, scan.valid_end)?;
         Ok((manager, records, scan.incomplete_tail))
     }
 
-    fn from_scan(file: File, path: PathBuf, records: &[WalRecord], length: u64) -> Self {
+    fn from_scan(
+        file: File,
+        root_path: PathBuf,
+        path: PathBuf,
+        header: WalHeader,
+        records: &[WalRecord],
+        length: u64,
+    ) -> Result<Self, WalError> {
         let last_lsn = records.last().map(|record| record.lsn);
         let last_by_txn = records
             .iter()
@@ -325,10 +439,26 @@ impl WalManager {
             states.insert(record.txn_id, wal_state_after(&record.kind));
             states
         });
-        Self {
+        let next_lsn = logical_lsn(header.base_lsn, length)?;
+        let records_next_txn_id = records.iter().map(|record| record.txn_id.0).max().map_or(
+            Ok(header.next_txn_id.0),
+            |maximum| {
+                maximum
+                    .checked_add(1)
+                    .ok_or(WalError::InvalidNextTxnId(maximum))
+            },
+        )?;
+        let next_txn_id = TxnId(header.next_txn_id.0.max(records_next_txn_id));
+        Ok(Self {
             file,
+            root_path,
             path,
-            next_lsn: Lsn(length),
+            generation: header.generation,
+            base_lsn: header.base_lsn,
+            checkpoint_lsn: header.checkpoint_lsn,
+            next_txn_id,
+            next_offset: length,
+            next_lsn,
             written_lsn: last_lsn,
             // Readability after reopening does not prove that a prior owner
             // called fsync. Conservatively require the next durability request
@@ -341,12 +471,34 @@ impl WalManager {
             fail_next_flush: false,
             #[cfg(test)]
             fail_next_append_after: None,
-        }
+            #[cfg(test)]
+            fail_next_rotation_after: None,
+        })
     }
 
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn base_lsn(&self) -> Lsn {
+        self.base_lsn
+    }
+
+    #[must_use]
+    pub fn checkpoint_lsn(&self) -> Option<Lsn> {
+        self.checkpoint_lsn
+    }
+
+    #[must_use]
+    pub fn next_txn_id(&self) -> TxnId {
+        self.next_txn_id
     }
 
     #[must_use]
@@ -382,6 +534,16 @@ impl WalManager {
         }
         validate_transaction_sequence(lsn, txn_id, self.txn_states.get(&txn_id).copied(), &kind)?;
         validate_page_images(lsn, &kind)?;
+        let begin_next_txn_id = if matches!(kind, WalRecordKind::Begin) {
+            Some(
+                txn_id
+                    .0
+                    .checked_add(1)
+                    .ok_or(WalError::InvalidNextTxnId(txn_id.0))?,
+            )
+        } else {
+            None
+        };
         let record = WalRecord {
             lsn,
             txn_id,
@@ -393,26 +555,33 @@ impl WalManager {
             .0
             .checked_add(bytes.len() as u64)
             .ok_or(WalError::LsnOverflow)?);
-        self.file.seek(SeekFrom::Start(lsn.0))?;
+        let next_offset = self
+            .next_offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(WalError::LsnOverflow)?;
+        self.file.seek(SeekFrom::Start(self.next_offset))?;
         #[cfg(test)]
         if let Some(prefix_len) = self.fail_next_append_after.take() {
             let prefix_len = prefix_len.min(bytes.len());
             if let Err(error) = self.file.write_all(&bytes[..prefix_len]) {
-                return Err(self.rollback_failed_append(lsn, error));
+                return Err(self.rollback_failed_append(error));
             }
-            return Err(self.rollback_failed_append(
-                lsn,
-                std::io::Error::other("injected partial WAL append failure"),
-            ));
+            return Err(self.rollback_failed_append(std::io::Error::other(
+                "injected partial WAL append failure",
+            )));
         }
         if let Err(error) = self.file.write_all(&bytes) {
-            return Err(self.rollback_failed_append(lsn, error));
+            return Err(self.rollback_failed_append(error));
         }
+        self.next_offset = next_offset;
         self.next_lsn = next_lsn;
         self.written_lsn = Some(lsn);
         self.last_by_txn.insert(txn_id, lsn);
         self.txn_states
             .insert(txn_id, wal_state_after(&record.kind));
+        if let Some(next_txn_id) = begin_next_txn_id {
+            self.next_txn_id = TxnId(next_txn_id.max(self.next_txn_id.0));
+        }
         Ok(lsn)
     }
 
@@ -443,6 +612,79 @@ impl WalManager {
         Ok(scan_file(&mut self.file, TailPolicy::Reject)?.records)
     }
 
+    /// Starts a new durable WAL generation after the caller has synchronized
+    /// every database page represented by the current generation.
+    pub(crate) fn rotate(&mut self, next_txn_id: TxnId) -> Result<(), WalError> {
+        self.ensure_healthy()?;
+        if next_txn_id.0 == 0 || next_txn_id.0 < self.next_txn_id.0 {
+            return Err(WalError::InvalidNextTxnId(next_txn_id.0));
+        }
+        if let Some(written) = self.written_lsn {
+            self.flush_through(written)?;
+        }
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(WalError::InvalidGeneration(self.generation))?;
+        let header = WalHeader {
+            generation,
+            base_lsn: self.next_lsn,
+            checkpoint_lsn: self.written_lsn.or(self.checkpoint_lsn),
+            next_txn_id,
+        };
+        validate_header(header)?;
+
+        let alternate = wal_alternate_path(&self.root_path);
+        let target = if self.path == self.root_path {
+            alternate
+        } else {
+            self.root_path.clone()
+        };
+        if target.try_exists()? {
+            std::fs::remove_file(&target)?;
+            sync_parent_directory(&target)?;
+        }
+        #[cfg(test)]
+        let failure_after = self.fail_next_rotation_after.take();
+        #[cfg(not(test))]
+        let failure_after = None;
+        let file = match create_generation_file(&target, header, failure_after) {
+            Ok(file) => file,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if let Err(error) = sync_parent_directory(&target) {
+            self.poisoned = true;
+            return Err(error);
+        }
+
+        let old_path = self.path.clone();
+        let old_file = std::mem::replace(&mut self.file, file);
+        self.path = target;
+        self.generation = header.generation;
+        self.base_lsn = header.base_lsn;
+        self.checkpoint_lsn = header.checkpoint_lsn;
+        self.next_txn_id = header.next_txn_id;
+        self.next_offset = WAL_HEADER_SIZE as u64;
+        self.next_lsn = header.base_lsn;
+        self.written_lsn = None;
+        self.durable_lsn = None;
+        self.last_by_txn.clear();
+        self.txn_states.clear();
+        drop(old_file);
+        if let Err(error) = std::fs::remove_file(&old_path) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        if let Err(error) = sync_parent_directory(&old_path) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn close(mut self) -> Result<(), WalError> {
         self.ensure_healthy()?;
         if let Some(written) = self.written_lsn {
@@ -461,8 +703,15 @@ impl WalManager {
         self.fail_next_append_after = Some(after_bytes);
     }
 
-    fn rollback_failed_append(&mut self, lsn: Lsn, append_error: std::io::Error) -> WalError {
-        if self.file.set_len(lsn.0).is_err() || self.file.seek(SeekFrom::Start(lsn.0)).is_err() {
+    #[cfg(test)]
+    pub(crate) fn inject_partial_rotation_failure(&mut self, after_bytes: usize) {
+        self.fail_next_rotation_after = Some(after_bytes);
+    }
+
+    fn rollback_failed_append(&mut self, append_error: std::io::Error) -> WalError {
+        if self.file.set_len(self.next_offset).is_err()
+            || self.file.seek(SeekFrom::Start(self.next_offset)).is_err()
+        {
             self.poisoned = true;
         }
         WalError::Io(append_error)
@@ -481,6 +730,118 @@ pub fn wal_path(database_path: impl AsRef<Path>) -> PathBuf {
     let mut path = database_path.as_ref().as_os_str().to_os_string();
     path.push("-wal");
     PathBuf::from(path)
+}
+
+#[must_use]
+pub fn wal_alternate_path(wal_root_path: impl AsRef<Path>) -> PathBuf {
+    let mut path = wal_root_path.as_ref().as_os_str().to_os_string();
+    path.push(".next");
+    PathBuf::from(path)
+}
+
+fn encode_header(header: WalHeader) -> Result<[u8; WAL_HEADER_SIZE], WalError> {
+    validate_header(header)?;
+    let mut bytes = [0_u8; WAL_HEADER_SIZE];
+    bytes[0..4].copy_from_slice(WAL_MAGIC);
+    bytes[4..6].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+    bytes[6..8].copy_from_slice(&(WAL_HEADER_SIZE as u16).to_le_bytes());
+    bytes[8..16].copy_from_slice(&header.generation.to_le_bytes());
+    bytes[16..24].copy_from_slice(&header.base_lsn.0.to_le_bytes());
+    bytes[24..32].copy_from_slice(&header.checkpoint_lsn.map_or(0, |lsn| lsn.0).to_le_bytes());
+    bytes[32..40].copy_from_slice(&header.next_txn_id.0.to_le_bytes());
+    Ok(bytes)
+}
+
+fn read_header(file: &mut File) -> Result<WalHeader, WalError> {
+    let length = file.metadata()?.len();
+    if length < WAL_HEADER_SIZE as u64 {
+        return Err(WalError::TruncatedHeader);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = [0_u8; WAL_HEADER_SIZE];
+    file.read_exact(&mut bytes)?;
+    if &bytes[0..4] != WAL_MAGIC {
+        return Err(WalError::InvalidMagic);
+    }
+    let version = read_u16(&bytes, 4);
+    if version != WAL_FORMAT_VERSION {
+        return Err(WalError::UnsupportedVersion(version));
+    }
+    let header_size = read_u16(&bytes, 6);
+    if usize::from(header_size) != WAL_HEADER_SIZE {
+        return Err(WalError::InvalidHeaderSize(header_size));
+    }
+    if bytes[40..48].iter().any(|byte| *byte != 0) {
+        return Err(WalError::InvalidReservedBytes);
+    }
+    let raw_checkpoint = read_u64(&bytes, 24);
+    let header = WalHeader {
+        generation: read_u64(&bytes, 8),
+        base_lsn: Lsn(read_u64(&bytes, 16)),
+        checkpoint_lsn: (raw_checkpoint != 0).then_some(Lsn(raw_checkpoint)),
+        next_txn_id: TxnId(read_u64(&bytes, 32)),
+    };
+    validate_header(header)?;
+    Ok(header)
+}
+
+fn validate_header(header: WalHeader) -> Result<(), WalError> {
+    if header.generation == 0 {
+        return Err(WalError::InvalidGeneration(header.generation));
+    }
+    if header.base_lsn.0 == 0
+        || header
+            .checkpoint_lsn
+            .is_some_and(|checkpoint| checkpoint >= header.base_lsn)
+    {
+        return Err(WalError::InvalidBaseLsn {
+            base_lsn: header.base_lsn,
+            checkpoint_lsn: header.checkpoint_lsn,
+        });
+    }
+    if header.next_txn_id.0 == 0 {
+        return Err(WalError::InvalidNextTxnId(0));
+    }
+    Ok(())
+}
+
+fn create_generation_file(
+    path: &Path,
+    header: WalHeader,
+    fail_after: Option<usize>,
+) -> Result<File, WalError> {
+    let bytes = encode_header(header)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if let Some(prefix_len) = fail_after {
+        file.write_all(&bytes[..prefix_len.min(bytes.len())])?;
+        file.sync_all()?;
+        return Err(WalError::Io(std::io::Error::other(
+            "injected partial WAL generation creation failure",
+        )));
+    }
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(file)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), WalError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn logical_lsn(base_lsn: Lsn, physical_offset: u64) -> Result<Lsn, WalError> {
+    let relative = physical_offset
+        .checked_sub(WAL_HEADER_SIZE as u64)
+        .ok_or(WalError::TruncatedHeader)?;
+    Ok(Lsn(base_lsn
+        .0
+        .checked_add(relative)
+        .ok_or(WalError::LsnOverflow)?))
 }
 
 fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
@@ -524,35 +885,55 @@ struct ScanResult {
     incomplete_tail: bool,
 }
 
+fn validate_generation_candidates(
+    candidates: &[(PathBuf, File, WalHeader, ScanResult)],
+) -> Result<(), WalError> {
+    if candidates.len() < 2 {
+        return Ok(());
+    }
+    let (_, _, older_header, older_scan) = &candidates[candidates.len() - 2];
+    let (_, _, newer_header, _) = &candidates[candidates.len() - 1];
+    if newer_header.generation == older_header.generation {
+        return Err(WalError::GenerationConflict);
+    }
+    let expected_generation = older_header
+        .generation
+        .checked_add(1)
+        .ok_or(WalError::InvalidGeneration(older_header.generation))?;
+    let older_end = logical_lsn(older_header.base_lsn, older_scan.valid_end)?;
+    let older_checkpoint = older_scan
+        .records
+        .last()
+        .map(|record| record.lsn)
+        .or(older_header.checkpoint_lsn);
+    let older_next_txn_id = older_scan
+        .records
+        .iter()
+        .map(|record| record.txn_id.0)
+        .max()
+        .map_or(older_header.next_txn_id.0, |maximum| {
+            maximum.saturating_add(1).max(older_header.next_txn_id.0)
+        });
+    if newer_header.generation != expected_generation
+        || newer_header.base_lsn != older_end
+        || newer_header.checkpoint_lsn != older_checkpoint
+        || newer_header.next_txn_id.0 < older_next_txn_id
+    {
+        return Err(WalError::GenerationConflict);
+    }
+    Ok(())
+}
+
 fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, WalError> {
     let length = file.metadata()?.len();
-    if length < WAL_HEADER_SIZE as u64 {
-        return Err(WalError::TruncatedHeader);
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut header = [0_u8; WAL_HEADER_SIZE];
-    file.read_exact(&mut header)?;
-    if &header[0..4] != WAL_MAGIC {
-        return Err(WalError::InvalidMagic);
-    }
-    let version = read_u16(&header, 4);
-    if version != WAL_FORMAT_VERSION {
-        return Err(WalError::UnsupportedVersion(version));
-    }
-    let header_size = read_u16(&header, 6);
-    if usize::from(header_size) != WAL_HEADER_SIZE {
-        return Err(WalError::InvalidHeaderSize(header_size));
-    }
-    if header[8..].iter().any(|byte| *byte != 0) {
-        return Err(WalError::InvalidReservedBytes);
-    }
+    let header = read_header(file)?;
 
     let mut records = Vec::new();
     let mut offset = WAL_HEADER_SIZE as u64;
     let mut txn_last_lsn = HashMap::<TxnId, Lsn>::new();
     let mut txn_states = HashMap::<TxnId, WalTxnState>::new();
     while offset < length {
-        let lsn = Lsn(offset);
+        let lsn = logical_lsn(header.base_lsn, offset)?;
         let remaining = length - offset;
         if remaining < RECORD_HEADER_SIZE as u64 {
             let mut partial = vec![0_u8; remaining as usize];
@@ -935,6 +1316,10 @@ mod tests {
         std::env::temp_dir().join(format!("netbadb-{name}-{}-wal", std::process::id()))
     }
 
+    fn initial_physical_offset(lsn: netbadb_types::Lsn) -> u64 {
+        super::WAL_HEADER_SIZE as u64 + lsn.0 - super::INITIAL_BASE_LSN.0
+    }
+
     #[test]
     fn records_round_trip_after_reopen_with_prev_lsn_chain() {
         let path = test_path("wal-round-trip");
@@ -1080,10 +1465,10 @@ mod tests {
         let version_path = test_path("wal-bad-version");
         let wal = WalManager::create(&version_path).expect("create WAL");
         drop(wal);
-        overwrite(&version_path, 4, &99_u16.to_le_bytes());
+        overwrite(&version_path, 4, &1_u16.to_le_bytes());
         assert!(matches!(
             WalManager::open(&version_path),
-            Err(WalError::UnsupportedVersion(99))
+            Err(WalError::UnsupportedVersion(1))
         ));
 
         let length_path = test_path("wal-short-length");
@@ -1106,6 +1491,52 @@ mod tests {
     }
 
     #[test]
+    fn scanner_rejects_invalid_generation_metadata_and_slot_conflicts() {
+        let generation_path = test_path("wal-zero-generation");
+        drop(WalManager::create(&generation_path).expect("create WAL"));
+        overwrite(&generation_path, 8, &0_u64.to_le_bytes());
+        assert!(matches!(
+            WalManager::open(&generation_path),
+            Err(WalError::InvalidGeneration(0))
+        ));
+
+        let base_path = test_path("wal-invalid-base");
+        drop(WalManager::create(&base_path).expect("create WAL"));
+        overwrite(&base_path, 24, &1_u64.to_le_bytes());
+        assert!(matches!(
+            WalManager::open(&base_path),
+            Err(WalError::InvalidBaseLsn { .. })
+        ));
+
+        let txn_path = test_path("wal-zero-next-txn");
+        drop(WalManager::create(&txn_path).expect("create WAL"));
+        overwrite(&txn_path, 32, &0_u64.to_le_bytes());
+        assert!(matches!(
+            WalManager::open(&txn_path),
+            Err(WalError::InvalidNextTxnId(0))
+        ));
+
+        let conflict_path = test_path("wal-generation-conflict");
+        drop(WalManager::create(&conflict_path).expect("create WAL"));
+        let alternate = super::wal_alternate_path(&conflict_path);
+        std::fs::copy(&conflict_path, &alternate).expect("copy conflicting generation");
+        assert!(matches!(
+            WalManager::open(&conflict_path),
+            Err(WalError::GenerationConflict)
+        ));
+
+        for path in [
+            generation_path,
+            base_path,
+            txn_path,
+            conflict_path,
+            alternate,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn scanner_rejects_a_malformed_page_update_image() {
         let path = test_path("wal-bad-page-image");
         let mut wal = WalManager::create(&path).expect("create WAL");
@@ -1125,8 +1556,10 @@ mod tests {
         .expect("append update");
         drop(wal);
 
-        let after_image_offset =
-            update_lsn.0 + super::RECORD_HEADER_SIZE as u64 + 8 + crate::PAGE_SIZE as u64;
+        let after_image_offset = initial_physical_offset(update_lsn)
+            + super::RECORD_HEADER_SIZE as u64
+            + 8
+            + crate::PAGE_SIZE as u64;
         overwrite(&path, after_image_offset + 4, &99_u16.to_le_bytes());
         assert!(matches!(
             WalManager::open(&path),
@@ -1159,7 +1592,7 @@ mod tests {
         ));
         assert_eq!(
             std::fs::metadata(&path).expect("read WAL length").len(),
-            update_lsn.0
+            initial_physical_offset(update_lsn)
         );
         wal.append(TxnId(1), Some(begin), WalRecordKind::Abort)
             .expect("append abort after rollback");
@@ -1185,7 +1618,7 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("open WAL");
-        file.seek(SeekFrom::Start(commit.0 + 32))
+        file.seek(SeekFrom::Start(initial_physical_offset(commit) + 32))
             .expect("seek prevLSN");
         file.write_all(&999_u64.to_le_bytes())
             .expect("corrupt prevLSN");

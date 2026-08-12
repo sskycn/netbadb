@@ -148,6 +148,8 @@ The current code genuinely supports:
 - lazy single-writer admission and synchronous physical runtime rollback;
 - synchronous startup recovery with analysis, repeat-history redo, and
   reverse-LSN undo of incomplete or aborted transactions;
+- explicit quiescent checkpoints with bounded two-generation WAL retention,
+  monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - insert, scan, file reopen, row encoding, and row decoding;
 - executor support for filter, projection, and limit;
 - a native embedded `netbadb-core::Database` API.
@@ -157,9 +159,11 @@ data pages from version 1 to version 2 to add pageLSN; old pages are rejected
 rather than guessed or migrated. Files created by the pre-Foundation
 sequential `HEAP` page prototype are likewise not migrated.
 
-Each database file has a retained sibling WAL named `<database>-wal`.
-Creation uses create-new semantics and refuses to overwrite either an existing
-database file or an existing WAL path.
+Each database uses two alternating WAL slots named `<database>-wal` and
+`<database>-wal.next`. Creation uses create-new semantics and refuses to
+overwrite an existing database or WAL slot. A successful checkpoint retains
+only the current generation; at most one superseded slot can remain after an
+interrupted rotation and is cleaned on open or the next checkpoint.
 `Database::insert` runs as an implicit transaction. Call
 `begin_transaction`, `insert_in`, and `Transaction::commit` when several
 inserts must share one WAL chain, or call `Transaction::rollback` (equivalently
@@ -182,6 +186,15 @@ an error. `flush` remains legal during an active transaction because the engine
 uses STEAL and WAL-orders each page write; flush success does not mean commit.
 Readers are not isolated and may observe an active writer's buffered changes.
 
+`Database::checkpoint` and `HeapStorage::checkpoint` are explicit synchronous
+quiescent checkpoints. They return a typed error instead of waiting whenever a
+transaction handle remains outstanding, a writer is active/pending, or runtime
+health requires startup recovery. A successful checkpoint first flushes the
+current WAL, WAL-orders and synchronizes every dirty page, then creates and
+synchronizes the next WAL generation. Commit, rollback, and clean read-only
+drop unregister their transaction handle; `close` also rejects any still-live
+read-only transaction so it cannot invalidate that handle's prevLSN chain.
+
 `Database::open` and `HeapStorage::open` synchronously recover before exposing
 the buffer pool. Recovery classifies transactions with a Commit record as
 winners, RollbackComplete transactions as already physically undone, and
@@ -197,12 +210,26 @@ An incomplete final WAL record caused by EOF is discarded at the recovery
 boundary only when its available header bytes are structurally valid. Invalid
 magic, versions, tags, lengths, transaction chains, middle records, and page
 images remain hard errors. Existing data pages are fully validated before
-their pageLSN can suppress redo. The retained WAL currently has no checksum.
+their pageLSN can suppress redo. The active WAL generation currently has no
+checksum. WAL header format v2 separates physical file offsets from logical
+LSNs: for a record at physical offset `P`,
+`LSN = base_lsn + (P - 48)`. A checkpoint chooses the old logical end as the
+new base, so LSNs never move backward even though physical WAL bytes are
+recycled and historical pageLSNs remain unchanged.
 
-Phase 2B.1 still does not provide MVCC, reader isolation, checkpoints, WAL
-recycling, bounded WAL growth, concurrent writers, or cross-process writer
-coordination. A successful explicit `close` rejects unresolved writers and then
-WAL-orders and flushes dirty pages.
+Startup validates both WAL slots and deterministically chooses the valid slot
+with the greatest consistent generation. A truncated newly-created header is
+an interrupted rotation and falls back to the last valid slot; a corrupt newer
+complete generation is a hard error. Recovery scans only the selected
+post-checkpoint generation. Clean shutdown markers are intentionally omitted:
+the bounded current generation is scanned on open, avoiding a second persistent
+state machine whose marker would need invalidation before writes.
+
+Phase 2C still does not provide MVCC, reader isolation, fuzzy or background
+checkpoints, concurrent writers, or cross-process writer coordination. A
+successful explicit `close` rejects every outstanding transaction and then
+WAL-orders and flushes dirty pages; WAL recycling remains an explicit
+checkpoint operation.
 
 The query language is a deliberately small native subset, not a claim of SQL
 compatibility. `NULL` parsing is recognized but rejected by the current type
@@ -264,17 +291,16 @@ The implementation sequence is intentionally vertical:
 5. Single Writer + Runtime Rollback (Phase 2B.1) — lazy writer ownership,
    retryable commit/rollback states, physical before-image undo, and
    crash-during-rollback safety.
-6. Checkpoint + WAL Lifecycle (Phase 2C) — bounded recovery start points,
-   clean-shutdown metadata, and WAL truncation/recycling.
+6. Checkpoint + WAL Lifecycle (Phase 2C) — quiescent recovery boundaries,
+   monotonic logical LSNs, and crash-safe bounded WAL generation recycling.
 7. Query execution — richer expressions, null semantics, and write commands.
 8. Indexing — B+Tree and planner access-path selection.
 9. Server mode — protocol, sessions, and `netbadbd`.
 10. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
 11. Advanced optimization — statistics, cost model, joins, and rewrite rules.
 
-Checkpoints, WAL recycling, isolation/MVCC, B+Tree indexes, server networking,
-and Go wire-protocol code are roadmap items, not implemented features in this
-slice.
+Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
+are roadmap items, not implemented features in this slice.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 
