@@ -70,10 +70,11 @@ impl HeapStorage {
             *page = Page::new(page_id, PageType::Heap);
         }
         buffer.flush_all()?;
+        let transactions = TransactionManager::new(wal, buffer.clone(), None)?;
         Ok(Self {
             buffer,
             table,
-            transactions: TransactionManager::new(wal, None)?,
+            transactions,
             #[cfg(test)]
             skip_drop_flush: false,
         })
@@ -112,10 +113,11 @@ impl HeapStorage {
             let header = buffer.read_page(HEADER_PAGE)?;
             validate_heap_metadata(header.page().bytes(), &table)?;
         }
+        let transactions = TransactionManager::new(wal, buffer.clone(), max_txn)?;
         Ok(Self {
             buffer,
             table,
-            transactions: TransactionManager::new(wal, max_txn)?,
+            transactions,
             #[cfg(test)]
             skip_drop_flush: false,
         })
@@ -128,10 +130,10 @@ impl HeapStorage {
                 transaction.commit()?;
                 Ok(row_id)
             }
-            Err(error) => {
-                let _ = transaction.abort();
-                Err(error)
-            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error),
+            },
         }
     }
 
@@ -161,6 +163,7 @@ impl HeapStorage {
             }
             .into());
         }
+        transaction.acquire_writer()?;
 
         let last_page = self
             .buffer
@@ -258,6 +261,7 @@ impl HeapStorage {
     }
 
     pub fn close(self) -> Result<(), StorageError> {
+        self.transactions.ensure_clean_close()?;
         self.flush()
     }
 
@@ -513,7 +517,10 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::HeapStorage;
-    use crate::{BufferError, PageManager, SlotId, StorageError, TransactionState, wal_path};
+    use crate::{
+        BufferError, PageManager, SlotId, StorageError, TransactionError, TransactionState,
+        WalRecordKind, wal_path,
+    };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
 
@@ -820,6 +827,402 @@ mod tests {
         ));
         assert_eq!(storage.buffer.page_count(), 2);
         drop(storage);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn active_writer_blocks_another_write_until_runtime_rollback_finishes() {
+        let path = test_path("heap-single-writer-rollback");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut loser = storage.begin_transaction().expect("begin loser");
+        let mut winner = storage
+            .begin_transaction()
+            .expect("begin concurrent reader");
+        storage
+            .insert_in(
+                &mut loser,
+                &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
+            )
+            .expect("insert loser row");
+
+        assert!(matches!(
+            storage.insert_in(
+                &mut winner,
+                &[ScalarValue::Int64(2), ScalarValue::Text("winner".into())],
+            ),
+            Err(StorageError::Transaction(TransactionError::WriterBusy {
+                txn_id
+            })) if txn_id == loser.id()
+        ));
+        loser.rollback().expect("rollback loser");
+        storage
+            .insert_in(
+                &mut winner,
+                &[ScalarValue::Int64(2), ScalarValue::Text("winner".into())],
+            )
+            .expect("insert winner after rollback");
+        winner.commit().expect("commit winner");
+        assert_eq!(loser.state(), TransactionState::RolledBack);
+        assert_eq!(storage.scan().expect("scan rows").len(), 1);
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        let rows = reopened.scan().expect("scan reopened rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(2));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rollback_reverses_multiple_updates_to_the_same_page() {
+        let path = test_path("heap-rollback-same-page");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(0), ScalarValue::Text("base".into())])
+            .expect("insert committed base row");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        for id in 1..=2_i64 {
+            storage
+                .insert_in(
+                    &mut transaction,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text("temporary".into()),
+                    ],
+                )
+                .expect("insert temporary row");
+        }
+
+        transaction.inject_rollback_interruption_after(1);
+        assert!(matches!(
+            transaction.rollback(),
+            Err(StorageError::Transaction(
+                TransactionError::RollbackInterrupted
+            ))
+        ));
+        assert_eq!(transaction.state(), TransactionState::RollbackPending);
+        assert_eq!(storage.scan().expect("scan partial rollback").len(), 2);
+        transaction.rollback().expect("rollback transaction");
+        let rows = storage.scan().expect("scan after rollback");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(0));
+        let records = storage.wal_records().expect("scan WAL");
+        assert!(matches!(
+            records[records.len() - 2].kind,
+            WalRecordKind::Abort
+        ));
+        assert!(matches!(
+            records.last().map(|record| &record.kind),
+            Some(WalRecordKind::RollbackComplete)
+        ));
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert_eq!(reopened.scan().expect("scan reopened rows").len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rollback_failure_keeps_writer_and_retry_completes_physical_undo() {
+        let path = test_path("heap-rollback-retry");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut first = storage
+            .begin_transaction()
+            .expect("begin first transaction");
+        let mut second = storage
+            .begin_transaction()
+            .expect("begin second transaction");
+        storage
+            .insert_in(
+                &mut first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("temporary".into())],
+            )
+            .expect("insert temporary row");
+        storage.buffer.inject_page_write_failure();
+
+        assert!(matches!(first.rollback(), Err(StorageError::Io(_))));
+        assert_eq!(first.state(), TransactionState::RollbackPending);
+        assert!(matches!(
+            storage.insert_in(
+                &mut second,
+                &[ScalarValue::Int64(2), ScalarValue::Text("blocked".into())],
+            ),
+            Err(StorageError::Transaction(TransactionError::WriterBusy {
+                txn_id
+            })) if txn_id == first.id()
+        ));
+
+        first.rollback().expect("retry rollback");
+        storage
+            .insert_in(
+                &mut second,
+                &[ScalarValue::Int64(2), ScalarValue::Text("winner".into())],
+            )
+            .expect("write after rollback retry");
+        second.commit().expect("commit second transaction");
+        let rows = storage.scan().expect("scan rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(2));
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rollback_removes_multiple_new_pages_in_reverse_order() {
+        let path = test_path("heap-rollback-new-pages");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(0), ScalarValue::Text("base".repeat(975))])
+            .expect("fill original data page");
+        let original_page_count = storage.buffer.page_count();
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        for id in 1..=2_i64 {
+            storage
+                .insert_in(
+                    &mut transaction,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text("temporary".repeat(430)),
+                    ],
+                )
+                .expect("allocate transaction page");
+        }
+        assert_eq!(storage.buffer.page_count(), original_page_count + 2);
+
+        storage.buffer.inject_page_sync_failure();
+        assert!(matches!(transaction.rollback(), Err(StorageError::Io(_))));
+        assert_eq!(transaction.state(), TransactionState::RollbackPending);
+        assert_eq!(storage.buffer.page_count(), original_page_count + 1);
+        transaction.rollback().expect("rollback allocated pages");
+        assert_eq!(storage.buffer.page_count(), original_page_count);
+        assert_eq!(storage.scan().expect("scan after rollback").len(), 1);
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert_eq!(reopened.buffer.page_count(), original_page_count);
+        assert_eq!(reopened.scan().expect("scan reopened rows").len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn crash_during_runtime_rollback_is_completed_by_startup_recovery() {
+        let path = test_path("heap-crash-during-rollback");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("temporary".into())],
+            )
+            .expect("insert first temporary row");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[
+                    ScalarValue::Int64(2),
+                    ScalarValue::Text("temporary-2".into()),
+                ],
+            )
+            .expect("insert second temporary row");
+        transaction.inject_rollback_interruption_after(1);
+
+        assert!(matches!(
+            transaction.rollback(),
+            Err(StorageError::Transaction(
+                TransactionError::RollbackInterrupted
+            ))
+        ));
+        assert_eq!(transaction.state(), TransactionState::RollbackPending);
+        drop(transaction);
+        storage.simulate_crash();
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("recover interrupted rollback");
+        assert!(reopened.scan().expect("scan recovered rows").is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn completed_rollback_is_not_reapplied_over_a_later_winner() {
+        let path = test_path("heap-rollback-later-winner");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut loser = storage.begin_transaction().expect("begin loser");
+        storage
+            .insert_in(
+                &mut loser,
+                &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
+            )
+            .expect("insert loser");
+        loser.rollback().expect("rollback loser");
+
+        let mut winner = storage.begin_transaction().expect("begin winner");
+        storage
+            .insert_in(
+                &mut winner,
+                &[ScalarValue::Int64(2), ScalarValue::Text("winner".into())],
+            )
+            .expect("insert winner");
+        winner.commit().expect("commit winner");
+        storage.simulate_crash();
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("recover database");
+        let rows = reopened.scan().expect("scan recovered winner");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(2));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_transaction_does_not_reserve_the_writer() {
+        let path = test_path("heap-read-only-does-not-block");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut read_only = storage
+            .begin_transaction()
+            .expect("begin read-only transaction");
+        let mut writer = storage
+            .begin_transaction()
+            .expect("begin writer transaction");
+
+        storage
+            .insert_in(
+                &mut writer,
+                &[ScalarValue::Int64(1), ScalarValue::Text("writer".into())],
+            )
+            .expect("read-only transaction must not block writer");
+        writer.commit().expect("commit writer");
+        read_only.commit().expect("commit read-only transaction");
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn commit_failure_keeps_writer_until_the_same_commit_is_retried() {
+        let path = test_path("heap-commit-failure-writer");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut first = storage
+            .begin_transaction()
+            .expect("begin first transaction");
+        let mut second = storage
+            .begin_transaction()
+            .expect("begin second transaction");
+        storage
+            .insert_in(
+                &mut first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("first".into())],
+            )
+            .expect("insert first row");
+        storage
+            .transactions
+            .wal()
+            .borrow_mut()
+            .inject_flush_failure();
+
+        assert!(matches!(first.commit(), Err(StorageError::Wal(_))));
+        assert_eq!(first.state(), TransactionState::CommitPending);
+        assert!(matches!(
+            storage.insert_in(
+                &mut second,
+                &[ScalarValue::Int64(2), ScalarValue::Text("blocked".into())],
+            ),
+            Err(StorageError::Transaction(TransactionError::WriterBusy {
+                txn_id
+            })) if txn_id == first.id()
+        ));
+        first.commit().expect("retry commit");
+        storage
+            .insert_in(
+                &mut second,
+                &[ScalarValue::Int64(2), ScalarValue::Text("second".into())],
+            )
+            .expect("write after durable commit");
+        second.commit().expect("commit second transaction");
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dropping_a_dirty_writer_poisons_later_writes() {
+        let path = test_path("heap-drop-dirty-writer");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut first = storage
+            .begin_transaction()
+            .expect("begin first transaction");
+        storage
+            .insert_in(
+                &mut first,
+                &[
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("unfinished".into()),
+                ],
+            )
+            .expect("insert unfinished row");
+        drop(first);
+
+        let mut second = storage.begin_transaction().expect("begin read-only handle");
+        assert!(matches!(
+            storage.insert_in(
+                &mut second,
+                &[ScalarValue::Int64(2), ScalarValue::Text("must fail".into())],
+            ),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
+        assert!(matches!(
+            storage.close(),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
+        drop(second);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn transaction_from_another_database_is_rejected_before_writer_acquisition() {
+        let first_path = test_path("heap-foreign-first");
+        let second_path = test_path("heap-foreign-second");
+        let mut first = HeapStorage::create(&first_path, table()).expect("create first heap");
+        let mut second = HeapStorage::create(&second_path, table()).expect("create second heap");
+        let mut transaction = first.begin_transaction().expect("begin first transaction");
+
+        assert!(matches!(
+            second.insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("foreign".into())],
+            ),
+            Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction { txn_id }
+            )) if txn_id == transaction.id()
+        ));
+        transaction.rollback().expect("finish transaction");
+        first.close().expect("close first heap");
+        second.close().expect("close second heap");
+        cleanup(&first_path);
+        cleanup(&second_path);
+    }
+
+    #[test]
+    fn close_rejects_an_unfinished_writer() {
+        let path = test_path("heap-close-active-writer");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("unfinished".into()),
+                ],
+            )
+            .expect("insert unfinished row");
+
+        assert!(matches!(
+            storage.close(),
+            Err(StorageError::Transaction(
+                TransactionError::UnfinishedWriter { txn_id }
+            )) if txn_id == transaction.id()
+        ));
+        drop(transaction);
         cleanup(&path);
     }
 }

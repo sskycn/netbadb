@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use netbadb_types::PageId;
 
+use crate::page::{ValidatedBeforeImage, validate_before_image};
 use crate::transaction::SharedWal;
 use crate::{BufferError, Page, PageManager, StorageError, TransactionError};
 
@@ -186,6 +187,68 @@ impl BufferState {
         }
         self.disk.sync()
     }
+
+    fn undo_page_update(
+        &mut self,
+        page_id: PageId,
+        before: &[u8; crate::PAGE_SIZE],
+    ) -> Result<(), StorageError> {
+        match validate_before_image(page_id, before)? {
+            ValidatedBeforeImage::Existing(page) => {
+                let page = *page;
+                if page_id.0 >= self.disk.page_count() {
+                    return Err(crate::invalid_format(format!(
+                        "rollback page {} is outside the data file",
+                        page_id.0
+                    )));
+                }
+                let index = if let Some(index) = self.find_frame(page_id) {
+                    let frame = &mut self.frames[index];
+                    if frame.pin_count != 0 {
+                        return Err(BufferError::PagePinned { page_id }.into());
+                    }
+                    frame.page = page;
+                    frame.dirty = true;
+                    index
+                } else {
+                    let index = self.prepare_frame()?;
+                    self.install_frame(index, page, false);
+                    let frame = &mut self.frames[index];
+                    frame.pin_count = 0;
+                    frame.dirty = true;
+                    index
+                };
+                self.flush_frame(index)?;
+                self.disk.sync()?;
+            }
+            ValidatedBeforeImage::NewPage => {
+                if page_id.0 == self.disk.page_count() {
+                    // A prior retry may have completed `set_len` but failed
+                    // its sync. Synchronize even when the page is already
+                    // absent before allowing RollbackComplete to become
+                    // durable.
+                    self.disk.sync()?;
+                    return Ok(());
+                }
+                if let Some(index) = self.find_frame(page_id) {
+                    if self.frames[index].pin_count != 0 {
+                        return Err(BufferError::PagePinned { page_id }.into());
+                    }
+                }
+                self.disk.remove_trailing_page(page_id)?;
+                if let Some(index) = self.find_frame(page_id) {
+                    self.frames.remove(index);
+                    self.next_victim = if self.frames.is_empty() {
+                        0
+                    } else {
+                        self.next_victim.min(self.frames.len() - 1)
+                    };
+                }
+                self.disk.sync()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A synchronous, single-threaded buffer pool. `Rc<RefCell<_>>` is confined to
@@ -290,9 +353,22 @@ impl BufferPool {
         self.state.borrow_mut().flush_all()
     }
 
+    pub(crate) fn undo_page_update(
+        &self,
+        page_id: PageId,
+        before: &[u8; crate::PAGE_SIZE],
+    ) -> Result<(), StorageError> {
+        self.state.borrow_mut().undo_page_update(page_id, before)
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_page_write_failure(&self) {
         self.state.borrow_mut().disk.inject_write_failure();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_page_sync_failure(&self) {
+        self.state.borrow_mut().disk.inject_sync_failure();
     }
 }
 

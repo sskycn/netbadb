@@ -93,10 +93,11 @@ Database file
   exposing slotted-page operations. Heap pages use a slot directory at the
   front, free space in the middle, and tuple bytes packed from the end of the
   page backward.
-- `TransactionManager` allocates strong `TxnId` values and appends a `Begin`
-  record. A transaction tracks `Active`, `CommitPending`, `Committed`, or
-  `Aborted` and owns its last LSN. Commit appends exactly one commit record and
-  becomes committed only after `flush_through(commit_lsn)` succeeds.
+- `TransactionManager` allocates strong `TxnId` values, appends `Begin`, and
+  owns the per-open-database writer/health state. A transaction tracks
+  `Active`, `CommitPending`, `RollbackPending`, `Committed`, or `RolledBack`
+  and owns its last LSN. Writer ownership is acquired lazily before the first
+  heap mutation; read-only transactions do not reserve it.
 - `HeapStorage` validates and encodes rows, constructs a candidate after-image,
   appends its `PageUpdate`, and only then publishes the page to the buffer
   frame. It no longer flushes the entire buffer after each insert. Page guards
@@ -149,7 +150,8 @@ Every record has a 40-byte fixed header followed by a bounded payload:
 ```text
 0..4    WREC magic
 4..6    u16 record format version (1)
-6       u8 record type (Begin=1, PageUpdate=2, Commit=3, Abort=4)
+6       u8 record type (Begin=1, PageUpdate=2, Commit=3, Abort=4,
+                        RollbackComplete=5)
 7       reserved byte (zero)
 8..12   u32 total record length
 12..16  u32 payload length
@@ -159,12 +161,13 @@ Every record has a 40-byte fixed header followed by a bounded payload:
 40..    payload
 ```
 
-`Begin`, `Commit`, and `Abort` have no payload. `PageUpdate` stores an explicit
-u64 page ID, one 4 KiB before-image, and one 4 KiB after-image. Consequently,
-the maximum accepted record is 8,240 bytes. The scanner validates magic,
-versions, reserved bytes, lengths, truncation, stored LSN, transaction state,
-and the prevLSN chain before exposing a record. The format does not yet include
-a checksum; checksum selection remains an explicit future format decision.
+`Begin`, `Commit`, `Abort`, and `RollbackComplete` have no payload.
+`PageUpdate` stores an explicit u64 page ID, one 4 KiB before-image, and one 4
+KiB after-image. Consequently, the maximum accepted record is 8,240 bytes. The
+scanner validates magic, versions, reserved bytes, lengths, truncation, stored
+LSN, transaction state, and the prevLSN chain before exposing a record. The
+format does not yet include a checksum; checksum selection remains an explicit
+future format decision.
 
 The write ordering invariant is:
 
@@ -181,6 +184,27 @@ flush fails, the handle remains `CommitPending`; retrying commit flushes the
 same record and does not append a duplicate. A new-page update is also flushed
 before extending the database file, because writing the allocator's zero page
 is itself a data-file write that must not overtake its WAL record.
+
+Runtime rollback uses:
+
+```text
+Active
+    → append + flush Abort
+    → RollbackPending
+    → follow this transaction's prevLSN chain backward
+    → validate and install each full before-image
+      (zero before-image removes the exact trailing page)
+    → sync each affected rollback page or truncation
+    → append + flush RollbackComplete
+    → RolledBack
+```
+
+Before-images restore their historical pageLSN; rollback does not generate
+ordinary PageUpdate records. A rollback error leaves `RollbackPending` and
+retains writer ownership, so calling `rollback` again safely repeats the
+idempotent physical undo. Only the affected rollback page is flushed per undo
+step. Commit remains NO-FORCE; rollback synchronizes its physical changes before
+reporting success.
 
 All disk widths are explicit; no Rust struct layout, host-endian values,
 pointers, or `usize` are persisted. Malformed headers, slot directories,
@@ -201,39 +225,46 @@ Open Data File + WAL
 Analysis
     │
     ├── Winners (Commit exists)
-    └── Losers (incomplete or Abort)
+    ├── Completed rollback (RollbackComplete exists)
+    └── Losers (incomplete or Abort-only)
     │
     ▼
-Redo every PageUpdate in ascending LSN
+Redo non-rolled-back PageUpdates in ascending LSN
     │
     ▼
 Undo losers in descending global LSN
 ```
 
 Analysis builds transaction lastLSNs and an LSN lookup. Redo repeats history,
-including loser updates: an existing page is skipped only when its pageLSN is
-at least the update LSN, and that pageLSN is trusted only after full page
-validation; otherwise the validated after-image is installed. A new page must
-be exactly the next trailing page, so WAL cannot create page-ID gaps. Undo
-follows each loser's prevLSN chain through a max-heap and installs PageUpdate
-before-images in global descending LSN order. A zero before-image means the
-loser allocated that page, which can only remove the exact trailing page. The
-page file is synchronized before recovery returns.
+including loser updates, but skips transactions with durable
+RollbackComplete: an existing page is skipped only when its pageLSN is at least
+the update LSN, and that pageLSN is trusted only after full page validation;
+otherwise the validated after-image is installed. A new page must be exactly
+the next trailing page, so WAL cannot create page-ID gaps. Undo follows each
+incomplete or Abort-only loser's prevLSN chain through a max-heap and installs
+PageUpdate before-images in global descending LSN order. A zero before-image
+means the loser allocated that page, which can only remove the exact trailing
+page. The page file is synchronized before recovery returns.
 
 Because full-page after-images can include another transaction's uncommitted
-contents, the runtime currently permits one active writer. A dirty transaction
-that aborts or is dropped, or a dropped commit-pending transaction, makes
-further writes require reopen/recovery. Analysis also rejects a retained WAL
-where a committed page update follows a loser update to the same page, before
-recovery writes any page. This keeps unsupported dirty write dependencies from
-being mistaken for successful recovery; it is a single-writer safety invariant,
-not general isolation.
+contents, the runtime permits one writer and acquires that ownership before any
+heap page mutation or allocation. CommitPending and RollbackPending retain it.
+Commit durability or completed physical rollback releases it. Dropping an
+unfinished dirty writer marks the open storage recovery-required; later writes
+and close fail, while read-only handles may still be created. Analysis also
+rejects historical retained WAL where a committed page update follows an
+unresolved loser update to the same page before recovery writes any page. This
+is a single-writer safety invariant, not general isolation or cross-process
+locking.
 
-The algorithm intentionally has no compensation log records. A crash during
-redo or undo is handled by rerunning complete repeat-history redo followed by
-the same deterministic undo, making restart recovery idempotent for this
-full-page-image model. The retained valid WAL is synchronized before any
-recovery page write.
+The algorithm intentionally has no compensation log records. During runtime
+rollback, Abort is durable before physical undo and RollbackComplete becomes
+durable only after all rollback page changes are synchronized. A crash before
+completion therefore leaves an Abort-only loser: startup repeats its history
+and deterministically undoes the whole prevLSN chain. A durable completion
+record means the already-synchronized transaction images must be skipped, so a
+later committed winner is never overwritten by reapplying the old rollback.
+The retained valid WAL is synchronized before any recovery page write.
 
 At startup only an incomplete final record whose available header is
 structurally valid may be truncated at EOF. Corrupt middle records, invalid
@@ -241,10 +272,12 @@ magic/version/type/length fields, invalid transaction state, broken transaction
 chains, malformed data pages, and malformed before/after page images fail open
 with typed errors.
 
-Phase 2B supplies crash recovery, not transaction visibility or isolation.
-`abort` appends an abort record; its physical effects are removed during
-restart. There is no MVCC, checkpoint, WAL recycling, bounded WAL growth, or
-runtime full rollback guarantee.
+The current model is single-writer, STEAL, NO-FORCE, WAL-protected, and supports
+synchronous physical runtime rollback plus startup crash recovery. `abort` is
+an alias for that rollback operation. Reads have no snapshot or visibility
+isolation and may observe active-writer pages. There is no MVCC, checkpoint,
+WAL recycling, bounded WAL growth, B+Tree, concurrent writer queue, or
+cross-process writer lock.
 
 ## Embedded and server modes
 

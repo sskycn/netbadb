@@ -140,10 +140,12 @@ The current code genuinely supports:
 - version 2 slotted heap pages with persistent pageLSNs and checked bounds;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
-- versioned little-endian WAL records for begin, full-page update, commit, and
-  abort, with strong LSNs and per-transaction prevLSN chains;
+- versioned little-endian WAL records for begin, full-page update, commit,
+  abort, and rollback completion, with strong LSNs and per-transaction prevLSN
+  chains;
 - explicit transaction handles plus implicit single-insert transactions;
 - commit durability through WAL sync and WAL-before-data-page writeback;
+- lazy single-writer admission and synchronous physical runtime rollback;
 - synchronous startup recovery with analysis, repeat-history redo, and
   reverse-LSN undo of incomplete or aborted transactions;
 - insert, scan, file reopen, row encoding, and row decoding;
@@ -160,25 +162,35 @@ Creation uses create-new semantics and refuses to overwrite either an existing
 database file or an existing WAL path.
 `Database::insert` runs as an implicit transaction. Call
 `begin_transaction`, `insert_in`, and `Transaction::commit` when several
-inserts must share one WAL chain. A successful commit means its commit record
-has reached durable storage; heap pages may remain buffered until eviction,
-`flush`, or `close`.
+inserts must share one WAL chain, or call `Transaction::rollback` (equivalently
+`abort`) to remove their physical effects. A successful commit means its
+commit record has reached durable storage; heap pages may remain buffered until
+eviction, `flush`, or `close`.
 
-The current full-page-image model permits one active writer. A committed or
-read-only transaction releases the writer slot. If a transaction with page
-updates is aborted or dropped, or a commit-pending handle is dropped after a
-flush failure, later writes are rejected until the database is reopened and
-startup recovery resolves the WAL state. This prevents a later committed
-after-image from depending on uncommitted page contents, which cannot be
-separated safely without isolation or a finer-grained log format.
+The current full-page-image model permits one writer per open database object.
+Writer ownership is acquired lazily by the first write, so read-only
+transactions do not reserve it. Commit releases ownership only after the
+Commit record is durable. Rollback first makes Abort durable, follows the
+transaction's prevLSN chain backward, installs and synchronizes each validated
+before-image (or removes newly allocated trailing pages), then durably records
+RollbackComplete and releases ownership. A failed commit or rollback remains
+pending and retains the writer for retry.
+
+Dropping an unfinished dirty writer does not silently release it: the open
+storage becomes recovery-required for subsequent writes, and `close` reports
+an error. `flush` remains legal during an active transaction because the engine
+uses STEAL and WAL-orders each page write; flush success does not mean commit.
+Readers are not isolated and may observe an active writer's buffered changes.
 
 `Database::open` and `HeapStorage::open` synchronously recover before exposing
 the buffer pool. Recovery classifies transactions with a Commit record as
-winners, redoes all page updates in ascending LSN order while using pageLSN to
-skip installed images, then undoes incomplete and explicitly aborted losers in
-global descending LSN order from full before-images. Repeating recovery is
-idempotent even without compensation log records because each restart first
-repeats the same history and then applies the same deterministic undo.
+winners, RollbackComplete transactions as already physically undone, and
+incomplete or Abort-only transactions as losers. It redoes non-rolled-back page
+updates in ascending LSN order while using pageLSN to skip installed images,
+then undoes losers in global descending LSN order from full before-images.
+Repeating recovery is idempotent even without compensation log records because
+each restart first repeats the same history and then applies the same
+deterministic undo.
 
 An incomplete final WAL record caused by EOF is discarded at the recovery
 boundary only when its available header bytes are structurally valid. Invalid
@@ -186,10 +198,10 @@ magic, versions, tags, lengths, transaction chains, middle records, and page
 images remain hard errors. Existing data pages are fully validated before
 their pageLSN can suppress redo. The retained WAL currently has no checksum.
 
-Phase 2B does not provide MVCC, isolation, checkpoints, WAL recycling, bounded
-WAL growth, or general runtime physical rollback. `abort` records intent;
-physical undo is guaranteed during restart recovery. A successful explicit
-`close` still WAL-orders and flushes dirty pages.
+Phase 2B.1 still does not provide MVCC, reader isolation, checkpoints, WAL
+recycling, bounded WAL growth, concurrent writers, or cross-process writer
+coordination. A successful explicit `close` rejects unresolved writers and then
+WAL-orders and flushes dirty pages.
 
 The query language is a deliberately small native subset, not a claim of SQL
 compatibility. `NULL` parsing is recognized but rejected by the current type
@@ -248,17 +260,20 @@ The implementation sequence is intentionally vertical:
    LSN/pageLSN, durable commit, and WAL-ordered page writeback.
 4. Recovery (Phase 2B) — startup analysis, repeat-history redo, reverse-LSN
    undo, crash-tail handling, and crash-reopen guarantees.
-5. Checkpoint + WAL Lifecycle (Phase 2C) — bounded recovery start points,
+5. Single Writer + Runtime Rollback (Phase 2B.1) — lazy writer ownership,
+   retryable commit/rollback states, physical before-image undo, and
+   crash-during-rollback safety.
+6. Checkpoint + WAL Lifecycle (Phase 2C) — bounded recovery start points,
    clean-shutdown metadata, and WAL truncation/recycling.
-6. Query execution — richer expressions, null semantics, and write commands.
-7. Indexing — B+Tree and planner access-path selection.
-8. Server mode — protocol, sessions, and `netbadbd`.
-9. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-10. Advanced optimization — statistics, cost model, joins, and rewrite rules.
+7. Query execution — richer expressions, null semantics, and write commands.
+8. Indexing — B+Tree and planner access-path selection.
+9. Server mode — protocol, sessions, and `netbadbd`.
+10. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+11. Advanced optimization — statistics, cost model, joins, and rewrite rules.
 
-Checkpoints, WAL recycling, runtime rollback, isolation/MVCC, B+Tree indexes,
-server networking, and Go wire-protocol code are roadmap items, not implemented
-features in this slice.
+Checkpoints, WAL recycling, isolation/MVCC, B+Tree indexes, server networking,
+and Go wire-protocol code are roadmap items, not implemented features in this
+slice.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

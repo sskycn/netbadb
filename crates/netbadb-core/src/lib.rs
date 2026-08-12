@@ -188,4 +188,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }
+
+    #[test]
+    fn embedded_database_supports_explicit_runtime_rollback() {
+        let path =
+            std::env::temp_dir().join(format!("netbadb-core-rollback-{}", std::process::id()));
+        let mut database = Database::create(&path, table()).expect("create database");
+        let mut transaction = database.begin_transaction().expect("begin transaction");
+        database
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("temporary".into())],
+            )
+            .expect("insert temporary row");
+        transaction.rollback().expect("rollback transaction");
+        assert_eq!(transaction.state(), TransactionState::RolledBack);
+        database.close().expect("close database");
+
+        let mut reopened = Database::open(&path, table()).expect("reopen database");
+        let result = reopened
+            .query("SELECT name FROM users WHERE id >= 1")
+            .expect("query after rollback");
+        assert!(result.rows.is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
 }

@@ -75,6 +75,24 @@ pub struct Page {
     bytes: [u8; PAGE_SIZE],
 }
 
+#[derive(Debug)]
+pub(crate) enum ValidatedBeforeImage {
+    Existing(Box<Page>),
+    NewPage,
+}
+
+pub(crate) fn validate_before_image(
+    page_id: PageId,
+    bytes: &[u8; PAGE_SIZE],
+) -> Result<ValidatedBeforeImage, StorageError> {
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(ValidatedBeforeImage::NewPage);
+    }
+    let page = Page::from_bytes(page_id, *bytes);
+    page.header()?;
+    Ok(ValidatedBeforeImage::Existing(Box::new(page)))
+}
+
 impl Page {
     #[must_use]
     pub fn zero(id: PageId) -> Self {
@@ -352,6 +370,8 @@ pub struct PageManager {
     page_count: u64,
     #[cfg(test)]
     fail_next_write: bool,
+    #[cfg(test)]
+    fail_next_sync: bool,
 }
 
 impl PageManager {
@@ -379,6 +399,8 @@ impl PageManager {
             page_count: 1,
             #[cfg(test)]
             fail_next_write: false,
+            #[cfg(test)]
+            fail_next_sync: false,
         })
     }
 
@@ -399,6 +421,8 @@ impl PageManager {
             page_count: length / page_size,
             #[cfg(test)]
             fail_next_write: false,
+            #[cfg(test)]
+            fail_next_sync: false,
         })
     }
 
@@ -459,6 +483,10 @@ impl PageManager {
     }
 
     pub fn sync(&mut self) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_sync) {
+            return Err(std::io::Error::other("injected page sync failure").into());
+        }
         self.file.sync_all()?;
         Ok(())
     }
@@ -466,6 +494,11 @@ impl PageManager {
     #[cfg(test)]
     pub(crate) fn inject_write_failure(&mut self) {
         self.fail_next_write = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sync_failure(&mut self) {
+        self.fail_next_sync = true;
     }
 
     fn page_offset(&self, id: PageId) -> Result<u64, StorageError> {

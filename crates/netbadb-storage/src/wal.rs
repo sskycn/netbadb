@@ -210,6 +210,7 @@ pub enum WalRecordKind {
     },
     Commit,
     Abort,
+    RollbackComplete,
 }
 
 impl WalRecordKind {
@@ -219,13 +220,14 @@ impl WalRecordKind {
             Self::PageUpdate { .. } => 2,
             Self::Commit => 3,
             Self::Abort => 4,
+            Self::RollbackComplete => 5,
         }
     }
 
     const fn payload_len(&self) -> usize {
         match self {
             Self::PageUpdate { .. } => PAGE_UPDATE_PAYLOAD_SIZE,
-            Self::Begin | Self::Commit | Self::Abort => 0,
+            Self::Begin | Self::Commit | Self::Abort | Self::RollbackComplete => 0,
         }
     }
 }
@@ -320,14 +322,7 @@ impl WalManager {
             .map(|record| (record.txn_id, record.lsn))
             .collect();
         let txn_states = records.iter().fold(HashMap::new(), |mut states, record| {
-            states.insert(
-                record.txn_id,
-                if matches!(&record.kind, WalRecordKind::Commit | WalRecordKind::Abort) {
-                    WalTxnState::Complete
-                } else {
-                    WalTxnState::Active
-                },
-            );
+            states.insert(record.txn_id, wal_state_after(&record.kind));
             states
         });
         Self {
@@ -416,14 +411,8 @@ impl WalManager {
         self.next_lsn = next_lsn;
         self.written_lsn = Some(lsn);
         self.last_by_txn.insert(txn_id, lsn);
-        self.txn_states.insert(
-            txn_id,
-            if matches!(&record.kind, WalRecordKind::Commit | WalRecordKind::Abort) {
-                WalTxnState::Complete
-            } else {
-                WalTxnState::Active
-            },
-        );
+        self.txn_states
+            .insert(txn_id, wal_state_after(&record.kind));
         Ok(lsn)
     }
 
@@ -687,18 +676,15 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
                 require_payload_length(lsn, payload_len, 0)?;
                 WalRecordKind::Abort
             }
+            5 => {
+                require_payload_length(lsn, payload_len, 0)?;
+                WalRecordKind::RollbackComplete
+            }
             tag => return Err(WalError::UnknownRecordType { lsn, tag }),
         };
         validate_page_images(lsn, &kind)?;
         txn_last_lsn.insert(txn_id, lsn);
-        txn_states.insert(
-            txn_id,
-            if matches!(&kind, WalRecordKind::Commit | WalRecordKind::Abort) {
-                WalTxnState::Complete
-            } else {
-                WalTxnState::Active
-            },
-        );
+        txn_states.insert(txn_id, wal_state_after(&kind));
         records.push(WalRecord {
             lsn,
             txn_id,
@@ -798,7 +784,7 @@ fn validate_partial_record_header(
 
 fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
     match tag {
-        1 | 3 | 4 => Ok(0),
+        1 | 3 | 4 | 5 => Ok(0),
         2 => Ok(PAGE_UPDATE_PAYLOAD_SIZE as u32),
         tag => Err(WalError::UnknownRecordType { lsn, tag }),
     }
@@ -807,7 +793,16 @@ fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalTxnState {
     Active,
+    Aborting,
     Complete,
+}
+
+fn wal_state_after(kind: &WalRecordKind) -> WalTxnState {
+    match kind {
+        WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } => WalTxnState::Active,
+        WalRecordKind::Abort => WalTxnState::Aborting,
+        WalRecordKind::Commit | WalRecordKind::RollbackComplete => WalTxnState::Complete,
+    }
 }
 
 fn validate_transaction_sequence(
@@ -827,7 +822,7 @@ fn validate_transaction_tag_sequence(
 ) -> Result<(), WalError> {
     let valid = matches!(
         (state, record_type),
-        (None, 1) | (Some(WalTxnState::Active), 2..=4)
+        (None, 1) | (Some(WalTxnState::Active), 2..=4) | (Some(WalTxnState::Aborting), 5)
     );
     if !valid {
         return Err(WalError::InvalidTransactionSequence {

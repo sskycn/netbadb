@@ -4,6 +4,7 @@ use std::fmt;
 
 use netbadb_types::{Lsn, PageId, TxnId};
 
+use crate::page::{ValidatedBeforeImage, validate_before_image};
 use crate::{Page, PageManager, StorageError, WalError, WalManager, WalRecord, WalRecordKind};
 
 /// Summary of the synchronous recovery work performed while opening storage.
@@ -136,6 +137,7 @@ impl From<StorageError> for RecoveryError {
 struct TransactionAnalysis {
     last_lsn: Lsn,
     committed: bool,
+    rolled_back: bool,
 }
 
 pub(crate) struct RecoveryManager;
@@ -166,10 +168,13 @@ impl RecoveryManager {
                 .or_insert(TransactionAnalysis {
                     last_lsn: record.lsn,
                     committed: false,
+                    rolled_back: false,
                 });
             transaction.last_lsn = record.lsn;
             if matches!(record.kind, WalRecordKind::Commit) {
                 transaction.committed = true;
+            } else if matches!(record.kind, WalRecordKind::RollbackComplete) {
+                transaction.rolled_back = true;
             }
         }
 
@@ -179,11 +184,17 @@ impl RecoveryManager {
             .count();
         let losers = transactions
             .iter()
-            .filter(|(_, transaction)| !transaction.committed)
+            .filter(|(_, transaction)| !transaction.committed && !transaction.rolled_back)
             .map(|(txn_id, transaction)| (*txn_id, transaction.last_lsn))
             .collect::<Vec<_>>();
         Self::validate_no_winner_depends_on_loser(records, &transactions)?;
-        Self::validate_page_topology(records, &record_by_lsn, &losers, pages.page_count())?;
+        Self::validate_page_topology(
+            records,
+            &record_by_lsn,
+            &transactions,
+            &losers,
+            pages.page_count(),
+        )?;
         let mut report = RecoveryReport {
             records_scanned: records.len(),
             committed_transactions,
@@ -200,6 +211,12 @@ impl RecoveryManager {
 
         let mut operations = 0_usize;
         for record in records {
+            if transactions
+                .get(&record.txn_id)
+                .is_some_and(|transaction| transaction.rolled_back)
+            {
+                continue;
+            }
             let WalRecordKind::PageUpdate { page_id, after, .. } = &record.kind else {
                 continue;
             };
@@ -260,30 +277,32 @@ impl RecoveryManager {
             {
                 Self::reject_metadata_page(*page_id, record.lsn)?;
                 let page_count = pages.page_count();
-                if before.iter().all(|byte| *byte == 0) {
-                    if page_id.0 > page_count {
-                        return Err(RecoveryError::PageGap {
-                            page_id: *page_id,
-                            page_count,
-                        });
+                match validate_before_image(*page_id, before)? {
+                    ValidatedBeforeImage::NewPage => {
+                        if page_id.0 > page_count {
+                            return Err(RecoveryError::PageGap {
+                                page_id: *page_id,
+                                page_count,
+                            });
+                        }
+                        if pages.remove_trailing_page(*page_id)? {
+                            report.pages_undone += 1;
+                            operations += 1;
+                            Self::maybe_interrupt(operations, operation_limit)?;
+                        }
                     }
-                    if pages.remove_trailing_page(*page_id)? {
+                    ValidatedBeforeImage::Existing(before_page) => {
+                        if page_id.0 >= page_count {
+                            return Err(RecoveryError::PageGap {
+                                page_id: *page_id,
+                                page_count,
+                            });
+                        }
+                        pages.write_page(&before_page)?;
                         report.pages_undone += 1;
                         operations += 1;
                         Self::maybe_interrupt(operations, operation_limit)?;
                     }
-                } else {
-                    if page_id.0 >= page_count {
-                        return Err(RecoveryError::PageGap {
-                            page_id: *page_id,
-                            page_count,
-                        });
-                    }
-                    let before_page = Page::from_bytes(*page_id, **before);
-                    pages.write_page(&before_page)?;
-                    report.pages_undone += 1;
-                    operations += 1;
-                    Self::maybe_interrupt(operations, operation_limit)?;
                 }
             }
             if let Some(prev_lsn) = record.prev_lsn {
@@ -305,11 +324,18 @@ impl RecoveryManager {
     fn validate_page_topology(
         records: &[WalRecord],
         record_by_lsn: &HashMap<Lsn, usize>,
+        transactions: &HashMap<TxnId, TransactionAnalysis>,
         losers: &[(TxnId, Lsn)],
         initial_page_count: u64,
     ) -> Result<(), RecoveryError> {
         let mut simulated_page_count = initial_page_count;
         for record in records {
+            if transactions
+                .get(&record.txn_id)
+                .is_some_and(|transaction| transaction.rolled_back)
+            {
+                continue;
+            }
             let WalRecordKind::PageUpdate { page_id, .. } = &record.kind else {
                 continue;
             };
@@ -388,9 +414,10 @@ impl RecoveryManager {
             let WalRecordKind::PageUpdate { page_id, .. } = &record.kind else {
                 continue;
             };
-            let committed = transactions
-                .get(&record.txn_id)
-                .is_some_and(|transaction| transaction.committed);
+            let Some(transaction) = transactions.get(&record.txn_id) else {
+                continue;
+            };
+            let committed = transaction.committed;
             if committed {
                 if let Some((loser_txn, loser_lsn)) = latest_loser_by_page.get(page_id).copied() {
                     return Err(RecoveryError::CommittedUpdateDependsOnLoser {
@@ -401,7 +428,7 @@ impl RecoveryManager {
                         winner_lsn: record.lsn,
                     });
                 }
-            } else {
+            } else if !transaction.rolled_back {
                 latest_loser_by_page.insert(*page_id, (record.txn_id, record.lsn));
             }
         }

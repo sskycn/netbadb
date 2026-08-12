@@ -256,10 +256,19 @@ pub enum TransactionError {
     WriterBusy {
         txn_id: netbadb_types::TxnId,
     },
+    InvalidRollbackChain {
+        txn_id: netbadb_types::TxnId,
+        lsn: netbadb_types::Lsn,
+    },
+    UnfinishedWriter {
+        txn_id: netbadb_types::TxnId,
+    },
     RecoveryRequired,
     ForeignTransaction {
         txn_id: netbadb_types::TxnId,
     },
+    #[cfg(test)]
+    RollbackInterrupted,
 }
 
 impl fmt::Display for TransactionError {
@@ -272,19 +281,30 @@ impl fmt::Display for TransactionError {
             ),
             Self::IdExhausted => formatter.write_str("transaction ID space is exhausted"),
             Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
-            Self::WriterBusy { txn_id } => write!(
+            Self::WriterBusy { txn_id } => {
+                write!(formatter, "transaction {} is the active writer", txn_id.0)
+            }
+            Self::InvalidRollbackChain { txn_id, lsn } => write!(
                 formatter,
-                "transaction {} is the active writer",
+                "transaction {} has an invalid rollback chain at WAL record {}",
+                txn_id.0, lsn.0
+            ),
+            Self::UnfinishedWriter { txn_id } => write!(
+                formatter,
+                "transaction {} still owns the database writer",
                 txn_id.0
             ),
-            Self::RecoveryRequired => formatter.write_str(
-                "a transaction with page updates ended without commit; reopen the database to recover before writing again",
-            ),
+            Self::RecoveryRequired => formatter
+                .write_str("an unfinished writer requires database recovery before writing again"),
             Self::ForeignTransaction { txn_id } => write!(
                 formatter,
                 "transaction {} belongs to a different database",
                 txn_id.0
             ),
+            #[cfg(test)]
+            Self::RollbackInterrupted => {
+                formatter.write_str("rollback interrupted by a test failure injection")
+            }
         }
     }
 }

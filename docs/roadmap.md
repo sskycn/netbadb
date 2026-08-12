@@ -58,8 +58,27 @@ this format version.
 - single-writer enforcement and rejection of committed updates that depend on
   earlier loser contents in retained WAL.
 
-Phase 2B intentionally has no MVCC, isolation, checkpoints, WAL recycling,
+Phase 2B intentionally had no MVCC, isolation, checkpoints, WAL recycling,
 bounded WAL growth, or runtime full rollback guarantee.
+
+## Phase 2B.1 — Single Writer + Runtime Rollback (complete)
+
+- lazy first-write ownership with read-only transactions admitted concurrently;
+- explicit Active, CommitPending, RollbackPending, Committed, and RolledBack
+  states;
+- retryable durable commit and durable Abort followed by synchronous physical
+  before-image undo;
+- reverse-prevLSN rollback, including exact reverse removal of newly allocated
+  trailing pages;
+- durable RollbackComplete records after rollback pages are synchronized;
+- recovery-safe interruption, failed commit/rollback writer retention, dirty
+  writer Drop poisoning, and unresolved-writer close errors;
+- regression tests preventing later winners from depending on loser page
+  images.
+
+This is a single-writer STEAL/NO-FORCE model. Reads are not isolated and may
+observe an active writer. There is still no MVCC, checkpoint, WAL recycling,
+bounded WAL growth, or concurrent-writer scheduling.
 
 ## Phase 2C — Checkpoint + WAL Lifecycle (next)
 
