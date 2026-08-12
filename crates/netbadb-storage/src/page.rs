@@ -372,6 +372,8 @@ pub struct PageManager {
     fail_next_write: bool,
     #[cfg(test)]
     fail_next_sync: bool,
+    #[cfg(test)]
+    fail_next_allocation_after: Option<usize>,
 }
 
 impl PageManager {
@@ -401,6 +403,8 @@ impl PageManager {
             fail_next_write: false,
             #[cfg(test)]
             fail_next_sync: false,
+            #[cfg(test)]
+            fail_next_allocation_after: None,
         })
     }
 
@@ -423,6 +427,8 @@ impl PageManager {
             fail_next_write: false,
             #[cfg(test)]
             fail_next_sync: false,
+            #[cfg(test)]
+            fail_next_allocation_after: None,
         })
     }
 
@@ -439,6 +445,12 @@ impl PageManager {
             .ok_or(StorageError::PageOffsetOverflow { page_id: id })?;
         let page = Page::zero(id);
         self.file.seek(SeekFrom::End(0))?;
+        #[cfg(test)]
+        if let Some(prefix_len) = self.fail_next_allocation_after.take() {
+            let prefix_len = prefix_len.min(PAGE_SIZE);
+            self.file.write_all(&page.bytes()[..prefix_len])?;
+            return Err(std::io::Error::other("injected partial page allocation failure").into());
+        }
         self.file.write_all(page.bytes())?;
         self.page_count = next_count;
         Ok(page)
@@ -446,6 +458,10 @@ impl PageManager {
 
     pub(crate) fn remove_trailing_page(&mut self, id: PageId) -> Result<bool, StorageError> {
         if id.0 == self.page_count {
+            // `allocate_page` may have extended the file partially before an
+            // I/O error without advancing the logical page count. Restore the
+            // exact logical boundary even when the page is already absent.
+            self.file.set_len(self.page_offset(id)?)?;
             return Ok(false);
         }
         let expected_count =
@@ -499,6 +515,11 @@ impl PageManager {
     #[cfg(test)]
     pub(crate) fn inject_sync_failure(&mut self) {
         self.fail_next_sync = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_partial_allocation_failure(&mut self, after_bytes: usize) {
+        self.fail_next_allocation_after = Some(after_bytes);
     }
 
     fn page_offset(&self, id: PageId) -> Result<u64, StorageError> {

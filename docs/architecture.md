@@ -233,6 +233,9 @@ Redo non-rolled-back PageUpdates in ascending LSN
     │
     ▼
 Undo losers in descending global LSN
+    │
+    ▼
+Sync undo + durably finalize recovered losers
 ```
 
 Analysis builds transaction lastLSNs and an LSN lookup. Redo repeats history,
@@ -244,7 +247,10 @@ the next trailing page, so WAL cannot create page-ID gaps. Undo follows each
 incomplete or Abort-only loser's prevLSN chain through a max-heap and installs
 PageUpdate before-images in global descending LSN order. A zero before-image
 means the loser allocated that page, which can only remove the exact trailing
-page. The page file is synchronized before recovery returns.
+page. The page file is synchronized, then recovery appends Abort for any loser
+that was still Active, appends RollbackComplete, and flushes those terminal
+records before returning. This prevents a recovered loser from conflicting
+with or overwriting a later winner on another restart.
 
 Because full-page after-images can include another transaction's uncommitted
 contents, the runtime permits one writer and acquires that ownership before any
@@ -261,10 +267,11 @@ The algorithm intentionally has no compensation log records. During runtime
 rollback, Abort is durable before physical undo and RollbackComplete becomes
 durable only after all rollback page changes are synchronized. A crash before
 completion therefore leaves an Abort-only loser: startup repeats its history
-and deterministically undoes the whole prevLSN chain. A durable completion
-record means the already-synchronized transaction images must be skipped, so a
-later committed winner is never overwritten by reapplying the old rollback.
-The retained valid WAL is synchronized before any recovery page write.
+and deterministically undoes the whole prevLSN chain. Startup recovery uses the
+same ordering when it finalizes a loser after undo. A durable completion record
+means the already-synchronized transaction images must be skipped, so a later
+committed winner is never overwritten by reapplying the old rollback. The
+retained valid WAL is synchronized before any recovery page write.
 
 At startup only an incomplete final record whose available header is
 structurally valid may be truncated at EOF. Corrupt middle records, invalid

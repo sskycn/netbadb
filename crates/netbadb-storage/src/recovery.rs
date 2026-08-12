@@ -182,11 +182,12 @@ impl RecoveryManager {
             .values()
             .filter(|transaction| transaction.committed)
             .count();
-        let losers = transactions
+        let mut losers = transactions
             .iter()
             .filter(|(_, transaction)| !transaction.committed && !transaction.rolled_back)
             .map(|(txn_id, transaction)| (*txn_id, transaction.last_lsn))
             .collect::<Vec<_>>();
+        losers.sort_unstable_by_key(|(txn_id, last_lsn)| (last_lsn.0, txn_id.0));
         Self::validate_no_winner_depends_on_loser(records, &transactions)?;
         Self::validate_page_topology(
             records,
@@ -253,7 +254,7 @@ impl RecoveryManager {
         // prevLSN chain. Popping the greatest LSN gives a global reverse-LSN
         // undo order while preserving every per-transaction chain.
         let mut undo = BinaryHeap::<(u64, u64)>::new();
-        for (txn_id, last_lsn) in losers {
+        for (txn_id, last_lsn) in &losers {
             undo.push((last_lsn.0, txn_id.0));
         }
         while let Some((raw_lsn, raw_txn_id)) = undo.pop() {
@@ -311,6 +312,35 @@ impl RecoveryManager {
         }
 
         pages.sync()?;
+
+        // Once physical undo is durable, record that startup recovery has
+        // completed each loser. Otherwise a later committed update could be
+        // rejected—or overwritten by the same old loser—on the next restart.
+        let mut completion_lsn = None;
+        for (txn_id, last_lsn) in &losers {
+            let last_record =
+                records
+                    .get(record_by_lsn.get(last_lsn).copied().ok_or(
+                        RecoveryError::MissingRecord {
+                            txn_id: *txn_id,
+                            lsn: *last_lsn,
+                        },
+                    )?)
+                    .ok_or(RecoveryError::MissingRecord {
+                        txn_id: *txn_id,
+                        lsn: *last_lsn,
+                    })?;
+            let abort_lsn = if matches!(last_record.kind, WalRecordKind::Abort) {
+                *last_lsn
+            } else {
+                wal.append(*txn_id, Some(*last_lsn), WalRecordKind::Abort)?
+            };
+            completion_lsn =
+                Some(wal.append(*txn_id, Some(abort_lsn), WalRecordKind::RollbackComplete)?);
+        }
+        if let Some(lsn) = completion_lsn {
+            wal.flush_through(lsn)?;
+        }
         Ok(report)
     }
 
@@ -328,6 +358,7 @@ impl RecoveryManager {
         losers: &[(TxnId, Lsn)],
         initial_page_count: u64,
     ) -> Result<(), RecoveryError> {
+        Self::validate_rolled_back_page_topology(records, transactions, initial_page_count)?;
         let mut simulated_page_count = initial_page_count;
         for record in records {
             if transactions
@@ -400,6 +431,60 @@ impl RecoveryManager {
             }
             if let Some(prev_lsn) = record.prev_lsn {
                 undo.push((prev_lsn.0, txn_id.0));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_rolled_back_page_topology(
+        records: &[WalRecord],
+        transactions: &HashMap<TxnId, TransactionAnalysis>,
+        initial_page_count: u64,
+    ) -> Result<(), RecoveryError> {
+        let mut allocated_ranges = HashMap::<TxnId, (u64, u64)>::new();
+        for record in records {
+            if !transactions
+                .get(&record.txn_id)
+                .is_some_and(|transaction| transaction.rolled_back)
+            {
+                continue;
+            }
+            let WalRecordKind::PageUpdate {
+                page_id, before, ..
+            } = &record.kind
+            else {
+                continue;
+            };
+            Self::reject_metadata_page(*page_id, record.lsn)?;
+            if before.iter().all(|byte| *byte == 0) {
+                let range = allocated_ranges
+                    .entry(record.txn_id)
+                    .or_insert((page_id.0, page_id.0));
+                if range.0 == range.1 && page_id.0 > initial_page_count {
+                    return Err(RecoveryError::PageGap {
+                        page_id: *page_id,
+                        page_count: initial_page_count,
+                    });
+                }
+                if page_id.0 != range.1 {
+                    return Err(RecoveryError::PageGap {
+                        page_id: *page_id,
+                        page_count: range.1,
+                    });
+                }
+                range.1 = range.1.checked_add(1).ok_or(RecoveryError::PageGap {
+                    page_id: *page_id,
+                    page_count: range.1,
+                })?;
+            } else if page_id.0 >= initial_page_count
+                && !allocated_ranges
+                    .get(&record.txn_id)
+                    .is_some_and(|(start, end)| page_id.0 >= *start && page_id.0 < *end)
+            {
+                return Err(RecoveryError::PageGap {
+                    page_id: *page_id,
+                    page_count: initial_page_count,
+                });
             }
         }
         Ok(())
@@ -792,10 +877,17 @@ mod tests {
         let report = recover(&path).expect("recover partial tail");
         assert!(report.truncated_wal_tail);
         assert_eq!(read_page(&path, PageId(1)), original);
-        assert_eq!(
-            std::fs::metadata(&wal_file).expect("WAL metadata").len(),
-            commit.0
-        );
+        let mut finalized = WalManager::open(&wal_file).expect("open finalized WAL");
+        let finalized_records = finalized.scan().expect("scan finalized WAL");
+        assert!(matches!(
+            finalized_records[finalized_records.len() - 2].kind,
+            WalRecordKind::Abort
+        ));
+        assert!(matches!(
+            finalized_records.last().map(|record| &record.kind),
+            Some(WalRecordKind::RollbackComplete)
+        ));
+        drop(finalized);
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -906,6 +998,64 @@ mod tests {
             Err(RecoveryError::Storage(_))
         ));
         assert_eq!(read_page(&path, PageId(1)), original);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rollback_complete_does_not_bypass_page_reference_validation() {
+        let (path, _original) = create_fixture("completed-metadata-update");
+        let mut wal = WalManager::open(wal_path(&path)).expect("open WAL");
+        let txn_id = TxnId(57);
+        let begin = wal
+            .append(txn_id, None, WalRecordKind::Begin)
+            .expect("begin");
+        let before = Page::zero(PageId(0));
+        let mut after = Page::new(PageId(0), PageType::Heap);
+        let update = wal.next_lsn();
+        after.set_page_lsn(update);
+        wal.append(txn_id, Some(begin), page_update_kind(&before, &after))
+            .expect("append metadata update");
+        let abort = wal
+            .append(txn_id, Some(update), WalRecordKind::Abort)
+            .expect("abort");
+        let complete = wal
+            .append(txn_id, Some(abort), WalRecordKind::RollbackComplete)
+            .expect("complete rollback");
+        wal.flush_through(complete).expect("flush WAL");
+        drop(wal);
+        assert!(matches!(
+            recover(&path),
+            Err(RecoveryError::MetadataPageUpdate { .. })
+        ));
+        cleanup(&path);
+
+        let (path, _original) = create_fixture("completed-page-gap");
+        let mut wal = WalManager::open(wal_path(&path)).expect("open WAL");
+        let txn_id = TxnId(58);
+        let begin = wal
+            .append(txn_id, None, WalRecordKind::Begin)
+            .expect("begin");
+        let before = Page::zero(PageId(3));
+        let mut after = Page::new(PageId(3), PageType::Heap);
+        let update = wal.next_lsn();
+        after.set_page_lsn(update);
+        wal.append(txn_id, Some(begin), page_update_kind(&before, &after))
+            .expect("append gap update");
+        let abort = wal
+            .append(txn_id, Some(update), WalRecordKind::Abort)
+            .expect("abort");
+        let complete = wal
+            .append(txn_id, Some(abort), WalRecordKind::RollbackComplete)
+            .expect("complete rollback");
+        wal.flush_through(complete).expect("flush WAL");
+        drop(wal);
+        assert!(matches!(
+            recover(&path),
+            Err(RecoveryError::PageGap {
+                page_id: PageId(3),
+                page_count: 2,
+            })
+        ));
         cleanup(&path);
     }
 

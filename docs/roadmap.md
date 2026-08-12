@@ -70,7 +70,8 @@ bounded WAL growth, or runtime full rollback guarantee.
   before-image undo;
 - reverse-prevLSN rollback, including exact reverse removal of newly allocated
   trailing pages;
-- durable RollbackComplete records after rollback pages are synchronized;
+- durable RollbackComplete records after runtime or startup rollback pages are
+  synchronized;
 - recovery-safe interruption, failed commit/rollback writer retention, dirty
   writer Drop poisoning, and unresolved-writer close errors;
 - regression tests preventing later winners from depending on loser page

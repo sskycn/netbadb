@@ -223,10 +223,9 @@ impl BufferState {
             }
             ValidatedBeforeImage::NewPage => {
                 if page_id.0 == self.disk.page_count() {
-                    // A prior retry may have completed `set_len` but failed
-                    // its sync. Synchronize even when the page is already
-                    // absent before allowing RollbackComplete to become
-                    // durable.
+                    // Also truncates a partial allocation that extended the
+                    // file without advancing the logical page count.
+                    self.disk.remove_trailing_page(page_id)?;
                     self.disk.sync()?;
                     return Ok(());
                 }
@@ -369,6 +368,14 @@ impl BufferPool {
     #[cfg(test)]
     pub(crate) fn inject_page_sync_failure(&self) {
         self.state.borrow_mut().disk.inject_sync_failure();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_partial_page_allocation_failure(&self, after_bytes: usize) {
+        self.state
+            .borrow_mut()
+            .disk
+            .inject_partial_allocation_failure(after_bytes);
     }
 }
 

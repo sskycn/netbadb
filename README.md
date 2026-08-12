@@ -188,9 +188,10 @@ winners, RollbackComplete transactions as already physically undone, and
 incomplete or Abort-only transactions as losers. It redoes non-rolled-back page
 updates in ascending LSN order while using pageLSN to skip installed images,
 then undoes losers in global descending LSN order from full before-images.
-Repeating recovery is idempotent even without compensation log records because
-each restart first repeats the same history and then applies the same
-deterministic undo.
+After synchronizing physical undo, startup appends and flushes Abort when
+needed plus RollbackComplete for each recovered loser. A crash before that
+completion is durable safely repeats history and deterministic undo; later
+opens skip transactions whose completion is durable.
 
 An incomplete final WAL record caused by EOF is discarded at the recovery
 boundary only when its available header bytes are structurally valid. Invalid

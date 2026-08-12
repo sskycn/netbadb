@@ -831,6 +831,69 @@ mod tests {
     }
 
     #[test]
+    fn rollback_truncates_a_partial_new_page_allocation() {
+        let path = test_path("heap-partial-allocation-rollback");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("x".repeat(3_900))])
+            .expect("fill first page");
+        storage.buffer.inject_partial_page_allocation_failure(137);
+
+        assert!(matches!(
+            storage.insert(&[
+                ScalarValue::Int64(2),
+                ScalarValue::Text("new page".repeat(200)),
+            ]),
+            Err(StorageError::Io(_))
+        ));
+        assert_eq!(storage.buffer.page_count(), 2);
+        storage.close().expect("close after rollback");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen aligned heap");
+        let rows = reopened.scan().expect("scan rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(1));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn startup_undo_is_finalized_before_a_later_winner_commits() {
+        let path = test_path("heap-startup-undo-later-winner");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut loser = storage.begin_transaction().expect("begin loser");
+        storage
+            .insert_in(
+                &mut loser,
+                &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
+            )
+            .expect("insert loser");
+        storage.flush().expect("steal loser page");
+        drop(loser);
+        storage.simulate_crash();
+
+        let mut recovered = HeapStorage::open(&path, table()).expect("recover loser");
+        assert!(recovered.scan().expect("scan recovered heap").is_empty());
+        assert!(matches!(
+            recovered
+                .wal_records()
+                .expect("scan finalized WAL")
+                .last()
+                .map(|record| &record.kind),
+            Some(WalRecordKind::RollbackComplete)
+        ));
+        recovered
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("winner".into())])
+            .expect("insert later winner");
+        recovered.close().expect("close recovered heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen after winner");
+        let rows = reopened.scan().expect("scan winner");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(2));
+        cleanup(&path);
+    }
+
+    #[test]
     fn active_writer_blocks_another_write_until_runtime_rollback_finishes() {
         let path = test_path("heap-single-writer-rollback");
         let mut storage = HeapStorage::create(&path, table()).expect("create heap");
