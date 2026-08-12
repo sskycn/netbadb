@@ -176,7 +176,7 @@ impl Page {
                     length: slot.length,
                 },
             )?;
-            if slot.length == 0 || offset >= PAGE_SIZE || end > PAGE_SIZE {
+            if offset > PAGE_SIZE || end > PAGE_SIZE {
                 return Err(PageError::RecordOutOfBounds {
                     slot: slot_id,
                     offset: slot.offset,
@@ -251,7 +251,7 @@ impl Page {
         }
 
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
-        if record.is_empty() || record.len() > max_record_size || record.len() > u16::MAX as usize {
+        if record.len() > max_record_size || record.len() > u16::MAX as usize {
             return Err(PageError::RecordTooLarge {
                 size: record.len(),
                 capacity: max_record_size,
@@ -450,6 +450,21 @@ mod tests {
                 slot: SlotId(2)
             }))
         ));
+    }
+
+    #[test]
+    fn zero_length_record_has_a_real_slot() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let empty = page.insert_record(&[]).expect("insert empty record");
+        let non_empty = page.insert_record(b"value").expect("insert value");
+        let header = page.header().expect("valid page header");
+
+        assert_eq!(header.slot_count, 2);
+        assert_eq!(page.read_record(empty).expect("read empty record"), b"");
+        assert_eq!(
+            page.read_record(non_empty).expect("read non-empty record"),
+            b"value"
+        );
     }
 
     #[test]

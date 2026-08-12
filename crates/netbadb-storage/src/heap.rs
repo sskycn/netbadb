@@ -37,6 +37,7 @@ impl HeapStorage {
         buffer_pool_size: usize,
     ) -> Result<Self, StorageError> {
         validate_table(&table)?;
+        BufferPool::validate_capacity(buffer_pool_size)?;
         let pages = PageManager::create(path)?;
         let buffer = BufferPool::new(pages, buffer_pool_size)?;
         {
@@ -63,6 +64,7 @@ impl HeapStorage {
         buffer_pool_size: usize,
     ) -> Result<Self, StorageError> {
         validate_table(&table)?;
+        BufferPool::validate_capacity(buffer_pool_size)?;
         let pages = PageManager::open(path)?;
         if pages.page_count() < 2 {
             return Err(crate::invalid_format("heap file has no data page"));
@@ -79,7 +81,7 @@ impl HeapStorage {
         self.validate_row(values)?;
         let payload = encode_row(values)?;
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
-        if payload.is_empty() || payload.len() > max_record_size {
+        if payload.len() > max_record_size {
             return Err(PageError::RecordTooLarge {
                 size: payload.len(),
                 capacity: max_record_size,
@@ -376,7 +378,7 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::HeapStorage;
-    use crate::{PageManager, SlotId, StorageError};
+    use crate::{BufferError, PageManager, SlotId, StorageError};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
 
@@ -413,6 +415,41 @@ mod tests {
             rows[0].1,
             vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_column_row_round_trips() {
+        let path = test_path("heap-empty-row");
+        let empty_table = TableDef::new(TableId(2), "events", vec![]);
+        let mut storage = HeapStorage::create(&path, empty_table.clone()).expect("create heap");
+        let row_id = storage.insert(&[]).expect("insert empty row");
+        assert_eq!(row_id.slot, 0);
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, empty_table).expect("reopen heap");
+        let rows = reopened.scan().expect("scan heap");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_buffer_capacity_does_not_truncate_an_existing_heap() {
+        let path = test_path("heap-invalid-capacity");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(7), ScalarValue::Text("Ada".into())])
+            .expect("insert row");
+        storage.close().expect("close heap");
+
+        assert!(matches!(
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 0),
+            Err(StorageError::Buffer(BufferError::InvalidCapacity))
+        ));
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen preserved heap");
+        assert_eq!(reopened.scan().expect("scan preserved heap").len(), 1);
         let _ = std::fs::remove_file(path);
     }
 

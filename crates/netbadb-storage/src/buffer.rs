@@ -68,6 +68,12 @@ impl BufferState {
         let frame = self.frames.get_mut(index).ok_or(BufferError::Exhausted {
             capacity: self.capacity,
         })?;
+        if frame.writer {
+            return Err(BufferError::PagePinned {
+                page_id: frame.page_id,
+            }
+            .into());
+        }
         if frame.dirty {
             self.disk.write_page(&frame.page)?;
             frame.dirty = false;
@@ -156,6 +162,12 @@ impl BufferState {
     }
 
     fn flush_all(&mut self) -> Result<(), StorageError> {
+        if let Some(frame) = self.frames.iter().find(|frame| frame.writer) {
+            return Err(BufferError::PagePinned {
+                page_id: frame.page_id,
+            }
+            .into());
+        }
         for index in 0..self.frames.len() {
             self.flush_frame(index)?;
         }
@@ -174,10 +186,15 @@ pub struct BufferPool {
 pub const DEFAULT_BUFFER_POOL_SIZE: usize = 8;
 
 impl BufferPool {
-    pub fn new(page_manager: PageManager, capacity: usize) -> Result<Self, StorageError> {
+    pub(crate) fn validate_capacity(capacity: usize) -> Result<(), StorageError> {
         if capacity == 0 {
             return Err(BufferError::InvalidCapacity.into());
         }
+        Ok(())
+    }
+
+    pub fn new(page_manager: PageManager, capacity: usize) -> Result<Self, StorageError> {
+        Self::validate_capacity(capacity)?;
         Ok(Self {
             state: Rc::new(RefCell::new(BufferState {
                 disk: page_manager,
@@ -390,6 +407,33 @@ mod tests {
         drop(page_a);
         let page_b = pool.read_page(PageId(2)).expect("load page B");
         drop(page_b);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn flush_rejects_an_active_write_guard_and_succeeds_after_release() {
+        let path = test_path("buffer-flush-writer");
+        let manager = prepared_manager(&path);
+        let pool = BufferPool::new(manager, 1).expect("create buffer pool");
+        let mut page = pool.write_page(PageId(1)).expect("write page");
+        page.page_mut().bytes_mut()[100] = 91;
+
+        assert!(matches!(
+            pool.flush_all(),
+            Err(StorageError::Buffer(crate::BufferError::PagePinned {
+                page_id: PageId(1)
+            }))
+        ));
+
+        drop(page);
+        pool.flush_all().expect("flush released page");
+        drop(pool);
+
+        let mut reopened = PageManager::open(&path).expect("reopen page file");
+        assert_eq!(
+            reopened.read_page(PageId(1)).expect("read page").bytes()[100],
+            91
+        );
         let _ = std::fs::remove_file(path);
     }
 }
