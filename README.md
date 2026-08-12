@@ -1,8 +1,8 @@
-# XDB
+# NetbaDb
 
-**XDB is a typed relational database built for application development.**
+**NetbaDb is a typed relational database built for application development.**
 
-XDB combines a relational database engine, a typed query compiler, application-native schema semantics, developer tooling, and AI-friendly interfaces into one coherent system.
+NetbaDb combines a relational database engine, a typed query compiler, application-native schema semantics, developer tooling, and AI-friendly interfaces into one coherent system.
 
 Its goal is not merely to execute SQL.
 
@@ -26,13 +26,13 @@ Typed Result
 
 understandable, verifiable, inspectable, and safe.
 
-> XDB is currently under active design and development.
+> NetbaDb is currently under active design and development.
 >
 > Features described as roadmap items are architectural goals and should not be considered implemented until explicitly marked otherwise.
 
 ---
 
-## Why XDB?
+## Why NetbaDb?
 
 Traditional application database stacks usually contain several independently evolving layers:
 
@@ -62,7 +62,7 @@ Typical problems include:
 * query planners that application tooling cannot understand;
 * AI tools operating on SQL strings without enough semantic context.
 
-XDB is designed around a different model:
+NetbaDb is designed around a different model:
 
 ```text
 Application
@@ -73,9 +73,9 @@ Typed Query Compiler
     ↓
 Relational IR
     ↓
-XDB Planner
+NetbaDb Planner
     ↓
-XDB Execution Engine
+NetbaDb Execution Engine
 ```
 
 Types, relations, parameters, result shapes, source locations, and query plans remain explicit throughout the pipeline.
@@ -86,7 +86,7 @@ Types, relations, parameters, result shapes, source locations, and query plans r
 
 ## 1. Types are semantic
 
-XDB distinguishes between types that have the same physical representation but different meanings.
+NetbaDb distinguishes between types that have the same physical representation but different meanings.
 
 For example:
 
@@ -105,7 +105,7 @@ UserID != TeamID
 
 This makes it possible to detect mistakes such as comparing unrelated identifiers before query execution.
 
-XDB therefore distinguishes between:
+NetbaDb therefore distinguishes between:
 
 ```text
 Physical Type
@@ -121,7 +121,7 @@ rather than reducing everything to a primitive SQL type as early as possible.
 
 ## 2. Queries are compiled
 
-XDB treats queries as programs.
+NetbaDb treats queries as programs.
 
 The intended compiler pipeline is:
 
@@ -159,7 +159,7 @@ Query execution should never depend on a template engine reverse-engineering the
 
 ## 3. Relational algebra is the core
 
-XDB uses a typed relational intermediate representation as the semantic boundary between query languages and the execution engine.
+NetbaDb uses a typed relational intermediate representation as the semantic boundary between query languages and the execution engine.
 
 Conceptually:
 
@@ -208,7 +208,7 @@ AI tooling
 
 ## 4. Correctness before cleverness
 
-XDB should prefer a simple, obviously correct plan over a sophisticated optimization whose semantic safety is unclear.
+NetbaDb should prefer a simple, obviously correct plan over a sophisticated optimization whose semantic safety is unclear.
 
 Logical optimizations may include:
 
@@ -252,11 +252,11 @@ A query should be explainable from source code all the way to storage access.
 
 ## 6. Tooling and database semantics share one model
 
-XDB is designed so that the following components do not independently reimplement database semantics:
+NetbaDb is designed so that the following components do not independently reimplement database semantics:
 
 ```text
-XDB Server
-XDB CLI
+NetbaDb Server
+NetbaDb CLI
 Language Server
 IDE
 SDK
@@ -276,7 +276,7 @@ The long-term architecture is:
 
 ```text
                         ┌─────────────────┐
-                        │     XDB IDE     │
+                        │     NetbaDb IDE     │
                         └────────┬────────┘
                                  │
                      ┌───────────┴───────────┐
@@ -285,7 +285,7 @@ The long-term architecture is:
                      └───────────┬───────────┘
                                  │
                     ┌────────────▼────────────┐
-                    │      XDB Compiler       │
+                    │      NetbaDb Compiler       │
                     ├─────────────────────────┤
                     │ Parser                  │
                     │ Resolver                │
@@ -297,7 +297,7 @@ The long-term architecture is:
                     └────────────┬────────────┘
                                  │
                     ┌────────────▼────────────┐
-                    │      XDB Planner        │
+                    │      NetbaDb Planner        │
                     ├─────────────────────────┤
                     │ Statistics              │
                     │ Access Path Selection   │
@@ -307,7 +307,7 @@ The long-term architecture is:
                     └────────────┬────────────┘
                                  │
                     ┌────────────▼────────────┐
-                    │      XDB Executor       │
+                    │      NetbaDb Executor       │
                     ├─────────────────────────┤
                     │ Scan                    │
                     │ Filter                  │
@@ -344,10 +344,10 @@ The long-term architecture is:
 A possible repository structure is:
 
 ```text
-xdb/
+netbadb/
 ├── cmd/
-│   ├── xdb/
-│   └── xdbd/
+│   ├── netbadb/
+│   └── netbadbd/
 │
 ├── internal/
 │   ├── catalog/
@@ -376,7 +376,7 @@ xdb/
 │   └── protocol/
 │
 ├── pkg/
-│   └── xdb/
+│   └── netbadb/
 │
 ├── sdk/
 │   └── go/
@@ -398,7 +398,7 @@ The architectural boundaries should not.
 
 # Storage Engine
 
-The first XDB storage engine is intended to prioritize:
+The first NetbaDb storage engine is intended to prioritize:
 
 ```text
 single node
@@ -509,7 +509,7 @@ The implementation should not commit to unnecessary complexity before workload r
 
 A database must remain correct when the process or machine fails at arbitrary points.
 
-XDB therefore treats crash recovery as a core storage requirement rather than a later reliability feature.
+NetbaDb therefore treats crash recovery as a core storage requirement rather than a later reliability feature.
 
 The long-term recovery architecture includes:
 
@@ -528,7 +528,7 @@ A committed transaction must not depend on all modified data pages already havin
 
 # Catalog
 
-XDB maintains a system catalog describing database objects.
+NetbaDb maintains a system catalog describing database objects.
 
 Conceptually:
 
@@ -546,7 +546,7 @@ Catalog
 └── Functions
 ```
 
-Unlike a conventional relational catalog, XDB may preserve application-level semantic type information.
+Unlike a conventional relational catalog, NetbaDb may preserve application-level semantic type information.
 
 For example:
 
@@ -606,7 +606,7 @@ This allows higher-level queries to describe relationships without allowing arbi
 
 # Query Language
 
-XDB is intended to support relational queries through a typed query language.
+NetbaDb is intended to support relational queries through a typed query language.
 
 SQL compatibility may also be provided where useful.
 
@@ -714,7 +714,7 @@ before execution begins.
 
 # Nominal Types
 
-Nominal typing is an important XDB design goal.
+Nominal typing is an important NetbaDb design goal.
 
 Consider:
 
@@ -811,7 +811,7 @@ cost estimates
 
 # Query Optimization
 
-XDB separates optimization into two categories.
+NetbaDb separates optimization into two categories.
 
 ## Logical optimization
 
@@ -843,12 +843,12 @@ The optimizer should remain deterministic and inspectable wherever practical.
 
 # EXPLAIN
 
-XDB aims to make query plans easy to inspect.
+NetbaDb aims to make query plans easy to inspect.
 
 Conceptually:
 
 ```text
-xdb> explain
+netbadb> explain
      select User.Name
      where User.TeamID = :team
      order by User.Name
@@ -887,7 +887,7 @@ memory
 
 # Prepared Plans
 
-Because XDB controls both the compiler and database execution model, application queries may eventually be represented as typed prepared plans rather than raw SQL text.
+Because NetbaDb controls both the compiler and database execution model, application queries may eventually be represented as typed prepared plans rather than raw SQL text.
 
 Conceptually:
 
@@ -897,7 +897,7 @@ Application
 Query ID
 + Typed Parameters
     ↓
-Prepared XDB Plan
+Prepared NetbaDb Plan
     ↓
 Execution
 ```
@@ -918,12 +918,12 @@ This can eliminate repeated parsing and reduce runtime query/schema mismatch.
 
 # Go Integration
 
-Go is the initial first-class application language for XDB.
+Go is the initial first-class application language for NetbaDb.
 
 A future Go API may look conceptually like:
 
 ```go
-db, err := xdb.Open("app.xdb")
+db, err := netbadb.Open("app.netbadb")
 if err != nil {
     return err
 }
@@ -945,9 +945,9 @@ Application code should not need to manually reconstruct this information from S
 
 ---
 
-# XDB and Repository Generation
+# NetbaDb and Repository Generation
 
-XDB can work with repository-oriented application architectures.
+NetbaDb can work with repository-oriented application architectures.
 
 For example:
 
@@ -970,20 +970,20 @@ result shape matches
 result Go type matches
 ```
 
-The generated implementation then becomes a thin adapter over a compiled XDB operation.
+The generated implementation then becomes a thin adapter over a compiled NetbaDb operation.
 
 ---
 
 # Schema Frontends
 
-XDB should not permanently couple its internal schema model to one programming language.
+NetbaDb should not permanently couple its internal schema model to one programming language.
 
 The long-term architecture is:
 
 ```text
 Go Schema ───────┐
                  │
-XDB Schema ──────┼──► Canonical Schema IR
+NetbaDb Schema ──────┼──► Canonical Schema IR
                  │
 Future Frontend ─┘
 ```
@@ -1038,56 +1038,56 @@ online migration planning
 
 ---
 
-# XDB CLI
+# NetbaDb CLI
 
 The command-line interface is expected to become the primary low-level administrative and development tool.
 
 Possible command families include:
 
 ```text
-xdb init
+netbadb init
 
-xdb start
-xdb stop
+netbadb start
+netbadb stop
 
-xdb shell
+netbadb shell
 
-xdb check
-xdb fmt
+netbadb check
+netbadb fmt
 
-xdb schema
-xdb migrate
+netbadb schema
+netbadb migrate
 
-xdb query
-xdb explain
-xdb profile
+netbadb query
+netbadb explain
+netbadb profile
 
-xdb inspect
+netbadb inspect
 
-xdb verify
+netbadb verify
 
-xdb backup
-xdb restore
+netbadb backup
+netbadb restore
 
-xdb doctor
+netbadb doctor
 ```
 
 Exact commands remain subject to implementation.
 
 ---
 
-# XDB Server
+# NetbaDb Server
 
-XDB may operate in multiple modes.
+NetbaDb may operate in multiple modes.
 
 ## Embedded
 
 ```text
 Application
     │
-    └── XDB Engine
+    └── NetbaDb Engine
           │
-        app.xdb
+        app.netbadb
 ```
 
 This mode targets:
@@ -1108,9 +1108,9 @@ Roadmap:
 ```text
 Application
     │
- XDB Protocol
+ NetbaDb Protocol
     │
-   xdbd
+   netbadbd
     │
  Storage
 ```
@@ -1128,23 +1128,23 @@ administration
 
 ---
 
-# XDB IDE
+# NetbaDb IDE
 
-XDB is intended to have a database-aware development environment.
+NetbaDb is intended to have a database-aware development environment.
 
 The IDE should not merely wrap a text editor.
 
-Its purpose is to visualize and expose XDB semantics.
+Its purpose is to visualize and expose NetbaDb semantics.
 
 Conceptually:
 
 ```text
 ┌─────────────────────────────────────────────────────┐
-│                     XDB IDE                         │
+│                     NetbaDb IDE                         │
 ├───────────────┬──────────────────────┬──────────────┤
 │ Project       │ Editor               │ Inspector    │
 │               │                      │              │
-│ Tables        │ Go / XDB Query       │ Types        │
+│ Tables        │ Go / NetbaDb Query       │ Types        │
 │ Relations     │                      │ Parameters   │
 │ Repositories  │                      │ Result       │
 │ Queries       │                      │ Plan         │
@@ -1251,7 +1251,7 @@ output columns
 
 # Diagnostics
 
-Diagnostics are a first-class XDB API.
+Diagnostics are a first-class NetbaDb API.
 
 Every compiler or database development error should ideally contain:
 
@@ -1268,7 +1268,7 @@ optional help
 Example:
 
 ```text
-error[XDB3204]:
+error[NetbaDb3204]:
 
 cannot compare UserID with TeamID
 
@@ -1300,7 +1300,7 @@ AI
 
 # Language Server
 
-XDB language tooling should provide:
+NetbaDb language tooling should provide:
 
 ```text
 diagnostics
@@ -1323,7 +1323,7 @@ It should never maintain a parallel semantic implementation.
 
 # MCP
 
-XDB is intended to expose structured development and database capabilities to AI systems through MCP.
+NetbaDb is intended to expose structured development and database capabilities to AI systems through MCP.
 
 Possible read-only operations include:
 
@@ -1356,7 +1356,7 @@ AI access must respect workspace, database, transaction, and permission boundari
 
 # AI-Native Development
 
-Because XDB exposes structured semantics rather than only source text, AI tools can reason about:
+Because NetbaDb exposes structured semantics rather than only source text, AI tools can reason about:
 
 ```text
 schema
@@ -1396,7 +1396,7 @@ and answer based on database state rather than guessing from SQL text alone.
 
 # Safety
 
-XDB should follow an explicit safety model.
+NetbaDb should follow an explicit safety model.
 
 Potentially destructive actions must be distinguishable from planning.
 
@@ -1428,23 +1428,23 @@ Administrative tools should avoid ambiguous implicit mutation.
 
 # Compatibility Backends
 
-XDB does not need to require every application to immediately use the native XDB storage engine.
+NetbaDb does not need to require every application to immediately use the native NetbaDb storage engine.
 
 The broader compiler and tooling architecture may support:
 
 ```text
-               XDB Compiler
+               NetbaDb Compiler
                      │
           ┌──────────┼───────────┐
           │          │           │
           ▼          ▼           ▼
-        XDB       PostgreSQL    MySQL
+        NetbaDb       PostgreSQL    MySQL
       Native
 ```
 
 Additional backends may include SQLite.
 
-This allows applications to use XDB's:
+This allows applications to use NetbaDb's:
 
 ```text
 schema model
@@ -1457,13 +1457,13 @@ MCP
 
 even when production data remains in an existing database.
 
-The native XDB backend can then provide the deepest integration.
+The native NetbaDb backend can then provide the deepest integration.
 
 ---
 
 # Non-Goals
 
-XDB should not initially attempt to reproduce every feature accumulated by mature database systems.
+NetbaDb should not initially attempt to reproduce every feature accumulated by mature database systems.
 
 Initial non-goals include:
 
@@ -1485,7 +1485,7 @@ Those features should only be introduced if real workloads justify them.
 
 # Development Strategy
 
-XDB should grow vertically rather than horizontally.
+NetbaDb should grow vertically rather than horizontally.
 
 A feature is most valuable when it works through the complete stack:
 
@@ -1655,9 +1655,9 @@ Goals:
 ```text
 Go Type
    ↓
-XDB Compiler
+NetbaDb Compiler
    ↓
-XDB Database
+NetbaDb Database
    ↓
 Go Type
 ```
@@ -1671,7 +1671,7 @@ with no untyped mapping boundary.
 Focus:
 
 ```text
-xdb CLI
+netbadb CLI
 LSP
 MCP
 schema explorer
@@ -1681,7 +1681,7 @@ plan visualizer
 
 ---
 
-## Phase 7 — XDB IDE
+## Phase 7 — NetbaDb IDE
 
 Focus:
 
@@ -1704,7 +1704,7 @@ AI integration
 Focus:
 
 ```text
-xdbd
+netbadbd
 wire protocol
 authentication
 TLS
@@ -1735,7 +1735,7 @@ cluster management
 
 Database correctness must be demonstrated aggressively.
 
-XDB should use multiple complementary testing strategies.
+NetbaDb should use multiple complementary testing strategies.
 
 ## Unit Tests
 
@@ -1809,7 +1809,7 @@ The reopened database must satisfy transactional invariants.
 
 ## Differential Tests
 
-Where XDB supports semantics comparable to another mature relational database, test suites may compare results against a reference database.
+Where NetbaDb supports semantics comparable to another mature relational database, test suites may compare results against a reference database.
 
 ---
 
@@ -1834,13 +1834,13 @@ index lookup latency
 
 Then optimize the dominant cost.
 
-XDB should avoid architecture complexity introduced solely for hypothetical performance.
+NetbaDb should avoid architecture complexity introduced solely for hypothetical performance.
 
 ---
 
 # Observability
 
-Future XDB observability may expose:
+Future NetbaDb observability may expose:
 
 ```text
 active connections
@@ -1862,9 +1862,9 @@ These metrics should also be consumable programmatically by developer and AI too
 
 ---
 
-# What Makes XDB Different?
+# What Makes NetbaDb Different?
 
-XDB is not defined by a new SQL syntax.
+NetbaDb is not defined by a new SQL syntax.
 
 Its core differentiator is the integration of:
 
@@ -1902,7 +1902,7 @@ used consistently across the entire development stack.
 
 # Vision
 
-The long-term XDB development experience should look like this:
+The long-term NetbaDb development experience should look like this:
 
 ```text
 Define application types
@@ -1921,7 +1921,7 @@ IDE shows its logical plan
           ↓
 Planner selects physical plan
           ↓
-XDB executes it
+NetbaDb executes it
           ↓
 Profiler explains what happened
           ↓
@@ -1944,13 +1944,13 @@ Storage
 
 should remain traceable.
 
-XDB should make the database part of the application's type system and development environment rather than an opaque service hidden behind SQL strings.
+NetbaDb should make the database part of the application's type system and development environment rather than an opaque service hidden behind SQL strings.
 
 ---
 
 # Status
 
-XDB is an experimental project.
+NetbaDb is an experimental project.
 
 The immediate priorities are:
 
