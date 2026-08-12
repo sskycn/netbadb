@@ -44,8 +44,17 @@ impl HeapStorage {
         validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
         let path = path.as_ref();
-        let pages = PageManager::create(path)?;
-        let wal = Rc::new(RefCell::new(WalManager::create(wal_path(path))?));
+        let wal_path = wal_path(path);
+        let wal_manager = WalManager::create(&wal_path)?;
+        let pages = match PageManager::create(path) {
+            Ok(pages) => pages,
+            Err(error) => {
+                drop(wal_manager);
+                let _ = std::fs::remove_file(wal_path);
+                return Err(error);
+            }
+        };
+        let wal = Rc::new(RefCell::new(wal_manager));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let mut header = buffer.write_page(HEADER_PAGE)?;
@@ -558,6 +567,27 @@ mod tests {
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen preserved heap");
         assert_eq!(reopened.scan().expect("scan preserved heap").len(), 1);
         cleanup(&path);
+    }
+
+    #[test]
+    fn wal_create_failure_does_not_truncate_an_existing_database_path() {
+        let path = test_path("heap-wal-create-failure");
+        let original = b"existing database contents";
+        std::fs::write(&path, original).expect("write existing database");
+        let wal_path = wal_path(&path);
+        std::fs::create_dir(&wal_path).expect("create conflicting WAL directory");
+
+        assert!(matches!(
+            HeapStorage::create(&path, table()),
+            Err(StorageError::Wal(crate::WalError::Io(_)))
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved database"),
+            original
+        );
+
+        std::fs::remove_dir(wal_path).expect("remove WAL directory");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

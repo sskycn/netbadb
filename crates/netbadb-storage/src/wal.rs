@@ -81,6 +81,7 @@ pub enum WalError {
         requested: Lsn,
         written: Option<Lsn>,
     },
+    Poisoned,
 }
 
 impl fmt::Display for WalError {
@@ -169,6 +170,9 @@ impl fmt::Display for WalError {
                 "cannot flush through LSN {} when last written LSN is {written:?}",
                 requested.0
             ),
+            Self::Poisoned => formatter.write_str(
+                "WAL manager is poisoned after an append failure that could not be rolled back",
+            ),
         }
     }
 }
@@ -235,16 +239,18 @@ pub struct WalManager {
     durable_lsn: Option<Lsn>,
     last_by_txn: HashMap<TxnId, Lsn>,
     txn_states: HashMap<TxnId, WalTxnState>,
+    poisoned: bool,
     #[cfg(test)]
     fail_next_flush: bool,
+    #[cfg(test)]
+    fail_next_append_after: Option<usize>,
 }
 
 impl WalManager {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let path = path.as_ref().to_owned();
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -252,8 +258,15 @@ impl WalManager {
         header[0..4].copy_from_slice(WAL_MAGIC);
         header[4..6].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
         header[6..8].copy_from_slice(&(WAL_HEADER_SIZE as u16).to_le_bytes());
-        file.write_all(&header)?;
-        file.sync_all()?;
+        let initialization = (|| -> std::io::Result<()> {
+            file.write_all(&header)?;
+            file.sync_all()
+        })();
+        if let Err(error) = initialization {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         Ok(Self {
             file,
             path,
@@ -262,8 +275,11 @@ impl WalManager {
             durable_lsn: None,
             last_by_txn: HashMap::new(),
             txn_states: HashMap::new(),
+            poisoned: false,
             #[cfg(test)]
             fail_next_flush: false,
+            #[cfg(test)]
+            fail_next_append_after: None,
         })
     }
 
@@ -293,11 +309,17 @@ impl WalManager {
             path,
             next_lsn: Lsn(length),
             written_lsn: last_lsn,
-            durable_lsn: last_lsn,
+            // Readability after reopening does not prove that a prior owner
+            // called fsync. Conservatively require the next durability request
+            // to synchronize the file again.
+            durable_lsn: None,
             last_by_txn,
             txn_states,
+            poisoned: false,
             #[cfg(test)]
             fail_next_flush: false,
+            #[cfg(test)]
+            fail_next_append_after: None,
         })
     }
 
@@ -327,6 +349,7 @@ impl WalManager {
         prev_lsn: Option<Lsn>,
         kind: WalRecordKind,
     ) -> Result<Lsn, WalError> {
+        self.ensure_healthy()?;
         let lsn = self.next_lsn;
         let expected_prev = self.last_by_txn.get(&txn_id).copied();
         if prev_lsn != expected_prev {
@@ -345,12 +368,26 @@ impl WalManager {
             kind,
         };
         let bytes = encode_record(&record)?;
-        self.file.seek(SeekFrom::Start(lsn.0))?;
-        self.file.write_all(&bytes)?;
-        self.next_lsn = Lsn(lsn
+        let next_lsn = Lsn(lsn
             .0
             .checked_add(bytes.len() as u64)
             .ok_or(WalError::LsnOverflow)?);
+        self.file.seek(SeekFrom::Start(lsn.0))?;
+        #[cfg(test)]
+        if let Some(prefix_len) = self.fail_next_append_after.take() {
+            let prefix_len = prefix_len.min(bytes.len());
+            if let Err(error) = self.file.write_all(&bytes[..prefix_len]) {
+                return Err(self.rollback_failed_append(lsn, error));
+            }
+            return Err(self.rollback_failed_append(
+                lsn,
+                std::io::Error::other("injected partial WAL append failure"),
+            ));
+        }
+        if let Err(error) = self.file.write_all(&bytes) {
+            return Err(self.rollback_failed_append(lsn, error));
+        }
+        self.next_lsn = next_lsn;
         self.written_lsn = Some(lsn);
         self.last_by_txn.insert(txn_id, lsn);
         self.txn_states.insert(
@@ -365,6 +402,7 @@ impl WalManager {
     }
 
     pub fn flush_through(&mut self, lsn: Lsn) -> Result<(), WalError> {
+        self.ensure_healthy()?;
         if self.durable_lsn.is_some_and(|durable| durable >= lsn) {
             return Ok(());
         }
@@ -386,10 +424,12 @@ impl WalManager {
     }
 
     pub fn scan(&mut self) -> Result<Vec<WalRecord>, WalError> {
+        self.ensure_healthy()?;
         scan_file(&mut self.file)
     }
 
     pub fn close(mut self) -> Result<(), WalError> {
+        self.ensure_healthy()?;
         if let Some(written) = self.written_lsn {
             self.flush_through(written)?;
         }
@@ -399,6 +439,25 @@ impl WalManager {
     #[cfg(test)]
     pub(crate) fn inject_flush_failure(&mut self) {
         self.fail_next_flush = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_partial_append_failure(&mut self, after_bytes: usize) {
+        self.fail_next_append_after = Some(after_bytes);
+    }
+
+    fn rollback_failed_append(&mut self, lsn: Lsn, append_error: std::io::Error) -> WalError {
+        if self.file.set_len(lsn.0).is_err() || self.file.seek(SeekFrom::Start(lsn.0)).is_err() {
+            self.poisoned = true;
+        }
+        WalError::Io(append_error)
+    }
+
+    fn ensure_healthy(&self) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        Ok(())
     }
 }
 
@@ -745,6 +804,14 @@ mod tests {
         assert_eq!(records[0].prev_lsn, None);
         assert_eq!(records[1].prev_lsn, Some(begin));
         assert_eq!(records[2].prev_lsn, Some(update));
+        assert_eq!(reopened.durable_lsn(), None);
+        reopened.inject_flush_failure();
+        assert!(matches!(
+            reopened.flush_through(commit),
+            Err(WalError::Io(_))
+        ));
+        assert_eq!(reopened.durable_lsn(), None);
+        reopened.flush_through(commit).expect("resync reopened WAL");
         assert_eq!(reopened.durable_lsn(), Some(commit));
         let WalRecordKind::PageUpdate {
             page_id,
@@ -864,6 +931,40 @@ mod tests {
             WalManager::open(&path),
             Err(WalError::InvalidPageImage { image: "after", .. })
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn partial_append_failure_is_truncated_before_the_next_record() {
+        let path = test_path("wal-partial-append");
+        let mut wal = WalManager::create(&path).expect("create WAL");
+        let begin = wal
+            .append(TxnId(1), None, WalRecordKind::Begin)
+            .expect("append begin");
+        let before = Page::new(PageId(1), PageType::Heap);
+        let mut after = before.clone();
+        after.insert_record(b"row").expect("insert record");
+        let update_lsn = wal.next_lsn();
+        after.set_page_lsn(update_lsn);
+        wal.inject_partial_append_failure(100);
+
+        assert!(matches!(
+            wal.append(
+                TxnId(1),
+                Some(begin),
+                super::page_update_kind(&before, &after),
+            ),
+            Err(WalError::Io(_))
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("read WAL length").len(),
+            update_lsn.0
+        );
+        wal.append(TxnId(1), Some(begin), WalRecordKind::Abort)
+            .expect("append abort after rollback");
+        let records = wal.scan().expect("scan repaired WAL");
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[1].kind, WalRecordKind::Abort));
         let _ = std::fs::remove_file(path);
     }
 

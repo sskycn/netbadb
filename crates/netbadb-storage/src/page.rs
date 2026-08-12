@@ -356,17 +356,24 @@ pub struct PageManager {
 
 impl PageManager {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = path.as_ref().to_owned();
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(&path)?;
         // NBPG is the legacy experimental container header. It is intentionally
         // kept unchanged; versioned page headers live in data pages.
-        file.write_all(FILE_MAGIC)?;
-        file.write_all(&[0; PAGE_SIZE - FILE_MAGIC.len()])?;
-        file.sync_all()?;
+        let initialization = (|| -> std::io::Result<()> {
+            file.write_all(FILE_MAGIC)?;
+            file.write_all(&[0; PAGE_SIZE - FILE_MAGIC.len()])?;
+            file.sync_all()
+        })();
+        if let Err(error) = initialization {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error.into());
+        }
         Ok(Self {
             file,
             page_count: 1,

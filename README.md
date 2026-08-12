@@ -154,6 +154,8 @@ rather than guessed or migrated. Files created by the pre-Foundation
 sequential `HEAP` page prototype are likewise not migrated.
 
 Each database file has a retained sibling WAL named `<database>-wal`.
+Creation uses create-new semantics and refuses to overwrite either an existing
+database file or an existing WAL path.
 `Database::insert` runs as an implicit transaction. Call
 `begin_transaction`, `insert_in`, and `Transaction::commit` when several
 inserts must share one WAL chain. A successful commit means its commit record
