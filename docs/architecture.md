@@ -8,22 +8,21 @@ tables, columns, physical types, semantic types, nullability, keys, and
 relationships. The core consumes that representation and does not inspect Go
 types or Rust application structs.
 
-The current crate graph is:
+In this graph, `A -> B` means A depends on B. The current crate graph is:
 
 ```text
-netbadb-types
-├── netbadb-schema
-├── netbadb-rel
-├── netbadb-parser
-│   └── netbadb-hir ──┐
-└────────────────────┼── netbadb-compiler
-                     │
-netbadb-schema ──────┘
-
-netbadb-rel ──► netbadb-planner
-netbadb-schema + netbadb-types ──► netbadb-storage
-netbadb-planner + netbadb-rel + netbadb-storage ──► netbadb-executor
-compiler + planner + executor + storage ──► netbadb-core
+netbadb-schema -> netbadb-types
+netbadb-hir -> netbadb-parser + netbadb-schema + netbadb-types
+netbadb-rel -> netbadb-types
+netbadb-compiler -> netbadb-hir + netbadb-parser + netbadb-rel
+                    + netbadb-schema + netbadb-types
+netbadb-planner -> netbadb-rel + netbadb-types
+netbadb-storage -> netbadb-schema + netbadb-types
+netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
+                    + netbadb-types
+netbadb-core -> compiler + planner + executor + storage + schema + types
+netbadb-sdk -> netbadb-core + netbadb-executor + netbadb-schema
+               + netbadb-types
 ```
 
 No lower layer depends on a higher layer. In particular, storage does not

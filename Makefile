@@ -1,4 +1,6 @@
-.PHONY: fmt fmt-check check clippy test
+MSRV := 1.85.0
+
+.PHONY: fmt fmt-check check clippy test msrv-check
 
 fmt:
 	cargo fmt --all
@@ -14,3 +16,6 @@ clippy:
 
 test:
 	cargo test --workspace
+
+msrv-check:
+	cargo +$(MSRV) check --workspace --all-targets

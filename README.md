@@ -96,17 +96,19 @@ netbadb/
 └── tests/
 ```
 
-The dependency direction is acyclic:
+In the dependency graph below, `A -> B` means that crate A depends on crate B.
+The direction is acyclic:
 
 ```text
-types ──► schema
-types ──► rel ──► planner
-parser ──► hir ──► compiler ──► planner
-schema ──► hir / compiler
-schema + types ──► storage
-planner + rel + storage ──► executor
-compiler + planner + executor + storage ──► core
-core ──► Rust SDK
+schema -> types
+hir -> parser + schema + types
+rel -> types
+compiler -> hir + parser + rel + schema + types
+planner -> rel + types
+storage -> schema + types
+executor -> planner + rel + storage + types
+core -> compiler + planner + executor + storage + schema + types
+Rust SDK -> core + executor + schema + types
 ```
 
 Storage has no dependency on the planner or executor. The executor consumes a
@@ -152,13 +154,16 @@ versioned and language-neutral before the Go client is generated around it.
 
 ## Development
 
-Install a stable Rust toolchain with `rustfmt` and `clippy`, then run:
+The repository pins Rust 1.97.1 with `rustfmt` and `clippy` in
+`rust-toolchain.toml`; rustup installs it automatically when needed. The
+workspace MSRV is Rust 1.85.0. Run:
 
 ```bash
-cargo fmt --check
-cargo check --workspace
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo +1.85.0 check --workspace --all-targets
 ```
 
 Convenience targets are available through `make`:
@@ -168,6 +173,7 @@ make fmt-check
 make check
 make clippy
 make test
+make msrv-check
 ```
 
 The Go SDK notes are under [`sdk/go`](sdk/go/README.md). Once executable Go
