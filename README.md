@@ -1,8 +1,8 @@
-# NetbaDb
+# NetbaDB
 
-**NetbaDb is a typed relational database built for application development.**
+**NetbaDB is a typed relational database built for application development.**
 
-NetbaDb combines a relational database engine, a typed query compiler, application-native schema semantics, developer tooling, and AI-friendly interfaces into one coherent system.
+NetbaDB combines a relational database engine, a typed query compiler, application-native schema semantics, developer tooling, and AI-friendly interfaces into one coherent system.
 
 Its goal is not merely to execute SQL.
 
@@ -26,13 +26,13 @@ Typed Result
 
 understandable, verifiable, inspectable, and safe.
 
-> NetbaDb is currently under active design and development.
+> NetbaDB is currently under active design and development.
 >
 > Features described as roadmap items are architectural goals and should not be considered implemented until explicitly marked otherwise.
 
 ---
 
-## Why NetbaDb?
+## Why NetbaDB?
 
 Traditional application database stacks usually contain several independently evolving layers:
 
@@ -62,7 +62,7 @@ Typical problems include:
 * query planners that application tooling cannot understand;
 * AI tools operating on SQL strings without enough semantic context.
 
-NetbaDb is designed around a different model:
+NetbaDB is designed around a different model:
 
 ```text
 Application
@@ -73,9 +73,9 @@ Typed Query Compiler
     ↓
 Relational IR
     ↓
-NetbaDb Planner
+NetbaDB Planner
     ↓
-NetbaDb Execution Engine
+NetbaDB Execution Engine
 ```
 
 Types, relations, parameters, result shapes, source locations, and query plans remain explicit throughout the pipeline.
@@ -86,7 +86,7 @@ Types, relations, parameters, result shapes, source locations, and query plans r
 
 ## 1. Types are semantic
 
-NetbaDb distinguishes between types that have the same physical representation but different meanings.
+NetbaDB distinguishes between types that have the same physical representation but different meanings.
 
 For example:
 
@@ -105,7 +105,7 @@ UserID != TeamID
 
 This makes it possible to detect mistakes such as comparing unrelated identifiers before query execution.
 
-NetbaDb therefore distinguishes between:
+NetbaDB therefore distinguishes between:
 
 ```text
 Physical Type
@@ -121,7 +121,7 @@ rather than reducing everything to a primitive SQL type as early as possible.
 
 ## 2. Queries are compiled
 
-NetbaDb treats queries as programs.
+NetbaDB treats queries as programs.
 
 The intended compiler pipeline is:
 
@@ -159,7 +159,7 @@ Query execution should never depend on a template engine reverse-engineering the
 
 ## 3. Relational algebra is the core
 
-NetbaDb uses a typed relational intermediate representation as the semantic boundary between query languages and the execution engine.
+NetbaDB uses a typed relational intermediate representation as the semantic boundary between query languages and the execution engine.
 
 Conceptually:
 
@@ -208,7 +208,7 @@ AI tooling
 
 ## 4. Correctness before cleverness
 
-NetbaDb should prefer a simple, obviously correct plan over a sophisticated optimization whose semantic safety is unclear.
+NetbaDB should prefer a simple, obviously correct plan over a sophisticated optimization whose semantic safety is unclear.
 
 Logical optimizations may include:
 
@@ -252,11 +252,11 @@ A query should be explainable from source code all the way to storage access.
 
 ## 6. Tooling and database semantics share one model
 
-NetbaDb is designed so that the following components do not independently reimplement database semantics:
+NetbaDB is designed so that the following components do not independently reimplement database semantics:
 
 ```text
-NetbaDb Server
-NetbaDb CLI
+NetbaDB Server
+NetbaDB CLI
 Language Server
 IDE
 SDK
@@ -276,7 +276,7 @@ The long-term architecture is:
 
 ```text
                         ┌─────────────────┐
-                        │     NetbaDb IDE     │
+                        │     NetbaDB IDE     │
                         └────────┬────────┘
                                  │
                      ┌───────────┴───────────┐
@@ -285,7 +285,7 @@ The long-term architecture is:
                      └───────────┬───────────┘
                                  │
                     ┌────────────▼────────────┐
-                    │      NetbaDb Compiler       │
+                    │      NetbaDB Compiler       │
                     ├─────────────────────────┤
                     │ Parser                  │
                     │ Resolver                │
@@ -297,7 +297,7 @@ The long-term architecture is:
                     └────────────┬────────────┘
                                  │
                     ┌────────────▼────────────┐
-                    │      NetbaDb Planner        │
+                    │      NetbaDB Planner        │
                     ├─────────────────────────┤
                     │ Statistics              │
                     │ Access Path Selection   │
@@ -307,7 +307,7 @@ The long-term architecture is:
                     └────────────┬────────────┘
                                  │
                     ┌────────────▼────────────┐
-                    │      NetbaDb Executor       │
+                    │      NetbaDB Executor       │
                     ├─────────────────────────┤
                     │ Scan                    │
                     │ Filter                  │
@@ -398,7 +398,7 @@ The architectural boundaries should not.
 
 # Storage Engine
 
-The first NetbaDb storage engine is intended to prioritize:
+The first NetbaDB storage engine is intended to prioritize:
 
 ```text
 single node
@@ -509,7 +509,7 @@ The implementation should not commit to unnecessary complexity before workload r
 
 A database must remain correct when the process or machine fails at arbitrary points.
 
-NetbaDb therefore treats crash recovery as a core storage requirement rather than a later reliability feature.
+NetbaDB therefore treats crash recovery as a core storage requirement rather than a later reliability feature.
 
 The long-term recovery architecture includes:
 
@@ -528,7 +528,7 @@ A committed transaction must not depend on all modified data pages already havin
 
 # Catalog
 
-NetbaDb maintains a system catalog describing database objects.
+NetbaDB maintains a system catalog describing database objects.
 
 Conceptually:
 
@@ -546,7 +546,7 @@ Catalog
 └── Functions
 ```
 
-Unlike a conventional relational catalog, NetbaDb may preserve application-level semantic type information.
+Unlike a conventional relational catalog, NetbaDB may preserve application-level semantic type information.
 
 For example:
 
@@ -606,7 +606,7 @@ This allows higher-level queries to describe relationships without allowing arbi
 
 # Query Language
 
-NetbaDb is intended to support relational queries through a typed query language.
+NetbaDB is intended to support relational queries through a typed query language.
 
 SQL compatibility may also be provided where useful.
 
@@ -714,7 +714,7 @@ before execution begins.
 
 # Nominal Types
 
-Nominal typing is an important NetbaDb design goal.
+Nominal typing is an important NetbaDB design goal.
 
 Consider:
 
@@ -811,7 +811,7 @@ cost estimates
 
 # Query Optimization
 
-NetbaDb separates optimization into two categories.
+NetbaDB separates optimization into two categories.
 
 ## Logical optimization
 
@@ -843,7 +843,7 @@ The optimizer should remain deterministic and inspectable wherever practical.
 
 # EXPLAIN
 
-NetbaDb aims to make query plans easy to inspect.
+NetbaDB aims to make query plans easy to inspect.
 
 Conceptually:
 
@@ -887,7 +887,7 @@ memory
 
 # Prepared Plans
 
-Because NetbaDb controls both the compiler and database execution model, application queries may eventually be represented as typed prepared plans rather than raw SQL text.
+Because NetbaDB controls both the compiler and database execution model, application queries may eventually be represented as typed prepared plans rather than raw SQL text.
 
 Conceptually:
 
@@ -897,7 +897,7 @@ Application
 Query ID
 + Typed Parameters
     ↓
-Prepared NetbaDb Plan
+Prepared NetbaDB Plan
     ↓
 Execution
 ```
@@ -918,7 +918,7 @@ This can eliminate repeated parsing and reduce runtime query/schema mismatch.
 
 # Go Integration
 
-Go is the initial first-class application language for NetbaDb.
+Go is the initial first-class application language for NetbaDB.
 
 A future Go API may look conceptually like:
 
@@ -945,9 +945,9 @@ Application code should not need to manually reconstruct this information from S
 
 ---
 
-# NetbaDb and Repository Generation
+# NetbaDB and Repository Generation
 
-NetbaDb can work with repository-oriented application architectures.
+NetbaDB can work with repository-oriented application architectures.
 
 For example:
 
@@ -970,20 +970,20 @@ result shape matches
 result Go type matches
 ```
 
-The generated implementation then becomes a thin adapter over a compiled NetbaDb operation.
+The generated implementation then becomes a thin adapter over a compiled NetbaDB operation.
 
 ---
 
 # Schema Frontends
 
-NetbaDb should not permanently couple its internal schema model to one programming language.
+NetbaDB should not permanently couple its internal schema model to one programming language.
 
 The long-term architecture is:
 
 ```text
 Go Schema ───────┐
                  │
-NetbaDb Schema ──────┼──► Canonical Schema IR
+NetbaDB Schema ──────┼──► Canonical Schema IR
                  │
 Future Frontend ─┘
 ```
@@ -1038,7 +1038,7 @@ online migration planning
 
 ---
 
-# NetbaDb CLI
+# NetbaDB CLI
 
 The command-line interface is expected to become the primary low-level administrative and development tool.
 
@@ -1076,16 +1076,16 @@ Exact commands remain subject to implementation.
 
 ---
 
-# NetbaDb Server
+# NetbaDB Server
 
-NetbaDb may operate in multiple modes.
+NetbaDB may operate in multiple modes.
 
 ## Embedded
 
 ```text
 Application
     │
-    └── NetbaDb Engine
+    └── NetbaDB Engine
           │
         app.netbadb
 ```
@@ -1108,7 +1108,7 @@ Roadmap:
 ```text
 Application
     │
- NetbaDb Protocol
+ NetbaDB Protocol
     │
    netbadbd
     │
@@ -1128,23 +1128,23 @@ administration
 
 ---
 
-# NetbaDb IDE
+# NetbaDB IDE
 
-NetbaDb is intended to have a database-aware development environment.
+NetbaDB is intended to have a database-aware development environment.
 
 The IDE should not merely wrap a text editor.
 
-Its purpose is to visualize and expose NetbaDb semantics.
+Its purpose is to visualize and expose NetbaDB semantics.
 
 Conceptually:
 
 ```text
 ┌─────────────────────────────────────────────────────┐
-│                     NetbaDb IDE                         │
+│                     NetbaDB IDE                         │
 ├───────────────┬──────────────────────┬──────────────┤
 │ Project       │ Editor               │ Inspector    │
 │               │                      │              │
-│ Tables        │ Go / NetbaDb Query       │ Types        │
+│ Tables        │ Go / NetbaDB Query       │ Types        │
 │ Relations     │                      │ Parameters   │
 │ Repositories  │                      │ Result       │
 │ Queries       │                      │ Plan         │
@@ -1251,7 +1251,7 @@ output columns
 
 # Diagnostics
 
-Diagnostics are a first-class NetbaDb API.
+Diagnostics are a first-class NetbaDB API.
 
 Every compiler or database development error should ideally contain:
 
@@ -1268,7 +1268,7 @@ optional help
 Example:
 
 ```text
-error[NetbaDb3204]:
+error[NetbaDB3204]:
 
 cannot compare UserID with TeamID
 
@@ -1300,7 +1300,7 @@ AI
 
 # Language Server
 
-NetbaDb language tooling should provide:
+NetbaDB language tooling should provide:
 
 ```text
 diagnostics
@@ -1323,7 +1323,7 @@ It should never maintain a parallel semantic implementation.
 
 # MCP
 
-NetbaDb is intended to expose structured development and database capabilities to AI systems through MCP.
+NetbaDB is intended to expose structured development and database capabilities to AI systems through MCP.
 
 Possible read-only operations include:
 
@@ -1356,7 +1356,7 @@ AI access must respect workspace, database, transaction, and permission boundari
 
 # AI-Native Development
 
-Because NetbaDb exposes structured semantics rather than only source text, AI tools can reason about:
+Because NetbaDB exposes structured semantics rather than only source text, AI tools can reason about:
 
 ```text
 schema
@@ -1396,7 +1396,7 @@ and answer based on database state rather than guessing from SQL text alone.
 
 # Safety
 
-NetbaDb should follow an explicit safety model.
+NetbaDB should follow an explicit safety model.
 
 Potentially destructive actions must be distinguishable from planning.
 
@@ -1428,23 +1428,23 @@ Administrative tools should avoid ambiguous implicit mutation.
 
 # Compatibility Backends
 
-NetbaDb does not need to require every application to immediately use the native NetbaDb storage engine.
+NetbaDB does not need to require every application to immediately use the native NetbaDB storage engine.
 
 The broader compiler and tooling architecture may support:
 
 ```text
-               NetbaDb Compiler
+               NetbaDB Compiler
                      │
           ┌──────────┼───────────┐
           │          │           │
           ▼          ▼           ▼
-        NetbaDb       PostgreSQL    MySQL
+        NetbaDB       PostgreSQL    MySQL
       Native
 ```
 
 Additional backends may include SQLite.
 
-This allows applications to use NetbaDb's:
+This allows applications to use NetbaDB's:
 
 ```text
 schema model
@@ -1457,13 +1457,13 @@ MCP
 
 even when production data remains in an existing database.
 
-The native NetbaDb backend can then provide the deepest integration.
+The native NetbaDB backend can then provide the deepest integration.
 
 ---
 
 # Non-Goals
 
-NetbaDb should not initially attempt to reproduce every feature accumulated by mature database systems.
+NetbaDB should not initially attempt to reproduce every feature accumulated by mature database systems.
 
 Initial non-goals include:
 
@@ -1485,7 +1485,7 @@ Those features should only be introduced if real workloads justify them.
 
 # Development Strategy
 
-NetbaDb should grow vertically rather than horizontally.
+NetbaDB should grow vertically rather than horizontally.
 
 A feature is most valuable when it works through the complete stack:
 
@@ -1655,9 +1655,9 @@ Goals:
 ```text
 Go Type
    ↓
-NetbaDb Compiler
+NetbaDB Compiler
    ↓
-NetbaDb Database
+NetbaDB Database
    ↓
 Go Type
 ```
@@ -1681,7 +1681,7 @@ plan visualizer
 
 ---
 
-## Phase 7 — NetbaDb IDE
+## Phase 7 — NetbaDB IDE
 
 Focus:
 
@@ -1735,7 +1735,7 @@ cluster management
 
 Database correctness must be demonstrated aggressively.
 
-NetbaDb should use multiple complementary testing strategies.
+NetbaDB should use multiple complementary testing strategies.
 
 ## Unit Tests
 
@@ -1809,7 +1809,7 @@ The reopened database must satisfy transactional invariants.
 
 ## Differential Tests
 
-Where NetbaDb supports semantics comparable to another mature relational database, test suites may compare results against a reference database.
+Where NetbaDB supports semantics comparable to another mature relational database, test suites may compare results against a reference database.
 
 ---
 
@@ -1834,13 +1834,13 @@ index lookup latency
 
 Then optimize the dominant cost.
 
-NetbaDb should avoid architecture complexity introduced solely for hypothetical performance.
+NetbaDB should avoid architecture complexity introduced solely for hypothetical performance.
 
 ---
 
 # Observability
 
-Future NetbaDb observability may expose:
+Future NetbaDB observability may expose:
 
 ```text
 active connections
@@ -1862,9 +1862,9 @@ These metrics should also be consumable programmatically by developer and AI too
 
 ---
 
-# What Makes NetbaDb Different?
+# What Makes NetbaDB Different?
 
-NetbaDb is not defined by a new SQL syntax.
+NetbaDB is not defined by a new SQL syntax.
 
 Its core differentiator is the integration of:
 
@@ -1902,7 +1902,7 @@ used consistently across the entire development stack.
 
 # Vision
 
-The long-term NetbaDb development experience should look like this:
+The long-term NetbaDB development experience should look like this:
 
 ```text
 Define application types
@@ -1921,7 +1921,7 @@ IDE shows its logical plan
           ↓
 Planner selects physical plan
           ↓
-NetbaDb executes it
+NetbaDB executes it
           ↓
 Profiler explains what happened
           ↓
@@ -1944,13 +1944,13 @@ Storage
 
 should remain traceable.
 
-NetbaDb should make the database part of the application's type system and development environment rather than an opaque service hidden behind SQL strings.
+NetbaDB should make the database part of the application's type system and development environment rather than an opaque service hidden behind SQL strings.
 
 ---
 
 # Status
 
-NetbaDb is an experimental project.
+NetbaDB is an experimental project.
 
 The immediate priorities are:
 
