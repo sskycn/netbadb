@@ -40,7 +40,7 @@ The current embedded path is synchronous:
 ```text
 Rust Schema API
     ↓
-SELECT / FROM / WHERE / LIMIT parser
+SELECT / FROM / WHERE / LIMIT + typed NULL expression parser
     ↓
 Typed HIR
     ↓
@@ -131,9 +131,10 @@ The current code genuinely supports:
 - Canonical schema definitions with nullable, primary-key, physical, and
   semantic type metadata;
 - parser support for `SELECT`, `FROM`, `WHERE`, `LIMIT`, wildcard projection,
-  boolean operators, comparisons, integer/string/boolean literals, and
-  parentheses;
-- name resolution and type checking with nominal semantic types;
+  `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`,
+  integer/string/boolean/NULL literals, and parentheses;
+- name resolution and expression type checking with nominal semantic types and
+  explicit nullability;
 - typed HIR and logical relational IR;
 - sequential-scan physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
@@ -151,7 +152,8 @@ The current code genuinely supports:
 - explicit quiescent checkpoints with bounded two-generation WAL retention,
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - insert, scan, file reopen, row encoding, and row decoding;
-- executor support for filter, projection, and limit;
+- executor support for filter, projection, limit, SQL three-valued boolean
+  logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
 The experimental storage format uses versioned slotted pages. Phase 2A bumps
@@ -231,9 +233,15 @@ successful explicit `close` rejects every outstanding transaction and then
 WAL-orders and flushes dirty pages; WAL recycling remains an explicit
 checkpoint operation.
 
-The query language is a deliberately small native subset, not a claim of SQL
-compatibility. `NULL` parsing is recognized but rejected by the current type
-checker because null semantics are not implemented yet.
+The query language is a deliberately small native subset, not a claim of full
+SQL compatibility. Database NULL is represented explicitly as
+`ScalarValue::Null`, while Rust `Option` remains reserved for absent clauses or
+metadata. Untyped NULL literals receive a semantic type from their expression
+context. Comparisons with NULL evaluate to UNKNOWN; `IS NULL` and `IS NOT NULL`
+are the explicit tests. `AND`, `OR`, and `NOT` use SQL three-valued logic, and a
+`WHERE` filter retains only TRUE, rejecting both FALSE and UNKNOWN. Heap writes
+independently enforce schema nullability, including through the embedded insert
+API.
 
 ## Go and protocol strategy
 
@@ -293,11 +301,14 @@ The implementation sequence is intentionally vertical:
    crash-during-rollback safety.
 6. Checkpoint + WAL Lifecycle (Phase 2C) — quiescent recovery boundaries,
    monotonic logical LSNs, and crash-safe bounded WAL generation recycling.
-7. Query execution — richer expressions, null semantics, and write commands.
-8. Indexing — B+Tree and planner access-path selection.
-9. Server mode — protocol, sessions, and `netbadbd`.
-10. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-11. Advanced optimization — statistics, cost model, joins, and rewrite rules.
+7. Typed expressions + NULL semantics (Phase 3A) — contextual NULL typing,
+   expression nullability, three-valued logic, and explicit NULL predicates.
+8. Typed DML (Phase 3B) — insert/update/delete plans, affected-row results, and
+   transaction integration.
+9. Indexing — B+Tree and planner access-path selection.
+10. Server mode — protocol, sessions, and `netbadbd`.
+11. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+12. Advanced optimization — statistics, cost model, joins, and rewrite rules.
 
 Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
 are roadmap items, not implemented features in this slice.

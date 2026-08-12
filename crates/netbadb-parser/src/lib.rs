@@ -43,6 +43,16 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    Unary {
+        operator: UnaryOp,
+        expression: Box<Expr>,
+        span: Span,
+    },
+    IsNull {
+        expression: Box<Expr>,
+        negated: bool,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +73,11 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +106,8 @@ enum TokenKind {
     Limit,
     And,
     Or,
+    Is,
+    Not,
     True,
     False,
     Null,
@@ -228,6 +245,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "LIMIT" => TokenKind::Limit,
                     "AND" => TokenKind::And,
                     "OR" => TokenKind::Or,
+                    "IS" => TokenKind::Is,
+                    "NOT" => TokenKind::Not,
                     "TRUE" => TokenKind::True,
                     "FALSE" => TokenKind::False,
                     "NULL" => TokenKind::Null,
@@ -318,8 +337,36 @@ impl Parser {
     }
 
     fn parse_expr(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
-        let mut left = self.parse_primary()?;
-        while let Some((operator, precedence)) = self.current_binary_operator() {
+        let mut left = self.parse_prefix()?;
+        loop {
+            if self.matches(&TokenKind::Is) {
+                const IS_PRECEDENCE: u8 = 4;
+                if IS_PRECEDENCE < minimum_precedence {
+                    break;
+                }
+                self.position += 1;
+                let negated = if self.matches(&TokenKind::Not) {
+                    self.position += 1;
+                    true
+                } else {
+                    false
+                };
+                let null = self.expect_simple(TokenKind::Null)?;
+                let span = Span {
+                    start: expr_span(&left).start,
+                    end: null.span.end,
+                };
+                left = Expr::IsNull {
+                    expression: Box::new(left),
+                    negated,
+                    span,
+                };
+                continue;
+            }
+
+            let Some((operator, precedence)) = self.current_binary_operator() else {
+                break;
+            };
             if precedence < minimum_precedence {
                 break;
             }
@@ -338,6 +385,25 @@ impl Parser {
             };
         }
         Ok(left)
+    }
+
+    fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
+        if self.matches(&TokenKind::Not) {
+            let start = self.current().span.start;
+            self.position += 1;
+            // Comparisons and IS NULL bind inside NOT; AND and OR do not.
+            let expression = self.parse_expr(3)?;
+            let span = Span {
+                start,
+                end: expr_span(&expression).end,
+            };
+            return Ok(Expr::Unary {
+                operator: UnaryOp::Not,
+                expression: Box::new(expression),
+                span,
+            });
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -396,12 +462,12 @@ impl Parser {
         match self.current().kind {
             TokenKind::Or => Some((BinaryOp::Or, 1)),
             TokenKind::And => Some((BinaryOp::And, 2)),
-            TokenKind::Eq => Some((BinaryOp::Eq, 3)),
-            TokenKind::NotEq => Some((BinaryOp::NotEq, 3)),
-            TokenKind::Lt => Some((BinaryOp::Lt, 3)),
-            TokenKind::LtEq => Some((BinaryOp::LtEq, 3)),
-            TokenKind::Gt => Some((BinaryOp::Gt, 3)),
-            TokenKind::GtEq => Some((BinaryOp::GtEq, 3)),
+            TokenKind::Eq => Some((BinaryOp::Eq, 4)),
+            TokenKind::NotEq => Some((BinaryOp::NotEq, 4)),
+            TokenKind::Lt => Some((BinaryOp::Lt, 4)),
+            TokenKind::LtEq => Some((BinaryOp::LtEq, 4)),
+            TokenKind::Gt => Some((BinaryOp::Gt, 4)),
+            TokenKind::GtEq => Some((BinaryOp::GtEq, 4)),
             _ => None,
         }
     }
@@ -449,13 +515,16 @@ impl Parser {
 fn expr_span(expression: &Expr) -> Span {
     match expression {
         Expr::Column(column) => column.span,
-        Expr::Literal { span, .. } | Expr::Binary { span, .. } => *span,
+        Expr::Literal { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::IsNull { span, .. } => *span,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, Literal, SelectItem, parse};
+    use super::{BinaryOp, Expr, Literal, SelectItem, UnaryOp, parse};
 
     #[test]
     fn parses_the_initial_query_subset() {
@@ -489,5 +558,87 @@ mod tests {
             parse("SELECT 名 FROM users").expect_err("unsupported identifier should be rejected");
         assert_eq!(error.span.start, 7);
         assert_eq!(error.span.end, 10);
+    }
+
+    #[test]
+    fn parses_null_predicates_and_not() {
+        let null = parse("SELECT id FROM users WHERE NULL").expect("parse");
+        assert!(matches!(
+            null.selection,
+            Some(Expr::Literal {
+                value: Literal::Null,
+                ..
+            })
+        ));
+
+        let is_null = parse("SELECT id FROM users WHERE nickname IS NULL").expect("parse");
+        assert!(matches!(
+            is_null.selection,
+            Some(Expr::IsNull { negated: false, .. })
+        ));
+
+        let is_not_null = parse("SELECT id FROM users WHERE nickname IS NOT NULL").expect("parse");
+        assert!(matches!(
+            is_not_null.selection,
+            Some(Expr::IsNull { negated: true, .. })
+        ));
+
+        let not = parse("SELECT id FROM users WHERE NOT active").expect("parse");
+        assert!(matches!(
+            not.selection,
+            Some(Expr::Unary {
+                operator: UnaryOp::Not,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn not_wraps_comparison_before_and() {
+        let query =
+            parse("SELECT id FROM users WHERE NOT id = 1 AND active = true").expect("parse");
+        let Some(Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            ..
+        }) = query.selection
+        else {
+            panic!("expected top-level AND");
+        };
+        assert!(matches!(
+            *left,
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                expression,
+                ..
+            } if matches!(*expression, Expr::Binary { operator: BinaryOp::Eq, .. })
+        ));
+    }
+
+    #[test]
+    fn parentheses_override_boolean_precedence() {
+        let query =
+            parse("SELECT id FROM users WHERE NOT (active OR false) AND true").expect("parse");
+        assert!(matches!(
+            query.selection,
+            Some(Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                ..
+            }) if matches!(*left, Expr::Unary { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_is_and_not_syntax_report_spans() {
+        for source in [
+            "SELECT id FROM users WHERE id IS",
+            "SELECT id FROM users WHERE id IS truth",
+            "SELECT id FROM users WHERE NOT",
+        ] {
+            let error = parse(source).expect_err("invalid expression");
+            assert!(error.span.start <= error.span.end);
+            assert!(error.span.end <= source.len());
+        }
     }
 }

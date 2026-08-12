@@ -577,7 +577,7 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 
 #[cfg(test)]
 mod tests {
-    use super::HeapStorage;
+    use super::{HeapStorage, decode_row, encode_row};
     use crate::{
         BufferError, CheckpointError, PageManager, SlotId, StorageError, TransactionError,
         TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
@@ -643,6 +643,79 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].1.is_empty());
         cleanup(&path);
+    }
+
+    #[test]
+    fn nullable_row_round_trips_after_close_and_reopen() {
+        let path = test_path("heap-null-round-trip");
+        let nullable_table = TableDef::new(
+            TableId(3),
+            "profiles",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "nickname",
+                    TypeSpec::Physical(PhysicalType::Text),
+                )
+                .nullable(true),
+            ],
+        );
+        let mut storage = HeapStorage::create(&path, nullable_table.clone()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Null])
+            .expect("insert NULL");
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, nullable_table).expect("reopen heap");
+        assert_eq!(
+            reopened.scan().expect("scan")[0].1,
+            vec![ScalarValue::Int64(1), ScalarValue::Null]
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn non_nullable_column_rejects_null_at_the_heap_boundary() {
+        let path = test_path("heap-null-rejected");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        assert!(matches!(
+            storage.insert(&[ScalarValue::Null, ScalarValue::Text("Ada".into())]),
+            Err(StorageError::NullNotAllowed { column }) if column == "id"
+        ));
+        assert!(storage.scan().expect("scan").is_empty());
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn null_scalar_boundaries_and_truncated_following_values_are_checked() {
+        let nullable_table = TableDef::new(
+            TableId(4),
+            "profiles",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "nickname",
+                    TypeSpec::Physical(PhysicalType::Text),
+                )
+                .nullable(true),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+            ],
+        );
+        let encoded = encode_row(&[ScalarValue::Null, ScalarValue::Bool(true)]).expect("encode");
+        assert_eq!(
+            decode_row(&encoded, &nullable_table).expect("decode"),
+            vec![ScalarValue::Null, ScalarValue::Bool(true)]
+        );
+        assert!(matches!(
+            decode_row(&encoded[..1], &nullable_table),
+            Err(StorageError::Codec(crate::CodecError::MissingScalarTag))
+        ));
     }
 
     #[test]

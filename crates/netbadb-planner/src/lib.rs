@@ -75,6 +75,7 @@ mod tests {
             column_id: ColumnId(1),
             name: "id".into(),
             data_type: SemanticType::physical(PhysicalType::Int64),
+            nullable: false,
         };
         let logical = LogicalPlan::Scan {
             table_id: TableId(1),

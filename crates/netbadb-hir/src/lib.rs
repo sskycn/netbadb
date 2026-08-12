@@ -3,9 +3,11 @@
 use std::error::Error;
 use std::fmt;
 
-use netbadb_parser::{BinaryOp as AstBinaryOp, Expr as AstExpr, Ident, Literal, Query, Span};
+use netbadb_parser::{
+    BinaryOp as AstBinaryOp, Expr as AstExpr, Ident, Literal, Query, Span, UnaryOp as AstUnaryOp,
+};
 use netbadb_schema::{Schema, TableDef};
-use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
+use netbadb_types::{ColumnId, ExprType, PhysicalType, ScalarValue, SemanticType, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
@@ -13,6 +15,7 @@ pub struct ColumnRef {
     pub column_id: ColumnId,
     pub name: String,
     pub data_type: SemanticType,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,10 +30,15 @@ pub enum BinaryOp {
     Or,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Not,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedExpr {
     pub kind: TypedExprKind,
-    pub data_type: SemanticType,
+    pub expr_type: ExprType,
     pub span: Span,
 }
 
@@ -42,6 +50,14 @@ pub enum TypedExprKind {
         operator: BinaryOp,
         left: Box<TypedExpr>,
         right: Box<TypedExpr>,
+    },
+    Unary {
+        operator: UnaryOp,
+        expression: Box<TypedExpr>,
+    },
+    IsNull {
+        expression: Box<TypedExpr>,
+        negated: bool,
     },
 }
 
@@ -75,7 +91,7 @@ pub enum HirError {
         right: SemanticType,
         span: Span,
     },
-    UnsupportedLiteral {
+    CannotInferNullType {
         span: Span,
     },
 }
@@ -93,8 +109,8 @@ impl fmt::Display for HirError {
             Self::IncompatibleComparison { left, right, .. } => {
                 write!(formatter, "cannot compare {left} with {right}")
             }
-            Self::UnsupportedLiteral { .. } => {
-                formatter.write_str("NULL is not typed in the initial query subset")
+            Self::CannotInferNullType { .. } => {
+                formatter.write_str("cannot infer the type of NULL in this expression")
             }
         }
     }
@@ -130,17 +146,17 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
             Ok::<_, HirError>(columns)
         })?;
 
+    let bool_type = SemanticType::physical(PhysicalType::Bool);
     let selection = query
         .selection
         .as_ref()
-        .map(|expression| lower_expr(table, expression))
+        .map(|expression| lower_expr(table, expression, Some(&bool_type)))
         .transpose()?;
     if let Some(predicate) = &selection {
-        let bool_type = SemanticType::physical(PhysicalType::Bool);
-        if predicate.data_type != bool_type {
+        if predicate.expr_type.data_type != bool_type {
             return Err(HirError::TypeMismatch {
                 expected: bool_type,
-                actual: predicate.data_type.clone(),
+                actual: predicate.expr_type.data_type.clone(),
                 span: predicate.span,
             });
         }
@@ -155,35 +171,54 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
     })
 }
 
-fn lower_expr(table: &TableDef, expression: &AstExpr) -> Result<TypedExpr, HirError> {
+fn lower_expr(
+    table: &TableDef,
+    expression: &AstExpr,
+    expected: Option<&SemanticType>,
+) -> Result<TypedExpr, HirError> {
     match expression {
         AstExpr::Column(column) => {
             let resolved = resolve_column(table, column)?;
             Ok(TypedExpr {
-                data_type: resolved.data_type.clone(),
+                expr_type: ExprType {
+                    data_type: resolved.data_type.clone(),
+                    nullable: resolved.nullable,
+                },
                 kind: TypedExprKind::Column(resolved),
                 span: column.span,
             })
         }
         AstExpr::Literal { value, span } => {
-            let (value, data_type) = match value {
+            let (value, data_type, nullable) = match value {
                 Literal::Bool(value) => (
                     ScalarValue::Bool(*value),
                     SemanticType::physical(PhysicalType::Bool),
+                    false,
                 ),
                 Literal::Int(value) => (
                     ScalarValue::Int64(*value),
                     SemanticType::physical(PhysicalType::Int64),
+                    false,
                 ),
                 Literal::String(value) => (
                     ScalarValue::Text(value.clone()),
                     SemanticType::physical(PhysicalType::Text),
+                    false,
                 ),
-                Literal::Null => return Err(HirError::UnsupportedLiteral { span: *span }),
+                Literal::Null => (
+                    ScalarValue::Null,
+                    expected
+                        .cloned()
+                        .ok_or(HirError::CannotInferNullType { span: *span })?,
+                    true,
+                ),
             };
             Ok(TypedExpr {
                 kind: TypedExprKind::Literal(value),
-                data_type,
+                expr_type: ExprType {
+                    data_type,
+                    nullable,
+                },
                 span: *span,
             })
         }
@@ -193,26 +228,15 @@ fn lower_expr(table: &TableDef, expression: &AstExpr) -> Result<TypedExpr, HirEr
             right,
             span,
         } => {
-            let left = lower_expr(table, left)?;
-            let right = lower_expr(table, right)?;
             let operator = lower_operator(*operator);
             let bool_type = SemanticType::physical(PhysicalType::Bool);
-            match operator {
+            let (left, right) = match operator {
                 BinaryOp::And | BinaryOp::Or => {
-                    if left.data_type != bool_type {
-                        return Err(HirError::TypeMismatch {
-                            expected: bool_type.clone(),
-                            actual: left.data_type,
-                            span: left.span,
-                        });
-                    }
-                    if right.data_type != bool_type {
-                        return Err(HirError::TypeMismatch {
-                            expected: bool_type.clone(),
-                            actual: right.data_type,
-                            span: right.span,
-                        });
-                    }
+                    let left = lower_expr(table, left, Some(&bool_type))?;
+                    let right = lower_expr(table, right, Some(&bool_type))?;
+                    require_type(&left, &bool_type)?;
+                    require_type(&right, &bool_type)?;
+                    (left, right)
                 }
                 BinaryOp::Eq
                 | BinaryOp::NotEq
@@ -220,25 +244,134 @@ fn lower_expr(table: &TableDef, expression: &AstExpr) -> Result<TypedExpr, HirEr
                 | BinaryOp::LtEq
                 | BinaryOp::Gt
                 | BinaryOp::GtEq => {
-                    if !left.data_type.is_compatible_with(&right.data_type) {
+                    let (left, right) = lower_comparison_operands(table, left, right)?;
+                    if !left
+                        .expr_type
+                        .data_type
+                        .is_compatible_with(&right.expr_type.data_type)
+                    {
                         return Err(HirError::IncompatibleComparison {
-                            left: left.data_type,
-                            right: right.data_type,
+                            left: left.expr_type.data_type,
+                            right: right.expr_type.data_type,
                             span: *span,
                         });
                     }
+                    (left, right)
                 }
-            }
+            };
+            let nullable = left.expr_type.nullable || right.expr_type.nullable;
             Ok(TypedExpr {
                 kind: TypedExprKind::Binary {
                     operator,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
-                data_type: bool_type,
+                expr_type: ExprType {
+                    data_type: bool_type,
+                    nullable,
+                },
                 span: *span,
             })
         }
+        AstExpr::Unary {
+            operator,
+            expression,
+            span,
+        } => {
+            let bool_type = SemanticType::physical(PhysicalType::Bool);
+            let expression = lower_expr(table, expression, Some(&bool_type))?;
+            require_type(&expression, &bool_type)?;
+            Ok(TypedExpr {
+                expr_type: ExprType {
+                    data_type: bool_type,
+                    nullable: expression.expr_type.nullable,
+                },
+                kind: TypedExprKind::Unary {
+                    operator: match operator {
+                        AstUnaryOp::Not => UnaryOp::Not,
+                    },
+                    expression: Box::new(expression),
+                },
+                span: *span,
+            })
+        }
+        AstExpr::IsNull {
+            expression,
+            negated,
+            span,
+        } => {
+            let bool_type = SemanticType::physical(PhysicalType::Bool);
+            let expression = if is_null_literal(expression) {
+                lower_expr(table, expression, Some(&bool_type))?
+            } else {
+                lower_expr(table, expression, None)?
+            };
+            Ok(TypedExpr {
+                expr_type: ExprType {
+                    data_type: bool_type,
+                    nullable: false,
+                },
+                kind: TypedExprKind::IsNull {
+                    expression: Box::new(expression),
+                    negated: *negated,
+                },
+                span: *span,
+            })
+        }
+    }
+}
+
+fn lower_comparison_operands(
+    table: &TableDef,
+    left: &AstExpr,
+    right: &AstExpr,
+) -> Result<(TypedExpr, TypedExpr), HirError> {
+    match (is_null_literal(left), is_null_literal(right)) {
+        (true, true) => {
+            // With no operand context, BOOL is a deterministic carrier type;
+            // both runtime values remain NULL and comparison yields UNKNOWN.
+            let carrier = SemanticType::physical(PhysicalType::Bool);
+            Ok((
+                lower_expr(table, left, Some(&carrier))?,
+                lower_expr(table, right, Some(&carrier))?,
+            ))
+        }
+        (true, false) => {
+            let right = lower_expr(table, right, None)?;
+            let left = lower_expr(table, left, Some(&right.expr_type.data_type))?;
+            Ok((left, right))
+        }
+        (false, true) => {
+            let left = lower_expr(table, left, None)?;
+            let right = lower_expr(table, right, Some(&left.expr_type.data_type))?;
+            Ok((left, right))
+        }
+        (false, false) => Ok((
+            lower_expr(table, left, None)?,
+            lower_expr(table, right, None)?,
+        )),
+    }
+}
+
+fn is_null_literal(expression: &AstExpr) -> bool {
+    matches!(
+        expression,
+        AstExpr::Literal {
+            value: Literal::Null,
+            ..
+        }
+    )
+}
+
+fn require_type(expression: &TypedExpr, expected: &SemanticType) -> Result<(), HirError> {
+    if expression.expr_type.data_type == *expected {
+        Ok(())
+    } else {
+        Err(HirError::TypeMismatch {
+            expected: expected.clone(),
+            actual: expression.expr_type.data_type.clone(),
+            span: expression.span,
+        })
     }
 }
 
@@ -259,6 +392,7 @@ fn column_ref(table_id: TableId, column: &netbadb_schema::ColumnDef) -> ColumnRe
         column_id: column.id,
         name: column.name.clone(),
         data_type: column.semantic_type(),
+        nullable: column.nullable,
     }
 }
 
@@ -277,7 +411,7 @@ fn lower_operator(operator: AstBinaryOp) -> BinaryOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{HirError, TypedExprKind, lower_query};
+    use super::{HirError, TypedExprKind, UnaryOp, lower_query};
     use netbadb_parser::parse;
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
@@ -300,6 +434,21 @@ mod tests {
                     ColumnId(3),
                     "active",
                     TypeSpec::Physical(PhysicalType::Bool),
+                )
+                .nullable(true),
+                ColumnDef::new(
+                    ColumnId(4),
+                    "nickname",
+                    TypeSpec::Physical(PhysicalType::Text),
+                )
+                .nullable(true),
+                ColumnDef::new(
+                    ColumnId(5),
+                    "team_id",
+                    TypeSpec::Semantic {
+                        name: "TeamId".into(),
+                        physical: PhysicalType::UInt64,
+                    },
                 ),
             ],
         )])
@@ -321,5 +470,93 @@ mod tests {
         let query = parse("SELECT id FROM users WHERE id = 1").expect("parse");
         let error = lower_query(&schema(), &query).expect_err("raw integer cannot be a UserId");
         assert!(matches!(error, HirError::IncompatibleComparison { .. }));
+    }
+
+    #[test]
+    fn contextually_types_null_and_tracks_expression_nullability() {
+        let query = parse("SELECT nickname FROM users WHERE nickname = NULL").expect("parse");
+        let typed = lower_query(&schema(), &query).expect("lower");
+        let predicate = typed.selection.expect("predicate");
+        assert_eq!(predicate.expr_type.data_type.physical, PhysicalType::Bool);
+        assert!(predicate.expr_type.nullable);
+        let TypedExprKind::Binary { right, .. } = predicate.kind else {
+            panic!("expected comparison");
+        };
+        assert_eq!(right.expr_type.data_type.physical, PhysicalType::Text);
+        assert!(right.expr_type.nullable);
+    }
+
+    #[test]
+    fn is_null_is_non_nullable_and_not_preserves_nullability() {
+        let is_null = lower_query(
+            &schema(),
+            &parse("SELECT id FROM users WHERE nickname IS NULL").expect("parse"),
+        )
+        .expect("lower")
+        .selection
+        .expect("predicate");
+        assert!(!is_null.expr_type.nullable);
+        assert!(matches!(is_null.kind, TypedExprKind::IsNull { .. }));
+
+        let not = lower_query(
+            &schema(),
+            &parse("SELECT id FROM users WHERE NOT active").expect("parse"),
+        )
+        .expect("lower")
+        .selection
+        .expect("predicate");
+        assert!(not.expr_type.nullable);
+        assert!(matches!(
+            not.kind,
+            TypedExprKind::Unary {
+                operator: UnaryOp::Not,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn where_null_is_a_nullable_boolean() {
+        let typed = lower_query(
+            &schema(),
+            &parse("SELECT id FROM users WHERE NULL").expect("parse"),
+        )
+        .expect("lower");
+        let predicate = typed.selection.expect("predicate");
+        assert_eq!(predicate.expr_type.data_type.physical, PhysicalType::Bool);
+        assert!(predicate.expr_type.nullable);
+    }
+
+    #[test]
+    fn null_does_not_weaken_nominal_comparisons() {
+        let null_query = parse("SELECT id FROM users WHERE id = NULL").expect("parse");
+        assert!(lower_query(&schema(), &null_query).is_ok());
+
+        let incompatible = parse("SELECT id FROM users WHERE id = team_id").expect("parse");
+        assert!(matches!(
+            lower_query(&schema(), &incompatible),
+            Err(HirError::IncompatibleComparison { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_columns_non_boolean_where_and_invalid_not() {
+        let unknown = parse("SELECT id FROM users WHERE missing = 1").expect("parse");
+        assert!(matches!(
+            lower_query(&schema(), &unknown),
+            Err(HirError::UnknownColumn { .. })
+        ));
+
+        let non_boolean = parse("SELECT id FROM users WHERE nickname").expect("parse");
+        assert!(matches!(
+            lower_query(&schema(), &non_boolean),
+            Err(HirError::TypeMismatch { .. })
+        ));
+
+        let invalid_not = parse("SELECT id FROM users WHERE NOT nickname").expect("parse");
+        assert!(matches!(
+            lower_query(&schema(), &invalid_not),
+            Err(HirError::TypeMismatch { .. })
+        ));
     }
 }

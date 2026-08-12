@@ -5,7 +5,7 @@ use std::fmt;
 
 use netbadb_hir::{ColumnRef as HirColumnRef, HirError, TypedExpr, TypedExprKind, TypedQuery};
 use netbadb_parser::{ParseError, parse};
-use netbadb_rel::{BinaryOp, ColumnRef, Expr, LogicalPlan};
+use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, UnaryOp};
 use netbadb_schema::Schema;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +96,7 @@ fn column_ref(table_id: netbadb_types::TableId, column: &netbadb_schema::ColumnD
         column_id: column.id,
         name: column.name.clone(),
         data_type: column.semantic_type(),
+        nullable: column.nullable,
     }
 }
 
@@ -105,18 +106,19 @@ fn column_ref_from_hir(column: &HirColumnRef) -> ColumnRef {
         column_id: column.column_id,
         name: column.name.clone(),
         data_type: column.data_type.clone(),
+        nullable: column.nullable,
     }
 }
 
 fn lower_expr(expression: &TypedExpr) -> Expr {
-    match &expression.kind {
-        TypedExprKind::Column(column) => Expr::Column(column_ref_from_hir(column)),
-        TypedExprKind::Literal(value) => Expr::Literal(value.clone()),
+    let kind = match &expression.kind {
+        TypedExprKind::Column(column) => ExprKind::Column(column_ref_from_hir(column)),
+        TypedExprKind::Literal(value) => ExprKind::Literal(value.clone()),
         TypedExprKind::Binary {
             operator,
             left,
             right,
-        } => Expr::Binary {
+        } => ExprKind::Binary {
             operator: match operator {
                 netbadb_hir::BinaryOp::Eq => BinaryOp::Eq,
                 netbadb_hir::BinaryOp::NotEq => BinaryOp::NotEq,
@@ -130,12 +132,33 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
             left: Box::new(lower_expr(left)),
             right: Box::new(lower_expr(right)),
         },
+        TypedExprKind::Unary {
+            operator,
+            expression,
+        } => ExprKind::Unary {
+            operator: match operator {
+                netbadb_hir::UnaryOp::Not => UnaryOp::Not,
+            },
+            expression: Box::new(lower_expr(expression)),
+        },
+        TypedExprKind::IsNull {
+            expression,
+            negated,
+        } => ExprKind::IsNull {
+            expression: Box::new(lower_expr(expression)),
+            negated: *negated,
+        },
+    };
+    Expr {
+        kind,
+        expr_type: expression.expr_type.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::compile;
+    use netbadb_rel::{ExprKind, LogicalPlan};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -153,5 +176,35 @@ mod tests {
             compile(&schema, "SELECT name FROM users WHERE id >= 2 LIMIT 1").expect("compile");
         assert_eq!(compiled.logical_plan.output_columns().len(), 1);
         assert_eq!(compiled.hir.limit, Some(1));
+    }
+
+    #[test]
+    fn preserves_null_predicates_in_logical_ir() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "nickname",
+                    TypeSpec::Physical(PhysicalType::Text),
+                )
+                .nullable(true),
+            ],
+        )]);
+        let compiled =
+            compile(&schema, "SELECT id FROM users WHERE nickname IS NOT NULL").expect("compile");
+        let LogicalPlan::Project { input, .. } = compiled.logical_plan else {
+            panic!("expected project");
+        };
+        let LogicalPlan::Filter { predicate, .. } = *input else {
+            panic!("expected filter");
+        };
+        assert!(matches!(
+            predicate.kind,
+            ExprKind::IsNull { negated: true, .. }
+        ));
+        assert!(!predicate.expr_type.nullable);
     }
 }

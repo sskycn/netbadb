@@ -1,6 +1,6 @@
 //! Typed logical relational IR shared by the compiler, planner, and executor.
 
-use netbadb_types::{ColumnId, ScalarValue, SemanticType, TableId};
+use netbadb_types::{ColumnId, ExprType, ScalarValue, SemanticType, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
@@ -8,6 +8,7 @@ pub struct ColumnRef {
     pub column_id: ColumnId,
     pub name: String,
     pub data_type: SemanticType,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,14 +23,33 @@ pub enum BinaryOp {
     Or,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Not,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub expr_type: ExprType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExprKind {
     Column(ColumnRef),
     Literal(ScalarValue),
     Binary {
         operator: BinaryOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    Unary {
+        operator: UnaryOp,
+        expression: Box<Expr>,
+    },
+    IsNull {
+        expression: Box<Expr>,
+        negated: bool,
     },
 }
 

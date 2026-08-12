@@ -61,6 +61,48 @@ long-lived references to pages, frames, or tuples, leaving room for future
 buffer management and concurrent execution without spreading lifetimes across
 the whole system.
 
+## Typed expressions and NULL
+
+Database NULL is an explicit `ScalarValue::Null`; it is not represented by
+Rust `Option<ScalarValue>`. `Option` continues to mean that syntax or metadata,
+such as a `WHERE` clause, is absent. Parser NULL literals begin untyped. HIR
+assigns them a semantic type from the surrounding boolean or comparison
+context without granting NULL an arbitrary nominal identity.
+
+HIR and relational expressions carry an expression type consisting of:
+
+```text
+SemanticType + nullable
+```
+
+Column nullability originates in Canonical Schema IR. Literal values other than
+NULL are non-nullable. A comparison is nullable when either operand is
+nullable, boolean `AND`/`OR`/`NOT` preserve possible UNKNOWN results, and
+`IS NULL`/`IS NOT NULL` always produce a non-null BOOL. This expression
+nullability is distinct from schema nullability: a nullable column may contain
+NULL, while an expression over that column may or may not return NULL.
+
+`IS NULL` and `IS NOT NULL` remain explicit AST, HIR, and relational nodes;
+they are not lowered to equality with NULL. Ordinary `=`, `!=`, `<`, `<=`,
+`>`, and `>=` comparisons return UNKNOWN if either operand is NULL, including
+`NULL = NULL`. Nominal compatibility checks still apply to non-NULL operands,
+so contextual NULL typing cannot make `UserId = TeamId` legal.
+
+The executor centralizes boolean conversion as three truth values:
+
+```text
+Bool(true)  → TRUE
+Bool(false) → FALSE
+NULL        → UNKNOWN
+```
+
+`AND`, `OR`, and `NOT` use the SQL three-valued truth tables. A filter keeps a
+row only when its predicate is TRUE; FALSE and UNKNOWN both reject the row.
+Storage's existing scalar tag for NULL round-trips through heap pages, buffers,
+the database file, and reopen. `HeapStorage` validates every embedded write and
+returns `StorageError::NullNotAllowed` when NULL targets a non-nullable column,
+independently of query compilation.
+
 ## Storage boundary
 
 The synchronous storage path is now:

@@ -99,12 +99,27 @@ the next mutation would add another persistent state machine. Phase 2C remains
 synchronous and explicit: there is no fuzzy checkpoint, background policy, WAL
 archive, replication, or PITR.
 
-## Phase 3 — Query execution
+## Phase 3A — Typed Expressions + NULL Semantics (complete)
 
-- richer expression typing and null semantics;
-- insert/update/delete plans;
-- joins, sort, aggregate, and explain output;
-- deterministic execution and result-shape diagnostics.
+- explicit `ScalarValue::Null` across storage and query execution;
+- contextual typing of NULL literals plus expression nullability metadata;
+- explicit `IS NULL`, `IS NOT NULL`, and unary `NOT` nodes through AST, typed
+  HIR, relational IR, planning, and execution;
+- complete SQL three-valued `AND`, `OR`, and `NOT` semantics;
+- UNKNOWN-producing comparisons with NULL and TRUE-only `WHERE` filtering;
+- preserved nominal type safety and independent heap-level NOT NULL
+  enforcement;
+- nullable row codec, close/reopen, parser, HIR, compiler, truth-table, and
+  embedded end-to-end coverage.
+
+Phase 3A does not expand projection to arbitrary expressions and does not add
+DML, joins, sorting, aggregation, indexes, or explain output.
+
+## Phase 3B — Typed DML
+
+- typed INSERT, UPDATE, and DELETE plans;
+- affected-row results;
+- transaction integration for explicit and implicit DML.
 
 ## Phase 4 — Indexing and planning
 

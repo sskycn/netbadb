@@ -94,6 +94,13 @@ impl fmt::Display for SemanticType {
     }
 }
 
+/// A resolved expression's semantic type and whether it may evaluate to NULL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExprType {
+    pub data_type: SemanticType,
+    pub nullable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalarValue {
     Bool(bool),
