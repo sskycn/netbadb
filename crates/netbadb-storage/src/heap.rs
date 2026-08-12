@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_tuple_bounds_are_rejected_during_scan() {
+    fn corrupted_page_bounds_are_rejected_during_recovery_open() {
         let path = test_path("heap-corrupt-slot");
         let mut storage = HeapStorage::create(&path, table()).expect("create heap");
         storage
@@ -677,9 +677,8 @@ mod tests {
         pages.sync().expect("sync corrupt slot");
         drop(pages);
 
-        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         assert!(matches!(
-            reopened.scan(),
+            HeapStorage::open(&path, table()),
             Err(StorageError::Page(
                 crate::PageError::RecordOutOfBounds { .. }
             ))

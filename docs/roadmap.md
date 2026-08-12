@@ -55,6 +55,8 @@ this format version.
 - structurally valid incomplete-final-record truncation with hard errors for
   corruption, incompatible versions, broken chains, and malformed images;
 - deterministic restart, idempotency, and interrupted redo/undo tests.
+- single-writer enforcement and rejection of committed updates that depend on
+  earlier loser contents in retained WAL.
 
 Phase 2B intentionally has no MVCC, isolation, checkpoints, WAL recycling,
 bounded WAL growth, or runtime full rollback guarantee.

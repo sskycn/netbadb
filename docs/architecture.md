@@ -212,12 +212,22 @@ Undo losers in descending global LSN
 
 Analysis builds transaction lastLSNs and an LSN lookup. Redo repeats history,
 including loser updates: an existing page is skipped only when its pageLSN is
-at least the update LSN; otherwise the validated after-image is installed. A
-new page must be exactly the next trailing page, so WAL cannot create page-ID
-gaps. Undo follows each loser's prevLSN chain through a max-heap and installs
-PageUpdate before-images in global descending LSN order. A zero before-image
-means the loser allocated that page, which can only remove the exact trailing
-page. The page file is synchronized before recovery returns.
+at least the update LSN, and that pageLSN is trusted only after full page
+validation; otherwise the validated after-image is installed. A new page must
+be exactly the next trailing page, so WAL cannot create page-ID gaps. Undo
+follows each loser's prevLSN chain through a max-heap and installs PageUpdate
+before-images in global descending LSN order. A zero before-image means the
+loser allocated that page, which can only remove the exact trailing page. The
+page file is synchronized before recovery returns.
+
+Because full-page after-images can include another transaction's uncommitted
+contents, the runtime currently permits one active writer. A dirty transaction
+that aborts or is dropped, or a dropped commit-pending transaction, makes
+further writes require reopen/recovery. Analysis also rejects a retained WAL
+where a committed page update follows a loser update to the same page, before
+recovery writes any page. This keeps unsupported dirty write dependencies from
+being mistaken for successful recovery; it is a single-writer safety invariant,
+not general isolation.
 
 The algorithm intentionally has no compensation log records. A crash during
 redo or undo is handled by rerunning complete repeat-history redo followed by
@@ -227,8 +237,9 @@ recovery page write.
 
 At startup only an incomplete final record whose available header is
 structurally valid may be truncated at EOF. Corrupt middle records, invalid
-magic/version/type/length fields, broken transaction chains, and malformed
-before/after page images fail open with typed errors.
+magic/version/type/length fields, invalid transaction state, broken transaction
+chains, malformed data pages, and malformed before/after page images fail open
+with typed errors.
 
 Phase 2B supplies crash recovery, not transaction visibility or isolation.
 `abort` appends an abort record; its physical effects are removed during

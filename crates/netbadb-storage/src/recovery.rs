@@ -33,6 +33,13 @@ pub enum RecoveryError {
         page_id: PageId,
         page_count: u64,
     },
+    CommittedUpdateDependsOnLoser {
+        page_id: PageId,
+        loser_txn: TxnId,
+        loser_lsn: Lsn,
+        winner_txn: TxnId,
+        winner_lsn: Lsn,
+    },
     MissingRecord {
         txn_id: TxnId,
         lsn: Lsn,
@@ -71,6 +78,17 @@ impl fmt::Display for RecoveryError {
                 formatter,
                 "loser-created page {} is not trailing in the {}-page file",
                 page_id.0, page_count
+            ),
+            Self::CommittedUpdateDependsOnLoser {
+                page_id,
+                loser_txn,
+                loser_lsn,
+                winner_txn,
+                winner_lsn,
+            } => write!(
+                formatter,
+                "committed transaction {} update at {} depends on loser transaction {} update at {} on page {}",
+                winner_txn.0, winner_lsn.0, loser_txn.0, loser_lsn.0, page_id.0
             ),
             Self::MissingRecord { txn_id, lsn } => write!(
                 formatter,
@@ -164,6 +182,7 @@ impl RecoveryManager {
             .filter(|(_, transaction)| !transaction.committed)
             .map(|(txn_id, transaction)| (*txn_id, transaction.last_lsn))
             .collect::<Vec<_>>();
+        Self::validate_no_winner_depends_on_loser(records, &transactions)?;
         Self::validate_page_topology(records, &record_by_lsn, &losers, pages.page_count())?;
         let mut report = RecoveryReport {
             records_scanned: records.len(),
@@ -200,11 +219,7 @@ impl RecoveryManager {
                 if current.bytes().iter().all(|byte| *byte == 0) {
                     None
                 } else {
-                    // The fixed-width pageLSN is safe to inspect before full
-                    // page decoding. A skipped malformed page remains
-                    // malformed and is rejected by its normal consumer; a
-                    // lower-LSN page is reconstructed from validated WAL.
-                    current.raw_page_lsn_for_recovery()
+                    current.page_lsn()?
                 }
             };
             if current_lsn.is_some_and(|page_lsn| page_lsn >= record.lsn) {
@@ -359,6 +374,35 @@ impl RecoveryManager {
             }
             if let Some(prev_lsn) = record.prev_lsn {
                 undo.push((prev_lsn.0, txn_id.0));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_no_winner_depends_on_loser(
+        records: &[WalRecord],
+        transactions: &HashMap<TxnId, TransactionAnalysis>,
+    ) -> Result<(), RecoveryError> {
+        let mut latest_loser_by_page = HashMap::<PageId, (TxnId, Lsn)>::new();
+        for record in records {
+            let WalRecordKind::PageUpdate { page_id, .. } = &record.kind else {
+                continue;
+            };
+            let committed = transactions
+                .get(&record.txn_id)
+                .is_some_and(|transaction| transaction.committed);
+            if committed {
+                if let Some((loser_txn, loser_lsn)) = latest_loser_by_page.get(page_id).copied() {
+                    return Err(RecoveryError::CommittedUpdateDependsOnLoser {
+                        page_id: *page_id,
+                        loser_txn,
+                        loser_lsn,
+                        winner_txn: record.txn_id,
+                        winner_lsn: record.lsn,
+                    });
+                }
+            } else {
+                latest_loser_by_page.insert(*page_id, (record.txn_id, record.lsn));
             }
         }
         Ok(())
@@ -557,6 +601,40 @@ mod tests {
         assert_eq!(report.committed_transactions, 1);
         assert_eq!(report.undone_transactions, 1);
         assert_eq!(read_page(&path, PageId(1)), winner_page);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_rejects_a_winner_that_observed_an_earlier_loser_update() {
+        let (path, original) = create_fixture("loser-before-winner");
+        let mut wal = WalManager::open(wal_path(&path)).expect("open WAL");
+        let loser_begin = wal
+            .append(TxnId(12), None, WalRecordKind::Begin)
+            .expect("loser begin");
+        let (loser_update, loser_page) =
+            append_update(&mut wal, TxnId(12), loser_begin, &original, b"loser");
+        let winner_begin = wal
+            .append(TxnId(13), None, WalRecordKind::Begin)
+            .expect("winner begin");
+        let (winner_update, _) =
+            append_update(&mut wal, TxnId(13), winner_begin, &loser_page, b"winner");
+        let commit = wal
+            .append(TxnId(13), Some(winner_update), WalRecordKind::Commit)
+            .expect("winner commit");
+        wal.flush_through(commit.max(loser_update))
+            .expect("flush WAL");
+        drop(wal);
+
+        assert!(matches!(
+            recover(&path),
+            Err(RecoveryError::CommittedUpdateDependsOnLoser {
+                page_id: PageId(1),
+                loser_txn: TxnId(12),
+                winner_txn: TxnId(13),
+                ..
+            })
+        ));
+        assert_eq!(read_page(&path, PageId(1)), original);
         cleanup(&path);
     }
 

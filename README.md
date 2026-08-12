@@ -164,6 +164,14 @@ inserts must share one WAL chain. A successful commit means its commit record
 has reached durable storage; heap pages may remain buffered until eviction,
 `flush`, or `close`.
 
+The current full-page-image model permits one active writer. A committed or
+read-only transaction releases the writer slot. If a transaction with page
+updates is aborted or dropped, or a commit-pending handle is dropped after a
+flush failure, later writes are rejected until the database is reopened and
+startup recovery resolves the WAL state. This prevents a later committed
+after-image from depending on uncommitted page contents, which cannot be
+separated safely without isolation or a finer-grained log format.
+
 `Database::open` and `HeapStorage::open` synchronously recover before exposing
 the buffer pool. Recovery classifies transactions with a Commit record as
 winners, redoes all page updates in ascending LSN order while using pageLSN to
@@ -175,7 +183,8 @@ repeats the same history and then applies the same deterministic undo.
 An incomplete final WAL record caused by EOF is discarded at the recovery
 boundary only when its available header bytes are structurally valid. Invalid
 magic, versions, tags, lengths, transaction chains, middle records, and page
-images remain hard errors. The retained WAL currently has no checksum.
+images remain hard errors. Existing data pages are fully validated before
+their pageLSN can suppress redo. The retained WAL currently has no checksum.
 
 Phase 2B does not provide MVCC, isolation, checkpoints, WAL recycling, bounded
 WAL growth, or general runtime physical rollback. `abort` records intent;

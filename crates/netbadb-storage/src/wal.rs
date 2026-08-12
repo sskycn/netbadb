@@ -641,6 +641,12 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
                 actual: prev_lsn,
             });
         }
+        validate_transaction_tag_sequence(
+            lsn,
+            txn_id,
+            txn_states.get(&txn_id).copied(),
+            record_type,
+        )?;
 
         if u64::from(total_len) > remaining {
             if tail_policy == TailPolicy::AllowIncompleteFinalRecord {
@@ -683,7 +689,6 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
             }
             tag => return Err(WalError::UnknownRecordType { lsn, tag }),
         };
-        validate_transaction_sequence(lsn, txn_id, txn_states.get(&txn_id).copied(), &kind)?;
         validate_page_images(lsn, &kind)?;
         txn_last_lsn.insert(txn_id, lsn);
         txn_states.insert(
@@ -775,17 +780,7 @@ fn validate_partial_record_header(
         let txn_id = TxnId(read_u64(bytes, 24));
         let record_type = bytes[6];
         let state = txn_states.get(&txn_id).copied();
-        let valid = matches!(
-            (state, record_type),
-            (None, 1) | (Some(WalTxnState::Active), 2..=4)
-        );
-        if !valid {
-            return Err(WalError::InvalidTransactionSequence {
-                lsn,
-                txn_id,
-                record_type,
-            });
-        }
+        validate_transaction_tag_sequence(lsn, txn_id, state, record_type)?;
         let available_prev = bytes.len().saturating_sub(32).min(8);
         if available_prev > 0 {
             let expected = txn_last_lsn
@@ -821,18 +816,24 @@ fn validate_transaction_sequence(
     state: Option<WalTxnState>,
     kind: &WalRecordKind,
 ) -> Result<(), WalError> {
+    validate_transaction_tag_sequence(lsn, txn_id, state, kind.tag())
+}
+
+fn validate_transaction_tag_sequence(
+    lsn: Lsn,
+    txn_id: TxnId,
+    state: Option<WalTxnState>,
+    record_type: u8,
+) -> Result<(), WalError> {
     let valid = matches!(
-        (state, kind),
-        (None, WalRecordKind::Begin)
-            | (Some(WalTxnState::Active), WalRecordKind::PageUpdate { .. })
-            | (Some(WalTxnState::Active), WalRecordKind::Commit)
-            | (Some(WalTxnState::Active), WalRecordKind::Abort)
+        (state, record_type),
+        (None, 1) | (Some(WalTxnState::Active), 2..=4)
     );
     if !valid {
         return Err(WalError::InvalidTransactionSequence {
             lsn,
             txn_id,
-            record_type: kind.tag(),
+            record_type,
         });
     }
     Ok(())
@@ -1029,6 +1030,45 @@ mod tests {
         ));
         let _ = std::fs::remove_file(truncated_path);
         let _ = std::fs::remove_file(oversized_path);
+    }
+
+    #[test]
+    fn recovery_rejects_an_invalid_transaction_sequence_in_a_partial_page_update() {
+        let path = test_path("wal-invalid-partial-sequence");
+        let wal = WalManager::create(&path).expect("create WAL");
+        let lsn = wal.next_lsn();
+        drop(wal);
+
+        let mut header = [0_u8; super::RECORD_HEADER_SIZE];
+        header[0..4].copy_from_slice(super::RECORD_MAGIC);
+        header[4..6].copy_from_slice(&super::RECORD_FORMAT_VERSION.to_le_bytes());
+        header[6] = 2;
+        header[8..12].copy_from_slice(&(super::WAL_MAX_RECORD_SIZE as u32).to_le_bytes());
+        header[12..16].copy_from_slice(&(super::PAGE_UPDATE_PAYLOAD_SIZE as u32).to_le_bytes());
+        header[16..24].copy_from_slice(&lsn.0.to_le_bytes());
+        header[24..32].copy_from_slice(&999_u64.to_le_bytes());
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open WAL tail");
+        file.write_all(&header).expect("write record header");
+        file.write_all(&[0_u8; 8]).expect("write partial payload");
+        drop(file);
+        let length_before = std::fs::metadata(&path).expect("WAL metadata").len();
+
+        assert!(matches!(
+            WalManager::open_for_recovery(&path),
+            Err(WalError::InvalidTransactionSequence {
+                txn_id: TxnId(999),
+                record_type: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("WAL metadata").len(),
+            length_before
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

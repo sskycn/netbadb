@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use netbadb_types::{Lsn, TxnId};
@@ -9,6 +9,15 @@ use crate::{Page, StorageError, TransactionError, WalManager, WalRecordKind};
 pub(crate) type SharedWal = Rc<RefCell<WalManager>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterState {
+    Idle,
+    Active(TxnId),
+    RecoveryRequired,
+}
+
+type SharedWriterState = Rc<Cell<WriterState>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
     Active,
     CommitPending,
@@ -16,14 +25,16 @@ pub enum TransactionState {
     Aborted,
 }
 
-/// A synchronous transaction handle. Phase 2A makes commit durable but does
-/// not yet provide rollback, isolation, or crash recovery.
+/// A synchronous transaction handle. Transactions provide durable commit and
+/// startup recovery, but do not provide runtime rollback or isolation.
 #[derive(Debug)]
 pub struct Transaction {
     id: TxnId,
     state: TransactionState,
     last_lsn: Lsn,
     wal: SharedWal,
+    writer_state: SharedWriterState,
+    has_page_updates: bool,
 }
 
 impl Transaction {
@@ -69,6 +80,7 @@ impl Transaction {
             .map_err(|_| TransactionError::WalBusy)?
             .flush_through(commit_lsn)?;
         self.state = TransactionState::Committed;
+        self.release_writer();
         Ok(())
     }
 
@@ -81,6 +93,11 @@ impl Transaction {
             .append(self.id, Some(self.last_lsn), WalRecordKind::Abort)?;
         self.last_lsn = lsn;
         self.state = TransactionState::Aborted;
+        if self.has_page_updates {
+            self.writer_state.set(WriterState::RecoveryRequired);
+        } else {
+            self.release_writer();
+        }
         Ok(())
     }
 
@@ -118,6 +135,7 @@ impl Transaction {
         )?;
         debug_assert_eq!(actual, lsn);
         self.last_lsn = actual;
+        self.has_page_updates = true;
         Ok(actual)
     }
 
@@ -128,12 +146,31 @@ impl Transaction {
             .flush_through(lsn)?;
         Ok(())
     }
+
+    fn release_writer(&self) {
+        if self.writer_state.get() == WriterState::Active(self.id) {
+            self.writer_state.set(WriterState::Idle);
+        }
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.state == TransactionState::CommitPending
+            || (self.state == TransactionState::Active && self.has_page_updates)
+        {
+            self.writer_state.set(WriterState::RecoveryRequired);
+        } else if self.state == TransactionState::Active {
+            self.release_writer();
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct TransactionManager {
     wal: SharedWal,
     next_txn_id: TxnId,
+    writer_state: SharedWriterState,
 }
 
 impl TransactionManager {
@@ -151,10 +188,20 @@ impl TransactionManager {
         Ok(Self {
             wal,
             next_txn_id: TxnId(next),
+            writer_state: Rc::new(Cell::new(WriterState::Idle)),
         })
     }
 
     pub(crate) fn begin(&mut self) -> Result<Transaction, StorageError> {
+        match self.writer_state.get() {
+            WriterState::Idle => {}
+            WriterState::Active(txn_id) => {
+                return Err(TransactionError::WriterBusy { txn_id }.into());
+            }
+            WriterState::RecoveryRequired => {
+                return Err(TransactionError::RecoveryRequired.into());
+            }
+        }
         let id = self.next_txn_id;
         let next = id.0.checked_add(1).ok_or(TransactionError::IdExhausted)?;
         let begin_lsn = self
@@ -163,11 +210,14 @@ impl TransactionManager {
             .map_err(|_| TransactionError::WalBusy)?
             .append(id, None, WalRecordKind::Begin)?;
         self.next_txn_id = TxnId(next);
+        self.writer_state.set(WriterState::Active(id));
         Ok(Transaction {
             id,
             state: TransactionState::Active,
             last_lsn: begin_lsn,
             wal: Rc::clone(&self.wal),
+            writer_state: Rc::clone(&self.writer_state),
+            has_page_updates: false,
         })
     }
 
@@ -182,7 +232,9 @@ mod tests {
     use std::rc::Rc;
 
     use super::{TransactionManager, TransactionState};
-    use crate::{StorageError, WalManager, WalRecordKind};
+    use netbadb_types::PageId;
+
+    use crate::{Page, PageType, StorageError, TransactionError, WalManager, WalRecordKind};
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-{name}-{}-wal", std::process::id()))
@@ -237,6 +289,73 @@ mod tests {
         assert!(matches!(records[0].kind, WalRecordKind::Begin));
         assert!(matches!(records[1].kind, WalRecordKind::Abort));
         assert!(transaction.abort().is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_one_writer_can_be_active_and_commit_releases_it() {
+        let path = test_path("txn-single-writer");
+        let wal = Rc::new(RefCell::new(WalManager::create(&path).expect("create WAL")));
+        let mut manager = TransactionManager::new(Rc::clone(&wal), None).expect("manager");
+        let mut first = manager.begin().expect("begin first transaction");
+
+        assert!(matches!(
+            manager.begin(),
+            Err(StorageError::Transaction(TransactionError::WriterBusy {
+                txn_id
+            })) if txn_id == first.id()
+        ));
+        first.commit().expect("commit first transaction");
+        let second = manager.begin().expect("begin after commit");
+        drop(second);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dirty_loser_requires_recovery_before_another_writer() {
+        for (name, abort) in [("txn-dirty-abort", true), ("txn-dirty-drop", false)] {
+            let path = test_path(name);
+            let wal = Rc::new(RefCell::new(WalManager::create(&path).expect("create WAL")));
+            let mut manager = TransactionManager::new(Rc::clone(&wal), None).expect("manager");
+            let mut transaction = manager.begin().expect("begin transaction");
+            let before = Page::new(PageId(1), PageType::Heap);
+            let mut after = before.clone();
+            after.insert_record(b"dirty").expect("insert row");
+            transaction
+                .log_page_update(&before, &mut after)
+                .expect("log page update");
+            if abort {
+                transaction.abort().expect("abort transaction");
+            }
+            drop(transaction);
+
+            assert!(matches!(
+                manager.begin(),
+                Err(StorageError::Transaction(
+                    TransactionError::RecoveryRequired
+                ))
+            ));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn dropped_commit_pending_writer_requires_recovery() {
+        let path = test_path("txn-dropped-commit-pending");
+        let wal = Rc::new(RefCell::new(WalManager::create(&path).expect("create WAL")));
+        let mut manager = TransactionManager::new(Rc::clone(&wal), None).expect("manager");
+        let mut transaction = manager.begin().expect("begin transaction");
+        wal.borrow_mut().inject_flush_failure();
+        assert!(matches!(transaction.commit(), Err(StorageError::Wal(_))));
+        assert_eq!(transaction.state(), TransactionState::CommitPending);
+        drop(transaction);
+
+        assert!(matches!(
+            manager.begin(),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
         let _ = std::fs::remove_file(path);
     }
 }

@@ -244,7 +244,7 @@ impl fmt::Display for MetadataError {
 
 impl Error for MetadataError {}
 
-/// Errors raised by the Phase 2A transaction state machine.
+/// Errors raised by the transaction state machine and single-writer guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionError {
     NotActive {
@@ -253,6 +253,10 @@ pub enum TransactionError {
     },
     IdExhausted,
     WalBusy,
+    WriterBusy {
+        txn_id: netbadb_types::TxnId,
+    },
+    RecoveryRequired,
     ForeignTransaction {
         txn_id: netbadb_types::TxnId,
     },
@@ -268,6 +272,14 @@ impl fmt::Display for TransactionError {
             ),
             Self::IdExhausted => formatter.write_str("transaction ID space is exhausted"),
             Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
+            Self::WriterBusy { txn_id } => write!(
+                formatter,
+                "transaction {} is the active writer",
+                txn_id.0
+            ),
+            Self::RecoveryRequired => formatter.write_str(
+                "a transaction with page updates ended without commit; reopen the database to recover before writing again",
+            ),
             Self::ForeignTransaction { txn_id } => write!(
                 formatter,
                 "transaction {} belongs to a different database",

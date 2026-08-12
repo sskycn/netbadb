@@ -115,11 +115,6 @@ impl Page {
         Ok(self.header()?.page_lsn)
     }
 
-    pub(crate) fn raw_page_lsn_for_recovery(&self) -> Option<Lsn> {
-        let raw_page_lsn = self.read_u64(PAGE_LSN_OFFSET);
-        (raw_page_lsn != 0).then_some(Lsn(raw_page_lsn))
-    }
-
     pub(crate) fn set_page_lsn(&mut self, lsn: Lsn) {
         self.bytes[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8].copy_from_slice(&lsn.0.to_le_bytes());
     }
