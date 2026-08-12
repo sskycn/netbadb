@@ -50,7 +50,13 @@ Sequential-scan physical plan
     ↓
 Filter / projection / limit executor
     ↓
-Heap pages in a database file
+Heap
+    ↓
+Buffer pool (guards, pinning, dirty writeback)
+    ↓
+Slotted pages
+    ↓
+Page manager / database file
 ```
 
 The core does not depend on Go, a network runtime, JSON execution IR, or
@@ -85,7 +91,7 @@ netbadb/
 │   ├── netbadb-rel/         typed logical relational IR
 │   ├── netbadb-compiler/    AST → HIR → logical plan
 │   ├── netbadb-planner/     logical plan → physical plan
-│   ├── netbadb-storage/     pages, page manager, heap file
+│   ├── netbadb-storage/     slotted pages, buffer pool, page manager, heap file
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   └── netbadb-core/        native embedded database API
 ├── sdk/
@@ -129,9 +135,15 @@ The current code genuinely supports:
 - typed HIR and logical relational IR;
 - sequential-scan physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
+- versioned slotted heap pages with explicit page types and checked bounds;
+- synchronous buffer-pool guards with pinning, dirty tracking, flush, and
+  bounded eviction;
 - insert, scan, file reopen, row encoding, and row decoding;
 - executor support for filter, projection, and limit;
 - a native embedded `netbadb-core::Database` API.
+
+The experimental storage format uses versioned slotted pages. Files created by
+the pre-Foundation sequential `HEAP` page prototype are not migrated.
 
 The query language is a deliberately small native subset, not a claim of SQL
 compatibility. `NULL` parsing is recognized but rejected by the current type
@@ -184,10 +196,12 @@ client code exists, it should be tested from that module with `go test ./...`.
 The implementation sequence is intentionally vertical:
 
 1. Rust foundation — stable types, schema, parser, HIR, and relational IR.
-2. Minimal storage — database file, page manager, heap insert and scan.
-3. Query execution — richer expressions, transactions, and write commands.
-4. Indexing — B+Tree and planner access-path selection.
-5. Durability — WAL, checkpoints, and recovery.
+2. Storage Foundation — versioned slotted pages, checked page decoding,
+   bounded buffer pool, guards, dirty writeback, heap insert/scan, and reopen.
+3. Transaction + WAL Foundation — transaction lifecycle, WAL records, LSNs,
+   commit durability, checkpoints, and recovery.
+4. Query execution — richer expressions, null semantics, and write commands.
+5. Indexing — B+Tree and planner access-path selection.
 6. Server mode — protocol, sessions, and `netbadbd`.
 7. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
 8. Advanced optimization — statistics, cost model, joins, and rewrite rules.

@@ -1,6 +1,6 @@
 # NetbaDB roadmap
 
-## Phase 0 — Rust foundation (current)
+## Phase 0 — Rust foundation (complete)
 
 - Cargo workspace and dependency direction;
 - canonical IDs, physical types, semantic types, and schema metadata;
@@ -11,21 +11,29 @@
 - synchronous executor and error enums;
 - tests for parser, type checking, planning, execution, and storage round trips.
 
-## Phase 1 — Minimal storage
+## Phase 1 — Storage Foundation (complete)
 
-- database/catalog metadata beyond the single-table prototype;
-- page validation and free-page management;
-- heap insert and scan APIs for multiple tables;
-- buffer manager with IDs, pinning, dirty tracking, and flush policy;
-- integration tests for reopen and corruption detection.
+- fixed 4 KiB pages with explicit version, page type, and slotted-page bounds;
+- checked page allocation, offset arithmetic, raw page I/O, and heap metadata;
+- bounded synchronous buffer pool with guards, pin/unpin, dirty writeback,
+  flush, eviction, and pinned-page exhaustion errors;
+- heap insert and scan through the buffer boundary, including multi-page and
+  close/reopen behavior;
+- deterministic page, buffer, heap, corruption, eviction, and vertical-slice
+  tests.
 
-## Phase 2 — Transactions and durability
+The database file format remains experimental. The legacy `NBPG` container
+marker is retained, while heap metadata and data-page layouts are explicitly
+versioned. The pre-Foundation sequential `HEAP` data-page layout is not
+migrated. Dirty writeback is not WAL ordering and does not provide crash-safe
+transaction durability.
+
+## Phase 2 — Transaction + WAL Foundation (next)
 
 - transaction IDs and transaction API;
-- initial isolation model;
-- WAL and commit records;
-- checkpoints and recovery tests;
-- explicit rollback behavior.
+- transaction lifecycle and initial isolation model;
+- versioned WAL records and LSN allocation;
+- commit durability, checkpoints, recovery tests, and explicit rollback.
 
 ## Phase 3 — Query execution
 

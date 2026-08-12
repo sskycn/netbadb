@@ -17,6 +17,10 @@ id_type!(PageId, u64);
 id_type!(FrameId, u32);
 id_type!(TxnId, u64);
 
+/// A stable, explicitly sized slot identifier inside a database page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlotId(pub u16);
+
 /// A stable location of a row inside a heap page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RowId {

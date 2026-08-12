@@ -1,170 +1,156 @@
 use std::path::Path;
 
 use netbadb_schema::TableDef;
-use netbadb_types::{PageId, RowId, ScalarValue};
+use netbadb_types::{PageId, RowId, ScalarValue, SlotId};
 
-use crate::{PAGE_SIZE, Page, PageManager, StorageError, invalid_format};
+use crate::{
+    BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE,
+    Page, PageError, PageManager, PageType, SLOT_SIZE, StorageError,
+};
 
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_DATA_PAGE: PageId = PageId(1);
 const HEADER_MAGIC: &[u8; 4] = b"NBD1";
-const DATA_MAGIC: &[u8; 4] = b"HEAP";
-const HEAP_HEADER_OFFSET: usize = 16;
-const DATA_HEADER_SIZE: usize = 12;
+const HEAP_FORMAT_VERSION: u16 = 1;
+const HEAP_METADATA_OFFSET: usize = 16;
+const HEAP_VERSION_OFFSET: usize = HEAP_METADATA_OFFSET + 4;
+const HEAP_RESERVED_OFFSET: usize = HEAP_VERSION_OFFSET + 2;
+const HEAP_TABLE_ID_OFFSET: usize = HEAP_RESERVED_OFFSET + 2;
+const HEAP_COLUMN_COUNT_OFFSET: usize = HEAP_TABLE_ID_OFFSET + 8;
 
+/// Heap storage over the buffer pool. Heap code interprets pages as heap pages;
+/// the buffer pool and page manager remain generic over raw database pages.
 #[derive(Debug)]
 pub struct HeapStorage {
-    pages: PageManager,
+    buffer: BufferPool,
     table: TableDef,
 }
 
 impl HeapStorage {
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        if table.columns.len() > u16::MAX as usize {
-            return Err(invalid_format("table has more than 65535 columns"));
+        Self::create_with_buffer_pool_size(path, table, DEFAULT_BUFFER_POOL_SIZE)
+    }
+
+    pub fn create_with_buffer_pool_size(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        buffer_pool_size: usize,
+    ) -> Result<Self, StorageError> {
+        validate_table(&table)?;
+        let pages = PageManager::create(path)?;
+        let buffer = BufferPool::new(pages, buffer_pool_size)?;
+        {
+            let mut header = buffer.write_page(HEADER_PAGE)?;
+            write_heap_metadata(header.page_mut().bytes_mut(), &table);
         }
-        let mut pages = PageManager::create(path)?;
-        let mut header = pages.read_page(HEADER_PAGE)?;
-        let bytes = header.bytes_mut();
-        bytes[HEAP_HEADER_OFFSET..HEAP_HEADER_OFFSET + HEADER_MAGIC.len()]
-            .copy_from_slice(HEADER_MAGIC);
-        bytes[HEAP_HEADER_OFFSET + 4..HEAP_HEADER_OFFSET + 12]
-            .copy_from_slice(&table.id.0.to_le_bytes());
-        bytes[HEAP_HEADER_OFFSET + 12..HEAP_HEADER_OFFSET + 14]
-            .copy_from_slice(&(table.columns.len() as u16).to_le_bytes());
-        pages.write_page(&header)?;
-        let data_page = pages.allocate_page()?;
-        let data_page = initialize_data_page(data_page);
-        pages.write_page(&data_page)?;
-        pages.sync()?;
-        Ok(Self { pages, table })
+        {
+            let mut data_page = buffer.new_page()?;
+            let page_id = data_page.page_id();
+            let page = data_page.page_mut();
+            *page = Page::new(page_id, PageType::Heap);
+        }
+        buffer.flush_all()?;
+        Ok(Self { buffer, table })
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        let mut pages = PageManager::open(path)?;
+        Self::open_with_buffer_pool_size(path, table, DEFAULT_BUFFER_POOL_SIZE)
+    }
+
+    pub fn open_with_buffer_pool_size(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        buffer_pool_size: usize,
+    ) -> Result<Self, StorageError> {
+        validate_table(&table)?;
+        let pages = PageManager::open(path)?;
         if pages.page_count() < 2 {
-            return Err(invalid_format("heap file has no data page"));
+            return Err(crate::invalid_format("heap file has no data page"));
         }
-        let header = pages.read_page(HEADER_PAGE)?;
-        let bytes = header.bytes();
-        if &bytes[HEAP_HEADER_OFFSET..HEAP_HEADER_OFFSET + HEADER_MAGIC.len()] != HEADER_MAGIC {
-            return Err(invalid_format("heap header magic does not match"));
+        let buffer = BufferPool::new(pages, buffer_pool_size)?;
+        {
+            let header = buffer.read_page(HEADER_PAGE)?;
+            validate_heap_metadata(header.page().bytes(), &table)?;
         }
-        let table_id = read_u64(bytes, HEAP_HEADER_OFFSET + 4)?;
-        let column_count = read_u16(bytes, HEAP_HEADER_OFFSET + 12)? as usize;
-        if table_id != table.id.0 {
-            return Err(StorageError::SchemaMismatch {
-                expected: format!("table id {}", table.id.0),
-                actual: format!("table id {table_id}"),
-            });
-        }
-        if column_count != table.columns.len() {
-            return Err(StorageError::SchemaMismatch {
-                expected: format!("{} columns", table.columns.len()),
-                actual: format!("{column_count} columns"),
-            });
-        }
-        Ok(Self { pages, table })
+        Ok(Self { buffer, table })
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<RowId, StorageError> {
         self.validate_row(values)?;
         let payload = encode_row(values)?;
-        let needed = 4 + payload.len();
-        let capacity = PAGE_SIZE - DATA_HEADER_SIZE;
-        if needed > capacity {
-            return Err(StorageError::RowTooLarge {
-                size: needed,
-                capacity,
-            });
+        let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+        if payload.is_empty() || payload.len() > max_record_size {
+            return Err(PageError::RecordTooLarge {
+                size: payload.len(),
+                capacity: max_record_size,
+            }
+            .into());
         }
 
-        let mut page_id = PageId(self.pages.page_count() - 1);
-        let mut page = self.pages.read_page(page_id)?;
-        let mut used = read_u32(page.bytes(), 8)? as usize;
-        let mut row_count = read_u16(page.bytes(), 4)?;
-        if &page.bytes()[0..4] != DATA_MAGIC || !(DATA_HEADER_SIZE..=PAGE_SIZE).contains(&used) {
-            return Err(invalid_format(format!(
-                "data page {} is corrupt",
-                page_id.0
-            )));
-        }
-        let fits_on_page = used
-            .checked_add(needed)
-            .map(|end| end <= PAGE_SIZE)
-            .unwrap_or(false);
-        if row_count == u16::MAX || !fits_on_page {
-            page = initialize_data_page(self.pages.allocate_page()?);
-            page_id = page.id;
-            used = DATA_HEADER_SIZE;
-            row_count = 0;
-        }
-
-        let slot = row_count;
-        let bytes = page.bytes_mut();
-        bytes[used..used + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes[used + 4..used + needed].copy_from_slice(&payload);
-        bytes[8..12].copy_from_slice(&((used + needed) as u32).to_le_bytes());
-        bytes[4..6].copy_from_slice(&(row_count + 1).to_le_bytes());
-        self.pages.write_page(&page)?;
-        self.pages.sync()?;
+        let last_page = self
+            .buffer
+            .page_count()
+            .checked_sub(1)
+            .ok_or_else(|| crate::invalid_format("heap file has no pages"))?;
+        let existing = {
+            let mut page = self.buffer.write_page(PageId(last_page))?;
+            page.page_mut().insert_record(&payload)
+        };
+        let (page_id, slot) = match existing {
+            Ok(slot) => (PageId(last_page), slot),
+            Err(StorageError::Page(PageError::PageFull { .. })) => {
+                let mut page = self.buffer.new_page()?;
+                let page_id = page.page_id();
+                let slot = {
+                    let raw_page = page.page_mut();
+                    *raw_page = Page::new(page_id, PageType::Heap);
+                    raw_page.insert_record(&payload)?
+                };
+                (page_id, slot)
+            }
+            Err(error) => return Err(error),
+        };
+        self.buffer.flush_all()?;
         Ok(RowId {
             page: page_id,
-            slot,
+            slot: slot.0,
         })
     }
 
     pub fn scan(&mut self) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
         let mut rows = Vec::new();
-        for page_number in FIRST_DATA_PAGE.0..self.pages.page_count() {
+        for page_number in FIRST_DATA_PAGE.0..self.buffer.page_count() {
             let page_id = PageId(page_number);
-            let page = self.pages.read_page(page_id)?;
-            let bytes = page.bytes();
-            if &bytes[0..4] != DATA_MAGIC {
-                return Err(invalid_format(format!(
-                    "data page {} has invalid magic",
-                    page_id.0
-                )));
-            }
-            let row_count = read_u16(bytes, 4)?;
-            let used = read_u32(bytes, 8)? as usize;
-            if !(DATA_HEADER_SIZE..=PAGE_SIZE).contains(&used) {
-                return Err(invalid_format(format!(
-                    "data page {} has invalid used length",
-                    page_id.0
-                )));
-            }
-            let mut offset = DATA_HEADER_SIZE;
-            for slot in 0..row_count {
-                let length_end = offset
-                    .checked_add(4)
-                    .ok_or_else(|| invalid_format("row length offset overflows"))?;
-                if length_end > used {
-                    return Err(invalid_format("row length exceeds page used length"));
+            let page = self.buffer.read_page(page_id)?;
+            let header = page.page().header()?;
+            if header.page_type != PageType::Heap {
+                return Err(PageError::WrongPageType {
+                    expected: PageType::Heap,
+                    actual: header.page_type,
                 }
-                let row_length = read_u32(bytes, offset)? as usize;
-                offset = length_end;
-                let row_end = offset
-                    .checked_add(row_length)
-                    .ok_or_else(|| invalid_format("row payload offset overflows"))?;
-                if row_end > used {
-                    return Err(invalid_format("row payload exceeds page used length"));
-                }
-                let values = decode_row(&bytes[offset..row_end], &self.table)?;
+                .into());
+            }
+            for slot_number in 0..header.slot_count {
+                let slot = SlotId(slot_number);
+                let values = decode_row(page.page().read_record(slot)?, &self.table)?;
                 rows.push((
                     RowId {
                         page: page_id,
-                        slot,
+                        slot: slot.0,
                     },
                     values,
                 ));
-                offset = row_end;
-            }
-            if offset != used {
-                return Err(invalid_format("data page contains trailing bytes"));
             }
         }
         Ok(rows)
+    }
+
+    pub fn flush(&self) -> Result<(), StorageError> {
+        self.buffer.flush_all()
+    }
+
+    pub fn close(self) -> Result<(), StorageError> {
+        self.buffer.flush_all()
     }
 
     #[must_use]
@@ -200,11 +186,62 @@ impl HeapStorage {
     }
 }
 
-fn initialize_data_page(mut page: Page) -> Page {
-    let bytes = page.bytes_mut();
-    bytes[0..4].copy_from_slice(DATA_MAGIC);
-    bytes[8..12].copy_from_slice(&(DATA_HEADER_SIZE as u32).to_le_bytes());
-    page
+impl Drop for HeapStorage {
+    fn drop(&mut self) {
+        // Explicit `flush`/`close` report errors. Drop only preserves the old
+        // embedded behavior with best-effort cleanup and is not durability.
+        let _ = self.buffer.flush_all();
+    }
+}
+
+fn validate_table(table: &TableDef) -> Result<(), StorageError> {
+    if table.columns.len() > u16::MAX as usize {
+        return Err(crate::invalid_format("table has more than 65535 columns"));
+    }
+    Ok(())
+}
+
+fn write_heap_metadata(bytes: &mut [u8; PAGE_SIZE], table: &TableDef) {
+    bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()]
+        .copy_from_slice(HEADER_MAGIC);
+    bytes[HEAP_VERSION_OFFSET..HEAP_VERSION_OFFSET + 2]
+        .copy_from_slice(&HEAP_FORMAT_VERSION.to_le_bytes());
+    bytes[HEAP_RESERVED_OFFSET..HEAP_RESERVED_OFFSET + 2].fill(0);
+    bytes[HEAP_TABLE_ID_OFFSET..HEAP_TABLE_ID_OFFSET + 8]
+        .copy_from_slice(&table.id.0.to_le_bytes());
+    bytes[HEAP_COLUMN_COUNT_OFFSET..HEAP_COLUMN_COUNT_OFFSET + 2]
+        .copy_from_slice(&(table.columns.len() as u16).to_le_bytes());
+}
+
+fn validate_heap_metadata(bytes: &[u8; PAGE_SIZE], table: &TableDef) -> Result<(), StorageError> {
+    if &bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()] != HEADER_MAGIC {
+        return Err(MetadataError::InvalidMagic.into());
+    }
+    let version = read_u16(bytes, HEAP_VERSION_OFFSET)?;
+    if version != HEAP_FORMAT_VERSION {
+        return Err(MetadataError::UnsupportedVersion(version).into());
+    }
+    if bytes[HEAP_RESERVED_OFFSET..HEAP_RESERVED_OFFSET + 2]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(MetadataError::InvalidReservedBytes.into());
+    }
+    let table_id = read_u64(bytes, HEAP_TABLE_ID_OFFSET)?;
+    let column_count = usize::from(read_u16(bytes, HEAP_COLUMN_COUNT_OFFSET)?);
+    if table_id != table.id.0 {
+        return Err(StorageError::SchemaMismatch {
+            expected: format!("table id {}", table.id.0),
+            actual: format!("table id {table_id}"),
+        });
+    }
+    if column_count != table.columns.len() {
+        return Err(StorageError::SchemaMismatch {
+            expected: format!("{} columns", table.columns.len()),
+            actual: format!("{column_count} columns"),
+        });
+    }
+    Ok(())
 }
 
 fn encode_row(values: &[ScalarValue]) -> Result<Vec<u8>, StorageError> {
@@ -227,7 +264,7 @@ fn encode_row(values: &[ScalarValue]) -> Result<Vec<u8>, StorageError> {
                 encoded.push(3);
                 let length = u32::try_from(value.len()).map_err(|_| StorageError::RowTooLarge {
                     size: value.len(),
-                    capacity: PAGE_SIZE - DATA_HEADER_SIZE,
+                    capacity: PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE,
                 })?;
                 encoded.extend_from_slice(&length.to_le_bytes());
                 encoded.extend_from_slice(value.as_bytes());
@@ -259,18 +296,23 @@ fn decode_row(payload: &[u8], table: &TableDef) -> Result<Vec<ScalarValue>, Stor
         values.push(value);
     }
     if offset != payload.len() {
-        return Err(invalid_format("row contains extra values"));
+        return Err(CodecError::ExtraValues.into());
     }
     Ok(values)
 }
 
 fn decode_value(payload: &[u8], offset: &mut usize) -> Result<ScalarValue, StorageError> {
-    let tag = *payload
-        .get(*offset)
-        .ok_or_else(|| invalid_format("missing scalar tag"))?;
+    let tag = *payload.get(*offset).ok_or(CodecError::MissingScalarTag)?;
     *offset += 1;
     match tag {
-        0 => Ok(ScalarValue::Bool(read_byte(payload, offset)? != 0)),
+        0 => {
+            let value = read_byte(payload, offset)?;
+            match value {
+                0 => Ok(ScalarValue::Bool(false)),
+                1 => Ok(ScalarValue::Bool(true)),
+                other => Err(CodecError::InvalidBoolean(other).into()),
+            }
+        }
         1 => Ok(ScalarValue::Int64(i64::from_le_bytes(read_array(
             payload, offset,
         )?))),
@@ -281,37 +323,30 @@ fn decode_value(payload: &[u8], offset: &mut usize) -> Result<ScalarValue, Stora
             let length = u32::from_le_bytes(read_array(payload, offset)?) as usize;
             let end = (*offset)
                 .checked_add(length)
-                .ok_or_else(|| invalid_format("text length overflows"))?;
-            let text = std::str::from_utf8(
-                payload
-                    .get(*offset..end)
-                    .ok_or_else(|| invalid_format("text exceeds row"))?,
-            )
-            .map_err(|_| invalid_format("text is not valid UTF-8"))?
-            .to_owned();
+                .ok_or(CodecError::LengthOverflow)?;
+            let text_bytes = payload
+                .get(*offset..end)
+                .ok_or(CodecError::ScalarTruncated)?;
+            let text = std::str::from_utf8(text_bytes)
+                .map_err(|_| CodecError::TextNotUtf8)?
+                .to_owned();
             *offset = end;
             Ok(ScalarValue::Text(text))
         }
         4 => Ok(ScalarValue::Null),
-        _ => Err(invalid_format("unknown scalar tag")),
+        other => Err(CodecError::UnknownScalarTag(other).into()),
     }
 }
 
 fn read_byte(bytes: &[u8], offset: &mut usize) -> Result<u8, StorageError> {
-    let byte = *bytes
-        .get(*offset)
-        .ok_or_else(|| invalid_format("scalar exceeds row"))?;
+    let byte = *bytes.get(*offset).ok_or(CodecError::ScalarTruncated)?;
     *offset += 1;
     Ok(byte)
 }
 
 fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N], StorageError> {
-    let end = (*offset)
-        .checked_add(N)
-        .ok_or_else(|| invalid_format("scalar length overflows"))?;
-    let source = bytes
-        .get(*offset..end)
-        .ok_or_else(|| invalid_format("scalar exceeds row"))?;
+    let end = (*offset).checked_add(N).ok_or(CodecError::LengthOverflow)?;
+    let source = bytes.get(*offset..end).ok_or(CodecError::ScalarTruncated)?;
     let mut output = [0; N];
     output.copy_from_slice(source);
     *offset = end;
@@ -322,10 +357,6 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, StorageError> {
     Ok(u16::from_le_bytes(read_array_at(bytes, offset)?))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, StorageError> {
-    Ok(u32::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, StorageError> {
     Ok(u64::from_le_bytes(read_array_at(bytes, offset)?))
 }
@@ -333,10 +364,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, StorageError> {
 fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], StorageError> {
     let end = offset
         .checked_add(N)
-        .ok_or_else(|| invalid_format("header length overflows"))?;
+        .ok_or_else(|| crate::invalid_format("metadata offset overflows"))?;
     let source = bytes
         .get(offset..end)
-        .ok_or_else(|| invalid_format("header is truncated"))?;
+        .ok_or_else(|| crate::invalid_format("metadata is truncated"))?;
     let mut output = [0; N];
     output.copy_from_slice(source);
     Ok(output)
@@ -345,8 +376,9 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::HeapStorage;
+    use crate::{PageManager, SlotId, StorageError};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+    use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
 
     fn table() -> TableDef {
         TableDef::new(
@@ -360,15 +392,19 @@ mod tests {
         )
     }
 
+    fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("netbadb-{name}-{}", std::process::id()))
+    }
+
     #[test]
     fn insert_write_read_decode_round_trip() {
-        let path = std::env::temp_dir().join(format!("netbadb-heap-{}", std::process::id()));
+        let path = test_path("heap-round-trip");
         let mut storage = HeapStorage::create(&path, table()).expect("create heap");
         let row_id = storage
             .insert(&[ScalarValue::Int64(7), ScalarValue::Text("Ada".into())])
             .expect("insert");
         assert_eq!(row_id.slot, 0);
-        drop(storage);
+        storage.close().expect("close heap");
 
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         let rows = reopened.scan().expect("scan");
@@ -377,6 +413,100 @@ mod tests {
             rows[0].1,
             vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inserts_across_pages_and_scans_with_capacity_one() {
+        let path = test_path("heap-multi-page");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        for id in 0..700_i64 {
+            storage
+                .insert(&[ScalarValue::Int64(id), ScalarValue::Text("row".into())])
+                .expect("insert row");
+        }
+        let rows = storage.scan().expect("scan multi-page heap");
+        assert_eq!(rows.len(), 700);
+        assert!(rows.iter().any(|(row_id, _)| row_id.page.0 > 1));
+        storage.close().expect("close heap");
+
+        let mut reopened =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("reopen heap");
+        assert_eq!(reopened.scan().expect("reopen scan").len(), 700);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupted_tuple_encoding_is_rejected_during_scan() {
+        let path = test_path("heap-corrupt-row");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert row");
+        storage.close().expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut page = pages.read_page(PageId(1)).expect("read data page");
+        let slot = page.slot(SlotId(0)).expect("read row slot");
+        page.bytes_mut()[usize::from(slot.offset)] = 99;
+        pages.write_page(&page).expect("write corrupt row");
+        pages.sync().expect("sync corrupt row");
+        drop(pages);
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert!(matches!(
+            reopened.scan(),
+            Err(StorageError::Codec(crate::CodecError::UnknownScalarTag(99)))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupted_tuple_bounds_are_rejected_during_scan() {
+        let path = test_path("heap-corrupt-slot");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert row");
+        storage.close().expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut page = pages.read_page(PageId(1)).expect("read data page");
+        page.bytes_mut()[18..20].copy_from_slice(&u16::MAX.to_le_bytes());
+        pages.write_page(&page).expect("write corrupt slot");
+        pages.sync().expect("sync corrupt slot");
+        drop(pages);
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert!(matches!(
+            reopened.scan(),
+            Err(StorageError::Page(
+                crate::PageError::RecordOutOfBounds { .. }
+            ))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unsupported_heap_metadata_version_is_rejected() {
+        let path = test_path("heap-corrupt-metadata");
+        let storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage.close().expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut header = pages.read_page(PageId(0)).expect("read metadata page");
+        header.bytes_mut()[20..22].copy_from_slice(&99_u16.to_le_bytes());
+        pages.write_page(&header).expect("write corrupt metadata");
+        pages.sync().expect("sync corrupt metadata");
+        drop(pages);
+
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Metadata(
+                crate::MetadataError::UnsupportedVersion(99)
+            ))
+        ));
         let _ = std::fs::remove_file(path);
     }
 }

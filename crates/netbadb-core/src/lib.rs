@@ -82,6 +82,18 @@ impl Database {
         Ok(())
     }
 
+    /// Flushes dirty pages and reports any write or sync failure.
+    pub fn flush(&self) -> Result<(), DatabaseError> {
+        self.storage.flush()?;
+        Ok(())
+    }
+
+    /// Explicitly closes the embedded database after flushing dirty pages.
+    pub fn close(self) -> Result<(), DatabaseError> {
+        self.storage.close()?;
+        Ok(())
+    }
+
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
         let compiled = compile(&self.schema, source)?;
         let physical = netbadb_planner::plan(&compiled.logical_plan);
@@ -121,7 +133,7 @@ mod tests {
         database
             .insert(&[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())])
             .expect("insert");
-        drop(database);
+        database.close().expect("close database");
 
         let mut reopened = Database::open(&path, table()).expect("open database");
         let result = reopened

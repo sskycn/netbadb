@@ -63,18 +63,65 @@ the whole system.
 
 ## Storage boundary
 
-`netbadb-storage` currently provides:
+The synchronous storage path is now:
 
-- a fixed 4 KiB page abstraction;
-- a synchronous `PageManager` over a database file;
-- a heap file with a small header and data pages;
-- physical scalar encoding/decoding;
-- row validation against the supplied Canonical Schema.
+```text
+Executor
+    ↓
+HeapStorage
+    ↓
+BufferPool + PageGuards
+    ↓
+PageManager
+    ↓
+Database file
+```
 
-The API is intentionally narrow: insert and scan return owned values and stable
-`RowId`s. Page allocation, page I/O, and row encoding remain below the
-executor. WAL, buffer eviction, transactions, indexes, and recovery can be
-introduced behind this boundary.
+`netbadb-storage` keeps the boundaries concrete and small:
+
+- `PageManager` owns fixed-size file I/O, page allocation, checked page-offset
+  arithmetic, and file sync. It does not interpret heap or index semantics.
+- `BufferPool` owns a bounded set of raw page frames. It uses a simple
+  round-robin eviction boundary, pins pages while guards are alive, refuses to
+  evict pinned pages, writes dirty pages before reuse, and exposes explicit
+  `flush_page`/`flush_all` operations.
+- `Page` validates a versioned page header and explicit page type before
+  exposing slotted-page operations. Heap pages use a slot directory at the
+  front, free space in the middle, and tuple bytes packed from the end of the
+  page backward.
+- `HeapStorage` validates schema rows, encodes typed scalar values, chooses the
+  last heap page or allocates a new one, and returns owned rows. Page guards do
+  not escape these operations, so executor and query APIs carry no page
+  lifetimes.
+
+The experimental container retains the legacy `NBPG` file-root marker. Heap
+metadata has its own `NBD1` marker and explicit version. Data pages use the
+following little-endian layout:
+
+```text
+0..4    NBP1 page magic
+4..6    u16 page format version
+6       u8 page type (1 metadata, 2 heap)
+7       reserved byte (zero)
+8..10   u16 slot count
+10..12  u16 free-space lower bound
+12..14  u16 free-space upper bound
+14..16  reserved bytes (zero)
+16..    slot entries: u16 tuple offset + u16 tuple length
+...     free space
+...     tuple bytes, allocated from PAGE_SIZE backward
+```
+
+This is an intentional replacement of the pre-Foundation sequential `HEAP`
+data-page layout. That earlier experimental format has no migration path; new
+files use the versioned layout above.
+
+All disk widths are explicit; no Rust struct layout, host-endian values,
+pointers, or `usize` are persisted. Malformed headers, slot directories,
+record ranges, row lengths, tags, and UTF-8 values return typed errors. The
+current dirty-page writeback is not WAL ordering and is not crash-safe
+transaction durability. WAL, transactions, MVCC, indexes, and recovery remain
+future layers.
 
 ## Embedded and server modes
 

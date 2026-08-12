@@ -1,20 +1,231 @@
-//! Synchronous page and heap storage for the first embedded vertical slice.
+//! Synchronous page, buffer, and heap storage for the embedded vertical slice.
 
+mod buffer;
 mod heap;
 mod page;
 
+pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard, WritePageGuard};
 pub use heap::HeapStorage;
-pub use page::{PAGE_SIZE, Page, PageManager};
+pub use page::{
+    PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
+    PageType, SLOT_SIZE, Slot,
+};
 
 use std::error::Error;
 use std::fmt;
 
-use netbadb_types::PhysicalType;
+use netbadb_types::{PageId, PhysicalType, SlotId};
+
+/// Errors raised while validating or mutating a raw database page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageError {
+    InvalidMagic,
+    UnsupportedVersion(u16),
+    UnknownPageType(u8),
+    InvalidReservedByte(u8),
+    InvalidSlotCount(u16),
+    InvalidFreeSpace {
+        free_start: u16,
+        free_end: u16,
+    },
+    SlotDirectoryOutOfBounds {
+        slot_count: u16,
+        free_start: u16,
+    },
+    InvalidSlot {
+        slot: SlotId,
+    },
+    RecordOutOfBounds {
+        slot: SlotId,
+        offset: u16,
+        length: u16,
+    },
+    RecordOverlapsFreeSpace {
+        slot: SlotId,
+        offset: u16,
+        free_end: u16,
+    },
+    OverlappingRecords {
+        first: SlotId,
+        second: SlotId,
+    },
+    WrongPageType {
+        expected: PageType,
+        actual: PageType,
+    },
+    PageFull {
+        required: usize,
+        available: usize,
+    },
+    RecordTooLarge {
+        size: usize,
+        capacity: usize,
+    },
+}
+
+impl fmt::Display for PageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMagic => formatter.write_str("page magic does not match"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported page format version {version}")
+            }
+            Self::UnknownPageType(tag) => write!(formatter, "unknown page type tag {tag}"),
+            Self::InvalidReservedByte(value) => {
+                write!(formatter, "page reserved byte must be zero, found {value}")
+            }
+            Self::InvalidSlotCount(count) => write!(formatter, "invalid page slot count {count}"),
+            Self::InvalidFreeSpace {
+                free_start,
+                free_end,
+            } => write!(
+                formatter,
+                "invalid page free-space bounds {free_start}..{free_end}"
+            ),
+            Self::SlotDirectoryOutOfBounds {
+                slot_count,
+                free_start,
+            } => write!(
+                formatter,
+                "slot directory with {slot_count} slots ends at {free_start}"
+            ),
+            Self::InvalidSlot { slot } => write!(formatter, "invalid page slot {}", slot.0),
+            Self::RecordOutOfBounds {
+                slot,
+                offset,
+                length,
+            } => write!(
+                formatter,
+                "record in slot {} is out of bounds at {offset} with length {length}",
+                slot.0
+            ),
+            Self::RecordOverlapsFreeSpace {
+                slot,
+                offset,
+                free_end,
+            } => write!(
+                formatter,
+                "record in slot {} at {offset} overlaps free space beginning at {free_end}",
+                slot.0
+            ),
+            Self::OverlappingRecords { first, second } => write!(
+                formatter,
+                "records in slots {} and {} overlap",
+                first.0, second.0
+            ),
+            Self::WrongPageType { expected, actual } => {
+                write!(formatter, "expected {expected:?} page, found {actual:?}")
+            }
+            Self::PageFull {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "page needs {required} bytes but only {available} are free"
+            ),
+            Self::RecordTooLarge { size, capacity } => write!(
+                formatter,
+                "record of {size} bytes exceeds page record capacity {capacity}"
+            ),
+        }
+    }
+}
+
+impl Error for PageError {}
+
+/// Errors raised by the in-memory buffer pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferError {
+    InvalidCapacity,
+    Exhausted { capacity: usize },
+    PagePinned { page_id: PageId },
+    PageNotCached { page_id: PageId },
+    PinCountOverflow { page_id: PageId },
+}
+
+impl fmt::Display for BufferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCapacity => formatter.write_str("buffer pool capacity must be non-zero"),
+            Self::Exhausted { capacity } => write!(
+                formatter,
+                "buffer pool with capacity {capacity} has no evictable frame"
+            ),
+            Self::PagePinned { page_id } => {
+                write!(formatter, "page {} is pinned by an active guard", page_id.0)
+            }
+            Self::PageNotCached { page_id } => {
+                write!(formatter, "page {} is not cached", page_id.0)
+            }
+            Self::PinCountOverflow { page_id } => {
+                write!(formatter, "pin count for page {} overflows", page_id.0)
+            }
+        }
+    }
+}
+
+impl Error for BufferError {}
+
+/// Errors raised while decoding the explicit row scalar format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodecError {
+    MissingScalarTag,
+    UnknownScalarTag(u8),
+    InvalidBoolean(u8),
+    ScalarTruncated,
+    LengthOverflow,
+    TextNotUtf8,
+    ExtraValues,
+}
+
+impl fmt::Display for CodecError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingScalarTag => formatter.write_str("row is missing a scalar tag"),
+            Self::UnknownScalarTag(tag) => write!(formatter, "unknown scalar tag {tag}"),
+            Self::InvalidBoolean(value) => write!(formatter, "invalid boolean value {value}"),
+            Self::ScalarTruncated => formatter.write_str("scalar value is truncated"),
+            Self::LengthOverflow => formatter.write_str("scalar length overflows the row"),
+            Self::TextNotUtf8 => formatter.write_str("text value is not valid UTF-8"),
+            Self::ExtraValues => formatter.write_str("row contains extra values"),
+        }
+    }
+}
+
+impl Error for CodecError {}
+
+/// Errors raised while decoding the heap file root metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataError {
+    InvalidMagic,
+    UnsupportedVersion(u16),
+    InvalidReservedBytes,
+}
+
+impl fmt::Display for MetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMagic => formatter.write_str("heap metadata magic does not match"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported heap metadata version {version}")
+            }
+            Self::InvalidReservedBytes => {
+                formatter.write_str("heap metadata reserved bytes are non-zero")
+            }
+        }
+    }
+}
+
+impl Error for MetadataError {}
 
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
     InvalidFormat(String),
+    Page(PageError),
+    Buffer(BufferError),
+    Codec(CodecError),
+    Metadata(MetadataError),
     SchemaMismatch {
         expected: String,
         actual: String,
@@ -35,6 +246,9 @@ pub enum StorageError {
         size: usize,
         capacity: usize,
     },
+    PageOffsetOverflow {
+        page_id: PageId,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -42,6 +256,10 @@ impl fmt::Display for StorageError {
         match self {
             Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
             Self::InvalidFormat(message) => write!(formatter, "invalid database format: {message}"),
+            Self::Page(error) => write!(formatter, "page error: {error}"),
+            Self::Buffer(error) => write!(formatter, "buffer pool error: {error}"),
+            Self::Codec(error) => write!(formatter, "row codec error: {error}"),
+            Self::Metadata(error) => write!(formatter, "heap metadata error: {error}"),
             Self::SchemaMismatch { expected, actual } => write!(
                 formatter,
                 "schema mismatch: expected {expected}, found {actual}"
@@ -64,6 +282,13 @@ impl fmt::Display for StorageError {
                 formatter,
                 "row payload of {size} bytes exceeds page capacity {capacity}"
             ),
+            Self::PageOffsetOverflow { page_id } => {
+                write!(
+                    formatter,
+                    "page {} offset overflows the disk address",
+                    page_id.0
+                )
+            }
         }
     }
 }
@@ -72,6 +297,10 @@ impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Page(error) => Some(error),
+            Self::Buffer(error) => Some(error),
+            Self::Codec(error) => Some(error),
+            Self::Metadata(error) => Some(error),
             _ => None,
         }
     }
@@ -80,6 +309,30 @@ impl Error for StorageError {
 impl From<std::io::Error> for StorageError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<PageError> for StorageError {
+    fn from(error: PageError) -> Self {
+        Self::Page(error)
+    }
+}
+
+impl From<BufferError> for StorageError {
+    fn from(error: BufferError) -> Self {
+        Self::Buffer(error)
+    }
+}
+
+impl From<CodecError> for StorageError {
+    fn from(error: CodecError) -> Self {
+        Self::Codec(error)
+    }
+}
+
+impl From<MetadataError> for StorageError {
+    fn from(error: MetadataError) -> Self {
+        Self::Metadata(error)
     }
 }
 
