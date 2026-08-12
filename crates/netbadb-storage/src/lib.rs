@@ -44,6 +44,14 @@ pub enum PageError {
     InvalidSlot {
         slot: SlotId,
     },
+    SlotDeleted {
+        slot: SlotId,
+    },
+    InvalidDeletedSlotEncoding {
+        slot: SlotId,
+        offset: u16,
+        length: u16,
+    },
     RecordOutOfBounds {
         slot: SlotId,
         offset: u16,
@@ -67,6 +75,11 @@ pub enum PageError {
         available: usize,
     },
     RecordTooLarge {
+        size: usize,
+        capacity: usize,
+    },
+    UpdateWouldOverflowPage {
+        slot: SlotId,
         size: usize,
         capacity: usize,
     },
@@ -99,6 +112,16 @@ impl fmt::Display for PageError {
                 "slot directory with {slot_count} slots ends at {free_start}"
             ),
             Self::InvalidSlot { slot } => write!(formatter, "invalid page slot {}", slot.0),
+            Self::SlotDeleted { slot } => write!(formatter, "page slot {} is deleted", slot.0),
+            Self::InvalidDeletedSlotEncoding {
+                slot,
+                offset,
+                length,
+            } => write!(
+                formatter,
+                "slot {} has invalid deleted encoding ({offset}, {length})",
+                slot.0
+            ),
             Self::RecordOutOfBounds {
                 slot,
                 offset,
@@ -135,6 +158,15 @@ impl fmt::Display for PageError {
             Self::RecordTooLarge { size, capacity } => write!(
                 formatter,
                 "record of {size} bytes exceeds page record capacity {capacity}"
+            ),
+            Self::UpdateWouldOverflowPage {
+                slot,
+                size,
+                capacity,
+            } => write!(
+                formatter,
+                "replacement record of {size} bytes for slot {} exceeds its page capacity {capacity}",
+                slot.0
             ),
         }
     }
@@ -378,6 +410,12 @@ pub enum StorageError {
     NullNotAllowed {
         column: String,
     },
+    RowNotFound {
+        row_id: netbadb_types::RowId,
+    },
+    RowDeleted {
+        row_id: netbadb_types::RowId,
+    },
     RowTooLarge {
         size: usize,
         capacity: usize,
@@ -418,6 +456,16 @@ impl fmt::Display for StorageError {
             Self::NullNotAllowed { column } => {
                 write!(formatter, "column `{column}` is not nullable")
             }
+            Self::RowNotFound { row_id } => write!(
+                formatter,
+                "row at page {}, slot {} does not exist",
+                row_id.page.0, row_id.slot
+            ),
+            Self::RowDeleted { row_id } => write!(
+                formatter,
+                "row at page {}, slot {} has been deleted",
+                row_id.page.0, row_id.slot
+            ),
             Self::RowTooLarge { size, capacity } => write!(
                 formatter,
                 "row payload of {size} bytes exceeds page capacity {capacity}"

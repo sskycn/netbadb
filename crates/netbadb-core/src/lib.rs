@@ -4,12 +4,14 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use netbadb_compiler::{CompileError, compile};
-use netbadb_executor::{ExecutionError, QueryResult, execute};
+use netbadb_compiler::{CompileError, compile_statement};
+use netbadb_executor::{ExecutionError, execute_statement};
+use netbadb_planner::PhysicalStatement;
 use netbadb_schema::{Schema, TableDef};
 use netbadb_storage::{HeapStorage, StorageError};
 use netbadb_types::ScalarValue;
 
+pub use netbadb_executor::{ExecutionResult, QueryResult};
 pub use netbadb_storage::{Transaction, TransactionState};
 
 #[derive(Debug)]
@@ -17,6 +19,7 @@ pub enum DatabaseError {
     Compile(CompileError),
     Storage(StorageError),
     Execution(ExecutionError),
+    ExpectedQuery,
 }
 
 impl fmt::Display for DatabaseError {
@@ -25,6 +28,7 @@ impl fmt::Display for DatabaseError {
             Self::Compile(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
+            Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
         }
     }
 }
@@ -35,6 +39,7 @@ impl Error for DatabaseError {
             Self::Compile(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
+            Self::ExpectedQuery => None,
         }
     }
 }
@@ -116,9 +121,61 @@ impl Database {
     }
 
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
-        let compiled = compile(&self.schema, source)?;
-        let physical = netbadb_planner::plan(&compiled.logical_plan);
-        Ok(execute(&physical, &mut self.storage)?)
+        let compiled = compile_statement(&self.schema, source)?;
+        let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
+        let PhysicalStatement::Query(_) = physical else {
+            return Err(DatabaseError::ExpectedQuery);
+        };
+        match execute_statement(&physical, &mut self.storage, None)? {
+            ExecutionResult::Query(result) => Ok(result),
+            ExecutionResult::AffectedRows(_) => Err(DatabaseError::ExpectedQuery),
+        }
+    }
+
+    /// Executes SELECT or one typed DML statement. DML runs in one implicit
+    /// transaction and returns an explicit affected-row count.
+    pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
+        let compiled = compile_statement(&self.schema, source)?;
+        let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
+        if matches!(physical, PhysicalStatement::Query(_)) {
+            return Ok(execute_statement(&physical, &mut self.storage, None)?);
+        }
+
+        let mut transaction = self.storage.begin_transaction()?;
+        match execute_statement(&physical, &mut self.storage, Some(&mut transaction)) {
+            Ok(result) => {
+                transaction.commit()?;
+                Ok(result)
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error.into()),
+                Err(rollback_error) => Err(rollback_error.into()),
+            },
+        }
+    }
+
+    /// Executes a statement using an existing transaction. Until savepoints
+    /// exist, an execution-time DML failure rolls back the whole transaction.
+    pub fn execute_in(
+        &mut self,
+        transaction: &mut Transaction,
+        source: &str,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        // Reject inactive or foreign handles before compilation/execution. In
+        // particular, a foreign handle must never be rolled back by this DB.
+        self.storage.validate_transaction(transaction)?;
+        let compiled = compile_statement(&self.schema, source)?;
+        let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
+        if matches!(physical, PhysicalStatement::Query(_)) {
+            return Ok(execute_statement(&physical, &mut self.storage, None)?);
+        }
+        match execute_statement(&physical, &mut self.storage, Some(transaction)) {
+            Ok(result) => Ok(result),
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error.into()),
+                Err(rollback_error) => Err(rollback_error.into()),
+            },
+        }
     }
 
     #[must_use]

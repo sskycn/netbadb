@@ -74,6 +74,31 @@ pub enum LogicalPlan {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub column: ColumnRef,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalStatement {
+    Query(LogicalPlan),
+    Insert {
+        table_id: TableId,
+        table_name: String,
+        values: Vec<Expr>,
+    },
+    Update {
+        input: LogicalPlan,
+        table_id: TableId,
+        assignments: Vec<Assignment>,
+    },
+    Delete {
+        input: LogicalPlan,
+        table_id: TableId,
+    },
+}
+
 impl LogicalPlan {
     #[must_use]
     pub fn output_columns(&self) -> &[ColumnRef] {

@@ -103,6 +103,39 @@ the database file, and reopen. `HeapStorage` validates every embedded write and
 returns `StorageError::NullNotAllowed` when NULL targets a non-nullable column,
 independently of query compilation.
 
+## Typed DML
+
+The parser's top level is a typed `Statement` enum with distinct Select,
+Insert, Update, and Delete variants. The HIR resolves every table and column to
+stable IDs, assigns expression types, rejects duplicate targets and invalid
+NULL/nominal assignments, and fills omitted nullable INSERT columns with NULL.
+Logical and physical statement enums preserve that distinction. UPDATE and
+DELETE select targets through the existing sequential Scan + optional Filter
+tree rather than embedding a second predicate implementation.
+
+Execution scan tuples carry a hidden `RowId` alongside values. Projection can
+discard SQL-visible columns without manufacturing a `_rowid` feature. DML
+collects all selected targets before mutation, avoiding scan interference when
+a page is compacted. UPDATE evaluates every assignment against the original
+row and constructs one complete replacement, so `SET a = b, b = a` swaps the
+values. The shared three-valued evaluator modifies only TRUE rows; FALSE and
+UNKNOWN are skipped.
+
+`ExecutionResult` distinguishes query rows from `AffectedRows(u64)`. INSERT
+returns one; UPDATE counts selected rows, including same-value assignments;
+DELETE counts slots actually tombstoned. `Database::execute` wraps one DML
+statement in an implicit transaction. `Database::execute_in` uses an explicit
+transaction and permits reads of the transaction's currently buffered writes.
+Because savepoints do not exist, an execution-time mutating-statement failure
+rolls back the whole explicit transaction.
+
+Heap mutation remains below SQL semantics. `insert_in`, `update_in`, and
+`delete_in` validate the transaction and full row, build a candidate page,
+append the existing full-page before/after-image `PageUpdate`, assign pageLSN,
+and only then install the dirty page. Runtime rollback and startup recovery
+therefore need no DML-specific undo or WAL record type. A mid-statement error
+causes the owning transaction to restore all preceding page images.
+
 ## Storage boundary
 
 The synchronous storage path is now:
@@ -148,11 +181,11 @@ Database file
 
 The experimental container retains the legacy `NBPG` file-root marker. Heap
 metadata has its own `NBD1` marker and explicit version. Data pages use the
-following version 2 little-endian layout:
+following version 3 little-endian layout:
 
 ```text
 0..4    NBP1 page magic
-4..6    u16 page format version (2)
+4..6    u16 page format version (3)
 6       u8 page type (2 heap; tag 1 remains reserved)
 7       reserved byte (zero)
 8..10   u16 slot count
@@ -165,10 +198,21 @@ following version 2 little-endian layout:
 ...     tuple bytes, allocated from PAGE_SIZE backward
 ```
 
-This is an intentional replacement of both the pre-Foundation sequential
-`HEAP` layout and Phase 1 page version 1. Neither experimental format has a
-migration path; the decoder returns an unsupported-version error for version
-1 rather than interpreting it as version 2.
+Each slot has one of two persistent states. A live slot stores its checked
+offset and length; zero-length records remain legal and use their real offset.
+The reserved pair `(offset = 0, length = 65535)` means Deleted. Either reserved
+component without the complete pair is corruption. DELETE rebuilds the live
+tuple area while retaining every slot index, then writes the tombstone. UPDATE
+rebuilds the page around the replacement while retaining its slot and RowId.
+Deleted slots are not reused, so an old RowId never aliases a later row. A
+replacement that cannot fit on its current page returns
+`UpdateWouldOverflowPage`; this release has no row relocation or forwarding
+pointer.
+
+Version 3 intentionally changes the meaning of a formerly invalid slot pair.
+It replaces the pre-Foundation sequential `HEAP` layout, Phase 1 page version
+1, and Phase 2 page version 2. These experimental formats have no migration
+path; versions 1 and 2 are rejected rather than reinterpreted.
 
 ## Transaction and WAL boundary
 
@@ -202,9 +246,10 @@ The WAL file header is:
 ```
 
 WAL v1 is rejected explicitly; this experimental format has no migration
-framework. The data-page layout remains version 2 because its existing u64
-pageLSN already stores the logical value and its binary representation did not
-change.
+framework. WAL remains version 2 and PageUpdate remains a pair of complete
+page images. Only the separately versioned data-page format changed to version
+3 for deleted-slot semantics; logical LSN and checkpoint generation encodings
+did not change.
 
 Every record has a 40-byte fixed header followed by a bounded payload:
 

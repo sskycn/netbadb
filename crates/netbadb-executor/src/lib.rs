@@ -1,18 +1,24 @@
-//! Synchronous execution of the initial physical plan subset.
+//! Synchronous execution of typed query and DML physical statements.
 
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
-use netbadb_planner::PhysicalPlan;
-use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, UnaryOp};
-use netbadb_storage::{HeapStorage, StorageError};
-use netbadb_types::ScalarValue;
+use netbadb_planner::{PhysicalPlan, PhysicalStatement};
+use netbadb_rel::{Assignment, BinaryOp, ColumnRef, Expr, ExprKind, UnaryOp};
+use netbadb_storage::{HeapStorage, StorageError, Transaction};
+use netbadb_types::{RowId, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryResult {
     pub columns: Vec<ColumnRef>,
     pub rows: Vec<Vec<ScalarValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionResult {
+    Query(QueryResult),
+    AffectedRows(u64),
 }
 
 #[derive(Debug)]
@@ -21,6 +27,9 @@ pub enum ExecutionError {
     MissingColumn(String),
     ExpectedBoolean,
     TypeMismatch,
+    TransactionRequired,
+    AffectedRowsOverflow,
+    TableMismatch { planned: TableId, storage: TableId },
 }
 
 impl fmt::Display for ExecutionError {
@@ -35,6 +44,15 @@ impl fmt::Display for ExecutionError {
                 formatter.write_str("predicate evaluated to a non-boolean value")
             }
             Self::TypeMismatch => formatter.write_str("values have incompatible runtime types"),
+            Self::TransactionRequired => {
+                formatter.write_str("a mutating statement requires an active transaction")
+            }
+            Self::AffectedRowsOverflow => formatter.write_str("affected row count overflowed u64"),
+            Self::TableMismatch { planned, storage } => write!(
+                formatter,
+                "physical plan targets table {}, but storage contains table {}",
+                planned.0, storage.0
+            ),
         }
     }
 }
@@ -58,30 +76,114 @@ pub fn execute(
     plan: &PhysicalPlan,
     storage: &mut HeapStorage,
 ) -> Result<QueryResult, ExecutionError> {
+    let result = execute_rows(plan, storage)?;
+    Ok(QueryResult {
+        columns: result.columns,
+        rows: result.rows.into_iter().map(|row| row.values).collect(),
+    })
+}
+
+pub fn execute_statement(
+    statement: &PhysicalStatement,
+    storage: &mut HeapStorage,
+    transaction: Option<&mut Transaction>,
+) -> Result<ExecutionResult, ExecutionError> {
+    match statement {
+        PhysicalStatement::Query(plan) => execute(plan, storage).map(ExecutionResult::Query),
+        PhysicalStatement::Insert {
+            table_id, values, ..
+        } => {
+            let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
+            storage.validate_transaction(transaction)?;
+            ensure_table(*table_id, storage)?;
+            let row = values
+                .iter()
+                .map(|value| evaluate(value, &[], &[]))
+                .collect::<Result<Vec<_>, _>>()?;
+            storage.insert_in(transaction, &row)?;
+            Ok(ExecutionResult::AffectedRows(1))
+        }
+        PhysicalStatement::Update {
+            input,
+            table_id,
+            assignments,
+        } => {
+            let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
+            storage.validate_transaction(transaction)?;
+            ensure_table(*table_id, storage)?;
+            let input = execute_rows(input, storage)?;
+            let replacements = build_replacements(&input, assignments)?;
+            let affected = u64::try_from(replacements.len())
+                .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
+            for (row_id, values) in replacements {
+                storage.update_in(transaction, row_id, &values)?;
+            }
+            Ok(ExecutionResult::AffectedRows(affected))
+        }
+        PhysicalStatement::Delete { input, table_id } => {
+            let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
+            storage.validate_transaction(transaction)?;
+            ensure_table(*table_id, storage)?;
+            let input = execute_rows(input, storage)?;
+            let affected = u64::try_from(input.rows.len())
+                .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
+            for row in input.rows {
+                storage.delete_in(transaction, row.row_id)?;
+            }
+            Ok(ExecutionResult::AffectedRows(affected))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionRow {
+    row_id: RowId,
+    values: Vec<ScalarValue>,
+}
+
+#[derive(Debug)]
+struct ExecutionRows {
+    columns: Vec<ColumnRef>,
+    rows: Vec<ExecutionRow>,
+}
+
+fn execute_rows(
+    plan: &PhysicalPlan,
+    storage: &mut HeapStorage,
+) -> Result<ExecutionRows, ExecutionError> {
     match plan {
-        PhysicalPlan::SeqScan { columns, .. } => {
-            let rows = storage.scan()?.into_iter().map(|(_, row)| row).collect();
-            Ok(QueryResult {
+        PhysicalPlan::SeqScan {
+            table_id, columns, ..
+        } => {
+            ensure_table(*table_id, storage)?;
+            let rows = storage
+                .scan()?
+                .into_iter()
+                .map(|(row_id, values)| ExecutionRow { row_id, values })
+                .collect();
+            Ok(ExecutionRows {
                 columns: columns.clone(),
                 rows,
             })
         }
         PhysicalPlan::Filter { input, predicate } => {
-            let mut result = execute(input, storage)?;
+            let mut result = execute_rows(input, storage)?;
             let columns = result.columns.clone();
             result.rows = result
                 .rows
                 .into_iter()
-                .filter_map(|row| match evaluate_truth(predicate, &row, &columns) {
-                    Ok(TruthValue::True) => Some(Ok(row)),
-                    Ok(TruthValue::False | TruthValue::Unknown) => None,
-                    Err(error) => Some(Err(error)),
-                })
+                .filter_map(
+                    |row| match evaluate_truth(predicate, &row.values, &columns) {
+                        Ok(TruthValue::True) => Some(Ok(row)),
+                        Ok(TruthValue::False | TruthValue::Unknown) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                )
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
-            let input_result = execute(input, storage)?;
+            let input_result = execute_rows(input, storage)?;
             let positions = columns
                 .iter()
                 .map(|column| {
@@ -99,24 +201,73 @@ pub fn execute(
                 .rows
                 .into_iter()
                 .map(|row| {
-                    positions
+                    let values = positions
                         .iter()
-                        .map(|position| row[*position].clone())
-                        .collect()
+                        .map(|position| row.values[*position].clone())
+                        .collect();
+                    ExecutionRow {
+                        row_id: row.row_id,
+                        values,
+                    }
                 })
                 .collect();
-            Ok(QueryResult {
+            Ok(ExecutionRows {
                 columns: columns.clone(),
                 rows,
             })
         }
         PhysicalPlan::Limit { input, limit } => {
-            let mut result = execute(input, storage)?;
+            let mut result = execute_rows(input, storage)?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
         }
     }
+}
+
+fn ensure_table(table_id: TableId, storage: &HeapStorage) -> Result<(), ExecutionError> {
+    let storage_table_id = storage.table().id;
+    if table_id != storage_table_id {
+        return Err(ExecutionError::TableMismatch {
+            planned: table_id,
+            storage: storage_table_id,
+        });
+    }
+    Ok(())
+}
+
+fn build_replacements(
+    input: &ExecutionRows,
+    assignments: &[Assignment],
+) -> Result<Vec<(RowId, Vec<ScalarValue>)>, ExecutionError> {
+    input
+        .rows
+        .iter()
+        .map(|row| {
+            let evaluated = assignments
+                .iter()
+                .map(|assignment| {
+                    let position = input
+                        .columns
+                        .iter()
+                        .position(|column| {
+                            column.table_id == assignment.column.table_id
+                                && column.column_id == assignment.column.column_id
+                        })
+                        .ok_or_else(|| {
+                            ExecutionError::MissingColumn(assignment.column.name.clone())
+                        })?;
+                    let value = evaluate(&assignment.value, &row.values, &input.columns)?;
+                    Ok((position, value))
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            let mut replacement = row.values.clone();
+            for (position, value) in evaluated {
+                replacement[position] = value;
+            }
+            Ok((row.row_id, replacement))
+        })
+        .collect()
 }
 
 fn evaluate(

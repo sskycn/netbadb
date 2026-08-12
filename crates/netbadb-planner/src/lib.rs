@@ -1,6 +1,6 @@
 //! Physical planning kept separate from logical relational meaning.
 
-use netbadb_rel::{ColumnRef, Expr};
+use netbadb_rel::{Assignment, ColumnRef, Expr, LogicalStatement};
 use netbadb_types::TableId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,25 @@ pub enum PhysicalPlan {
     Limit {
         input: Box<PhysicalPlan>,
         limit: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhysicalStatement {
+    Query(PhysicalPlan),
+    Insert {
+        table_id: TableId,
+        table_name: String,
+        values: Vec<Expr>,
+    },
+    Update {
+        input: PhysicalPlan,
+        table_id: TableId,
+        assignments: Vec<Assignment>,
+    },
+    Delete {
+        input: PhysicalPlan,
+        table_id: TableId,
     },
 }
 
@@ -61,11 +80,40 @@ pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
     }
 }
 
+#[must_use]
+pub fn plan_statement(logical: &LogicalStatement) -> PhysicalStatement {
+    match logical {
+        LogicalStatement::Query(query) => PhysicalStatement::Query(plan(query)),
+        LogicalStatement::Insert {
+            table_id,
+            table_name,
+            values,
+        } => PhysicalStatement::Insert {
+            table_id: *table_id,
+            table_name: table_name.clone(),
+            values: values.clone(),
+        },
+        LogicalStatement::Update {
+            input,
+            table_id,
+            assignments,
+        } => PhysicalStatement::Update {
+            input: plan(input),
+            table_id: *table_id,
+            assignments: assignments.clone(),
+        },
+        LogicalStatement::Delete { input, table_id } => PhysicalStatement::Delete {
+            input: plan(input),
+            table_id: *table_id,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PhysicalPlan, plan};
+    use super::{PhysicalPlan, PhysicalStatement, plan, plan_statement};
     use netbadb_rel::ColumnRef;
-    use netbadb_rel::LogicalPlan;
+    use netbadb_rel::{LogicalPlan, LogicalStatement};
     use netbadb_types::{ColumnId, PhysicalType, SemanticType, TableId};
 
     #[test]
@@ -83,5 +131,24 @@ mod tests {
             columns: vec![column],
         };
         assert!(matches!(plan(&logical), PhysicalPlan::SeqScan { .. }));
+    }
+
+    #[test]
+    fn preserves_a_dml_operator_above_its_physical_input() {
+        let logical = LogicalStatement::Delete {
+            input: LogicalPlan::Scan {
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: Vec::new(),
+            },
+            table_id: TableId(1),
+        };
+        assert!(matches!(
+            plan_statement(&logical),
+            PhysicalStatement::Delete {
+                input: PhysicalPlan::SeqScan { .. },
+                table_id: TableId(1),
+            }
+        ));
     }
 }

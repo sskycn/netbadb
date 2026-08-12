@@ -115,11 +115,33 @@ archive, replication, or PITR.
 Phase 3A does not expand projection to arbitrary expressions and does not add
 DML, joins, sorting, aggregation, indexes, or explain output.
 
-## Phase 3B — Typed DML
+## Phase 3B — Typed DML (complete)
 
-- typed INSERT, UPDATE, and DELETE plans;
-- affected-row results;
-- transaction integration for explicit and implicit DML.
+- typed statement AST, HIR, logical statements, and physical INSERT, UPDATE,
+  and DELETE plans;
+- explicit `AffectedRows(u64)` results and SELECT-compatible `execute`;
+- stable-RowId page delete/replace primitives, version 3 tombstones, and
+  deterministic page compaction without slot reuse;
+- sequential target collection with shared three-valued predicates and
+  simultaneous UPDATE assignments;
+- implicit statement transactions and explicit multi-statement transaction
+  integration, with whole-transaction rollback on mutating statement failure;
+- unchanged full-page-image WAL, runtime rollback, startup recovery, and
+  checkpoint machinery covering every DML mutation;
+- parser, typing, page boundary, fault-injection, recovery, and embedded
+  vertical integration tests.
+
+UPDATE preserves RowId but does not relocate a row. A replacement that cannot
+fit on its current page fails atomically. INSERT is currently one row with an
+explicit column list; there are no defaults, RETURNING, UPSERT, or subqueries.
+
+## Phase 3C — Join Execution
+
+- qualified columns and table aliases;
+- typed INNER JOIN syntax and predicates;
+- row-at-a-time nested-loop join physical execution;
+- SQL NULL join-predicate semantics;
+- deterministic compiler, planner, executor, and end-to-end tests.
 
 ## Phase 4 — Indexing and planning
 

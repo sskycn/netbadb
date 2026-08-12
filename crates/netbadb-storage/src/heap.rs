@@ -138,8 +138,48 @@ impl HeapStorage {
         }
     }
 
+    pub fn update(&mut self, row_id: RowId, values: &[ScalarValue]) -> Result<(), StorageError> {
+        let mut transaction = self.begin_transaction()?;
+        match self.update_in(&mut transaction, row_id, values) {
+            Ok(()) => {
+                transaction.commit()?;
+                Ok(())
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error),
+            },
+        }
+    }
+
+    pub fn delete(&mut self, row_id: RowId) -> Result<(), StorageError> {
+        let mut transaction = self.begin_transaction()?;
+        match self.delete_in(&mut transaction, row_id) {
+            Ok(()) => {
+                transaction.commit()?;
+                Ok(())
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error),
+            },
+        }
+    }
+
     pub fn begin_transaction(&mut self) -> Result<Transaction, StorageError> {
         self.transactions.begin()
+    }
+
+    /// Verifies that a transaction is active and belongs to this heap. DML
+    /// executors call this even when a predicate selects no rows.
+    pub fn validate_transaction(&self, transaction: &Transaction) -> Result<(), StorageError> {
+        if !transaction.belongs_to(self.transactions.wal()) {
+            return Err(TransactionError::ForeignTransaction {
+                txn_id: transaction.id(),
+            }
+            .into());
+        }
+        transaction.ensure_active()
     }
 
     pub fn insert_in(
@@ -216,6 +256,68 @@ impl HeapStorage {
         })
     }
 
+    pub fn read_row(&self, row_id: RowId) -> Result<Vec<ScalarValue>, StorageError> {
+        self.ensure_row_page(row_id)?;
+        let page = self.buffer.read_page(row_id.page)?;
+        let slot = SlotId(row_id.slot);
+        if page
+            .page()
+            .is_slot_deleted(slot)
+            .map_err(|error| map_row_error(error, row_id))?
+        {
+            return Err(StorageError::RowDeleted { row_id });
+        }
+        decode_row(
+            page.page()
+                .read_record(slot)
+                .map_err(|error| map_row_error(error, row_id))?,
+            &self.table,
+        )
+    }
+
+    pub fn update_in(
+        &mut self,
+        transaction: &mut Transaction,
+        row_id: RowId,
+        values: &[ScalarValue],
+    ) -> Result<(), StorageError> {
+        self.validate_transaction(transaction)?;
+        self.validate_row(values)?;
+        self.ensure_row_page(row_id)?;
+        let payload = encode_row(values)?;
+        transaction.acquire_writer()?;
+
+        let mut page = self.buffer.write_page(row_id.page)?;
+        let before = page.page().clone();
+        let mut after = before.clone();
+        after
+            .replace_record(SlotId(row_id.slot), &payload)
+            .map_err(|error| map_row_error(error, row_id))?;
+        transaction.log_page_update(&before, &mut after)?;
+        *page.page_mut() = after;
+        Ok(())
+    }
+
+    pub fn delete_in(
+        &mut self,
+        transaction: &mut Transaction,
+        row_id: RowId,
+    ) -> Result<(), StorageError> {
+        self.validate_transaction(transaction)?;
+        self.ensure_row_page(row_id)?;
+        transaction.acquire_writer()?;
+
+        let mut page = self.buffer.write_page(row_id.page)?;
+        let before = page.page().clone();
+        let mut after = before.clone();
+        after
+            .delete_record(SlotId(row_id.slot))
+            .map_err(|error| map_row_error(error, row_id))?;
+        transaction.log_page_update(&before, &mut after)?;
+        *page.page_mut() = after;
+        Ok(())
+    }
+
     pub fn scan(&mut self) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
         let mut rows = Vec::new();
         for page_number in FIRST_DATA_PAGE.0..self.buffer.page_count() {
@@ -231,6 +333,9 @@ impl HeapStorage {
             }
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
+                if page.page().is_slot_deleted(slot)? {
+                    continue;
+                }
                 let values = decode_row(page.page().read_record(slot)?, &self.table)?;
                 rows.push((
                     RowId {
@@ -381,6 +486,21 @@ impl HeapStorage {
             }
         }
         Ok(())
+    }
+
+    fn ensure_row_page(&self, row_id: RowId) -> Result<(), StorageError> {
+        if row_id.page < FIRST_DATA_PAGE || row_id.page.0 >= self.buffer.page_count() {
+            return Err(StorageError::RowNotFound { row_id });
+        }
+        Ok(())
+    }
+}
+
+fn map_row_error(error: StorageError, row_id: RowId) -> StorageError {
+    match error {
+        StorageError::Page(PageError::InvalidSlot { .. }) => StorageError::RowNotFound { row_id },
+        StorageError::Page(PageError::SlotDeleted { .. }) => StorageError::RowDeleted { row_id },
+        other => other,
     }
 }
 
@@ -719,6 +839,214 @@ mod tests {
     }
 
     #[test]
+    fn row_id_update_delete_and_tombstones_survive_reopen() {
+        let path = test_path("heap-row-mutation");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let first = storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("a long original value".into()),
+            ])
+            .expect("insert first");
+        let middle = storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("middle".into())])
+            .expect("insert middle");
+        let third = storage
+            .insert(&[ScalarValue::Int64(3), ScalarValue::Text("third".into())])
+            .expect("insert third");
+
+        storage
+            .update(
+                first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("x".into())],
+            )
+            .expect("shrink first");
+        storage
+            .update(
+                first,
+                &[
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("a replacement that grows again".into()),
+                ],
+            )
+            .expect("grow first");
+        storage.delete(middle).expect("delete middle");
+        assert!(matches!(
+            storage.read_row(middle),
+            Err(StorageError::RowDeleted { row_id }) if row_id == middle
+        ));
+        assert_eq!(
+            storage.read_row(third).expect("third remains")[0],
+            ScalarValue::Int64(3)
+        );
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        let rows = reopened.scan().expect("scan");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, first);
+        assert_eq!(rows[1].0, third);
+        assert!(matches!(
+            reopened.delete(middle),
+            Err(StorageError::RowDeleted { .. })
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn runtime_rollback_restores_updates_and_deletes() {
+        let path = test_path("heap-mutation-rollback");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let first = storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("first".into())])
+            .expect("insert first");
+        let second = storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("second".into())])
+            .expect("insert second");
+        let mut transaction = storage.begin_transaction().expect("begin");
+        storage
+            .update_in(
+                &mut transaction,
+                first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("updated".into())],
+            )
+            .expect("update");
+        storage.delete_in(&mut transaction, second).expect("delete");
+        transaction.rollback().expect("rollback");
+
+        assert_eq!(
+            storage.read_row(first).expect("restored update")[1],
+            ScalarValue::Text("first".into())
+        );
+        assert_eq!(
+            storage.read_row(second).expect("restored delete")[1],
+            ScalarValue::Text("second".into())
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn committed_and_loser_row_mutations_recover_from_full_page_images() {
+        let path = test_path("heap-mutation-recovery");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let first = storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("first".into())])
+            .expect("insert first");
+        let second = storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("second".into())])
+            .expect("insert second");
+        storage.close().expect("persist baseline");
+
+        let mut storage = HeapStorage::open(&path, table()).expect("open baseline");
+        let mut winner = storage.begin_transaction().expect("begin winner");
+        storage
+            .update_in(
+                &mut winner,
+                first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("committed".into())],
+            )
+            .expect("winner update");
+        winner.commit().expect("commit winner");
+        storage.simulate_crash();
+
+        let mut storage = HeapStorage::open(&path, table()).expect("redo winner");
+        assert_eq!(
+            storage.read_row(first).expect("committed row")[1],
+            ScalarValue::Text("committed".into())
+        );
+        let mut loser = storage.begin_transaction().expect("begin loser");
+        storage.delete_in(&mut loser, second).expect("loser delete");
+        storage.flush().expect("steal loser delete");
+        drop(loser);
+        storage.simulate_crash();
+
+        let recovered = HeapStorage::open(&path, table()).expect("undo loser");
+        assert_eq!(
+            recovered.read_row(second).expect("restored row")[1],
+            ScalarValue::Text("second".into())
+        );
+        drop(recovered);
+
+        let mut storage = HeapStorage::open(&path, table()).expect("open for delete winner");
+        let mut delete_winner = storage.begin_transaction().expect("begin delete winner");
+        storage
+            .delete_in(&mut delete_winner, second)
+            .expect("winner delete");
+        delete_winner.commit().expect("commit delete winner");
+        storage.simulate_crash();
+
+        let mut storage = HeapStorage::open(&path, table()).expect("redo delete winner");
+        assert!(matches!(
+            storage.read_row(second),
+            Err(StorageError::RowDeleted { .. })
+        ));
+        let mut update_loser = storage.begin_transaction().expect("begin update loser");
+        storage
+            .update_in(
+                &mut update_loser,
+                first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
+            )
+            .expect("loser update");
+        storage.flush().expect("steal loser update");
+        drop(update_loser);
+        storage.simulate_crash();
+
+        let recovered = HeapStorage::open(&path, table()).expect("undo update loser");
+        assert_eq!(
+            recovered.read_row(first).expect("restored winner value")[1],
+            ScalarValue::Text("committed".into())
+        );
+        assert!(matches!(
+            recovered.read_row(second),
+            Err(StorageError::RowDeleted { .. })
+        ));
+        drop(recovered);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mid_statement_delete_wal_failure_rolls_back_prior_deletes() {
+        let path = test_path("heap-delete-statement-failure");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let first = storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("first".into())])
+            .expect("insert first");
+        let second = storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("second".into())])
+            .expect("insert second");
+        let mut transaction = storage.begin_transaction().expect("begin statement");
+
+        storage
+            .delete_in(&mut transaction, first)
+            .expect("delete first target");
+        storage
+            .transactions
+            .wal()
+            .borrow_mut()
+            .inject_partial_append_failure(100);
+        assert!(matches!(
+            storage.delete_in(&mut transaction, second),
+            Err(StorageError::Wal(_))
+        ));
+        transaction
+            .rollback()
+            .expect("rollback whole failed statement");
+
+        assert_eq!(
+            storage.read_row(first).expect("first restored")[0],
+            ScalarValue::Int64(1)
+        );
+        assert_eq!(
+            storage.read_row(second).expect("second unchanged")[0],
+            ScalarValue::Int64(2)
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
     fn invalid_buffer_capacity_does_not_truncate_an_existing_heap() {
         let path = test_path("heap-invalid-capacity");
         let mut storage = HeapStorage::create(&path, table()).expect("create heap");
@@ -816,7 +1144,7 @@ mod tests {
         let mut pages = PageManager::open(&path).expect("open page manager");
         let mut page = pages.read_page(PageId(1)).expect("read data page");
         page.bytes_mut()[crate::PAGE_HEADER_SIZE + 2..crate::PAGE_HEADER_SIZE + 4]
-            .copy_from_slice(&u16::MAX.to_le_bytes());
+            .copy_from_slice(&(u16::MAX - 1).to_le_bytes());
         pages.write_page(&page).expect("write corrupt slot");
         pages.sync().expect("sync corrupt slot");
         drop(pages);

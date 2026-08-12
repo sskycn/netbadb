@@ -40,15 +40,15 @@ The current embedded path is synchronous:
 ```text
 Rust Schema API
     ↓
-SELECT / FROM / WHERE / LIMIT + typed NULL expression parser
+SELECT + typed INSERT / UPDATE / DELETE statement parser
     ↓
 Typed HIR
     ↓
-Logical relational plan
+Logical query / DML statement plan
     ↓
 Sequential-scan physical plan
     ↓
-Filter / projection / limit executor
+Filter / projection / limit + RowId mutation executor
     ↓
 Heap
     ↓
@@ -130,36 +130,40 @@ The current code genuinely supports:
 - Cargo workspace compilation and unit/integration tests;
 - Canonical schema definitions with nullable, primary-key, physical, and
   semantic type metadata;
-- parser support for `SELECT`, `FROM`, `WHERE`, `LIMIT`, wildcard projection,
-  `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`,
-  integer/string/boolean/NULL literals, and parentheses;
+- parser support for `SELECT`, explicit-column single-row `INSERT`, `UPDATE`,
+  `DELETE`, optional DML `WHERE`, `LIMIT`, wildcard projection,
+  `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
+  boolean/NULL literals, and parentheses;
 - name resolution and expression type checking with nominal semantic types and
   explicit nullability;
-- typed HIR and logical relational IR;
+- typed query/DML HIR and logical relational IR;
 - sequential-scan physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
-- version 2 slotted heap pages with persistent pageLSNs and checked bounds;
+- version 3 slotted heap pages with persistent pageLSNs, explicit deleted-slot
+  tombstones, and checked bounds;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
 - versioned little-endian WAL records for begin, full-page update, commit,
   abort, and rollback completion, with strong LSNs and per-transaction prevLSN
   chains;
-- explicit transaction handles plus implicit single-insert transactions;
+- explicit transaction handles plus implicit statement transactions;
 - commit durability through WAL sync and WAL-before-data-page writeback;
 - lazy single-writer admission and synchronous physical runtime rollback;
 - synchronous startup recovery with analysis, repeat-history redo, and
   reverse-LSN undo of incomplete or aborted transactions;
 - explicit quiescent checkpoints with bounded two-generation WAL retention,
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
-- insert, scan, file reopen, row encoding, and row decoding;
-- executor support for filter, projection, limit, SQL three-valued boolean
-  logic, and NULL comparisons;
+- RowId-based insert, update, delete, scan, file reopen, row encoding, and row
+  decoding;
+- executor support for filter, projection, limit, typed DML, affected-row
+  results, SQL three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
-The experimental storage format uses versioned slotted pages. Phase 2A bumps
-data pages from version 1 to version 2 to add pageLSN; old pages are rejected
-rather than guessed or migrated. Files created by the pre-Foundation
-sequential `HEAP` page prototype are likewise not migrated.
+The experimental storage format uses versioned slotted pages. Phase 2A bumped
+data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
+version 3 because a formerly invalid slot encoding now means Deleted. Versions
+1 and 2 are rejected rather than guessed or migrated. Files created by the
+pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`. Creation uses create-new semantics and refuses to
@@ -243,6 +247,24 @@ are the explicit tests. `AND`, `OR`, and `NOT` use SQL three-valued logic, and a
 independently enforce schema nullability, including through the embedded insert
 API.
 
+Typed DML uses the same compiler, transaction, full-page WAL, rollback, and
+recovery path as heap writes. `Database::execute` returns either query rows or
+an explicit `AffectedRows(u64)` result; `query` rejects mutating statements.
+Single-row INSERT requires an explicit column list. Omitted nullable columns
+become NULL, while omitted non-nullable columns are rejected. UPDATE evaluates
+all right-hand sides against the original row, and UPDATE/DELETE reuse the
+SELECT predicate evaluator, so FALSE and UNKNOWN do not mutate a row.
+
+Mutation is located by an internal `RowId` (`PageId + SlotId`) that is never
+exposed as a SQL column. DELETE compacts tuple bytes without renumbering slots;
+the slot becomes an explicit tombstone and is not reused. UPDATE rebuilds the
+current 4 KiB page while preserving the slot. If a larger replacement cannot
+fit on that page, the statement returns `UpdateWouldOverflowPage` and rolls
+back atomically; row relocation and forwarding pointers are not implemented.
+Implicit DML owns one transaction. `execute_in` supports multiple statements
+in an explicit transaction; until savepoints exist, an execution-time DML
+failure rolls back that whole transaction.
+
 ## Go and protocol strategy
 
 Go is no longer treated as the database implementation language. The intended
@@ -303,12 +325,14 @@ The implementation sequence is intentionally vertical:
    monotonic logical LSNs, and crash-safe bounded WAL generation recycling.
 7. Typed expressions + NULL semantics (Phase 3A) — contextual NULL typing,
    expression nullability, three-valued logic, and explicit NULL predicates.
-8. Typed DML (Phase 3B) — insert/update/delete plans, affected-row results, and
-   transaction integration.
-9. Indexing — B+Tree and planner access-path selection.
-10. Server mode — protocol, sessions, and `netbadbd`.
-11. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-12. Advanced optimization — statistics, cost model, joins, and rewrite rules.
+8. Typed DML (Phase 3B) — typed insert/update/delete plans, stable-RowId page
+   mutation, affected-row results, and atomic WAL-backed execution. Complete.
+9. Join execution (Phase 3C) — qualified columns, aliases, typed INNER JOIN,
+   nested-loop execution, and NULL-aware join predicates.
+10. Indexing — B+Tree and planner access-path selection.
+11. Server mode — protocol, sessions, and `netbadbd`.
+12. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+13. Advanced optimization — statistics, cost model, and rewrite rules.
 
 Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
 are roadmap items, not implemented features in this slice.

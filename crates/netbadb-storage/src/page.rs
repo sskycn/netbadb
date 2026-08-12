@@ -11,7 +11,7 @@ pub const PAGE_SIZE: usize = 4 * 1024;
 /// Magic for versioned database pages. The explicit version field remains
 /// separate so a decoder never has to infer layout from a magic string.
 pub const PAGE_MAGIC: &[u8; 4] = b"NBP1";
-pub const PAGE_FORMAT_VERSION: u16 = 2;
+pub const PAGE_FORMAT_VERSION: u16 = 3;
 pub const PAGE_HEADER_SIZE: usize = 24;
 pub const SLOT_SIZE: usize = 4;
 
@@ -22,6 +22,8 @@ const SLOT_COUNT_OFFSET: usize = 8;
 const FREE_START_OFFSET: usize = 10;
 const FREE_END_OFFSET: usize = 12;
 const PAGE_LSN_OFFSET: usize = 16;
+const DELETED_SLOT_OFFSET: u16 = 0;
+const DELETED_SLOT_LENGTH: u16 = u16::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
@@ -196,6 +198,17 @@ impl Page {
         for index in 0..slot_count {
             let slot_id = SlotId(index);
             let slot = self.slot_at(slot_id);
+            if is_deleted_slot(slot) {
+                continue;
+            }
+            if slot.offset == DELETED_SLOT_OFFSET || slot.length == DELETED_SLOT_LENGTH {
+                return Err(PageError::InvalidDeletedSlotEncoding {
+                    slot: slot_id,
+                    offset: slot.offset,
+                    length: slot.length,
+                }
+                .into());
+            }
             let offset = usize::from(slot.offset);
             let end = offset.checked_add(usize::from(slot.length)).ok_or(
                 PageError::RecordOutOfBounds {
@@ -220,16 +233,16 @@ impl Page {
                 }
                 .into());
             }
-            for (other_index, &(other_start, other_end)) in ranges.iter().enumerate() {
+            for &(other_slot, other_start, other_end) in &ranges {
                 if offset < other_end && other_start < end {
                     return Err(PageError::OverlappingRecords {
-                        first: SlotId(other_index as u16),
+                        first: other_slot,
                         second: slot_id,
                     }
                     .into());
                 }
             }
-            ranges.push((offset, end));
+            ranges.push((slot_id, offset, end));
         }
 
         Ok(PageHeader {
@@ -246,7 +259,19 @@ impl Page {
         if slot.0 >= header.slot_count {
             return Err(PageError::InvalidSlot { slot }.into());
         }
-        Ok(self.slot_at(slot))
+        let entry = self.slot_at(slot);
+        if is_deleted_slot(entry) {
+            return Err(PageError::SlotDeleted { slot }.into());
+        }
+        Ok(entry)
+    }
+
+    pub fn is_slot_deleted(&self, slot: SlotId) -> Result<bool, StorageError> {
+        let header = self.header()?;
+        if slot.0 >= header.slot_count {
+            return Err(PageError::InvalidSlot { slot }.into());
+        }
+        Ok(is_deleted_slot(self.slot_at(slot)))
     }
 
     pub fn read_record(&self, slot: SlotId) -> Result<&[u8], StorageError> {
@@ -332,6 +357,129 @@ impl Page {
         Ok(slot)
     }
 
+    /// Marks a live slot deleted and compacts the remaining payloads without
+    /// renumbering or reusing any slot.
+    pub fn delete_record(&mut self, slot: SlotId) -> Result<(), StorageError> {
+        let mut records = self.live_records()?;
+        let target = records
+            .get_mut(usize::from(slot.0))
+            .ok_or(PageError::InvalidSlot { slot })?;
+        if target.is_none() {
+            return Err(PageError::SlotDeleted { slot }.into());
+        }
+        *target = None;
+        self.rebuild_records(&records, None)
+    }
+
+    /// Replaces one live slot while preserving its SlotId. The page remains
+    /// byte-for-byte unchanged when the replacement cannot fit.
+    pub fn replace_record(&mut self, slot: SlotId, record: &[u8]) -> Result<(), StorageError> {
+        let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+        if record.len() > max_record_size || record.len() > u16::MAX as usize {
+            return Err(PageError::RecordTooLarge {
+                size: record.len(),
+                capacity: max_record_size,
+            }
+            .into());
+        }
+        let mut records = self.live_records()?;
+        let target = records
+            .get_mut(usize::from(slot.0))
+            .ok_or(PageError::InvalidSlot { slot })?;
+        if target.is_none() {
+            return Err(PageError::SlotDeleted { slot }.into());
+        }
+        *target = Some(record.to_vec());
+        self.rebuild_records(&records, Some((slot, record.len())))
+    }
+
+    fn live_records(&self) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        let header = self.header()?;
+        (0..header.slot_count)
+            .map(|index| {
+                let slot = SlotId(index);
+                if is_deleted_slot(self.slot_at(slot)) {
+                    Ok(None)
+                } else {
+                    Ok(Some(self.read_record(slot)?.to_vec()))
+                }
+            })
+            .collect()
+    }
+
+    fn rebuild_records(
+        &mut self,
+        records: &[Option<Vec<u8>>],
+        replacement: Option<(SlotId, usize)>,
+    ) -> Result<(), StorageError> {
+        let header = self.header()?;
+        let directory_end = PAGE_HEADER_SIZE
+            .checked_add(
+                records
+                    .len()
+                    .checked_mul(SLOT_SIZE)
+                    .ok_or(PageError::InvalidSlotCount(header.slot_count))?,
+            )
+            .ok_or(PageError::InvalidSlotCount(header.slot_count))?;
+        let payload_size = records.iter().try_fold(0_usize, |total, record| {
+            total
+                .checked_add(record.as_ref().map_or(0, Vec::len))
+                .ok_or(PageError::RecordTooLarge {
+                    size: usize::MAX,
+                    capacity: PAGE_SIZE.saturating_sub(directory_end),
+                })
+        })?;
+        let capacity = PAGE_SIZE.saturating_sub(directory_end);
+        if payload_size > capacity {
+            if let Some((slot, size)) = replacement {
+                return Err(PageError::UpdateWouldOverflowPage {
+                    slot,
+                    size,
+                    capacity: capacity.saturating_sub(payload_size.saturating_sub(size)),
+                }
+                .into());
+            }
+            return Err(PageError::PageFull {
+                required: payload_size,
+                available: capacity,
+            }
+            .into());
+        }
+
+        let mut rebuilt = Page::new(self.id, header.page_type);
+        if let Some(page_lsn) = header.page_lsn {
+            rebuilt.set_page_lsn(page_lsn);
+        }
+        rebuilt.write_u16(SLOT_COUNT_OFFSET, header.slot_count);
+        rebuilt.write_u16(FREE_START_OFFSET, directory_end as u16);
+        let mut free_end = PAGE_SIZE;
+        for (index, record) in records.iter().enumerate() {
+            let entry_offset = PAGE_HEADER_SIZE + index * SLOT_SIZE;
+            match record {
+                Some(record) => {
+                    free_end = free_end
+                        .checked_sub(record.len())
+                        .ok_or(PageError::PageFull {
+                            required: payload_size,
+                            available: capacity,
+                        })?;
+                    let end = free_end + record.len();
+                    rebuilt.bytes[free_end..end].copy_from_slice(record);
+                    rebuilt.write_u16(entry_offset, free_end as u16);
+                    rebuilt.write_u16(entry_offset + 2, record.len() as u16);
+                }
+                None => {
+                    rebuilt.write_u16(entry_offset, DELETED_SLOT_OFFSET);
+                    rebuilt.write_u16(entry_offset + 2, DELETED_SLOT_LENGTH);
+                }
+            }
+        }
+        rebuilt.write_u16(FREE_END_OFFSET, free_end as u16);
+        rebuilt.header()?;
+        *self = rebuilt;
+        Ok(())
+    }
+
     fn slot_at(&self, slot: SlotId) -> Slot {
         let offset = PAGE_HEADER_SIZE + usize::from(slot.0) * SLOT_SIZE;
         Slot {
@@ -360,6 +508,10 @@ impl Page {
     fn write_u16(&mut self, offset: usize, value: u16) {
         self.bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
+}
+
+const fn is_deleted_slot(slot: Slot) -> bool {
+    slot.offset == DELETED_SLOT_OFFSET && slot.length == DELETED_SLOT_LENGTH
 }
 
 /// Synchronous fixed-page I/O. This type owns the file but does not interpret
@@ -572,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn page_lsn_round_trips_and_version_one_is_rejected() {
+    fn page_lsn_round_trips_and_older_versions_are_rejected() {
         let mut page = Page::new(PageId(1), PageType::Heap);
         page.set_page_lsn(Lsn(1234));
         let decoded = Page::from_bytes(PageId(1), *page.bytes());
@@ -583,6 +735,12 @@ mod tests {
         assert!(matches!(
             version_one.header(),
             Err(StorageError::Page(PageError::UnsupportedVersion(1)))
+        ));
+        let mut version_two = Page::new(PageId(3), PageType::Heap);
+        version_two.bytes_mut()[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(matches!(
+            version_two.header(),
+            Err(StorageError::Page(PageError::UnsupportedVersion(2)))
         ));
     }
 
@@ -622,6 +780,66 @@ mod tests {
             page.read_record(non_empty).expect("read non-empty record"),
             b"value"
         );
+        page.delete_record(empty).expect("delete empty record");
+        assert!(matches!(
+            page.read_record(empty),
+            Err(StorageError::Page(PageError::SlotDeleted { slot })) if slot == empty
+        ));
+        assert_eq!(
+            page.read_record(non_empty).expect("read stable record"),
+            b"value"
+        );
+    }
+
+    #[test]
+    fn delete_compacts_payloads_without_renumbering_slots() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let first = page.insert_record(b"first").expect("insert first");
+        let middle = page.insert_record(b"middle").expect("insert middle");
+        let third = page.insert_record(b"third").expect("insert third");
+
+        page.delete_record(middle).expect("delete middle");
+        assert_eq!(page.read_record(first).expect("first remains"), b"first");
+        assert_eq!(page.read_record(third).expect("third remains"), b"third");
+        assert!(page.is_slot_deleted(middle).expect("deleted state"));
+        assert_eq!(page.header().expect("valid compacted page").slot_count, 3);
+        assert!(matches!(
+            page.delete_record(middle),
+            Err(StorageError::Page(PageError::SlotDeleted { .. }))
+        ));
+    }
+
+    #[test]
+    fn replace_record_grows_and_shrinks_without_changing_slot() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let first = page
+            .insert_record(b"a long original")
+            .expect("insert first");
+        let second = page.insert_record(b"second").expect("insert second");
+        page.replace_record(first, b"x").expect("shrink");
+        assert_eq!(page.read_record(first).expect("read shrink"), b"x");
+        page.replace_record(first, b"a substantially longer replacement")
+            .expect("grow");
+        assert_eq!(
+            page.read_record(first).expect("read grow"),
+            b"a substantially longer replacement"
+        );
+        assert_eq!(page.read_record(second).expect("stable second"), b"second");
+    }
+
+    #[test]
+    fn overflowing_replace_leaves_page_unchanged() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let first = page.insert_record(b"first").expect("insert first");
+        page.insert_record(&[7; 3_900]).expect("fill page");
+        let before = page.clone();
+        assert!(matches!(
+            page.replace_record(first, &[8; 200]),
+            Err(StorageError::Page(
+                PageError::UpdateWouldOverflowPage { .. }
+            ))
+        ));
+        assert_eq!(page, before);
     }
 
     #[test]
@@ -681,10 +899,23 @@ mod tests {
         invalid_slot.bytes_mut()[super::PAGE_HEADER_SIZE..super::PAGE_HEADER_SIZE + 2]
             .copy_from_slice(&1_u16.to_le_bytes());
         invalid_slot.bytes_mut()[super::PAGE_HEADER_SIZE + 2..super::PAGE_HEADER_SIZE + 4]
-            .copy_from_slice(&u16::MAX.to_le_bytes());
+            .copy_from_slice(&(u16::MAX - 1).to_le_bytes());
         assert!(matches!(
             invalid_slot.header(),
             Err(StorageError::Page(PageError::RecordOutOfBounds { .. }))
+        ));
+
+        let mut invalid_deleted = Page::new(PageId(6), PageType::Heap);
+        invalid_deleted
+            .insert_record(b"safe")
+            .expect("insert record");
+        invalid_deleted.bytes_mut()[super::PAGE_HEADER_SIZE..super::PAGE_HEADER_SIZE + 2]
+            .copy_from_slice(&0_u16.to_le_bytes());
+        assert!(matches!(
+            invalid_deleted.header(),
+            Err(StorageError::Page(
+                PageError::InvalidDeletedSlotEncoding { .. }
+            ))
         ));
     }
 

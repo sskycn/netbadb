@@ -25,6 +25,44 @@ pub struct Query {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Statement {
+    Select(Query),
+    Insert(InsertStatement),
+    Update(UpdateStatement),
+    Delete(DeleteStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertStatement {
+    pub table: Ident,
+    pub columns: Vec<Ident>,
+    pub values: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub column: Ident,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateStatement {
+    pub table: Ident,
+    pub assignments: Vec<Assignment>,
+    pub selection: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteStatement {
+    pub table: Ident,
+    pub selection: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
     Wildcard(Span),
     Column(Ident),
@@ -104,6 +142,12 @@ enum TokenKind {
     From,
     Where,
     Limit,
+    Insert,
+    Into,
+    Values,
+    Update,
+    Set,
+    Delete,
     And,
     Or,
     Is,
@@ -124,6 +168,7 @@ enum TokenKind {
     GtEq,
     LParen,
     RParen,
+    Semicolon,
     Eof,
 }
 
@@ -134,12 +179,22 @@ struct Token {
 }
 
 pub fn parse(input: &str) -> Result<Query, ParseError> {
+    match parse_statement(input)? {
+        Statement::Select(query) => Ok(query),
+        statement => Err(ParseError {
+            message: "expected a SELECT statement".into(),
+            span: statement_span(&statement),
+        }),
+    }
+}
+
+pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
     let tokens = tokenize(input)?;
     Parser {
         tokens,
         position: 0,
     }
-    .parse_query()
+    .parse_statement()
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
@@ -170,6 +225,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             b')' => {
                 position += 1;
                 TokenKind::RParen
+            }
+            b';' => {
+                position += 1;
+                TokenKind::Semicolon
             }
             b'=' => {
                 position += 1;
@@ -243,6 +302,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "FROM" => TokenKind::From,
                     "WHERE" => TokenKind::Where,
                     "LIMIT" => TokenKind::Limit,
+                    "INSERT" => TokenKind::Insert,
+                    "INTO" => TokenKind::Into,
+                    "VALUES" => TokenKind::Values,
+                    "UPDATE" => TokenKind::Update,
+                    "SET" => TokenKind::Set,
+                    "DELETE" => TokenKind::Delete,
                     "AND" => TokenKind::And,
                     "OR" => TokenKind::Or,
                     "IS" => TokenKind::Is,
@@ -287,7 +352,22 @@ struct Parser {
 }
 
 impl Parser {
-    fn parse_query(mut self) -> Result<Query, ParseError> {
+    fn parse_statement(mut self) -> Result<Statement, ParseError> {
+        let statement = match self.current().kind {
+            TokenKind::Select => Statement::Select(self.parse_query()?),
+            TokenKind::Insert => Statement::Insert(self.parse_insert()?),
+            TokenKind::Update => Statement::Update(self.parse_update()?),
+            TokenKind::Delete => Statement::Delete(self.parse_delete()?),
+            _ => return Err(self.error_here("expected SELECT, INSERT, UPDATE, or DELETE")),
+        };
+        if self.matches(&TokenKind::Semicolon) {
+            self.position += 1;
+        }
+        self.expect_simple(TokenKind::Eof)?;
+        Ok(statement)
+    }
+
+    fn parse_query(&mut self) -> Result<Query, ParseError> {
         let start = self.expect_simple(TokenKind::Select)?.span.start;
         let projection = self.parse_projection()?;
         self.expect_simple(TokenKind::From)?;
@@ -311,13 +391,114 @@ impl Parser {
         } else {
             None
         };
-        let end = self.expect_simple(TokenKind::Eof)?.span.end;
+        let end = self.current().span.start;
         Ok(Query {
             projection,
             from,
             selection,
             limit,
             span: Span { start, end },
+        })
+    }
+
+    fn parse_insert(&mut self) -> Result<InsertStatement, ParseError> {
+        let start = self.expect_simple(TokenKind::Insert)?.span.start;
+        self.expect_simple(TokenKind::Into)?;
+        let table = self.expect_ident()?;
+        self.expect_simple(TokenKind::LParen)?;
+        let columns = self.parse_identifier_list()?;
+        self.expect_simple(TokenKind::RParen)?;
+        self.expect_simple(TokenKind::Values)?;
+        self.expect_simple(TokenKind::LParen)?;
+        let values = self.parse_expression_list()?;
+        let end = self.expect_simple(TokenKind::RParen)?.span.end;
+        Ok(InsertStatement {
+            table,
+            columns,
+            values,
+            span: Span { start, end },
+        })
+    }
+
+    fn parse_update(&mut self) -> Result<UpdateStatement, ParseError> {
+        let start = self.expect_simple(TokenKind::Update)?.span.start;
+        let table = self.expect_ident()?;
+        self.expect_simple(TokenKind::Set)?;
+        let mut assignments = vec![self.parse_assignment()?];
+        while self.matches(&TokenKind::Comma) {
+            self.position += 1;
+            assignments.push(self.parse_assignment()?);
+        }
+        let selection = if self.matches(&TokenKind::Where) {
+            self.position += 1;
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        let assignment_end = assignments
+            .last()
+            .map_or(table.span.end, |assignment| assignment.span.end);
+        let end = selection
+            .as_ref()
+            .map_or(assignment_end, |expr| expr_span(expr).end);
+        Ok(UpdateStatement {
+            table,
+            assignments,
+            selection,
+            span: Span { start, end },
+        })
+    }
+
+    fn parse_delete(&mut self) -> Result<DeleteStatement, ParseError> {
+        let start = self.expect_simple(TokenKind::Delete)?.span.start;
+        self.expect_simple(TokenKind::From)?;
+        let table = self.expect_ident()?;
+        let selection = if self.matches(&TokenKind::Where) {
+            self.position += 1;
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        let end = selection
+            .as_ref()
+            .map_or(table.span.end, |expression| expr_span(expression).end);
+        Ok(DeleteStatement {
+            table,
+            selection,
+            span: Span { start, end },
+        })
+    }
+
+    fn parse_identifier_list(&mut self) -> Result<Vec<Ident>, ParseError> {
+        let mut identifiers = vec![self.expect_ident()?];
+        while self.matches(&TokenKind::Comma) {
+            self.position += 1;
+            identifiers.push(self.expect_ident()?);
+        }
+        Ok(identifiers)
+    }
+
+    fn parse_expression_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut expressions = vec![self.parse_expr(0)?];
+        while self.matches(&TokenKind::Comma) {
+            self.position += 1;
+            expressions.push(self.parse_expr(0)?);
+        }
+        Ok(expressions)
+    }
+
+    fn parse_assignment(&mut self) -> Result<Assignment, ParseError> {
+        let column = self.expect_ident()?;
+        self.expect_simple(TokenKind::Eq)?;
+        let value = self.parse_expr(0)?;
+        let span = Span {
+            start: column.span.start,
+            end: expr_span(&value).end,
+        };
+        Ok(Assignment {
+            column,
+            value,
+            span,
         })
     }
 
@@ -522,9 +703,18 @@ fn expr_span(expression: &Expr) -> Span {
     }
 }
 
+fn statement_span(statement: &Statement) -> Span {
+    match statement {
+        Statement::Select(statement) => statement.span,
+        Statement::Insert(statement) => statement.span,
+        Statement::Update(statement) => statement.span,
+        Statement::Delete(statement) => statement.span,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, Literal, SelectItem, UnaryOp, parse};
+    use super::{BinaryOp, Expr, Literal, SelectItem, Statement, UnaryOp, parse, parse_statement};
 
     #[test]
     fn parses_the_initial_query_subset() {
@@ -640,5 +830,54 @@ mod tests {
             assert!(error.span.start <= error.span.end);
             assert!(error.span.end <= source.len());
         }
+    }
+
+    #[test]
+    fn parses_insert_update_and_delete_statements() {
+        let insert =
+            parse_statement("INSERT INTO users (id, name, nickname) VALUES (1, 'Ada', NULL);")
+                .expect("insert parses");
+        assert!(matches!(
+            insert,
+            Statement::Insert(statement)
+                if statement.columns.len() == 3 && statement.values.len() == 3
+        ));
+
+        let update =
+            parse_statement("UPDATE users SET nickname = 'ada', active = NOT active WHERE id = 1;")
+                .expect("update parses");
+        assert!(matches!(
+            update,
+            Statement::Update(statement)
+                if statement.assignments.len() == 2 && statement.selection.is_some()
+        ));
+
+        let delete =
+            parse_statement("DELETE FROM users WHERE nickname IS NULL;").expect("delete parses");
+        assert!(matches!(
+            delete,
+            Statement::Delete(statement) if statement.selection.is_some()
+        ));
+    }
+
+    #[test]
+    fn reports_structural_dml_errors_with_spans() {
+        for source in [
+            "INSERT users (id) VALUES (1)",
+            "INSERT INTO users (id) (1)",
+            "UPDATE users id = 1",
+            "UPDATE users SET",
+            "DELETE users WHERE id = 1",
+            "DELETE FROM users WHERE",
+        ] {
+            let error = parse_statement(source).expect_err("invalid DML");
+            assert!(error.span.start <= error.span.end);
+            assert!(error.span.end <= source.len());
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_statements() {
+        assert!(parse_statement("DELETE FROM users; DELETE FROM users").is_err());
     }
 }

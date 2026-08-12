@@ -3,15 +3,25 @@
 use std::error::Error;
 use std::fmt;
 
-use netbadb_hir::{ColumnRef as HirColumnRef, HirError, TypedExpr, TypedExprKind, TypedQuery};
-use netbadb_parser::{ParseError, parse};
-use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, UnaryOp};
+use netbadb_hir::{
+    ColumnRef as HirColumnRef, HirError, TypedExpr, TypedExprKind, TypedQuery, TypedStatement,
+};
+use netbadb_parser::{ParseError, parse, parse_statement};
+use netbadb_rel::{
+    Assignment, BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement, UnaryOp,
+};
 use netbadb_schema::Schema;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledQuery {
     pub hir: TypedQuery,
     pub logical_plan: LogicalPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledStatement {
+    pub hir: TypedStatement,
+    pub logical_statement: LogicalStatement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +100,98 @@ pub fn compile(schema: &Schema, source: &str) -> Result<CompiledQuery, CompileEr
     Ok(CompiledQuery { hir, logical_plan })
 }
 
+pub fn compile_statement(schema: &Schema, source: &str) -> Result<CompiledStatement, CompileError> {
+    let ast = parse_statement(source)?;
+    let hir = netbadb_hir::lower_statement(schema, &ast)?;
+    let logical_statement = lower_statement(&hir);
+    Ok(CompiledStatement {
+        hir,
+        logical_statement,
+    })
+}
+
+fn lower_statement(statement: &TypedStatement) -> LogicalStatement {
+    match statement {
+        TypedStatement::Select(query) => LogicalStatement::Query(lower_query_plan(query)),
+        TypedStatement::Insert(insert) => LogicalStatement::Insert {
+            table_id: insert.table_id,
+            table_name: insert.table_name.clone(),
+            values: insert.values.iter().map(lower_expr).collect(),
+        },
+        TypedStatement::Update(update) => LogicalStatement::Update {
+            input: scan_and_filter(
+                update.table_id,
+                &update.table_name,
+                &update.columns,
+                update.selection.as_ref(),
+            ),
+            table_id: update.table_id,
+            assignments: update
+                .assignments
+                .iter()
+                .map(|assignment| Assignment {
+                    column: column_ref_from_hir(&assignment.column),
+                    value: lower_expr(&assignment.value),
+                })
+                .collect(),
+        },
+        TypedStatement::Delete(delete) => LogicalStatement::Delete {
+            input: scan_and_filter(
+                delete.table_id,
+                &delete.table_name,
+                &delete.columns,
+                delete.selection.as_ref(),
+            ),
+            table_id: delete.table_id,
+        },
+    }
+}
+
+fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
+    let mut plan = LogicalPlan::Scan {
+        table_id: query.table_id,
+        table_name: query.table_name.clone(),
+        columns: query.columns.iter().map(column_ref_from_hir).collect(),
+    };
+    if let Some(predicate) = &query.selection {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: lower_expr(predicate),
+        };
+    }
+    plan = LogicalPlan::Project {
+        input: Box::new(plan),
+        columns: query.projection.iter().map(column_ref_from_hir).collect(),
+    };
+    if let Some(limit) = query.limit {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit,
+        };
+    }
+    plan
+}
+
+fn scan_and_filter(
+    table_id: netbadb_types::TableId,
+    table_name: &str,
+    columns: &[HirColumnRef],
+    selection: Option<&TypedExpr>,
+) -> LogicalPlan {
+    let mut plan = LogicalPlan::Scan {
+        table_id,
+        table_name: table_name.to_owned(),
+        columns: columns.iter().map(column_ref_from_hir).collect(),
+    };
+    if let Some(predicate) = selection {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: lower_expr(predicate),
+        };
+    }
+    plan
+}
+
 fn column_ref(table_id: netbadb_types::TableId, column: &netbadb_schema::ColumnDef) -> ColumnRef {
     ColumnRef {
         table_id,
@@ -157,8 +259,8 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
 
 #[cfg(test)]
 mod tests {
-    use super::compile;
-    use netbadb_rel::{ExprKind, LogicalPlan};
+    use super::{compile, compile_statement};
+    use netbadb_rel::{ExprKind, LogicalPlan, LogicalStatement};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -206,5 +308,41 @@ mod tests {
             ExprKind::IsNull { negated: true, .. }
         ));
         assert!(!predicate.expr_type.nullable);
+    }
+
+    #[test]
+    fn compiles_typed_dml_statements() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "nickname",
+                    TypeSpec::Physical(PhysicalType::Text),
+                )
+                .nullable(true),
+            ],
+        )]);
+        assert!(matches!(
+            compile_statement(&schema, "INSERT INTO users (id, name) VALUES (1, 'Ada')")
+                .expect("compile insert")
+                .logical_statement,
+            LogicalStatement::Insert { .. }
+        ));
+        assert!(matches!(
+            compile_statement(&schema, "UPDATE users SET nickname = name WHERE id = 1")
+                .expect("compile update")
+                .logical_statement,
+            LogicalStatement::Update { .. }
+        ));
+        assert!(matches!(
+            compile_statement(&schema, "DELETE FROM users WHERE nickname IS NULL")
+                .expect("compile delete")
+                .logical_statement,
+            LogicalStatement::Delete { .. }
+        ));
     }
 }
