@@ -63,6 +63,9 @@ pub enum WalError {
         expected: Option<Lsn>,
         actual: Option<Lsn>,
     },
+    InvalidPartialPrevLsn {
+        lsn: Lsn,
+    },
     InvalidTransactionSequence {
         lsn: Lsn,
         txn_id: TxnId,
@@ -140,6 +143,11 @@ impl fmt::Display for WalError {
             } => write!(
                 formatter,
                 "WAL record at {} has prevLSN {actual:?}, expected {expected:?}",
+                lsn.0
+            ),
+            Self::InvalidPartialPrevLsn { lsn } => write!(
+                formatter,
+                "partial WAL record at {} has a mismatched prevLSN prefix",
                 lsn.0
             ),
             Self::InvalidTransactionSequence {
@@ -286,8 +294,26 @@ impl WalManager {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let path = path.as_ref().to_owned();
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let records = scan_file(&mut file)?;
-        let length = file.metadata()?.len();
+        let scan = scan_file(&mut file, TailPolicy::Reject)?;
+        Ok(Self::from_scan(file, path, &scan.records, scan.valid_end))
+    }
+
+    pub(crate) fn open_for_recovery(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
+        let path = path.as_ref().to_owned();
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let scan = scan_file(&mut file, TailPolicy::AllowIncompleteFinalRecord)?;
+        if scan.incomplete_tail {
+            file.set_len(scan.valid_end)?;
+            file.sync_data()?;
+        }
+        let records = scan.records;
+        let manager = Self::from_scan(file, path, &records, scan.valid_end);
+        Ok((manager, records, scan.incomplete_tail))
+    }
+
+    fn from_scan(file: File, path: PathBuf, records: &[WalRecord], length: u64) -> Self {
         let last_lsn = records.last().map(|record| record.lsn);
         let last_by_txn = records
             .iter()
@@ -304,7 +330,7 @@ impl WalManager {
             );
             states
         });
-        Ok(Self {
+        Self {
             file,
             path,
             next_lsn: Lsn(length),
@@ -320,7 +346,7 @@ impl WalManager {
             fail_next_flush: false,
             #[cfg(test)]
             fail_next_append_after: None,
-        })
+        }
     }
 
     #[must_use]
@@ -425,7 +451,7 @@ impl WalManager {
 
     pub fn scan(&mut self) -> Result<Vec<WalRecord>, WalError> {
         self.ensure_healthy()?;
-        scan_file(&mut self.file)
+        Ok(scan_file(&mut self.file, TailPolicy::Reject)?.records)
     }
 
     pub fn close(mut self) -> Result<(), WalError> {
@@ -496,7 +522,20 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
     Ok(bytes)
 }
 
-fn scan_file(file: &mut File) -> Result<Vec<WalRecord>, WalError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailPolicy {
+    Reject,
+    AllowIncompleteFinalRecord,
+}
+
+#[derive(Debug)]
+struct ScanResult {
+    records: Vec<WalRecord>,
+    valid_end: u64,
+    incomplete_tail: bool,
+}
+
+fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, WalError> {
     let length = file.metadata()?.len();
     if length < WAL_HEADER_SIZE as u64 {
         return Err(WalError::TruncatedHeader);
@@ -527,6 +566,17 @@ fn scan_file(file: &mut File) -> Result<Vec<WalRecord>, WalError> {
         let lsn = Lsn(offset);
         let remaining = length - offset;
         if remaining < RECORD_HEADER_SIZE as u64 {
+            let mut partial = vec![0_u8; remaining as usize];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut partial)?;
+            validate_partial_record_header(lsn, &partial, &txn_last_lsn, &txn_states)?;
+            if tail_policy == TailPolicy::AllowIncompleteFinalRecord {
+                return Ok(ScanResult {
+                    records,
+                    valid_end: offset,
+                    incomplete_tail: true,
+                });
+            }
             return Err(WalError::TruncatedRecord { lsn });
         }
         let mut record_header = [0_u8; RECORD_HEADER_SIZE];
@@ -558,9 +608,6 @@ fn scan_file(file: &mut File) -> Result<Vec<WalRecord>, WalError> {
                 length: total_len,
             });
         }
-        if u64::from(total_len) > remaining {
-            return Err(WalError::TruncatedRecord { lsn });
-        }
         let payload_len = read_u32(&record_header, 12);
         let expected_payload = total_len - RECORD_HEADER_SIZE as u32;
         if payload_len != expected_payload {
@@ -570,6 +617,12 @@ fn scan_file(file: &mut File) -> Result<Vec<WalRecord>, WalError> {
                 actual: payload_len,
             });
         }
+        let record_type = record_header[6];
+        require_payload_length(
+            lsn,
+            payload_len,
+            expected_payload_for_tag(lsn, record_type)?,
+        )?;
         let actual_lsn = Lsn(read_u64(&record_header, 16));
         if actual_lsn != lsn {
             return Err(WalError::InvalidRecordedLsn {
@@ -589,7 +642,18 @@ fn scan_file(file: &mut File) -> Result<Vec<WalRecord>, WalError> {
             });
         }
 
-        let kind = match record_header[6] {
+        if u64::from(total_len) > remaining {
+            if tail_policy == TailPolicy::AllowIncompleteFinalRecord {
+                return Ok(ScanResult {
+                    records,
+                    valid_end: offset,
+                    incomplete_tail: true,
+                });
+            }
+            return Err(WalError::TruncatedRecord { lsn });
+        }
+
+        let kind = match record_type {
             1 => {
                 require_payload_length(lsn, payload_len, 0)?;
                 WalRecordKind::Begin
@@ -640,7 +704,109 @@ fn scan_file(file: &mut File) -> Result<Vec<WalRecord>, WalError> {
             .checked_add(u64::from(total_len))
             .ok_or(WalError::LsnOverflow)?;
     }
-    Ok(records)
+    Ok(ScanResult {
+        records,
+        valid_end: offset,
+        incomplete_tail: false,
+    })
+}
+
+fn validate_partial_record_header(
+    lsn: Lsn,
+    bytes: &[u8],
+    txn_last_lsn: &HashMap<TxnId, Lsn>,
+    txn_states: &HashMap<TxnId, WalTxnState>,
+) -> Result<(), WalError> {
+    let magic_len = bytes.len().min(RECORD_MAGIC.len());
+    if bytes[..magic_len] != RECORD_MAGIC[..magic_len] {
+        return Err(WalError::InvalidRecordMagic { lsn });
+    }
+    if bytes.len() >= 6 {
+        let version = read_u16(bytes, 4);
+        if version != RECORD_FORMAT_VERSION {
+            return Err(WalError::UnsupportedRecordVersion { lsn, version });
+        }
+    }
+    if bytes.len() >= 7 {
+        expected_payload_for_tag(lsn, bytes[6])?;
+    }
+    if bytes.len() >= 8 && bytes[7] != 0 {
+        return Err(WalError::InvalidReservedBytes);
+    }
+    if bytes.len() >= 12 {
+        let total_len = read_u32(bytes, 8);
+        if total_len < RECORD_HEADER_SIZE as u32 {
+            return Err(WalError::InvalidRecordLength {
+                lsn,
+                length: total_len,
+            });
+        }
+        if total_len as usize > WAL_MAX_RECORD_SIZE {
+            return Err(WalError::RecordTooLarge {
+                lsn,
+                length: total_len,
+            });
+        }
+    }
+    if bytes.len() >= 16 {
+        let total_len = read_u32(bytes, 8);
+        let payload_len = read_u32(bytes, 12);
+        let expected = total_len - RECORD_HEADER_SIZE as u32;
+        if payload_len != expected {
+            return Err(WalError::InvalidPayloadLength {
+                lsn,
+                expected,
+                actual: payload_len,
+            });
+        }
+        let kind_expected = expected_payload_for_tag(lsn, bytes[6])?;
+        require_payload_length(lsn, payload_len, kind_expected)?;
+    }
+    if bytes.len() >= 24 {
+        let actual = Lsn(read_u64(bytes, 16));
+        if actual != lsn {
+            return Err(WalError::InvalidRecordedLsn {
+                expected: lsn,
+                actual,
+            });
+        }
+    }
+    if bytes.len() >= 32 {
+        let txn_id = TxnId(read_u64(bytes, 24));
+        let record_type = bytes[6];
+        let state = txn_states.get(&txn_id).copied();
+        let valid = matches!(
+            (state, record_type),
+            (None, 1) | (Some(WalTxnState::Active), 2..=4)
+        );
+        if !valid {
+            return Err(WalError::InvalidTransactionSequence {
+                lsn,
+                txn_id,
+                record_type,
+            });
+        }
+        let available_prev = bytes.len().saturating_sub(32).min(8);
+        if available_prev > 0 {
+            let expected = txn_last_lsn
+                .get(&txn_id)
+                .copied()
+                .map_or(0, |prev_lsn| prev_lsn.0)
+                .to_le_bytes();
+            if bytes[32..32 + available_prev] != expected[..available_prev] {
+                return Err(WalError::InvalidPartialPrevLsn { lsn });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
+    match tag {
+        1 | 3 | 4 => Ok(0),
+        2 => Ok(PAGE_UPDATE_PAYLOAD_SIZE as u32),
+        tag => Err(WalError::UnknownRecordType { lsn, tag }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

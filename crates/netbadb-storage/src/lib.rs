@@ -3,6 +3,7 @@
 mod buffer;
 mod heap;
 mod page;
+mod recovery;
 mod transaction;
 mod wal;
 
@@ -12,6 +13,7 @@ pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
     PageType, SLOT_SIZE, Slot,
 };
+pub use recovery::RecoveryError;
 pub use transaction::{Transaction, TransactionState};
 pub use wal::{
     WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
@@ -285,6 +287,7 @@ pub enum StorageError {
     Buffer(BufferError),
     Codec(CodecError),
     Metadata(MetadataError),
+    Recovery(RecoveryError),
     Wal(WalError),
     Transaction(TransactionError),
     SchemaMismatch {
@@ -321,6 +324,7 @@ impl fmt::Display for StorageError {
             Self::Buffer(error) => write!(formatter, "buffer pool error: {error}"),
             Self::Codec(error) => write!(formatter, "row codec error: {error}"),
             Self::Metadata(error) => write!(formatter, "heap metadata error: {error}"),
+            Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
             Self::Wal(error) => write!(formatter, "write-ahead log error: {error}"),
             Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
             Self::SchemaMismatch { expected, actual } => write!(
@@ -364,6 +368,7 @@ impl Error for StorageError {
             Self::Buffer(error) => Some(error),
             Self::Codec(error) => Some(error),
             Self::Metadata(error) => Some(error),
+            Self::Recovery(error) => Some(error),
             Self::Wal(error) => Some(error),
             Self::Transaction(error) => Some(error),
             _ => None,
@@ -398,6 +403,12 @@ impl From<CodecError> for StorageError {
 impl From<MetadataError> for StorageError {
     fn from(error: MetadataError) -> Self {
         Self::Metadata(error)
+    }
+}
+
+impl From<RecoveryError> for StorageError {
+    fn from(error: RecoveryError) -> Self {
+        Self::Recovery(error)
     }
 }
 

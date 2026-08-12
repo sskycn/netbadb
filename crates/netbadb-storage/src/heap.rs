@@ -5,6 +5,7 @@ use std::rc::Rc;
 use netbadb_schema::TableDef;
 use netbadb_types::{PageId, RowId, ScalarValue, SlotId};
 
+use crate::recovery::RecoveryManager;
 use crate::transaction::TransactionManager;
 use crate::{
     BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE,
@@ -29,6 +30,8 @@ pub struct HeapStorage {
     buffer: BufferPool,
     table: TableDef,
     transactions: TransactionManager,
+    #[cfg(test)]
+    skip_drop_flush: bool,
 }
 
 impl HeapStorage {
@@ -71,6 +74,8 @@ impl HeapStorage {
             buffer,
             table,
             transactions: TransactionManager::new(wal, None)?,
+            #[cfg(test)]
+            skip_drop_flush: false,
         })
     }
 
@@ -86,12 +91,20 @@ impl HeapStorage {
         validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
         let path = path.as_ref();
-        let pages = PageManager::open(path)?;
+        let mut pages = PageManager::open(path)?;
+        let (mut wal_manager, records, truncated_wal_tail) =
+            WalManager::open_for_recovery(wal_path(path))?;
+        if let Err(error) =
+            RecoveryManager::recover(&mut pages, &mut wal_manager, &records, truncated_wal_tail)
+        {
+            return Err(match error {
+                crate::RecoveryError::Storage(storage) => *storage,
+                recovery => recovery.into(),
+            });
+        }
         if pages.page_count() < 2 {
             return Err(crate::invalid_format("heap file has no data page"));
         }
-        let mut wal_manager = WalManager::open(wal_path(path))?;
-        let records = wal_manager.scan()?;
         let max_txn = records.iter().map(|record| record.txn_id).max();
         let wal = Rc::new(RefCell::new(wal_manager));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
@@ -103,6 +116,8 @@ impl HeapStorage {
             buffer,
             table,
             transactions: TransactionManager::new(wal, max_txn)?,
+            #[cfg(test)]
+            skip_drop_flush: false,
         })
     }
 
@@ -271,6 +286,11 @@ impl HeapStorage {
             .durable_lsn())
     }
 
+    #[cfg(test)]
+    fn simulate_crash(mut self) {
+        self.skip_drop_flush = true;
+    }
+
     fn validate_row(&self, values: &[ScalarValue]) -> Result<(), StorageError> {
         if values.len() != self.table.columns.len() {
             return Err(StorageError::InvalidRowLength {
@@ -303,6 +323,10 @@ impl Drop for HeapStorage {
     fn drop(&mut self) {
         // Explicit `flush`/`close` report errors. Drop only preserves the old
         // embedded behavior with best-effort cleanup and is not durability.
+        #[cfg(test)]
+        if self.skip_drop_flush {
+            return;
+        }
         let _ = self.buffer.flush_all();
     }
 }
@@ -707,6 +731,42 @@ mod tests {
         storage.close().expect("close heap");
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         assert_eq!(reopened.scan().expect("scan").len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_automatically_recovers_a_committed_unflushed_insert() {
+        let path = test_path("heap-open-recovery");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("recovered".into())])
+            .expect("insert committed row");
+        storage.simulate_crash();
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("open with recovery");
+        let rows = reopened.scan().expect("scan recovered rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], ScalarValue::Int64(1));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_automatically_undoes_an_active_flushed_insert() {
+        let path = test_path("heap-open-undo");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
+            )
+            .expect("insert active row");
+        storage.flush().expect("flush active page and WAL");
+        drop(transaction);
+        storage.simulate_crash();
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("open with undo");
+        assert!(reopened.scan().expect("scan recovered rows").is_empty());
         cleanup(&path);
     }
 

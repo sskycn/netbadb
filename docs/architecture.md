@@ -164,7 +164,7 @@ u64 page ID, one 4 KiB before-image, and one 4 KiB after-image. Consequently,
 the maximum accepted record is 8,240 bytes. The scanner validates magic,
 versions, reserved bytes, lengths, truncation, stored LSN, transaction state,
 and the prevLSN chain before exposing a record. The format does not yet include
-a checksum; checksum selection is deferred with recovery rather than implied.
+a checksum; checksum selection remains an explicit future format decision.
 
 The write ordering invariant is:
 
@@ -184,13 +184,56 @@ is itself a data-file write that must not overtake its WAL record.
 
 All disk widths are explicit; no Rust struct layout, host-endian values,
 pointers, or `usize` are persisted. Malformed headers, slot directories,
-record ranges, row lengths, tags, and UTF-8 values return typed errors. The
-Phase 2A provides WAL commit durability and WAL-before-page ordering, but not
-transactional visibility or recovery. `abort` appends an abort record and
-changes state without physical undo. A successful explicit close flushes the
-retained WAL and all dirty pages in order, and clean close/reopen is supported.
-Crash reopen and WAL replay are Phase 2B work; current open validates the WAL
-but does not redo committed pages or undo incomplete transactions.
+record ranges, row lengths, tags, and UTF-8 values return typed errors.
+
+## Startup recovery
+
+Recovery is synchronous storage-layer work and completes before a `BufferPool`,
+`HeapStorage`, or `Database` is exposed:
+
+```text
+Database::open
+    │
+    ▼
+Open Data File + WAL
+    │
+    ▼
+Analysis
+    │
+    ├── Winners (Commit exists)
+    └── Losers (incomplete or Abort)
+    │
+    ▼
+Redo every PageUpdate in ascending LSN
+    │
+    ▼
+Undo losers in descending global LSN
+```
+
+Analysis builds transaction lastLSNs and an LSN lookup. Redo repeats history,
+including loser updates: an existing page is skipped only when its pageLSN is
+at least the update LSN; otherwise the validated after-image is installed. A
+new page must be exactly the next trailing page, so WAL cannot create page-ID
+gaps. Undo follows each loser's prevLSN chain through a max-heap and installs
+PageUpdate before-images in global descending LSN order. A zero before-image
+means the loser allocated that page, which can only remove the exact trailing
+page. The page file is synchronized before recovery returns.
+
+The algorithm intentionally has no compensation log records. A crash during
+redo or undo is handled by rerunning complete repeat-history redo followed by
+the same deterministic undo, making restart recovery idempotent for this
+full-page-image model. The retained valid WAL is synchronized before any
+recovery page write.
+
+At startup only an incomplete final record whose available header is
+structurally valid may be truncated at EOF. Corrupt middle records, invalid
+magic/version/type/length fields, broken transaction chains, and malformed
+before/after page images fail open with typed errors.
+
+Phase 2B supplies crash recovery, not transaction visibility or isolation.
+`abort` appends an abort record; its physical effects are removed during
+restart. There is no MVCC, checkpoint, WAL recycling, bounded WAL growth, or
+runtime full rollback guarantee.
 
 ## Embedded and server modes
 

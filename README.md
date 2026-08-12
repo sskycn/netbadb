@@ -144,6 +144,8 @@ The current code genuinely supports:
   abort, with strong LSNs and per-transaction prevLSN chains;
 - explicit transaction handles plus implicit single-insert transactions;
 - commit durability through WAL sync and WAL-before-data-page writeback;
+- synchronous startup recovery with analysis, repeat-history redo, and
+  reverse-LSN undo of incomplete or aborted transactions;
 - insert, scan, file reopen, row encoding, and row decoding;
 - executor support for filter, projection, and limit;
 - a native embedded `netbadb-core::Database` API.
@@ -162,14 +164,23 @@ inserts must share one WAL chain. A successful commit means its commit record
 has reached durable storage; heap pages may remain buffered until eviction,
 `flush`, or `close`.
 
-Phase 2A deliberately does not claim rollback, isolation, checkpoints, or
-crash recovery. `abort` records the state transition but does not undo page
-updates, and uncommitted updates are not hidden. A successful explicit
-`close` WAL-orders and flushes dirty pages, so clean close/reopen is supported.
-Opening after a process or machine crash is not yet guaranteed to reconstruct
-the committed state because WAL replay arrives in Phase 2B. WAL records use
-full before/after page images and currently have no checksum; malformed or
-truncated records return errors instead of being silently accepted.
+`Database::open` and `HeapStorage::open` synchronously recover before exposing
+the buffer pool. Recovery classifies transactions with a Commit record as
+winners, redoes all page updates in ascending LSN order while using pageLSN to
+skip installed images, then undoes incomplete and explicitly aborted losers in
+global descending LSN order from full before-images. Repeating recovery is
+idempotent even without compensation log records because each restart first
+repeats the same history and then applies the same deterministic undo.
+
+An incomplete final WAL record caused by EOF is discarded at the recovery
+boundary only when its available header bytes are structurally valid. Invalid
+magic, versions, tags, lengths, transaction chains, middle records, and page
+images remain hard errors. The retained WAL currently has no checksum.
+
+Phase 2B does not provide MVCC, isolation, checkpoints, WAL recycling, bounded
+WAL growth, or general runtime physical rollback. `abort` records intent;
+physical undo is guaranteed during restart recovery. A successful explicit
+`close` still WAL-orders and flushes dirty pages.
 
 The query language is a deliberately small native subset, not a claim of SQL
 compatibility. `NULL` parsing is recognized but rejected by the current type
@@ -226,16 +237,19 @@ The implementation sequence is intentionally vertical:
    bounded buffer pool, guards, dirty writeback, heap insert/scan, and reopen.
 3. Transaction + WAL Core (Phase 2A) — transaction lifecycle, versioned WAL,
    LSN/pageLSN, durable commit, and WAL-ordered page writeback.
-4. Recovery (Phase 2B) — WAL replay, explicit undo/redo policy, checkpoints,
-   and crash-reopen guarantees.
-5. Query execution — richer expressions, null semantics, and write commands.
-6. Indexing — B+Tree and planner access-path selection.
-7. Server mode — protocol, sessions, and `netbadbd`.
-8. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-9. Advanced optimization — statistics, cost model, joins, and rewrite rules.
+4. Recovery (Phase 2B) — startup analysis, repeat-history redo, reverse-LSN
+   undo, crash-tail handling, and crash-reopen guarantees.
+5. Checkpoint + WAL Lifecycle (Phase 2C) — bounded recovery start points,
+   clean-shutdown metadata, and WAL truncation/recycling.
+6. Query execution — richer expressions, null semantics, and write commands.
+7. Indexing — B+Tree and planner access-path selection.
+8. Server mode — protocol, sessions, and `netbadbd`.
+9. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+10. Advanced optimization — statistics, cost model, joins, and rewrite rules.
 
-Recovery, rollback, isolation/MVCC, B+Tree indexes, server networking, and Go
-wire-protocol code are roadmap items, not implemented features in this slice.
+Checkpoints, WAL recycling, runtime rollback, isolation/MVCC, B+Tree indexes,
+server networking, and Go wire-protocol code are roadmap items, not implemented
+features in this slice.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

@@ -41,17 +41,31 @@ migrated.
   failure tests;
 - clean close/reopen and multi-page transaction tests.
 
-Phase 2A has no rollback or isolation: abort is a logged state transition, not
-physical undo, and changes are not hidden from other operations. It also does
-not replay WAL after a crash. The WAL has no checksum in this format version.
+Phase 2A's runtime remains non-isolated: uncommitted changes are not hidden and
+abort itself does not synchronously roll pages back. The WAL has no checksum in
+this format version.
 
-## Phase 2B — Recovery (next)
+## Phase 2B — Crash Recovery (complete)
 
-- analysis/redo/undo policy and WAL replay on open;
-- crash-reopen guarantees for committed and incomplete transactions;
-- explicit rollback behavior;
-- checkpoints, WAL retention/truncation policy, and checksums;
-- deterministic torn-write and recovery tests.
+- synchronous startup recovery before buffer-pool exposure;
+- analysis into Commit winners and incomplete/Abort losers;
+- repeat-history redo in ascending LSN with pageLSN skipping;
+- global descending-LSN loser undo through prevLSN chains and before-images;
+- exact trailing-page allocation/removal without page-ID gaps;
+- structurally valid incomplete-final-record truncation with hard errors for
+  corruption, incompatible versions, broken chains, and malformed images;
+- deterministic restart, idempotency, and interrupted redo/undo tests.
+
+Phase 2B intentionally has no MVCC, isolation, checkpoints, WAL recycling,
+bounded WAL growth, or runtime full rollback guarantee.
+
+## Phase 2C — Checkpoint + WAL Lifecycle (next)
+
+- checkpoint record and state model;
+- bounded recovery start point;
+- WAL truncation and recycling with safe retention rules;
+- clean-shutdown metadata if it materially reduces startup work;
+- recovery performance and bounded-growth tests.
 
 ## Phase 3 — Query execution
 

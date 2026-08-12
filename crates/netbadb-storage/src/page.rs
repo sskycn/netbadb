@@ -115,6 +115,11 @@ impl Page {
         Ok(self.header()?.page_lsn)
     }
 
+    pub(crate) fn raw_page_lsn_for_recovery(&self) -> Option<Lsn> {
+        let raw_page_lsn = self.read_u64(PAGE_LSN_OFFSET);
+        (raw_page_lsn != 0).then_some(Lsn(raw_page_lsn))
+    }
+
     pub(crate) fn set_page_lsn(&mut self, lsn: Lsn) {
         self.bytes[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8].copy_from_slice(&lsn.0.to_le_bytes());
     }
@@ -418,6 +423,24 @@ impl PageManager {
         self.file.write_all(page.bytes())?;
         self.page_count = next_count;
         Ok(page)
+    }
+
+    pub(crate) fn remove_trailing_page(&mut self, id: PageId) -> Result<bool, StorageError> {
+        if id.0 == self.page_count {
+            return Ok(false);
+        }
+        let expected_count =
+            id.0.checked_add(1)
+                .ok_or(StorageError::PageOffsetOverflow { page_id: id })?;
+        if expected_count != self.page_count || id.0 == 0 {
+            return Err(invalid_format(format!(
+                "page {} cannot be removed from a {}-page file",
+                id.0, self.page_count
+            )));
+        }
+        self.file.set_len(self.page_offset(id)?)?;
+        self.page_count = id.0;
+        Ok(true)
     }
 
     pub fn read_page(&mut self, id: PageId) -> Result<Page, StorageError> {
