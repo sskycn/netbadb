@@ -9,9 +9,10 @@ over convenience or speculative performance.
 - Never persist Rust memory layout, enum discriminants, pointers, `usize`, or
   host-endian values.
 - Every persistent integer MUST have an explicit width and byte order.
-- Every persistent root/header MUST identify the format with magic bytes and an
-  explicit version. For an experimental format, a version encoded in the magic
-  (for example `NBD1`) is acceptable when documented.
+- Every new persistent root/header, and every existing root/header whose layout
+  or meaning changes, MUST identify the format with magic bytes and an explicit
+  version. For an experimental format, a version encoded in the magic (for
+  example `NBD1`) is acceptable when documented.
 - Every page kind MUST have an explicit type tag. Reusing a tag with a new
   meaning is forbidden.
 - Lengths, optional fields, page boundaries, and record boundaries MUST have
@@ -20,9 +21,13 @@ over convenience or speculative performance.
   corruption model MUST be documented before claiming durability or format
   stability.
 
-The current file format is experimental. Before declaring any persistent format
-stable, version handling and compatibility behavior MUST be explicit. Once
-stable, field encodings, tags, and meanings MUST NOT change silently.
+The current file format is experimental. The generic `PageManager` container's
+existing `NBPG` magic is a documented legacy exception and does not encode a
+version. Do not extend or reinterpret that header without introducing explicit
+version handling; unrelated storage changes do not need to migrate it. Before
+declaring any persistent format stable, version handling and compatibility
+behavior MUST be explicit. Once stable, field encodings, tags, and meanings MUST
+NOT change silently.
 
 ## Decoding and corruption
 
