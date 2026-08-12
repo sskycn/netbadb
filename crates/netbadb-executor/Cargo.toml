@@ -1,0 +1,18 @@
+[package]
+name = "netbadb-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+netbadb-planner = { path = "../netbadb-planner" }
+netbadb-rel = { path = "../netbadb-rel" }
+netbadb-storage = { path = "../netbadb-storage" }
+netbadb-types = { path = "../netbadb-types" }
+
+[dev-dependencies]
+netbadb-schema = { path = "../netbadb-schema" }
+
+[lints]
+workspace = true

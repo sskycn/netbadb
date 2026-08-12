@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/netbadb-types",
+    "crates/netbadb-schema",
+    "crates/netbadb-parser",
+    "crates/netbadb-hir",
+    "crates/netbadb-rel",
+    "crates/netbadb-compiler",
+    "crates/netbadb-planner",
+    "crates/netbadb-storage",
+    "crates/netbadb-executor",
+    "crates/netbadb-core",
+    "sdk/rust",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"

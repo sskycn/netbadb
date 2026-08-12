@@ -1,0 +1,13 @@
+[package]
+name = "netbadb-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+netbadb-rel = { path = "../netbadb-rel" }
+netbadb-types = { path = "../netbadb-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "netbadb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+netbadb-schema = { path = "../netbadb-schema" }
+netbadb-types = { path = "../netbadb-types" }
+
+[lints]
+workspace = true
