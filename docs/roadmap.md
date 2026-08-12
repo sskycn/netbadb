@@ -25,15 +25,33 @@
 The database file format remains experimental. The legacy `NBPG` container
 marker is retained, while heap metadata and data-page layouts are explicitly
 versioned. The pre-Foundation sequential `HEAP` data-page layout is not
-migrated. Dirty writeback is not WAL ordering and does not provide crash-safe
-transaction durability.
+migrated.
 
-## Phase 2 — Transaction + WAL Foundation (next)
+## Phase 2A — Transaction + WAL Core (complete)
 
-- transaction IDs and transaction API;
-- transaction lifecycle and initial isolation model;
-- versioned WAL records and LSN allocation;
-- commit durability, checkpoints, recovery tests, and explicit rollback.
+- strong transaction IDs and LSNs plus explicit and implicit transaction APIs;
+- active, commit-pending, committed, and aborted lifecycle states;
+- separate retained WAL with versioned, bounded, little-endian Begin,
+  PageUpdate, Commit, and Abort records;
+- per-transaction prevLSN chains and full-page before/after images;
+- page format version 2 with persistent pageLSN and explicit version 1
+  rejection;
+- append-versus-durable tracking and commit-record durability;
+- WAL-before-data-page flush and eviction, including active-writer and I/O
+  failure tests;
+- clean close/reopen and multi-page transaction tests.
+
+Phase 2A has no rollback or isolation: abort is a logged state transition, not
+physical undo, and changes are not hidden from other operations. It also does
+not replay WAL after a crash. The WAL has no checksum in this format version.
+
+## Phase 2B — Recovery (next)
+
+- analysis/redo/undo policy and WAL replay on open;
+- crash-reopen guarantees for committed and incomplete transactions;
+- explicit rollback behavior;
+- checkpoints, WAL retention/truncation policy, and checksums;
+- deterministic torn-write and recovery tests.
 
 ## Phase 3 — Query execution
 

@@ -28,6 +28,9 @@ fn public_embedded_api_round_trips_rows_and_queries() {
         result.rows,
         vec![vec![ScalarValue::Int64(1), ScalarValue::Text("Ada".into())]]
     );
-    drop(database);
-    let _ = std::fs::remove_file(path);
+    database.close().expect("close database");
+    let _ = std::fs::remove_file(&path);
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let _ = std::fs::remove_file(wal_path);
 }

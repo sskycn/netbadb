@@ -52,6 +52,8 @@ Filter / projection / limit executor
     ↓
 Heap
     ↓
+Transaction lifecycle + versioned WAL
+    ↓
 Buffer pool (guards, pinning, dirty writeback)
     ↓
 Slotted pages
@@ -91,7 +93,7 @@ netbadb/
 │   ├── netbadb-rel/         typed logical relational IR
 │   ├── netbadb-compiler/    AST → HIR → logical plan
 │   ├── netbadb-planner/     logical plan → physical plan
-│   ├── netbadb-storage/     slotted pages, buffer pool, page manager, heap file
+│   ├── netbadb-storage/     transactions, WAL, pages, buffer pool, and heap
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   └── netbadb-core/        native embedded database API
 ├── sdk/
@@ -135,15 +137,37 @@ The current code genuinely supports:
 - typed HIR and logical relational IR;
 - sequential-scan physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
-- versioned slotted heap pages with explicit page types and checked bounds;
+- version 2 slotted heap pages with persistent pageLSNs and checked bounds;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
+- versioned little-endian WAL records for begin, full-page update, commit, and
+  abort, with strong LSNs and per-transaction prevLSN chains;
+- explicit transaction handles plus implicit single-insert transactions;
+- commit durability through WAL sync and WAL-before-data-page writeback;
 - insert, scan, file reopen, row encoding, and row decoding;
 - executor support for filter, projection, and limit;
 - a native embedded `netbadb-core::Database` API.
 
-The experimental storage format uses versioned slotted pages. Files created by
-the pre-Foundation sequential `HEAP` page prototype are not migrated.
+The experimental storage format uses versioned slotted pages. Phase 2A bumps
+data pages from version 1 to version 2 to add pageLSN; old pages are rejected
+rather than guessed or migrated. Files created by the pre-Foundation
+sequential `HEAP` page prototype are likewise not migrated.
+
+Each database file has a retained sibling WAL named `<database>-wal`.
+`Database::insert` runs as an implicit transaction. Call
+`begin_transaction`, `insert_in`, and `Transaction::commit` when several
+inserts must share one WAL chain. A successful commit means its commit record
+has reached durable storage; heap pages may remain buffered until eviction,
+`flush`, or `close`.
+
+Phase 2A deliberately does not claim rollback, isolation, checkpoints, or
+crash recovery. `abort` records the state transition but does not undo page
+updates, and uncommitted updates are not hidden. A successful explicit
+`close` WAL-orders and flushes dirty pages, so clean close/reopen is supported.
+Opening after a process or machine crash is not yet guaranteed to reconstruct
+the committed state because WAL replay arrives in Phase 2B. WAL records use
+full before/after page images and currently have no checksum; malformed or
+truncated records return errors instead of being silently accepted.
 
 The query language is a deliberately small native subset, not a claim of SQL
 compatibility. `NULL` parsing is recognized but rejected by the current type
@@ -198,15 +222,17 @@ The implementation sequence is intentionally vertical:
 1. Rust foundation — stable types, schema, parser, HIR, and relational IR.
 2. Storage Foundation — versioned slotted pages, checked page decoding,
    bounded buffer pool, guards, dirty writeback, heap insert/scan, and reopen.
-3. Transaction + WAL Foundation — transaction lifecycle, WAL records, LSNs,
-   commit durability, checkpoints, and recovery.
-4. Query execution — richer expressions, null semantics, and write commands.
-5. Indexing — B+Tree and planner access-path selection.
-6. Server mode — protocol, sessions, and `netbadbd`.
-7. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-8. Advanced optimization — statistics, cost model, joins, and rewrite rules.
+3. Transaction + WAL Core (Phase 2A) — transaction lifecycle, versioned WAL,
+   LSN/pageLSN, durable commit, and WAL-ordered page writeback.
+4. Recovery (Phase 2B) — WAL replay, explicit undo/redo policy, checkpoints,
+   and crash-reopen guarantees.
+5. Query execution — richer expressions, null semantics, and write commands.
+6. Indexing — B+Tree and planner access-path selection.
+7. Server mode — protocol, sessions, and `netbadbd`.
+8. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+9. Advanced optimization — statistics, cost model, joins, and rewrite rules.
 
-Transactions, MVCC, WAL, recovery, B+Tree indexes, server networking, and Go
+Recovery, rollback, isolation/MVCC, B+Tree indexes, server networking, and Go
 wire-protocol code are roadmap items, not implemented features in this slice.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

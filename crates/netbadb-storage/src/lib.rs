@@ -3,12 +3,19 @@
 mod buffer;
 mod heap;
 mod page;
+mod transaction;
+mod wal;
 
-pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard, WritePageGuard};
+pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::HeapStorage;
 pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
     PageType, SLOT_SIZE, Slot,
+};
+pub use transaction::{Transaction, TransactionState};
+pub use wal::{
+    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
+    WalRecordKind, wal_path,
 };
 
 use std::error::Error;
@@ -137,10 +144,22 @@ impl Error for PageError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferError {
     InvalidCapacity,
-    Exhausted { capacity: usize },
-    PagePinned { page_id: PageId },
-    PageNotCached { page_id: PageId },
-    PinCountOverflow { page_id: PageId },
+    Exhausted {
+        capacity: usize,
+    },
+    PagePinned {
+        page_id: PageId,
+    },
+    PageNotCached {
+        page_id: PageId,
+    },
+    PinCountOverflow {
+        page_id: PageId,
+    },
+    WalUnavailable {
+        page_id: PageId,
+        page_lsn: netbadb_types::Lsn,
+    },
 }
 
 impl fmt::Display for BufferError {
@@ -160,6 +179,11 @@ impl fmt::Display for BufferError {
             Self::PinCountOverflow { page_id } => {
                 write!(formatter, "pin count for page {} overflows", page_id.0)
             }
+            Self::WalUnavailable { page_id, page_lsn } => write!(
+                formatter,
+                "page {} at LSN {} cannot be flushed without its WAL",
+                page_id.0, page_lsn.0
+            ),
         }
     }
 }
@@ -218,6 +242,41 @@ impl fmt::Display for MetadataError {
 
 impl Error for MetadataError {}
 
+/// Errors raised by the Phase 2A transaction state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionError {
+    NotActive {
+        txn_id: netbadb_types::TxnId,
+        state: TransactionState,
+    },
+    IdExhausted,
+    WalBusy,
+    ForeignTransaction {
+        txn_id: netbadb_types::TxnId,
+    },
+}
+
+impl fmt::Display for TransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotActive { txn_id, state } => write!(
+                formatter,
+                "transaction {} is {state:?}, not active",
+                txn_id.0
+            ),
+            Self::IdExhausted => formatter.write_str("transaction ID space is exhausted"),
+            Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
+            Self::ForeignTransaction { txn_id } => write!(
+                formatter,
+                "transaction {} belongs to a different database",
+                txn_id.0
+            ),
+        }
+    }
+}
+
+impl Error for TransactionError {}
+
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
@@ -226,6 +285,8 @@ pub enum StorageError {
     Buffer(BufferError),
     Codec(CodecError),
     Metadata(MetadataError),
+    Wal(WalError),
+    Transaction(TransactionError),
     SchemaMismatch {
         expected: String,
         actual: String,
@@ -260,6 +321,8 @@ impl fmt::Display for StorageError {
             Self::Buffer(error) => write!(formatter, "buffer pool error: {error}"),
             Self::Codec(error) => write!(formatter, "row codec error: {error}"),
             Self::Metadata(error) => write!(formatter, "heap metadata error: {error}"),
+            Self::Wal(error) => write!(formatter, "write-ahead log error: {error}"),
+            Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
             Self::SchemaMismatch { expected, actual } => write!(
                 formatter,
                 "schema mismatch: expected {expected}, found {actual}"
@@ -301,6 +364,8 @@ impl Error for StorageError {
             Self::Buffer(error) => Some(error),
             Self::Codec(error) => Some(error),
             Self::Metadata(error) => Some(error),
+            Self::Wal(error) => Some(error),
+            Self::Transaction(error) => Some(error),
             _ => None,
         }
     }
@@ -333,6 +398,18 @@ impl From<CodecError> for StorageError {
 impl From<MetadataError> for StorageError {
     fn from(error: MetadataError) -> Self {
         Self::Metadata(error)
+    }
+}
+
+impl From<WalError> for StorageError {
+    fn from(error: WalError) -> Self {
+        Self::Wal(error)
+    }
+}
+
+impl From<TransactionError> for StorageError {
+    fn from(error: TransactionError) -> Self {
+        Self::Transaction(error)
     }
 }
 

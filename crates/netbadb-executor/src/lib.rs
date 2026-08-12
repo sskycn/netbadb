@@ -262,6 +262,8 @@ mod tests {
         };
         let result: QueryResult = execute(&plan(&logical), &mut storage).expect("execute");
         assert_eq!(result.rows, vec![vec![ScalarValue::Text("Lin".into())]]);
-        let _ = std::fs::remove_file(path);
+        storage.close().expect("close storage");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }
 }

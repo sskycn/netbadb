@@ -70,6 +70,8 @@ Executor
     ↓
 HeapStorage
     ↓
+TransactionManager + WAL
+    ↓
 BufferPool + PageGuards
     ↓
 PageManager
@@ -83,45 +85,112 @@ Database file
   arithmetic, and file sync. It does not interpret heap or index semantics.
 - `BufferPool` owns a bounded set of raw page frames. It uses a simple
   round-robin eviction boundary, pins pages while guards are alive, refuses to
-  evict pinned pages, writes dirty pages before reuse, and exposes explicit
-  `flush_page`/`flush_all` operations.
+  evict pinned pages, and exposes explicit `flush_page`/`flush_all`
+  operations. Before writing a dirty data page it makes the WAL durable
+  through that page's pageLSN. The data-page write is not attempted if the WAL
+  flush fails.
 - `Page` validates a versioned page header and explicit page type before
   exposing slotted-page operations. Heap pages use a slot directory at the
   front, free space in the middle, and tuple bytes packed from the end of the
   page backward.
-- `HeapStorage` validates schema rows, encodes typed scalar values, chooses the
-  last heap page or allocates a new one, and returns owned rows. Page guards do
-  not escape these operations, so executor and query APIs carry no page
+- `TransactionManager` allocates strong `TxnId` values and appends a `Begin`
+  record. A transaction tracks `Active`, `CommitPending`, `Committed`, or
+  `Aborted` and owns its last LSN. Commit appends exactly one commit record and
+  becomes committed only after `flush_through(commit_lsn)` succeeds.
+- `HeapStorage` validates and encodes rows, constructs a candidate after-image,
+  appends its `PageUpdate`, and only then publishes the page to the buffer
+  frame. It no longer flushes the entire buffer after each insert. Page guards
+  do not escape these operations, so executor and query APIs carry no page
   lifetimes.
 
 The experimental container retains the legacy `NBPG` file-root marker. Heap
 metadata has its own `NBD1` marker and explicit version. Data pages use the
-following little-endian layout:
+following version 2 little-endian layout:
 
 ```text
 0..4    NBP1 page magic
-4..6    u16 page format version
-6       u8 page type (1 metadata, 2 heap)
+4..6    u16 page format version (2)
+6       u8 page type (2 heap; tag 1 remains reserved)
 7       reserved byte (zero)
 8..10   u16 slot count
 10..12  u16 free-space lower bound
 12..14  u16 free-space upper bound
 14..16  reserved bytes (zero)
-16..    slot entries: u16 tuple offset + u16 tuple length
+16..24  u64 pageLSN (zero means no WAL record)
+24..    slot entries: u16 tuple offset + u16 tuple length
 ...     free space
 ...     tuple bytes, allocated from PAGE_SIZE backward
 ```
 
-This is an intentional replacement of the pre-Foundation sequential `HEAP`
-data-page layout. That earlier experimental format has no migration path; new
-files use the versioned layout above.
+This is an intentional replacement of both the pre-Foundation sequential
+`HEAP` layout and Phase 1 page version 1. Neither experimental format has a
+migration path; the decoder returns an unsupported-version error for version
+1 rather than interpreting it as version 2.
+
+## Transaction and WAL boundary
+
+The WAL is a separate `<database>-wal` file. Appending writes a complete record
+to the file but does not imply durability. `WalManager` separately tracks the
+highest written and durable LSN, and `flush_through` advances durability with
+`sync_data`. LSN zero is reserved for “no LSN”; real LSNs are byte offsets and
+start after the 16-byte WAL file header.
+
+The WAL file header is:
+
+```text
+0..4    NBWL magic
+4..6    u16 WAL format version (1)
+6..8    u16 header size (16)
+8..16   reserved bytes (zero)
+```
+
+Every record has a 40-byte fixed header followed by a bounded payload:
+
+```text
+0..4    WREC magic
+4..6    u16 record format version (1)
+6       u8 record type (Begin=1, PageUpdate=2, Commit=3, Abort=4)
+7       reserved byte (zero)
+8..12   u32 total record length
+12..16  u32 payload length
+16..24  u64 LSN (the record's file offset)
+24..32  u64 transaction ID
+32..40  u64 prevLSN (zero only for Begin)
+40..    payload
+```
+
+`Begin`, `Commit`, and `Abort` have no payload. `PageUpdate` stores an explicit
+u64 page ID, one 4 KiB before-image, and one 4 KiB after-image. Consequently,
+the maximum accepted record is 8,240 bytes. The scanner validates magic,
+versions, reserved bytes, lengths, truncation, stored LSN, transaction state,
+and the prevLSN chain before exposing a record. The format does not yet include
+a checksum; checksum selection is deferred with recovery rather than implied.
+
+The write ordering invariant is:
+
+```text
+construct after-image with pageLSN
+    → append PageUpdate
+    → publish dirty buffer frame
+    → flush WAL through pageLSN
+    → write data page
+```
+
+Commit uses `append Commit → flush_through(commitLSN) → Committed`. If the
+flush fails, the handle remains `CommitPending`; retrying commit flushes the
+same record and does not append a duplicate. A new-page update is also flushed
+before extending the database file, because writing the allocator's zero page
+is itself a data-file write that must not overtake its WAL record.
 
 All disk widths are explicit; no Rust struct layout, host-endian values,
 pointers, or `usize` are persisted. Malformed headers, slot directories,
 record ranges, row lengths, tags, and UTF-8 values return typed errors. The
-current dirty-page writeback is not WAL ordering and is not crash-safe
-transaction durability. WAL, transactions, MVCC, indexes, and recovery remain
-future layers.
+Phase 2A provides WAL commit durability and WAL-before-page ordering, but not
+transactional visibility or recovery. `abort` appends an abort record and
+changes state without physical undo. A successful explicit close flushes the
+retained WAL and all dirty pages in order, and clean close/reopen is supported.
+Crash reopen and WAL replay are Phase 2B work; current open validates the WAL
+but does not redo committed pages or undo incomplete transactions.
 
 ## Embedded and server modes
 

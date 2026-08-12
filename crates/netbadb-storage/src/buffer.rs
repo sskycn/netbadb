@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use netbadb_types::PageId;
 
-use crate::{BufferError, Page, PageManager, StorageError};
+use crate::transaction::SharedWal;
+use crate::{BufferError, Page, PageManager, StorageError, TransactionError};
 
 #[derive(Debug)]
 struct BufferFrame {
@@ -20,6 +21,7 @@ struct BufferState {
     frames: Vec<BufferFrame>,
     capacity: usize,
     next_victim: usize,
+    wal: Option<SharedWal>,
 }
 
 impl BufferState {
@@ -75,6 +77,17 @@ impl BufferState {
             .into());
         }
         if frame.dirty {
+            if frame.page_id.0 != 0 {
+                if let Some(page_lsn) = frame.page.page_lsn()? {
+                    let wal = self.wal.as_ref().ok_or(BufferError::WalUnavailable {
+                        page_id: frame.page_id,
+                        page_lsn,
+                    })?;
+                    wal.try_borrow_mut()
+                        .map_err(|_| TransactionError::WalBusy)?
+                        .flush_through(page_lsn)?;
+                }
+            }
             self.disk.write_page(&frame.page)?;
             frame.dirty = false;
         }
@@ -194,6 +207,22 @@ impl BufferPool {
     }
 
     pub fn new(page_manager: PageManager, capacity: usize) -> Result<Self, StorageError> {
+        Self::new_inner(page_manager, capacity, None)
+    }
+
+    pub(crate) fn with_wal(
+        page_manager: PageManager,
+        capacity: usize,
+        wal: SharedWal,
+    ) -> Result<Self, StorageError> {
+        Self::new_inner(page_manager, capacity, Some(wal))
+    }
+
+    fn new_inner(
+        page_manager: PageManager,
+        capacity: usize,
+        wal: Option<SharedWal>,
+    ) -> Result<Self, StorageError> {
         Self::validate_capacity(capacity)?;
         Ok(Self {
             state: Rc::new(RefCell::new(BufferState {
@@ -201,6 +230,7 @@ impl BufferPool {
                 frames: Vec::with_capacity(capacity),
                 capacity,
                 next_victim: 0,
+                wal,
             })),
         })
     }
@@ -232,7 +262,7 @@ impl BufferPool {
         })
     }
 
-    pub fn write_page(&self, page_id: PageId) -> Result<WritePageGuard, StorageError> {
+    pub(crate) fn write_page(&self, page_id: PageId) -> Result<WritePageGuard, StorageError> {
         let page = self.state.borrow_mut().pin_write(page_id)?;
         Ok(WritePageGuard {
             state: Rc::clone(&self.state),
@@ -242,7 +272,7 @@ impl BufferPool {
         })
     }
 
-    pub fn new_page(&self) -> Result<WritePageGuard, StorageError> {
+    pub(crate) fn new_page(&self) -> Result<WritePageGuard, StorageError> {
         let page = self.state.borrow_mut().allocate_page()?;
         Ok(WritePageGuard {
             state: Rc::clone(&self.state),
@@ -258,6 +288,11 @@ impl BufferPool {
 
     pub fn flush_all(&self) -> Result<(), StorageError> {
         self.state.borrow_mut().flush_all()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_page_write_failure(&self) {
+        self.state.borrow_mut().disk.inject_write_failure();
     }
 }
 
@@ -290,10 +325,10 @@ impl Drop for ReadPageGuard {
     }
 }
 
-/// A short-lived owned mutable page snapshot. Calling `page_mut` or
-/// `mark_dirty` causes the page to be written back to its frame on drop.
+/// A short-lived owned mutable page snapshot. Calling `page_mut` causes the
+/// page to be written back to its frame on drop.
 #[derive(Debug)]
-pub struct WritePageGuard {
+pub(crate) struct WritePageGuard {
     state: Rc<RefCell<BufferState>>,
     page_id: PageId,
     page: Page,
@@ -311,13 +346,9 @@ impl WritePageGuard {
         &self.page
     }
 
-    pub fn page_mut(&mut self) -> &mut Page {
+    pub(crate) fn page_mut(&mut self) -> &mut Page {
         self.dirty = true;
         &mut self.page
-    }
-
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
     }
 }
 
@@ -331,9 +362,12 @@ impl Drop for WritePageGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::BufferPool;
-    use crate::{Page, PageManager, PageType, StorageError};
-    use netbadb_types::PageId;
+    use crate::{Page, PageManager, PageType, StorageError, WalManager, WalRecordKind};
+    use netbadb_types::{PageId, TxnId};
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-{name}-{}", std::process::id()))
@@ -349,6 +383,32 @@ mod tests {
         }
         manager.sync().expect("sync pages");
         manager
+    }
+
+    fn prepare_logged_update(
+        pool: &BufferPool,
+        wal: &Rc<RefCell<WalManager>>,
+    ) -> netbadb_types::Lsn {
+        let begin = wal
+            .borrow_mut()
+            .append(TxnId(1), None, WalRecordKind::Begin)
+            .expect("append begin");
+        let mut guard = pool.write_page(PageId(1)).expect("write page");
+        let before = guard.page().clone();
+        let mut after = before.clone();
+        after.insert_record(b"logged").expect("insert record");
+        let update_lsn = wal.borrow().next_lsn();
+        after.set_page_lsn(update_lsn);
+        let appended = wal
+            .borrow_mut()
+            .append(
+                TxnId(1),
+                Some(begin),
+                crate::wal::page_update_kind(&before, &after),
+            )
+            .expect("append update");
+        *guard.page_mut() = after;
+        appended
     }
 
     #[test]
@@ -435,5 +495,82 @@ mod tests {
             91
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn capacity_one_eviction_flushes_wal_before_the_dirty_page() {
+        let path = test_path("buffer-wal-eviction");
+        let wal_path = crate::wal_path(&path);
+        let manager = prepared_manager(&path);
+        let wal = Rc::new(RefCell::new(
+            WalManager::create(&wal_path).expect("create WAL"),
+        ));
+        let pool = BufferPool::with_wal(manager, 1, Rc::clone(&wal)).expect("create pool");
+        let update_lsn = prepare_logged_update(&pool, &wal);
+
+        let other = pool.read_page(PageId(2)).expect("evict dirty page");
+        drop(other);
+        assert!(
+            wal.borrow()
+                .durable_lsn()
+                .is_some_and(|lsn| lsn >= update_lsn)
+        );
+        let reloaded = pool.read_page(PageId(1)).expect("reload page");
+        assert_eq!(
+            reloaded.page().page_lsn().expect("pageLSN"),
+            Some(update_lsn)
+        );
+        drop(reloaded);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn wal_flush_failure_prevents_the_data_page_write() {
+        let path = test_path("buffer-wal-failure");
+        let wal_path = crate::wal_path(&path);
+        let manager = prepared_manager(&path);
+        let wal = Rc::new(RefCell::new(
+            WalManager::create(&wal_path).expect("create WAL"),
+        ));
+        let pool = BufferPool::with_wal(manager, 1, Rc::clone(&wal)).expect("create pool");
+        prepare_logged_update(&pool, &wal);
+        wal.borrow_mut().inject_flush_failure();
+
+        assert!(matches!(pool.flush_all(), Err(StorageError::Wal(_))));
+        drop(pool);
+        let mut disk = PageManager::open(&path).expect("open data file");
+        assert_eq!(
+            disk.read_page(PageId(1))
+                .expect("read unchanged page")
+                .page_lsn()
+                .expect("pageLSN"),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn page_write_failure_happens_only_after_wal_is_durable() {
+        let path = test_path("buffer-page-write-failure");
+        let wal_path = crate::wal_path(&path);
+        let manager = prepared_manager(&path);
+        let wal = Rc::new(RefCell::new(
+            WalManager::create(&wal_path).expect("create WAL"),
+        ));
+        let pool = BufferPool::with_wal(manager, 1, Rc::clone(&wal)).expect("create pool");
+        let update_lsn = prepare_logged_update(&pool, &wal);
+        pool.inject_page_write_failure();
+
+        assert!(matches!(pool.flush_all(), Err(StorageError::Io(_))));
+        assert!(
+            wal.borrow()
+                .durable_lsn()
+                .is_some_and(|lsn| lsn >= update_lsn)
+        );
+        pool.flush_all().expect("retry page flush");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(wal_path);
     }
 }

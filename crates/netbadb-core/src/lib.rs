@@ -10,6 +10,8 @@ use netbadb_schema::{Schema, TableDef};
 use netbadb_storage::{HeapStorage, StorageError};
 use netbadb_types::ScalarValue;
 
+pub use netbadb_storage::{Transaction, TransactionState};
+
 #[derive(Debug)]
 pub enum DatabaseError {
     Compile(CompileError),
@@ -82,6 +84,19 @@ impl Database {
         Ok(())
     }
 
+    pub fn begin_transaction(&mut self) -> Result<Transaction, DatabaseError> {
+        Ok(self.storage.begin_transaction()?)
+    }
+
+    pub fn insert_in(
+        &mut self,
+        transaction: &mut Transaction,
+        values: &[ScalarValue],
+    ) -> Result<(), DatabaseError> {
+        self.storage.insert_in(transaction, values)?;
+        Ok(())
+    }
+
     /// Flushes dirty pages and reports any write or sync failure.
     pub fn flush(&self) -> Result<(), DatabaseError> {
         self.storage.flush()?;
@@ -108,7 +123,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{Database, TransactionState};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
@@ -140,6 +155,37 @@ mod tests {
             .query("SELECT name FROM users WHERE id >= 2 LIMIT 1")
             .expect("query");
         assert_eq!(result.rows, vec![vec![ScalarValue::Text("Lin".into())]]);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn embedded_database_supports_an_explicit_multi_insert_transaction() {
+        let path = std::env::temp_dir().join(format!("netbadb-core-txn-{}", std::process::id()));
+        let mut database = Database::create(&path, table()).expect("create database");
+        let mut transaction = database.begin_transaction().expect("begin transaction");
+        database
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())],
+            )
+            .expect("first insert");
+        database
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())],
+            )
+            .expect("second insert");
+        transaction.commit().expect("commit transaction");
+        assert_eq!(transaction.state(), TransactionState::Committed);
+        database.close().expect("close database");
+
+        let mut reopened = Database::open(&path, table()).expect("open database");
+        let result = reopened
+            .query("SELECT name FROM users WHERE id >= 1")
+            .expect("query");
+        assert_eq!(result.rows.len(), 2);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }
 }

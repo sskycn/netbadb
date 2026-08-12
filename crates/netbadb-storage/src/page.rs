@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use netbadb_types::{PageId, SlotId};
+use netbadb_types::{Lsn, PageId, SlotId};
 
 use crate::{PageError, StorageError, invalid_format};
 
@@ -11,8 +11,8 @@ pub const PAGE_SIZE: usize = 4 * 1024;
 /// Magic for versioned database pages. The explicit version field remains
 /// separate so a decoder never has to infer layout from a magic string.
 pub const PAGE_MAGIC: &[u8; 4] = b"NBP1";
-pub const PAGE_FORMAT_VERSION: u16 = 1;
-pub const PAGE_HEADER_SIZE: usize = 16;
+pub const PAGE_FORMAT_VERSION: u16 = 2;
+pub const PAGE_HEADER_SIZE: usize = 24;
 pub const SLOT_SIZE: usize = 4;
 
 const FILE_MAGIC: &[u8; 4] = b"NBPG";
@@ -21,24 +21,22 @@ const RESERVED_OFFSET: usize = 7;
 const SLOT_COUNT_OFFSET: usize = 8;
 const FREE_START_OFFSET: usize = 10;
 const FREE_END_OFFSET: usize = 12;
+const PAGE_LSN_OFFSET: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
-    Metadata,
     Heap,
 }
 
 impl PageType {
     const fn tag(self) -> u8 {
         match self {
-            Self::Metadata => 1,
             Self::Heap => 2,
         }
     }
 
     fn from_tag(tag: u8) -> Result<Self, PageError> {
         match tag {
-            1 => Ok(Self::Metadata),
             2 => Ok(Self::Heap),
             other => Err(PageError::UnknownPageType(other)),
         }
@@ -51,6 +49,8 @@ pub struct PageHeader {
     pub slot_count: u16,
     pub free_start: u16,
     pub free_end: u16,
+    /// The WAL record that produced the current persistent page image.
+    pub page_lsn: Option<Lsn>,
 }
 
 impl PageHeader {
@@ -107,8 +107,16 @@ impl Page {
     }
 
     #[must_use]
-    pub fn bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         &mut self.bytes
+    }
+
+    pub fn page_lsn(&self) -> Result<Option<Lsn>, StorageError> {
+        Ok(self.header()?.page_lsn)
+    }
+
+    pub(crate) fn set_page_lsn(&mut self, lsn: Lsn) {
+        self.bytes[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8].copy_from_slice(&lsn.0.to_le_bytes());
     }
 
     pub fn header(&self) -> Result<PageHeader, StorageError> {
@@ -122,7 +130,7 @@ impl Page {
         if self.bytes[RESERVED_OFFSET] != 0 {
             return Err(PageError::InvalidReservedByte(self.bytes[RESERVED_OFFSET]).into());
         }
-        if let Some(&value) = self.bytes[14..PAGE_HEADER_SIZE]
+        if let Some(&value) = self.bytes[14..PAGE_LSN_OFFSET]
             .iter()
             .find(|byte| **byte != 0)
         {
@@ -133,6 +141,8 @@ impl Page {
         let slot_count = self.read_u16(SLOT_COUNT_OFFSET);
         let free_start = self.read_u16(FREE_START_OFFSET);
         let free_end = self.read_u16(FREE_END_OFFSET);
+        let raw_page_lsn = self.read_u64(PAGE_LSN_OFFSET);
+        let page_lsn = (raw_page_lsn != 0).then_some(Lsn(raw_page_lsn));
         let max_slots = (PAGE_SIZE - PAGE_HEADER_SIZE) / SLOT_SIZE;
         if usize::from(slot_count) > max_slots {
             return Err(PageError::InvalidSlotCount(slot_count).into());
@@ -209,6 +219,7 @@ impl Page {
             slot_count,
             free_start,
             free_end,
+            page_lsn,
         })
     }
 
@@ -315,6 +326,19 @@ impl Page {
         u16::from_le_bytes([self.bytes[offset], self.bytes[offset + 1]])
     }
 
+    fn read_u64(&self, offset: usize) -> u64 {
+        u64::from_le_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+            self.bytes[offset + 4],
+            self.bytes[offset + 5],
+            self.bytes[offset + 6],
+            self.bytes[offset + 7],
+        ])
+    }
+
     fn write_u16(&mut self, offset: usize, value: u16) {
         self.bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -326,6 +350,8 @@ impl Page {
 pub struct PageManager {
     file: File,
     page_count: u64,
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 impl PageManager {
@@ -344,6 +370,8 @@ impl PageManager {
         Ok(Self {
             file,
             page_count: 1,
+            #[cfg(test)]
+            fail_next_write: false,
         })
     }
 
@@ -362,6 +390,8 @@ impl PageManager {
         Ok(Self {
             file,
             page_count: length / page_size,
+            #[cfg(test)]
+            fail_next_write: false,
         })
     }
 
@@ -370,7 +400,7 @@ impl PageManager {
         self.page_count
     }
 
-    pub fn allocate_page(&mut self) -> Result<Page, StorageError> {
+    pub(crate) fn allocate_page(&mut self) -> Result<Page, StorageError> {
         let id = PageId(self.page_count);
         let next_count = self
             .page_count
@@ -391,8 +421,12 @@ impl PageManager {
         Ok(Page::from_bytes(id, bytes))
     }
 
-    pub fn write_page(&mut self, page: &Page) -> Result<(), StorageError> {
+    pub(crate) fn write_page(&mut self, page: &Page) -> Result<(), StorageError> {
         self.ensure_page_exists(page.id)?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err(std::io::Error::other("injected page write failure").into());
+        }
         self.file
             .seek(SeekFrom::Start(self.page_offset(page.id)?))?;
         self.file.write_all(page.bytes())?;
@@ -402,6 +436,11 @@ impl PageManager {
     pub fn sync(&mut self) -> Result<(), StorageError> {
         self.file.sync_all()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_write_failure(&mut self) {
+        self.fail_next_write = true;
     }
 
     fn page_offset(&self, id: PageId) -> Result<u64, StorageError> {
@@ -424,7 +463,7 @@ mod tests {
 
     use super::{PAGE_SIZE, Page, PageError, PageManager, PageType, SLOT_SIZE};
     use crate::StorageError;
-    use netbadb_types::{PageId, SlotId};
+    use netbadb_types::{Lsn, PageId, SlotId};
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-{name}-{}", std::process::id()))
@@ -438,6 +477,7 @@ mod tests {
         let header = page.header().expect("valid page header");
 
         assert_eq!(header.slot_count, 2);
+        assert_eq!(header.page_lsn, None);
         assert_eq!(
             header.free_start,
             (super::PAGE_HEADER_SIZE + 2 * SLOT_SIZE) as u16
@@ -450,6 +490,44 @@ mod tests {
                 slot: SlotId(2)
             }))
         ));
+    }
+
+    #[test]
+    fn page_lsn_round_trips_and_version_one_is_rejected() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        page.set_page_lsn(Lsn(1234));
+        let decoded = Page::from_bytes(PageId(1), *page.bytes());
+        assert_eq!(decoded.page_lsn().expect("decode pageLSN"), Some(Lsn(1234)));
+
+        let mut version_one = Page::new(PageId(2), PageType::Heap);
+        version_one.bytes_mut()[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(matches!(
+            version_one.header(),
+            Err(StorageError::Page(PageError::UnsupportedVersion(1)))
+        ));
+    }
+
+    #[test]
+    fn page_lsn_persists_through_page_manager_io() {
+        let path = test_path("page-lsn");
+        let mut manager = PageManager::create(&path).expect("create page file");
+        let allocated = manager.allocate_page().expect("allocate page");
+        let mut page = Page::new(allocated.id, PageType::Heap);
+        page.set_page_lsn(Lsn(4321));
+        manager.write_page(&page).expect("write page");
+        manager.sync().expect("sync page");
+        drop(manager);
+
+        let mut reopened = PageManager::open(&path).expect("reopen page file");
+        assert_eq!(
+            reopened
+                .read_page(PageId(1))
+                .expect("read page")
+                .page_lsn()
+                .expect("decode pageLSN"),
+            Some(Lsn(4321))
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -510,8 +588,10 @@ mod tests {
         ));
 
         let mut invalid_free_space = Page::new(PageId(4), PageType::Heap);
-        invalid_free_space.bytes_mut()[10..12].copy_from_slice(&16_u16.to_le_bytes());
-        invalid_free_space.bytes_mut()[12..14].copy_from_slice(&15_u16.to_le_bytes());
+        invalid_free_space.bytes_mut()[10..12]
+            .copy_from_slice(&(super::PAGE_HEADER_SIZE as u16).to_le_bytes());
+        invalid_free_space.bytes_mut()[12..14]
+            .copy_from_slice(&((super::PAGE_HEADER_SIZE - 1) as u16).to_le_bytes());
         assert!(matches!(
             invalid_free_space.header(),
             Err(StorageError::Page(PageError::InvalidFreeSpace { .. }))
@@ -519,8 +599,10 @@ mod tests {
 
         let mut invalid_slot = Page::new(PageId(5), PageType::Heap);
         invalid_slot.insert_record(b"safe").expect("insert record");
-        invalid_slot.bytes_mut()[16..18].copy_from_slice(&1_u16.to_le_bytes());
-        invalid_slot.bytes_mut()[18..20].copy_from_slice(&u16::MAX.to_le_bytes());
+        invalid_slot.bytes_mut()[super::PAGE_HEADER_SIZE..super::PAGE_HEADER_SIZE + 2]
+            .copy_from_slice(&1_u16.to_le_bytes());
+        invalid_slot.bytes_mut()[super::PAGE_HEADER_SIZE + 2..super::PAGE_HEADER_SIZE + 4]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(matches!(
             invalid_slot.header(),
             Err(StorageError::Page(PageError::RecordOutOfBounds { .. }))

@@ -1,11 +1,15 @@
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 use netbadb_schema::TableDef;
 use netbadb_types::{PageId, RowId, ScalarValue, SlotId};
 
+use crate::transaction::TransactionManager;
 use crate::{
     BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE,
-    Page, PageError, PageManager, PageType, SLOT_SIZE, StorageError,
+    Page, PageError, PageManager, PageType, SLOT_SIZE, StorageError, Transaction, TransactionError,
+    WalManager, wal_path,
 };
 
 const HEADER_PAGE: PageId = PageId(0);
@@ -24,6 +28,7 @@ const HEAP_COLUMN_COUNT_OFFSET: usize = HEAP_TABLE_ID_OFFSET + 8;
 pub struct HeapStorage {
     buffer: BufferPool,
     table: TableDef,
+    transactions: TransactionManager,
 }
 
 impl HeapStorage {
@@ -38,8 +43,10 @@ impl HeapStorage {
     ) -> Result<Self, StorageError> {
         validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
+        let path = path.as_ref();
         let pages = PageManager::create(path)?;
-        let buffer = BufferPool::new(pages, buffer_pool_size)?;
+        let wal = Rc::new(RefCell::new(WalManager::create(wal_path(path))?));
+        let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let mut header = buffer.write_page(HEADER_PAGE)?;
             write_heap_metadata(header.page_mut().bytes_mut(), &table);
@@ -51,7 +58,11 @@ impl HeapStorage {
             *page = Page::new(page_id, PageType::Heap);
         }
         buffer.flush_all()?;
-        Ok(Self { buffer, table })
+        Ok(Self {
+            buffer,
+            table,
+            transactions: TransactionManager::new(wal, None)?,
+        })
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
@@ -65,19 +76,57 @@ impl HeapStorage {
     ) -> Result<Self, StorageError> {
         validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
+        let path = path.as_ref();
         let pages = PageManager::open(path)?;
         if pages.page_count() < 2 {
             return Err(crate::invalid_format("heap file has no data page"));
         }
-        let buffer = BufferPool::new(pages, buffer_pool_size)?;
+        let mut wal_manager = WalManager::open(wal_path(path))?;
+        let records = wal_manager.scan()?;
+        let max_txn = records.iter().map(|record| record.txn_id).max();
+        let wal = Rc::new(RefCell::new(wal_manager));
+        let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let header = buffer.read_page(HEADER_PAGE)?;
             validate_heap_metadata(header.page().bytes(), &table)?;
         }
-        Ok(Self { buffer, table })
+        Ok(Self {
+            buffer,
+            table,
+            transactions: TransactionManager::new(wal, max_txn)?,
+        })
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<RowId, StorageError> {
+        let mut transaction = self.begin_transaction()?;
+        match self.insert_in(&mut transaction, values) {
+            Ok(row_id) => {
+                transaction.commit()?;
+                Ok(row_id)
+            }
+            Err(error) => {
+                let _ = transaction.abort();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn begin_transaction(&mut self) -> Result<Transaction, StorageError> {
+        self.transactions.begin()
+    }
+
+    pub fn insert_in(
+        &mut self,
+        transaction: &mut Transaction,
+        values: &[ScalarValue],
+    ) -> Result<RowId, StorageError> {
+        if !transaction.belongs_to(self.transactions.wal()) {
+            return Err(TransactionError::ForeignTransaction {
+                txn_id: transaction.id(),
+            }
+            .into());
+        }
+        transaction.ensure_active()?;
         self.validate_row(values)?;
         let payload = encode_row(values)?;
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
@@ -96,23 +145,43 @@ impl HeapStorage {
             .ok_or_else(|| crate::invalid_format("heap file has no pages"))?;
         let existing = {
             let mut page = self.buffer.write_page(PageId(last_page))?;
-            page.page_mut().insert_record(&payload)
+            let before = page.page().clone();
+            let mut after = before.clone();
+            match after.insert_record(&payload) {
+                Ok(slot) => {
+                    transaction.log_page_update(&before, &mut after)?;
+                    *page.page_mut() = after;
+                    Ok(Some(slot))
+                }
+                Err(StorageError::Page(PageError::PageFull { .. })) => Ok(None),
+                Err(error) => Err(error),
+            }
         };
         let (page_id, slot) = match existing {
-            Ok(slot) => (PageId(last_page), slot),
-            Err(StorageError::Page(PageError::PageFull { .. })) => {
+            Ok(Some(slot)) => (PageId(last_page), slot),
+            Ok(None) => {
+                let expected_page_id = PageId(self.buffer.page_count());
+                let before = Page::zero(expected_page_id);
+                let mut after = Page::new(expected_page_id, PageType::Heap);
+                let slot = after.insert_record(&payload)?;
+                let update_lsn = transaction.log_page_update(&before, &mut after)?;
+                // Extending the database file writes a zero-filled page before
+                // the buffer can install the logged after-image. Make the WAL
+                // durable first so even allocation obeys write-ahead ordering.
+                transaction.flush_through(update_lsn)?;
                 let mut page = self.buffer.new_page()?;
                 let page_id = page.page_id();
-                let slot = {
-                    let raw_page = page.page_mut();
-                    *raw_page = Page::new(page_id, PageType::Heap);
-                    raw_page.insert_record(&payload)?
-                };
+                if page_id != expected_page_id {
+                    return Err(crate::invalid_format(format!(
+                        "allocated page {}, expected {}",
+                        page_id.0, expected_page_id.0
+                    )));
+                }
+                *page.page_mut() = after;
                 (page_id, slot)
             }
             Err(error) => return Err(error),
         };
-        self.buffer.flush_all()?;
         Ok(RowId {
             page: page_id,
             slot: slot.0,
@@ -148,16 +217,49 @@ impl HeapStorage {
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
+        let written = self
+            .transactions
+            .wal()
+            .try_borrow()
+            .map_err(|_| TransactionError::WalBusy)?
+            .written_lsn();
+        if let Some(lsn) = written {
+            self.transactions
+                .wal()
+                .try_borrow_mut()
+                .map_err(|_| TransactionError::WalBusy)?
+                .flush_through(lsn)?;
+        }
         self.buffer.flush_all()
     }
 
     pub fn close(self) -> Result<(), StorageError> {
-        self.buffer.flush_all()
+        self.flush()
     }
 
     #[must_use]
     pub fn table(&self) -> &TableDef {
         &self.table
+    }
+
+    #[cfg(test)]
+    fn wal_records(&self) -> Result<Vec<crate::WalRecord>, StorageError> {
+        Ok(self
+            .transactions
+            .wal()
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .scan()?)
+    }
+
+    #[cfg(test)]
+    fn durable_lsn(&self) -> Result<Option<netbadb_types::Lsn>, StorageError> {
+        Ok(self
+            .transactions
+            .wal()
+            .try_borrow()
+            .map_err(|_| TransactionError::WalBusy)?
+            .durable_lsn())
     }
 
     fn validate_row(&self, values: &[ScalarValue]) -> Result<(), StorageError> {
@@ -378,7 +480,7 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::HeapStorage;
-    use crate::{BufferError, PageManager, SlotId, StorageError};
+    use crate::{BufferError, PageManager, SlotId, StorageError, TransactionState, wal_path};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
 
@@ -398,6 +500,11 @@ mod tests {
         std::env::temp_dir().join(format!("netbadb-{name}-{}", std::process::id()))
     }
 
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(wal_path(path));
+    }
+
     #[test]
     fn insert_write_read_decode_round_trip() {
         let path = test_path("heap-round-trip");
@@ -415,7 +522,7 @@ mod tests {
             rows[0].1,
             vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
         );
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -431,7 +538,7 @@ mod tests {
         let rows = reopened.scan().expect("scan heap");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].1.is_empty());
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -450,7 +557,7 @@ mod tests {
 
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen preserved heap");
         assert_eq!(reopened.scan().expect("scan preserved heap").len(), 1);
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -471,7 +578,7 @@ mod tests {
         let mut reopened =
             HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("reopen heap");
         assert_eq!(reopened.scan().expect("reopen scan").len(), 700);
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -496,7 +603,7 @@ mod tests {
             reopened.scan(),
             Err(StorageError::Codec(crate::CodecError::UnknownScalarTag(99)))
         ));
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -510,7 +617,8 @@ mod tests {
 
         let mut pages = PageManager::open(&path).expect("open page manager");
         let mut page = pages.read_page(PageId(1)).expect("read data page");
-        page.bytes_mut()[18..20].copy_from_slice(&u16::MAX.to_le_bytes());
+        page.bytes_mut()[crate::PAGE_HEADER_SIZE + 2..crate::PAGE_HEADER_SIZE + 4]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
         pages.write_page(&page).expect("write corrupt slot");
         pages.sync().expect("sync corrupt slot");
         drop(pages);
@@ -522,7 +630,7 @@ mod tests {
                 crate::PageError::RecordOutOfBounds { .. }
             ))
         ));
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -544,6 +652,85 @@ mod tests {
                 crate::MetadataError::UnsupportedVersion(99)
             ))
         ));
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn implicit_insert_commits_wal_without_flushing_the_heap_page() {
+        let path = test_path("heap-no-insert-flush");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert row");
+        assert!(storage.durable_lsn().expect("durable LSN").is_some());
+
+        let mut disk = PageManager::open(&path).expect("open page file");
+        assert_eq!(
+            disk.read_page(PageId(1))
+                .expect("read data page")
+                .header()
+                .expect("valid page")
+                .slot_count,
+            0
+        );
+        drop(disk);
+        storage.close().expect("close heap");
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert_eq!(reopened.scan().expect("scan").len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn one_transaction_updates_multiple_pages_with_one_prev_lsn_chain() {
+        let path = test_path("heap-multi-page-transaction");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        let text = "x".repeat(1_000);
+        for id in 0..12_i64 {
+            storage
+                .insert_in(
+                    &mut transaction,
+                    &[ScalarValue::Int64(id), ScalarValue::Text(text.clone())],
+                )
+                .expect("insert in transaction");
+        }
+        transaction.commit().expect("commit transaction");
+        assert_eq!(transaction.state(), TransactionState::Committed);
+        let records = storage.wal_records().expect("scan WAL");
+        assert_eq!(records.len(), 14);
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].prev_lsn, Some(pair[0].lsn));
+        }
+        storage.close().expect("close heap");
+
+        let mut reopened =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("reopen heap");
+        let rows = reopened.scan().expect("scan rows");
+        assert_eq!(rows.len(), 12);
+        assert!(rows.iter().any(|(row_id, _)| row_id.page.0 > 1));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn wal_flush_failure_prevents_new_page_allocation() {
+        let path = test_path("heap-allocation-wal-failure");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("x".repeat(3_900))])
+            .expect("fill first page");
+        storage
+            .transactions
+            .wal()
+            .borrow_mut()
+            .inject_flush_failure();
+
+        assert!(matches!(
+            storage.insert(&[ScalarValue::Int64(2), ScalarValue::Text("y".repeat(1_000)),]),
+            Err(StorageError::Wal(_))
+        ));
+        assert_eq!(storage.buffer.page_count(), 2);
+        drop(storage);
+        cleanup(&path);
     }
 }
