@@ -4,13 +4,14 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_hir::{
-    ColumnRef as HirColumnRef, HirError, TypedExpr, TypedExprKind, TypedQuery, TypedRelation,
+    ColumnRef as HirColumnRef, HirError, NullOrder as HirNullOrder,
+    SortDirection as HirSortDirection, TypedExpr, TypedExprKind, TypedQuery, TypedRelation,
     TypedStatement,
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
     Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement,
-    UnaryOp,
+    NullOrder, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_schema::Schema;
 
@@ -137,6 +138,26 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
             predicate: lower_expr(predicate),
         };
     }
+    if !query.order_by.is_empty() {
+        plan = LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys: query
+                .order_by
+                .iter()
+                .map(|key| SortKey {
+                    column: column_ref_from_hir(&key.column),
+                    direction: match key.direction {
+                        HirSortDirection::Asc => SortDirection::Asc,
+                        HirSortDirection::Desc => SortDirection::Desc,
+                    },
+                    null_order: match key.null_order {
+                        HirNullOrder::First => NullOrder::First,
+                        HirNullOrder::Last => NullOrder::Last,
+                    },
+                })
+                .collect(),
+        };
+    }
     plan = LogicalPlan::Project {
         input: Box::new(plan),
         columns: query.projection.iter().map(column_ref_from_hir).collect(),
@@ -244,7 +265,7 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::{compile, compile_statement};
-    use netbadb_rel::{ExprKind, LogicalPlan, LogicalStatement};
+    use netbadb_rel::{ExprKind, LogicalPlan, LogicalStatement, NullOrder, SortDirection};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
 
@@ -294,6 +315,40 @@ mod tests {
             ExprKind::IsNull { negated: true, .. }
         ));
         assert!(!predicate.expr_type.nullable);
+    }
+
+    #[test]
+    fn places_sort_before_projection_and_limit_for_unprojected_keys() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ],
+        )])
+        .expect("valid test schema");
+        let compiled = compile(
+            &schema,
+            "SELECT name FROM users WHERE id > 0 ORDER BY id DESC LIMIT 2",
+        )
+        .expect("compile ORDER BY");
+        let LogicalPlan::Limit { input, limit: 2 } = compiled.logical_plan else {
+            panic!("expected limit");
+        };
+        let LogicalPlan::Project { input, columns } = *input else {
+            panic!("expected project");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "name");
+        let LogicalPlan::Sort { input, keys } = *input else {
+            panic!("expected sort");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].column.name, "id");
+        assert_eq!(keys[0].direction, SortDirection::Desc);
+        assert_eq!(keys[0].null_order, NullOrder::First);
+        assert!(matches!(*input, LogicalPlan::Filter { .. }));
     }
 
     #[test]

@@ -40,15 +40,15 @@ The current embedded path is synchronous:
 ```text
 Rust Schema API
     ↓
-SELECT / INNER JOIN + typed INSERT / UPDATE / DELETE statement parser
+SELECT / INNER JOIN / ORDER BY + typed INSERT / UPDATE / DELETE parser
     ↓
 Typed HIR
     ↓
 Logical query / DML statement plan
     ↓
-Sequential scan + nested-loop join physical plan
+Sequential scan + nested-loop join + stable in-memory sort physical plan
     ↓
-Join / filter / projection / limit + RowId mutation executor
+Join / filter / sort / projection / limit + RowId mutation executor
     ↓
 Heap
     ↓
@@ -137,7 +137,7 @@ The current code genuinely supports:
   semantic type metadata, unified validation, and stable schema fingerprints;
 - parser support for `SELECT`, qualified columns, `AS` and shorthand table
   aliases, chained `JOIN`/`INNER JOIN ... ON`, explicit-column single-row `INSERT`, `UPDATE`,
-  `DELETE`, optional DML `WHERE`, `LIMIT`, wildcard projection,
+  `DELETE`, optional DML `WHERE`, multi-key source-column `ORDER BY`, `LIMIT`, wildcard projection,
   `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
   boolean/NULL literals, and parentheses;
 - name resolution and expression type checking with nominal semantic types and
@@ -161,7 +161,7 @@ The current code genuinely supports:
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - RowId-based insert, update, delete, scan, file reopen, row encoding, and row
   decoding;
-- executor support for INNER JOIN, filter, projection, limit, typed DML, affected-row
+- executor support for INNER JOIN, filter, stable in-memory sort, projection, limit, typed DML, affected-row
   results, SQL three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
@@ -307,6 +307,18 @@ The core composes multiple unchanged one-table heap files with
 embedded data loading. No page, heap, WAL, recovery, checkpoint, or transaction
 format changed for JOIN. Multi-table write transactions remain unsupported.
 
+`ORDER BY` accepts one or more qualified or unqualified source-column keys.
+Each key may specify `ASC` or `DESC` and `NULLS FIRST` or `NULLS LAST`; omitted
+options become `ASC NULLS LAST` or `DESC NULLS FIRST`. Keys are resolved against
+the complete `FROM`/`JOIN` scope before projection, so a query may sort by a
+column it does not return. Alias names, ordinals, and arbitrary sort
+expressions are not supported. Planning preserves the order
+`Scan/Join -> Filter -> Sort -> Project -> Limit`. The executor resolves key
+positions once, validates runtime physical types, and performs a stable
+in-memory lexicographic sort. Stability makes ties repeatable for the current
+input order, but it is not a permanent ordering guarantee across future plan
+changes; callers that need a total order must include sufficient keys.
+
 ## Go and protocol strategy
 
 Go is no longer treated as the database implementation language. The intended
@@ -373,8 +385,8 @@ The implementation sequence is intentionally vertical:
    self joins, nested-loop execution, and NULL-aware join predicates. Complete.
 10. Data-page integrity — Page v4 CRC32C bound to PageId, recovery-safe pageLSN
     validation, checkpoint-baseline corruption detection, and page fuzzing.
-11. Aggregate + Sort (Phase 3D) — `ORDER BY`, aggregate functions, `GROUP BY`,
-    and aggregate NULL semantics.
+11. Aggregate + Sort (Phase 3D) — typed source-column `ORDER BY` is complete;
+    aggregate functions, `GROUP BY`, and aggregate NULL semantics remain.
 12. Indexing — B+Tree and planner access-path selection.
 13. Server mode — protocol, sessions, and `netbadbd`.
 14. SDKs and tooling — generated Go client, CLI, LSP, and MCP.

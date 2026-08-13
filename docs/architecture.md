@@ -121,13 +121,32 @@ ordinary equality never joins NULL to NULL. The existing expression checker
 requires BOOL while allowing nullable BOOL, and nominal compatibility prevents
 JOIN from comparing distinct semantic types with the same physical encoding.
 This algorithm preserves duplicates and deterministic left-major/right-minor
-order. WHERE remains a Filter above Join, followed by Project and Limit;
-`SELECT *` follows left-to-right relation and schema order.
+order. Query operators are arranged as `Scan/Join -> Filter -> Sort -> Project
+-> Limit`, allowing sorting by source columns that projection omits. `SELECT *`
+follows left-to-right relation and schema order.
 
 Core multi-table catalogs compose one existing heap file per `TableId`. JOIN
 therefore introduces no persistent format or transaction-layer changes: page
-version 3, heap metadata, WAL, recovery, checkpoints, and single-writer rules
-are unchanged.
+version 4, heap metadata version 2, WAL version 3 with record version 2,
+recovery, checkpoints, and single-writer rules are unchanged.
+
+## Typed ORDER BY
+
+`ORDER BY` accepts one or more source-column keys, qualified or unqualified,
+and resolves them through the same complete `FROM`/`JOIN` `RelationScope` used
+by other expressions. HIR makes every option explicit: omitted direction is
+`ASC`; omitted NULL placement is `NULLS LAST` for ascending keys and
+`NULLS FIRST` for descending keys. Alias names, ordinals, and arbitrary sort
+expressions are outside this slice.
+
+Logical `Sort` and physical `Sort` preserve the input's binding-aware output
+shape. The executor resolves all key positions once, validates that each
+non-NULL runtime value has the key's declared physical type, and then performs
+a stable in-memory lexicographic sort. NULL placement is applied independently
+of direction; direction reverses only ordinary non-NULL comparison. Stability
+preserves input order among equal keys for the current plan, but does not
+promise a permanent tie order if future access paths change. A caller that
+requires a total order must provide enough keys.
 
 ## Typed expressions and NULL
 

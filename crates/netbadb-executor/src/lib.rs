@@ -5,7 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_planner::{PhysicalPlan, PhysicalStatement};
-use netbadb_rel::{Assignment, BinaryOp, ColumnRef, Expr, ExprKind, UnaryOp};
+use netbadb_rel::{
+    Assignment, BinaryOp, ColumnRef, Expr, ExprKind, NullOrder, SortDirection, SortKey, UnaryOp,
+};
 use netbadb_storage::{HeapStorage, StorageError, Transaction};
 use netbadb_types::{RowId, ScalarValue, TableId};
 
@@ -250,6 +252,29 @@ fn execute_rows(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(result)
         }
+        PhysicalPlan::Sort { input, keys } => {
+            let mut result = execute_rows(input, storages)?;
+            let positions = resolve_sort_positions(&result.columns, keys)?;
+            validate_sort_values(&result.rows, &positions, keys)?;
+
+            let mut comparison_error = None;
+            result.rows.sort_by(|left, right| {
+                if comparison_error.is_some() {
+                    return Ordering::Equal;
+                }
+                match compare_sort_rows(left, right, &positions, keys) {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        comparison_error = Some(error);
+                        Ordering::Equal
+                    }
+                }
+            });
+            if let Some(error) = comparison_error {
+                return Err(error);
+            }
+            Ok(result)
+        }
         PhysicalPlan::Project { input, columns } => {
             let input_result = execute_rows(input, storages)?;
             let positions = columns
@@ -289,6 +314,90 @@ fn execute_rows(
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
+        }
+    }
+}
+
+fn resolve_sort_positions(
+    columns: &[ColumnRef],
+    keys: &[SortKey],
+) -> Result<Vec<usize>, ExecutionError> {
+    keys.iter()
+        .map(|key| {
+            columns
+                .iter()
+                .position(|candidate| {
+                    candidate.binding_id == key.column.binding_id
+                        && candidate.column_id == key.column.column_id
+                })
+                .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))
+        })
+        .collect()
+}
+
+fn validate_sort_values(
+    rows: &[ExecutionRow],
+    positions: &[usize],
+    keys: &[SortKey],
+) -> Result<(), ExecutionError> {
+    for row in rows {
+        for (position, key) in positions.iter().zip(keys) {
+            let value = row
+                .values
+                .get(*position)
+                .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))?;
+            if !value.matches_type(&key.column.data_type) {
+                return Err(ExecutionError::TypeMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compare_sort_rows(
+    left: &ExecutionRow,
+    right: &ExecutionRow,
+    positions: &[usize],
+    keys: &[SortKey],
+) -> Result<Ordering, ExecutionError> {
+    for (position, key) in positions.iter().zip(keys) {
+        let left = left
+            .values
+            .get(*position)
+            .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))?;
+        let right = right
+            .values
+            .get(*position)
+            .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))?;
+        let ordering = compare_sort_values(left, right, key)?;
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+fn compare_sort_values(
+    left: &ScalarValue,
+    right: &ScalarValue,
+    key: &SortKey,
+) -> Result<Ordering, ExecutionError> {
+    match (left, right) {
+        (ScalarValue::Null, ScalarValue::Null) => Ok(Ordering::Equal),
+        (ScalarValue::Null, _) => Ok(match key.null_order {
+            NullOrder::First => Ordering::Less,
+            NullOrder::Last => Ordering::Greater,
+        }),
+        (_, ScalarValue::Null) => Ok(match key.null_order {
+            NullOrder::First => Ordering::Greater,
+            NullOrder::Last => Ordering::Less,
+        }),
+        _ => {
+            let ordering = compare_values(left, right)?;
+            Ok(match key.direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            })
         }
     }
 }
@@ -505,9 +614,11 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryResult, TruthValue, evaluate_binary, execute};
+    use super::{ExecutionError, QueryResult, TruthValue, evaluate_binary, execute};
     use netbadb_planner::plan;
-    use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan};
+    use netbadb_rel::{
+        BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
+    };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
     use netbadb_types::{
@@ -640,5 +751,178 @@ mod tests {
                 ScalarValue::Null
             );
         }
+    }
+
+    #[test]
+    fn stable_sort_covers_all_types_null_orders_and_runtime_validation() {
+        let table = TableDef::new(
+            TableId(2),
+            "sortable",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "unsigned",
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                ),
+                ColumnDef::new(ColumnId(3), "text", TypeSpec::Physical(PhysicalType::Text)),
+                ColumnDef::new(
+                    ColumnId(4),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+                ColumnDef::new(
+                    ColumnId(5),
+                    "value",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+            ],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-executor-sort-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut storage = HeapStorage::create(&path, table).expect("create heap");
+        for row in [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::UInt64(2),
+                ScalarValue::Text("b".into()),
+                ScalarValue::Bool(true),
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::UInt64(1),
+                ScalarValue::Text("c".into()),
+                ScalarValue::Bool(false),
+                ScalarValue::Int64(3),
+            ],
+            vec![
+                ScalarValue::Int64(3),
+                ScalarValue::UInt64(3),
+                ScalarValue::Text("a".into()),
+                ScalarValue::Bool(true),
+                ScalarValue::Int64(1),
+            ],
+            vec![
+                ScalarValue::Int64(4),
+                ScalarValue::UInt64(4),
+                ScalarValue::Text("d".into()),
+                ScalarValue::Bool(false),
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(5),
+                ScalarValue::UInt64(5),
+                ScalarValue::Text("e".into()),
+                ScalarValue::Bool(true),
+                ScalarValue::Int64(2),
+            ],
+        ] {
+            storage.insert(&row).expect("insert sortable row");
+        }
+
+        let column = |id: u32, name: &str, physical: PhysicalType, nullable: bool| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(2),
+            column_id: ColumnId(id),
+            relation_name: "sortable".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable,
+        };
+        let id = column(1, "id", PhysicalType::Int64, false);
+        let unsigned = column(2, "unsigned", PhysicalType::UInt64, false);
+        let text = column(3, "text", PhysicalType::Text, false);
+        let active = column(4, "active", PhysicalType::Bool, false);
+        let value = column(5, "value", PhysicalType::Int64, true);
+        let columns = vec![
+            id.clone(),
+            unsigned.clone(),
+            text.clone(),
+            active.clone(),
+            value.clone(),
+        ];
+        {
+            let mut sorted_ids = |key: ColumnRef, direction, null_order| {
+                let logical = LogicalPlan::Project {
+                    input: Box::new(LogicalPlan::Sort {
+                        input: Box::new(LogicalPlan::Scan {
+                            binding_id: RelationBindingId(0),
+                            table_id: TableId(2),
+                            table_name: "sortable".into(),
+                            columns: columns.clone(),
+                        }),
+                        keys: vec![SortKey {
+                            column: key,
+                            direction,
+                            null_order,
+                        }],
+                    }),
+                    columns: vec![id.clone()],
+                };
+                execute(&plan(&logical), &mut storage)
+                    .expect("sort executes")
+                    .rows
+                    .into_iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                sorted_ids(unsigned, SortDirection::Asc, NullOrder::Last),
+                [2, 1, 3, 4, 5].map(ScalarValue::Int64)
+            );
+            assert_eq!(
+                sorted_ids(text, SortDirection::Asc, NullOrder::Last),
+                [3, 1, 2, 4, 5].map(ScalarValue::Int64)
+            );
+            assert_eq!(
+                sorted_ids(active, SortDirection::Asc, NullOrder::Last),
+                [2, 4, 1, 3, 5].map(ScalarValue::Int64)
+            );
+            assert_eq!(
+                sorted_ids(value.clone(), SortDirection::Asc, NullOrder::Last),
+                [3, 5, 2, 1, 4].map(ScalarValue::Int64)
+            );
+            assert_eq!(
+                sorted_ids(value.clone(), SortDirection::Desc, NullOrder::First),
+                [1, 4, 2, 5, 3].map(ScalarValue::Int64)
+            );
+            assert_eq!(
+                sorted_ids(value.clone(), SortDirection::Asc, NullOrder::First),
+                [1, 4, 3, 5, 2].map(ScalarValue::Int64)
+            );
+            assert_eq!(
+                sorted_ids(value, SortDirection::Desc, NullOrder::Last),
+                [2, 5, 3, 1, 4].map(ScalarValue::Int64)
+            );
+        }
+
+        let mut mismatched = id.clone();
+        mismatched.data_type = SemanticType::physical(PhysicalType::UInt64);
+        let invalid = LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(2),
+                table_name: "sortable".into(),
+                columns,
+            }),
+            keys: vec![SortKey {
+                column: mismatched,
+                direction: SortDirection::Asc,
+                null_order: NullOrder::Last,
+            }],
+        };
+        assert!(matches!(
+            execute(&plan(&invalid), &mut storage),
+            Err(ExecutionError::TypeMismatch)
+        ));
+
+        storage.close().expect("close storage");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }
 }

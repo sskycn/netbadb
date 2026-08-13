@@ -19,6 +19,25 @@ pub enum JoinKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOrder {
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    pub column: ColumnRef,
+    pub direction: SortDirection,
+    pub null_order: NullOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Eq,
     NotEq,
@@ -79,6 +98,10 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         predicate: Expr,
     },
+    Sort {
+        input: Box<LogicalPlan>,
+        keys: Vec<SortKey>,
+    },
     Project {
         input: Box<LogicalPlan>,
         columns: Vec<ColumnRef>,
@@ -121,7 +144,9 @@ impl LogicalPlan {
             Self::Scan { columns, .. }
             | Self::Join { columns, .. }
             | Self::Project { columns, .. } => columns,
-            Self::Filter { input, .. } | Self::Limit { input, .. } => input.output_columns(),
+            Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
+                input.output_columns()
+            }
         }
     }
 }

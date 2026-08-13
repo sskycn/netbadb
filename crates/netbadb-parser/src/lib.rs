@@ -21,6 +21,7 @@ pub struct Query {
     pub from: FromItem,
     pub joins: Vec<Join>,
     pub selection: Option<Expr>,
+    pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub span: Span,
 }
@@ -42,6 +43,26 @@ pub struct Join {
     pub kind: JoinKind,
     pub right: FromItem,
     pub condition: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOrder {
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderByItem {
+    pub column: ColumnName,
+    pub direction: Option<SortDirection>,
+    pub null_order: Option<NullOrder>,
     pub span: Span,
 }
 
@@ -169,6 +190,13 @@ enum TokenKind {
     Select,
     From,
     Where,
+    Order,
+    By,
+    Asc,
+    Desc,
+    Nulls,
+    First,
+    Last,
     Limit,
     Insert,
     Into,
@@ -338,6 +366,13 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "SELECT" => TokenKind::Select,
                     "FROM" => TokenKind::From,
                     "WHERE" => TokenKind::Where,
+                    "ORDER" => TokenKind::Order,
+                    "BY" => TokenKind::By,
+                    "ASC" => TokenKind::Asc,
+                    "DESC" => TokenKind::Desc,
+                    "NULLS" => TokenKind::Nulls,
+                    "FIRST" => TokenKind::First,
+                    "LAST" => TokenKind::Last,
                     "LIMIT" => TokenKind::Limit,
                     "INSERT" => TokenKind::Insert,
                     "INTO" => TokenKind::Into,
@@ -423,6 +458,11 @@ impl Parser {
         } else {
             None
         };
+        let order_by = if self.matches(&TokenKind::Order) {
+            self.parse_order_by()?
+        } else {
+            Vec::new()
+        };
         let limit = if self.matches(&TokenKind::Limit) {
             self.position += 1;
             let token = self.current().clone();
@@ -442,8 +482,59 @@ impl Parser {
             from,
             joins,
             selection,
+            order_by,
             limit,
             span: Span { start, end },
+        })
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderByItem>, ParseError> {
+        self.expect_simple(TokenKind::Order)?;
+        self.expect_simple(TokenKind::By)?;
+        let mut items = vec![self.parse_order_by_item()?];
+        while self.matches(&TokenKind::Comma) {
+            self.position += 1;
+            items.push(self.parse_order_by_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_order_by_item(&mut self) -> Result<OrderByItem, ParseError> {
+        let column = self.parse_column_name()?;
+        let mut end = column.span.end;
+        let direction = if self.matches(&TokenKind::Asc) {
+            end = self.current().span.end;
+            self.position += 1;
+            Some(SortDirection::Asc)
+        } else if self.matches(&TokenKind::Desc) {
+            end = self.current().span.end;
+            self.position += 1;
+            Some(SortDirection::Desc)
+        } else {
+            None
+        };
+        let null_order = if self.matches(&TokenKind::Nulls) {
+            self.position += 1;
+            let token = self.current().clone();
+            let null_order = match token.kind {
+                TokenKind::First => NullOrder::First,
+                TokenKind::Last => NullOrder::Last,
+                _ => return Err(self.error_here("NULLS expects FIRST or LAST")),
+            };
+            end = token.span.end;
+            self.position += 1;
+            Some(null_order)
+        } else {
+            None
+        };
+        Ok(OrderByItem {
+            span: Span {
+                start: column.span.start,
+                end,
+            },
+            column,
+            direction,
+            null_order,
         })
     }
 
@@ -831,7 +922,10 @@ fn statement_span(statement: &Statement) -> Span {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, Literal, SelectItem, Statement, UnaryOp, parse, parse_statement};
+    use super::{
+        BinaryOp, Expr, Literal, NullOrder, SelectItem, SortDirection, Statement, UnaryOp, parse,
+        parse_statement,
+    };
 
     #[test]
     fn parses_the_initial_query_subset() {
@@ -1035,6 +1129,73 @@ mod tests {
             "SELECT * FROM users AS JOIN teams ON users.id = teams.id",
         ] {
             assert!(parse(source).is_err(), "{source} must fail");
+        }
+    }
+
+    #[test]
+    fn parses_order_by_columns_directions_nulls_and_limit() {
+        let query = parse(
+            "SELECT name FROM users WHERE active = true \
+             ORDER BY users.id, name DESC NULLS LAST, active ASC NULLS FIRST LIMIT 2",
+        )
+        .expect("ORDER BY query parses");
+        assert_eq!(query.order_by.len(), 3);
+        assert_eq!(
+            query.order_by[0]
+                .column
+                .qualifier
+                .as_ref()
+                .expect("qualified key")
+                .name,
+            "users"
+        );
+        assert_eq!(query.order_by[0].direction, None);
+        assert_eq!(query.order_by[0].null_order, None);
+        assert_eq!(query.order_by[1].direction, Some(SortDirection::Desc));
+        assert_eq!(query.order_by[1].null_order, Some(NullOrder::Last));
+        assert_eq!(query.order_by[2].direction, Some(SortDirection::Asc));
+        assert_eq!(query.order_by[2].null_order, Some(NullOrder::First));
+        assert_eq!(query.limit, Some(2));
+
+        let nulls = parse("SELECT id FROM users ORDER BY id NULLS FIRST")
+            .expect("NULLS without direction parses");
+        assert_eq!(nulls.order_by[0].direction, None);
+        assert_eq!(nulls.order_by[0].null_order, Some(NullOrder::First));
+        let explicit = parse("SELECT id FROM users ORDER BY id ASC NULLS LAST")
+            .expect("explicit ASC NULLS LAST parses");
+        assert_eq!(explicit.order_by[0].direction, Some(SortDirection::Asc));
+        assert_eq!(explicit.order_by[0].null_order, Some(NullOrder::Last));
+
+        let alias =
+            parse("SELECT u.id FROM users u JOIN teams t ON u.id = t.id ORDER BY u.id DESC")
+                .expect("qualified join ORDER BY parses");
+        assert_eq!(
+            alias.order_by[0]
+                .column
+                .qualifier
+                .as_ref()
+                .expect("alias qualifier")
+                .name,
+            "u"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_order_by_syntax_and_clause_order() {
+        for source in [
+            "SELECT id FROM users ORDER BY",
+            "SELECT id FROM users ORDER BY ,",
+            "SELECT id FROM users ORDER BY id,",
+            "SELECT id FROM users ORDER BY id ASC DESC",
+            "SELECT id FROM users ORDER BY id NULLS",
+            "SELECT id FROM users ORDER BY id NULLS UNKNOWN",
+            "SELECT id FROM users ORDER BY 1",
+            "SELECT id FROM users ORDER BY id = 1",
+            "SELECT id FROM users LIMIT 1 ORDER BY id",
+        ] {
+            let error = parse(source).expect_err("invalid ORDER BY must fail");
+            assert!(error.span.start <= error.span.end, "{source}");
+            assert!(error.span.end <= source.len(), "{source}");
         }
     }
 }

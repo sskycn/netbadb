@@ -1,6 +1,6 @@
 //! Physical planning kept separate from logical relational meaning.
 
-use netbadb_rel::{Assignment, ColumnRef, Expr, JoinKind, LogicalStatement};
+use netbadb_rel::{Assignment, ColumnRef, Expr, JoinKind, LogicalStatement, SortKey};
 use netbadb_types::{RelationBindingId, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,10 @@ pub enum PhysicalPlan {
     Filter {
         input: Box<PhysicalPlan>,
         predicate: Expr,
+    },
+    Sort {
+        input: Box<PhysicalPlan>,
+        keys: Vec<SortKey>,
     },
     Project {
         input: Box<PhysicalPlan>,
@@ -58,7 +62,9 @@ impl PhysicalPlan {
             Self::SeqScan { columns, .. }
             | Self::NestedLoopJoin { columns, .. }
             | Self::Project { columns, .. } => columns,
-            Self::Filter { input, .. } | Self::Limit { input, .. } => input.output_columns(),
+            Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
+                input.output_columns()
+            }
         }
     }
 }
@@ -93,6 +99,10 @@ pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
         netbadb_rel::LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
             input: Box::new(plan(input)),
             predicate: predicate.clone(),
+        },
+        netbadb_rel::LogicalPlan::Sort { input, keys } => PhysicalPlan::Sort {
+            input: Box::new(plan(input)),
+            keys: keys.clone(),
         },
         netbadb_rel::LogicalPlan::Project { input, columns } => PhysicalPlan::Project {
             input: Box::new(plan(input)),
@@ -209,6 +219,38 @@ mod tests {
         assert!(matches!(
             plan(&logical),
             PhysicalPlan::NestedLoopJoin { .. }
+        ));
+    }
+
+    #[test]
+    fn lowers_sort_without_changing_output_columns() {
+        let column = ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(1),
+            relation_name: "users".into(),
+            name: "id".into(),
+            data_type: SemanticType::physical(PhysicalType::Int64),
+            nullable: false,
+        };
+        let logical = LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: vec![column.clone()],
+            }),
+            keys: vec![netbadb_rel::SortKey {
+                column: column.clone(),
+                direction: netbadb_rel::SortDirection::Desc,
+                null_order: netbadb_rel::NullOrder::Last,
+            }],
+        };
+        assert_eq!(logical.output_columns(), &[column]);
+        assert!(matches!(
+            plan(&logical),
+            PhysicalPlan::Sort { keys, .. }
+                if keys[0].direction == netbadb_rel::SortDirection::Desc
         ));
     }
 }

@@ -5,7 +5,8 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_parser::{
-    BinaryOp as AstBinaryOp, ColumnName, Expr as AstExpr, FromItem, Ident, Literal, Query, Span,
+    BinaryOp as AstBinaryOp, ColumnName, Expr as AstExpr, FromItem, Ident, Literal,
+    NullOrder as AstNullOrder, Query, SortDirection as AstSortDirection, Span,
     Statement as AstStatement, UnaryOp as AstUnaryOp,
 };
 use netbadb_schema::{Schema, TableDef};
@@ -43,6 +44,26 @@ pub struct TypedJoin {
     pub kind: JoinKind,
     pub right: TypedRelation,
     pub predicate: TypedExpr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOrder {
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedOrderKey {
+    pub column: ColumnRef,
+    pub direction: SortDirection,
+    pub null_order: NullOrder,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +116,7 @@ pub struct TypedQuery {
     pub columns: Vec<ColumnRef>,
     pub projection: Vec<ColumnRef>,
     pub selection: Option<TypedExpr>,
+    pub order_by: Vec<TypedOrderKey>,
     pub limit: Option<u64>,
 }
 
@@ -311,12 +333,36 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         }
     }
 
+    let order_by = query
+        .order_by
+        .iter()
+        .map(|item| {
+            let direction = match item.direction.unwrap_or(AstSortDirection::Asc) {
+                AstSortDirection::Asc => SortDirection::Asc,
+                AstSortDirection::Desc => SortDirection::Desc,
+            };
+            let null_order = match item.null_order {
+                Some(AstNullOrder::First) => NullOrder::First,
+                Some(AstNullOrder::Last) => NullOrder::Last,
+                None if direction == SortDirection::Asc => NullOrder::Last,
+                None => NullOrder::First,
+            };
+            Ok(TypedOrderKey {
+                column: scope.resolve(&item.column)?,
+                direction,
+                null_order,
+                span: item.span,
+            })
+        })
+        .collect::<Result<Vec<_>, HirError>>()?;
+
     Ok(TypedQuery {
         from,
         joins,
         columns: scope.columns(),
         projection,
         selection,
+        order_by,
         limit: query.limit,
     })
 }
@@ -901,7 +947,10 @@ fn lower_operator(operator: AstBinaryOp) -> BinaryOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{HirError, TypedExprKind, TypedStatement, UnaryOp, lower_query, lower_statement};
+    use super::{
+        HirError, NullOrder, SortDirection, TypedExprKind, TypedStatement, UnaryOp, lower_query,
+        lower_statement,
+    };
     use netbadb_parser::{parse, parse_statement};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
@@ -1182,6 +1231,56 @@ mod tests {
     }
 
     #[test]
+    fn resolves_typed_order_keys_with_explicit_null_defaults() {
+        let typed = lower_query(
+            &schema(),
+            &parse(
+                "SELECT u.name FROM users u JOIN teams t ON u.team_id = t.id \
+                 ORDER BY t.name, u.nickname DESC, u.id ASC NULLS FIRST",
+            )
+            .expect("parse"),
+        )
+        .expect("lower ORDER BY");
+        assert_eq!(typed.projection.len(), 1);
+        assert_eq!(typed.order_by.len(), 3);
+        assert_eq!(typed.order_by[0].column.relation_name, "t");
+        assert_eq!(typed.order_by[0].direction, SortDirection::Asc);
+        assert_eq!(typed.order_by[0].null_order, NullOrder::Last);
+        assert_eq!(typed.order_by[1].direction, SortDirection::Desc);
+        assert_eq!(typed.order_by[1].null_order, NullOrder::First);
+        assert!(typed.order_by[1].column.nullable);
+        assert_eq!(typed.order_by[2].null_order, NullOrder::First);
+        assert_eq!(
+            typed.order_by[2].column.data_type.name.as_deref(),
+            Some("UserId")
+        );
+    }
+
+    #[test]
+    fn order_by_reuses_scope_ambiguity_and_qualifier_errors() {
+        let ambiguous =
+            parse("SELECT u.name FROM users u JOIN teams t ON u.team_id = t.id ORDER BY id")
+                .expect("parse ambiguous key");
+        assert!(matches!(
+            lower_query(&schema(), &ambiguous),
+            Err(HirError::AmbiguousColumn { name, .. }) if name == "id"
+        ));
+
+        let unknown = parse("SELECT name FROM users u ORDER BY x.id").expect("parse qualifier");
+        assert!(matches!(
+            lower_query(&schema(), &unknown),
+            Err(HirError::UnknownRelationQualifier { name, .. }) if name == "x"
+        ));
+
+        let unknown_column =
+            parse("SELECT name FROM users ORDER BY missing").expect("parse unknown column");
+        assert!(matches!(
+            lower_query(&schema(), &unknown_column),
+            Err(HirError::UnknownColumn { name, .. }) if name == "missing"
+        ));
+    }
+
+    #[test]
     fn rejects_ambiguous_unknown_and_duplicate_relation_names() {
         let ambiguous =
             parse("SELECT id FROM users u JOIN teams t ON u.team_id = t.id").expect("parse");
@@ -1229,7 +1328,7 @@ mod tests {
             &schema(),
             &parse(
                 "SELECT e.name, m.name FROM employees e JOIN employees m \
-                 ON e.manager_id = m.id",
+                 ON e.manager_id = m.id ORDER BY m.name, e.id DESC",
             )
             .expect("parse"),
         )
@@ -1238,6 +1337,14 @@ mod tests {
         assert_ne!(
             typed.projection[0].binding_id,
             typed.projection[1].binding_id
+        );
+        assert_eq!(
+            typed.order_by[0].column.binding_id,
+            typed.projection[1].binding_id
+        );
+        assert_eq!(
+            typed.order_by[1].column.binding_id,
+            typed.projection[0].binding_id
         );
 
         let nominal_mismatch =

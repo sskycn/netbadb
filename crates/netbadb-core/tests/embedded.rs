@@ -104,6 +104,115 @@ fn public_embedded_api_round_trips_rows_and_queries() {
 }
 
 #[test]
+fn order_by_unprojected_nullable_and_semantic_keys_survives_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-order-by-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let table = TableDef::new(
+        TableId(91),
+        "users",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Semantic {
+                    name: "UserId".into(),
+                    physical: PhysicalType::UInt64,
+                },
+            ),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ColumnDef::new(
+                ColumnId(3),
+                "score",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+        ],
+    );
+    let mut database = Database::create(&path, table.clone()).expect("create database");
+    for row in [
+        vec![
+            ScalarValue::UInt64(1),
+            ScalarValue::Text("A".into()),
+            ScalarValue::Null,
+        ],
+        vec![
+            ScalarValue::UInt64(2),
+            ScalarValue::Text("B".into()),
+            ScalarValue::Int64(20),
+        ],
+        vec![
+            ScalarValue::UInt64(3),
+            ScalarValue::Text("C".into()),
+            ScalarValue::Int64(10),
+        ],
+        vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::Text("D".into()),
+            ScalarValue::Null,
+        ],
+        vec![
+            ScalarValue::UInt64(5),
+            ScalarValue::Text("E".into()),
+            ScalarValue::Int64(20),
+        ],
+    ] {
+        database.insert(&row).expect("insert row");
+    }
+
+    let source = "SELECT name FROM users ORDER BY score DESC NULLS LAST, id ASC LIMIT 4";
+    let result = database.query(source).expect("ordered query");
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].name, "name");
+    assert_eq!(result.columns[0].data_type.physical, PhysicalType::Text);
+    assert_eq!(
+        result.rows,
+        ["B", "E", "C", "A"]
+            .map(|name| vec![ScalarValue::Text(name.into())])
+            .to_vec()
+    );
+
+    let by_id_source = "SELECT name FROM users ORDER BY id DESC LIMIT 2";
+    let by_id = database.query(by_id_source).expect("unprojected ID sort");
+    assert_eq!(
+        by_id.rows,
+        ["E", "D"]
+            .map(|name| vec![ScalarValue::Text(name.into())])
+            .to_vec()
+    );
+
+    let semantic = database
+        .query("SELECT id FROM users ORDER BY id DESC LIMIT 1")
+        .expect("semantic key query");
+    assert_eq!(
+        semantic.columns[0].data_type.name.as_deref(),
+        Some("UserId")
+    );
+    assert_eq!(semantic.rows, vec![vec![ScalarValue::UInt64(5)]]);
+    database.close().expect("close database");
+
+    let mut reopened = Database::open(&path, table).expect("reopen database");
+    assert_eq!(
+        reopened
+            .query(source)
+            .expect("ordered query after reopen")
+            .rows,
+        result.rows
+    );
+    assert_eq!(
+        reopened
+            .query(by_id_source)
+            .expect("unprojected ID sort after reopen")
+            .rows,
+        by_id.rows
+    );
+    reopened.close().expect("close reopened database");
+    cleanup(&path);
+}
+
+#[test]
 fn public_query_pipeline_obeys_null_and_three_valued_logic_after_reopen() {
     let path =
         std::env::temp_dir().join(format!("netbadb-null-integration-{}", std::process::id()));
@@ -649,12 +758,15 @@ fn sql_keyword_name_is_accepted_by_canonical_schema_and_storage() {
     cleanup(&path);
     let table = TableDef::new(
         TableId(83),
-        "select",
-        vec![ColumnDef::new(
-            ColumnId(1),
-            "id",
-            TypeSpec::Physical(PhysicalType::UInt64),
-        )],
+        "order",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "group",
+                TypeSpec::Physical(PhysicalType::UInt64),
+            ),
+            ColumnDef::new(ColumnId(2), "nulls", TypeSpec::Physical(PhysicalType::Text)),
+        ],
     );
 
     Database::create(&path, table.clone())
@@ -930,6 +1042,76 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
         3
     );
     reopened.close().expect("close reopened catalog");
+    cleanup(&users_path);
+    cleanup(&teams_path);
+}
+
+#[test]
+fn order_by_join_columns_uses_binding_identity_and_multiple_keys() {
+    let base = std::env::temp_dir().join(format!(
+        "netbadb-order-join-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let users_path = base.with_extension("users.db");
+    let teams_path = base.with_extension("teams.db");
+    let users = TableDef::new(
+        TableId(92),
+        "users",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                ColumnId(2),
+                "team_id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            ),
+        ],
+    );
+    let teams = TableDef::new(
+        TableId(93),
+        "teams",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    );
+    let mut database = Database::create_tables(vec![
+        (users_path.clone(), users),
+        (teams_path.clone(), teams),
+    ])
+    .expect("create catalog");
+    for (id, team_id) in [(1, 2), (2, 1), (3, 1)] {
+        database
+            .insert_into(
+                TableId(92),
+                &[ScalarValue::Int64(id), ScalarValue::Int64(team_id)],
+            )
+            .expect("insert user");
+    }
+    for (id, name) in [(1, "alpha"), (2, "beta")] {
+        database
+            .insert_into(
+                TableId(93),
+                &[ScalarValue::Int64(id), ScalarValue::Text(name.into())],
+            )
+            .expect("insert team");
+    }
+
+    let result = database
+        .query(
+            "SELECT u.id, t.name FROM users u JOIN teams t ON u.team_id = t.id \
+             ORDER BY t.name ASC, u.id DESC",
+        )
+        .expect("ordered join");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![ScalarValue::Int64(3), ScalarValue::Text("alpha".into())],
+            vec![ScalarValue::Int64(2), ScalarValue::Text("alpha".into())],
+            vec![ScalarValue::Int64(1), ScalarValue::Text("beta".into())],
+        ]
+    );
+    database.close().expect("close catalog");
     cleanup(&users_path);
     cleanup(&teams_path);
 }
