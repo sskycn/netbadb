@@ -2643,12 +2643,34 @@ mod tests {
     #[test]
     fn process_crash_partial_final_wal_record_is_truncated_once() {
         let (path, _, _) = prepare_process_crash_baseline("process-crash-partial-wal-tail");
+        let wal = wal_path(&path);
+        let valid_length = std::fs::metadata(&wal)
+            .expect("read valid WAL metadata")
+            .len();
         spawn_crash_child(
             &path,
             "partial-final-wal-record",
             TestCrashPoint::WalPartialFinalRecord,
         );
-        assert_reopens_twice_with(&path, "before");
+        let partial_length = std::fs::metadata(&wal)
+            .expect("read partial WAL metadata")
+            .len();
+        assert!(partial_length > valid_length);
+
+        assert_eq!(reopen_value(&path), "before");
+        assert_eq!(
+            std::fs::metadata(&wal)
+                .expect("read truncated WAL metadata")
+                .len(),
+            valid_length
+        );
+        assert_eq!(reopen_value(&path), "before");
+        assert_eq!(
+            std::fs::metadata(&wal)
+                .expect("read stable WAL metadata")
+                .len(),
+            valid_length
+        );
         cleanup(&path);
     }
 }
