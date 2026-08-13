@@ -42,10 +42,12 @@ independent of any application language. A column has:
 `Schema::new` is the fallible construction path and delegates to
 `Schema::validate`; unchecked public construction is not available. Validation
 rejects duplicate table IDs/names, duplicate column IDs/names within a table,
-table or column names that the current unquoted SQL identifier grammar cannot
-represent, and empty semantic-type names. Name equality remains case-sensitive,
-matching current resolution, while reserved-keyword detection is
-case-insensitive like the lexer.
+empty table/column names, and empty semantic-type names. Canonical names are
+frontend-independent UTF-8 identities, and equality remains exact and
+case-sensitive. The current SQL frontend still supports only its existing
+unquoted ASCII identifier syntax and has no quoted identifiers. Names outside
+that textual subset can be persisted and identified but cannot yet be referenced
+through SQL text.
 Zero-column tables remain valid and receive an identity with column count zero.
 Primary-key metadata is preserved in identity, but this phase does not add key
 enforcement; nullability remains the independently enforced write constraint.

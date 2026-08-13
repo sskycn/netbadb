@@ -119,12 +119,10 @@ impl TableDef {
 
     /// Validates all invariants local to one canonical table definition.
     pub fn validate(&self) -> Result<(), SchemaError> {
-        if let Err(reason) = validate_identifier(&self.name) {
-            return Err(SchemaError::InvalidTableName {
-                name: self.name.clone(),
-                reason,
-            });
+        if self.name.is_empty() {
+            return Err(SchemaError::EmptyTableName);
         }
+        canonical_string_length(&self.name, "table name")?;
         if self.columns.len() > u32::MAX as usize {
             return Err(SchemaError::TooManyColumns {
                 table: self.name.clone(),
@@ -132,13 +130,12 @@ impl TableDef {
             });
         }
         for (index, column) in self.columns.iter().enumerate() {
-            if let Err(reason) = validate_identifier(&column.name) {
-                return Err(SchemaError::InvalidColumnName {
+            if column.name.is_empty() {
+                return Err(SchemaError::EmptyColumnName {
                     table: self.name.clone(),
-                    name: column.name.clone(),
-                    reason,
                 });
             }
+            canonical_string_length(&column.name, "column name")?;
             if let TypeSpec::Semantic { name, .. } = &column.type_spec {
                 if name.is_empty() {
                     return Err(SchemaError::InvalidSemanticType {
@@ -147,6 +144,7 @@ impl TableDef {
                         name: name.clone(),
                     });
                 }
+                canonical_string_length(name, "semantic type name")?;
             }
             for other in &self.columns[..index] {
                 if column.id == other.id {
@@ -281,14 +279,9 @@ pub enum SchemaError {
         table: String,
         name: String,
     },
-    InvalidTableName {
-        name: String,
-        reason: IdentifierError,
-    },
-    InvalidColumnName {
+    EmptyTableName,
+    EmptyColumnName {
         table: String,
-        name: String,
-        reason: IdentifierError,
     },
     InvalidSemanticType {
         table: String,
@@ -304,35 +297,6 @@ pub enum SchemaError {
         length: usize,
     },
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdentifierError {
-    Empty,
-    InvalidStart { character: char },
-    InvalidCharacter { index: usize, character: char },
-    ReservedKeyword,
-}
-
-impl fmt::Display for IdentifierError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("name is empty"),
-            Self::InvalidStart { character } => write!(
-                formatter,
-                "first character `{}` is not an ASCII letter or underscore",
-                character.escape_default()
-            ),
-            Self::InvalidCharacter { index, character } => write!(
-                formatter,
-                "character `{}` at byte {index} is not an ASCII letter, digit, or underscore",
-                character.escape_default()
-            ),
-            Self::ReservedKeyword => formatter.write_str("name is a reserved SQL keyword"),
-        }
-    }
-}
-
-impl Error for IdentifierError {}
 
 impl fmt::Display for SchemaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -356,17 +320,13 @@ impl fmt::Display for SchemaError {
                 formatter,
                 "column name `{name}` is defined more than once in table `{table}`"
             ),
-            Self::InvalidTableName { name, reason } => {
-                write!(formatter, "invalid table name `{name}`: {reason}")
+            Self::EmptyTableName => formatter.write_str("table name must not be empty"),
+            Self::EmptyColumnName { table } => {
+                write!(
+                    formatter,
+                    "column name in table `{table}` must not be empty"
+                )
             }
-            Self::InvalidColumnName {
-                table,
-                name,
-                reason,
-            } => write!(
-                formatter,
-                "invalid column name `{name}` in table `{table}`: {reason}"
-            ),
             Self::InvalidSemanticType {
                 table,
                 column,
@@ -391,71 +351,20 @@ impl fmt::Display for SchemaError {
     }
 }
 
-impl Error for SchemaError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidTableName { reason, .. } | Self::InvalidColumnName { reason, .. } => {
-                Some(reason)
-            }
-            _ => None,
-        }
-    }
-}
-
-fn validate_identifier(name: &str) -> Result<(), IdentifierError> {
-    let mut characters = name.char_indices();
-    let Some((_, first)) = characters.next() else {
-        return Err(IdentifierError::Empty);
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(IdentifierError::InvalidStart { character: first });
-    }
-    for (index, character) in characters {
-        if !(character.is_ascii_alphanumeric() || character == '_') {
-            return Err(IdentifierError::InvalidCharacter { index, character });
-        }
-    }
-    if is_reserved_keyword(name) {
-        return Err(IdentifierError::ReservedKeyword);
-    }
-    Ok(())
-}
-
-fn is_reserved_keyword(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "SELECT"
-            | "FROM"
-            | "WHERE"
-            | "LIMIT"
-            | "INSERT"
-            | "INTO"
-            | "VALUES"
-            | "UPDATE"
-            | "SET"
-            | "DELETE"
-            | "AS"
-            | "JOIN"
-            | "INNER"
-            | "ON"
-            | "AND"
-            | "OR"
-            | "IS"
-            | "NOT"
-            | "TRUE"
-            | "FALSE"
-            | "NULL"
-    )
-}
+impl Error for SchemaError {}
 
 fn push_string(output: &mut Vec<u8>, value: &str, field: &'static str) -> Result<(), SchemaError> {
-    let length = u32::try_from(value.len()).map_err(|_| SchemaError::CanonicalStringTooLong {
-        field,
-        length: value.len(),
-    })?;
+    let length = canonical_string_length(value, field)?;
     output.extend_from_slice(&length.to_le_bytes());
     output.extend_from_slice(value.as_bytes());
     Ok(())
+}
+
+fn canonical_string_length(value: &str, field: &'static str) -> Result<u32, SchemaError> {
+    u32::try_from(value.len()).map_err(|_| SchemaError::CanonicalStringTooLong {
+        field,
+        length: value.len(),
+    })
 }
 
 const fn physical_type_tag(physical: PhysicalType) -> u8 {
@@ -469,7 +378,7 @@ const fn physical_type_tag(physical: PhysicalType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnDef, IdentifierError, Schema, SchemaError, TableDef, TypeSpec};
+    use super::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
 
     fn user_table() -> TableDef {
@@ -512,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_column_identity_and_unrepresentable_names() {
+    fn rejects_duplicate_column_identity_and_empty_names() {
         let mut duplicate_id = user_table();
         duplicate_id.columns[1].id = ColumnId(1);
         assert!(matches!(
@@ -532,47 +441,13 @@ mod tests {
         empty_table_name.name.clear();
         assert!(matches!(
             empty_table_name.validate(),
-            Err(SchemaError::InvalidTableName {
-                reason: IdentifierError::Empty,
-                ..
-            })
+            Err(SchemaError::EmptyTableName)
         ));
         let mut empty_column_name = user_table();
         empty_column_name.columns[0].name.clear();
         assert!(matches!(
             empty_column_name.validate(),
-            Err(SchemaError::InvalidColumnName {
-                reason: IdentifierError::Empty,
-                ..
-            })
-        ));
-        for (name, expected) in [
-            ("select", IdentifierError::ReservedKeyword),
-            (
-                "team-members",
-                IdentifierError::InvalidCharacter {
-                    index: 4,
-                    character: '-',
-                },
-            ),
-            ("用户", IdentifierError::InvalidStart { character: '用' }),
-            ("1users", IdentifierError::InvalidStart { character: '1' }),
-        ] {
-            let mut invalid = user_table();
-            invalid.name = name.into();
-            assert!(matches!(
-                invalid.validate(),
-                Err(SchemaError::InvalidTableName { reason, .. }) if reason == expected
-            ));
-        }
-        let mut reserved_column = user_table();
-        reserved_column.columns[0].name = "from".into();
-        assert!(matches!(
-            reserved_column.validate(),
-            Err(SchemaError::InvalidColumnName {
-                reason: IdentifierError::ReservedKeyword,
-                ..
-            })
+            Err(SchemaError::EmptyColumnName { table }) if table == "users"
         ));
         let mut empty_semantic_name = user_table();
         if let TypeSpec::Semantic { name, .. } = &mut empty_semantic_name.columns[0].type_spec {
@@ -588,6 +463,38 @@ mod tests {
         nullable_primary_key
             .validate()
             .expect("primary-key enforcement is not yet a schema invariant");
+    }
+
+    #[test]
+    fn accepts_frontend_independent_names_and_preserves_case() {
+        for name in ["order", "group", "team-members", "用户"] {
+            TableDef::new(
+                TableId(20),
+                name,
+                vec![ColumnDef::new(
+                    ColumnId(1),
+                    name,
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                )],
+            )
+            .validate()
+            .expect("canonical names are independent of SQL spelling rules");
+        }
+
+        let schema = Schema::new(vec![
+            TableDef::new(
+                TableId(21),
+                "users",
+                vec![
+                    ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::UInt64)),
+                    ColumnDef::new(ColumnId(2), "Id", TypeSpec::Physical(PhysicalType::UInt64)),
+                ],
+            ),
+            TableDef::new(TableId(22), "Users", Vec::new()),
+        ])
+        .expect("canonical name identity is case-sensitive");
+        assert!(schema.table("users").is_some());
+        assert!(schema.table("Users").is_some());
     }
 
     #[test]
@@ -625,6 +532,28 @@ mod tests {
         assert_eq!(
             table.fingerprint().expect("fingerprint").to_string(),
             "823e72558862af9f9520020c872b4ebbdc5f63b9a93a4c460f849b935493f7c4"
+        );
+    }
+
+    #[test]
+    fn frontend_independent_names_have_deterministic_identity() {
+        let table = TableDef::new(
+            TableId(23),
+            "用户",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "用户-id",
+                TypeSpec::Physical(PhysicalType::UInt64),
+            )],
+        );
+
+        assert_eq!(
+            table.canonical_bytes().expect("first canonical encoding"),
+            table.canonical_bytes().expect("second canonical encoding")
+        );
+        assert_eq!(
+            table.fingerprint().expect("first fingerprint"),
+            table.fingerprint().expect("second fingerprint")
         );
     }
 

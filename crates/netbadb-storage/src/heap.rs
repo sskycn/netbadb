@@ -800,6 +800,34 @@ mod tests {
     }
 
     #[test]
+    fn frontend_independent_schema_names_survive_reopen() {
+        let path = test_path("heap-frontend-independent-names");
+        cleanup(&path);
+        let table = TableDef::new(
+            TableId(19),
+            "用户",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "用户-id",
+                TypeSpec::Physical(PhysicalType::UInt64),
+            )],
+        );
+        let mut storage = HeapStorage::create(&path, table.clone()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::UInt64(7)])
+            .expect("insert row");
+        storage.close().expect("close heap");
+
+        let mut reopened = HeapStorage::open(&path, table).expect("reopen heap");
+        assert_eq!(
+            reopened.scan().expect("scan reopened heap")[0].1,
+            vec![ScalarValue::UInt64(7)]
+        );
+        reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
     fn reopen_requires_the_complete_canonical_schema_identity() {
         let path = test_path("heap-schema-identity");
         cleanup(&path);
