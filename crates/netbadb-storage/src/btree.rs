@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use netbadb_index::{
     BTreeHandle, IndexEntry, IndexEntryKey, IndexError, IndexSpec, InternalNode, InternalSeparator,
     LeafNode, MetaNode, compare_entry_keys, compare_key_to_entry, decode_internal, decode_leaf,
-    decode_meta, encode_internal, encode_leaf, encode_meta, ensure_entry_fits, split_internal,
-    split_leaf,
+    decode_meta, encode_internal, encode_leaf, encode_meta, ensure_entry_fits,
+    merge_internals_if_fits, merge_leaves_if_fits, split_internal, split_leaf,
 };
 use netbadb_types::{PageId, RowId, ScalarValue};
 
@@ -24,6 +24,21 @@ struct PathEntry {
     page_id: PageId,
     node: InternalNode,
     child_position: usize,
+}
+
+#[derive(Debug)]
+enum DeleteNode {
+    Leaf(LeafNode),
+    Internal(InternalNode),
+}
+
+impl DeleteNode {
+    fn encoded_len(&self, spec: &IndexSpec) -> Result<usize, IndexError> {
+        match self {
+            Self::Leaf(node) => Ok(encode_leaf(spec, node)?.len()),
+            Self::Internal(node) => Ok(encode_internal(spec, node)?.len()),
+        }
+    }
 }
 
 /// Persistence orchestration for one B+Tree stored in the same database file
@@ -227,6 +242,112 @@ impl<'a> BTree<'a> {
         self.apply_changes(transaction, changes)
     }
 
+    /// Deletes and commits exactly one `(key, RowId)` entry.
+    pub fn delete(
+        &mut self,
+        handle: BTreeHandle,
+        key: ScalarValue,
+        row_id: RowId,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.storage.begin_transaction()?;
+        match self.delete_in(&mut transaction, handle, key, row_id) {
+            Ok(()) => {
+                transaction.commit()?;
+                Ok(())
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
+        }
+    }
+
+    /// Deletes exactly one `(key, RowId)` entry in the caller's transaction.
+    /// All merge and root-collapse decisions are preflighted before WAL is
+    /// changed, so a missing entry leaves the transaction active.
+    pub fn delete_in(
+        &mut self,
+        transaction: &mut Transaction,
+        handle: BTreeHandle,
+        key: ScalarValue,
+        row_id: RowId,
+    ) -> Result<(), StorageError> {
+        self.storage.validate_transaction(transaction)?;
+        let meta = self.read_meta(handle)?;
+        let entry = IndexEntry { key, row_id };
+        meta.spec.validate_key(&entry.key)?;
+        transaction.acquire_writer()?;
+
+        let (leaf_page, mut leaf, mut path) = self.find_leaf_for_entry(&meta, &entry)?;
+        leaf.remove(&meta.spec, &entry)?;
+        let capacity = Page::single_payload_capacity();
+        if meta.height == 1 {
+            let payload = encode_leaf(&meta.spec, &leaf)?;
+            let change = self.prepare_existing_page(leaf_page, PageType::BTreeLeaf, &payload)?;
+            return self.apply_changes(transaction, vec![change]);
+        }
+
+        let soft_min = capacity / 2;
+        let mut current_page = leaf_page;
+        let mut current = DeleteNode::Leaf(leaf);
+        let mut changes = Vec::new();
+
+        loop {
+            let current_size = current.encoded_len(&meta.spec)?;
+            if current_size >= soft_min {
+                changes.push(self.prepare_delete_node(current_page, &meta.spec, &current)?);
+                return self.apply_changes(transaction, changes);
+            }
+
+            let mut parent = path.pop().ok_or(IndexError::InvalidHeight(meta.height))?;
+            let merge = self.preflight_merge(
+                &meta.spec,
+                &parent.node,
+                parent.child_position,
+                current_page,
+                &current,
+                capacity,
+            )?;
+            let Some((retained_page, merged, separator_position)) = merge else {
+                changes.push(self.prepare_delete_node(current_page, &meta.spec, &current)?);
+                return self.apply_changes(transaction, changes);
+            };
+
+            changes.push(self.prepare_delete_node(retained_page, &meta.spec, &merged)?);
+            parent.node.remove_separator(separator_position)?;
+
+            if path.is_empty() {
+                if parent.node.separators.is_empty() {
+                    let height = meta
+                        .height
+                        .checked_sub(1)
+                        .filter(|height| *height >= 1)
+                        .ok_or(IndexError::InvalidHeight(meta.height))?;
+                    let updated_meta = MetaNode {
+                        root_page: retained_page,
+                        height,
+                        spec: meta.spec.clone(),
+                    };
+                    changes.push(self.prepare_existing_page(
+                        handle.meta_page,
+                        PageType::BTreeMeta,
+                        &encode_meta(&updated_meta)?,
+                    )?);
+                } else {
+                    changes.push(self.prepare_delete_node(
+                        parent.page_id,
+                        &meta.spec,
+                        &DeleteNode::Internal(parent.node),
+                    )?);
+                }
+                return self.apply_changes(transaction, changes);
+            }
+
+            current_page = parent.page_id;
+            current = DeleteNode::Internal(parent.node);
+        }
+    }
+
     /// Returns every RowId for `key` in the explicit persistent tie-break
     /// order. The index does not validate whether those RowIds are live.
     pub fn lookup(
@@ -406,6 +527,103 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
+    fn preflight_merge(
+        &self,
+        spec: &IndexSpec,
+        parent: &InternalNode,
+        child_position: usize,
+        current_page: PageId,
+        current: &DeleteNode,
+        capacity: usize,
+    ) -> Result<Option<(PageId, DeleteNode, usize)>, StorageError> {
+        let (left_page, right_page, separator_position, current_is_left) =
+            if child_position < parent.separators.len() {
+                (
+                    current_page,
+                    parent.child(child_position + 1)?,
+                    child_position,
+                    true,
+                )
+            } else {
+                let separator_position = child_position
+                    .checked_sub(1)
+                    .ok_or(IndexError::InvalidNodeType)?;
+                (
+                    parent.child(separator_position)?,
+                    current_page,
+                    separator_position,
+                    false,
+                )
+            };
+        let fence = &parent
+            .separators
+            .get(separator_position)
+            .ok_or(IndexError::InvalidNodeType)?
+            .key;
+
+        let merged = match current {
+            DeleteNode::Leaf(current_leaf) => {
+                let (left, right) = if current_is_left {
+                    (current_leaf.clone(), self.read_leaf(right_page, spec)?)
+                } else {
+                    (self.read_leaf(left_page, spec)?, current_leaf.clone())
+                };
+                if left.entries.is_empty() && left_page != current_page {
+                    return Err(IndexError::EmptyLeaf { page_id: left_page }.into());
+                }
+                if right.entries.is_empty() && right_page != current_page {
+                    return Err(IndexError::EmptyLeaf {
+                        page_id: right_page,
+                    }
+                    .into());
+                }
+                if left.next_leaf != Some(right_page) {
+                    return Err(IndexError::InvalidLeafLink {
+                        left_page,
+                        expected_right: right_page,
+                        actual_right: left.next_leaf,
+                    }
+                    .into());
+                }
+                merge_leaves_if_fits(spec, &left, &right, capacity)?.map(DeleteNode::Leaf)
+            }
+            DeleteNode::Internal(current_internal) => {
+                let (left, right) = if current_is_left {
+                    (
+                        current_internal.clone(),
+                        self.read_internal(right_page, spec)?,
+                    )
+                } else {
+                    (
+                        self.read_internal(left_page, spec)?,
+                        current_internal.clone(),
+                    )
+                };
+                merge_internals_if_fits(spec, &left, fence, &right, capacity)?
+                    .map(DeleteNode::Internal)
+            }
+        };
+        Ok(merged.map(|node| (left_page, node, separator_position)))
+    }
+
+    fn prepare_delete_node(
+        &self,
+        page_id: PageId,
+        spec: &IndexSpec,
+        node: &DeleteNode,
+    ) -> Result<PreparedPage, StorageError> {
+        match node {
+            DeleteNode::Leaf(leaf) => {
+                self.prepare_existing_page(page_id, PageType::BTreeLeaf, &encode_leaf(spec, leaf)?)
+            }
+            DeleteNode::Internal(internal) => self.prepare_existing_page(
+                page_id,
+                PageType::BTreeInternal,
+                &encode_internal(spec, internal)?,
+            ),
+        }
+    }
+
     fn prepare_existing_page(
         &self,
         page_id: PageId,
@@ -504,6 +722,16 @@ impl<'a> BTree<'a> {
                 }
             };
             *page.page_mut() = change.after.clone();
+            #[cfg(test)]
+            {
+                drop(page);
+                published += 1;
+                if published == 1 {
+                    crate::crash_test::maybe_crash(
+                        crate::crash_test::TestCrashPoint::BTreeAfterFirstPagePublish,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -744,6 +972,501 @@ mod tests {
             Err(StorageError::Index(IndexError::DuplicateEntry))
         ));
         storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn exact_delete_preserves_duplicates_and_not_found_keeps_transaction_active() {
+        let path = path("exact-delete");
+        cleanup(&path);
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let handle = storage
+            .btree()
+            .create(IndexSpec {
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: true,
+            })
+            .expect("create tree");
+        let rows = [row_id(1), row_id(2), row_id(3)];
+        for row in rows {
+            storage
+                .btree()
+                .insert(handle, ScalarValue::UInt64(42), row)
+                .expect("insert duplicate");
+        }
+        storage
+            .btree()
+            .delete(handle, ScalarValue::UInt64(42), rows[1])
+            .expect("delete exact duplicate");
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(handle, &ScalarValue::UInt64(42))
+                .expect("lookup duplicates"),
+            vec![rows[0], rows[2]]
+        );
+
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        let missing = storage
+            .btree()
+            .delete_in(&mut transaction, handle, ScalarValue::UInt64(42), rows[1])
+            .expect_err("second exact delete must fail");
+        assert!(matches!(
+            missing,
+            StorageError::Index(IndexError::EntryNotFound)
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        storage
+            .btree()
+            .insert_in(&mut transaction, handle, ScalarValue::Null, row_id(10))
+            .expect("transaction remains writable");
+        transaction.commit().expect("commit after not found");
+        storage.close().expect("close tree");
+
+        let mut reopened =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("reopen tree");
+        assert_eq!(
+            reopened
+                .btree()
+                .lookup(handle, &ScalarValue::UInt64(42))
+                .expect("lookup reopened"),
+            vec![rows[0], rows[2]]
+        );
+        assert_eq!(
+            reopened
+                .btree()
+                .lookup(handle, &ScalarValue::Null)
+                .expect("lookup NULL"),
+            vec![row_id(10)]
+        );
+        reopened.close().expect("close reopened tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn exact_delete_handles_duplicate_key_entries_across_leaf_boundaries() {
+        let path = path("duplicate-delete-across-leaves");
+        cleanup(&path);
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let handle = storage
+            .btree()
+            .create(IndexSpec {
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            })
+            .expect("create tree");
+        let mut expected = (0..240_u64).map(row_id).collect::<Vec<_>>();
+        for row in expected.iter().rev().copied() {
+            storage
+                .btree()
+                .insert(handle, ScalarValue::UInt64(42), row)
+                .expect("insert duplicate");
+        }
+        assert!(storage.btree().read_meta(handle).expect("meta").height > 1);
+        for ordinal in [0_usize, 119, 239] {
+            let removed = row_id(ordinal as u64);
+            storage
+                .btree()
+                .delete(handle, ScalarValue::UInt64(42), removed)
+                .expect("delete boundary duplicate");
+            expected.retain(|row| *row != removed);
+            assert_eq!(
+                storage
+                    .btree()
+                    .lookup(handle, &ScalarValue::UInt64(42))
+                    .expect("lookup duplicates"),
+                expected
+            );
+        }
+        storage.close().expect("close tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_validates_signed_text_null_type_and_row_id_before_wal() {
+        for (case, spec, key) in [
+            (
+                "signed-delete",
+                IndexSpec {
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: false,
+                },
+                ScalarValue::Int64(-42),
+            ),
+            ("text-delete", text_spec(), ScalarValue::Text("键".into())),
+            (
+                "null-delete",
+                IndexSpec {
+                    data_type: SemanticType::physical(PhysicalType::UInt64),
+                    nullable: true,
+                },
+                ScalarValue::Null,
+            ),
+        ] {
+            let path = path(case);
+            cleanup(&path);
+            let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+            let handle = storage.btree().create(spec).expect("create tree");
+            let row = row_id(7);
+            storage
+                .btree()
+                .insert(handle, key.clone(), row)
+                .expect("insert typed key");
+            storage
+                .btree()
+                .delete(handle, key.clone(), row)
+                .expect("delete typed key");
+            assert!(
+                storage
+                    .btree()
+                    .lookup(handle, &key)
+                    .expect("lookup")
+                    .is_empty()
+            );
+            storage.close().expect("close tree");
+            cleanup(&path);
+        }
+
+        let path = path("delete-validation");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let handle = storage
+            .btree()
+            .create(IndexSpec {
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            })
+            .expect("create tree");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+        for (key, row) in [
+            (ScalarValue::Null, row_id(1)),
+            (ScalarValue::Int64(1), row_id(1)),
+            (
+                ScalarValue::UInt64(1),
+                RowId {
+                    page: PageId(0),
+                    slot: 0,
+                    generation: 1,
+                },
+            ),
+            (
+                ScalarValue::UInt64(1),
+                RowId {
+                    page: PageId(1),
+                    slot: 0,
+                    generation: 0,
+                },
+            ),
+        ] {
+            assert!(
+                storage
+                    .btree()
+                    .delete_in(&mut transaction, handle, key, row)
+                    .is_err()
+            );
+            assert_eq!(transaction.state(), TransactionState::Active);
+        }
+        transaction
+            .commit()
+            .expect("validation errors do not poison transaction");
+        storage.close().expect("close tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn deterministic_insert_delete_sequence_matches_reference_map() {
+        let path = path("delete-reference-map");
+        cleanup(&path);
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let handle = storage
+            .btree()
+            .create(IndexSpec {
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            })
+            .expect("create tree");
+        let mut expected = BTreeMap::<u64, Vec<RowId>>::new();
+
+        for ordinal in 0..320_u64 {
+            let key = (ordinal * 37) % 23;
+            let row = row_id(ordinal);
+            storage
+                .btree()
+                .insert(handle, ScalarValue::UInt64(key), row)
+                .expect("insert reference entry");
+            expected.entry(key).or_default().push(row);
+        }
+        for ordinal in (0..320_u64).step_by(3) {
+            let key = (ordinal * 37) % 23;
+            let row = row_id(ordinal);
+            storage
+                .btree()
+                .delete(handle, ScalarValue::UInt64(key), row)
+                .expect("delete reference entry");
+            expected
+                .get_mut(&key)
+                .expect("reference key")
+                .retain(|candidate| *candidate != row);
+        }
+        for ordinal in 320..400_u64 {
+            let key = (ordinal * 19) % 23;
+            let row = row_id(ordinal);
+            storage
+                .btree()
+                .insert(handle, ScalarValue::UInt64(key), row)
+                .expect("reinsert reference entry");
+            expected.entry(key).or_default().push(row);
+        }
+        for rows in expected.values_mut() {
+            rows.sort_by(|left, right| netbadb_index::compare_row_ids(*left, *right));
+        }
+        for key in 0..23_u64 {
+            assert_eq!(
+                storage
+                    .btree()
+                    .lookup(handle, &ScalarValue::UInt64(key))
+                    .expect("reference lookup"),
+                expected.get(&key).cloned().unwrap_or_default()
+            );
+        }
+        storage.close().expect("close tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn root_leaf_delete_can_empty_tree_and_rollback_restores_entry() {
+        let path = path("root-leaf-delete");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let handle = storage.btree().create(text_spec()).expect("create tree");
+        let original_root = storage.btree().read_meta(handle).expect("meta").root_page;
+        let row = row_id(1);
+        storage
+            .btree()
+            .insert(handle, ScalarValue::Text("only".into()), row)
+            .expect("insert only entry");
+        let mut transaction = storage.begin_transaction().expect("begin delete");
+        storage
+            .btree()
+            .delete_in(
+                &mut transaction,
+                handle,
+                ScalarValue::Text("only".into()),
+                row,
+            )
+            .expect("delete only entry");
+        assert!(
+            storage
+                .btree()
+                .lookup(handle, &ScalarValue::Text("only".into()))
+                .expect("empty lookup")
+                .is_empty()
+        );
+        transaction.rollback().expect("rollback delete");
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(handle, &ScalarValue::Text("only".into()))
+                .expect("restored lookup"),
+            vec![row]
+        );
+        storage
+            .btree()
+            .delete(handle, ScalarValue::Text("only".into()), row)
+            .expect("commit delete");
+        let meta = storage.btree().read_meta(handle).expect("empty meta");
+        assert_eq!(meta.height, 1);
+        assert_eq!(meta.root_page, original_root);
+        assert!(
+            storage
+                .btree()
+                .read_leaf(meta.root_page, &meta.spec)
+                .expect("root leaf")
+                .entries
+                .is_empty()
+        );
+        storage.close().expect("close tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn heavy_delete_merges_collapses_root_and_allows_regrowth() {
+        let path = path("delete-collapse-regrow");
+        cleanup(&path);
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let handle = storage.btree().create(text_spec()).expect("create tree");
+        let count = 420_u64;
+        for ordinal in 0..count {
+            storage
+                .btree()
+                .insert(handle, split_key(ordinal as usize), row_id(ordinal))
+                .expect("insert tall tree");
+        }
+        let old_page_count = storage.buffer().page_count();
+        assert!(storage.btree().read_meta(handle).expect("tall meta").height >= 3);
+
+        for ordinal in 0..count {
+            storage
+                .btree()
+                .delete(handle, split_key(ordinal as usize), row_id(ordinal))
+                .expect("delete tall tree");
+            if ordinal % 37 == 0 && ordinal + 1 < count {
+                assert_eq!(
+                    storage
+                        .btree()
+                        .lookup(handle, &split_key((ordinal + 1) as usize))
+                        .expect("survivor lookup"),
+                    vec![row_id(ordinal + 1)]
+                );
+            }
+        }
+        let meta = storage.btree().read_meta(handle).expect("collapsed meta");
+        assert_eq!(meta.height, 1);
+        assert!(
+            storage
+                .btree()
+                .read_leaf(meta.root_page, &meta.spec)
+                .expect("empty root")
+                .entries
+                .is_empty()
+        );
+        assert_eq!(storage.buffer().page_count(), old_page_count);
+
+        storage
+            .btree()
+            .insert(handle, ScalarValue::Text("regrown".into()), row_id(999))
+            .expect("insert after collapse");
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(handle, &ScalarValue::Text("regrown".into()))
+                .expect("lookup regrown"),
+            vec![row_id(999)]
+        );
+        storage.checkpoint().expect("checkpoint");
+        storage.close().expect("close tree");
+        let mut reopened =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("reopen tree");
+        assert_eq!(
+            reopened
+                .btree()
+                .lookup(handle, &ScalarValue::Text("regrown".into()))
+                .expect("lookup reopened"),
+            vec![row_id(999)]
+        );
+        reopened.close().expect("close reopened tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn deleting_live_separator_entry_keeps_persistent_fence_for_future_routing() {
+        let (path, handle, trigger) = prepare_split_baseline("persistent-fence");
+        let mut storage =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("open tree");
+        storage
+            .btree()
+            .insert(handle, split_key(trigger), row_id(trigger as u64))
+            .expect("split root");
+        for ordinal in trigger + 1..trigger + 8 {
+            storage
+                .btree()
+                .insert(handle, split_key(ordinal), row_id(ordinal as u64))
+                .expect("fill right leaf");
+        }
+
+        let (meta, root_before, fence) = {
+            let tree = storage.btree();
+            let meta = tree.read_meta(handle).expect("meta");
+            let root = tree
+                .read_internal(meta.root_page, &meta.spec)
+                .expect("root");
+            let fence = root.separators[0].key.clone();
+            (meta, root, fence)
+        };
+        storage
+            .btree()
+            .delete(handle, fence.key.clone(), fence.row_id)
+            .expect("delete live fence entry");
+        let root_after = storage
+            .btree()
+            .read_internal(meta.root_page, &meta.spec)
+            .expect("root after delete");
+        assert_eq!(root_after, root_before, "delete must not rewrite the fence");
+        assert!(
+            storage
+                .btree()
+                .lookup(handle, &fence.key)
+                .expect("deleted fence lookup")
+                .iter()
+                .all(|row| *row != fence.row_id)
+        );
+
+        let ScalarValue::Text(old_fence) = &fence.key else {
+            panic!("text split must produce a text fence");
+        };
+        let between = ScalarValue::Text(format!("{old_fence}\0"));
+        let between_row = row_id(10_000);
+        storage
+            .btree()
+            .insert(handle, between.clone(), between_row)
+            .expect("insert between stale fence and live minimum");
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(handle, &between)
+                .expect("lookup between"),
+            vec![between_row]
+        );
+        storage.close().expect("close tree");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn merge_log_failure_requires_rollback_and_restores_root() {
+        let (path, handle, trigger) = prepare_split_baseline("delete-log-failure");
+        let mut storage =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("open tree");
+        storage
+            .btree()
+            .insert(handle, split_key(trigger), row_id(trigger as u64))
+            .expect("split root");
+        let before = storage.btree().read_meta(handle).expect("meta before");
+        assert_eq!(before.height, 2);
+        let page_count = storage.buffer().page_count();
+
+        let mut transaction = storage.begin_transaction().expect("begin delete");
+        let error = {
+            let mut tree = storage.btree();
+            tree.inject_log_failure_after(1);
+            tree.delete_in(
+                &mut transaction,
+                handle,
+                split_key(trigger),
+                row_id(trigger as u64),
+            )
+            .expect_err("second delete PageUpdate must fail")
+        };
+        assert!(matches!(error, StorageError::Wal(_)));
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        assert!(transaction.commit().is_err());
+        transaction.rollback().expect("rollback partial merge");
+        assert_eq!(storage.buffer().page_count(), page_count);
+        assert_eq!(
+            storage.btree().read_meta(handle).expect("restored meta"),
+            before
+        );
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(handle, &split_key(trigger))
+                .expect("restored entry"),
+            vec![row_id(trigger as u64)]
+        );
+        storage.close().expect("close tree");
         cleanup(&path);
     }
 
@@ -1174,6 +1897,39 @@ mod tests {
                     .expect("commit split winner");
                 crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
+            "delete-boundary" => {
+                let mut transaction = storage.begin_transaction().expect("begin delete loser");
+                storage
+                    .btree()
+                    .delete_in(
+                        &mut transaction,
+                        handle,
+                        split_key(trigger),
+                        row_id(trigger as u64),
+                    )
+                    .expect("perform delete until crash point");
+            }
+            "delete-loser-flush" => {
+                let mut transaction = storage.begin_transaction().expect("begin delete loser");
+                storage
+                    .btree()
+                    .delete_in(
+                        &mut transaction,
+                        handle,
+                        split_key(trigger),
+                        row_id(trigger as u64),
+                    )
+                    .expect("perform loser delete");
+                storage.flush().expect("flush loser pages");
+                crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
+            }
+            "delete-winner" => {
+                storage
+                    .btree()
+                    .delete(handle, split_key(trigger), row_id(trigger as u64))
+                    .expect("commit delete winner");
+                crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
+            }
             other => panic!("unknown B+Tree crash case `{other}`"),
         }
         panic!("B+Tree crash child returned without reaching its crash point")
@@ -1248,6 +2004,86 @@ mod tests {
             TestCrashPoint::CommittedWithoutDataFlush,
         );
         assert_split_reopens(&path, handle, true);
+        cleanup(&path);
+    }
+
+    fn prepare_delete_collapse_baseline(case: &str) -> (std::path::PathBuf, BTreeHandle) {
+        let (path, handle, trigger) = prepare_split_baseline(case);
+        let mut storage =
+            HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("open baseline");
+        storage
+            .btree()
+            .insert(handle, split_key(trigger), row_id(trigger as u64))
+            .expect("split baseline root");
+        assert_eq!(storage.btree().read_meta(handle).expect("meta").height, 2);
+        storage.close().expect("close collapse baseline");
+        (path, handle)
+    }
+
+    fn assert_delete_collapse_reopens(path: &std::path::Path, handle: BTreeHandle, deleted: bool) {
+        let trigger = split_trigger_ordinal();
+        for _ in 0..2 {
+            let mut storage = HeapStorage::open_with_buffer_pool_size(path, table(), 1)
+                .expect("recover delete tree");
+            let rows = storage
+                .btree()
+                .lookup(handle, &split_key(trigger))
+                .expect("lookup recovered delete");
+            assert_eq!(
+                rows,
+                if deleted {
+                    vec![]
+                } else {
+                    vec![row_id(trigger as u64)]
+                }
+            );
+            assert_eq!(
+                storage
+                    .btree()
+                    .read_meta(handle)
+                    .expect("recovered meta")
+                    .height,
+                if deleted { 1 } else { 2 }
+            );
+            storage.close().expect("close recovered delete tree");
+        }
+    }
+
+    #[test]
+    fn process_crash_root_collapse_loser_undoes_log_publish_and_steal() {
+        for (case, child_case, point) in [
+            (
+                "delete-first-log",
+                "delete-boundary",
+                TestCrashPoint::BTreeAfterFirstPageUpdateLog,
+            ),
+            (
+                "delete-first-publish",
+                "delete-boundary",
+                TestCrashPoint::BTreeAfterFirstPagePublish,
+            ),
+            (
+                "delete-steal",
+                "delete-loser-flush",
+                TestCrashPoint::ActiveWriterAfterDurablePageFlush,
+            ),
+        ] {
+            let (path, handle) = prepare_delete_collapse_baseline(case);
+            spawn_crash_child(&path, child_case, point);
+            assert_delete_collapse_reopens(&path, handle, false);
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn process_crash_no_force_root_collapse_winner_redoes_leaf_and_meta() {
+        let (path, handle) = prepare_delete_collapse_baseline("delete-winner");
+        spawn_crash_child(
+            &path,
+            "delete-winner",
+            TestCrashPoint::CommittedWithoutDataFlush,
+        );
+        assert_delete_collapse_reopens(&path, handle, true);
         cleanup(&path);
     }
 }

@@ -164,8 +164,9 @@ The current code genuinely supports:
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - generation-safe RowId insert, update, delete, scan, stale-locator detection,
   file reopen, row encoding, and row decoding;
-- persistent transactional B+Tree create, insert, and duplicate-preserving
-  point lookup with typed keys, arbitrary height, and buffer capacity one;
+- persistent transactional B+Tree create, insert, exact delete, merge-only
+  rebalance/root collapse, and duplicate-preserving point lookup with typed
+  keys, arbitrary height, and buffer capacity one;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
@@ -324,10 +325,18 @@ supports arbitrary height, and logs deterministic full-page changes in the
 order new right page, existing left page, ancestors, then new root/meta when
 needed. All new-page WAL is durable before file extension.
 
-This Phase 4C1 API is storage-only. It does not automatically maintain indexes
-for heap DML, validate that referenced RowIds are currently live, enforce
-uniqueness, delete/rebalance entries, expose SQL index DDL, add IndexScan, or
-change optimizer policy.
+Internal separators are persistent lower-bound fence keys. Their RowId is an
+ordering token and need not remain a live leaf entry or heap locator; delete
+therefore does not rewrite a fence merely because a right-subtree minimum
+changed. Exact delete uses encoded-byte soft underflow, deterministic
+merge-only rebalance, recursive parent compaction, and root collapse. Removed
+right pages and old roots remain valid, unreachable index pages and are not
+reclaimed or reused yet.
+
+This Phase 4C2 API is storage-only. It does not automatically maintain indexes
+for heap DML, persist an IndexDef/catalog mapping from columns to BTreeHandles,
+validate that referenced RowIds are currently live, enforce uniqueness, expose
+SQL index DDL, add IndexScan, or change the planner's SeqScan policy.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -459,13 +468,15 @@ The implementation sequence is intentionally vertical:
     mutation safety. Complete.
 14. Persistent B+Tree (Phase 4C1) — transactional create/insert/point lookup,
     mixed pages, split recovery, and explicit typed codecs. Complete.
-15. B+Tree delete/rebalance (Phase 4C2), transactional heap/index maintenance
+15. B+Tree exact delete/merge/root-collapse (Phase 4C2) — complete.
+16. Transactional heap/index maintenance and persistent IndexDef discovery
     (Phase 4D), IndexScan (Phase 4E), then statistics/costing (Phase 4F).
-16. Server mode — protocol, sessions, and `netbadbd`.
-17. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-18. Advanced optimization — statistics, cost model, and rewrite rules.
+17. Server mode — protocol, sessions, and `netbadbd`.
+18. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+19. Advanced optimization — statistics, cost model, and rewrite rules.
 
-Isolation/MVCC, B+Tree deletion and SQL/planner integration, server networking,
+Isolation/MVCC, index catalog/heap maintenance and SQL/planner integration,
+server networking,
 and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

@@ -31,7 +31,10 @@ pub struct BTreeHandle {
     pub meta_page: PageId,
 }
 
-/// Complete ordered identity of one leaf entry and internal separator.
+/// Complete ordered identity of one leaf entry or persistent internal fence.
+///
+/// A separator's `RowId` is an ordering token. It need not continue to name a
+/// live heap row or leaf entry after deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntryKey {
     pub key: ScalarValue,
@@ -102,6 +105,7 @@ pub enum IndexError {
     },
     NullNotAllowed,
     DuplicateEntry,
+    EntryNotFound,
     KeyTooLarge {
         size: usize,
         capacity: usize,
@@ -119,6 +123,11 @@ pub enum IndexError {
     LeafChainOrder {
         left_page: PageId,
         right_page: PageId,
+    },
+    InvalidLeafLink {
+        left_page: PageId,
+        expected_right: PageId,
+        actual_right: Option<PageId>,
     },
 }
 
@@ -167,6 +176,7 @@ impl fmt::Display for IndexError {
             }
             Self::NullNotAllowed => formatter.write_str("index key must not be NULL"),
             Self::DuplicateEntry => formatter.write_str("index entry already exists"),
+            Self::EntryNotFound => formatter.write_str("index entry does not exist"),
             Self::KeyTooLarge { size, capacity } => write!(
                 formatter,
                 "encoded index key entry is {size} bytes; leaf capacity is {capacity}"
@@ -192,6 +202,17 @@ impl fmt::Display for IndexError {
                 formatter,
                 "B+Tree leaf chain is not strictly increasing between pages {} and {}",
                 left_page.0, right_page.0
+            ),
+            Self::InvalidLeafLink {
+                left_page,
+                expected_right,
+                actual_right,
+            } => write!(
+                formatter,
+                "B+Tree leaf page {} links to {:?}, expected page {}",
+                left_page.0,
+                actual_right.map(|page| page.0),
+                expected_right.0
             ),
         }
     }
@@ -244,6 +265,18 @@ impl LeafNode {
             }
         }
     }
+
+    /// Removes exactly one `(key, RowId)` entry while preserving full order.
+    pub fn remove(&mut self, spec: &IndexSpec, entry: &IndexEntryKey) -> Result<(), IndexError> {
+        spec.validate_key(&entry.key)?;
+        validate_row_id(entry.row_id)?;
+        let position = self
+            .entries
+            .binary_search_by(|existing| compare_entry_keys(existing, entry))
+            .map_err(|_| IndexError::EntryNotFound)?;
+        self.entries.remove(position);
+        Ok(())
+    }
 }
 
 impl InternalNode {
@@ -281,6 +314,14 @@ impl InternalNode {
         self.separators
             .insert(child_position, InternalSeparator { key, right_child });
         validate_internal_order(self)
+    }
+
+    /// Removes the separator that owns the child immediately to its right.
+    pub fn remove_separator(&mut self, position: usize) -> Result<InternalSeparator, IndexError> {
+        if position >= self.separators.len() {
+            return Err(IndexError::InvalidNodeType);
+        }
+        Ok(self.separators.remove(position))
     }
 }
 
@@ -567,6 +608,63 @@ pub fn split_internal(
         separators: node.separators[middle + 1..].to_vec(),
     };
     Ok((left, promoted.key, right))
+}
+
+/// Merges adjacent leaves when their actual version-1 encoding fits one page.
+/// The caller keeps the left physical page and orphans the right one.
+pub fn merge_leaves_if_fits(
+    spec: &IndexSpec,
+    left: &LeafNode,
+    right: &LeafNode,
+    capacity: usize,
+) -> Result<Option<LeafNode>, IndexError> {
+    let mut entries = Vec::with_capacity(
+        left.entries
+            .len()
+            .checked_add(right.entries.len())
+            .ok_or(IndexError::LengthOverflow)?,
+    );
+    entries.extend(left.entries.iter().cloned());
+    entries.extend(right.entries.iter().cloned());
+    let merged = LeafNode {
+        entries,
+        next_leaf: right.next_leaf,
+    };
+    let payload = encode_leaf(spec, &merged)?;
+    Ok((payload.len() <= capacity).then_some(merged))
+}
+
+/// Merges adjacent internal nodes through their parent's persistent fence when
+/// the actual version-1 encoding fits one page.
+pub fn merge_internals_if_fits(
+    spec: &IndexSpec,
+    left: &InternalNode,
+    parent_fence: &IndexEntryKey,
+    right: &InternalNode,
+    capacity: usize,
+) -> Result<Option<InternalNode>, IndexError> {
+    spec.validate_key(&parent_fence.key)?;
+    validate_row_id(parent_fence.row_id)?;
+    validate_child(right.first_child)?;
+    let separator_count = left
+        .separators
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_add(right.separators.len()))
+        .ok_or(IndexError::LengthOverflow)?;
+    let mut separators = Vec::with_capacity(separator_count);
+    separators.extend(left.separators.iter().cloned());
+    separators.push(InternalSeparator {
+        key: parent_fence.clone(),
+        right_child: right.first_child,
+    });
+    separators.extend(right.separators.iter().cloned());
+    let merged = InternalNode {
+        first_child: left.first_child,
+        separators,
+    };
+    let payload = encode_internal(spec, &merged)?;
+    Ok((payload.len() <= capacity).then_some(merged))
 }
 
 fn common_header(magic: &[u8; 4]) -> Vec<u8> {
@@ -1002,6 +1100,60 @@ mod tests {
         leaf.insert(&spec, second.clone()).unwrap();
         assert_eq!(leaf.entries, vec![second, first.clone()]);
         assert_eq!(leaf.insert(&spec, first), Err(IndexError::DuplicateEntry));
+    }
+
+    #[test]
+    fn exact_remove_preserves_duplicate_user_keys_and_reports_missing() {
+        let spec = spec(PhysicalType::UInt64, false);
+        let mut leaf = LeafNode::empty();
+        let first = entry(ScalarValue::UInt64(42), 1, 0);
+        let middle = entry(ScalarValue::UInt64(42), 2, 0);
+        let last = entry(ScalarValue::UInt64(42), 3, 0);
+        for item in [&last, &first, &middle] {
+            leaf.insert(&spec, item.clone()).unwrap();
+        }
+        leaf.remove(&spec, &middle).unwrap();
+        assert_eq!(leaf.entries, vec![first, last]);
+        assert_eq!(leaf.remove(&spec, &middle), Err(IndexError::EntryNotFound));
+    }
+
+    #[test]
+    fn byte_aware_merge_helpers_validate_order_and_capacity() {
+        let spec = spec(PhysicalType::Text, false);
+        let left = LeafNode {
+            entries: vec![entry(ScalarValue::Text("a".into()), 1, 0)],
+            next_leaf: Some(PageId(9)),
+        };
+        let right = LeafNode {
+            entries: vec![entry(ScalarValue::Text("b".into()), 2, 0)],
+            next_leaf: Some(PageId(10)),
+        };
+        let merged = merge_leaves_if_fits(&spec, &left, &right, 128)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.next_leaf, Some(PageId(10)));
+        assert_eq!(merged.entries.len(), 2);
+        assert!(
+            merge_leaves_if_fits(&spec, &left, &right, 32)
+                .unwrap()
+                .is_none()
+        );
+
+        let left_internal = InternalNode {
+            first_child: PageId(1),
+            separators: vec![],
+        };
+        let right_internal = InternalNode {
+            first_child: PageId(2),
+            separators: vec![],
+        };
+        let fence = entry(ScalarValue::Text("b".into()), 2, 0);
+        let merged = merge_internals_if_fits(&spec, &left_internal, &fence, &right_internal, 128)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.first_child, PageId(1));
+        assert_eq!(merged.separators[0].key, fence);
+        assert_eq!(merged.separators[0].right_child, PageId(2));
     }
 
     #[test]

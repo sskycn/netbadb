@@ -249,7 +249,11 @@ sorting or aggregation.
   metadata-page handles, deterministic full-page WAL splits, rollback-required
   partial failure handling, STEAL/NO-FORCE crash recovery, checkpoint/reopen,
   capacity-one traversal, corruption tests, and bounded decoder fuzzing;
-- next Phase 4C2: B+Tree delete and rebalance;
+- Phase 4C2 complete: exact `(key, RowId)` delete, deterministic merge-only
+  encoded-byte rebalance, recursive parent compaction, root collapse, and
+  rollback/STEAL/NO-FORCE crash durability;
+- Phase 4C2 intentionally defers sibling redistribution and physical
+  reclamation/reuse of orphan pages left by merge and root collapse;
 - next Phase 4D: atomic heap/index DML maintenance;
 - next Phase 4E: index scan physical operator;
 - next Phase 4F: catalog statistics and deterministic cost-based access-path

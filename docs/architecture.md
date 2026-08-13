@@ -440,8 +440,10 @@ generation 1. The payload has its own version-1 semantic codec:
   physical plus optional nominal semantic type, and nullability;
 - `NBTL` leaf: sorted full `(ScalarValue, RowId)` entries and optional next-leaf
   PageId;
-- `NBTI` internal: first child plus sorted full-entry separators and right
-  children.
+- `NBTI` internal: first child plus sorted persistent lower-bound fence keys
+  and right children. A fence's RowId is only an ordering token: it need not
+  identify a currently live heap row or leaf entry. Deleting the first live
+  entry in a right subtree therefore does not rewrite or enlarge its fence.
 
 All integers are fixed-width little-endian. Decoders reject wrong magic or
 version, nonzero reserved fields, invalid UTF-8/type/value tags, zero child
@@ -469,8 +471,20 @@ the first file extension. Any failure after the first PageUpdate makes the
 transaction `RollbackRequired`; runtime rollback and startup loser undo restore
 existing pages and remove trailing new pages in reverse order.
 
-Phase 4C1 deliberately has no delete/rebalance, uniqueness, automatic heap DML
-maintenance, SQL index DDL, IndexScan operator, optimizer choice, or statistics.
+Exact `(key, RowId)` deletion uses a soft half-capacity encoded-byte threshold
+to attempt deterministic right-first merges, falling back to the left sibling
+for the last child. It never redistributes entries. A merge occurs only when
+the actual encoded leaf or internal payload fits; otherwise a sparse node
+remains valid. Parent separator removal recurses upward, and a zero-separator
+root collapses. The surviving physical page is always the left page, repairing
+the forward leaf chain without a predecessor lookup. All final page images are
+preflighted before WAL publication and logged bottom-up with metadata last.
+Delete never allocates or shrinks the file. Removed right pages and old roots
+remain valid but unreachable orphan index pages; reclamation is deferred.
+
+Phase 4C2 deliberately has no sibling redistribution, orphan-page reclamation,
+uniqueness, automatic heap DML maintenance, persistent IndexDef/catalog,
+SQL index DDL, IndexScan operator, optimizer choice, or statistics.
 
 ## Transaction and WAL boundary
 
