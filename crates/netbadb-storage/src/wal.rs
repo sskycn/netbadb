@@ -572,6 +572,11 @@ impl WalManager {
                 "injected partial WAL append failure",
             )));
         }
+        #[cfg(test)]
+        if crate::crash_test::is_enabled(crate::crash_test::TestCrashPoint::WalPartialFinalRecord) {
+            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            crate::crash_test::crash_now();
+        }
         if let Err(error) = self.file.write_all(&bytes) {
             return Err(self.rollback_failed_append(error));
         }
@@ -661,6 +666,10 @@ impl WalManager {
             self.poisoned = true;
             return Err(error);
         }
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::CheckpointAfterNewGenerationDurable,
+        );
 
         let old_path = self.path.clone();
         let old_file = std::mem::replace(&mut self.file, file);
@@ -680,6 +689,10 @@ impl WalManager {
             self.poisoned = true;
             return Err(error.into());
         }
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::CheckpointAfterOldGenerationRemoved,
+        );
         if let Err(error) = sync_parent_directory(&old_path) {
             self.poisoned = true;
             return Err(error);

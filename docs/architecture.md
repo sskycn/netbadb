@@ -538,6 +538,13 @@ simple and deterministic; a marker would require a separate durable
 clean-to-dirty invalidation state machine before the next mutation and does not
 currently remove enough work to justify that risk.
 
+Deterministic subprocess tests exercise STEAL loser undo, NO-FORCE winner redo,
+commit and rollback durability boundaries, recovery interruption, and both WAL
+generation rotation windows. Each child terminates without running Rust object
+destructors, then the parent opens the database twice to verify convergence and
+idempotence. This models abrupt database-process loss only; it does not simulate
+kernel, machine, controller, or storage-device power loss.
+
 ## Embedded and server modes
 
 `netbadb-core` is synchronous and embedded. A future server crate may add an

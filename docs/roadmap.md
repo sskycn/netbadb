@@ -91,13 +91,16 @@ bounded WAL growth, or concurrent-writer scheduling.
 - bounded recovery input containing only post-checkpoint records;
 - monotonic LSN/pageLSN behavior across repeated recycling;
 - deterministic rotation-failure, generation-corruption, recovery-range,
-  TxnId, close/reopen, and bounded-growth tests.
+  TxnId, close/reopen, and bounded-growth tests;
+- deterministic subprocess termination coverage for STEAL/NO-FORCE recovery,
+  commit/rollback boundaries, interrupted recovery, and WAL rotation windows.
 
 Clean-shutdown metadata is intentionally omitted because recovery already scans
 only one bounded generation, while safely invalidating a clean marker before
 the next mutation would add another persistent state machine. Phase 2C remains
 synchronous and explicit: there is no fuzzy checkpoint, background policy, WAL
-archive, replication, or PITR.
+archive, replication, or PITR. Subprocess termination tests model abrupt process
+loss without Rust destructors, not machine or storage-device power loss.
 
 ## Phase 3A — Typed Expressions + NULL Semantics (complete)
 

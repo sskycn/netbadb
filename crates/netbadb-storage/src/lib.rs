@@ -1,6 +1,8 @@
 //! Synchronous page, buffer, and heap storage for the embedded vertical slice.
 
 mod buffer;
+#[cfg(test)]
+mod crash_test;
 mod heap;
 mod page;
 mod recovery;

@@ -81,6 +81,10 @@ impl Transaction {
                     .try_borrow_mut()
                     .map_err(|_| TransactionError::WalBusy)?;
                 let lsn = wal.append(self.id, Some(self.last_lsn), WalRecordKind::Commit)?;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::CommitAfterAppend,
+                );
                 self.last_lsn = lsn;
                 self.state = TransactionState::CommitPending;
                 lsn
@@ -99,6 +103,8 @@ impl Transaction {
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .flush_through(commit_lsn)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::CommitAfterWalSync);
         self.state = TransactionState::Committed;
         self.release_writer();
         self.unregister();
@@ -118,6 +124,10 @@ impl Transaction {
                     .try_borrow_mut()
                     .map_err(|_| TransactionError::WalBusy)?
                     .append(self.id, Some(self.last_lsn), WalRecordKind::Abort)?;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::RollbackAfterAbortAppend,
+                );
                 self.last_lsn = abort_lsn;
                 self.rollback_start_lsn = Some(rollback_start_lsn);
                 self.state = TransactionState::RollbackPending;
@@ -146,6 +156,8 @@ impl Transaction {
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .flush_through(abort_lsn)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::RollbackAfterAbortSync);
         let records = self
             .wal
             .try_borrow_mut()
@@ -164,12 +176,20 @@ impl Transaction {
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .append(self.id, Some(abort_lsn), WalRecordKind::RollbackComplete)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::RollbackAfterCompleteAppend,
+        );
         self.last_lsn = complete_lsn;
         self.rollback_complete_lsn = Some(complete_lsn);
         self.wal
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .flush_through(complete_lsn)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::RollbackAfterCompleteSync,
+        );
         self.finish_rollback();
         Ok(())
     }
@@ -293,6 +313,10 @@ impl Transaction {
                     page_id, before, ..
                 } => {
                     self.buffer.undo_page_update(*page_id, before)?;
+                    #[cfg(test)]
+                    crate::crash_test::maybe_crash(
+                        crate::crash_test::TestCrashPoint::RollbackAfterPageUndo,
+                    );
                     #[cfg(test)]
                     {
                         operations += 1;

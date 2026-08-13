@@ -722,13 +722,14 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::{HeapStorage, decode_row, encode_row};
+    use crate::crash_test::{self, TestCrashPoint};
     use crate::{
         BufferError, CheckpointError, PageManager, SlotId, StorageError, TransactionError,
         TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
         WalRecordKind, wal_alternate_path, wal_path,
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
+    use netbadb_types::{ColumnId, Lsn, PageId, PhysicalType, ScalarValue, TableId};
 
     fn table() -> TableDef {
         TableDef::new(
@@ -2321,6 +2322,333 @@ mod tests {
 
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         assert!(reopened.scan().expect("scan heap").is_empty());
+        cleanup(&path);
+    }
+
+    const PROCESS_CRASH_CHILD_TEST: &str = "heap::tests::process_crash_child_entrypoint";
+
+    fn prepare_process_crash_baseline(case: &str) -> (std::path::PathBuf, Lsn, u64) {
+        let path = test_path(case);
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create crash-test heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("before".into())])
+            .expect("insert crash-test baseline");
+        let last_lsn = storage
+            .wal_records()
+            .expect("scan baseline WAL")
+            .last()
+            .expect("baseline WAL record")
+            .lsn;
+        let generation = storage.wal_generation().expect("baseline WAL generation");
+        storage.close().expect("close crash-test baseline");
+        (path, last_lsn, generation)
+    }
+
+    fn spawn_crash_child(path: &std::path::Path, case: &str, point: TestCrashPoint) {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg(PROCESS_CRASH_CHILD_TEST)
+            .arg("--nocapture");
+        crash_test::configure_child(&mut command, case, path, point);
+        let status = command.status().expect("start crash-test child");
+        assert_eq!(
+            status.code(),
+            Some(crash_test::EXIT_CODE),
+            "child `{case}` did not terminate at crash point {point:?}: {status}"
+        );
+    }
+
+    fn only_row(storage: &mut HeapStorage) -> (netbadb_types::RowId, String) {
+        let rows = storage.scan().expect("scan crash-test heap");
+        assert_eq!(rows.len(), 1, "crash recovery changed row cardinality");
+        let (row_id, values) = rows.into_iter().next().expect("one crash-test row");
+        assert_eq!(values[0], ScalarValue::Int64(1));
+        let ScalarValue::Text(value) = &values[1] else {
+            panic!("crash-test value is not text");
+        };
+        (row_id, value.clone())
+    }
+
+    fn reopen_value(path: &std::path::Path) -> String {
+        let mut storage = HeapStorage::open(path, table()).expect("reopen crash-test heap");
+        let (_, value) = only_row(&mut storage);
+        storage.close().expect("close recovered crash-test heap");
+        value
+    }
+
+    fn assert_reopens_twice_with(path: &std::path::Path, expected: &str) {
+        assert_eq!(reopen_value(path), expected);
+        assert_eq!(reopen_value(path), expected);
+    }
+
+    fn update_crash_test_value(
+        storage: &mut HeapStorage,
+        transaction: &mut crate::Transaction,
+        value: &str,
+    ) {
+        let (row_id, _) = only_row(storage);
+        storage
+            .update_in(
+                transaction,
+                row_id,
+                &[ScalarValue::Int64(1), ScalarValue::Text(value.into())],
+            )
+            .expect("update crash-test row");
+    }
+
+    fn run_process_crash_child(case: &str, path: &std::path::Path) {
+        match case {
+            "active-writer-after-durable-page-flush" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                let mut transaction = storage.begin_transaction().expect("begin active writer");
+                update_crash_test_value(&mut storage, &mut transaction, "uncommitted");
+                // STEAL: PageUpdate WAL is durable, then the uncommitted data
+                // page is written and synchronized, but no Commit exists.
+                storage.flush().expect("durably flush uncommitted page");
+                crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
+            }
+            "committed-without-data-flush" | "commit-boundary" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                let mut transaction = storage.begin_transaction().expect("begin commit writer");
+                update_crash_test_value(&mut storage, &mut transaction, "after");
+                transaction.commit().expect("commit child transaction");
+                // NO-FORCE: commit returned after durable WAL, while the dirty
+                // data page has not been explicitly flushed or closed.
+                crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
+            }
+            "rollback-single" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                let mut transaction = storage.begin_transaction().expect("begin rollback writer");
+                update_crash_test_value(&mut storage, &mut transaction, "after");
+                transaction.rollback().expect("rollback child transaction");
+            }
+            "rollback-multiple" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                let mut transaction = storage.begin_transaction().expect("begin rollback writer");
+                update_crash_test_value(&mut storage, &mut transaction, "v1");
+                update_crash_test_value(&mut storage, &mut transaction, "v2");
+                transaction.rollback().expect("rollback child transaction");
+            }
+            "active-multiple-for-recovery" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                let mut transaction = storage.begin_transaction().expect("begin active writer");
+                update_crash_test_value(&mut storage, &mut transaction, "v1");
+                update_crash_test_value(&mut storage, &mut transaction, "v2");
+                storage.flush().expect("durably flush active writer");
+                crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
+            }
+            "recovery-open" => {
+                let _storage = HeapStorage::open(path, table()).expect("start child recovery");
+            }
+            "checkpoint" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                storage.checkpoint().expect("checkpoint child heap");
+            }
+            "partial-final-wal-record" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open child heap");
+                let _transaction = storage.begin_transaction().expect("append partial Begin");
+            }
+            other => panic!("unknown process crash case `{other}`"),
+        }
+        panic!("process crash child `{case}` returned without reaching its crash point");
+    }
+
+    #[test]
+    fn process_crash_child_entrypoint() {
+        if std::env::var_os(crash_test::CHILD_ENV).is_none() {
+            return;
+        }
+        let case = std::env::var(crash_test::CASE_ENV).expect("crash child case");
+        let path = std::env::var_os(crash_test::DATABASE_PATH_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("crash child database path");
+        run_process_crash_child(&case, &path);
+    }
+
+    #[test]
+    fn process_crash_steal_loser_is_undone_after_durable_page_flush() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-steal-durable-page");
+        spawn_crash_child(
+            &path,
+            "active-writer-after-durable-page-flush",
+            TestCrashPoint::ActiveWriterAfterDurablePageFlush,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_no_force_winner_is_redone_after_commit_returns() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-no-force-commit");
+        spawn_crash_child(
+            &path,
+            "committed-without-data-flush",
+            TestCrashPoint::CommittedWithoutDataFlush,
+        );
+        assert_reopens_twice_with(&path, "after");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_commit_after_append_recovers_a_valid_wal_prefix() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-commit-after-append");
+        spawn_crash_child(&path, "commit-boundary", TestCrashPoint::CommitAfterAppend);
+        let first = reopen_value(&path);
+        assert!(matches!(first.as_str(), "before" | "after"));
+        assert_eq!(reopen_value(&path), first);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_commit_after_wal_sync_preserves_winner() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-commit-after-sync");
+        spawn_crash_child(&path, "commit-boundary", TestCrashPoint::CommitAfterWalSync);
+        assert_reopens_twice_with(&path, "after");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_rollback_after_abort_append_restores_before() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-abort-after-append");
+        spawn_crash_child(
+            &path,
+            "rollback-single",
+            TestCrashPoint::RollbackAfterAbortAppend,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_rollback_after_abort_sync_restores_before() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-abort-after-sync");
+        spawn_crash_child(
+            &path,
+            "rollback-single",
+            TestCrashPoint::RollbackAfterAbortSync,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_mid_rollback_converges_after_first_durable_undo() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-mid-rollback");
+        spawn_crash_child(
+            &path,
+            "rollback-multiple",
+            TestCrashPoint::RollbackAfterPageUndo,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_after_rollback_complete_append_restores_before() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-complete-after-append");
+        spawn_crash_child(
+            &path,
+            "rollback-single",
+            TestCrashPoint::RollbackAfterCompleteAppend,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_after_rollback_complete_sync_restores_before() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-complete-after-sync");
+        spawn_crash_child(
+            &path,
+            "rollback-single",
+            TestCrashPoint::RollbackAfterCompleteSync,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_recovery_interruption_is_idempotent() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-recovery-operation");
+        spawn_crash_child(
+            &path,
+            "active-multiple-for-recovery",
+            TestCrashPoint::ActiveWriterAfterDurablePageFlush,
+        );
+        spawn_crash_child(
+            &path,
+            "recovery-open",
+            TestCrashPoint::RecoveryAfterPageOperation,
+        );
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    fn verify_checkpoint_crash(
+        path: &std::path::Path,
+        baseline_lsn: Lsn,
+        baseline_generation: u64,
+    ) {
+        let mut storage = HeapStorage::open(path, table()).expect("reopen checkpoint crash");
+        assert_eq!(
+            storage.wal_generation().expect("selected generation"),
+            baseline_generation + 1
+        );
+        assert_eq!(only_row(&mut storage).1, "before");
+        let mut transaction = storage.begin_transaction().expect("begin after checkpoint");
+        assert!(transaction.id().0 > 1);
+        assert!(transaction.last_lsn() > baseline_lsn);
+        update_crash_test_value(&mut storage, &mut transaction, "after-checkpoint");
+        transaction.commit().expect("commit after checkpoint crash");
+        storage.close().expect("close checkpoint crash heap");
+        assert_reopens_twice_with(path, "after-checkpoint");
+    }
+
+    #[test]
+    fn process_crash_checkpoint_selects_durable_higher_generation() {
+        let (path, baseline_lsn, baseline_generation) =
+            prepare_process_crash_baseline("process-crash-checkpoint-new-generation");
+        spawn_crash_child(
+            &path,
+            "checkpoint",
+            TestCrashPoint::CheckpointAfterNewGenerationDurable,
+        );
+        let root = wal_path(&path);
+        let alternate = wal_alternate_path(&root);
+        assert!(root.exists() && alternate.exists());
+        verify_checkpoint_crash(&path, baseline_lsn, baseline_generation);
+        assert!(!root.exists() && alternate.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_checkpoint_reopens_after_old_generation_removal() {
+        let (path, baseline_lsn, baseline_generation) =
+            prepare_process_crash_baseline("process-crash-checkpoint-old-removed");
+        spawn_crash_child(
+            &path,
+            "checkpoint",
+            TestCrashPoint::CheckpointAfterOldGenerationRemoved,
+        );
+        let root = wal_path(&path);
+        let alternate = wal_alternate_path(&root);
+        assert!(!root.exists() && alternate.exists());
+        verify_checkpoint_crash(&path, baseline_lsn, baseline_generation);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_partial_final_wal_record_is_truncated_once() {
+        let (path, _, _) = prepare_process_crash_baseline("process-crash-partial-wal-tail");
+        spawn_crash_child(
+            &path,
+            "partial-final-wal-record",
+            TestCrashPoint::WalPartialFinalRecord,
+        );
+        assert_reopens_twice_with(&path, "before");
         cleanup(&path);
     }
 }

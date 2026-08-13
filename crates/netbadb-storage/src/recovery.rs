@@ -247,6 +247,10 @@ impl RecoveryManager {
             pages.write_page(&after_page)?;
             report.pages_redone += 1;
             operations += 1;
+            #[cfg(test)]
+            crate::crash_test::maybe_crash(
+                crate::crash_test::TestCrashPoint::RecoveryAfterPageOperation,
+            );
             Self::maybe_interrupt(operations, operation_limit)?;
         }
 
@@ -289,6 +293,10 @@ impl RecoveryManager {
                         if pages.remove_trailing_page(*page_id)? {
                             report.pages_undone += 1;
                             operations += 1;
+                            #[cfg(test)]
+                            crate::crash_test::maybe_crash(
+                                crate::crash_test::TestCrashPoint::RecoveryAfterPageOperation,
+                            );
                             Self::maybe_interrupt(operations, operation_limit)?;
                         }
                     }
@@ -302,6 +310,10 @@ impl RecoveryManager {
                         pages.write_page(&before_page)?;
                         report.pages_undone += 1;
                         operations += 1;
+                        #[cfg(test)]
+                        crate::crash_test::maybe_crash(
+                            crate::crash_test::TestCrashPoint::RecoveryAfterPageOperation,
+                        );
                         Self::maybe_interrupt(operations, operation_limit)?;
                     }
                 }
