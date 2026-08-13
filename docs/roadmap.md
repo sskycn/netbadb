@@ -242,10 +242,18 @@ sorting or aggregation.
 - Phase 4B transaction safety complete: destination then source PageUpdates
   form one transaction chain, and partial compound mutations enter
   RollbackRequired so they cannot commit;
-- B+Tree index crate;
-- index scan physical operator;
-- catalog statistics;
-- deterministic cost-based access-path selection.
+- Phase 4C1 complete: pure typed B+Tree node/ordering/codec crate plus
+  transactional persistent create, arbitrary-height insert, and
+  duplicate-preserving point lookup;
+- Phase 4C1 durability complete: mixed Heap/B+Tree Page v5 kinds, stable
+  metadata-page handles, deterministic full-page WAL splits, rollback-required
+  partial failure handling, STEAL/NO-FORCE crash recovery, checkpoint/reopen,
+  capacity-one traversal, corruption tests, and bounded decoder fuzzing;
+- next Phase 4C2: B+Tree delete and rebalance;
+- next Phase 4D: atomic heap/index DML maintenance;
+- next Phase 4E: index scan physical operator;
+- next Phase 4F: catalog statistics and deterministic cost-based access-path
+  selection.
 
 ## Phase 5 — Server and protocol
 

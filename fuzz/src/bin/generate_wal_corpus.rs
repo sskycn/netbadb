@@ -1,8 +1,14 @@
 use std::path::{Path, PathBuf};
 
+use netbadb_index::{
+    IndexEntry, IndexSpec, InternalNode, InternalSeparator, LeafNode, MetaNode, encode_internal,
+    encode_leaf, encode_meta,
+};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::{HeapStorage, Page, PageType, WalManager, WalRecordKind, wal_path};
-use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId, TxnId};
+use netbadb_types::{
+    ColumnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType, TableId, TxnId,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::env::args_os().nth(1).map_or_else(
@@ -35,7 +41,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })?;
     write_page_decode_seed(&output)?;
+    write_btree_decode_seeds(&output)?;
     Ok(())
+}
+
+fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = wal_output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("btree_decode");
+    std::fs::create_dir_all(&output)?;
+    std::fs::write(output.join("empty"), [])?;
+    let spec = IndexSpec {
+        data_type: SemanticType::physical(PhysicalType::UInt64),
+        nullable: true,
+    };
+    let entry = IndexEntry {
+        key: ScalarValue::UInt64(42),
+        row_id: RowId {
+            page: PageId(1),
+            slot: 0,
+            generation: 1,
+        },
+    };
+    write_btree_seed(
+        &output,
+        "valid-meta",
+        0,
+        &encode_meta(&MetaNode {
+            root_page: PageId(2),
+            height: 1,
+            spec: spec.clone(),
+        })?,
+    )?;
+    write_btree_seed(
+        &output,
+        "valid-empty-leaf",
+        1,
+        &encode_leaf(&spec, &LeafNode::empty())?,
+    )?;
+    let leaf = encode_leaf(
+        &spec,
+        &LeafNode {
+            entries: vec![entry.clone()],
+            next_leaf: None,
+        },
+    )?;
+    write_btree_seed(&output, "valid-leaf-one-entry", 1, &leaf)?;
+    write_btree_seed(
+        &output,
+        "valid-internal-one-separator",
+        2,
+        &encode_internal(
+            &spec,
+            &InternalNode {
+                first_child: PageId(2),
+                separators: vec![InternalSeparator {
+                    key: entry,
+                    right_child: PageId(3),
+                }],
+            },
+        )?,
+    )?;
+    write_btree_seed(
+        &output,
+        "truncated-leaf",
+        1,
+        &leaf[..leaf.len() - 1],
+    )?;
+    Ok(())
+}
+
+fn write_btree_seed(output: &Path, name: &str, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut seed = Vec::with_capacity(payload.len() + 1);
+    seed.push(kind);
+    seed.extend_from_slice(payload);
+    std::fs::write(output.join(name), seed)
 }
 
 fn write_page_decode_seed(wal_output: &Path) -> Result<(), Box<dyn std::error::Error>> {

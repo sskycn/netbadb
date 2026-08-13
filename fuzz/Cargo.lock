@@ -131,8 +131,16 @@ name = "netbadb-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "netbadb-index",
  "netbadb-schema",
  "netbadb-storage",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-index"
+version = "0.1.0"
+dependencies = [
  "netbadb-types",
 ]
 
@@ -149,6 +157,7 @@ name = "netbadb-storage"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "netbadb-index",
  "netbadb-schema",
  "netbadb-types",
 ]

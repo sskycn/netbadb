@@ -115,6 +115,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-index"
+version = "0.1.0"
+dependencies = [
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-parser"
 version = "0.1.0"
 
@@ -156,6 +163,7 @@ name = "netbadb-storage"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "netbadb-index",
  "netbadb-schema",
  "netbadb-types",
 ]

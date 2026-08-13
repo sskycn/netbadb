@@ -357,6 +357,13 @@ impl Transaction {
     pub(crate) fn inject_rollback_interruption_after(&mut self, operations: usize) {
         self.interrupt_rollback_after = Some(operations);
     }
+
+    #[cfg(test)]
+    pub(crate) fn inject_partial_append_failure(&self, after_bytes: usize) {
+        self.wal
+            .borrow_mut()
+            .inject_partial_append_failure(after_bytes);
+    }
 }
 
 impl Drop for Transaction {

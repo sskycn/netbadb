@@ -6,7 +6,8 @@ More-specific `AGENTS.md` files add rules for their directory subtree.
 Scoped rules currently live in:
 
 - `crates/AGENTS.md` for Rust libraries and compiler/execution layers;
-- `crates/netbadb-storage/AGENTS.md` for persistent formats, pages, and heap storage;
+- `crates/netbadb-index/AGENTS.md` for typed index ordering and node codecs;
+- `crates/netbadb-storage/AGENTS.md` for persistent formats, pages, heap, and index storage;
 - `sdk/AGENTS.md` for Rust, Go, and future language SDKs.
 
 Do not create a directory or crate only to hold an instruction file. Add server,
@@ -91,7 +92,8 @@ hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
 planner -> rel + types
-storage -> schema + types
+index -> types
+storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
 Rust SDK -> core + executor + schema + types

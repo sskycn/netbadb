@@ -17,7 +17,8 @@ netbadb-rel -> netbadb-types
 netbadb-compiler -> netbadb-hir + netbadb-parser + netbadb-rel
                     + netbadb-schema + netbadb-types
 netbadb-planner -> netbadb-rel + netbadb-types
-netbadb-storage -> netbadb-schema + netbadb-types
+netbadb-index -> netbadb-types
+netbadb-storage -> netbadb-index + netbadb-schema + netbadb-types
 netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
 netbadb-core -> compiler + planner + executor + storage + schema + types
@@ -293,6 +294,7 @@ The synchronous storage path is now:
 Executor
     ↓
 HeapStorage
+    ↘ BTree persistence orchestration
     ↓
 TransactionManager + WAL
     ↓
@@ -327,6 +329,11 @@ Database file
   frame. It no longer flushes the entire buffer after each insert. Page guards
   do not escape these operations, so executor and query APIs carry no page
   lifetimes.
+- `netbadb-index` is the storage-independent B+Tree domain layer. It owns
+  `IndexSpec`, explicit key/RowId ordering, nodes, versioned codecs, and
+  byte-balanced split calculation; it has no dependency on storage, WAL, SQL,
+  planner, or executor. `netbadb-storage::BTree` owns page traversal,
+  allocation, transaction/WAL ordering, publication, and recovery integration.
 
 The experimental container retains the legacy `NBPG` file-root marker. Heap
 metadata has its own `NBD1` marker and version 2 little-endian layout inside
@@ -354,7 +361,8 @@ data page. Data pages use the following version 5 little-endian layout:
 ```text
 0..4    NBP1 page magic
 4..6    u16 page format version (5)
-6       u8 page type (2 heap; tag 1 remains reserved)
+6       u8 page type (2 heap, 3 BTreeMeta, 4 BTreeInternal, 5 BTreeLeaf;
+        tag 1 remains reserved)
 7       reserved byte (zero)
 8..10   u16 slot count
 10..12  u16 free-space lower bound
@@ -415,6 +423,54 @@ version 4 added data-page integrity without moving existing header fields;
 version 5 adds explicit slot generation. It replaces the pre-Foundation
 sequential `HEAP` layout and page versions 1 through 4. These experimental
 formats have no migration path and are rejected rather than reinterpreted.
+
+## Persistent B+Tree boundary
+
+One table database file may interleave Heap and B+Tree pages. Heap scans and
+first-fit allocation validate every page, process only Heap pages, and skip
+valid index pages. RowId read/update/delete requires a Heap page, so a locator
+for an index page is rejected. B+Tree allocation uses the same PageManager,
+buffer pool, transaction manager, WAL generation, recovery, and checkpoint as
+heap mutation; there is no second file or durability domain.
+
+Every index page is a normal checksummed Page v5 with exactly one live slot 0,
+generation 1. The payload has its own version-1 semantic codec:
+
+- `NBTM` metadata: stable `BTreeHandle` page, current root PageId, height,
+  physical plus optional nominal semantic type, and nullability;
+- `NBTL` leaf: sorted full `(ScalarValue, RowId)` entries and optional next-leaf
+  PageId;
+- `NBTI` internal: first child plus sorted full-entry separators and right
+  children.
+
+All integers are fixed-width little-endian. Decoders reject wrong magic or
+version, nonzero reserved fields, invalid UTF-8/type/value tags, zero child
+pages, invalid RowIds, impossible counts, truncation, trailing bytes, and
+non-increasing entries. Traversal is bounded by persisted height and validates
+each PageId against current page count and each expected node kind. The page
+CRC catches raw corruption first; independently tested node decoders catch
+semantic corruption after a valid CRC is recomputed.
+
+Key order is NULL first, then native Bool/Int64/UInt64/UTF-8 Text value order.
+The tie-break is explicitly PageId, SlotId, generation; `RowId` itself does not
+gain a persistent `Ord` contract. Duplicate values are legal and point lookup
+returns all matching RowIds in tie-break order. An exact `(key, RowId)` repeat
+is `DuplicateEntry`. `IndexSpec` validates runtime physical type, nullability,
+and persists optional nominal identity, although nominal identity does not
+change physical comparison.
+
+Insertion descends without retaining guards, allowing a buffer pool capacity
+of one. Overflow splits deterministically by encoded byte size, updates leaf
+links, propagates complete separator entries, splits internal nodes, and uses a
+new root plus metadata update when height grows. One compound mutation logs
+full-page images in deterministic new-right/existing-left/ancestor/root/meta
+order. If it creates pages, all corresponding WAL records become durable before
+the first file extension. Any failure after the first PageUpdate makes the
+transaction `RollbackRequired`; runtime rollback and startup loser undo restore
+existing pages and remove trailing new pages in reverse order.
+
+Phase 4C1 deliberately has no delete/rebalance, uniqueness, automatic heap DML
+maintenance, SQL index DDL, IndexScan operator, optimizer choice, or statistics.
 
 ## Transaction and WAL boundary
 

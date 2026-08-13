@@ -31,18 +31,27 @@ const DELETED_SLOT_LENGTH: u16 = u16::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     Heap,
+    BTreeMeta,
+    BTreeInternal,
+    BTreeLeaf,
 }
 
 impl PageType {
     const fn tag(self) -> u8 {
         match self {
             Self::Heap => 2,
+            Self::BTreeMeta => 3,
+            Self::BTreeInternal => 4,
+            Self::BTreeLeaf => 5,
         }
     }
 
     fn from_tag(tag: u8) -> Result<Self, PageError> {
         match tag {
             2 => Ok(Self::Heap),
+            3 => Ok(Self::BTreeMeta),
+            4 => Ok(Self::BTreeInternal),
+            5 => Ok(Self::BTreeLeaf),
             other => Err(PageError::UnknownPageType(other)),
         }
     }
@@ -340,14 +349,7 @@ impl Page {
     }
 
     pub fn insert_record(&mut self, record: &[u8]) -> Result<SlotRef, StorageError> {
-        let header = self.header()?;
-        if header.page_type != PageType::Heap {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Heap,
-                actual: header.page_type,
-            }
-            .into());
-        }
+        let header = self.expect_page_type(PageType::Heap)?;
 
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
         if record.len() > max_record_size || record.len() > u16::MAX as usize {
@@ -408,6 +410,7 @@ impl Page {
     /// Marks a live slot deleted and compacts remaining payloads. Generation is
     /// retained until a later insertion reuses this slot.
     pub fn delete_record(&mut self, slot: SlotId) -> Result<(), StorageError> {
+        self.expect_page_type(PageType::Heap)?;
         let mut records = self.rebuild_slots()?;
         let target = records
             .get_mut(usize::from(slot.0))
@@ -422,6 +425,7 @@ impl Page {
     /// Replaces one live slot while preserving its SlotId. The page remains
     /// byte-for-byte unchanged when the replacement cannot fit.
     pub fn replace_record(&mut self, slot: SlotId, record: &[u8]) -> Result<(), StorageError> {
+        self.expect_page_type(PageType::Heap)?;
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
         if record.len() > max_record_size || record.len() > u16::MAX as usize {
             return Err(PageError::RecordTooLarge {
@@ -439,6 +443,107 @@ impl Page {
         }
         target.payload = Some(record.to_vec());
         self.rebuild_records(&records, Some((slot, record.len())))
+    }
+
+    /// Initializes a non-heap page with its single generation-1 payload.
+    pub(crate) fn initialize_single_payload(
+        &mut self,
+        expected: PageType,
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        let header = self.expect_page_type(expected)?;
+        if expected == PageType::Heap || header.slot_count != 0 {
+            return Err(PageError::InvalidSinglePayload {
+                page_type: expected,
+                slot_count: header.slot_count,
+            }
+            .into());
+        }
+        let capacity = Self::single_payload_capacity();
+        if payload.len() > capacity || payload.len() > u16::MAX as usize {
+            return Err(PageError::RecordTooLarge {
+                size: payload.len(),
+                capacity,
+            }
+            .into());
+        }
+        self.rebuild_records(
+            &[RebuildSlot {
+                generation: 1,
+                payload: Some(payload.to_vec()),
+            }],
+            None,
+        )
+    }
+
+    /// Replaces the only payload of a non-heap page without changing its slot.
+    pub(crate) fn replace_single_payload(
+        &mut self,
+        expected: PageType,
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        self.validate_single_payload(expected)?;
+        let capacity = Self::single_payload_capacity();
+        if payload.len() > capacity || payload.len() > u16::MAX as usize {
+            return Err(PageError::RecordTooLarge {
+                size: payload.len(),
+                capacity,
+            }
+            .into());
+        }
+        self.rebuild_records(
+            &[RebuildSlot {
+                generation: 1,
+                payload: Some(payload.to_vec()),
+            }],
+            Some((SlotId(0), payload.len())),
+        )
+    }
+
+    pub(crate) fn single_payload(&self, expected: PageType) -> Result<&[u8], StorageError> {
+        self.validate_single_payload(expected)?;
+        self.read_record(SlotId(0))
+    }
+
+    #[must_use]
+    pub(crate) const fn single_payload_capacity() -> usize {
+        PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE
+    }
+
+    fn validate_single_payload(&self, expected: PageType) -> Result<(), StorageError> {
+        let header = self.expect_page_type(expected)?;
+        if expected == PageType::Heap || header.slot_count != 1 {
+            return Err(PageError::InvalidSinglePayload {
+                page_type: expected,
+                slot_count: header.slot_count,
+            }
+            .into());
+        }
+        match self.slot_state(SlotId(0))? {
+            SlotState::Live(slot) if slot.generation == 1 => Ok(()),
+            SlotState::Live(slot) => Err(PageError::InvalidSinglePayloadGeneration {
+                page_type: expected,
+                generation: slot.generation,
+            }
+            .into()),
+            SlotState::Deleted { generation } => Err(PageError::InvalidSinglePayloadGeneration {
+                page_type: expected,
+                generation,
+            }
+            .into()),
+        }
+    }
+
+    fn expect_page_type(&self, expected: PageType) -> Result<PageHeader, StorageError> {
+        let header = self.header()?;
+        if header.page_type != expected {
+            return Err(PageError::WrongPageType {
+                expected,
+                actual: header.page_type,
+            }
+            .into());
+        }
+        Ok(header)
     }
 
     fn rebuild_slots(&self) -> Result<Vec<RebuildSlot>, StorageError> {
@@ -1134,6 +1239,48 @@ mod tests {
             Err(StorageError::Page(PageError::RecordTooLarge { .. }))
         ));
         assert_eq!(empty, before);
+    }
+
+    #[test]
+    fn btree_pages_enforce_one_live_generation_one_payload() {
+        for page_type in [
+            PageType::BTreeMeta,
+            PageType::BTreeInternal,
+            PageType::BTreeLeaf,
+        ] {
+            let mut page = Page::new(PageId(30), page_type);
+            page.initialize_single_payload(page_type, b"node")
+                .expect("initialize payload");
+            assert_eq!(
+                page.single_payload(page_type).expect("single payload"),
+                b"node"
+            );
+            page.replace_single_payload(page_type, b"replacement")
+                .expect("replace payload");
+            assert_eq!(
+                page.single_payload(page_type).expect("replacement"),
+                b"replacement"
+            );
+            assert!(matches!(
+                page.insert_record(b"heap"),
+                Err(StorageError::Page(PageError::WrongPageType { .. }))
+            ));
+        }
+
+        let empty = Page::new(PageId(31), PageType::BTreeLeaf);
+        assert!(matches!(
+            empty.single_payload(PageType::BTreeLeaf),
+            Err(StorageError::Page(PageError::InvalidSinglePayload {
+                slot_count: 0,
+                ..
+            }))
+        ));
+        let mut heap = Page::new(PageId(32), PageType::Heap);
+        heap.insert_record(b"row").expect("heap row");
+        assert!(matches!(
+            heap.single_payload(PageType::BTreeLeaf),
+            Err(StorageError::Page(PageError::WrongPageType { .. }))
+        ));
     }
 
     #[test]

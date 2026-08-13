@@ -59,6 +59,12 @@ impl PreparedInsert {
 }
 
 impl HeapStorage {
+    /// Borrows this heap's shared file, buffer, transaction, and WAL domain as
+    /// a persistent B+Tree API.
+    pub fn btree(&mut self) -> crate::BTree<'_> {
+        crate::BTree::new(self)
+    }
+
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
         Self::create_with_buffer_pool_size(path, table, DEFAULT_BUFFER_POOL_SIZE)
     }
@@ -207,6 +213,10 @@ impl HeapStorage {
         self.transactions.begin()
     }
 
+    pub(crate) fn buffer(&self) -> &BufferPool {
+        &self.buffer
+    }
+
     /// Verifies that a transaction is active and belongs to this heap. DML
     /// executors call this even when a predicate selects no rows.
     pub fn validate_transaction(&self, transaction: &Transaction) -> Result<(), StorageError> {
@@ -346,6 +356,11 @@ impl HeapStorage {
             let page = self.buffer.read_page(page_id)?;
             let before = page.page().clone();
             drop(page);
+            let page_type = before.header()?.page_type;
+            if page_type != PageType::Heap {
+                before.single_payload(page_type)?;
+                continue;
+            }
             let mut after = before.clone();
             match after.insert_record(payload) {
                 Ok(slot_ref) => {
@@ -497,11 +512,8 @@ impl HeapStorage {
             let page = self.buffer.read_page(page_id)?;
             let header = page.page().header()?;
             if header.page_type != PageType::Heap {
-                return Err(PageError::WrongPageType {
-                    expected: PageType::Heap,
-                    actual: header.page_type,
-                }
-                .into());
+                page.page().single_payload(header.page_type)?;
+                continue;
             }
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
@@ -639,7 +651,7 @@ impl HeapStorage {
     }
 
     #[cfg(test)]
-    fn simulate_crash(mut self) {
+    pub(crate) fn simulate_crash(mut self) {
         self.skip_drop_flush = true;
     }
 
@@ -687,6 +699,9 @@ fn map_row_error(error: StorageError, row_id: RowId) -> StorageError {
 }
 
 fn validate_row_slot(page: &Page, row_id: RowId) -> Result<SlotId, StorageError> {
+    if page.header()?.page_type != PageType::Heap {
+        return Err(StorageError::RowNotFound { row_id });
+    }
     let slot = SlotId(row_id.slot);
     let state = page
         .slot_state(slot)

@@ -1,5 +1,6 @@
 //! Synchronous page, buffer, and heap storage for the embedded vertical slice.
 
+mod btree;
 mod buffer;
 #[cfg(test)]
 mod crash_test;
@@ -9,6 +10,7 @@ mod recovery;
 mod transaction;
 mod wal;
 
+pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::HeapStorage;
 pub use page::{
@@ -25,6 +27,7 @@ pub use wal::{
 use std::error::Error;
 use std::fmt;
 
+use netbadb_index::IndexError;
 use netbadb_schema::{SchemaError, SchemaFingerprint};
 use netbadb_types::{PageId, PhysicalType, SlotId, TableId};
 
@@ -80,6 +83,14 @@ pub enum PageError {
     WrongPageType {
         expected: PageType,
         actual: PageType,
+    },
+    InvalidSinglePayload {
+        page_type: PageType,
+        slot_count: u16,
+    },
+    InvalidSinglePayloadGeneration {
+        page_type: PageType,
+        generation: u32,
     },
     PageFull {
         required: usize,
@@ -168,6 +179,20 @@ impl fmt::Display for PageError {
             Self::WrongPageType { expected, actual } => {
                 write!(formatter, "expected {expected:?} page, found {actual:?}")
             }
+            Self::InvalidSinglePayload {
+                page_type,
+                slot_count,
+            } => write!(
+                formatter,
+                "{page_type:?} page must contain exactly one live payload slot, found {slot_count}"
+            ),
+            Self::InvalidSinglePayloadGeneration {
+                page_type,
+                generation,
+            } => write!(
+                formatter,
+                "{page_type:?} single payload must have generation 1, found {generation}"
+            ),
             Self::PageFull {
                 required,
                 available,
@@ -416,6 +441,7 @@ pub enum StorageError {
     Buffer(BufferError),
     Codec(CodecError),
     Metadata(MetadataError),
+    Index(IndexError),
     Recovery(RecoveryError),
     Wal(WalError),
     Transaction(TransactionError),
@@ -469,6 +495,7 @@ impl fmt::Display for StorageError {
             Self::Buffer(error) => write!(formatter, "buffer pool error: {error}"),
             Self::Codec(error) => write!(formatter, "row codec error: {error}"),
             Self::Metadata(error) => write!(formatter, "heap metadata error: {error}"),
+            Self::Index(error) => write!(formatter, "index error: {error}"),
             Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
             Self::Wal(error) => write!(formatter, "write-ahead log error: {error}"),
             Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
@@ -538,6 +565,7 @@ impl Error for StorageError {
             Self::Buffer(error) => Some(error),
             Self::Codec(error) => Some(error),
             Self::Metadata(error) => Some(error),
+            Self::Index(error) => Some(error),
             Self::Recovery(error) => Some(error),
             Self::Wal(error) => Some(error),
             Self::Transaction(error) => Some(error),
@@ -580,6 +608,12 @@ impl From<CodecError> for StorageError {
 impl From<MetadataError> for StorageError {
     fn from(error: MetadataError) -> Self {
         Self::Metadata(error)
+    }
+}
+
+impl From<IndexError> for StorageError {
+    fn from(error: IndexError) -> Self {
+        Self::Index(error)
     }
 }
 

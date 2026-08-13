@@ -6,6 +6,7 @@ members = [
     "crates/netbadb-parser",
     "crates/netbadb-hir",
     "crates/netbadb-rel",
+    "crates/netbadb-index",
     "crates/netbadb-compiler",
     "crates/netbadb-planner",
     "crates/netbadb-storage",

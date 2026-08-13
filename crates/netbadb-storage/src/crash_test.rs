@@ -29,6 +29,8 @@ pub(crate) enum TestCrashPoint {
     RelocationAfterFirstPageUpdateLog,
     RelocationAfterBothPageUpdateLogs,
     RelocationAfterFirstPagePublish,
+    BTreeAfterFirstPageUpdateLog,
+    BTreeAfterFirstPagePublish,
     WalPartialFinalRecord,
 }
 
@@ -50,6 +52,8 @@ impl TestCrashPoint {
             Self::RelocationAfterFirstPageUpdateLog => "relocation-after-first-page-update-log",
             Self::RelocationAfterBothPageUpdateLogs => "relocation-after-both-page-update-logs",
             Self::RelocationAfterFirstPagePublish => "relocation-after-first-page-publish",
+            Self::BTreeAfterFirstPageUpdateLog => "btree-after-first-page-update-log",
+            Self::BTreeAfterFirstPagePublish => "btree-after-first-page-publish",
             Self::WalPartialFinalRecord => "wal-partial-final-record",
         }
     }

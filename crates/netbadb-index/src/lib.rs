@@ -1,0 +1,1217 @@
+//! Pure typed B+Tree domain objects, ordering, codecs, and split calculations.
+//!
+//! Physical pages, WAL, transactions, and file allocation intentionally live
+//! in `netbadb-storage`.
+
+use std::cmp::Ordering;
+use std::error::Error;
+use std::fmt;
+
+use netbadb_types::{PageId, PhysicalType, RowId, ScalarValue, SemanticType};
+
+pub const BTREE_FORMAT_VERSION: u16 = 1;
+const META_MAGIC: &[u8; 4] = b"NBTM";
+const LEAF_MAGIC: &[u8; 4] = b"NBTL";
+const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
+const COMMON_HEADER_SIZE: usize = 8;
+const NODE_HEADER_SIZE: usize = COMMON_HEADER_SIZE + 4 + 8;
+const ROW_ID_SIZE: usize = 8 + 2 + 4;
+const MIN_ENTRY_SIZE: usize = 1 + ROW_ID_SIZE;
+
+/// Persistent physical/nominal key identity and NULL acceptance for one tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSpec {
+    pub data_type: SemanticType,
+    pub nullable: bool,
+}
+
+/// Stable external identity of a tree's metadata page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BTreeHandle {
+    pub meta_page: PageId,
+}
+
+/// Complete ordered identity of one leaf entry and internal separator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexEntryKey {
+    pub key: ScalarValue,
+    pub row_id: RowId,
+}
+
+/// Alias emphasizing the leaf-entry role of [`IndexEntryKey`].
+pub type IndexEntry = IndexEntryKey;
+
+/// Decoded `NBTM` version-1 metadata payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaNode {
+    pub root_page: PageId,
+    pub height: u32,
+    pub spec: IndexSpec,
+}
+
+/// Decoded `NBTL` version-1 leaf payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafNode {
+    pub entries: Vec<IndexEntry>,
+    pub next_leaf: Option<PageId>,
+}
+
+/// One full-key routing boundary and its right child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalSeparator {
+    pub key: IndexEntryKey,
+    pub right_child: PageId,
+}
+
+/// Decoded `NBTI` version-1 internal payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalNode {
+    pub first_child: PageId,
+    pub separators: Vec<InternalSeparator>,
+}
+
+/// Typed failures from index validation, codecs, ordering, and split logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexError {
+    InvalidMagic {
+        expected: [u8; 4],
+        actual: [u8; 4],
+    },
+    UnsupportedVersion(u16),
+    InvalidReservedBytes,
+    InvalidNodeType,
+    InvalidHeight(u32),
+    InvalidChild(PageId),
+    InvalidEntryOrder,
+    InvalidPhysicalType(u8),
+    InvalidNullable(u8),
+    InvalidSemanticNamePresence(u8),
+    InvalidValueTag(u8),
+    InvalidBoolean(u8),
+    InvalidUtf8,
+    InvalidRowId {
+        page: PageId,
+        generation: u32,
+    },
+    Truncated,
+    LengthOverflow,
+    ExtraBytes,
+    TypeMismatch {
+        expected: PhysicalType,
+        actual: Option<PhysicalType>,
+    },
+    NullNotAllowed,
+    DuplicateEntry,
+    KeyTooLarge {
+        size: usize,
+        capacity: usize,
+    },
+    NodeTooLarge {
+        size: usize,
+        capacity: usize,
+    },
+    LeafChainCycle {
+        page_id: PageId,
+    },
+    EmptyLeaf {
+        page_id: PageId,
+    },
+    LeafChainOrder {
+        left_page: PageId,
+        right_page: PageId,
+    },
+}
+
+impl fmt::Display for IndexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMagic { expected, actual } => write!(
+                formatter,
+                "B+Tree payload magic {:?} does not match {:?}",
+                actual, expected
+            ),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported B+Tree payload version {version}")
+            }
+            Self::InvalidReservedBytes => {
+                formatter.write_str("B+Tree payload reserved bytes are non-zero")
+            }
+            Self::InvalidNodeType => formatter.write_str("invalid B+Tree node type"),
+            Self::InvalidHeight(height) => write!(formatter, "invalid B+Tree height {height}"),
+            Self::InvalidChild(page) => write!(formatter, "invalid B+Tree child page {}", page.0),
+            Self::InvalidEntryOrder => {
+                formatter.write_str("B+Tree entries are not strictly increasing")
+            }
+            Self::InvalidPhysicalType(tag) => {
+                write!(formatter, "invalid B+Tree physical type tag {tag}")
+            }
+            Self::InvalidNullable(value) => {
+                write!(formatter, "invalid B+Tree nullable flag {value}")
+            }
+            Self::InvalidSemanticNamePresence(value) => {
+                write!(formatter, "invalid semantic-name presence flag {value}")
+            }
+            Self::InvalidValueTag(tag) => write!(formatter, "invalid index value tag {tag}"),
+            Self::InvalidBoolean(value) => write!(formatter, "invalid index boolean {value}"),
+            Self::InvalidUtf8 => formatter.write_str("B+Tree text is not valid UTF-8"),
+            Self::InvalidRowId { page, generation } => write!(
+                formatter,
+                "invalid index RowId at page {} with generation {generation}",
+                page.0
+            ),
+            Self::Truncated => formatter.write_str("B+Tree payload is truncated"),
+            Self::LengthOverflow => formatter.write_str("B+Tree payload length overflows"),
+            Self::ExtraBytes => formatter.write_str("B+Tree payload contains extra bytes"),
+            Self::TypeMismatch { expected, actual } => {
+                write!(formatter, "index expects {expected}, found {actual:?}")
+            }
+            Self::NullNotAllowed => formatter.write_str("index key must not be NULL"),
+            Self::DuplicateEntry => formatter.write_str("index entry already exists"),
+            Self::KeyTooLarge { size, capacity } => write!(
+                formatter,
+                "encoded index key entry is {size} bytes; leaf capacity is {capacity}"
+            ),
+            Self::NodeTooLarge { size, capacity } => write!(
+                formatter,
+                "encoded B+Tree node is {size} bytes; payload capacity is {capacity}"
+            ),
+            Self::LeafChainCycle { page_id } => {
+                write!(formatter, "B+Tree leaf chain cycles at page {}", page_id.0)
+            }
+            Self::EmptyLeaf { page_id } => {
+                write!(
+                    formatter,
+                    "non-root B+Tree leaf page {} is empty",
+                    page_id.0
+                )
+            }
+            Self::LeafChainOrder {
+                left_page,
+                right_page,
+            } => write!(
+                formatter,
+                "B+Tree leaf chain is not strictly increasing between pages {} and {}",
+                left_page.0, right_page.0
+            ),
+        }
+    }
+}
+
+impl Error for IndexError {}
+
+impl IndexSpec {
+    /// Validates a runtime scalar against physical type and NULL policy.
+    pub fn validate_key(&self, key: &ScalarValue) -> Result<(), IndexError> {
+        if matches!(key, ScalarValue::Null) {
+            return if self.nullable {
+                Ok(())
+            } else {
+                Err(IndexError::NullNotAllowed)
+            };
+        }
+        let actual = key.physical_type();
+        if actual != Some(self.data_type.physical) {
+            return Err(IndexError::TypeMismatch {
+                expected: self.data_type.physical,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl LeafNode {
+    /// Constructs a leaf with no entries or next-leaf link.
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_leaf: None,
+        }
+    }
+
+    /// Inserts in full `(key, RowId)` order and rejects an exact duplicate.
+    pub fn insert(&mut self, spec: &IndexSpec, entry: IndexEntry) -> Result<usize, IndexError> {
+        spec.validate_key(&entry.key)?;
+        validate_row_id(entry.row_id)?;
+        match self
+            .entries
+            .binary_search_by(|existing| compare_entry_keys(existing, &entry))
+        {
+            Ok(_) => Err(IndexError::DuplicateEntry),
+            Err(index) => {
+                self.entries.insert(index, entry);
+                Ok(index)
+            }
+        }
+    }
+}
+
+impl InternalNode {
+    /// Returns the child at a separator boundary position.
+    pub fn child(&self, position: usize) -> Result<PageId, IndexError> {
+        let child = if position == 0 {
+            self.first_child
+        } else {
+            self.separators
+                .get(position - 1)
+                .ok_or(IndexError::InvalidNodeType)?
+                .right_child
+        };
+        validate_child(child)?;
+        Ok(child)
+    }
+
+    /// Chooses a child using complete `(key, RowId)` separator order.
+    pub fn child_position(&self, key: &IndexEntryKey) -> usize {
+        self.separators
+            .partition_point(|separator| compare_entry_keys(key, &separator.key) != Ordering::Less)
+    }
+
+    /// Inserts a separator immediately after the split child position.
+    pub fn insert_separator(
+        &mut self,
+        child_position: usize,
+        key: IndexEntryKey,
+        right_child: PageId,
+    ) -> Result<(), IndexError> {
+        validate_child(right_child)?;
+        if child_position > self.separators.len() {
+            return Err(IndexError::InvalidNodeType);
+        }
+        self.separators
+            .insert(child_position, InternalSeparator { key, right_child });
+        validate_internal_order(self)
+    }
+}
+
+/// Compares RowIds by PageId, SlotId, then generation without adding an `Ord`
+/// contract to the shared RowId type.
+pub fn compare_row_ids(left: RowId, right: RowId) -> Ordering {
+    left.page
+        .0
+        .cmp(&right.page.0)
+        .then_with(|| left.slot.cmp(&right.slot))
+        .then_with(|| left.generation.cmp(&right.generation))
+}
+
+/// Compares index values with NULL first and native typed value ordering.
+pub fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Ordering {
+    match (left, right) {
+        (ScalarValue::Null, ScalarValue::Null) => Ordering::Equal,
+        (ScalarValue::Null, _) => Ordering::Less,
+        (_, ScalarValue::Null) => Ordering::Greater,
+        (ScalarValue::Bool(left), ScalarValue::Bool(right)) => left.cmp(right),
+        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => left.cmp(right),
+        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => left.cmp(right),
+        (ScalarValue::Text(left), ScalarValue::Text(right)) => left.cmp(right),
+        (left, right) => value_rank(left).cmp(&value_rank(right)),
+    }
+}
+
+/// Compares complete entry identities by key and then explicit RowId order.
+pub fn compare_entry_keys(left: &IndexEntryKey, right: &IndexEntryKey) -> Ordering {
+    compare_values(&left.key, &right.key).then_with(|| compare_row_ids(left.row_id, right.row_id))
+}
+
+/// Compares only a user key with an entry's user key.
+pub fn compare_key_to_entry(key: &ScalarValue, entry: &IndexEntryKey) -> Ordering {
+    compare_values(key, &entry.key)
+}
+
+/// Ensures an entry can fit both a leaf and a future internal separator.
+pub fn ensure_entry_fits(
+    spec: &IndexSpec,
+    entry: &IndexEntry,
+    capacity: usize,
+) -> Result<(), IndexError> {
+    spec.validate_key(&entry.key)?;
+    validate_row_id(entry.row_id)?;
+    let leaf_size = NODE_HEADER_SIZE
+        .checked_add(encoded_entry_len(entry)?)
+        .ok_or(IndexError::LengthOverflow)?;
+    let internal_size = leaf_size.checked_add(8).ok_or(IndexError::LengthOverflow)?;
+    if internal_size > capacity {
+        return Err(IndexError::KeyTooLarge {
+            size: internal_size,
+            capacity,
+        });
+    }
+    Ok(())
+}
+
+/// Encodes one validated `NBTM` version-1 payload.
+pub fn encode_meta(node: &MetaNode) -> Result<Vec<u8>, IndexError> {
+    validate_meta(node)?;
+    let mut output = common_header(META_MAGIC);
+    output.extend_from_slice(&node.root_page.0.to_le_bytes());
+    output.extend_from_slice(&node.height.to_le_bytes());
+    output.push(physical_type_tag(node.spec.data_type.physical));
+    output.push(u8::from(node.spec.nullable));
+    let name = node.spec.data_type.name.as_deref();
+    output.push(u8::from(name.is_some()));
+    output.push(0);
+    push_text(&mut output, name.unwrap_or(""))?;
+    Ok(output)
+}
+
+/// Decodes and fully validates one `NBTM` version-1 payload.
+pub fn decode_meta(input: &[u8]) -> Result<MetaNode, IndexError> {
+    let mut decoder = Decoder::new(input);
+    decoder.common_header(META_MAGIC)?;
+    let root_page = PageId(decoder.u64()?);
+    let height = decoder.u32()?;
+    let physical = physical_type_from_tag(decoder.u8()?)?;
+    let nullable = decode_bool_flag(decoder.u8()?).map_err(IndexError::InvalidNullable)?;
+    let name_present = match decoder.u8()? {
+        0 => false,
+        1 => true,
+        other => return Err(IndexError::InvalidSemanticNamePresence(other)),
+    };
+    if decoder.u8()? != 0 {
+        return Err(IndexError::InvalidReservedBytes);
+    }
+    let name = decoder.text()?;
+    decoder.finish()?;
+    if name_present != !name.is_empty() {
+        return Err(IndexError::InvalidSemanticNamePresence(u8::from(
+            name_present,
+        )));
+    }
+    let node = MetaNode {
+        root_page,
+        height,
+        spec: IndexSpec {
+            data_type: SemanticType {
+                physical,
+                name: name_present.then_some(name),
+            },
+            nullable,
+        },
+    };
+    validate_meta(&node)?;
+    Ok(node)
+}
+
+/// Encodes one validated `NBTL` version-1 payload.
+pub fn encode_leaf(spec: &IndexSpec, node: &LeafNode) -> Result<Vec<u8>, IndexError> {
+    validate_leaf(spec, node)?;
+    let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
+    let mut output = common_header(LEAF_MAGIC);
+    output.extend_from_slice(&count.to_le_bytes());
+    output.extend_from_slice(&node.next_leaf.map_or(0, |page| page.0).to_le_bytes());
+    for entry in &node.entries {
+        encode_entry(&mut output, entry)?;
+    }
+    Ok(output)
+}
+
+/// Decodes and fully validates one `NBTL` version-1 payload.
+pub fn decode_leaf(spec: &IndexSpec, input: &[u8]) -> Result<LeafNode, IndexError> {
+    let mut decoder = Decoder::new(input);
+    decoder.common_header(LEAF_MAGIC)?;
+    let count = decoder.count(MIN_ENTRY_SIZE)?;
+    let raw_next = decoder.u64()?;
+    let next_leaf = (raw_next != 0).then_some(PageId(raw_next));
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(decoder.entry(spec)?);
+    }
+    decoder.finish()?;
+    let node = LeafNode { entries, next_leaf };
+    validate_leaf(spec, &node)?;
+    Ok(node)
+}
+
+/// Encodes one validated `NBTI` version-1 payload.
+pub fn encode_internal(spec: &IndexSpec, node: &InternalNode) -> Result<Vec<u8>, IndexError> {
+    validate_internal(spec, node)?;
+    let count = u32::try_from(node.separators.len()).map_err(|_| IndexError::LengthOverflow)?;
+    let mut output = common_header(INTERNAL_MAGIC);
+    output.extend_from_slice(&count.to_le_bytes());
+    output.extend_from_slice(&node.first_child.0.to_le_bytes());
+    for separator in &node.separators {
+        encode_entry(&mut output, &separator.key)?;
+        output.extend_from_slice(&separator.right_child.0.to_le_bytes());
+    }
+    Ok(output)
+}
+
+/// Decodes and fully validates one `NBTI` version-1 payload.
+pub fn decode_internal(spec: &IndexSpec, input: &[u8]) -> Result<InternalNode, IndexError> {
+    let mut decoder = Decoder::new(input);
+    decoder.common_header(INTERNAL_MAGIC)?;
+    let count = decoder.count(MIN_ENTRY_SIZE + 8)?;
+    let first_child = PageId(decoder.u64()?);
+    let mut separators = Vec::with_capacity(count);
+    for _ in 0..count {
+        separators.push(InternalSeparator {
+            key: decoder.entry(spec)?,
+            right_child: PageId(decoder.u64()?),
+        });
+    }
+    decoder.finish()?;
+    let node = InternalNode {
+        first_child,
+        separators,
+    };
+    validate_internal(spec, &node)?;
+    Ok(node)
+}
+
+/// Chooses a deterministic encoded-byte boundary and links two fitting leaves.
+pub fn split_leaf(
+    spec: &IndexSpec,
+    entries: Vec<IndexEntry>,
+    old_next: Option<PageId>,
+    right_page: PageId,
+    capacity: usize,
+) -> Result<(LeafNode, LeafNode, IndexEntryKey), IndexError> {
+    validate_child(right_page)?;
+    if entries.len() < 2 {
+        return Err(IndexError::NodeTooLarge {
+            size: encoded_entries_size(&entries)?,
+            capacity,
+        });
+    }
+    let mut best = None;
+    for split in 1..entries.len() {
+        let left = LeafNode {
+            entries: entries[..split].to_vec(),
+            next_leaf: Some(right_page),
+        };
+        let right = LeafNode {
+            entries: entries[split..].to_vec(),
+            next_leaf: old_next,
+        };
+        let left_size = encode_leaf(spec, &left)?.len();
+        let right_size = encode_leaf(spec, &right)?.len();
+        if left_size <= capacity && right_size <= capacity {
+            let imbalance = left_size.abs_diff(right_size);
+            if best.is_none_or(|(best_imbalance, best_split)| {
+                (imbalance, split) < (best_imbalance, best_split)
+            }) {
+                best = Some((imbalance, split));
+            }
+        }
+    }
+    let Some((_, split)) = best else {
+        return Err(IndexError::NodeTooLarge {
+            size: encoded_entries_size(&entries)?,
+            capacity,
+        });
+    };
+    let left = LeafNode {
+        entries: entries[..split].to_vec(),
+        next_leaf: Some(right_page),
+    };
+    let right = LeafNode {
+        entries: entries[split..].to_vec(),
+        next_leaf: old_next,
+    };
+    let promoted = right
+        .entries
+        .first()
+        .cloned()
+        .ok_or(IndexError::InvalidEntryOrder)?;
+    Ok((left, right, promoted))
+}
+
+/// Promotes one full separator at a deterministic encoded-byte boundary.
+pub fn split_internal(
+    spec: &IndexSpec,
+    node: InternalNode,
+    capacity: usize,
+) -> Result<(InternalNode, IndexEntryKey, InternalNode), IndexError> {
+    validate_internal(spec, &node)?;
+    if node.separators.is_empty() {
+        return Err(IndexError::NodeTooLarge {
+            size: encode_internal(spec, &node)?.len(),
+            capacity,
+        });
+    }
+    let mut best = None;
+    for middle in 0..node.separators.len() {
+        let promoted = &node.separators[middle];
+        let left = InternalNode {
+            first_child: node.first_child,
+            separators: node.separators[..middle].to_vec(),
+        };
+        let right = InternalNode {
+            first_child: promoted.right_child,
+            separators: node.separators[middle + 1..].to_vec(),
+        };
+        let left_size = encode_internal(spec, &left)?.len();
+        let right_size = encode_internal(spec, &right)?.len();
+        if left_size <= capacity && right_size <= capacity {
+            let imbalance = left_size.abs_diff(right_size);
+            if best.is_none_or(|(best_imbalance, best_middle)| {
+                (imbalance, middle) < (best_imbalance, best_middle)
+            }) {
+                best = Some((imbalance, middle));
+            }
+        }
+    }
+    let Some((_, middle)) = best else {
+        return Err(IndexError::NodeTooLarge {
+            size: encode_internal(spec, &node)?.len(),
+            capacity,
+        });
+    };
+    let promoted = node.separators[middle].clone();
+    let left = InternalNode {
+        first_child: node.first_child,
+        separators: node.separators[..middle].to_vec(),
+    };
+    let right = InternalNode {
+        first_child: promoted.right_child,
+        separators: node.separators[middle + 1..].to_vec(),
+    };
+    Ok((left, promoted.key, right))
+}
+
+fn common_header(magic: &[u8; 4]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(COMMON_HEADER_SIZE);
+    output.extend_from_slice(magic);
+    output.extend_from_slice(&BTREE_FORMAT_VERSION.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output
+}
+
+fn validate_meta(node: &MetaNode) -> Result<(), IndexError> {
+    validate_child(node.root_page)?;
+    if node.height == 0 {
+        return Err(IndexError::InvalidHeight(node.height));
+    }
+    if node
+        .spec
+        .data_type
+        .name
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        return Err(IndexError::InvalidSemanticNamePresence(1));
+    }
+    Ok(())
+}
+
+fn validate_leaf(spec: &IndexSpec, node: &LeafNode) -> Result<(), IndexError> {
+    if node.next_leaf == Some(PageId(0)) {
+        return Err(IndexError::InvalidChild(PageId(0)));
+    }
+    for entry in &node.entries {
+        spec.validate_key(&entry.key)?;
+        validate_row_id(entry.row_id)?;
+    }
+    validate_entry_order(node.entries.iter())
+}
+
+fn validate_internal(spec: &IndexSpec, node: &InternalNode) -> Result<(), IndexError> {
+    validate_child(node.first_child)?;
+    for separator in &node.separators {
+        spec.validate_key(&separator.key.key)?;
+        validate_row_id(separator.key.row_id)?;
+        validate_child(separator.right_child)?;
+    }
+    validate_internal_order(node)
+}
+
+fn validate_internal_order(node: &InternalNode) -> Result<(), IndexError> {
+    validate_entry_order(node.separators.iter().map(|separator| &separator.key))
+}
+
+fn validate_entry_order<'a>(
+    entries: impl Iterator<Item = &'a IndexEntryKey>,
+) -> Result<(), IndexError> {
+    let mut previous: Option<&IndexEntryKey> = None;
+    for entry in entries {
+        if previous.is_some_and(|left| compare_entry_keys(left, entry) != Ordering::Less) {
+            return Err(IndexError::InvalidEntryOrder);
+        }
+        previous = Some(entry);
+    }
+    Ok(())
+}
+
+fn validate_child(page: PageId) -> Result<(), IndexError> {
+    if page.0 == 0 {
+        Err(IndexError::InvalidChild(page))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_row_id(row_id: RowId) -> Result<(), IndexError> {
+    if row_id.page.0 == 0 || row_id.generation == 0 {
+        return Err(IndexError::InvalidRowId {
+            page: row_id.page,
+            generation: row_id.generation,
+        });
+    }
+    Ok(())
+}
+
+fn encode_entry(output: &mut Vec<u8>, entry: &IndexEntry) -> Result<(), IndexError> {
+    match &entry.key {
+        ScalarValue::Null => output.push(0),
+        ScalarValue::Bool(value) => {
+            output.push(1);
+            output.push(u8::from(*value));
+        }
+        ScalarValue::Int64(value) => {
+            output.push(2);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt64(value) => {
+            output.push(3);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Text(value) => {
+            output.push(4);
+            push_text(output, value)?;
+        }
+    }
+    output.extend_from_slice(&entry.row_id.page.0.to_le_bytes());
+    output.extend_from_slice(&entry.row_id.slot.to_le_bytes());
+    output.extend_from_slice(&entry.row_id.generation.to_le_bytes());
+    Ok(())
+}
+
+fn encoded_entry_len(entry: &IndexEntry) -> Result<usize, IndexError> {
+    let key = match &entry.key {
+        ScalarValue::Null => 1,
+        ScalarValue::Bool(_) => 2,
+        ScalarValue::Int64(_) | ScalarValue::UInt64(_) => 9,
+        ScalarValue::Text(value) => 5_usize
+            .checked_add(value.len())
+            .ok_or(IndexError::LengthOverflow)?,
+    };
+    key.checked_add(ROW_ID_SIZE)
+        .ok_or(IndexError::LengthOverflow)
+}
+
+fn encoded_entries_size(entries: &[IndexEntry]) -> Result<usize, IndexError> {
+    entries.iter().try_fold(NODE_HEADER_SIZE, |size, entry| {
+        size.checked_add(encoded_entry_len(entry)?)
+            .ok_or(IndexError::LengthOverflow)
+    })
+}
+
+fn push_text(output: &mut Vec<u8>, value: &str) -> Result<(), IndexError> {
+    let length = u32::try_from(value.len()).map_err(|_| IndexError::LengthOverflow)?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+const fn physical_type_tag(value: PhysicalType) -> u8 {
+    match value {
+        PhysicalType::Bool => 1,
+        PhysicalType::Int64 => 2,
+        PhysicalType::UInt64 => 3,
+        PhysicalType::Text => 4,
+    }
+}
+
+fn physical_type_from_tag(tag: u8) -> Result<PhysicalType, IndexError> {
+    match tag {
+        1 => Ok(PhysicalType::Bool),
+        2 => Ok(PhysicalType::Int64),
+        3 => Ok(PhysicalType::UInt64),
+        4 => Ok(PhysicalType::Text),
+        other => Err(IndexError::InvalidPhysicalType(other)),
+    }
+}
+
+const fn value_rank(value: &ScalarValue) -> u8 {
+    match value {
+        ScalarValue::Null => 0,
+        ScalarValue::Bool(_) => 1,
+        ScalarValue::Int64(_) => 2,
+        ScalarValue::UInt64(_) => 3,
+        ScalarValue::Text(_) => 4,
+    }
+}
+
+fn decode_bool_flag(value: u8) -> Result<bool, u8> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(other),
+    }
+}
+
+struct Decoder<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn common_header(&mut self, expected: &[u8; 4]) -> Result<(), IndexError> {
+        let actual = self.array::<4>()?;
+        if &actual != expected {
+            return Err(IndexError::InvalidMagic {
+                expected: *expected,
+                actual,
+            });
+        }
+        let version = self.u16()?;
+        if version != BTREE_FORMAT_VERSION {
+            return Err(IndexError::UnsupportedVersion(version));
+        }
+        if self.u16()? != 0 {
+            return Err(IndexError::InvalidReservedBytes);
+        }
+        Ok(())
+    }
+
+    fn count(&mut self, minimum_size: usize) -> Result<usize, IndexError> {
+        let bytes = self
+            .input
+            .get(self.offset..self.offset + 4)
+            .ok_or(IndexError::Truncated)?;
+        let raw = u32::from_le_bytes(bytes.try_into().map_err(|_| IndexError::Truncated)?) as usize;
+        self.offset += 4;
+        let remaining_after_header = self.input.len().saturating_sub(self.offset + 8);
+        if raw > remaining_after_header / minimum_size {
+            return Err(IndexError::Truncated);
+        }
+        Ok(raw)
+    }
+
+    fn entry(&mut self, spec: &IndexSpec) -> Result<IndexEntry, IndexError> {
+        let key = match self.u8()? {
+            0 => ScalarValue::Null,
+            1 => match self.u8()? {
+                0 => ScalarValue::Bool(false),
+                1 => ScalarValue::Bool(true),
+                other => return Err(IndexError::InvalidBoolean(other)),
+            },
+            2 => ScalarValue::Int64(i64::from_le_bytes(self.array()?)),
+            3 => ScalarValue::UInt64(u64::from_le_bytes(self.array()?)),
+            4 => ScalarValue::Text(self.text()?),
+            other => return Err(IndexError::InvalidValueTag(other)),
+        };
+        spec.validate_key(&key)?;
+        let row_id = RowId {
+            page: PageId(self.u64()?),
+            slot: self.u16()?,
+            generation: self.u32()?,
+        };
+        validate_row_id(row_id)?;
+        Ok(IndexEntry { key, row_id })
+    }
+
+    fn text(&mut self) -> Result<String, IndexError> {
+        let length = self.u32()? as usize;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(IndexError::LengthOverflow)?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or(IndexError::Truncated)?;
+        self.offset = end;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| IndexError::InvalidUtf8)
+    }
+
+    fn u8(&mut self) -> Result<u8, IndexError> {
+        Ok(self.array::<1>()?[0])
+    }
+    fn u16(&mut self) -> Result<u16, IndexError> {
+        Ok(u16::from_le_bytes(self.array()?))
+    }
+    fn u32(&mut self) -> Result<u32, IndexError> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+    fn u64(&mut self) -> Result<u64, IndexError> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], IndexError> {
+        let end = self
+            .offset
+            .checked_add(N)
+            .ok_or(IndexError::LengthOverflow)?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or(IndexError::Truncated)?;
+        self.offset = end;
+        bytes.try_into().map_err(|_| IndexError::Truncated)
+    }
+
+    fn finish(self) -> Result<(), IndexError> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err(IndexError::ExtraBytes)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(physical: PhysicalType, nullable: bool) -> IndexSpec {
+        IndexSpec {
+            data_type: SemanticType::physical(physical),
+            nullable,
+        }
+    }
+
+    fn entry(key: ScalarValue, page: u64, slot: u16) -> IndexEntry {
+        IndexEntry {
+            key,
+            row_id: RowId {
+                page: PageId(page),
+                slot,
+                generation: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn codecs_round_trip_all_node_kinds_and_semantic_identity() {
+        let named = IndexSpec {
+            data_type: SemanticType::named("UserId", PhysicalType::UInt64),
+            nullable: true,
+        };
+        let meta = MetaNode {
+            root_page: PageId(9),
+            height: 3,
+            spec: named.clone(),
+        };
+        assert_eq!(decode_meta(&encode_meta(&meta).unwrap()).unwrap(), meta);
+        let leaf = LeafNode {
+            entries: vec![
+                entry(ScalarValue::Null, 1, 0),
+                entry(ScalarValue::UInt64(7), 2, 0),
+            ],
+            next_leaf: Some(PageId(11)),
+        };
+        assert_eq!(
+            decode_leaf(&named, &encode_leaf(&named, &leaf).unwrap()).unwrap(),
+            leaf
+        );
+        let internal = InternalNode {
+            first_child: PageId(5),
+            separators: vec![InternalSeparator {
+                key: entry(ScalarValue::UInt64(7), 2, 0),
+                right_child: PageId(6),
+            }],
+        };
+        assert_eq!(
+            decode_internal(&named, &encode_internal(&named, &internal).unwrap()).unwrap(),
+            internal
+        );
+    }
+
+    #[test]
+    fn leaf_codec_round_trips_every_supported_scalar_key() {
+        for (physical, key) in [
+            (PhysicalType::Bool, ScalarValue::Bool(true)),
+            (PhysicalType::Int64, ScalarValue::Int64(-42)),
+            (PhysicalType::UInt64, ScalarValue::UInt64(42)),
+            (PhysicalType::Text, ScalarValue::Text("用户".into())),
+        ] {
+            let spec = spec(physical, false);
+            let leaf = LeafNode {
+                entries: vec![entry(key, 1, 0)],
+                next_leaf: None,
+            };
+            assert_eq!(
+                decode_leaf(&spec, &encode_leaf(&spec, &leaf).unwrap()).unwrap(),
+                leaf
+            );
+        }
+    }
+
+    #[test]
+    fn ordering_is_typed_numeric_text_null_then_explicit_row_id() {
+        let mut signed = vec![
+            ScalarValue::Int64(100),
+            ScalarValue::Int64(-1),
+            ScalarValue::Int64(0),
+            ScalarValue::Int64(-100),
+            ScalarValue::Int64(1),
+        ];
+        signed.sort_by(compare_values);
+        assert_eq!(
+            signed,
+            vec![
+                ScalarValue::Int64(-100),
+                ScalarValue::Int64(-1),
+                ScalarValue::Int64(0),
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(100)
+            ]
+        );
+        let mut text = ["用户", "b", "aa", "a"];
+        text.sort();
+        let mut values = text
+            .iter()
+            .rev()
+            .map(|value| ScalarValue::Text((*value).into()))
+            .collect::<Vec<_>>();
+        values.sort_by(compare_values);
+        assert_eq!(
+            values,
+            vec![
+                ScalarValue::Text("a".into()),
+                ScalarValue::Text("aa".into()),
+                ScalarValue::Text("b".into()),
+                ScalarValue::Text("用户".into())
+            ]
+        );
+        assert_eq!(
+            compare_values(&ScalarValue::Null, &ScalarValue::Int64(-100)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_row_ids(
+                RowId {
+                    page: PageId(1),
+                    slot: 9,
+                    generation: 1
+                },
+                RowId {
+                    page: PageId(2),
+                    slot: 0,
+                    generation: 1
+                }
+            ),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn leaf_insert_supports_duplicates_but_rejects_exact_entry() {
+        let spec = spec(PhysicalType::UInt64, false);
+        let mut leaf = LeafNode::empty();
+        let first = entry(ScalarValue::UInt64(42), 2, 0);
+        let second = entry(ScalarValue::UInt64(42), 1, 0);
+        leaf.insert(&spec, first.clone()).unwrap();
+        leaf.insert(&spec, second.clone()).unwrap();
+        assert_eq!(leaf.entries, vec![second, first.clone()]);
+        assert_eq!(leaf.insert(&spec, first), Err(IndexError::DuplicateEntry));
+    }
+
+    #[test]
+    fn variable_width_leaf_split_finds_a_fitting_byte_boundary() {
+        let spec = spec(PhysicalType::Text, false);
+        let entries = vec![
+            entry(ScalarValue::Text("a".repeat(70)), 1, 0),
+            entry(ScalarValue::Text("b".repeat(5)), 2, 0),
+            entry(ScalarValue::Text("c".repeat(60)), 3, 0),
+        ];
+        let (left, right, promoted) = split_leaf(&spec, entries, None, PageId(8), 125).unwrap();
+        assert!(!left.entries.is_empty());
+        assert!(!right.entries.is_empty());
+        assert!(encode_leaf(&spec, &left).unwrap().len() <= 125);
+        assert!(encode_leaf(&spec, &right).unwrap().len() <= 125);
+        assert_eq!(promoted, right.entries[0]);
+    }
+
+    #[test]
+    fn entry_preflight_reserves_space_for_an_internal_child_pointer() {
+        let spec = spec(PhysicalType::Text, false);
+        let entry = entry(ScalarValue::Text("x".repeat(82)), 1, 0);
+        assert_eq!(
+            ensure_entry_fits(&spec, &entry, 125),
+            Err(IndexError::KeyTooLarge {
+                size: 129,
+                capacity: 125,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_payloads_return_typed_errors() {
+        let uint_spec = spec(PhysicalType::UInt64, false);
+        let valid = encode_leaf(
+            &uint_spec,
+            &LeafNode {
+                entries: vec![entry(ScalarValue::UInt64(1), 1, 0)],
+                next_leaf: None,
+            },
+        )
+        .unwrap();
+        let valid_meta = encode_meta(&MetaNode {
+            root_page: PageId(1),
+            height: 1,
+            spec: uint_spec.clone(),
+        })
+        .unwrap();
+        let valid_internal = encode_internal(
+            &uint_spec,
+            &InternalNode {
+                first_child: PageId(1),
+                separators: vec![InternalSeparator {
+                    key: entry(ScalarValue::UInt64(1), 1, 0),
+                    right_child: PageId(2),
+                }],
+            },
+        )
+        .unwrap();
+        for end in 0..valid_meta.len() {
+            assert!(decode_meta(&valid_meta[..end]).is_err());
+        }
+        for end in 0..valid.len() {
+            assert!(decode_leaf(&uint_spec, &valid[..end]).is_err());
+        }
+        for end in 0..valid_internal.len() {
+            assert!(decode_internal(&uint_spec, &valid_internal[..end]).is_err());
+        }
+        assert!(matches!(
+            decode_meta(&with_byte(&valid_meta, 0, b'X')),
+            Err(IndexError::InvalidMagic { .. })
+        ));
+        assert!(matches!(
+            decode_leaf(&uint_spec, &with_byte(&valid, 0, b'X')),
+            Err(IndexError::InvalidMagic { .. })
+        ));
+        assert!(matches!(
+            decode_internal(&uint_spec, &with_byte(&valid_internal, 0, b'X')),
+            Err(IndexError::InvalidMagic { .. })
+        ));
+        let mut bad_magic = valid.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            decode_leaf(&uint_spec, &bad_magic),
+            Err(IndexError::InvalidMagic { .. })
+        ));
+        let mut old = valid.clone();
+        old[4..6].copy_from_slice(&9_u16.to_le_bytes());
+        assert_eq!(
+            decode_leaf(&uint_spec, &old),
+            Err(IndexError::UnsupportedVersion(9))
+        );
+        let mut reserved = valid.clone();
+        reserved[6] = 1;
+        assert_eq!(
+            decode_leaf(&uint_spec, &reserved),
+            Err(IndexError::InvalidReservedBytes)
+        );
+        let mut zero_generation = valid.clone();
+        let last = zero_generation.len();
+        zero_generation[last - 4..].fill(0);
+        assert!(matches!(
+            decode_leaf(&uint_spec, &zero_generation),
+            Err(IndexError::InvalidRowId { generation: 0, .. })
+        ));
+        let mut zero_child = encode_internal(
+            &uint_spec,
+            &InternalNode {
+                first_child: PageId(1),
+                separators: vec![],
+            },
+        )
+        .unwrap();
+        zero_child[12..20].fill(0);
+        assert_eq!(
+            decode_internal(&uint_spec, &zero_child),
+            Err(IndexError::InvalidChild(PageId(0)))
+        );
+
+        let mut invalid_type = encode_meta(&MetaNode {
+            root_page: PageId(1),
+            height: 1,
+            spec: uint_spec.clone(),
+        })
+        .unwrap();
+        invalid_type[20] = 99;
+        assert_eq!(
+            decode_meta(&invalid_type),
+            Err(IndexError::InvalidPhysicalType(99))
+        );
+
+        let mut invalid_utf8 = encode_leaf(
+            &spec(PhysicalType::Text, false),
+            &LeafNode {
+                entries: vec![entry(ScalarValue::Text("x".into()), 1, 0)],
+                next_leaf: None,
+            },
+        )
+        .unwrap();
+        invalid_utf8[25] = 0xff;
+        assert_eq!(
+            decode_leaf(&spec(PhysicalType::Text, false), &invalid_utf8),
+            Err(IndexError::InvalidUtf8)
+        );
+
+        let mut unsorted = encode_leaf(
+            &uint_spec,
+            &LeafNode {
+                entries: vec![
+                    entry(ScalarValue::UInt64(1), 1, 0),
+                    entry(ScalarValue::UInt64(2), 2, 0),
+                ],
+                next_leaf: None,
+            },
+        )
+        .unwrap();
+        let first_key = 21;
+        let second_key = first_key + 23;
+        unsorted[first_key..first_key + 8].copy_from_slice(&2_u64.to_le_bytes());
+        unsorted[second_key..second_key + 8].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            decode_leaf(&uint_spec, &unsorted),
+            Err(IndexError::InvalidEntryOrder)
+        );
+
+        let mut duplicate_separator = encode_internal(
+            &uint_spec,
+            &InternalNode {
+                first_child: PageId(1),
+                separators: vec![
+                    InternalSeparator {
+                        key: entry(ScalarValue::UInt64(1), 1, 0),
+                        right_child: PageId(2),
+                    },
+                    InternalSeparator {
+                        key: entry(ScalarValue::UInt64(2), 2, 0),
+                        right_child: PageId(3),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let first_separator = 20;
+        let second_separator = first_separator + 31;
+        let first_entry = duplicate_separator[first_separator..first_separator + 23].to_vec();
+        duplicate_separator[second_separator..second_separator + 23].copy_from_slice(&first_entry);
+        assert_eq!(
+            decode_internal(&uint_spec, &duplicate_separator),
+            Err(IndexError::InvalidEntryOrder)
+        );
+    }
+
+    fn with_byte(input: &[u8], offset: usize, byte: u8) -> Vec<u8> {
+        let mut output = input.to_vec();
+        output[offset] = byte;
+        output
+    }
+
+    #[test]
+    fn spec_rejects_null_and_physical_mismatch() {
+        let nonnull = spec(PhysicalType::UInt64, false);
+        assert_eq!(
+            nonnull.validate_key(&ScalarValue::Null),
+            Err(IndexError::NullNotAllowed)
+        );
+        assert!(matches!(
+            nonnull.validate_key(&ScalarValue::Int64(1)),
+            Err(IndexError::TypeMismatch { .. })
+        ));
+        let nullable = spec(PhysicalType::UInt64, true);
+        assert!(nullable.validate_key(&ScalarValue::Null).is_ok());
+    }
+}

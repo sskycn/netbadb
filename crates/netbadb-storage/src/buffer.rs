@@ -222,7 +222,15 @@ impl BufferState {
                 self.disk.sync()?;
             }
             ValidatedBeforeImage::NewPage => {
-                if page_id.0 == self.disk.page_count() {
+                let page_count = self.disk.page_count();
+                if page_id.0 > page_count {
+                    // A compound operation can log several future pages before
+                    // allocating any of them. Reverse undo reaches the highest
+                    // not-yet-allocated page first; there is no physical state
+                    // to restore for that record.
+                    return Ok(());
+                }
+                if page_id.0 == page_count {
                     // Also truncates a partial allocation that extended the
                     // file without advancing the logical page count.
                     self.disk.remove_trailing_page(page_id)?;

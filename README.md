@@ -98,7 +98,8 @@ netbadb/
 │   ├── netbadb-rel/         typed logical relational IR
 │   ├── netbadb-compiler/    AST → HIR → logical plan
 │   ├── netbadb-planner/     logical plan → physical plan
-│   ├── netbadb-storage/     transactions, WAL, pages, buffer pool, and heap
+│   ├── netbadb-index/       typed B+Tree ordering, nodes, codecs, and splits
+│   ├── netbadb-storage/     transactions, WAL, pages, buffer pool, heap, B+Tree
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   └── netbadb-core/        native embedded database API
 ├── sdk/
@@ -118,7 +119,8 @@ hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
 planner -> rel + types
-storage -> schema + types
+index -> types
+storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
 Rust SDK -> core + executor + schema + types
@@ -162,6 +164,8 @@ The current code genuinely supports:
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - generation-safe RowId insert, update, delete, scan, stale-locator detection,
   file reopen, row encoding, and row decoding;
+- persistent transactional B+Tree create, insert, and duplicate-preserving
+  point lookup with typed keys, arbitrary height, and buffer capacity one;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
@@ -302,6 +306,29 @@ Implicit DML owns one transaction. `execute_in` supports multiple statements
 in an explicit transaction; until savepoints exist, an execution-time DML
 failure rolls back that whole transaction.
 
+Heap and B+Tree pages share one database file, buffer pool, transaction chain,
+WAL, recovery pass, and checkpoint. Page v5 assigns distinct page-type tags to
+Heap, BTreeMeta, BTreeInternal, and BTreeLeaf pages. Index pages contain exactly
+one generation-1 payload slot; heap scans and first-fit allocation validate and
+skip well-formed index pages, while RowId access rejects them as non-heap.
+
+`BTreeHandle` is a stable metadata-page identity. Its `NBTM` version-1 payload
+stores the current root, height, and `IndexSpec`; root splits can therefore
+replace the root without changing the handle. Leaf (`NBTL`) and internal
+(`NBTI`) version-1 payloads encode fixed-width little-endian fields and typed
+keys. Supported keys are Bool, Int64, UInt64, Text, and nullable NULL. Ordering
+is typed value order with NULL first, followed by explicit
+`(PageId, SlotId, generation)` RowId order. Equal keys are supported; only an
+exact `(key, RowId)` duplicate is rejected. Insert splits by encoded byte size,
+supports arbitrary height, and logs deterministic full-page changes in the
+order new right page, existing left page, ancestors, then new root/meta when
+needed. All new-page WAL is durable before file extension.
+
+This Phase 4C1 API is storage-only. It does not automatically maintain indexes
+for heap DML, validate that referenced RowIds are currently live, enforce
+uniqueness, delete/rebalance entries, expose SQL index DDL, add IndexScan, or
+change optimizer policy.
+
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
 resolve through the exposed relation name; unqualified columns are accepted
@@ -430,13 +457,16 @@ The implementation sequence is intentionally vertical:
 13. Heap-wide reuse + safe relocation (Phase 4B) — deterministic first-fit,
     RowId-returning UPDATE relocation, and rollback-required multi-page
     mutation safety. Complete.
-14. Indexing — B+Tree and planner access-path selection.
-15. Server mode — protocol, sessions, and `netbadbd`.
-16. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-17. Advanced optimization — statistics, cost model, and rewrite rules.
+14. Persistent B+Tree (Phase 4C1) — transactional create/insert/point lookup,
+    mixed pages, split recovery, and explicit typed codecs. Complete.
+15. B+Tree delete/rebalance (Phase 4C2), transactional heap/index maintenance
+    (Phase 4D), IndexScan (Phase 4E), then statistics/costing (Phase 4F).
+16. Server mode — protocol, sessions, and `netbadbd`.
+17. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+18. Advanced optimization — statistics, cost model, and rewrite rules.
 
-Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
-are roadmap items, not implemented features in this slice.
+Isolation/MVCC, B+Tree deletion and SQL/planner integration, server networking,
+and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 
