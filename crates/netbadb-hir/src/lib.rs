@@ -992,6 +992,7 @@ mod tests {
                 ],
             ),
         ])
+        .expect("valid test schema")
     }
 
     #[test]

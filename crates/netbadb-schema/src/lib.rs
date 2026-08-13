@@ -391,7 +391,16 @@ impl fmt::Display for SchemaError {
     }
 }
 
-impl Error for SchemaError {}
+impl Error for SchemaError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTableName { reason, .. } | Self::InvalidColumnName { reason, .. } => {
+                Some(reason)
+            }
+            _ => None,
+        }
+    }
+}
 
 fn validate_identifier(name: &str) -> Result<(), IdentifierError> {
     let mut characters = name.char_indices();
@@ -460,7 +469,7 @@ const fn physical_type_tag(physical: PhysicalType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
+    use super::{ColumnDef, IdentifierError, Schema, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
 
     fn user_table() -> TableDef {
@@ -485,11 +494,11 @@ mod tests {
 
     #[test]
     fn validates_schema_and_rejects_duplicate_table_identity() {
-        Schema::try_new(vec![user_table()]).expect("valid schema");
+        Schema::new(vec![user_table()]).expect("valid schema");
         let mut same_id = user_table();
         same_id.name = "other".into();
         assert!(matches!(
-            Schema::try_new(vec![user_table(), same_id]),
+            Schema::new(vec![user_table(), same_id]),
             Err(SchemaError::DuplicateTableId {
                 table_id: TableId(7)
             })
@@ -497,13 +506,13 @@ mod tests {
         let mut same_name = user_table();
         same_name.id = TableId(8);
         assert!(matches!(
-            Schema::try_new(vec![user_table(), same_name]),
+            Schema::new(vec![user_table(), same_name]),
             Err(SchemaError::DuplicateTableName { name }) if name == "users"
         ));
     }
 
     #[test]
-    fn rejects_duplicate_column_identity_and_empty_names() {
+    fn rejects_duplicate_column_identity_and_unrepresentable_names() {
         let mut duplicate_id = user_table();
         duplicate_id.columns[1].id = ColumnId(1);
         assert!(matches!(
@@ -523,13 +532,47 @@ mod tests {
         empty_table_name.name.clear();
         assert!(matches!(
             empty_table_name.validate(),
-            Err(SchemaError::InvalidTableName { .. })
+            Err(SchemaError::InvalidTableName {
+                reason: IdentifierError::Empty,
+                ..
+            })
         ));
         let mut empty_column_name = user_table();
         empty_column_name.columns[0].name.clear();
         assert!(matches!(
             empty_column_name.validate(),
-            Err(SchemaError::InvalidColumnName { .. })
+            Err(SchemaError::InvalidColumnName {
+                reason: IdentifierError::Empty,
+                ..
+            })
+        ));
+        for (name, expected) in [
+            ("select", IdentifierError::ReservedKeyword),
+            (
+                "team-members",
+                IdentifierError::InvalidCharacter {
+                    index: 4,
+                    character: '-',
+                },
+            ),
+            ("用户", IdentifierError::InvalidStart { character: '用' }),
+            ("1users", IdentifierError::InvalidStart { character: '1' }),
+        ] {
+            let mut invalid = user_table();
+            invalid.name = name.into();
+            assert!(matches!(
+                invalid.validate(),
+                Err(SchemaError::InvalidTableName { reason, .. }) if reason == expected
+            ));
+        }
+        let mut reserved_column = user_table();
+        reserved_column.columns[0].name = "from".into();
+        assert!(matches!(
+            reserved_column.validate(),
+            Err(SchemaError::InvalidColumnName {
+                reason: IdentifierError::ReservedKeyword,
+                ..
+            })
         ));
         let mut empty_semantic_name = user_table();
         if let TypeSpec::Semantic { name, .. } = &mut empty_semantic_name.columns[0].type_spec {
@@ -635,7 +678,7 @@ mod tests {
 
     #[test]
     fn schema_preserves_nominal_column_types() {
-        let schema = Schema::try_new(vec![user_table()]).expect("valid schema");
+        let schema = Schema::new(vec![user_table()]).expect("valid schema");
         assert_eq!(
             schema.table("users").expect("table exists").columns[0]
                 .semantic_type()

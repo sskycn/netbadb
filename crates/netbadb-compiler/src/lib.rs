@@ -257,7 +257,8 @@ mod tests {
                 ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
                 ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
             ],
-        )]);
+        )])
+        .expect("valid test schema");
         let compiled =
             compile(&schema, "SELECT name FROM users WHERE id >= 2 LIMIT 1").expect("compile");
         assert_eq!(compiled.logical_plan.output_columns().len(), 1);
@@ -278,7 +279,8 @@ mod tests {
                 )
                 .nullable(true),
             ],
-        )]);
+        )])
+        .expect("valid test schema");
         let compiled =
             compile(&schema, "SELECT id FROM users WHERE nickname IS NOT NULL").expect("compile");
         let LogicalPlan::Project { input, .. } = compiled.logical_plan else {
@@ -309,7 +311,8 @@ mod tests {
                 )
                 .nullable(true),
             ],
-        )]);
+        )])
+        .expect("valid test schema");
         assert!(matches!(
             compile_statement(&schema, "INSERT INTO users (id, name) VALUES (1, 'Ada')")
                 .expect("compile insert")
@@ -359,7 +362,8 @@ mod tests {
                     TypeSpec::Physical(PhysicalType::Int64),
                 )],
             ),
-        ]);
+        ])
+        .expect("valid test schema");
         let compiled = compile(
             &schema,
             "SELECT a.id, c.b_id FROM a JOIN b ON a.id = b.a_id \

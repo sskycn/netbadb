@@ -6,7 +6,7 @@ pub use netbadb_core::{
     TransactionState,
 };
 pub use netbadb_schema::{
-    CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,
-    TypeSpec,
+    CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, IdentifierError, Schema, SchemaError,
+    SchemaFingerprint, TableDef, TypeSpec,
 };
 pub use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};

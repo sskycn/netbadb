@@ -109,7 +109,7 @@ pub struct Database {
 
 impl Database {
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
-        let schema = Schema::try_new(vec![table.clone()])?;
+        let schema = Schema::new(vec![table.clone()])?;
         let storage = HeapStorage::create(path, table)?;
         Ok(Self {
             schema,
@@ -118,7 +118,7 @@ impl Database {
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
-        let schema = Schema::try_new(vec![table.clone()])?;
+        let schema = Schema::new(vec![table.clone()])?;
         let storage = HeapStorage::open(path, table)?;
         Ok(Self {
             schema,
@@ -130,7 +130,7 @@ impl Database {
     /// query catalog. Each heap persists the table's schema fingerprint.
     pub fn create_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
-        let schema = Schema::try_new(tables.iter().map(|(_, table)| table.clone()).collect())?;
+        let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
         let mut created_paths = Vec::with_capacity(tables.len());
         for (path, table) in tables {
@@ -163,7 +163,7 @@ impl Database {
     /// Opens one existing heap-format file per table as a single query catalog.
     pub fn open_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
-        let schema = Schema::try_new(tables.iter().map(|(_, table)| table.clone()).collect())?;
+        let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
         for (path, table) in tables {
             storages.push(HeapStorage::open(path, table)?);

@@ -39,10 +39,13 @@ independent of any application language. A column has:
 - nullability;
 - primary-key metadata.
 
-`Schema::validate` is the common invariant path used before persistence and by
-the core composition API. It rejects duplicate table IDs/names, duplicate
-column IDs/names within a table, and empty table, column, or semantic-type
-names. Name equality remains case-sensitive, matching current resolution.
+`Schema::new` is the fallible construction path and delegates to
+`Schema::validate`; unchecked public construction is not available. Validation
+rejects duplicate table IDs/names, duplicate column IDs/names within a table,
+table or column names that the current unquoted SQL identifier grammar cannot
+represent, and empty semantic-type names. Name equality remains case-sensitive,
+matching current resolution, while reserved-keyword detection is
+case-insensitive like the lexer.
 Zero-column tables remain valid and receive an identity with column count zero.
 Primary-key metadata is preserved in identity, but this phase does not add key
 enforcement; nullability remains the independently enforced write constraint.

@@ -1,6 +1,6 @@
 use netbadb_core::{Database, DatabaseError, ExecutionResult, TransactionState};
 use netbadb_executor::ExecutionError;
-use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
+use netbadb_schema::{ColumnDef, IdentifierError, SchemaError, TableDef, TypeSpec};
 use netbadb_storage::{PageError, StorageError};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
@@ -637,6 +637,37 @@ fn invalid_multi_table_schema_is_rejected_before_any_storage_is_created() {
         assert!(!wal.exists());
         assert!(!netbadb_storage::wal_alternate_path(&wal).exists());
     }
+}
+
+#[test]
+fn unqueryable_identifier_is_rejected_before_storage_creation() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-core-invalid-identifier-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    cleanup(&path);
+    let table = TableDef::new(
+        TableId(83),
+        "select",
+        vec![ColumnDef::new(
+            ColumnId(1),
+            "id",
+            TypeSpec::Physical(PhysicalType::UInt64),
+        )],
+    );
+
+    assert!(matches!(
+        Database::create(&path, table),
+        Err(DatabaseError::Schema(SchemaError::InvalidTableName {
+            reason: IdentifierError::ReservedKeyword,
+            ..
+        }))
+    ));
+    assert!(!path.exists());
+    let wal = netbadb_storage::wal_path(&path);
+    assert!(!wal.exists());
+    assert!(!netbadb_storage::wal_alternate_path(&wal).exists());
 }
 
 #[test]
