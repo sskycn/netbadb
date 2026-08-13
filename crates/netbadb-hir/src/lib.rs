@@ -168,6 +168,7 @@ pub struct TypedQuery {
     pub columns: Vec<ColumnRef>,
     pub projection: Vec<TypedProjectionItem>,
     pub selection: Option<TypedExpr>,
+    pub group_by: Vec<ColumnRef>,
     pub order_by: Vec<TypedOrderKey>,
     pub limit: Option<u64>,
 }
@@ -270,10 +271,14 @@ pub enum HirError {
     InsertValueReferencesColumn {
         span: Span,
     },
-    MixedAggregateProjection {
+    UngroupedColumn {
+        name: String,
         span: Span,
     },
-    OrderByNotSupportedWithAggregate {
+    WildcardNotSupportedWithGroupBy {
+        span: Span,
+    },
+    OrderByNotSupportedWithGrouping {
         span: Span,
     },
     InvalidAggregateArgument {
@@ -336,11 +341,15 @@ impl fmt::Display for HirError {
             Self::InsertValueReferencesColumn { .. } => {
                 formatter.write_str("INSERT VALUES expressions cannot reference table columns")
             }
-            Self::MixedAggregateProjection { .. } => formatter.write_str(
-                "global aggregate projection cannot include source columns without GROUP BY",
+            Self::UngroupedColumn { name, .. } => write!(
+                formatter,
+                "column `{name}` must appear in GROUP BY or be aggregated"
             ),
-            Self::OrderByNotSupportedWithAggregate { .. } => {
-                formatter.write_str("ORDER BY is not supported for aggregate queries yet")
+            Self::WildcardNotSupportedWithGroupBy { .. } => {
+                formatter.write_str("wildcard projection is not supported with GROUP BY")
+            }
+            Self::OrderByNotSupportedWithGrouping { .. } => {
+                formatter.write_str("ORDER BY is not supported for grouped queries yet")
             }
             Self::InvalidAggregateArgument { function, .. } => {
                 write!(formatter, "{} requires a source column", function.as_str())
@@ -386,18 +395,14 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         .projection
         .iter()
         .any(|item| matches!(item, netbadb_parser::SelectItem::Aggregate(_)));
-    if has_aggregate
-        && query
-            .projection
-            .iter()
-            .any(|item| !matches!(item, netbadb_parser::SelectItem::Aggregate(_)))
-    {
-        return Err(HirError::MixedAggregateProjection {
-            span: select_item_span(&query.projection[0]),
-        });
-    }
-    if has_aggregate && !query.order_by.is_empty() {
-        return Err(HirError::OrderByNotSupportedWithAggregate {
+    let group_by = query
+        .group_by
+        .iter()
+        .map(|column| scope.resolve(column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let is_grouping = has_aggregate || !group_by.is_empty();
+    if is_grouping && !query.order_by.is_empty() {
+        return Err(HirError::OrderByNotSupportedWithGrouping {
             span: query.order_by[0].span,
         });
     }
@@ -408,10 +413,26 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         .try_fold(Vec::new(), |mut projection, item| {
             match item {
                 netbadb_parser::SelectItem::Wildcard(_) => {
+                    if !group_by.is_empty() {
+                        return Err(HirError::WildcardNotSupportedWithGroupBy {
+                            span: select_item_span(item),
+                        });
+                    }
                     projection.extend(scope.columns().into_iter().map(TypedProjectionItem::Column))
                 }
                 netbadb_parser::SelectItem::Column(column) => {
-                    projection.push(TypedProjectionItem::Column(scope.resolve(column)?));
+                    let resolved = scope.resolve(column)?;
+                    if is_grouping
+                        && !group_by
+                            .iter()
+                            .any(|group_key| same_source_column(group_key, &resolved))
+                    {
+                        return Err(HirError::UngroupedColumn {
+                            name: column.name.name.clone(),
+                            span: column.span,
+                        });
+                    }
+                    projection.push(TypedProjectionItem::Column(resolved));
                 }
                 netbadb_parser::SelectItem::Aggregate(aggregate) => projection.push(
                     TypedProjectionItem::Aggregate(lower_aggregate(&scope, aggregate)?),
@@ -464,9 +485,14 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         columns: scope.columns(),
         projection,
         selection,
+        group_by,
         order_by,
         limit: query.limit,
     })
+}
+
+fn same_source_column(left: &ColumnRef, right: &ColumnRef) -> bool {
+    left.binding_id == right.binding_id && left.column_id == right.column_id
 }
 
 fn lower_aggregate(
@@ -1536,7 +1562,7 @@ mod tests {
         ] {
             assert!(matches!(
                 lower_query(&schema(), &parse(source).expect("parse mixed projection")),
-                Err(HirError::MixedAggregateProjection { .. })
+                Err(HirError::UngroupedColumn { .. })
             ));
         }
         assert!(matches!(
@@ -1544,7 +1570,7 @@ mod tests {
                 &schema(),
                 &parse("SELECT COUNT(*) FROM users ORDER BY id").expect("parse aggregate order")
             ),
-            Err(HirError::OrderByNotSupportedWithAggregate { .. })
+            Err(HirError::OrderByNotSupportedWithGrouping { .. })
         ));
         assert!(matches!(
             lower_query(
@@ -1570,6 +1596,129 @@ mod tests {
             ),
             Err(HirError::UnknownColumn { name, .. }) if name == "missing"
         ));
+    }
+
+    #[test]
+    fn resolves_group_keys_and_enforces_grouped_projection_semantics() {
+        let typed = lower_query(
+            &schema(),
+            &parse(
+                "SELECT COUNT(*), u.team_id, MAX(score) FROM users u \
+                 GROUP BY u.team_id, active",
+            )
+            .expect("parse grouped query"),
+        )
+        .expect("lower grouped query");
+        assert_eq!(typed.group_by.len(), 2);
+        assert_eq!(typed.group_by[0].name, "team_id");
+        assert_eq!(typed.group_by[0].relation_name, "u");
+        assert_eq!(typed.projection.len(), 3);
+
+        for source in [
+            "SELECT id, COUNT(*) FROM users GROUP BY team_id",
+            "SELECT team_id, id FROM users GROUP BY team_id",
+            "SELECT id FROM users GROUP BY team_id",
+            "SELECT COUNT(*), name FROM users",
+        ] {
+            let error = lower_query(&schema(), &parse(source).expect("parse ungrouped column"))
+                .expect_err("ungrouped source column must fail");
+            assert!(matches!(
+                error,
+                HirError::UngroupedColumn { name, .. } if name == "id" || name == "name"
+            ));
+        }
+
+        let source = "SELECT COUNT(*), name FROM users";
+        let error = lower_query(&schema(), &parse(source).expect("parse span case"))
+            .expect_err("ungrouped name must fail");
+        let HirError::UngroupedColumn { name, span } = error else {
+            panic!("expected ungrouped column");
+        };
+        assert_eq!(name, "name");
+        assert_eq!(&source[span.start..span.end], "name");
+
+        for source in [
+            "SELECT team_id FROM users GROUP BY team_id",
+            "SELECT COUNT(*) FROM users GROUP BY team_id",
+            "SELECT team_id, COUNT(*) FROM users GROUP BY team_id, active",
+        ] {
+            assert!(
+                lower_query(&schema(), &parse(source).expect("parse valid grouping")).is_ok(),
+                "{source}"
+            );
+        }
+
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse("SELECT * FROM users GROUP BY team_id").expect("parse wildcard grouping")
+            ),
+            Err(HirError::WildcardNotSupportedWithGroupBy { .. })
+        ));
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse("SELECT team_id FROM users GROUP BY team_id ORDER BY team_id")
+                    .expect("parse grouped order")
+            ),
+            Err(HirError::OrderByNotSupportedWithGrouping { .. })
+        ));
+    }
+
+    #[test]
+    fn group_by_reuses_binding_aware_scope_resolution() {
+        let qualified = lower_query(
+            &schema(),
+            &parse(
+                "SELECT u.id, COUNT(*) FROM users u JOIN teams t ON u.team_id = t.id \
+                 GROUP BY u.id",
+            )
+            .expect("parse qualified group"),
+        )
+        .expect("qualified group resolves");
+        assert_eq!(qualified.group_by[0].binding_id, RelationBindingId(0));
+
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse(
+                    "SELECT COUNT(*) FROM users u JOIN teams t ON u.team_id = t.id GROUP BY id"
+                )
+                .expect("parse ambiguous group")
+            ),
+            Err(HirError::AmbiguousColumn { name, .. }) if name == "id"
+        ));
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse("SELECT COUNT(*) FROM users u GROUP BY x.id")
+                    .expect("parse unknown qualifier")
+            ),
+            Err(HirError::UnknownRelationQualifier { name, .. }) if name == "x"
+        ));
+
+        let employee_group = lower_query(
+            &schema(),
+            &parse(
+                "SELECT e.id, COUNT(*) FROM employees e JOIN employees m \
+                 ON e.manager_id = m.id GROUP BY e.id",
+            )
+            .expect("parse employee self-join group"),
+        )
+        .expect("employee self-join group resolves");
+        let manager_group = lower_query(
+            &schema(),
+            &parse(
+                "SELECT m.id, COUNT(*) FROM employees e JOIN employees m \
+                 ON e.manager_id = m.id GROUP BY m.id",
+            )
+            .expect("parse manager self-join group"),
+        )
+        .expect("manager self-join group resolves");
+        assert_ne!(
+            employee_group.group_by[0].binding_id,
+            manager_group.group_by[0].binding_id
+        );
     }
 
     #[test]

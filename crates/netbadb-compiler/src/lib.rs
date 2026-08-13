@@ -11,8 +11,8 @@ use netbadb_hir::{
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
-    AggregateExpr, AggregateFunction, AggregateInput, Assignment, BinaryOp, ColumnRef,
-    DerivedField, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement, NullOrder,
+    AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
+    ColumnRef, DerivedField, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement, NullOrder,
     SortDirection, SortKey, UnaryOp,
 };
 use netbadb_schema::Schema;
@@ -145,18 +145,27 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
             predicate: lower_expr(predicate),
         };
     }
-    let aggregates = query
-        .projection
-        .iter()
-        .filter_map(|item| match item {
-            TypedProjectionItem::Aggregate(aggregate) => Some(lower_aggregate(aggregate)),
-            TypedProjectionItem::Column(_) => None,
-        })
-        .collect::<Vec<_>>();
-    if !aggregates.is_empty() {
+    let is_grouping = !query.group_by.is_empty()
+        || query
+            .projection
+            .iter()
+            .any(|item| matches!(item, TypedProjectionItem::Aggregate(_)));
+    if is_grouping {
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
-            aggregates,
+            group_keys: query.group_by.iter().map(column_ref_from_hir).collect(),
+            outputs: query
+                .projection
+                .iter()
+                .map(|item| match item {
+                    TypedProjectionItem::Column(column) => {
+                        AggregateOutput::GroupKey(column_ref_from_hir(column))
+                    }
+                    TypedProjectionItem::Aggregate(aggregate) => {
+                        AggregateOutput::Aggregate(lower_aggregate(aggregate))
+                    }
+                })
+                .collect(),
         };
     } else {
         if !query.order_by.is_empty() {
@@ -432,13 +441,70 @@ mod tests {
         let LogicalPlan::Limit { input, limit: 0 } = compiled.logical_plan else {
             panic!("expected limit");
         };
-        let LogicalPlan::Aggregate { input, aggregates } = *input else {
+        let LogicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } = *input
+        else {
             panic!("expected aggregate");
         };
-        assert_eq!(aggregates.len(), 2);
-        assert_eq!(aggregates[0].function, AggregateFunction::Count);
-        assert_eq!(aggregates[1].function, AggregateFunction::Sum);
+        assert!(group_keys.is_empty());
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(
+            outputs[0],
+            netbadb_rel::AggregateOutput::Aggregate(ref aggregate)
+                if aggregate.function == AggregateFunction::Count
+        ));
+        assert!(matches!(
+            outputs[1],
+            netbadb_rel::AggregateOutput::Aggregate(ref aggregate)
+                if aggregate.function == AggregateFunction::Sum
+        ));
         assert!(matches!(*input, LogicalPlan::Filter { .. }));
+    }
+
+    #[test]
+    fn grouped_plan_separates_keys_from_projection_order() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "team_id",
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                ),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "score",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                ),
+            ],
+        )])
+        .expect("valid schema");
+        let compiled = compile(
+            &schema,
+            "SELECT COUNT(*), team_id, MAX(score) FROM users GROUP BY team_id",
+        )
+        .expect("compile grouped query");
+        let LogicalPlan::Aggregate {
+            group_keys,
+            outputs,
+            ..
+        } = compiled.logical_plan
+        else {
+            panic!("expected grouped aggregate");
+        };
+        assert_eq!(group_keys.len(), 1);
+        assert!(matches!(
+            outputs.as_slice(),
+            [
+                netbadb_rel::AggregateOutput::Aggregate(_),
+                netbadb_rel::AggregateOutput::GroupKey(group_key),
+                netbadb_rel::AggregateOutput::Aggregate(_)
+            ] if group_key.name == "team_id"
+        ));
     }
 
     #[test]

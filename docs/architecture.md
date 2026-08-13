@@ -148,15 +148,18 @@ preserves input order among equal keys for the current plan, but does not
 promise a permanent tie order if future access paths change. A caller that
 requires a total order must provide enough keys.
 
-## Typed global aggregates
+## Typed global and grouped aggregates
 
 Aggregate function names are contextual only in SELECT projection. A plain
 identifier such as `count` remains a source column, while `COUNT(*)` or
 `COUNT(column)` is an aggregate. Aggregate arguments are limited to `*` for
 COUNT and qualified or unqualified source columns for all four functions. HIR
-resolves column inputs through the complete relation scope and rejects mixed
-source/aggregate projection because `GROUP BY` does not yet exist. Aggregate
-queries also reject `ORDER BY` in this slice.
+resolves column inputs and GROUP BY keys through the complete relation scope.
+For grouping queries, every projected source column must be one of the
+binding-aware group keys. A key need not be projected, GROUP BY may contain
+multiple source columns, and GROUP BY without aggregates forms distinct groups.
+Wildcard projection is rejected with GROUP BY. Grouped queries also reject
+`ORDER BY` in this slice.
 
 Normal and aggregate plans remain distinct:
 
@@ -169,15 +172,29 @@ An `OutputField` separates source identity from result metadata. Source fields
 retain their `RelationBindingId + TableId + ColumnId`; a `DerivedField` carries
 only its deterministic name, semantic type, and nullability. Consequently,
 `COUNT(*)` never receives fabricated catalog or query-source IDs. Logical and
-physical Aggregate operators own typed aggregate expressions and produce the
-derived fields directly rather than disguising aggregation as projection.
+physical Aggregate operators keep `group_keys` (group identity) separate from
+ordered `AggregateOutput` items (result shape). A group-key output remains a
+Source field and an aggregate remains Derived, so SELECT order is preserved
+without disguising aggregation as projection or inventing identifiers.
 
-The global aggregate executor materializes its input once and updates every
-aggregate state in one pass. Even zero input rows form one implicit group:
-COUNT returns zero, while SUM/MIN/MAX return NULL. LIMIT is above Aggregate, so
-LIMIT 0 removes that result row rather than limiting aggregate input. Runtime
-column values are checked against their typed physical inputs and SUM uses
-checked signed or unsigned addition.
+The aggregate executor materializes its input once and updates every aggregate
+state in one pass. It uses `HashMap<Vec<ScalarValue>, usize>` only for group
+lookup and a `Vec<GroupState>` for deterministic first-seen output order;
+randomized hash iteration never shapes results. Grouping is currently fully in
+memory. With no group keys, zero input rows still form one implicit group:
+COUNT returns zero, while SUM/MIN/MAX return NULL. With one or more keys, groups
+are created only when rows arrive, so empty input produces zero rows. LIMIT is
+above Aggregate and therefore limits complete result groups, never input rows.
+Runtime key and aggregate values are checked against typed physical inputs and
+SUM uses checked signed or unsigned addition.
+
+`ScalarValue` equality and hashing are used only for current-process group
+lookup. NULL equals NULL for grouping, so all NULLs at the same key position
+share a group; this is deliberately different from SQL expression equality,
+where `NULL = NULL` remains UNKNOWN. Scalar hashing is not a persistent format,
+schema fingerprint, WAL, page, or compatibility contract. Although first-seen
+order is deterministic for the current executor, SQL queries without ORDER BY
+do not guarantee row order.
 
 Aggregate type and NULL rules are:
 
@@ -190,8 +207,8 @@ Aggregate type and NULL rules are:
   comparison, ignore NULL, and are nullable for empty/all-NULL input. They
   preserve the input `SemanticType` because the result is an input value.
 
-There is no grouping, HAVING, DISTINCT aggregate, alias, aggregate expression,
-nested aggregate, or aggregate-aware ordering in this foundation slice.
+There is no HAVING, DISTINCT aggregate, alias, GROUP BY expression, nested
+aggregate, aggregate-aware ordering, GROUPING SETS, ROLLUP, or CUBE.
 
 ## Typed expressions and NULL
 

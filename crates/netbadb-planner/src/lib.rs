@@ -1,7 +1,7 @@
 //! Physical planning kept separate from logical relational meaning.
 
 use netbadb_rel::{
-    AggregateExpr, Assignment, ColumnRef, Expr, JoinKind, LogicalStatement, OutputField, SortKey,
+    AggregateOutput, Assignment, ColumnRef, Expr, JoinKind, LogicalStatement, OutputField, SortKey,
 };
 use netbadb_types::{RelationBindingId, TableId};
 
@@ -34,7 +34,8 @@ pub enum PhysicalPlan {
     },
     Aggregate {
         input: Box<PhysicalPlan>,
-        aggregates: Vec<AggregateExpr>,
+        group_keys: Vec<ColumnRef>,
+        outputs: Vec<AggregateOutput>,
     },
     Limit {
         input: Box<PhysicalPlan>,
@@ -70,10 +71,9 @@ impl PhysicalPlan {
             | Self::Project { columns, .. } => {
                 columns.iter().cloned().map(OutputField::Source).collect()
             }
-            Self::Aggregate { aggregates, .. } => aggregates
-                .iter()
-                .map(|aggregate| OutputField::Derived(aggregate.output.clone()))
-                .collect(),
+            Self::Aggregate { outputs, .. } => {
+                outputs.iter().map(AggregateOutput::output_field).collect()
+            }
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.output_fields()
             }
@@ -120,9 +120,14 @@ pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
             input: Box::new(plan(input)),
             columns: columns.clone(),
         },
-        netbadb_rel::LogicalPlan::Aggregate { input, aggregates } => PhysicalPlan::Aggregate {
+        netbadb_rel::LogicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } => PhysicalPlan::Aggregate {
             input: Box::new(plan(input)),
-            aggregates: aggregates.clone(),
+            group_keys: group_keys.clone(),
+            outputs: outputs.clone(),
         },
         netbadb_rel::LogicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
             input: Box::new(plan(input)),
@@ -291,15 +296,18 @@ mod tests {
                 table_name: "users".into(),
                 columns: vec![column.clone()],
             }),
-            aggregates: vec![netbadb_rel::AggregateExpr {
-                function: netbadb_rel::AggregateFunction::Min,
-                input: netbadb_rel::AggregateInput::Column(column),
-                output: netbadb_rel::DerivedField {
-                    name: "MIN(score)".into(),
-                    data_type: SemanticType::physical(PhysicalType::Int64),
-                    nullable: true,
+            group_keys: Vec::new(),
+            outputs: vec![netbadb_rel::AggregateOutput::Aggregate(
+                netbadb_rel::AggregateExpr {
+                    function: netbadb_rel::AggregateFunction::Min,
+                    input: netbadb_rel::AggregateInput::Column(column),
+                    output: netbadb_rel::DerivedField {
+                        name: "MIN(score)".into(),
+                        data_type: SemanticType::physical(PhysicalType::Int64),
+                        nullable: true,
+                    },
                 },
-            }],
+            )],
         };
         let physical = plan(&logical);
         assert!(matches!(
@@ -307,5 +315,58 @@ mod tests {
             [netbadb_rel::OutputField::Derived(field)] if field.name == "MIN(score)"
         ));
         assert!(matches!(physical, PhysicalPlan::Aggregate { .. }));
+    }
+
+    #[test]
+    fn preserves_group_keys_and_interleaved_aggregate_outputs() {
+        let column = ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(1),
+            relation_name: "users".into(),
+            name: "team_id".into(),
+            data_type: SemanticType::physical(PhysicalType::UInt64),
+            nullable: true,
+        };
+        let count = netbadb_rel::AggregateExpr {
+            function: netbadb_rel::AggregateFunction::Count,
+            input: netbadb_rel::AggregateInput::All,
+            output: netbadb_rel::DerivedField {
+                name: "COUNT(*)".into(),
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            },
+        };
+        let logical = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: vec![column.clone()],
+            }),
+            group_keys: vec![column.clone()],
+            outputs: vec![
+                netbadb_rel::AggregateOutput::Aggregate(count.clone()),
+                netbadb_rel::AggregateOutput::GroupKey(column),
+                netbadb_rel::AggregateOutput::Aggregate(count),
+            ],
+        };
+        let physical = plan(&logical);
+        assert!(matches!(
+            physical.output_fields().as_slice(),
+            [
+                netbadb_rel::OutputField::Derived(_),
+                netbadb_rel::OutputField::Source(_),
+                netbadb_rel::OutputField::Derived(_)
+            ]
+        ));
+        assert!(matches!(
+            physical,
+            PhysicalPlan::Aggregate {
+                group_keys,
+                outputs,
+                ..
+            } if group_keys.len() == 1 && outputs.len() == 3
+        ));
     }
 }

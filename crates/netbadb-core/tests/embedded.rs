@@ -401,6 +401,282 @@ fn typed_global_aggregates_cover_null_empty_types_limit_and_reopen() {
 }
 
 #[test]
+fn typed_grouped_aggregates_preserve_null_groups_projection_and_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-grouped-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let table = TableDef::new(
+        TableId(95),
+        "users",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Semantic {
+                    name: "UserId".into(),
+                    physical: PhysicalType::UInt64,
+                },
+            ),
+            ColumnDef::new(
+                ColumnId(2),
+                "team_id",
+                TypeSpec::Semantic {
+                    name: "TeamId".into(),
+                    physical: PhysicalType::UInt64,
+                },
+            )
+            .nullable(true),
+            ColumnDef::new(
+                ColumnId(3),
+                "score",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+            ColumnDef::new(
+                ColumnId(4),
+                "active",
+                TypeSpec::Physical(PhysicalType::Bool),
+            ),
+            ColumnDef::new(
+                ColumnId(5),
+                "country",
+                TypeSpec::Physical(PhysicalType::Text),
+            ),
+        ],
+    );
+    let mut database = Database::create(&path, table.clone()).expect("create grouped database");
+    for row in [
+        vec![
+            ScalarValue::UInt64(1),
+            ScalarValue::UInt64(10),
+            ScalarValue::Int64(10),
+            ScalarValue::Bool(true),
+            ScalarValue::Text("US".into()),
+        ],
+        vec![
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(10),
+            ScalarValue::Int64(20),
+            ScalarValue::Bool(true),
+            ScalarValue::Text("US".into()),
+        ],
+        vec![
+            ScalarValue::UInt64(3),
+            ScalarValue::UInt64(20),
+            ScalarValue::Null,
+            ScalarValue::Bool(true),
+            ScalarValue::Text("CA".into()),
+        ],
+        vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(20),
+            ScalarValue::Int64(30),
+            ScalarValue::Bool(false),
+            ScalarValue::Text("CA".into()),
+        ],
+        vec![
+            ScalarValue::UInt64(5),
+            ScalarValue::Null,
+            ScalarValue::Int64(5),
+            ScalarValue::Bool(true),
+            ScalarValue::Text("US".into()),
+        ],
+        vec![
+            ScalarValue::UInt64(6),
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Bool(true),
+            ScalarValue::Text("US".into()),
+        ],
+    ] {
+        database.insert(&row).expect("insert grouped row");
+    }
+
+    let source = "SELECT COUNT(*), team_id, COUNT(score), SUM(score), MIN(score), MAX(score) \
+                  FROM users GROUP BY team_id";
+    let grouped = database.query(source).expect("grouped aggregate");
+    assert_eq!(
+        grouped
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "COUNT(*)",
+            "team_id",
+            "COUNT(score)",
+            "SUM(score)",
+            "MIN(score)",
+            "MAX(score)"
+        ]
+    );
+    assert_eq!(grouped.columns[1].data_type.name.as_deref(), Some("TeamId"));
+    assert!(grouped.columns[1].nullable);
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                ScalarValue::UInt64(2),
+                ScalarValue::UInt64(10),
+                ScalarValue::UInt64(2),
+                ScalarValue::Int64(30),
+                ScalarValue::Int64(10),
+                ScalarValue::Int64(20),
+            ],
+            vec![
+                ScalarValue::UInt64(2),
+                ScalarValue::UInt64(20),
+                ScalarValue::UInt64(1),
+                ScalarValue::Int64(30),
+                ScalarValue::Int64(30),
+                ScalarValue::Int64(30),
+            ],
+            vec![
+                ScalarValue::UInt64(2),
+                ScalarValue::Null,
+                ScalarValue::UInt64(1),
+                ScalarValue::Int64(5),
+                ScalarValue::Int64(5),
+                ScalarValue::Int64(5),
+            ],
+        ]
+    );
+
+    let hidden = database
+        .query("SELECT COUNT(*) FROM users GROUP BY team_id")
+        .expect("hidden group key");
+    assert_eq!(hidden.columns.len(), 1);
+    assert_eq!(hidden.rows.len(), 3);
+    assert_eq!(
+        hidden.rows,
+        vec![
+            vec![ScalarValue::UInt64(2)],
+            vec![ScalarValue::UInt64(2)],
+            vec![ScalarValue::UInt64(2)]
+        ]
+    );
+    assert_eq!(
+        database
+            .query("SELECT team_id FROM users GROUP BY team_id")
+            .expect("group-only distinct output")
+            .rows,
+        vec![
+            vec![ScalarValue::UInt64(10)],
+            vec![ScalarValue::UInt64(20)],
+            vec![ScalarValue::Null]
+        ]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT active, COUNT(*), COUNT(score), SUM(score), MIN(score), MAX(score) \
+                 FROM users WHERE score IS NULL GROUP BY active",
+            )
+            .expect("all-null aggregate group")
+            .rows,
+        vec![vec![
+            ScalarValue::Bool(true),
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(0),
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Null,
+        ]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT score, COUNT(*) FROM users GROUP BY score")
+            .expect("signed integer group key")
+            .rows
+            .len(),
+        5
+    );
+    assert_eq!(
+        database
+            .query("SELECT country, team_id, COUNT(*) FROM users GROUP BY country, team_id")
+            .expect("multi-key grouping")
+            .rows,
+        vec![
+            vec![
+                ScalarValue::Text("US".into()),
+                ScalarValue::UInt64(10),
+                ScalarValue::UInt64(2)
+            ],
+            vec![
+                ScalarValue::Text("CA".into()),
+                ScalarValue::UInt64(20),
+                ScalarValue::UInt64(2)
+            ],
+            vec![
+                ScalarValue::Text("US".into()),
+                ScalarValue::Null,
+                ScalarValue::UInt64(2)
+            ],
+        ]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT country, score, COUNT(*) FROM users WHERE score IS NULL \
+                 GROUP BY country, score",
+            )
+            .expect("multi-key NULL grouping")
+            .rows,
+        vec![
+            vec![
+                ScalarValue::Text("CA".into()),
+                ScalarValue::Null,
+                ScalarValue::UInt64(1)
+            ],
+            vec![
+                ScalarValue::Text("US".into()),
+                ScalarValue::Null,
+                ScalarValue::UInt64(1)
+            ],
+        ]
+    );
+
+    let grouped_empty = database
+        .query("SELECT team_id, COUNT(*) FROM users WHERE country = 'missing' GROUP BY team_id")
+        .expect("empty grouped input");
+    assert!(grouped_empty.rows.is_empty());
+    assert_eq!(grouped_empty.columns.len(), 2);
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM users WHERE country = 'missing'")
+            .expect("empty global input")
+            .rows,
+        vec![vec![ScalarValue::UInt64(0)]]
+    );
+    let limited = database
+        .query("SELECT team_id, COUNT(*) FROM users GROUP BY team_id LIMIT 1")
+        .expect("limit grouped results");
+    assert_eq!(limited.rows.len(), 1);
+    assert_eq!(limited.rows[0][1], ScalarValue::UInt64(2));
+
+    let semantic = database
+        .query("SELECT team_id, SUM(id), MIN(id), MAX(id) FROM users GROUP BY team_id")
+        .expect("grouped semantic outputs");
+    assert_eq!(semantic.columns[1].data_type.name, None);
+    assert_eq!(
+        semantic.columns[2].data_type.name.as_deref(),
+        Some("UserId")
+    );
+    assert_eq!(
+        semantic.columns[3].data_type.name.as_deref(),
+        Some("UserId")
+    );
+
+    database.close().expect("close grouped database");
+    let mut reopened = Database::open(&path, table).expect("reopen grouped database");
+    assert_eq!(reopened.query(source).expect("group after reopen"), grouped);
+    reopened.close().expect("close reopened grouped database");
+    cleanup(&path);
+}
+
+#[test]
 fn public_query_pipeline_obeys_null_and_three_valued_logic_after_reopen() {
     let path =
         std::env::temp_dir().join(format!("netbadb-null-integration-{}", std::process::id()));
@@ -1198,6 +1474,33 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
     );
     assert_eq!(joined.columns[0].name, "name");
     assert_eq!(joined.columns[1].name, "name");
+    assert_eq!(
+        database
+            .query(
+                "SELECT t.name, COUNT(*) FROM users u JOIN teams t ON u.team_id = t.id \
+                 GROUP BY t.name",
+            )
+            .expect("group joined rows")
+            .rows,
+        vec![
+            vec![ScalarValue::Text("Core".into()), ScalarValue::UInt64(1)],
+            vec![ScalarValue::Text("Core-2".into()), ScalarValue::UInt64(1)],
+            vec![ScalarValue::Text("Tools".into()), ScalarValue::UInt64(1)],
+        ]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT u.team_id, COUNT(*) FROM users u JOIN teams t ON u.team_id = t.id \
+                 GROUP BY u.team_id",
+            )
+            .expect("group duplicate join rows")
+            .rows,
+        vec![
+            vec![ScalarValue::Int64(10), ScalarValue::UInt64(2)],
+            vec![ScalarValue::Int64(20), ScalarValue::UInt64(1)],
+        ]
+    );
     assert_eq!(
         database
             .query(

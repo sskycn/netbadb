@@ -119,6 +119,24 @@ pub struct AggregateExpr {
     pub output: DerivedField,
 }
 
+/// One projected field produced by an aggregate operator. Group identity is
+/// defined separately by the operator's `group_keys`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateOutput {
+    GroupKey(ColumnRef),
+    Aggregate(AggregateExpr),
+}
+
+impl AggregateOutput {
+    #[must_use]
+    pub fn output_field(&self) -> OutputField {
+        match self {
+            Self::GroupKey(column) => OutputField::Source(column.clone()),
+            Self::Aggregate(aggregate) => OutputField::Derived(aggregate.output.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Eq,
@@ -190,7 +208,8 @@ pub enum LogicalPlan {
     },
     Aggregate {
         input: Box<LogicalPlan>,
-        aggregates: Vec<AggregateExpr>,
+        group_keys: Vec<ColumnRef>,
+        outputs: Vec<AggregateOutput>,
     },
     Limit {
         input: Box<LogicalPlan>,
@@ -232,10 +251,9 @@ impl LogicalPlan {
             | Self::Project { columns, .. } => {
                 columns.iter().cloned().map(OutputField::Source).collect()
             }
-            Self::Aggregate { aggregates, .. } => aggregates
-                .iter()
-                .map(|aggregate| OutputField::Derived(aggregate.output.clone()))
-                .collect(),
+            Self::Aggregate { outputs, .. } => {
+                outputs.iter().map(AggregateOutput::output_field).collect()
+            }
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.output_fields()
             }

@@ -21,6 +21,7 @@ pub struct Query {
     pub from: FromItem,
     pub joins: Vec<Join>,
     pub selection: Option<Expr>,
+    pub group_by: Vec<ColumnName>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub span: Span,
@@ -212,6 +213,7 @@ enum TokenKind {
     Select,
     From,
     Where,
+    Group,
     Order,
     By,
     Asc,
@@ -388,6 +390,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "SELECT" => TokenKind::Select,
                     "FROM" => TokenKind::From,
                     "WHERE" => TokenKind::Where,
+                    "GROUP" => TokenKind::Group,
                     "ORDER" => TokenKind::Order,
                     "BY" => TokenKind::By,
                     "ASC" => TokenKind::Asc,
@@ -480,6 +483,11 @@ impl Parser {
         } else {
             None
         };
+        let group_by = if self.matches(&TokenKind::Group) {
+            self.parse_group_by()?
+        } else {
+            Vec::new()
+        };
         let order_by = if self.matches(&TokenKind::Order) {
             self.parse_order_by()?
         } else {
@@ -504,10 +512,22 @@ impl Parser {
             from,
             joins,
             selection,
+            group_by,
             order_by,
             limit,
             span: Span { start, end },
         })
+    }
+
+    fn parse_group_by(&mut self) -> Result<Vec<ColumnName>, ParseError> {
+        self.expect_simple(TokenKind::Group)?;
+        self.expect_simple(TokenKind::By)?;
+        let mut columns = vec![self.parse_column_name()?];
+        while self.matches(&TokenKind::Comma) {
+            self.position += 1;
+            columns.push(self.parse_column_name()?);
+        }
+        Ok(columns)
     }
 
     fn parse_order_by(&mut self) -> Result<Vec<OrderByItem>, ParseError> {
@@ -1280,6 +1300,47 @@ mod tests {
             "SELECT id FROM users LIMIT 1 ORDER BY id",
         ] {
             let error = parse(source).expect_err("invalid ORDER BY must fail");
+            assert!(error.span.start <= error.span.end, "{source}");
+            assert!(error.span.end <= source.len(), "{source}");
+        }
+    }
+
+    #[test]
+    fn parses_group_by_columns_in_select_clause_order() {
+        let query = parse(
+            "SELECT COUNT(*), u.team_id FROM users u WHERE u.active = true \
+             GROUP BY u.country, u.team_id ORDER BY u.team_id LIMIT 10",
+        )
+        .expect("GROUP BY query parses");
+        assert_eq!(query.group_by.len(), 2);
+        assert_eq!(query.group_by[0].name.name, "country");
+        assert_eq!(
+            query.group_by[0]
+                .qualifier
+                .as_ref()
+                .expect("qualified group key")
+                .name,
+            "u"
+        );
+        assert_eq!(query.group_by[1].name.name, "team_id");
+        assert_eq!(query.order_by.len(), 1);
+        assert_eq!(query.limit, Some(10));
+    }
+
+    #[test]
+    fn rejects_invalid_group_by_syntax_and_clause_order() {
+        for source in [
+            "SELECT id FROM users GROUP",
+            "SELECT id FROM users GROUP id",
+            "SELECT id FROM users GROUP BY",
+            "SELECT id FROM users GROUP BY ,",
+            "SELECT id FROM users GROUP BY id,",
+            "SELECT id FROM users GROUP BY 1",
+            "SELECT id FROM users GROUP BY id = 1",
+            "SELECT id FROM users ORDER BY id GROUP BY id",
+            "SELECT id FROM users LIMIT 1 GROUP BY id",
+        ] {
+            let error = parse(source).expect_err("invalid GROUP BY must fail");
             assert!(error.span.start <= error.span.end, "{source}");
             assert!(error.span.end <= source.len(), "{source}");
         }

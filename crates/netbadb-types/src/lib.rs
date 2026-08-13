@@ -105,7 +105,7 @@ pub struct ExprType {
     pub nullable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScalarValue {
     Bool(bool),
     Int64(i64),

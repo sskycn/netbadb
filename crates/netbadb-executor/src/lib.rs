@@ -1,13 +1,14 @@
 //! Synchronous execution of typed query and DML physical statements.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
 use netbadb_planner::{PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
-    AggregateExpr, AggregateFunction, AggregateInput, Assignment, BinaryOp, ColumnRef, Expr,
-    ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
+    AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
+    ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_storage::{HeapStorage, StorageError, Transaction};
 use netbadb_types::{RowId, ScalarValue, TableId};
@@ -328,9 +329,13 @@ fn execute_rows(
                 rows,
             })
         }
-        PhysicalPlan::Aggregate { input, aggregates } => {
+        PhysicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } => {
             let input = execute_rows(input, storages)?;
-            execute_aggregate(input, aggregates)
+            execute_aggregate(input, group_keys, outputs)
         }
         PhysicalPlan::Limit { input, limit } => {
             let mut result = execute_rows(input, storages)?;
@@ -440,11 +445,31 @@ enum AggregateState {
     Max(Option<ScalarValue>),
 }
 
+#[derive(Debug)]
+struct GroupState {
+    key_values: Vec<ScalarValue>,
+    aggregate_states: Vec<AggregateState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AggregateOutputPosition {
+    GroupKey(usize),
+    Aggregate(usize),
+}
+
 fn execute_aggregate(
     input: ExecutionRows,
-    aggregates: &[AggregateExpr],
+    group_keys: &[ColumnRef],
+    outputs: &[AggregateOutput],
 ) -> Result<ExecutionRows, ExecutionError> {
-    for aggregate in aggregates {
+    let aggregates = outputs
+        .iter()
+        .filter_map(|output| match output {
+            AggregateOutput::GroupKey(_) => None,
+            AggregateOutput::Aggregate(aggregate) => Some(aggregate),
+        })
+        .collect::<Vec<_>>();
+    for aggregate in &aggregates {
         if matches!(aggregate.input, AggregateInput::All)
             && aggregate.function != AggregateFunction::Count
         {
@@ -453,20 +478,73 @@ fn execute_aggregate(
             });
         }
     }
-    let positions = aggregates
+    let group_key_positions = group_keys
+        .iter()
+        .map(|column| find_source_position(&input.fields, column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let aggregate_positions = aggregates
         .iter()
         .map(|aggregate| match &aggregate.input {
             AggregateInput::All => Ok(None),
             AggregateInput::Column(column) => find_source_position(&input.fields, column).map(Some),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut states = aggregates
+    let mut aggregate_index = 0;
+    let output_positions = outputs
         .iter()
-        .map(initial_aggregate_state)
+        .map(|output| match output {
+            AggregateOutput::GroupKey(column) => group_keys
+                .iter()
+                .position(|group_key| same_source_column(group_key, column))
+                .map(AggregateOutputPosition::GroupKey)
+                .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone())),
+            AggregateOutput::Aggregate(_) => {
+                let position = AggregateOutputPosition::Aggregate(aggregate_index);
+                aggregate_index += 1;
+                Ok(position)
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let mut group_lookup = HashMap::<Vec<ScalarValue>, usize>::new();
+    let mut groups = Vec::<GroupState>::new();
+    if group_keys.is_empty() {
+        groups.push(new_group_state(Vec::new(), &aggregates)?);
+        group_lookup.insert(Vec::new(), 0);
+    }
+
     for row in &input.rows {
-        for ((aggregate, position), state) in aggregates.iter().zip(&positions).zip(&mut states) {
+        let key_values = group_key_positions
+            .iter()
+            .zip(group_keys)
+            .map(|(position, column)| {
+                let value = row
+                    .values
+                    .get(*position)
+                    .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+                if !value.matches_type(&column.data_type) {
+                    return Err(ExecutionError::TypeMismatch);
+                }
+                Ok(value.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let group_index = match group_lookup.get(&key_values).copied() {
+            Some(index) => index,
+            None => {
+                let index = groups.len();
+                groups.push(new_group_state(key_values.clone(), &aggregates)?);
+                group_lookup.insert(key_values, index);
+                index
+            }
+        };
+        let group = groups
+            .get_mut(group_index)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        for ((aggregate, position), state) in aggregates
+            .iter()
+            .zip(&aggregate_positions)
+            .zip(&mut group.aggregate_states)
+        {
             let value = match position {
                 Some(position) => {
                     let value = row.values.get(*position).ok_or_else(|| {
@@ -490,17 +568,55 @@ fn execute_aggregate(
         }
     }
 
-    let values = states.into_iter().map(finalize_aggregate_state).collect();
+    let rows = groups
+        .into_iter()
+        .map(|group| {
+            let aggregate_values = group
+                .aggregate_states
+                .into_iter()
+                .map(finalize_aggregate_state)
+                .collect::<Vec<_>>();
+            let values = output_positions
+                .iter()
+                .map(|position| match position {
+                    AggregateOutputPosition::GroupKey(position) => group
+                        .key_values
+                        .get(*position)
+                        .cloned()
+                        .ok_or(ExecutionError::TypeMismatch),
+                    AggregateOutputPosition::Aggregate(position) => aggregate_values
+                        .get(*position)
+                        .cloned()
+                        .ok_or(ExecutionError::TypeMismatch),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ExecutionRow {
+                row_id: None,
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
     Ok(ExecutionRows {
-        fields: aggregates
-            .iter()
-            .map(|aggregate| OutputField::Derived(aggregate.output.clone()))
-            .collect(),
-        rows: vec![ExecutionRow {
-            row_id: None,
-            values,
-        }],
+        fields: outputs.iter().map(AggregateOutput::output_field).collect(),
+        rows,
     })
+}
+
+fn new_group_state(
+    key_values: Vec<ScalarValue>,
+    aggregates: &[&AggregateExpr],
+) -> Result<GroupState, ExecutionError> {
+    Ok(GroupState {
+        key_values,
+        aggregate_states: aggregates
+            .iter()
+            .map(|aggregate| initial_aggregate_state(aggregate))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn same_source_column(left: &ColumnRef, right: &ColumnRef) -> bool {
+    left.binding_id == right.binding_id && left.column_id == right.column_id
 }
 
 fn initial_aggregate_state(aggregate: &AggregateExpr) -> Result<AggregateState, ExecutionError> {
@@ -799,8 +915,8 @@ mod tests {
     use super::{ExecutionError, QueryResult, TruthValue, evaluate_binary, execute};
     use netbadb_planner::plan;
     use netbadb_rel::{
-        AggregateExpr, AggregateFunction, AggregateInput, BinaryOp, ColumnRef, DerivedField, Expr,
-        ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
+        AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
+        DerivedField, Expr, ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
@@ -1110,6 +1226,118 @@ mod tests {
     }
 
     #[test]
+    fn grouped_aggregate_keeps_nulls_and_first_seen_output_order() {
+        let table = TableDef::new(
+            TableId(4),
+            "grouped",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "team_id",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "score",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+            ],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-executor-grouped-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut storage = HeapStorage::create(&path, table).expect("create grouped heap");
+        for row in [
+            vec![ScalarValue::Int64(20), ScalarValue::Int64(1)],
+            vec![ScalarValue::Int64(10), ScalarValue::Int64(2)],
+            vec![ScalarValue::Int64(20), ScalarValue::Null],
+            vec![ScalarValue::Null, ScalarValue::Int64(4)],
+            vec![ScalarValue::Null, ScalarValue::Null],
+        ] {
+            storage.insert(&row).expect("insert grouped row");
+        }
+        let column = |id: u32, name: &str, nullable| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(4),
+            column_id: ColumnId(id),
+            relation_name: "grouped".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(PhysicalType::Int64),
+            nullable,
+        };
+        let team_id = column(1, "team_id", true);
+        let score = column(2, "score", true);
+        let count = AggregateExpr {
+            function: AggregateFunction::Count,
+            input: AggregateInput::All,
+            output: DerivedField {
+                name: "COUNT(*)".into(),
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            },
+        };
+        let sum = AggregateExpr {
+            function: AggregateFunction::Sum,
+            input: AggregateInput::Column(score),
+            output: DerivedField {
+                name: "SUM(score)".into(),
+                data_type: SemanticType::physical(PhysicalType::Int64),
+                nullable: true,
+            },
+        };
+        let logical = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(4),
+                table_name: "grouped".into(),
+                columns: vec![team_id.clone(), column(2, "score", true)],
+            }),
+            group_keys: vec![team_id.clone()],
+            outputs: vec![
+                AggregateOutput::Aggregate(count),
+                AggregateOutput::GroupKey(team_id),
+                AggregateOutput::Aggregate(sum),
+            ],
+        };
+        let result = execute(&plan(&logical), &mut storage).expect("execute grouped aggregate");
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["COUNT(*)", "team_id", "SUM(score)"]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    ScalarValue::UInt64(2),
+                    ScalarValue::Int64(20),
+                    ScalarValue::Int64(1)
+                ],
+                vec![
+                    ScalarValue::UInt64(1),
+                    ScalarValue::Int64(10),
+                    ScalarValue::Int64(2)
+                ],
+                vec![
+                    ScalarValue::UInt64(2),
+                    ScalarValue::Null,
+                    ScalarValue::Int64(4)
+                ],
+            ]
+        );
+        storage.close().expect("close grouped heap");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
     fn global_aggregate_reports_checked_numeric_overflow_and_runtime_mismatch() {
         let table = TableDef::new(
             TableId(3),
@@ -1125,6 +1353,11 @@ mod tests {
                     "unsigned",
                     TypeSpec::Physical(PhysicalType::UInt64),
                 ),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "group_key",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
             ],
         );
         let path = std::env::temp_dir().join(format!(
@@ -1134,10 +1367,18 @@ mod tests {
         ));
         let mut storage = HeapStorage::create(&path, table).expect("create heap");
         storage
-            .insert(&[ScalarValue::Int64(i64::MAX), ScalarValue::UInt64(u64::MAX)])
+            .insert(&[
+                ScalarValue::Int64(i64::MAX),
+                ScalarValue::UInt64(u64::MAX),
+                ScalarValue::Bool(true),
+            ])
             .expect("insert max values");
         storage
-            .insert(&[ScalarValue::Int64(1), ScalarValue::UInt64(1)])
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::UInt64(1),
+                ScalarValue::Bool(true),
+            ])
             .expect("insert overflow values");
         let column = |id: u32, name: &str, physical| ColumnRef {
             binding_id: RelationBindingId(0),
@@ -1150,15 +1391,17 @@ mod tests {
         };
         let signed = column(1, "signed", PhysicalType::Int64);
         let unsigned = column(2, "unsigned", PhysicalType::UInt64);
+        let group_key = column(3, "group_key", PhysicalType::Bool);
         let scan = || LogicalPlan::Scan {
             binding_id: RelationBindingId(0),
             table_id: TableId(3),
             table_name: "numbers".into(),
-            columns: vec![signed.clone(), unsigned.clone()],
+            columns: vec![signed.clone(), unsigned.clone(), group_key.clone()],
         };
         let sum = |input: ColumnRef, physical, name: &str| LogicalPlan::Aggregate {
             input: Box::new(scan()),
-            aggregates: vec![AggregateExpr {
+            group_keys: Vec::new(),
+            outputs: vec![AggregateOutput::Aggregate(AggregateExpr {
                 function: AggregateFunction::Sum,
                 input: AggregateInput::Column(input),
                 output: DerivedField {
@@ -1166,7 +1409,7 @@ mod tests {
                     data_type: SemanticType::physical(physical),
                     nullable: true,
                 },
-            }],
+            })],
         };
         assert!(matches!(
             execute(
@@ -1210,7 +1453,8 @@ mod tests {
         ] {
             let invalid = LogicalPlan::Aggregate {
                 input: Box::new(scan()),
-                aggregates: vec![AggregateExpr {
+                group_keys: Vec::new(),
+                outputs: vec![AggregateOutput::Aggregate(AggregateExpr {
                     function,
                     input: AggregateInput::All,
                     output: DerivedField {
@@ -1218,7 +1462,7 @@ mod tests {
                         data_type: SemanticType::physical(PhysicalType::Int64),
                         nullable: true,
                     },
-                }],
+                })],
             };
             assert!(matches!(
                 execute(&plan(&invalid), &mut storage),
@@ -1227,6 +1471,39 @@ mod tests {
                 }) if actual == function
             ));
         }
+
+        let grouped_overflow = LogicalPlan::Aggregate {
+            input: Box::new(scan()),
+            group_keys: vec![group_key.clone()],
+            outputs: vec![AggregateOutput::Aggregate(AggregateExpr {
+                function: AggregateFunction::Sum,
+                input: AggregateInput::Column(signed.clone()),
+                output: DerivedField {
+                    name: "SUM(signed)".into(),
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: true,
+                },
+            })],
+        };
+        assert!(matches!(
+            execute(&plan(&grouped_overflow), &mut storage),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Sum,
+                ..
+            })
+        ));
+
+        let mut mismatched_group_key = unsigned.clone();
+        mismatched_group_key.data_type = SemanticType::physical(PhysicalType::Int64);
+        let invalid_group_key = LogicalPlan::Aggregate {
+            input: Box::new(scan()),
+            group_keys: vec![mismatched_group_key.clone()],
+            outputs: vec![AggregateOutput::GroupKey(mismatched_group_key)],
+        };
+        assert!(matches!(
+            execute(&plan(&invalid_group_key), &mut storage),
+            Err(ExecutionError::TypeMismatch)
+        ));
         storage.close().expect("close storage");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));

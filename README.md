@@ -40,13 +40,13 @@ The current embedded path is synchronous:
 ```text
 Rust Schema API
     ↓
-SELECT / JOIN / ORDER BY / global aggregate + typed DML parser
+SELECT / JOIN / ORDER BY / GROUP BY + typed DML parser
     ↓
 Typed HIR
     ↓
 Logical query / DML statement plan
     ↓
-Scan + nested-loop join + sort + global aggregate physical plan
+Scan + nested-loop join + sort + grouped aggregate physical plan
     ↓
 Join / filter / sort / aggregate / projection / limit + mutation executor
     ↓
@@ -137,8 +137,8 @@ The current code genuinely supports:
   semantic type metadata, unified validation, and stable schema fingerprints;
 - parser support for `SELECT`, qualified columns, `AS` and shorthand table
   aliases, chained `JOIN`/`INNER JOIN ... ON`, explicit-column single-row `INSERT`, `UPDATE`,
-  `DELETE`, optional DML `WHERE`, multi-key source-column `ORDER BY`, contextual
-  `COUNT`/`SUM`/`MIN`/`MAX`, `LIMIT`, wildcard projection,
+  `DELETE`, optional DML `WHERE`, source-column `GROUP BY`, multi-key
+  source-column `ORDER BY`, contextual `COUNT`/`SUM`/`MIN`/`MAX`, `LIMIT`, wildcard projection,
   `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
   boolean/NULL literals, and parentheses;
 - name resolution and expression type checking with nominal semantic types and
@@ -163,7 +163,7 @@ The current code genuinely supports:
 - RowId-based insert, update, delete, scan, file reopen, row encoding, and row
   decoding;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
-  global aggregates, projection, limit, typed DML, affected-row results, SQL
+  global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
@@ -321,7 +321,7 @@ in-memory lexicographic sort. Stability makes ties repeatable for the current
 input order, but it is not a permanent ordering guarantee across future plan
 changes; callers that need a total order must include sufficient keys.
 
-Global aggregates accept `COUNT(*)` or source-column arguments to `COUNT`,
+Aggregates accept `COUNT(*)` or source-column arguments to `COUNT`,
 `SUM`, `MIN`, and `MAX`. Aggregate names are contextual in projection, so a
 plain column named `count`, `sum`, `min`, or `max` remains selectable. The
 aggregate plan is `Scan/Join -> Filter -> Aggregate -> Limit`, and one input
@@ -332,11 +332,21 @@ and strips nominal meaning from its result. `MIN`/`MAX` support all current
 ordered physical types, ignore NULL, return NULL for empty/all-NULL input, and
 preserve the input `SemanticType`.
 
-Aggregate outputs are derived typed fields, not synthetic catalog columns, so
-they have no fabricated table, binding, or column IDs. Until `GROUP BY` and
-aggregate-aware ordering exist, aggregate projections cannot mix source
-columns and reject `ORDER BY`. Aliases, `DISTINCT`, aggregate expressions, and
-nested aggregates are also outside this slice.
+`GROUP BY` accepts one or more qualified or unqualified source columns. Every
+projected source column must be a group key, while keys may remain hidden from
+the result; GROUP BY without aggregates produces one row per distinct key.
+Logical and physical Aggregate operators keep `group_keys` separate from their
+ordered outputs, so interleaved source and derived fields preserve SELECT
+order without synthetic IDs. Grouping is in memory: a hash map finds group
+indexes and an insertion-ordered vector makes the current implementation
+deterministic. NULL keys share one group, unlike expression `NULL = NULL`,
+which remains UNKNOWN. Empty global input has one implicit group, while empty
+input with explicit keys has no groups. LIMIT applies after grouping.
+
+Grouped queries currently reject `ORDER BY`; SQL without ORDER BY makes no row
+order guarantee despite the executor's first-seen implementation order.
+HAVING, aliases, `DISTINCT`, GROUP BY expressions, aggregate expressions,
+nested aggregates, grouping sets, rollup, and cube remain unsupported.
 
 ## Go and protocol strategy
 
@@ -404,8 +414,8 @@ The implementation sequence is intentionally vertical:
    self joins, nested-loop execution, and NULL-aware join predicates. Complete.
 10. Data-page integrity — Page v4 CRC32C bound to PageId, recovery-safe pageLSN
     validation, checkpoint-baseline corruption detection, and page fuzzing.
-11. Aggregate + Sort (Phase 3D) — typed source-column `ORDER BY` and global
-    `COUNT`/`SUM`/`MIN`/`MAX` are complete; `GROUP BY` remains.
+11. Aggregate + Sort (Phase 3D) — typed source-column `ORDER BY`, global
+    aggregates, and in-memory `GROUP BY`/grouped aggregates are complete.
 12. Indexing — B+Tree and planner access-path selection.
 13. Server mode — protocol, sessions, and `netbadbd`.
 14. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
