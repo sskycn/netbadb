@@ -11,8 +11,8 @@ pub const PAGE_SIZE: usize = 4 * 1024;
 /// Magic for versioned database pages. The explicit version field remains
 /// separate so a decoder never has to infer layout from a magic string.
 pub const PAGE_MAGIC: &[u8; 4] = b"NBP1";
-pub const PAGE_FORMAT_VERSION: u16 = 3;
-pub const PAGE_HEADER_SIZE: usize = 24;
+pub const PAGE_FORMAT_VERSION: u16 = 4;
+pub const PAGE_HEADER_SIZE: usize = 28;
 pub const SLOT_SIZE: usize = 4;
 
 const FILE_MAGIC: &[u8; 4] = b"NBPG";
@@ -22,6 +22,8 @@ const SLOT_COUNT_OFFSET: usize = 8;
 const FREE_START_OFFSET: usize = 10;
 const FREE_END_OFFSET: usize = 12;
 const PAGE_LSN_OFFSET: usize = 16;
+const CHECKSUM_OFFSET: usize = 24;
+const CHECKSUM_END: usize = CHECKSUM_OFFSET + 4;
 const DELETED_SLOT_OFFSET: u16 = 0;
 const DELETED_SLOT_LENGTH: u16 = u16::MAX;
 
@@ -113,6 +115,7 @@ impl Page {
         page.write_u16(SLOT_COUNT_OFFSET, 0);
         page.write_u16(FREE_START_OFFSET, PAGE_HEADER_SIZE as u16);
         page.write_u16(FREE_END_OFFSET, PAGE_SIZE as u16);
+        page.refresh_checksum();
         page
     }
 
@@ -137,6 +140,7 @@ impl Page {
 
     pub(crate) fn set_page_lsn(&mut self, lsn: Lsn) {
         self.bytes[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8].copy_from_slice(&lsn.0.to_le_bytes());
+        self.refresh_checksum();
     }
 
     pub fn header(&self) -> Result<PageHeader, StorageError> {
@@ -147,6 +151,7 @@ impl Page {
         if version != PAGE_FORMAT_VERSION {
             return Err(PageError::UnsupportedVersion(version).into());
         }
+        self.verify_checksum()?;
         if self.bytes[RESERVED_OFFSET] != 0 {
             return Err(PageError::InvalidReservedByte(self.bytes[RESERVED_OFFSET]).into());
         }
@@ -354,6 +359,7 @@ impl Page {
         self.write_u16(SLOT_COUNT_OFFSET, header.slot_count + 1);
         self.write_u16(FREE_START_OFFSET, new_free_start as u16);
         self.write_u16(FREE_END_OFFSET, new_free_end as u16);
+        self.refresh_checksum();
         Ok(slot)
     }
 
@@ -475,6 +481,7 @@ impl Page {
             }
         }
         rebuilt.write_u16(FREE_END_OFFSET, free_end as u16);
+        rebuilt.refresh_checksum();
         rebuilt.header()?;
         *self = rebuilt;
         Ok(())
@@ -507,6 +514,37 @@ impl Page {
 
     fn write_u16(&mut self, offset: usize, value: u16) {
         self.bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+        ])
+    }
+
+    fn computed_checksum(&self) -> u32 {
+        let mut checksum = crc32c::crc32c(&self.id.0.to_le_bytes());
+        checksum = crc32c::crc32c_append(checksum, &self.bytes[..CHECKSUM_OFFSET]);
+        checksum = crc32c::crc32c_append(checksum, &[0; CHECKSUM_END - CHECKSUM_OFFSET]);
+        crc32c::crc32c_append(checksum, &self.bytes[CHECKSUM_END..])
+    }
+
+    fn verify_checksum(&self) -> Result<(), PageError> {
+        let stored = self.read_u32(CHECKSUM_OFFSET);
+        let computed = self.computed_checksum();
+        if stored != computed {
+            return Err(PageError::ChecksumMismatch { stored, computed });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_checksum(&mut self) {
+        self.bytes[CHECKSUM_OFFSET..CHECKSUM_END].fill(0);
+        let checksum = self.computed_checksum();
+        self.bytes[CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
     }
 }
 
@@ -742,6 +780,71 @@ mod tests {
             version_two.header(),
             Err(StorageError::Page(PageError::UnsupportedVersion(2)))
         ));
+        let mut version_three = Page::new(PageId(4), PageType::Heap);
+        version_three.bytes_mut()[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(matches!(
+            version_three.header(),
+            Err(StorageError::Page(PageError::UnsupportedVersion(3)))
+        ));
+    }
+
+    #[test]
+    fn page_v4_checksum_has_a_stable_golden_value_and_binds_page_id() {
+        let mut page = Page::new(PageId(7), PageType::Heap);
+        page.insert_record(b"checksum-golden")
+            .expect("insert golden payload");
+        page.set_page_lsn(Lsn(123));
+        let checksum = u32::from_le_bytes(
+            page.bytes()[super::CHECKSUM_OFFSET..super::CHECKSUM_END]
+                .try_into()
+                .expect("checksum field"),
+        );
+        assert_eq!(checksum, 0x1cb3_695a);
+        page.header().expect("new page checksum is valid");
+
+        let wrong_id = Page::from_bytes(PageId(8), *page.bytes());
+        assert!(matches!(
+            wrong_id.header(),
+            Err(StorageError::Page(PageError::ChecksumMismatch { .. }))
+        ));
+    }
+
+    #[test]
+    fn checksum_detects_payload_header_and_checksum_corruption() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let slot = page.insert_record(b"checksum payload").expect("insert");
+        let payload_offset = usize::from(page.slot(slot).expect("slot").offset);
+
+        for offset in [
+            payload_offset,
+            100,
+            super::SLOT_COUNT_OFFSET,
+            super::FREE_START_OFFSET,
+            super::FREE_END_OFFSET,
+            super::PAGE_LSN_OFFSET,
+            super::CHECKSUM_OFFSET,
+        ] {
+            let mut corrupted = page.clone();
+            corrupted.bytes_mut()[offset] ^= 0x80;
+            assert!(matches!(
+                corrupted.header(),
+                Err(StorageError::Page(PageError::ChecksumMismatch { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_page_is_only_an_allocation_sentinel() {
+        let zero = Page::zero(PageId(9));
+        assert!(zero.bytes().iter().all(|byte| *byte == 0));
+        assert!(matches!(
+            zero.header(),
+            Err(StorageError::Page(PageError::InvalidMagic))
+        ));
+        assert!(matches!(
+            super::validate_before_image(PageId(9), zero.bytes()),
+            Ok(super::ValidatedBeforeImage::NewPage)
+        ));
     }
 
     #[test]
@@ -847,16 +950,20 @@ mod tests {
         let mut page = Page::new(PageId(1), PageType::Heap);
         let capacity = PAGE_SIZE - super::PAGE_HEADER_SIZE - SLOT_SIZE;
         page.insert_record(&vec![7; capacity]).expect("record fits");
+        let full = page.clone();
         assert!(matches!(
             page.insert_record(b"next"),
             Err(StorageError::Page(PageError::PageFull { .. }))
         ));
+        assert_eq!(page, full);
 
         let mut empty = Page::new(PageId(2), PageType::Heap);
+        let before = empty.clone();
         assert!(matches!(
             empty.insert_record(&vec![0; capacity + 1]),
             Err(StorageError::Page(PageError::RecordTooLarge { .. }))
         ));
+        assert_eq!(empty, before);
     }
 
     #[test]
@@ -870,13 +977,31 @@ mod tests {
 
         let mut unknown_type = Page::new(PageId(2), PageType::Heap);
         unknown_type.bytes_mut()[6] = 99;
+        unknown_type.refresh_checksum();
         assert!(matches!(
             unknown_type.header(),
             Err(StorageError::Page(PageError::UnknownPageType(99)))
         ));
 
+        let mut invalid_reserved = Page::new(PageId(20), PageType::Heap);
+        invalid_reserved.bytes_mut()[7] = 1;
+        invalid_reserved.refresh_checksum();
+        assert!(matches!(
+            invalid_reserved.header(),
+            Err(StorageError::Page(PageError::InvalidReservedByte(1)))
+        ));
+
+        let mut invalid_slot_count = Page::new(PageId(21), PageType::Heap);
+        invalid_slot_count.bytes_mut()[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        invalid_slot_count.refresh_checksum();
+        assert!(matches!(
+            invalid_slot_count.header(),
+            Err(StorageError::Page(PageError::InvalidSlotCount(u16::MAX)))
+        ));
+
         let mut invalid_directory = Page::new(PageId(3), PageType::Heap);
         invalid_directory.bytes_mut()[10..12].copy_from_slice(&17_u16.to_le_bytes());
+        invalid_directory.refresh_checksum();
         assert!(matches!(
             invalid_directory.header(),
             Err(StorageError::Page(
@@ -889,6 +1014,7 @@ mod tests {
             .copy_from_slice(&(super::PAGE_HEADER_SIZE as u16).to_le_bytes());
         invalid_free_space.bytes_mut()[12..14]
             .copy_from_slice(&((super::PAGE_HEADER_SIZE - 1) as u16).to_le_bytes());
+        invalid_free_space.refresh_checksum();
         assert!(matches!(
             invalid_free_space.header(),
             Err(StorageError::Page(PageError::InvalidFreeSpace { .. }))
@@ -900,6 +1026,7 @@ mod tests {
             .copy_from_slice(&1_u16.to_le_bytes());
         invalid_slot.bytes_mut()[super::PAGE_HEADER_SIZE + 2..super::PAGE_HEADER_SIZE + 4]
             .copy_from_slice(&(u16::MAX - 1).to_le_bytes());
+        invalid_slot.refresh_checksum();
         assert!(matches!(
             invalid_slot.header(),
             Err(StorageError::Page(PageError::RecordOutOfBounds { .. }))
@@ -911,11 +1038,46 @@ mod tests {
             .expect("insert record");
         invalid_deleted.bytes_mut()[super::PAGE_HEADER_SIZE..super::PAGE_HEADER_SIZE + 2]
             .copy_from_slice(&0_u16.to_le_bytes());
+        invalid_deleted.refresh_checksum();
         assert!(matches!(
             invalid_deleted.header(),
             Err(StorageError::Page(
                 PageError::InvalidDeletedSlotEncoding { .. }
             ))
+        ));
+
+        let mut overlaps_free = Page::new(PageId(22), PageType::Heap);
+        let slot = overlaps_free
+            .insert_record(b"record")
+            .expect("insert record");
+        let record_offset = overlaps_free.slot(slot).expect("slot").offset;
+        overlaps_free.bytes_mut()[12..14].copy_from_slice(&(record_offset + 1).to_le_bytes());
+        overlaps_free.refresh_checksum();
+        assert!(matches!(
+            overlaps_free.header(),
+            Err(StorageError::Page(
+                PageError::RecordOverlapsFreeSpace { .. }
+            ))
+        ));
+
+        let mut overlapping_records = Page::new(PageId(23), PageType::Heap);
+        let first = overlapping_records
+            .insert_record(b"first")
+            .expect("insert first");
+        let second = overlapping_records
+            .insert_record(b"other")
+            .expect("insert second");
+        let first_offset = overlapping_records.slot(first).expect("first slot").offset;
+        let second_entry = super::PAGE_HEADER_SIZE + usize::from(second.0) * super::SLOT_SIZE;
+        overlapping_records.bytes_mut()[second_entry..second_entry + 2]
+            .copy_from_slice(&first_offset.to_le_bytes());
+        overlapping_records.refresh_checksum();
+        assert!(matches!(
+            overlapping_records.header(),
+            Err(StorageError::Page(PageError::OverlappingRecords {
+                first: SlotId(0),
+                second: SlotId(1),
+            }))
         ));
     }
 

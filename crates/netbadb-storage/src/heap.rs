@@ -1329,6 +1329,7 @@ mod tests {
         let mut page = pages.read_page(PageId(1)).expect("read data page");
         let slot = page.slot(SlotId(0)).expect("read row slot");
         page.bytes_mut()[usize::from(slot.offset)] = 99;
+        page.refresh_checksum();
         pages.write_page(&page).expect("write corrupt row");
         pages.sync().expect("sync corrupt row");
         drop(pages);
@@ -1354,6 +1355,7 @@ mod tests {
         let mut page = pages.read_page(PageId(1)).expect("read data page");
         page.bytes_mut()[crate::PAGE_HEADER_SIZE + 2..crate::PAGE_HEADER_SIZE + 4]
             .copy_from_slice(&(u16::MAX - 1).to_le_bytes());
+        page.refresh_checksum();
         pages.write_page(&page).expect("write corrupt slot");
         pages.sync().expect("sync corrupt slot");
         drop(pages);
@@ -1362,6 +1364,69 @@ mod tests {
             HeapStorage::open(&path, table()),
             Err(StorageError::Page(
                 crate::PageError::RecordOutOfBounds { .. }
+            ))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn corruption_after_checkpoint_is_detected_on_later_page_access() {
+        let path = test_path("heap-checkpoint-page-corruption");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("checkpointed".into()),
+            ])
+            .expect("insert row");
+        storage.checkpoint().expect("checkpoint heap");
+        assert!(storage.wal_records().expect("scan recycled WAL").is_empty());
+        storage.close().expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut page = pages.read_page(PageId(1)).expect("read data page");
+        let slot = page.slot(SlotId(0)).expect("read row slot");
+        page.bytes_mut()[usize::from(slot.offset)] ^= 0x40;
+        pages.write_page(&page).expect("write corrupt page");
+        pages.sync().expect("sync corrupt page");
+        drop(pages);
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("open without WAL page read");
+        assert!(matches!(
+            reopened.scan(),
+            Err(StorageError::Page(
+                crate::PageError::ChecksumMismatch { .. }
+            ))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_hard_fails_before_trusting_a_corrupt_pages_lsn() {
+        let path = test_path("heap-recovery-page-corruption");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("durable winner".into()),
+            ])
+            .expect("insert committed row");
+        storage.flush().expect("flush WAL and data page");
+        storage.simulate_crash();
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut page = pages.read_page(PageId(1)).expect("read data page");
+        assert!(page.page_lsn().expect("valid high pageLSN").is_some());
+        let slot = page.slot(SlotId(0)).expect("read row slot");
+        page.bytes_mut()[usize::from(slot.offset)] ^= 0x20;
+        pages.write_page(&page).expect("write corrupt page");
+        pages.sync().expect("sync corrupt page");
+        drop(pages);
+
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Page(
+                crate::PageError::ChecksumMismatch { .. }
             ))
         ));
         cleanup(&path);

@@ -33,6 +33,10 @@ use netbadb_types::{PageId, PhysicalType, SlotId, TableId};
 pub enum PageError {
     InvalidMagic,
     UnsupportedVersion(u16),
+    ChecksumMismatch {
+        stored: u32,
+        computed: u32,
+    },
     UnknownPageType(u8),
     InvalidReservedByte(u8),
     InvalidSlotCount(u16),
@@ -95,6 +99,10 @@ impl fmt::Display for PageError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported page format version {version}")
             }
+            Self::ChecksumMismatch { stored, computed } => write!(
+                formatter,
+                "page checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"
+            ),
             Self::UnknownPageType(tag) => write!(formatter, "unknown page type tag {tag}"),
             Self::InvalidReservedByte(value) => {
                 write!(formatter, "page reserved byte must be zero, found {value}")

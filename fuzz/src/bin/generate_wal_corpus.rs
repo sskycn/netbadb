@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_storage::{HeapStorage, WalManager, WalRecordKind, wal_path};
-use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId, TxnId};
+use netbadb_storage::{HeapStorage, Page, PageType, WalManager, WalRecordKind, wal_path};
+use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId, TxnId};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::env::args_os().nth(1).map_or_else(
@@ -34,6 +34,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set_len(truncated_len)?;
         Ok(())
     })?;
+    write_page_decode_seed(&output)?;
+    Ok(())
+}
+
+fn write_page_decode_seed(wal_output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = wal_output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("page_decode");
+    std::fs::create_dir_all(&output)?;
+    let mut page = Page::new(PageId(7), PageType::Heap);
+    page.insert_record(b"page-v4-fuzz-seed")?;
+    std::fs::write(output.join("valid-page-v4"), page.bytes())?;
     Ok(())
 }
 

@@ -118,7 +118,29 @@ loss without Rust destructors, not machine or storage-device power loss.
   decoder.
 
 WAL v2 and record v1 remain unsupported experimental formats. Heap metadata
-remains v2, data pages remain v3, and canonical schema encoding remains v1.
+remains v2 and canonical schema encoding remains v1.
+
+## Data-page integrity hardening (complete)
+
+- page format v4 expands the header from 24 to 28 bytes while preserving every
+  existing semantic field offset through pageLSN;
+- bytes 24..28 store a little-endian CRC32C over the expected little-endian
+  PageId plus the complete 4096-byte page, with the checksum field zeroed;
+- every successful semantic page mutation refreshes integrity, while failed
+  mutations remain byte-for-byte unchanged and the all-zero new-page
+  before-image remains a non-page WAL sentinel;
+- recovery validates checksum before trusting a current pageLSN and reports a
+  typed hard error rather than attempting repair from potentially recycled WAL;
+- deterministic payload/header/PageId, post-checkpoint, retained-WAL, semantic
+  corruption, rollback, and crash tests are complemented by a bounded public
+  Page decoder fuzz target.
+
+Page versions 1 through 3 remain unsupported experimental formats. Page 0
+retains heap metadata v2 and is outside Page v4 checksum coverage. WAL v3,
+record v2, heap metadata v2, and canonical schema v1 are unchanged. Page CRC
+detects persistent data-page corruption independently of WAL CRC after log
+recycling; neither checksum repairs corruption nor authenticates malicious
+changes.
 
 ## Phase 3A — Typed Expressions + NULL Semantics (complete)
 

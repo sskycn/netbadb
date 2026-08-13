@@ -450,7 +450,7 @@ mod tests {
 
     use super::BufferPool;
     use crate::{Page, PageManager, PageType, StorageError, WalManager, WalRecordKind};
-    use netbadb_types::{PageId, TxnId};
+    use netbadb_types::{PageId, SlotId, TxnId};
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-{name}-{}", std::process::id()))
@@ -524,12 +524,21 @@ mod tests {
 
         {
             let mut page_a = pool.write_page(PageId(1)).expect("write page A");
-            page_a.page_mut().bytes_mut()[100] = 77;
+            page_a
+                .page_mut()
+                .insert_record(b"dirty")
+                .expect("mutate page A");
         }
         let page_b = pool.read_page(PageId(2)).expect("evict page A for B");
         drop(page_b);
         let page_a_again = pool.read_page(PageId(1)).expect("reload dirty page A");
-        assert_eq!(page_a_again.page().bytes()[100], 77);
+        assert_eq!(
+            page_a_again
+                .page()
+                .read_record(SlotId(0))
+                .expect("read dirty record"),
+            b"dirty"
+        );
         drop(page_a_again);
         pool.flush_all().expect("flush pool");
         let _ = std::fs::remove_file(path);
@@ -559,7 +568,9 @@ mod tests {
         let manager = prepared_manager(&path);
         let pool = BufferPool::new(manager, 1).expect("create buffer pool");
         let mut page = pool.write_page(PageId(1)).expect("write page");
-        page.page_mut().bytes_mut()[100] = 91;
+        page.page_mut()
+            .insert_record(b"flushed")
+            .expect("mutate page");
 
         assert!(matches!(
             pool.flush_all(),
@@ -574,8 +585,12 @@ mod tests {
 
         let mut reopened = PageManager::open(&path).expect("reopen page file");
         assert_eq!(
-            reopened.read_page(PageId(1)).expect("read page").bytes()[100],
-            91
+            reopened
+                .read_page(PageId(1))
+                .expect("read page")
+                .read_record(SlotId(0))
+                .expect("read flushed record"),
+            b"flushed"
         );
         let _ = std::fs::remove_file(path);
     }

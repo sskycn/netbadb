@@ -232,10 +232,10 @@ Database file
   operations. Before writing a dirty data page it makes the WAL durable
   through that page's pageLSN. The data-page write is not attempted if the WAL
   flush fails.
-- `Page` validates a versioned page header and explicit page type before
-  exposing slotted-page operations. Heap pages use a slot directory at the
-  front, free space in the middle, and tuple bytes packed from the end of the
-  page backward.
+- `Page` validates a versioned page header, PageId-bound checksum, and explicit
+  page type before exposing slotted-page operations. Heap pages use a slot
+  directory at the front, free space in the middle, and tuple bytes packed
+  from the end of the page backward.
 - `TransactionManager` allocates strong `TxnId` values, appends `Begin`, and
   owns the per-open-database writer/health state. A transaction tracks
   `Active`, `CommitPending`, `RollbackPending`, `Committed`, or `RolledBack`
@@ -267,11 +267,12 @@ mismatch are distinct typed storage errors. Heap metadata version 1 is rejected
 without migration; the file format remains experimental and may change again
 between versions.
 
-Data pages use the following version 3 little-endian layout:
+Page 0 is legacy container/heap metadata and is not interpreted as a Page v4
+data page. Data pages use the following version 4 little-endian layout:
 
 ```text
 0..4    NBP1 page magic
-4..6    u16 page format version (3)
+4..6    u16 page format version (4)
 6       u8 page type (2 heap; tag 1 remains reserved)
 7       reserved byte (zero)
 8..10   u16 slot count
@@ -279,10 +280,21 @@ Data pages use the following version 3 little-endian layout:
 12..14  u16 free-space upper bound
 14..16  reserved bytes (zero)
 16..24  u64 pageLSN (zero means no WAL record)
-24..    slot entries: u16 tuple offset + u16 tuple length
+24..28  u32 CRC32C (little-endian)
+28..    slot entries: u16 tuple offset + u16 tuple length
 ...     free space
 ...     tuple bytes, allocated from PAGE_SIZE backward
 ```
+
+The Page v4 checksum is `CRC32C(page_id_le_u64 || complete_page_image)`, with
+bytes 24..28 of the page image treated as zero. It covers all 4096 bytes,
+including the header, pageLSN, slot directory, free/unused bytes, tombstones,
+and tuple payload. Binding the expected logical PageId also detects a valid
+page block read from the wrong physical page position. Magic and version are
+checked before CRC32C so an old page reports its explicit unsupported version;
+checksum verification then precedes all remaining semantic validation. The
+all-zero new-page before-image remains a WAL sentinel, not a valid persisted
+data page.
 
 Each slot has one of two persistent states. A live slot stores its checked
 offset and length; zero-length records remain legal and use their real offset.
@@ -295,10 +307,11 @@ replacement that cannot fit on its current page returns
 `UpdateWouldOverflowPage`; this release has no row relocation or forwarding
 pointer.
 
-Version 3 intentionally changes the meaning of a formerly invalid slot pair.
-It replaces the pre-Foundation sequential `HEAP` layout, Phase 1 page version
-1, and Phase 2 page version 2. These experimental formats have no migration
-path; versions 1 and 2 are rejected rather than reinterpreted.
+Version 3 intentionally changed the meaning of a formerly invalid slot pair;
+version 4 adds data-page integrity without moving the existing fields through
+pageLSN. It replaces the pre-Foundation sequential `HEAP` layout and page
+versions 1 through 3. These experimental formats have no migration path and
+are rejected rather than reinterpreted.
 
 ## Transaction and WAL boundary
 
@@ -338,7 +351,7 @@ after checksum verification are generation, base LSN, checkpoint LSN, and the
 transaction high-water mark trusted. WAL versions 1 and 2 are rejected
 explicitly; this experimental format has no migration framework. PageUpdate
 remains a pair of complete page images. The separately versioned data-page
-format remains version 3.
+format is version 4; the WAL and record formats remain versions 3 and 2.
 
 Every record has a 40-byte fixed header followed by a bounded payload:
 
@@ -453,6 +466,10 @@ page. The page file is synchronized, then recovery appends Abort for any loser
 that was still Active, appends RollbackComplete, and flushes those terminal
 records before returning. This prevents a recovered loser from conflicting
 with or overwriting a later winner on another restart.
+
+A checksum-invalid current page is a hard recovery error before its pageLSN is
+read or compared. Recovery does not blindly repair it from retained WAL because
+a checkpoint may already have recycled the page's complete history.
 
 Because full-page after-images can include another transaction's uncommitted
 contents, the runtime permits one writer and acquires that ownership before any

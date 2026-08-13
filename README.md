@@ -145,8 +145,8 @@ The current code genuinely supports:
 - typed query/DML HIR and logical relational IR;
 - sequential-scan and left-major/right-minor nested-loop join physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
-- version 3 slotted heap pages with persistent pageLSNs, explicit deleted-slot
-  tombstones, and checked bounds;
+- version 4 slotted heap pages with persistent pageLSNs, PageId-bound full-page
+  CRC32C, explicit deleted-slot tombstones, and checked bounds;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
 - versioned little-endian WAL records for begin, full-page update, commit,
@@ -169,9 +169,12 @@ The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 2 adds the canonical table-schema fingerprint; version 1
 is rejected rather than guessed or migrated. Phase 2A bumped
 data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
-version 3 because a formerly invalid slot encoding now means Deleted. Versions
-1 and 2 are rejected rather than guessed or migrated. Files created by the
-pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
+version 3 because a formerly invalid slot encoding now means Deleted. Page v4
+adds a 28-byte header and CRC32C integrity for persistent data pages. Versions
+1 through 3 are rejected rather than guessed or migrated. Files created by
+the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
+The legacy metadata page 0 retains its separate version-2 layout and is not a
+checksummed Page v4 data page.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`. Creation uses create-new semantics and refuses to
@@ -230,6 +233,15 @@ the checksum, so the fixed record header remains 40 bytes and record sizes and
 logical LSN spacing do not grow. Both checksums cover the complete header or
 record with the checksum field treated as zero. A physically complete record
 whose checksum fails is corruption and is never truncated as a crash tail.
+
+Each Page v4 data page stores a little-endian CRC32C in bytes 24..28 of its
+28-byte header. The checksum covers the expected PageId (as a little-endian
+u64) followed by all 4096 page bytes, treating the checksum field as zero. It
+therefore detects persisted header, slot-directory, free-space, and payload
+corruption—including after checkpoint recycling removes old WAL history—and
+must validate before recovery trusts pageLSN. A mismatch is a typed hard error;
+CRC32C neither repairs corruption nor provides cryptographic authentication.
+WAL checksums independently protect retained log bytes.
 
 The WAL header separates physical file offsets from logical LSNs: for a record
 at physical offset `P`,
@@ -359,12 +371,14 @@ The implementation sequence is intentionally vertical:
    mutation, affected-row results, and atomic WAL-backed execution. Complete.
 9. Join execution (Phase 3C) — qualified columns, aliases, typed INNER JOIN,
    self joins, nested-loop execution, and NULL-aware join predicates. Complete.
-10. Aggregate + Sort (Phase 3D) — `ORDER BY`, aggregate functions, `GROUP BY`,
+10. Data-page integrity — Page v4 CRC32C bound to PageId, recovery-safe pageLSN
+    validation, checkpoint-baseline corruption detection, and page fuzzing.
+11. Aggregate + Sort (Phase 3D) — `ORDER BY`, aggregate functions, `GROUP BY`,
     and aggregate NULL semantics.
-11. Indexing — B+Tree and planner access-path selection.
-12. Server mode — protocol, sessions, and `netbadbd`.
-13. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-14. Advanced optimization — statistics, cost model, and rewrite rules.
+12. Indexing — B+Tree and planner access-path selection.
+13. Server mode — protocol, sessions, and `netbadbd`.
+14. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+15. Advanced optimization — statistics, cost model, and rewrite rules.
 
 Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
 are roadmap items, not implemented features in this slice.
