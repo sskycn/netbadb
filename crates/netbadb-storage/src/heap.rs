@@ -9,8 +9,8 @@ use crate::recovery::RecoveryManager;
 use crate::transaction::TransactionManager;
 use crate::{
     BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE,
-    Page, PageError, PageManager, PageType, SLOT_SIZE, StorageError, Transaction, TransactionError,
-    WalManager, wal_path,
+    Page, PageError, PageManager, PageType, SLOT_SIZE, SlotState, StorageError, Transaction,
+    TransactionError, WalManager, wal_path,
 };
 
 const HEADER_PAGE: PageId = PageId(0);
@@ -228,13 +228,13 @@ impl HeapStorage {
                 Err(error) => Err(error),
             }
         };
-        let (page_id, slot) = match existing {
-            Ok(Some(slot)) => (PageId(last_page), slot),
+        let (page_id, slot_ref) = match existing {
+            Ok(Some(slot_ref)) => (PageId(last_page), slot_ref),
             Ok(None) => {
                 let expected_page_id = PageId(self.buffer.page_count());
                 let before = Page::zero(expected_page_id);
                 let mut after = Page::new(expected_page_id, PageType::Heap);
-                let slot = after.insert_record(&payload)?;
+                let slot_ref = after.insert_record(&payload)?;
                 let update_lsn = transaction.log_page_update(&before, &mut after)?;
                 // Extending the database file writes a zero-filled page before
                 // the buffer can install the logged after-image. Make the WAL
@@ -249,27 +249,21 @@ impl HeapStorage {
                     )));
                 }
                 *page.page_mut() = after;
-                (page_id, slot)
+                (page_id, slot_ref)
             }
             Err(error) => return Err(error),
         };
         Ok(RowId {
             page: page_id,
-            slot: slot.0,
+            slot: slot_ref.slot.0,
+            generation: slot_ref.generation,
         })
     }
 
     pub fn read_row(&self, row_id: RowId) -> Result<Vec<ScalarValue>, StorageError> {
         self.ensure_row_page(row_id)?;
         let page = self.buffer.read_page(row_id.page)?;
-        let slot = SlotId(row_id.slot);
-        if page
-            .page()
-            .is_slot_deleted(slot)
-            .map_err(|error| map_row_error(error, row_id))?
-        {
-            return Err(StorageError::RowDeleted { row_id });
-        }
+        let slot = validate_row_slot(page.page(), row_id)?;
         decode_row(
             page.page()
                 .read_record(slot)
@@ -285,16 +279,21 @@ impl HeapStorage {
         values: &[ScalarValue],
     ) -> Result<(), StorageError> {
         self.validate_transaction(transaction)?;
-        self.validate_row(values)?;
         self.ensure_row_page(row_id)?;
+        {
+            let page = self.buffer.read_page(row_id.page)?;
+            validate_row_slot(page.page(), row_id)?;
+        }
+        self.validate_row(values)?;
         let payload = encode_row(values)?;
         transaction.acquire_writer()?;
 
         let mut page = self.buffer.write_page(row_id.page)?;
         let before = page.page().clone();
         let mut after = before.clone();
+        let slot = validate_row_slot(&after, row_id)?;
         after
-            .replace_record(SlotId(row_id.slot), &payload)
+            .replace_record(slot, &payload)
             .map_err(|error| map_row_error(error, row_id))?;
         transaction.log_page_update(&before, &mut after)?;
         *page.page_mut() = after;
@@ -308,13 +307,18 @@ impl HeapStorage {
     ) -> Result<(), StorageError> {
         self.validate_transaction(transaction)?;
         self.ensure_row_page(row_id)?;
+        {
+            let page = self.buffer.read_page(row_id.page)?;
+            validate_row_slot(page.page(), row_id)?;
+        }
         transaction.acquire_writer()?;
 
         let mut page = self.buffer.write_page(row_id.page)?;
         let before = page.page().clone();
         let mut after = before.clone();
+        let slot = validate_row_slot(&after, row_id)?;
         after
-            .delete_record(SlotId(row_id.slot))
+            .delete_record(slot)
             .map_err(|error| map_row_error(error, row_id))?;
         transaction.log_page_update(&before, &mut after)?;
         *page.page_mut() = after;
@@ -336,17 +340,17 @@ impl HeapStorage {
             }
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
-                if page.page().is_slot_deleted(slot)? {
-                    continue;
+                if let SlotState::Live(slot_entry) = page.page().slot_state(slot)? {
+                    let values = decode_row(page.page().read_record(slot)?, &self.table)?;
+                    rows.push((
+                        RowId {
+                            page: page_id,
+                            slot: slot.0,
+                            generation: slot_entry.generation,
+                        },
+                        values,
+                    ));
                 }
-                let values = decode_row(page.page().read_record(slot)?, &self.table)?;
-                rows.push((
-                    RowId {
-                        page: page_id,
-                        slot: slot.0,
-                    },
-                    values,
-                ));
             }
         }
         Ok(rows)
@@ -504,6 +508,27 @@ fn map_row_error(error: StorageError, row_id: RowId) -> StorageError {
         StorageError::Page(PageError::InvalidSlot { .. }) => StorageError::RowNotFound { row_id },
         StorageError::Page(PageError::SlotDeleted { .. }) => StorageError::RowDeleted { row_id },
         other => other,
+    }
+}
+
+fn validate_row_slot(page: &Page, row_id: RowId) -> Result<SlotId, StorageError> {
+    let slot = SlotId(row_id.slot);
+    let state = page
+        .slot_state(slot)
+        .map_err(|error| map_row_error(error, row_id))?;
+    let actual_generation = match state {
+        SlotState::Live(slot) => slot.generation,
+        SlotState::Deleted { generation } => generation,
+    };
+    if row_id.generation != actual_generation {
+        return Err(StorageError::StaleRowId {
+            row_id,
+            actual_generation,
+        });
+    }
+    match state {
+        SlotState::Live(_) => Ok(slot),
+        SlotState::Deleted { .. } => Err(StorageError::RowDeleted { row_id }),
     }
 }
 
@@ -1099,6 +1124,173 @@ mod tests {
             reopened.delete(middle),
             Err(StorageError::RowDeleted { .. })
         ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reused_slot_distinguishes_deleted_and_stale_row_ids() {
+        let path = test_path("heap-generation-safe-row-id");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let old = storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("old".into())])
+            .expect("insert old occupant");
+        assert_eq!(old.generation, 1);
+        storage.delete(old).expect("delete old occupant");
+        assert!(matches!(
+            storage.read_row(old),
+            Err(StorageError::RowDeleted { row_id }) if row_id == old
+        ));
+
+        let new = storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("new".into())])
+            .expect("reuse old slot");
+        assert_eq!(new.page, old.page);
+        assert_eq!(new.slot, old.slot);
+        assert_eq!(new.generation, old.generation + 1);
+        assert!(matches!(
+            storage.read_row(old),
+            Err(StorageError::StaleRowId {
+                row_id,
+                actual_generation
+            }) if row_id == old && actual_generation == new.generation
+        ));
+        assert!(matches!(
+            storage.update(
+                old,
+                &[ScalarValue::Int64(3), ScalarValue::Text("stale".into())]
+            ),
+            Err(StorageError::StaleRowId { row_id, .. }) if row_id == old
+        ));
+        assert!(matches!(
+            storage.delete(old),
+            Err(StorageError::StaleRowId { row_id, .. }) if row_id == old
+        ));
+        assert_eq!(
+            storage.read_row(new).expect("read new occupant"),
+            vec![ScalarValue::Int64(2), ScalarValue::Text("new".into())]
+        );
+
+        storage.close().expect("close heap");
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert!(matches!(
+            reopened.read_row(old),
+            Err(StorageError::StaleRowId { .. })
+        ));
+        assert_eq!(reopened.scan().expect("scan reopened")[0].0, new);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn repeated_heap_reuse_keeps_one_slot_and_increments_row_id_generation() {
+        let path = test_path("heap-repeated-slot-reuse");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut current = storage
+            .insert(&[ScalarValue::Int64(0), ScalarValue::Text("row-0".into())])
+            .expect("insert initial occupant");
+        for generation in 2..=65 {
+            storage.delete(current).expect("delete current occupant");
+            current = storage
+                .insert(&[
+                    ScalarValue::Int64(i64::from(generation)),
+                    ScalarValue::Text(format!("row-{generation}")),
+                ])
+                .expect("reuse current slot");
+            assert_eq!(current.page, PageId(1));
+            assert_eq!(current.slot, 0);
+            assert_eq!(current.generation, generation);
+        }
+        let page = storage.buffer.read_page(PageId(1)).expect("read data page");
+        assert_eq!(page.page().header().expect("valid page").slot_count, 1);
+        drop(page);
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rollback_of_reused_slot_restores_tombstone_generation() {
+        let path = test_path("heap-reuse-rollback");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let old = storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("old".into())])
+            .expect("insert old occupant");
+        storage.delete(old).expect("commit tombstone");
+
+        let mut transaction = storage.begin_transaction().expect("begin reuse");
+        let candidate = storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(2), ScalarValue::Text("candidate".into())],
+            )
+            .expect("reuse tombstone");
+        assert_eq!(candidate.generation, old.generation + 1);
+        transaction.rollback().expect("rollback reuse");
+
+        assert!(matches!(
+            storage.read_row(old),
+            Err(StorageError::RowDeleted { row_id }) if row_id == old
+        ));
+        assert!(matches!(
+            storage.read_row(candidate),
+            Err(StorageError::StaleRowId {
+                actual_generation,
+                ..
+            }) if actual_generation == old.generation
+        ));
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn committed_reuse_redoes_and_uncommitted_flushed_reuse_undoes_generation() {
+        let path = test_path("heap-reuse-recovery");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let old = storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("old".into())])
+            .expect("insert old occupant");
+        storage.delete(old).expect("commit tombstone");
+        storage.close().expect("persist tombstone baseline");
+
+        let mut storage = HeapStorage::open(&path, table()).expect("open tombstone baseline");
+        let committed = storage
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("committed".into())])
+            .expect("commit reused occupant");
+        assert_eq!(committed.generation, old.generation + 1);
+        storage.simulate_crash();
+
+        let mut storage = HeapStorage::open(&path, table()).expect("redo committed reuse");
+        assert_eq!(
+            storage.scan().expect("scan committed reuse")[0].0,
+            committed
+        );
+        storage.delete(committed).expect("commit second tombstone");
+        storage.close().expect("persist second tombstone");
+
+        let mut storage = HeapStorage::open(&path, table()).expect("open second tombstone");
+        let mut transaction = storage.begin_transaction().expect("begin loser reuse");
+        let loser = storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(3), ScalarValue::Text("loser".into())],
+            )
+            .expect("reuse tombstone as loser");
+        assert_eq!(loser.generation, committed.generation + 1);
+        storage.flush().expect("steal-flush loser reuse");
+        drop(transaction);
+        storage.simulate_crash();
+
+        let reopened = HeapStorage::open(&path, table()).expect("undo loser reuse");
+        assert!(matches!(
+            reopened.read_row(committed),
+            Err(StorageError::RowDeleted { row_id }) if row_id == committed
+        ));
+        assert!(matches!(
+            reopened.read_row(loser),
+            Err(StorageError::StaleRowId {
+                actual_generation,
+                ..
+            }) if actual_generation == committed.generation
+        ));
+        drop(reopened);
         cleanup(&path);
     }
 
@@ -2505,6 +2697,33 @@ mod tests {
                 storage.flush().expect("durably flush active writer");
                 crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
             }
+            "committed-reuse-without-data-flush" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open reuse child heap");
+                let reused = storage
+                    .insert(&[
+                        ScalarValue::Int64(2),
+                        ScalarValue::Text("committed reuse".into()),
+                    ])
+                    .expect("commit reused slot");
+                assert_eq!(reused.generation, 2);
+                crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
+            }
+            "active-reuse-after-durable-page-flush" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open reuse child heap");
+                let mut transaction = storage.begin_transaction().expect("begin reuse loser");
+                let reused = storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::Int64(2),
+                            ScalarValue::Text("loser reuse".into()),
+                        ],
+                    )
+                    .expect("reuse slot as loser");
+                assert_eq!(reused.generation, 2);
+                storage.flush().expect("durably flush reused loser page");
+                crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
+            }
             "recovery-open" => {
                 let _storage = HeapStorage::open(path, table()).expect("start child recovery");
             }
@@ -2554,6 +2773,59 @@ mod tests {
             TestCrashPoint::CommittedWithoutDataFlush,
         );
         assert_reopens_twice_with(&path, "after");
+        cleanup(&path);
+    }
+
+    fn prepare_reuse_crash_baseline(case: &str) -> (std::path::PathBuf, netbadb_types::RowId) {
+        let path = test_path(case);
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create reuse baseline");
+        let old = storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("old occupant".into()),
+            ])
+            .expect("insert reuse baseline");
+        storage.delete(old).expect("commit reuse tombstone");
+        storage.close().expect("close reuse baseline");
+        (path, old)
+    }
+
+    #[test]
+    fn process_crash_no_force_committed_reuse_preserves_new_generation() {
+        let (path, old) = prepare_reuse_crash_baseline("process-crash-reuse-winner");
+        spawn_crash_child(
+            &path,
+            "committed-reuse-without-data-flush",
+            TestCrashPoint::CommittedWithoutDataFlush,
+        );
+        let mut reopened = HeapStorage::open(&path, table()).expect("redo committed reuse");
+        let rows = reopened.scan().expect("scan committed reuse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.generation, old.generation + 1);
+        assert!(matches!(
+            reopened.read_row(old),
+            Err(StorageError::StaleRowId { .. })
+        ));
+        reopened.close().expect("close committed reuse");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_steal_loser_reuse_restores_old_tombstone_generation() {
+        let (path, old) = prepare_reuse_crash_baseline("process-crash-reuse-loser");
+        spawn_crash_child(
+            &path,
+            "active-reuse-after-durable-page-flush",
+            TestCrashPoint::ActiveWriterAfterDurablePageFlush,
+        );
+        let mut reopened = HeapStorage::open(&path, table()).expect("undo loser reuse");
+        assert!(reopened.scan().expect("scan undone reuse").is_empty());
+        assert!(matches!(
+            reopened.read_row(old),
+            Err(StorageError::RowDeleted { row_id }) if row_id == old
+        ));
+        reopened.close().expect("close undone reuse");
         cleanup(&path);
     }
 

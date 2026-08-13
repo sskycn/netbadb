@@ -45,8 +45,12 @@ fn write_page_decode_seed(wal_output: &Path) -> Result<(), Box<dyn std::error::E
         .join("page_decode");
     std::fs::create_dir_all(&output)?;
     let mut page = Page::new(PageId(7), PageType::Heap);
-    page.insert_record(b"page-v4-fuzz-seed")?;
-    std::fs::write(output.join("valid-page-v4"), page.bytes())?;
+    page.insert_record(b"page-v5-generation-fuzz-seed")?;
+    let old_seed = output.join("valid-page-v4");
+    if old_seed.exists() {
+        std::fs::remove_file(old_seed)?;
+    }
+    std::fs::write(output.join("valid-page-v5"), page.bytes())?;
     Ok(())
 }
 

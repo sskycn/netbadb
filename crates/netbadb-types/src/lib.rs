@@ -26,11 +26,16 @@ id_type!(Lsn, u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotId(pub u16);
 
-/// A stable location of a row inside a heap page.
+/// A versioned physical locator for one occupant of one heap slot.
+///
+/// Generation zero is reserved and is never issued for a live row. Reusing a
+/// deleted slot increments its generation so an older locator cannot alias the
+/// new occupant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RowId {
     pub page: PageId,
     pub slot: u16,
+    pub generation: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -137,7 +142,7 @@ impl ScalarValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{PhysicalType, SemanticType};
+    use super::{PageId, PhysicalType, RowId, SemanticType};
 
     #[test]
     fn nominal_types_do_not_collapse_to_their_physical_type() {
@@ -148,5 +153,21 @@ mod tests {
         assert!(!user_id.is_compatible_with(&team_id));
         assert!(!user_id.is_compatible_with(&raw_id));
         assert!(user_id.is_compatible_with(&user_id));
+    }
+
+    #[test]
+    fn row_id_generation_is_explicit_identity() {
+        let first = RowId {
+            page: PageId(5),
+            slot: 3,
+            generation: 1,
+        };
+        assert_ne!(
+            first,
+            RowId {
+                generation: 2,
+                ..first
+            }
+        );
     }
 }

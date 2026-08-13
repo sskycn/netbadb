@@ -11,9 +11,10 @@ pub const PAGE_SIZE: usize = 4 * 1024;
 /// Magic for versioned database pages. The explicit version field remains
 /// separate so a decoder never has to infer layout from a magic string.
 pub const PAGE_MAGIC: &[u8; 4] = b"NBP1";
-pub const PAGE_FORMAT_VERSION: u16 = 4;
+pub const PAGE_FORMAT_VERSION: u16 = 5;
 pub const PAGE_HEADER_SIZE: usize = 28;
-pub const SLOT_SIZE: usize = 4;
+/// Persistent slot layout: offset (u16 LE), length (u16 LE), generation (u32 LE).
+pub const SLOT_SIZE: usize = 8;
 
 const FILE_MAGIC: &[u8; 4] = b"NBPG";
 const PAGE_TYPE_OFFSET: usize = 6;
@@ -68,6 +69,32 @@ impl PageHeader {
 pub struct Slot {
     pub offset: u16,
     pub length: u16,
+    pub generation: u32,
+}
+
+/// The page-local part of a versioned row locator returned by insertion.
+///
+/// Higher layers must retain both fields. Page mutation and inspection APIs
+/// accept only an explicit [`SlotId`], so discarding the generation cannot
+/// happen through an implicit conversion; generation validation belongs at
+/// the heap [`netbadb_types::RowId`] boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotRef {
+    pub slot: SlotId,
+    pub generation: u32,
+}
+
+/// Persisted state of an allocated slot. Deleted slots retain their generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotState {
+    Live(Slot),
+    Deleted { generation: u32 },
+}
+
+#[derive(Debug)]
+struct RebuildSlot {
+    generation: u32,
+    payload: Option<Vec<u8>>,
 }
 
 /// A fixed-size raw page. `from_bytes` deliberately does not validate the
@@ -203,6 +230,13 @@ impl Page {
         for index in 0..slot_count {
             let slot_id = SlotId(index);
             let slot = self.slot_at(slot_id);
+            if slot.generation == 0 {
+                return Err(PageError::InvalidSlotGeneration {
+                    slot: slot_id,
+                    generation: slot.generation,
+                }
+                .into());
+            }
             if is_deleted_slot(slot) {
                 continue;
             }
@@ -260,23 +294,29 @@ impl Page {
     }
 
     pub fn slot(&self, slot: SlotId) -> Result<Slot, StorageError> {
+        match self.slot_state(slot)? {
+            SlotState::Live(entry) => Ok(entry),
+            SlotState::Deleted { .. } => Err(PageError::SlotDeleted { slot }.into()),
+        }
+    }
+
+    pub fn slot_state(&self, slot: SlotId) -> Result<SlotState, StorageError> {
         let header = self.header()?;
         if slot.0 >= header.slot_count {
             return Err(PageError::InvalidSlot { slot }.into());
         }
         let entry = self.slot_at(slot);
         if is_deleted_slot(entry) {
-            return Err(PageError::SlotDeleted { slot }.into());
+            Ok(SlotState::Deleted {
+                generation: entry.generation,
+            })
+        } else {
+            Ok(SlotState::Live(entry))
         }
-        Ok(entry)
     }
 
     pub fn is_slot_deleted(&self, slot: SlotId) -> Result<bool, StorageError> {
-        let header = self.header()?;
-        if slot.0 >= header.slot_count {
-            return Err(PageError::InvalidSlot { slot }.into());
-        }
-        Ok(is_deleted_slot(self.slot_at(slot)))
+        Ok(matches!(self.slot_state(slot)?, SlotState::Deleted { .. }))
     }
 
     pub fn read_record(&self, slot: SlotId) -> Result<&[u8], StorageError> {
@@ -299,7 +339,7 @@ impl Page {
             .map_err(Into::into)
     }
 
-    pub fn insert_record(&mut self, record: &[u8]) -> Result<SlotId, StorageError> {
+    pub fn insert_record(&mut self, record: &[u8]) -> Result<SlotRef, StorageError> {
         let header = self.header()?;
         if header.page_type != PageType::Heap {
             return Err(PageError::WrongPageType {
@@ -317,12 +357,20 @@ impl Page {
             }
             .into());
         }
-        let required = SLOT_SIZE
-            .checked_add(record.len())
-            .ok_or(PageError::RecordTooLarge {
-                size: record.len(),
-                capacity: max_record_size,
-            })?;
+        let mut records = self.rebuild_slots()?;
+        let reusable = records
+            .iter()
+            .position(|slot| slot.payload.is_none() && slot.generation < u32::MAX);
+        let required = if reusable.is_some() {
+            record.len()
+        } else {
+            SLOT_SIZE
+                .checked_add(record.len())
+                .ok_or(PageError::RecordTooLarge {
+                    size: record.len(),
+                    capacity: max_record_size,
+                })?
+        };
         let available = header.free_space();
         if required > available {
             return Err(PageError::PageFull {
@@ -331,49 +379,43 @@ impl Page {
             }
             .into());
         }
-        let slot = SlotId(header.slot_count);
-        let new_free_start = usize::from(header.free_start)
-            .checked_add(SLOT_SIZE)
-            .ok_or(PageError::PageFull {
+        let slot_ref = if let Some(index) = reusable {
+            let slot = &mut records[index];
+            slot.generation = slot.generation.checked_add(1).ok_or(PageError::PageFull {
                 required,
                 available,
             })?;
-        let new_free_end = usize::from(header.free_end)
-            .checked_sub(record.len())
-            .ok_or(PageError::PageFull {
-                required,
-                available,
-            })?;
-        let record_start = new_free_end;
-        let record_end =
-            record_start
-                .checked_add(record.len())
-                .ok_or(PageError::RecordTooLarge {
-                    size: record.len(),
-                    capacity: max_record_size,
-                })?;
-
-        self.bytes[record_start..record_end].copy_from_slice(record);
-        self.write_u16(usize::from(header.free_start), record_start as u16);
-        self.write_u16(usize::from(header.free_start) + 2, record.len() as u16);
-        self.write_u16(SLOT_COUNT_OFFSET, header.slot_count + 1);
-        self.write_u16(FREE_START_OFFSET, new_free_start as u16);
-        self.write_u16(FREE_END_OFFSET, new_free_end as u16);
-        self.refresh_checksum();
-        Ok(slot)
+            slot.payload = Some(record.to_vec());
+            SlotRef {
+                slot: SlotId(index as u16),
+                generation: slot.generation,
+            }
+        } else {
+            let slot = SlotId(header.slot_count);
+            records.push(RebuildSlot {
+                generation: 1,
+                payload: Some(record.to_vec()),
+            });
+            SlotRef {
+                slot,
+                generation: 1,
+            }
+        };
+        self.rebuild_records(&records, None)?;
+        Ok(slot_ref)
     }
 
-    /// Marks a live slot deleted and compacts the remaining payloads without
-    /// renumbering or reusing any slot.
+    /// Marks a live slot deleted and compacts remaining payloads. Generation is
+    /// retained until a later insertion reuses this slot.
     pub fn delete_record(&mut self, slot: SlotId) -> Result<(), StorageError> {
-        let mut records = self.live_records()?;
+        let mut records = self.rebuild_slots()?;
         let target = records
             .get_mut(usize::from(slot.0))
             .ok_or(PageError::InvalidSlot { slot })?;
-        if target.is_none() {
+        if target.payload.is_none() {
             return Err(PageError::SlotDeleted { slot }.into());
         }
-        *target = None;
+        target.payload = None;
         self.rebuild_records(&records, None)
     }
 
@@ -388,34 +430,38 @@ impl Page {
             }
             .into());
         }
-        let mut records = self.live_records()?;
+        let mut records = self.rebuild_slots()?;
         let target = records
             .get_mut(usize::from(slot.0))
             .ok_or(PageError::InvalidSlot { slot })?;
-        if target.is_none() {
+        if target.payload.is_none() {
             return Err(PageError::SlotDeleted { slot }.into());
         }
-        *target = Some(record.to_vec());
+        target.payload = Some(record.to_vec());
         self.rebuild_records(&records, Some((slot, record.len())))
     }
 
-    fn live_records(&self) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+    fn rebuild_slots(&self) -> Result<Vec<RebuildSlot>, StorageError> {
         let header = self.header()?;
         (0..header.slot_count)
             .map(|index| {
                 let slot = SlotId(index);
-                if is_deleted_slot(self.slot_at(slot)) {
-                    Ok(None)
-                } else {
-                    Ok(Some(self.read_record(slot)?.to_vec()))
-                }
+                let entry = self.slot_at(slot);
+                Ok(RebuildSlot {
+                    generation: entry.generation,
+                    payload: if is_deleted_slot(entry) {
+                        None
+                    } else {
+                        Some(self.read_record(slot)?.to_vec())
+                    },
+                })
             })
             .collect()
     }
 
     fn rebuild_records(
         &mut self,
-        records: &[Option<Vec<u8>>],
+        records: &[RebuildSlot],
         replacement: Option<(SlotId, usize)>,
     ) -> Result<(), StorageError> {
         let header = self.header()?;
@@ -427,9 +473,9 @@ impl Page {
                     .ok_or(PageError::InvalidSlotCount(header.slot_count))?,
             )
             .ok_or(PageError::InvalidSlotCount(header.slot_count))?;
-        let payload_size = records.iter().try_fold(0_usize, |total, record| {
+        let payload_size = records.iter().try_fold(0_usize, |total, slot| {
             total
-                .checked_add(record.as_ref().map_or(0, Vec::len))
+                .checked_add(slot.payload.as_ref().map_or(0, Vec::len))
                 .ok_or(PageError::RecordTooLarge {
                     size: usize::MAX,
                     capacity: PAGE_SIZE.saturating_sub(directory_end),
@@ -456,12 +502,14 @@ impl Page {
         if let Some(page_lsn) = header.page_lsn {
             rebuilt.set_page_lsn(page_lsn);
         }
-        rebuilt.write_u16(SLOT_COUNT_OFFSET, header.slot_count);
+        let slot_count =
+            u16::try_from(records.len()).map_err(|_| PageError::InvalidSlotCount(u16::MAX))?;
+        rebuilt.write_u16(SLOT_COUNT_OFFSET, slot_count);
         rebuilt.write_u16(FREE_START_OFFSET, directory_end as u16);
         let mut free_end = PAGE_SIZE;
-        for (index, record) in records.iter().enumerate() {
+        for (index, slot) in records.iter().enumerate() {
             let entry_offset = PAGE_HEADER_SIZE + index * SLOT_SIZE;
-            match record {
+            match &slot.payload {
                 Some(record) => {
                     free_end = free_end
                         .checked_sub(record.len())
@@ -479,6 +527,7 @@ impl Page {
                     rebuilt.write_u16(entry_offset + 2, DELETED_SLOT_LENGTH);
                 }
             }
+            rebuilt.write_u32(entry_offset + 4, slot.generation);
         }
         rebuilt.write_u16(FREE_END_OFFSET, free_end as u16);
         rebuilt.refresh_checksum();
@@ -492,6 +541,7 @@ impl Page {
         Slot {
             offset: self.read_u16(offset),
             length: self.read_u16(offset + 2),
+            generation: self.read_u32(offset + 4),
         }
     }
 
@@ -514,6 +564,10 @@ impl Page {
 
     fn write_u16(&mut self, offset: usize, value: u16) {
         self.bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
@@ -751,8 +805,11 @@ mod tests {
             header.free_start,
             (super::PAGE_HEADER_SIZE + 2 * SLOT_SIZE) as u16
         );
-        assert_eq!(page.read_record(first).expect("read first"), b"first");
-        assert_eq!(page.read_record(second).expect("read second"), b"second");
+        assert_eq!(page.read_record(first.slot).expect("read first"), b"first");
+        assert_eq!(
+            page.read_record(second.slot).expect("read second"),
+            b"second"
+        );
         assert!(matches!(
             page.slot(SlotId(2)),
             Err(StorageError::Page(PageError::InvalidSlot {
@@ -786,10 +843,16 @@ mod tests {
             version_three.header(),
             Err(StorageError::Page(PageError::UnsupportedVersion(3)))
         ));
+        let mut version_four = Page::new(PageId(5), PageType::Heap);
+        version_four.bytes_mut()[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        assert!(matches!(
+            version_four.header(),
+            Err(StorageError::Page(PageError::UnsupportedVersion(4)))
+        ));
     }
 
     #[test]
-    fn page_v4_checksum_has_a_stable_golden_value_and_binds_page_id() {
+    fn page_v5_checksum_has_a_stable_golden_value_and_binds_page_id() {
         let mut page = Page::new(PageId(7), PageType::Heap);
         page.insert_record(b"checksum-golden")
             .expect("insert golden payload");
@@ -799,7 +862,7 @@ mod tests {
                 .try_into()
                 .expect("checksum field"),
         );
-        assert_eq!(checksum, 0x1cb3_695a);
+        assert_eq!(checksum, 0x4ec3_88c1);
         page.header().expect("new page checksum is valid");
 
         let wrong_id = Page::from_bytes(PageId(8), *page.bytes());
@@ -813,11 +876,12 @@ mod tests {
     fn checksum_detects_payload_header_and_checksum_corruption() {
         let mut page = Page::new(PageId(1), PageType::Heap);
         let slot = page.insert_record(b"checksum payload").expect("insert");
-        let payload_offset = usize::from(page.slot(slot).expect("slot").offset);
+        let payload_offset = usize::from(page.slot(slot.slot).expect("slot").offset);
 
         for offset in [
             payload_offset,
             100,
+            super::PAGE_HEADER_SIZE + 4,
             super::SLOT_COUNT_OFFSET,
             super::FREE_START_OFFSET,
             super::FREE_END_OFFSET,
@@ -878,20 +942,117 @@ mod tests {
         let header = page.header().expect("valid page header");
 
         assert_eq!(header.slot_count, 2);
-        assert_eq!(page.read_record(empty).expect("read empty record"), b"");
         assert_eq!(
-            page.read_record(non_empty).expect("read non-empty record"),
+            page.read_record(empty.slot).expect("read empty record"),
+            b""
+        );
+        assert_eq!(
+            page.read_record(non_empty.slot)
+                .expect("read non-empty record"),
             b"value"
         );
-        page.delete_record(empty).expect("delete empty record");
+        page.delete_record(empty.slot).expect("delete empty record");
         assert!(matches!(
-            page.read_record(empty),
-            Err(StorageError::Page(PageError::SlotDeleted { slot })) if slot == empty
+            page.read_record(empty.slot),
+            Err(StorageError::Page(PageError::SlotDeleted { slot })) if slot == empty.slot
         ));
         assert_eq!(
-            page.read_record(non_empty).expect("read stable record"),
+            page.read_record(non_empty.slot)
+                .expect("read stable record"),
             b"value"
         );
+        let reused = page.insert_record(&[]).expect("reuse for empty record");
+        assert_eq!(reused.slot, empty.slot);
+        assert_eq!(reused.generation, empty.generation + 1);
+        assert_eq!(
+            page.read_record(reused.slot).expect("read reused empty"),
+            b""
+        );
+    }
+
+    #[test]
+    fn insert_reuses_lowest_deleted_slot_and_increments_generation() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let first = page.insert_record(b"first").expect("insert first");
+        let second = page.insert_record(b"second").expect("insert second");
+        let third = page.insert_record(b"third").expect("insert third");
+        let fourth = page.insert_record(b"fourth").expect("insert fourth");
+        page.delete_record(second.slot).expect("delete second");
+        page.delete_record(third.slot).expect("delete third");
+
+        let reused_second = page.insert_record(b"new second").expect("reuse second");
+        let reused_third = page.insert_record(b"new third").expect("reuse third");
+        assert_eq!(reused_second.slot, second.slot);
+        assert_eq!(reused_second.generation, second.generation + 1);
+        assert_eq!(reused_third.slot, third.slot);
+        assert_eq!(reused_third.generation, third.generation + 1);
+        assert_eq!(page.header().expect("valid reused page").slot_count, 4);
+        assert_eq!(
+            page.read_record(first.slot).expect("first remains"),
+            b"first"
+        );
+        assert_eq!(
+            page.read_record(fourth.slot).expect("fourth remains"),
+            b"fourth"
+        );
+        assert_eq!(
+            page.read_record(reused_second.slot)
+                .expect("read second reuse"),
+            b"new second"
+        );
+    }
+
+    #[test]
+    fn repeated_reuse_keeps_slot_count_stable_and_generation_monotonic() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let mut current = page.insert_record(b"value").expect("insert initial");
+        for expected_generation in 2..=65 {
+            page.delete_record(current.slot).expect("delete occupant");
+            current = page.insert_record(b"next").expect("reuse occupant");
+            assert_eq!(current.slot, SlotId(0));
+            assert_eq!(current.generation, expected_generation);
+            assert_eq!(page.header().expect("valid page").slot_count, 1);
+        }
+    }
+
+    #[test]
+    fn exhausted_tombstone_generation_is_never_reused_or_wrapped() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let first = page.insert_record(b"first").expect("insert first");
+        page.delete_record(first.slot).expect("delete first");
+        page.write_u32(super::PAGE_HEADER_SIZE + 4, u32::MAX);
+        page.refresh_checksum();
+
+        let appended = page.insert_record(b"appended").expect("append new slot");
+        assert_eq!(appended.slot, SlotId(1));
+        assert_eq!(appended.generation, 1);
+        assert_eq!(
+            page.slot_state(first.slot).expect("read max tombstone"),
+            super::SlotState::Deleted {
+                generation: u32::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn exhausted_tombstone_returns_page_full_atomically_when_append_cannot_fit() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let first = page.insert_record(b"x").expect("insert first");
+        page.insert_record(&vec![
+            7;
+            PAGE_SIZE - super::PAGE_HEADER_SIZE - 2 * SLOT_SIZE - 1
+        ])
+        .expect("fill remaining page");
+        page.delete_record(first.slot).expect("delete first");
+        page.write_u32(super::PAGE_HEADER_SIZE + 4, u32::MAX);
+        page.refresh_checksum();
+        let before = page.clone();
+
+        assert!(matches!(
+            page.insert_record(&[]),
+            Err(StorageError::Page(PageError::PageFull { .. }))
+        ));
+        assert_eq!(page, before);
     }
 
     #[test]
@@ -901,13 +1062,19 @@ mod tests {
         let middle = page.insert_record(b"middle").expect("insert middle");
         let third = page.insert_record(b"third").expect("insert third");
 
-        page.delete_record(middle).expect("delete middle");
-        assert_eq!(page.read_record(first).expect("first remains"), b"first");
-        assert_eq!(page.read_record(third).expect("third remains"), b"third");
-        assert!(page.is_slot_deleted(middle).expect("deleted state"));
+        page.delete_record(middle.slot).expect("delete middle");
+        assert_eq!(
+            page.read_record(first.slot).expect("first remains"),
+            b"first"
+        );
+        assert_eq!(
+            page.read_record(third.slot).expect("third remains"),
+            b"third"
+        );
+        assert!(page.is_slot_deleted(middle.slot).expect("deleted state"));
         assert_eq!(page.header().expect("valid compacted page").slot_count, 3);
         assert!(matches!(
-            page.delete_record(middle),
+            page.delete_record(middle.slot),
             Err(StorageError::Page(PageError::SlotDeleted { .. }))
         ));
     }
@@ -919,15 +1086,18 @@ mod tests {
             .insert_record(b"a long original")
             .expect("insert first");
         let second = page.insert_record(b"second").expect("insert second");
-        page.replace_record(first, b"x").expect("shrink");
-        assert_eq!(page.read_record(first).expect("read shrink"), b"x");
-        page.replace_record(first, b"a substantially longer replacement")
+        page.replace_record(first.slot, b"x").expect("shrink");
+        assert_eq!(page.read_record(first.slot).expect("read shrink"), b"x");
+        page.replace_record(first.slot, b"a substantially longer replacement")
             .expect("grow");
         assert_eq!(
-            page.read_record(first).expect("read grow"),
+            page.read_record(first.slot).expect("read grow"),
             b"a substantially longer replacement"
         );
-        assert_eq!(page.read_record(second).expect("stable second"), b"second");
+        assert_eq!(
+            page.read_record(second.slot).expect("stable second"),
+            b"second"
+        );
     }
 
     #[test]
@@ -937,7 +1107,7 @@ mod tests {
         page.insert_record(&[7; 3_900]).expect("fill page");
         let before = page.clone();
         assert!(matches!(
-            page.replace_record(first, &[8; 200]),
+            page.replace_record(first.slot, &[8; 200]),
             Err(StorageError::Page(
                 PageError::UpdateWouldOverflowPage { .. }
             ))
@@ -1046,11 +1216,26 @@ mod tests {
             ))
         ));
 
+        let mut invalid_generation = Page::new(PageId(24), PageType::Heap);
+        invalid_generation
+            .insert_record(b"safe")
+            .expect("insert record");
+        invalid_generation.bytes_mut()[super::PAGE_HEADER_SIZE + 4..super::PAGE_HEADER_SIZE + 8]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        invalid_generation.refresh_checksum();
+        assert!(matches!(
+            invalid_generation.header(),
+            Err(StorageError::Page(PageError::InvalidSlotGeneration {
+                slot: SlotId(0),
+                generation: 0
+            }))
+        ));
+
         let mut overlaps_free = Page::new(PageId(22), PageType::Heap);
         let slot = overlaps_free
             .insert_record(b"record")
             .expect("insert record");
-        let record_offset = overlaps_free.slot(slot).expect("slot").offset;
+        let record_offset = overlaps_free.slot(slot.slot).expect("slot").offset;
         overlaps_free.bytes_mut()[12..14].copy_from_slice(&(record_offset + 1).to_le_bytes());
         overlaps_free.refresh_checksum();
         assert!(matches!(
@@ -1067,8 +1252,11 @@ mod tests {
         let second = overlapping_records
             .insert_record(b"other")
             .expect("insert second");
-        let first_offset = overlapping_records.slot(first).expect("first slot").offset;
-        let second_entry = super::PAGE_HEADER_SIZE + usize::from(second.0) * super::SLOT_SIZE;
+        let first_offset = overlapping_records
+            .slot(first.slot)
+            .expect("first slot")
+            .offset;
+        let second_entry = super::PAGE_HEADER_SIZE + usize::from(second.slot.0) * super::SLOT_SIZE;
         overlapping_records.bytes_mut()[second_entry..second_entry + 2]
             .copy_from_slice(&first_offset.to_le_bytes());
         overlapping_records.refresh_checksum();

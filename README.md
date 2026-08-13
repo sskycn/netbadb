@@ -146,8 +146,8 @@ The current code genuinely supports:
 - typed query/DML HIR and logical relational IR;
 - sequential-scan and left-major/right-minor nested-loop join physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
-- version 4 slotted heap pages with persistent pageLSNs, PageId-bound full-page
-  CRC32C, explicit deleted-slot tombstones, and checked bounds;
+- version 5 slotted heap pages with persistent pageLSNs, PageId-bound full-page
+  CRC32C, generation-bearing reusable tombstones, and checked bounds;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
 - versioned little-endian WAL records for begin, full-page update, commit,
@@ -160,8 +160,8 @@ The current code genuinely supports:
   reverse-LSN undo of incomplete or aborted transactions;
 - explicit quiescent checkpoints with bounded two-generation WAL retention,
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
-- RowId-based insert, update, delete, scan, file reopen, row encoding, and row
-  decoding;
+- generation-safe RowId insert, update, delete, scan, stale-locator detection,
+  file reopen, row encoding, and row decoding;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
@@ -172,11 +172,12 @@ Heap metadata version 2 adds the canonical table-schema fingerprint; version 1
 is rejected rather than guessed or migrated. Phase 2A bumped
 data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
 version 3 because a formerly invalid slot encoding now means Deleted. Page v4
-adds a 28-byte header and CRC32C integrity for persistent data pages. Versions
-1 through 3 are rejected rather than guessed or migrated. Files created by
+added a 28-byte header and CRC32C integrity; Page v5 expands each slot with a
+generation used for safe tombstone reuse. Versions 1 through 4 are rejected
+rather than guessed or migrated. Files created by
 the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-2 layout and is not a
-checksummed Page v4 data page.
+checksummed Page v5 data page.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`. Creation uses create-new semantics and refuses to
@@ -236,7 +237,7 @@ logical LSN spacing do not grow. Both checksums cover the complete header or
 record with the checksum field treated as zero. A physically complete record
 whose checksum fails is corruption and is never truncated as a crash tail.
 
-Each Page v4 data page stores a little-endian CRC32C in bytes 24..28 of its
+Each Page v5 data page stores a little-endian CRC32C in bytes 24..28 of its
 28-byte header. The checksum covers the expected PageId (as a little-endian
 u64) followed by all 4096 page bytes, treating the checksum field as zero. It
 therefore detects persisted header, slot-directory, free-space, and payload
@@ -283,10 +284,15 @@ become NULL, while omitted non-nullable columns are rejected. UPDATE evaluates
 all right-hand sides against the original row, and UPDATE/DELETE reuse the
 SELECT predicate evaluator, so FALSE and UNKNOWN do not mutate a row.
 
-Mutation is located by an internal `RowId` (`PageId + SlotId`) that is never
-exposed as a SQL column. DELETE compacts tuple bytes without renumbering slots;
-the slot becomes an explicit tombstone and is not reused. UPDATE rebuilds the
-current 4 KiB page while preserving the slot. If a larger replacement cannot
+Mutation is located by an internal versioned physical `RowId` (`PageId +
+SlotId + u32 generation`) that is never exposed as a SQL column or treated as a
+business key. Generation zero is never issued. DELETE compacts tuple bytes
+without renumbering slots and retains the current generation in an explicit
+tombstone. A later insertion may reuse the lowest eligible tombstone after a
+checked generation increment. Before reuse, the old locator reports
+`RowDeleted`; afterward it reports `StaleRowId` and cannot access the new
+occupant. UPDATE rebuilds the current 4 KiB page while preserving the slot and
+generation. If a larger replacement cannot
 fit on that page, the statement returns `UpdateWouldOverflowPage` and rolls
 back atomically; row relocation and forwarding pointers are not implemented.
 Implicit DML owns one transaction. `execute_in` supports multiple statements
@@ -416,10 +422,12 @@ The implementation sequence is intentionally vertical:
     validation, checkpoint-baseline corruption detection, and page fuzzing.
 11. Aggregate + Sort (Phase 3D) — typed source-column `ORDER BY`, global
     aggregates, and in-memory `GROUP BY`/grouped aggregates are complete.
-12. Indexing — B+Tree and planner access-path selection.
-13. Server mode — protocol, sessions, and `netbadbd`.
-14. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-15. Advanced optimization — statistics, cost model, and rewrite rules.
+12. Versioned RowId + slot reuse (Phase 4A) — Page v5 slot generations,
+    generation-safe tombstone reuse, and stale-locator detection. Complete.
+13. Indexing — B+Tree and planner access-path selection.
+14. Server mode — protocol, sessions, and `netbadbd`.
+15. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+16. Advanced optimization — statistics, cost model, and rewrite rules.
 
 Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
 are roadmap items, not implemented features in this slice.

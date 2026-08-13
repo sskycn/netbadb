@@ -126,8 +126,8 @@ order. Query operators are arranged as `Scan/Join -> Filter -> Sort -> Project
 follows left-to-right relation and schema order.
 
 Core multi-table catalogs compose one existing heap file per `TableId`. JOIN
-therefore introduces no persistent format or transaction-layer changes: page
-version 4, heap metadata version 2, WAL version 3 with record version 2,
+therefore introduces no transaction-layer changes: the current page format is
+version 5, heap metadata is version 2, WAL is version 3 with record version 2,
 recovery, checkpoints, and single-writer rules are unchanged.
 
 ## Typed ORDER BY
@@ -348,12 +348,12 @@ mismatch are distinct typed storage errors. Heap metadata version 1 is rejected
 without migration; the file format remains experimental and may change again
 between versions.
 
-Page 0 is legacy container/heap metadata and is not interpreted as a Page v4
-data page. Data pages use the following version 4 little-endian layout:
+Page 0 is legacy container/heap metadata and is not interpreted as a Page v5
+data page. Data pages use the following version 5 little-endian layout:
 
 ```text
 0..4    NBP1 page magic
-4..6    u16 page format version (4)
+4..6    u16 page format version (5)
 6       u8 page type (2 heap; tag 1 remains reserved)
 7       reserved byte (zero)
 8..10   u16 slot count
@@ -362,12 +362,12 @@ data page. Data pages use the following version 4 little-endian layout:
 14..16  reserved bytes (zero)
 16..24  u64 pageLSN (zero means no WAL record)
 24..28  u32 CRC32C (little-endian)
-28..    slot entries: u16 tuple offset + u16 tuple length
+28..    8-byte slot entries: u16 offset + u16 length + u32 generation
 ...     free space
 ...     tuple bytes, allocated from PAGE_SIZE backward
 ```
 
-The Page v4 checksum is `CRC32C(page_id_le_u64 || complete_page_image)`, with
+The Page v5 checksum is `CRC32C(page_id_le_u64 || complete_page_image)`, with
 bytes 24..28 of the page image treated as zero. It covers all 4096 bytes,
 including the header, pageLSN, slot directory, free/unused bytes, tombstones,
 and tuple payload. Binding the expected logical PageId also detects a valid
@@ -377,22 +377,32 @@ checksum verification then precedes all remaining semantic validation. The
 all-zero new-page before-image remains a WAL sentinel, not a valid persisted
 data page.
 
-Each slot has one of two persistent states. A live slot stores its checked
-offset and length; zero-length records remain legal and use their real offset.
-The reserved pair `(offset = 0, length = 65535)` means Deleted. Either reserved
-component without the complete pair is corruption. DELETE rebuilds the live
-tuple area while retaining every slot index, then writes the tombstone. UPDATE
-rebuilds the page around the replacement while retaining its slot and RowId.
-Deleted slots are not reused, so an old RowId never aliases a later row. A
-replacement that cannot fit on its current page returns
+Every allocated slot has a nonzero little-endian `u32` generation. A live slot
+stores its checked offset and length; zero-length records remain legal and use
+their real offset. The reserved pair `(offset = 0, length = 65535)` means
+Deleted and retains the generation. Either reserved component without the
+complete pair, or generation zero, is typed corruption. DELETE rebuilds the
+live tuple area while retaining every slot index and generation. UPDATE retains
+both. INSERT deterministically reuses the lowest deleted SlotId whose generation
+is below `u32::MAX`, increments it with checked arithmetic, and otherwise
+appends a generation-1 slot. A generation-maximum tombstone is permanently
+ineligible, so generation can never wrap. A replacement that cannot fit on its
+current page returns
 `UpdateWouldOverflowPage`; this release has no row relocation or forwarding
 pointer.
 
+`RowId` is the versioned physical locator `PageId + SlotId + generation`, not a
+business key, primary key, or globally monotonic identifier. A same-generation
+locator for a tombstone reports `RowDeleted`; after slot reuse, the old
+generation reports `StaleRowId` before live/deleted state is considered. Scans
+return the persisted generation, so executor UPDATE/DELETE retain the complete
+locator.
+
 Version 3 intentionally changed the meaning of a formerly invalid slot pair;
-version 4 adds data-page integrity without moving the existing fields through
-pageLSN. It replaces the pre-Foundation sequential `HEAP` layout and page
-versions 1 through 3. These experimental formats have no migration path and
-are rejected rather than reinterpreted.
+version 4 added data-page integrity without moving existing header fields;
+version 5 adds explicit slot generation. It replaces the pre-Foundation
+sequential `HEAP` layout and page versions 1 through 4. These experimental
+formats have no migration path and are rejected rather than reinterpreted.
 
 ## Transaction and WAL boundary
 
@@ -432,7 +442,7 @@ after checksum verification are generation, base LSN, checkpoint LSN, and the
 transaction high-water mark trusted. WAL versions 1 and 2 are rejected
 explicitly; this experimental format has no migration framework. PageUpdate
 remains a pair of complete page images. The separately versioned data-page
-format is version 4; the WAL and record formats remain versions 3 and 2.
+format is version 5; the WAL and record formats remain versions 3 and 2.
 
 Every record has a 40-byte fixed header followed by a bounded payload:
 

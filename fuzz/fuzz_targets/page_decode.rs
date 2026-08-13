@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
         .unwrap_or(SlotId(0));
     for slot in (0..header.slot_count).map(SlotId).chain([input_slot]) {
         let _ = page.slot(slot);
+        let _ = page.slot_state(slot);
         let _ = page.is_slot_deleted(slot);
         let _ = page.read_record(slot);
     }

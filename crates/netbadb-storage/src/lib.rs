@@ -13,7 +13,7 @@ pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::HeapStorage;
 pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
-    PageType, SLOT_SIZE, Slot,
+    PageType, SLOT_SIZE, Slot, SlotRef, SlotState,
 };
 pub use recovery::RecoveryError;
 pub use transaction::{Transaction, TransactionState};
@@ -50,6 +50,10 @@ pub enum PageError {
     },
     InvalidSlot {
         slot: SlotId,
+    },
+    InvalidSlotGeneration {
+        slot: SlotId,
+        generation: u32,
     },
     SlotDeleted {
         slot: SlotId,
@@ -123,6 +127,11 @@ impl fmt::Display for PageError {
                 "slot directory with {slot_count} slots ends at {free_start}"
             ),
             Self::InvalidSlot { slot } => write!(formatter, "invalid page slot {}", slot.0),
+            Self::InvalidSlotGeneration { slot, generation } => write!(
+                formatter,
+                "page slot {} has invalid generation {generation}",
+                slot.0
+            ),
             Self::SlotDeleted { slot } => write!(formatter, "page slot {} is deleted", slot.0),
             Self::InvalidDeletedSlotEncoding {
                 slot,
@@ -437,6 +446,10 @@ pub enum StorageError {
     RowDeleted {
         row_id: netbadb_types::RowId,
     },
+    StaleRowId {
+        row_id: netbadb_types::RowId,
+        actual_generation: u32,
+    },
     RowTooLarge {
         size: usize,
         capacity: usize,
@@ -485,13 +498,21 @@ impl fmt::Display for StorageError {
             }
             Self::RowNotFound { row_id } => write!(
                 formatter,
-                "row at page {}, slot {} does not exist",
-                row_id.page.0, row_id.slot
+                "row at page {}, slot {}, generation {} does not exist",
+                row_id.page.0, row_id.slot, row_id.generation
             ),
             Self::RowDeleted { row_id } => write!(
                 formatter,
-                "row at page {}, slot {} has been deleted",
-                row_id.page.0, row_id.slot
+                "row at page {}, slot {}, generation {} has been deleted",
+                row_id.page.0, row_id.slot, row_id.generation
+            ),
+            Self::StaleRowId {
+                row_id,
+                actual_generation,
+            } => write!(
+                formatter,
+                "row locator at page {}, slot {} has stale generation {}; current generation is {actual_generation}",
+                row_id.page.0, row_id.slot, row_id.generation
             ),
             Self::RowTooLarge { size, capacity } => write!(
                 formatter,

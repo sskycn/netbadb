@@ -135,8 +135,9 @@ remains v2 and canonical schema encoding remains v1.
   corruption, rollback, and crash tests are complemented by a bounded public
   Page decoder fuzz target.
 
-Page versions 1 through 3 remain unsupported experimental formats. Page 0
-retains heap metadata v2 and is outside Page v4 checksum coverage. WAL v3,
+Page v5 retains this checksum unchanged while extending slot entries with a
+generation; versions 1 through 4 are unsupported experimental formats. Page 0
+retains heap metadata v2 and is outside data-page checksum coverage. WAL v3,
 record v2, heap metadata v2, and canonical schema v1 are unchanged. Page CRC
 detects persistent data-page corruption independently of WAL CRC after log
 recycling; neither checksum repairs corruption nor authenticates malicious
@@ -164,7 +165,7 @@ DML, joins, sorting, aggregation, indexes, or explain output.
   and DELETE plans;
 - explicit `AffectedRows(u64)` results and SELECT-compatible `execute`;
 - stable-RowId page delete/replace primitives, version 3 tombstones, and
-  deterministic page compaction without slot reuse;
+  deterministic page compaction (later superseded by generation-safe reuse);
 - sequential target collection with shared three-valued predicates and
   simultaneous UPDATE assignments;
 - implicit statement transactions and explicit multi-statement transaction
@@ -228,6 +229,11 @@ sorting or aggregation.
 
 ## Phase 4 — Indexing and planning
 
+- Phase 4A complete: Page v5 stores a nonzero generation in every slot;
+  tombstones retain it, deterministic reuse increments it without wrap, and
+  stale RowIds are rejected before accessing a replacement occupant;
+- Phase 4A recovery complete: full-page WAL redo preserves committed reuse and
+  before-image undo restores the prior tombstone generation;
 - B+Tree index crate;
 - index scan physical operator;
 - catalog statistics;
