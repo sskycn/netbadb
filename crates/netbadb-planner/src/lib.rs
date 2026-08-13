@@ -1,6 +1,8 @@
 //! Physical planning kept separate from logical relational meaning.
 
-use netbadb_rel::{Assignment, ColumnRef, Expr, JoinKind, LogicalStatement, SortKey};
+use netbadb_rel::{
+    AggregateExpr, Assignment, ColumnRef, Expr, JoinKind, LogicalStatement, OutputField, SortKey,
+};
 use netbadb_types::{RelationBindingId, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +32,10 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         columns: Vec<ColumnRef>,
     },
+    Aggregate {
+        input: Box<PhysicalPlan>,
+        aggregates: Vec<AggregateExpr>,
+    },
     Limit {
         input: Box<PhysicalPlan>,
         limit: u64,
@@ -57,13 +63,19 @@ pub enum PhysicalStatement {
 
 impl PhysicalPlan {
     #[must_use]
-    pub fn output_columns(&self) -> &[ColumnRef] {
+    pub fn output_fields(&self) -> Vec<OutputField> {
         match self {
             Self::SeqScan { columns, .. }
             | Self::NestedLoopJoin { columns, .. }
-            | Self::Project { columns, .. } => columns,
+            | Self::Project { columns, .. } => {
+                columns.iter().cloned().map(OutputField::Source).collect()
+            }
+            Self::Aggregate { aggregates, .. } => aggregates
+                .iter()
+                .map(|aggregate| OutputField::Derived(aggregate.output.clone()))
+                .collect(),
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
-                input.output_columns()
+                input.output_fields()
             }
         }
     }
@@ -107,6 +119,10 @@ pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
         netbadb_rel::LogicalPlan::Project { input, columns } => PhysicalPlan::Project {
             input: Box::new(plan(input)),
             columns: columns.clone(),
+        },
+        netbadb_rel::LogicalPlan::Aggregate { input, aggregates } => PhysicalPlan::Aggregate {
+            input: Box::new(plan(input)),
+            aggregates: aggregates.clone(),
         },
         netbadb_rel::LogicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
             input: Box::new(plan(input)),
@@ -246,11 +262,50 @@ mod tests {
                 null_order: netbadb_rel::NullOrder::Last,
             }],
         };
-        assert_eq!(logical.output_columns(), &[column]);
+        assert_eq!(
+            logical.output_fields(),
+            vec![netbadb_rel::OutputField::Source(column)]
+        );
         assert!(matches!(
             plan(&logical),
             PhysicalPlan::Sort { keys, .. }
                 if keys[0].direction == netbadb_rel::SortDirection::Desc
         ));
+    }
+
+    #[test]
+    fn lowers_global_aggregate_with_derived_output_fields() {
+        let column = ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(1),
+            relation_name: "users".into(),
+            name: "score".into(),
+            data_type: SemanticType::physical(PhysicalType::Int64),
+            nullable: true,
+        };
+        let logical = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: vec![column.clone()],
+            }),
+            aggregates: vec![netbadb_rel::AggregateExpr {
+                function: netbadb_rel::AggregateFunction::Min,
+                input: netbadb_rel::AggregateInput::Column(column),
+                output: netbadb_rel::DerivedField {
+                    name: "MIN(score)".into(),
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: true,
+                },
+            }],
+        };
+        let physical = plan(&logical);
+        assert!(matches!(
+            physical.output_fields().as_slice(),
+            [netbadb_rel::OutputField::Derived(field)] if field.name == "MIN(score)"
+        ));
+        assert!(matches!(physical, PhysicalPlan::Aggregate { .. }));
     }
 }

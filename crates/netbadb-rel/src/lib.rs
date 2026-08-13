@@ -13,6 +13,55 @@ pub struct ColumnRef {
     pub nullable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Metadata for a computed result field that has no catalog column identity.
+pub struct DerivedField {
+    pub name: String,
+    pub data_type: SemanticType,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A plan output is either a resolvable source column or a derived value.
+pub enum OutputField {
+    Source(ColumnRef),
+    Derived(DerivedField),
+}
+
+impl OutputField {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Source(column) => &column.name,
+            Self::Derived(field) => &field.name,
+        }
+    }
+
+    #[must_use]
+    pub fn data_type(&self) -> &SemanticType {
+        match self {
+            Self::Source(column) => &column.data_type,
+            Self::Derived(field) => &field.data_type,
+        }
+    }
+
+    #[must_use]
+    pub const fn nullable(&self) -> bool {
+        match self {
+            Self::Source(column) => column.nullable,
+            Self::Derived(field) => field.nullable,
+        }
+    }
+
+    #[must_use]
+    pub const fn source_column(&self) -> Option<&ColumnRef> {
+        match self {
+            Self::Source(column) => Some(column),
+            Self::Derived(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
@@ -35,6 +84,39 @@ pub struct SortKey {
     pub column: ColumnRef,
     pub direction: SortDirection,
     pub null_order: NullOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+impl AggregateFunction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "COUNT",
+            Self::Sum => "SUM",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateInput {
+    All,
+    Column(ColumnRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateExpr {
+    pub function: AggregateFunction,
+    pub input: AggregateInput,
+    pub output: DerivedField,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +188,10 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         columns: Vec<ColumnRef>,
     },
+    Aggregate {
+        input: Box<LogicalPlan>,
+        aggregates: Vec<AggregateExpr>,
+    },
     Limit {
         input: Box<LogicalPlan>,
         limit: u64,
@@ -139,13 +225,19 @@ pub enum LogicalStatement {
 
 impl LogicalPlan {
     #[must_use]
-    pub fn output_columns(&self) -> &[ColumnRef] {
+    pub fn output_fields(&self) -> Vec<OutputField> {
         match self {
             Self::Scan { columns, .. }
             | Self::Join { columns, .. }
-            | Self::Project { columns, .. } => columns,
+            | Self::Project { columns, .. } => {
+                columns.iter().cloned().map(OutputField::Source).collect()
+            }
+            Self::Aggregate { aggregates, .. } => aggregates
+                .iter()
+                .map(|aggregate| OutputField::Derived(aggregate.output.clone()))
+                .collect(),
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
-                input.output_columns()
+                input.output_fields()
             }
         }
     }

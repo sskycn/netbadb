@@ -148,6 +148,51 @@ preserves input order among equal keys for the current plan, but does not
 promise a permanent tie order if future access paths change. A caller that
 requires a total order must provide enough keys.
 
+## Typed global aggregates
+
+Aggregate function names are contextual only in SELECT projection. A plain
+identifier such as `count` remains a source column, while `COUNT(*)` or
+`COUNT(column)` is an aggregate. Aggregate arguments are limited to `*` for
+COUNT and qualified or unqualified source columns for all four functions. HIR
+resolves column inputs through the complete relation scope and rejects mixed
+source/aggregate projection because `GROUP BY` does not yet exist. Aggregate
+queries also reject `ORDER BY` in this slice.
+
+Normal and aggregate plans remain distinct:
+
+```text
+Scan/Join -> Filter -> Sort -> Project -> Limit
+Scan/Join -> Filter -> Aggregate -> Limit
+```
+
+An `OutputField` separates source identity from result metadata. Source fields
+retain their `RelationBindingId + TableId + ColumnId`; a `DerivedField` carries
+only its deterministic name, semantic type, and nullability. Consequently,
+`COUNT(*)` never receives fabricated catalog or query-source IDs. Logical and
+physical Aggregate operators own typed aggregate expressions and produce the
+derived fields directly rather than disguising aggregation as projection.
+
+The global aggregate executor materializes its input once and updates every
+aggregate state in one pass. Even zero input rows form one implicit group:
+COUNT returns zero, while SUM/MIN/MAX return NULL. LIMIT is above Aggregate, so
+LIMIT 0 removes that result row rather than limiting aggregate input. Runtime
+column values are checked against their typed physical inputs and SUM uses
+checked signed or unsigned addition.
+
+Aggregate type and NULL rules are:
+
+- `COUNT(*)` counts every row; `COUNT(column)` ignores NULL. Both return a
+  non-null physical `UInt64`.
+- `SUM` accepts only `Int64` and `UInt64`, ignores NULL, and is nullable because
+  empty/all-NULL input returns NULL. Its result is an unnamed physical numeric
+  type even when the input is nominal, because a sum is not one input identity.
+- `MIN` and `MAX` accept Bool, Int64, UInt64, and Text using the existing value
+  comparison, ignore NULL, and are nullable for empty/all-NULL input. They
+  preserve the input `SemanticType` because the result is an input value.
+
+There is no grouping, HAVING, DISTINCT aggregate, alias, aggregate expression,
+nested aggregate, or aggregate-aware ordering in this foundation slice.
+
 ## Typed expressions and NULL
 
 Database NULL is an explicit `ScalarValue::Null`; it is not represented by

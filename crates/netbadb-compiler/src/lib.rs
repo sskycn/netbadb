@@ -4,14 +4,16 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_hir::{
-    ColumnRef as HirColumnRef, HirError, NullOrder as HirNullOrder,
-    SortDirection as HirSortDirection, TypedExpr, TypedExprKind, TypedQuery, TypedRelation,
+    AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
+    NullOrder as HirNullOrder, SortDirection as HirSortDirection, TypedAggregate,
+    TypedAggregateInput, TypedExpr, TypedExprKind, TypedProjectionItem, TypedQuery, TypedRelation,
     TypedStatement,
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
-    Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement,
-    NullOrder, SortDirection, SortKey, UnaryOp,
+    AggregateExpr, AggregateFunction, AggregateInput, Assignment, BinaryOp, ColumnRef,
+    DerivedField, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement, NullOrder,
+    SortDirection, SortKey, UnaryOp,
 };
 use netbadb_schema::Schema;
 
@@ -120,16 +122,21 @@ fn lower_statement(statement: &TypedStatement) -> LogicalStatement {
 
 fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
     let mut plan = lower_scan(&query.from);
+    let mut visible_columns = query
+        .from
+        .columns
+        .iter()
+        .map(column_ref_from_hir)
+        .collect::<Vec<_>>();
     for join in &query.joins {
         let right = lower_scan(&join.right);
-        let mut columns = plan.output_columns().to_vec();
-        columns.extend_from_slice(right.output_columns());
+        visible_columns.extend(join.right.columns.iter().map(column_ref_from_hir));
         plan = LogicalPlan::Join {
             left: Box::new(plan),
             right: Box::new(right),
             kind: JoinKind::Inner,
             predicate: lower_expr(&join.predicate),
-            columns,
+            columns: visible_columns.clone(),
         };
     }
     if let Some(predicate) = &query.selection {
@@ -138,30 +145,49 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
             predicate: lower_expr(predicate),
         };
     }
-    if !query.order_by.is_empty() {
-        plan = LogicalPlan::Sort {
+    let aggregates = query
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            TypedProjectionItem::Aggregate(aggregate) => Some(lower_aggregate(aggregate)),
+            TypedProjectionItem::Column(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if !aggregates.is_empty() {
+        plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
-            keys: query
-                .order_by
+            aggregates,
+        };
+    } else {
+        if !query.order_by.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                keys: query
+                    .order_by
+                    .iter()
+                    .map(|key| SortKey {
+                        column: column_ref_from_hir(&key.column),
+                        direction: match key.direction {
+                            HirSortDirection::Asc => SortDirection::Asc,
+                            HirSortDirection::Desc => SortDirection::Desc,
+                        },
+                        null_order: match key.null_order {
+                            HirNullOrder::First => NullOrder::First,
+                            HirNullOrder::Last => NullOrder::Last,
+                        },
+                    })
+                    .collect(),
+            };
+        }
+        plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            columns: query
+                .projection
                 .iter()
-                .map(|key| SortKey {
-                    column: column_ref_from_hir(&key.column),
-                    direction: match key.direction {
-                        HirSortDirection::Asc => SortDirection::Asc,
-                        HirSortDirection::Desc => SortDirection::Desc,
-                    },
-                    null_order: match key.null_order {
-                        HirNullOrder::First => NullOrder::First,
-                        HirNullOrder::Last => NullOrder::Last,
-                    },
-                })
+                .filter_map(|item| item.source_column().map(column_ref_from_hir))
                 .collect(),
         };
     }
-    plan = LogicalPlan::Project {
-        input: Box::new(plan),
-        columns: query.projection.iter().map(column_ref_from_hir).collect(),
-    };
     if let Some(limit) = query.limit {
         plan = LogicalPlan::Limit {
             input: Box::new(plan),
@@ -169,6 +195,28 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
         };
     }
     plan
+}
+
+fn lower_aggregate(aggregate: &TypedAggregate) -> AggregateExpr {
+    AggregateExpr {
+        function: match aggregate.function {
+            HirAggregateFunction::Count => AggregateFunction::Count,
+            HirAggregateFunction::Sum => AggregateFunction::Sum,
+            HirAggregateFunction::Min => AggregateFunction::Min,
+            HirAggregateFunction::Max => AggregateFunction::Max,
+        },
+        input: match &aggregate.input {
+            TypedAggregateInput::All => AggregateInput::All,
+            TypedAggregateInput::Column(column) => {
+                AggregateInput::Column(column_ref_from_hir(column))
+            }
+        },
+        output: DerivedField {
+            name: aggregate.output_name.clone(),
+            data_type: aggregate.expr_type.data_type.clone(),
+            nullable: aggregate.expr_type.nullable,
+        },
+    }
 }
 
 fn lower_scan(relation: &TypedRelation) -> LogicalPlan {
@@ -265,7 +313,10 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::{compile, compile_statement};
-    use netbadb_rel::{ExprKind, LogicalPlan, LogicalStatement, NullOrder, SortDirection};
+    use netbadb_rel::{
+        AggregateFunction, ExprKind, LogicalPlan, LogicalStatement, NullOrder, OutputField,
+        SortDirection,
+    };
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
 
@@ -282,7 +333,7 @@ mod tests {
         .expect("valid test schema");
         let compiled =
             compile(&schema, "SELECT name FROM users WHERE id >= 2 LIMIT 1").expect("compile");
-        assert_eq!(compiled.logical_plan.output_columns().len(), 1);
+        assert_eq!(compiled.logical_plan.output_fields().len(), 1);
         assert_eq!(compiled.hir.limit, Some(1));
     }
 
@@ -348,6 +399,45 @@ mod tests {
         assert_eq!(keys[0].column.name, "id");
         assert_eq!(keys[0].direction, SortDirection::Desc);
         assert_eq!(keys[0].null_order, NullOrder::First);
+        assert!(matches!(*input, LogicalPlan::Filter { .. }));
+    }
+
+    #[test]
+    fn places_global_aggregate_after_filter_and_before_limit() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "score",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+            ],
+        )])
+        .expect("valid test schema");
+        let compiled = compile(
+            &schema,
+            "SELECT COUNT(*), SUM(score) FROM users WHERE id > 0 LIMIT 0",
+        )
+        .expect("compile aggregate");
+        assert!(matches!(
+            compiled.logical_plan.output_fields().as_slice(),
+            [OutputField::Derived(count), OutputField::Derived(sum)]
+                if count.name == "COUNT(*)" && !count.nullable
+                    && sum.name == "SUM(score)" && sum.nullable
+        ));
+        let LogicalPlan::Limit { input, limit: 0 } = compiled.logical_plan else {
+            panic!("expected limit");
+        };
+        let LogicalPlan::Aggregate { input, aggregates } = *input else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(aggregates.len(), 2);
+        assert_eq!(aggregates[0].function, AggregateFunction::Count);
+        assert_eq!(aggregates[1].function, AggregateFunction::Sum);
         assert!(matches!(*input, LogicalPlan::Filter { .. }));
     }
 

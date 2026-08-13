@@ -6,7 +6,8 @@ use std::fmt;
 
 use netbadb_planner::{PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
-    Assignment, BinaryOp, ColumnRef, Expr, ExprKind, NullOrder, SortDirection, SortKey, UnaryOp,
+    AggregateExpr, AggregateFunction, AggregateInput, Assignment, BinaryOp, ColumnRef, Expr,
+    ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_storage::{HeapStorage, StorageError, Transaction};
 use netbadb_types::{RowId, ScalarValue, TableId};
@@ -38,9 +39,19 @@ pub enum ExecutionError {
     TypeMismatch,
     TransactionRequired,
     AffectedRowsOverflow,
+    AggregateOverflow {
+        function: AggregateFunction,
+        output: String,
+    },
+    InvalidAggregateInput {
+        function: AggregateFunction,
+    },
     MissingRowIdentity,
     MissingTableStorage(TableId),
-    TableMismatch { planned: TableId, storage: TableId },
+    TableMismatch {
+        planned: TableId,
+        storage: TableId,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -59,6 +70,18 @@ impl fmt::Display for ExecutionError {
                 formatter.write_str("a mutating statement requires an active transaction")
             }
             Self::AffectedRowsOverflow => formatter.write_str("affected row count overflowed u64"),
+            Self::AggregateOverflow { function, output } => write!(
+                formatter,
+                "{} overflowed while computing `{output}`",
+                function.as_str()
+            ),
+            Self::InvalidAggregateInput { function } => {
+                write!(
+                    formatter,
+                    "{} does not accept `*` as input",
+                    function.as_str()
+                )
+            }
             Self::MissingRowIdentity => {
                 formatter.write_str("mutation input does not contain a base row identity")
             }
@@ -105,12 +128,12 @@ pub fn execute_with_storages(
     let result = execute_rows(plan, storages)?;
     Ok(QueryResult {
         columns: result
-            .columns
+            .fields
             .into_iter()
-            .map(|column| ResultColumn {
-                name: column.name,
-                data_type: column.data_type,
-                nullable: column.nullable,
+            .map(|field| ResultColumn {
+                name: field.name().to_owned(),
+                data_type: field.data_type().clone(),
+                nullable: field.nullable(),
             })
             .collect(),
         rows: result.rows.into_iter().map(|row| row.values).collect(),
@@ -180,7 +203,7 @@ struct ExecutionRow {
 
 #[derive(Debug)]
 struct ExecutionRows {
-    columns: Vec<ColumnRef>,
+    fields: Vec<OutputField>,
     rows: Vec<ExecutionRow>,
 }
 
@@ -202,7 +225,7 @@ fn execute_rows(
                 })
                 .collect();
             Ok(ExecutionRows {
-                columns: columns.clone(),
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
             })
         }
@@ -215,6 +238,11 @@ fn execute_rows(
         } => {
             let left = execute_rows(left, storages)?;
             let right = execute_rows(right, storages)?;
+            let fields = columns
+                .iter()
+                .cloned()
+                .map(OutputField::Source)
+                .collect::<Vec<_>>();
             let mut rows = Vec::new();
             for left_row in left.rows {
                 for right_row in &right.rows {
@@ -223,7 +251,7 @@ fn execute_rows(
                     );
                     values.extend(left_row.values.iter().cloned());
                     values.extend(right_row.values.iter().cloned());
-                    if evaluate_truth(predicate, &values, columns)? == TruthValue::True {
+                    if evaluate_truth(predicate, &values, &fields)? == TruthValue::True {
                         rows.push(ExecutionRow {
                             row_id: None,
                             values,
@@ -232,18 +260,18 @@ fn execute_rows(
                 }
             }
             Ok(ExecutionRows {
-                columns: columns.clone(),
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
             })
         }
         PhysicalPlan::Filter { input, predicate } => {
             let mut result = execute_rows(input, storages)?;
-            let columns = result.columns.clone();
+            let fields = result.fields.clone();
             result.rows = result
                 .rows
                 .into_iter()
                 .filter_map(
-                    |row| match evaluate_truth(predicate, &row.values, &columns) {
+                    |row| match evaluate_truth(predicate, &row.values, &fields) {
                         Ok(TruthValue::True) => Some(Ok(row)),
                         Ok(TruthValue::False | TruthValue::Unknown) => None,
                         Err(error) => Some(Err(error)),
@@ -254,7 +282,7 @@ fn execute_rows(
         }
         PhysicalPlan::Sort { input, keys } => {
             let mut result = execute_rows(input, storages)?;
-            let positions = resolve_sort_positions(&result.columns, keys)?;
+            let positions = resolve_sort_positions(&result.fields, keys)?;
             validate_sort_values(&result.rows, &positions, keys)?;
 
             let mut comparison_error = None;
@@ -279,16 +307,7 @@ fn execute_rows(
             let input_result = execute_rows(input, storages)?;
             let positions = columns
                 .iter()
-                .map(|column| {
-                    input_result
-                        .columns
-                        .iter()
-                        .position(|candidate| {
-                            candidate.binding_id == column.binding_id
-                                && candidate.column_id == column.column_id
-                        })
-                        .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
-                })
+                .map(|column| find_source_position(&input_result.fields, column))
                 .collect::<Result<Vec<_>, _>>()?;
             let rows = input_result
                 .rows
@@ -305,9 +324,13 @@ fn execute_rows(
                 })
                 .collect();
             Ok(ExecutionRows {
-                columns: columns.clone(),
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
             })
+        }
+        PhysicalPlan::Aggregate { input, aggregates } => {
+            let input = execute_rows(input, storages)?;
+            execute_aggregate(input, aggregates)
         }
         PhysicalPlan::Limit { input, limit } => {
             let mut result = execute_rows(input, storages)?;
@@ -319,19 +342,11 @@ fn execute_rows(
 }
 
 fn resolve_sort_positions(
-    columns: &[ColumnRef],
+    fields: &[OutputField],
     keys: &[SortKey],
 ) -> Result<Vec<usize>, ExecutionError> {
     keys.iter()
-        .map(|key| {
-            columns
-                .iter()
-                .position(|candidate| {
-                    candidate.binding_id == key.column.binding_id
-                        && candidate.column_id == key.column.column_id
-                })
-                .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))
-        })
+        .map(|key| find_source_position(fields, &key.column))
         .collect()
 }
 
@@ -402,6 +417,190 @@ fn compare_sort_values(
     }
 }
 
+fn find_source_position(
+    fields: &[OutputField],
+    column: &ColumnRef,
+) -> Result<usize, ExecutionError> {
+    fields
+        .iter()
+        .position(|field| {
+            field.source_column().is_some_and(|candidate| {
+                candidate.binding_id == column.binding_id && candidate.column_id == column.column_id
+            })
+        })
+        .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
+}
+
+#[derive(Debug)]
+enum AggregateState {
+    Count(u64),
+    SumInt(Option<i64>),
+    SumUInt(Option<u64>),
+    Min(Option<ScalarValue>),
+    Max(Option<ScalarValue>),
+}
+
+fn execute_aggregate(
+    input: ExecutionRows,
+    aggregates: &[AggregateExpr],
+) -> Result<ExecutionRows, ExecutionError> {
+    for aggregate in aggregates {
+        if matches!(aggregate.input, AggregateInput::All)
+            && aggregate.function != AggregateFunction::Count
+        {
+            return Err(ExecutionError::InvalidAggregateInput {
+                function: aggregate.function,
+            });
+        }
+    }
+    let positions = aggregates
+        .iter()
+        .map(|aggregate| match &aggregate.input {
+            AggregateInput::All => Ok(None),
+            AggregateInput::Column(column) => find_source_position(&input.fields, column).map(Some),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut states = aggregates
+        .iter()
+        .map(initial_aggregate_state)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for row in &input.rows {
+        for ((aggregate, position), state) in aggregates.iter().zip(&positions).zip(&mut states) {
+            let value = match position {
+                Some(position) => {
+                    let value = row.values.get(*position).ok_or_else(|| {
+                        let name = match &aggregate.input {
+                            AggregateInput::Column(column) => column.name.clone(),
+                            AggregateInput::All => aggregate.output.name.clone(),
+                        };
+                        ExecutionError::MissingColumn(name)
+                    })?;
+                    let AggregateInput::Column(column) = &aggregate.input else {
+                        return Err(ExecutionError::TypeMismatch);
+                    };
+                    if !value.matches_type(&column.data_type) {
+                        return Err(ExecutionError::TypeMismatch);
+                    }
+                    Some(value)
+                }
+                None => None,
+            };
+            update_aggregate_state(state, aggregate, value)?;
+        }
+    }
+
+    let values = states.into_iter().map(finalize_aggregate_state).collect();
+    Ok(ExecutionRows {
+        fields: aggregates
+            .iter()
+            .map(|aggregate| OutputField::Derived(aggregate.output.clone()))
+            .collect(),
+        rows: vec![ExecutionRow {
+            row_id: None,
+            values,
+        }],
+    })
+}
+
+fn initial_aggregate_state(aggregate: &AggregateExpr) -> Result<AggregateState, ExecutionError> {
+    match aggregate.function {
+        AggregateFunction::Count => Ok(AggregateState::Count(0)),
+        AggregateFunction::Sum => match aggregate.output.data_type.physical {
+            netbadb_types::PhysicalType::Int64 => Ok(AggregateState::SumInt(None)),
+            netbadb_types::PhysicalType::UInt64 => Ok(AggregateState::SumUInt(None)),
+            netbadb_types::PhysicalType::Bool | netbadb_types::PhysicalType::Text => {
+                Err(ExecutionError::TypeMismatch)
+            }
+        },
+        AggregateFunction::Min => Ok(AggregateState::Min(None)),
+        AggregateFunction::Max => Ok(AggregateState::Max(None)),
+    }
+}
+
+fn update_aggregate_state(
+    state: &mut AggregateState,
+    aggregate: &AggregateExpr,
+    value: Option<&ScalarValue>,
+) -> Result<(), ExecutionError> {
+    match state {
+        AggregateState::Count(count) => {
+            if value.is_none_or(|value| !matches!(value, ScalarValue::Null)) {
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| aggregate_overflow(aggregate))?;
+            }
+        }
+        AggregateState::SumInt(sum) => {
+            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
+                let ScalarValue::Int64(value) = value else {
+                    return Err(ExecutionError::TypeMismatch);
+                };
+                *sum = Some(match sum {
+                    Some(sum) => sum
+                        .checked_add(*value)
+                        .ok_or_else(|| aggregate_overflow(aggregate))?,
+                    None => *value,
+                });
+            }
+        }
+        AggregateState::SumUInt(sum) => {
+            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
+                let ScalarValue::UInt64(value) = value else {
+                    return Err(ExecutionError::TypeMismatch);
+                };
+                *sum = Some(match sum {
+                    Some(sum) => sum
+                        .checked_add(*value)
+                        .ok_or_else(|| aggregate_overflow(aggregate))?,
+                    None => *value,
+                });
+            }
+        }
+        AggregateState::Min(current) => {
+            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
+                let replace = match current {
+                    None => true,
+                    Some(current) => compare_values(value, current)? == Ordering::Less,
+                };
+                if replace {
+                    *current = Some(value.clone());
+                }
+            }
+        }
+        AggregateState::Max(current) => {
+            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
+                let replace = match current {
+                    None => true,
+                    Some(current) => compare_values(value, current)? == Ordering::Greater,
+                };
+                if replace {
+                    *current = Some(value.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_overflow(aggregate: &AggregateExpr) -> ExecutionError {
+    ExecutionError::AggregateOverflow {
+        function: aggregate.function,
+        output: aggregate.output.name.clone(),
+    }
+}
+
+fn finalize_aggregate_state(state: AggregateState) -> ScalarValue {
+    match state {
+        AggregateState::Count(value) => ScalarValue::UInt64(value),
+        AggregateState::SumInt(value) => value.map_or(ScalarValue::Null, ScalarValue::Int64),
+        AggregateState::SumUInt(value) => value.map_or(ScalarValue::Null, ScalarValue::UInt64),
+        AggregateState::Min(value) | AggregateState::Max(value) => {
+            value.unwrap_or(ScalarValue::Null)
+        }
+    }
+}
+
 fn storage_for_table(
     storages: &mut [HeapStorage],
     table_id: TableId,
@@ -434,17 +633,8 @@ fn build_replacements(
             let evaluated = assignments
                 .iter()
                 .map(|assignment| {
-                    let position = input
-                        .columns
-                        .iter()
-                        .position(|column| {
-                            column.binding_id == assignment.column.binding_id
-                                && column.column_id == assignment.column.column_id
-                        })
-                        .ok_or_else(|| {
-                            ExecutionError::MissingColumn(assignment.column.name.clone())
-                        })?;
-                    let value = evaluate(&assignment.value, &row.values, &input.columns)?;
+                    let position = find_source_position(&input.fields, &assignment.column)?;
+                    let value = evaluate(&assignment.value, &row.values, &input.fields)?;
                     Ok((position, value))
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
@@ -463,17 +653,11 @@ fn build_replacements(
 fn evaluate(
     expression: &Expr,
     row: &[ScalarValue],
-    columns: &[ColumnRef],
+    fields: &[OutputField],
 ) -> Result<ScalarValue, ExecutionError> {
     match &expression.kind {
         ExprKind::Column(column) => {
-            let position = columns
-                .iter()
-                .position(|candidate| {
-                    candidate.binding_id == column.binding_id
-                        && candidate.column_id == column.column_id
-                })
-                .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+            let position = find_source_position(fields, column)?;
             row.get(position)
                 .cloned()
                 .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
@@ -484,21 +668,19 @@ fn evaluate(
             left,
             right,
         } => {
-            let left = evaluate(left, row, columns)?;
-            let right = evaluate(right, row, columns)?;
+            let left = evaluate(left, row, fields)?;
+            let right = evaluate(right, row, fields)?;
             evaluate_binary(*operator, left, right)
         }
         ExprKind::Unary {
             operator: UnaryOp::Not,
             expression,
-        } => Ok(evaluate_truth(expression, row, columns)?
-            .not()
-            .into_scalar()),
+        } => Ok(evaluate_truth(expression, row, fields)?.not().into_scalar()),
         ExprKind::IsNull {
             expression,
             negated,
         } => {
-            let is_null = matches!(evaluate(expression, row, columns)?, ScalarValue::Null);
+            let is_null = matches!(evaluate(expression, row, fields)?, ScalarValue::Null);
             Ok(ScalarValue::Bool(if *negated { !is_null } else { is_null }))
         }
     }
@@ -507,9 +689,9 @@ fn evaluate(
 fn evaluate_truth(
     expression: &Expr,
     row: &[ScalarValue],
-    columns: &[ColumnRef],
+    fields: &[OutputField],
 ) -> Result<TruthValue, ExecutionError> {
-    TruthValue::from_scalar(evaluate(expression, row, columns)?)
+    TruthValue::from_scalar(evaluate(expression, row, fields)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,7 +799,8 @@ mod tests {
     use super::{ExecutionError, QueryResult, TruthValue, evaluate_binary, execute};
     use netbadb_planner::plan;
     use netbadb_rel::{
-        BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
+        AggregateExpr, AggregateFunction, AggregateInput, BinaryOp, ColumnRef, DerivedField, Expr,
+        ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
@@ -921,6 +1104,129 @@ mod tests {
             Err(ExecutionError::TypeMismatch)
         ));
 
+        storage.close().expect("close storage");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn global_aggregate_reports_checked_numeric_overflow_and_runtime_mismatch() {
+        let table = TableDef::new(
+            TableId(3),
+            "numbers",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "signed",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                ),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "unsigned",
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                ),
+            ],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-aggregate-overflow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut storage = HeapStorage::create(&path, table).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(i64::MAX), ScalarValue::UInt64(u64::MAX)])
+            .expect("insert max values");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::UInt64(1)])
+            .expect("insert overflow values");
+        let column = |id: u32, name: &str, physical| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(3),
+            column_id: ColumnId(id),
+            relation_name: "numbers".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable: false,
+        };
+        let signed = column(1, "signed", PhysicalType::Int64);
+        let unsigned = column(2, "unsigned", PhysicalType::UInt64);
+        let scan = || LogicalPlan::Scan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(3),
+            table_name: "numbers".into(),
+            columns: vec![signed.clone(), unsigned.clone()],
+        };
+        let sum = |input: ColumnRef, physical, name: &str| LogicalPlan::Aggregate {
+            input: Box::new(scan()),
+            aggregates: vec![AggregateExpr {
+                function: AggregateFunction::Sum,
+                input: AggregateInput::Column(input),
+                output: DerivedField {
+                    name: name.into(),
+                    data_type: SemanticType::physical(physical),
+                    nullable: true,
+                },
+            }],
+        };
+        assert!(matches!(
+            execute(
+                &plan(&sum(signed.clone(), PhysicalType::Int64, "SUM(signed)")),
+                &mut storage
+            ),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Sum,
+                ..
+            })
+        ));
+        assert!(matches!(
+            execute(
+                &plan(&sum(
+                    unsigned.clone(),
+                    PhysicalType::UInt64,
+                    "SUM(unsigned)"
+                )),
+                &mut storage
+            ),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Sum,
+                ..
+            })
+        ));
+
+        let mut mismatched = signed.clone();
+        mismatched.data_type = SemanticType::physical(PhysicalType::UInt64);
+        assert!(matches!(
+            execute(
+                &plan(&sum(mismatched, PhysicalType::UInt64, "SUM(signed)")),
+                &mut storage
+            ),
+            Err(ExecutionError::TypeMismatch)
+        ));
+
+        for function in [
+            AggregateFunction::Sum,
+            AggregateFunction::Min,
+            AggregateFunction::Max,
+        ] {
+            let invalid = LogicalPlan::Aggregate {
+                input: Box::new(scan()),
+                aggregates: vec![AggregateExpr {
+                    function,
+                    input: AggregateInput::All,
+                    output: DerivedField {
+                        name: format!("{}(*)", function.as_str()),
+                        data_type: SemanticType::physical(PhysicalType::Int64),
+                        nullable: true,
+                    },
+                }],
+            };
+            assert!(matches!(
+                execute(&plan(&invalid), &mut storage),
+                Err(ExecutionError::InvalidAggregateInput {
+                    function: actual
+                }) if actual == function
+            ));
+        }
         storage.close().expect("close storage");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));

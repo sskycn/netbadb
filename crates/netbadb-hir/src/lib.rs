@@ -5,9 +5,10 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_parser::{
-    BinaryOp as AstBinaryOp, ColumnName, Expr as AstExpr, FromItem, Ident, Literal,
-    NullOrder as AstNullOrder, Query, SortDirection as AstSortDirection, Span,
-    Statement as AstStatement, UnaryOp as AstUnaryOp,
+    AggregateArgument as AstAggregateArgument, AggregateCall as AstAggregateCall,
+    AggregateFunction as AstAggregateFunction, BinaryOp as AstBinaryOp, ColumnName,
+    Expr as AstExpr, FromItem, Ident, Literal, NullOrder as AstNullOrder, Query,
+    SortDirection as AstSortDirection, Span, Statement as AstStatement, UnaryOp as AstUnaryOp,
 };
 use netbadb_schema::{Schema, TableDef};
 use netbadb_types::{
@@ -67,6 +68,57 @@ pub struct TypedOrderKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+impl AggregateFunction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "COUNT",
+            Self::Sum => "SUM",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedAggregateInput {
+    All,
+    Column(ColumnRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedAggregate {
+    pub function: AggregateFunction,
+    pub input: TypedAggregateInput,
+    pub expr_type: ExprType,
+    pub output_name: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedProjectionItem {
+    Column(ColumnRef),
+    Aggregate(TypedAggregate),
+}
+
+impl TypedProjectionItem {
+    #[must_use]
+    pub const fn source_column(&self) -> Option<&ColumnRef> {
+        match self {
+            Self::Column(column) => Some(column),
+            Self::Aggregate(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Eq,
     NotEq,
@@ -114,7 +166,7 @@ pub struct TypedQuery {
     pub from: TypedRelation,
     pub joins: Vec<TypedJoin>,
     pub columns: Vec<ColumnRef>,
-    pub projection: Vec<ColumnRef>,
+    pub projection: Vec<TypedProjectionItem>,
     pub selection: Option<TypedExpr>,
     pub order_by: Vec<TypedOrderKey>,
     pub limit: Option<u64>,
@@ -218,6 +270,21 @@ pub enum HirError {
     InsertValueReferencesColumn {
         span: Span,
     },
+    MixedAggregateProjection {
+        span: Span,
+    },
+    OrderByNotSupportedWithAggregate {
+        span: Span,
+    },
+    InvalidAggregateArgument {
+        function: AggregateFunction,
+        span: Span,
+    },
+    InvalidAggregateType {
+        function: AggregateFunction,
+        actual: SemanticType,
+        span: Span,
+    },
 }
 
 impl fmt::Display for HirError {
@@ -269,6 +336,18 @@ impl fmt::Display for HirError {
             Self::InsertValueReferencesColumn { .. } => {
                 formatter.write_str("INSERT VALUES expressions cannot reference table columns")
             }
+            Self::MixedAggregateProjection { .. } => formatter.write_str(
+                "global aggregate projection cannot include source columns without GROUP BY",
+            ),
+            Self::OrderByNotSupportedWithAggregate { .. } => {
+                formatter.write_str("ORDER BY is not supported for aggregate queries yet")
+            }
+            Self::InvalidAggregateArgument { function, .. } => {
+                write!(formatter, "{} requires a source column", function.as_str())
+            }
+            Self::InvalidAggregateType {
+                function, actual, ..
+            } => write!(formatter, "{} does not support {actual}", function.as_str()),
         }
     }
 }
@@ -303,19 +382,42 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         });
     }
 
+    let has_aggregate = query
+        .projection
+        .iter()
+        .any(|item| matches!(item, netbadb_parser::SelectItem::Aggregate(_)));
+    if has_aggregate
+        && query
+            .projection
+            .iter()
+            .any(|item| !matches!(item, netbadb_parser::SelectItem::Aggregate(_)))
+    {
+        return Err(HirError::MixedAggregateProjection {
+            span: select_item_span(&query.projection[0]),
+        });
+    }
+    if has_aggregate && !query.order_by.is_empty() {
+        return Err(HirError::OrderByNotSupportedWithAggregate {
+            span: query.order_by[0].span,
+        });
+    }
+
     let projection = query
         .projection
         .iter()
-        .try_fold(Vec::new(), |mut columns, item| {
+        .try_fold(Vec::new(), |mut projection, item| {
             match item {
                 netbadb_parser::SelectItem::Wildcard(_) => {
-                    columns.extend(scope.columns());
+                    projection.extend(scope.columns().into_iter().map(TypedProjectionItem::Column))
                 }
                 netbadb_parser::SelectItem::Column(column) => {
-                    columns.push(scope.resolve(column)?);
+                    projection.push(TypedProjectionItem::Column(scope.resolve(column)?));
                 }
+                netbadb_parser::SelectItem::Aggregate(aggregate) => projection.push(
+                    TypedProjectionItem::Aggregate(lower_aggregate(&scope, aggregate)?),
+                ),
             }
-            Ok::<_, HirError>(columns)
+            Ok::<_, HirError>(projection)
         })?;
 
     let selection = query
@@ -365,6 +467,103 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         order_by,
         limit: query.limit,
     })
+}
+
+fn lower_aggregate(
+    scope: &RelationScope<'_>,
+    aggregate: &AstAggregateCall,
+) -> Result<TypedAggregate, HirError> {
+    let function = match aggregate.function {
+        AstAggregateFunction::Count => AggregateFunction::Count,
+        AstAggregateFunction::Sum => AggregateFunction::Sum,
+        AstAggregateFunction::Min => AggregateFunction::Min,
+        AstAggregateFunction::Max => AggregateFunction::Max,
+    };
+    let input = match &aggregate.argument {
+        AstAggregateArgument::Star(_) if function == AggregateFunction::Count => {
+            TypedAggregateInput::All
+        }
+        AstAggregateArgument::Star(_) => {
+            return Err(HirError::InvalidAggregateArgument {
+                function,
+                span: aggregate.span,
+            });
+        }
+        AstAggregateArgument::Column(column) => TypedAggregateInput::Column(scope.resolve(column)?),
+    };
+    let expr_type = match function {
+        AggregateFunction::Count => ExprType {
+            data_type: SemanticType::physical(PhysicalType::UInt64),
+            nullable: false,
+        },
+        AggregateFunction::Sum => {
+            let TypedAggregateInput::Column(column) = &input else {
+                return Err(HirError::InvalidAggregateArgument {
+                    function,
+                    span: aggregate.span,
+                });
+            };
+            match column.data_type.physical {
+                PhysicalType::Int64 | PhysicalType::UInt64 => ExprType {
+                    data_type: SemanticType::physical(column.data_type.physical),
+                    nullable: true,
+                },
+                PhysicalType::Bool | PhysicalType::Text => {
+                    return Err(HirError::InvalidAggregateType {
+                        function,
+                        actual: column.data_type.clone(),
+                        span: aggregate.span,
+                    });
+                }
+            }
+        }
+        AggregateFunction::Min | AggregateFunction::Max => {
+            let TypedAggregateInput::Column(column) = &input else {
+                return Err(HirError::InvalidAggregateArgument {
+                    function,
+                    span: aggregate.span,
+                });
+            };
+            ExprType {
+                data_type: column.data_type.clone(),
+                nullable: true,
+            }
+        }
+    };
+    Ok(TypedAggregate {
+        function,
+        input,
+        expr_type,
+        output_name: aggregate_output_name(aggregate),
+        span: aggregate.span,
+    })
+}
+
+fn aggregate_output_name(aggregate: &AstAggregateCall) -> String {
+    let argument = match &aggregate.argument {
+        AstAggregateArgument::Star(_) => "*".to_owned(),
+        AstAggregateArgument::Column(column) => match &column.qualifier {
+            Some(qualifier) => format!("{}.{}", qualifier.name, column.name.name),
+            None => column.name.name.clone(),
+        },
+    };
+    format!(
+        "{}({argument})",
+        match aggregate.function {
+            AstAggregateFunction::Count => "COUNT",
+            AstAggregateFunction::Sum => "SUM",
+            AstAggregateFunction::Min => "MIN",
+            AstAggregateFunction::Max => "MAX",
+        }
+    )
+}
+
+fn select_item_span(item: &netbadb_parser::SelectItem) -> Span {
+    match item {
+        netbadb_parser::SelectItem::Wildcard(span) => *span,
+        netbadb_parser::SelectItem::Column(column) => column.span,
+        netbadb_parser::SelectItem::Aggregate(aggregate) => aggregate.span,
+    }
 }
 
 #[derive(Default)]
@@ -948,8 +1147,8 @@ fn lower_operator(operator: AstBinaryOp) -> BinaryOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        HirError, NullOrder, SortDirection, TypedExprKind, TypedStatement, UnaryOp, lower_query,
-        lower_statement,
+        AggregateFunction, HirError, NullOrder, SortDirection, TypedAggregateInput, TypedExprKind,
+        TypedProjectionItem, TypedStatement, UnaryOp, lower_query, lower_statement,
     };
     use netbadb_parser::{parse, parse_statement};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
@@ -989,6 +1188,12 @@ mod tests {
                             name: "TeamId".into(),
                             physical: PhysicalType::UInt64,
                         },
+                    )
+                    .nullable(true),
+                    ColumnDef::new(
+                        ColumnId(6),
+                        "score",
+                        TypeSpec::Physical(PhysicalType::Int64),
                     )
                     .nullable(true),
                 ],
@@ -1226,7 +1431,13 @@ mod tests {
         .expect("lower");
         assert_eq!(typed.from.binding_id, RelationBindingId(0));
         assert_eq!(typed.joins[0].right.binding_id, RelationBindingId(1));
-        assert_eq!(typed.projection[0].relation_name, "u");
+        assert_eq!(
+            typed.projection[0]
+                .source_column()
+                .expect("source projection")
+                .relation_name,
+            "u"
+        );
         assert!(typed.joins[0].predicate.expr_type.nullable);
     }
 
@@ -1254,6 +1465,111 @@ mod tests {
             typed.order_by[2].column.data_type.name.as_deref(),
             Some("UserId")
         );
+    }
+
+    #[test]
+    fn types_global_aggregates_and_preserves_only_value_semantics() {
+        let typed = lower_query(
+            &schema(),
+            &parse("SELECT COUNT(*), COUNT(score), SUM(id), MIN(id), MAX(u.score) FROM users u")
+                .expect("parse aggregates"),
+        )
+        .expect("lower aggregates");
+        let aggregates = typed
+            .projection
+            .iter()
+            .map(|item| match item {
+                TypedProjectionItem::Aggregate(aggregate) => aggregate,
+                TypedProjectionItem::Column(_) => panic!("expected only aggregates"),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(aggregates[0].input, TypedAggregateInput::All));
+        assert_eq!(aggregates[0].function, AggregateFunction::Count);
+        assert_eq!(aggregates[0].output_name, "COUNT(*)");
+        assert_eq!(
+            aggregates[0].expr_type.data_type.physical,
+            PhysicalType::UInt64
+        );
+        assert!(!aggregates[0].expr_type.nullable);
+        assert_eq!(aggregates[1].output_name, "COUNT(score)");
+        assert!(!aggregates[1].expr_type.nullable);
+        assert_eq!(aggregates[2].output_name, "SUM(id)");
+        assert_eq!(
+            aggregates[2].expr_type.data_type.physical,
+            PhysicalType::UInt64
+        );
+        assert_eq!(aggregates[2].expr_type.data_type.name, None);
+        assert!(aggregates[2].expr_type.nullable);
+        assert_eq!(
+            aggregates[3].expr_type.data_type.name.as_deref(),
+            Some("UserId")
+        );
+        assert!(aggregates[3].expr_type.nullable);
+        assert_eq!(aggregates[4].output_name, "MAX(u.score)");
+    }
+
+    #[test]
+    fn aggregate_resolution_and_global_restrictions_are_typed_errors() {
+        let qualified = lower_query(
+            &schema(),
+            &parse("SELECT COUNT(u.id), MIN(t.name) FROM users u JOIN teams t ON u.team_id = t.id")
+                .expect("parse qualified aggregates"),
+        )
+        .expect("qualified aggregates lower");
+        assert_eq!(qualified.projection.len(), 2);
+
+        for source in [
+            "SELECT SUM(name) FROM users",
+            "SELECT SUM(active) FROM users",
+        ] {
+            assert!(matches!(
+                lower_query(&schema(), &parse(source).expect("parse invalid SUM")),
+                Err(HirError::InvalidAggregateType {
+                    function: AggregateFunction::Sum,
+                    ..
+                })
+            ));
+        }
+        for source in [
+            "SELECT id, COUNT(*) FROM users",
+            "SELECT COUNT(*), name FROM users",
+        ] {
+            assert!(matches!(
+                lower_query(&schema(), &parse(source).expect("parse mixed projection")),
+                Err(HirError::MixedAggregateProjection { .. })
+            ));
+        }
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse("SELECT COUNT(*) FROM users ORDER BY id").expect("parse aggregate order")
+            ),
+            Err(HirError::OrderByNotSupportedWithAggregate { .. })
+        ));
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse(
+                    "SELECT COUNT(id) FROM users u JOIN teams t ON u.team_id = t.id"
+                )
+                .expect("parse ambiguous aggregate")
+            ),
+            Err(HirError::AmbiguousColumn { name, .. }) if name == "id"
+        ));
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse("SELECT COUNT(x.id) FROM users u").expect("parse unknown qualifier")
+            ),
+            Err(HirError::UnknownRelationQualifier { name, .. }) if name == "x"
+        ));
+        assert!(matches!(
+            lower_query(
+                &schema(),
+                &parse("SELECT MAX(u.missing) FROM users u").expect("parse unknown column")
+            ),
+            Err(HirError::UnknownColumn { name, .. }) if name == "missing"
+        ));
     }
 
     #[test]
@@ -1333,19 +1649,16 @@ mod tests {
             .expect("parse"),
         )
         .expect("self join lowers");
-        assert_eq!(typed.projection[0].table_id, typed.projection[1].table_id);
-        assert_ne!(
-            typed.projection[0].binding_id,
-            typed.projection[1].binding_id
-        );
-        assert_eq!(
-            typed.order_by[0].column.binding_id,
-            typed.projection[1].binding_id
-        );
-        assert_eq!(
-            typed.order_by[1].column.binding_id,
-            typed.projection[0].binding_id
-        );
+        let employee = typed.projection[0]
+            .source_column()
+            .expect("employee projection");
+        let manager = typed.projection[1]
+            .source_column()
+            .expect("manager projection");
+        assert_eq!(employee.table_id, manager.table_id);
+        assert_ne!(employee.binding_id, manager.binding_id);
+        assert_eq!(typed.order_by[0].column.binding_id, manager.binding_id);
+        assert_eq!(typed.order_by[1].column.binding_id, employee.binding_id);
 
         let nominal_mismatch =
             parse("SELECT u.id FROM users u JOIN teams t ON u.id = t.id").expect("parse mismatch");

@@ -115,6 +115,28 @@ pub struct DeleteStatement {
 pub enum SelectItem {
     Wildcard(Span),
     Column(ColumnName),
+    Aggregate(AggregateCall),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateArgument {
+    Star(Span),
+    Column(ColumnName),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateCall {
+    pub function: AggregateFunction,
+    pub argument: AggregateArgument,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -690,12 +712,67 @@ impl Parser {
             return Ok(vec![SelectItem::Wildcard(span)]);
         }
 
-        let mut projection = vec![SelectItem::Column(self.parse_column_name()?)];
+        let mut projection = vec![self.parse_projection_item()?];
         while self.matches(&TokenKind::Comma) {
             self.position += 1;
-            projection.push(SelectItem::Column(self.parse_column_name()?));
+            projection.push(self.parse_projection_item()?);
         }
         Ok(projection)
+    }
+
+    fn parse_projection_item(&mut self) -> Result<SelectItem, ParseError> {
+        let token = self.current().clone();
+        let TokenKind::Ident(name) = &token.kind else {
+            return Err(self.error_here("expected a projected column or aggregate"));
+        };
+        if !self
+            .tokens
+            .get(self.position + 1)
+            .is_some_and(|next| next.kind == TokenKind::LParen)
+        {
+            return self.parse_column_name().map(SelectItem::Column);
+        }
+
+        let function = if name.eq_ignore_ascii_case("count") {
+            AggregateFunction::Count
+        } else if name.eq_ignore_ascii_case("sum") {
+            AggregateFunction::Sum
+        } else if name.eq_ignore_ascii_case("min") {
+            AggregateFunction::Min
+        } else if name.eq_ignore_ascii_case("max") {
+            AggregateFunction::Max
+        } else {
+            return Err(ParseError {
+                message: format!("unsupported projection function `{name}`"),
+                span: token.span,
+            });
+        };
+        self.position += 1;
+        self.expect_simple(TokenKind::LParen)?;
+        let argument = if self.matches(&TokenKind::Star) {
+            let span = self.current().span;
+            if function != AggregateFunction::Count {
+                return Err(ParseError {
+                    message: format!("{} does not accept `*`", aggregate_name(function)),
+                    span,
+                });
+            }
+            self.position += 1;
+            AggregateArgument::Star(span)
+        } else if matches!(self.current().kind, TokenKind::Ident(_)) {
+            AggregateArgument::Column(self.parse_column_name()?)
+        } else {
+            return Err(self.error_here("aggregate expects `*` or a source column"));
+        };
+        let close = self.expect_simple(TokenKind::RParen)?;
+        Ok(SelectItem::Aggregate(AggregateCall {
+            function,
+            argument,
+            span: Span {
+                start: token.span.start,
+                end: close.span.end,
+            },
+        }))
     }
 
     fn parse_expr(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
@@ -920,11 +997,20 @@ fn statement_span(statement: &Statement) -> Span {
     }
 }
 
+const fn aggregate_name(function: AggregateFunction) -> &'static str {
+    match function {
+        AggregateFunction::Count => "COUNT",
+        AggregateFunction::Sum => "SUM",
+        AggregateFunction::Min => "MIN",
+        AggregateFunction::Max => "MAX",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryOp, Expr, Literal, NullOrder, SelectItem, SortDirection, Statement, UnaryOp, parse,
-        parse_statement,
+        AggregateArgument, AggregateFunction, BinaryOp, Expr, Literal, NullOrder, SelectItem,
+        SortDirection, Statement, UnaryOp, parse, parse_statement,
     };
 
     #[test]
@@ -1194,6 +1280,65 @@ mod tests {
             "SELECT id FROM users LIMIT 1 ORDER BY id",
         ] {
             let error = parse(source).expect_err("invalid ORDER BY must fail");
+            assert!(error.span.start <= error.span.end, "{source}");
+            assert!(error.span.end <= source.len(), "{source}");
+        }
+    }
+
+    #[test]
+    fn parses_contextual_global_aggregates_without_reserving_names() {
+        let query = parse(
+            "SELECT COUNT(*), count(score), SUM(u.score), MIN(name), MAX(active) FROM users u",
+        )
+        .expect("aggregates parse");
+        assert_eq!(query.projection.len(), 5);
+        assert!(matches!(
+            &query.projection[0],
+            SelectItem::Aggregate(call)
+                if call.function == AggregateFunction::Count
+                    && matches!(call.argument, AggregateArgument::Star(_))
+        ));
+        assert!(matches!(
+            &query.projection[1],
+            SelectItem::Aggregate(call)
+                if call.function == AggregateFunction::Count
+                    && matches!(&call.argument, AggregateArgument::Column(column) if column.name.name == "score")
+        ));
+        assert!(matches!(
+            &query.projection[2],
+            SelectItem::Aggregate(call)
+                if call.function == AggregateFunction::Sum
+                    && matches!(&call.argument, AggregateArgument::Column(column) if column.qualifier.as_ref().is_some_and(|qualifier| qualifier.name == "u"))
+        ));
+        assert!(matches!(
+            &query.projection[3],
+            SelectItem::Aggregate(call) if call.function == AggregateFunction::Min
+        ));
+        assert!(matches!(
+            &query.projection[4],
+            SelectItem::Aggregate(call) if call.function == AggregateFunction::Max
+        ));
+
+        for name in ["count", "sum", "min", "max"] {
+            let ordinary = parse(&format!("SELECT {name} FROM metrics"))
+                .expect("aggregate names remain contextual identifiers");
+            assert!(matches!(ordinary.projection[0], SelectItem::Column(_)));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_aggregate_projection_syntax() {
+        for source in [
+            "SELECT COUNT() FROM users",
+            "SELECT COUNT(a, b) FROM users",
+            "SELECT COUNT(1) FROM users",
+            "SELECT SUM(*) FROM users",
+            "SELECT SUM(1) FROM users",
+            "SELECT MIN(*) FROM users",
+            "SELECT MAX(*) FROM users",
+            "SELECT foo(id) FROM users",
+        ] {
+            let error = parse(source).expect_err("invalid aggregate must fail");
             assert!(error.span.start <= error.span.end, "{source}");
             assert!(error.span.end <= source.len(), "{source}");
         }

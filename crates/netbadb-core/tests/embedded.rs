@@ -213,6 +213,194 @@ fn order_by_unprojected_nullable_and_semantic_keys_survives_reopen() {
 }
 
 #[test]
+fn typed_global_aggregates_cover_null_empty_types_limit_and_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-aggregate-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let table = TableDef::new(
+        TableId(94),
+        "users",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Semantic {
+                    name: "UserId".into(),
+                    physical: PhysicalType::UInt64,
+                },
+            ),
+            ColumnDef::new(
+                ColumnId(2),
+                "score",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+            ColumnDef::new(ColumnId(3), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ColumnDef::new(
+                ColumnId(4),
+                "active",
+                TypeSpec::Physical(PhysicalType::Bool),
+            ),
+        ],
+    );
+    let mut database = Database::create(&path, table.clone()).expect("create aggregate database");
+    for row in [
+        vec![
+            ScalarValue::UInt64(1),
+            ScalarValue::Null,
+            ScalarValue::Text("A".into()),
+            ScalarValue::Bool(true),
+        ],
+        vec![
+            ScalarValue::UInt64(2),
+            ScalarValue::Int64(20),
+            ScalarValue::Text("B".into()),
+            ScalarValue::Bool(true),
+        ],
+        vec![
+            ScalarValue::UInt64(3),
+            ScalarValue::Int64(10),
+            ScalarValue::Text("C".into()),
+            ScalarValue::Bool(false),
+        ],
+        vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::Null,
+            ScalarValue::Text("D".into()),
+            ScalarValue::Bool(true),
+        ],
+        vec![
+            ScalarValue::UInt64(5),
+            ScalarValue::Int64(20),
+            ScalarValue::Text("E".into()),
+            ScalarValue::Bool(true),
+        ],
+    ] {
+        database.insert(&row).expect("insert aggregate row");
+    }
+
+    let all_source = "SELECT COUNT(*), COUNT(score), SUM(score), MIN(score), MAX(score) FROM users";
+    let all = database.query(all_source).expect("aggregate all rows");
+    assert_eq!(
+        all.rows,
+        vec![vec![
+            ScalarValue::UInt64(5),
+            ScalarValue::UInt64(3),
+            ScalarValue::Int64(50),
+            ScalarValue::Int64(10),
+            ScalarValue::Int64(20),
+        ]]
+    );
+    assert_eq!(
+        all.columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "COUNT(*)",
+            "COUNT(score)",
+            "SUM(score)",
+            "MIN(score)",
+            "MAX(score)"
+        ]
+    );
+    assert!(!all.columns[0].nullable);
+    assert!(!all.columns[1].nullable);
+    assert!(all.columns[2..].iter().all(|column| column.nullable));
+
+    let filtered_source = "SELECT COUNT(*), COUNT(score), SUM(score), MIN(score), MAX(score) \
+                           FROM users WHERE active = true";
+    let filtered = database.query(filtered_source).expect("filtered aggregate");
+    assert_eq!(
+        filtered.rows,
+        vec![vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(2),
+            ScalarValue::Int64(40),
+            ScalarValue::Int64(20),
+            ScalarValue::Int64(20),
+        ]]
+    );
+
+    let empty = database
+        .query(
+            "SELECT COUNT(*), COUNT(score), SUM(score), MIN(score), MAX(score) \
+             FROM users WHERE name = 'missing'",
+        )
+        .expect("empty aggregate input");
+    assert_eq!(
+        empty.rows,
+        vec![vec![
+            ScalarValue::UInt64(0),
+            ScalarValue::UInt64(0),
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Null,
+        ]]
+    );
+    let limited = database
+        .query("SELECT COUNT(*) FROM users LIMIT 0")
+        .expect("limit aggregate output");
+    assert_eq!(limited.columns[0].name, "COUNT(*)");
+    assert!(limited.rows.is_empty());
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM users LIMIT 1")
+            .expect("aggregate before limit")
+            .rows,
+        vec![vec![ScalarValue::UInt64(5)]]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT COUNT(score), SUM(score), MIN(score), MAX(score) \
+                 FROM users WHERE name = 'A'",
+            )
+            .expect("all-null aggregate input")
+            .rows,
+        vec![vec![
+            ScalarValue::UInt64(0),
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Null,
+        ]]
+    );
+
+    let typed = database
+        .query("SELECT SUM(id), MIN(id), MAX(id), MIN(name), MAX(name), MIN(active), MAX(active) FROM users")
+        .expect("typed aggregate outputs");
+    assert_eq!(typed.columns[0].data_type.physical, PhysicalType::UInt64);
+    assert_eq!(typed.columns[0].data_type.name, None);
+    assert_eq!(typed.columns[1].data_type.name.as_deref(), Some("UserId"));
+    assert_eq!(typed.columns[2].data_type.name.as_deref(), Some("UserId"));
+    assert_eq!(
+        typed.rows,
+        vec![vec![
+            ScalarValue::UInt64(15),
+            ScalarValue::UInt64(1),
+            ScalarValue::UInt64(5),
+            ScalarValue::Text("A".into()),
+            ScalarValue::Text("E".into()),
+            ScalarValue::Bool(false),
+            ScalarValue::Bool(true),
+        ]]
+    );
+
+    database.close().expect("close aggregate database");
+    let mut reopened = Database::open(&path, table).expect("reopen aggregate database");
+    assert_eq!(
+        reopened
+            .query(filtered_source)
+            .expect("aggregate after reopen"),
+        filtered
+    );
+    reopened.close().expect("close reopened aggregate database");
+    cleanup(&path);
+}
+
+#[test]
 fn public_query_pipeline_obeys_null_and_three_valued_logic_after_reopen() {
     let path =
         std::env::temp_dir().join(format!("netbadb-null-integration-{}", std::process::id()));
@@ -967,6 +1155,13 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
             .rows
             .is_empty()
     );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM users u JOIN teams t ON u.team_id = t.id")
+            .expect("aggregate empty join")
+            .rows,
+        vec![vec![ScalarValue::UInt64(0)]]
+    );
     for values in [
         vec![ScalarValue::Int64(10), ScalarValue::Text("Core".into())],
         vec![ScalarValue::Int64(10), ScalarValue::Text("Core-2".into())],
@@ -1003,6 +1198,20 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
     );
     assert_eq!(joined.columns[0].name, "name");
     assert_eq!(joined.columns[1].name, "name");
+    assert_eq!(
+        database
+            .query(
+                "SELECT COUNT(*), COUNT(t.id), MIN(t.name) FROM users u \
+                 JOIN teams t ON u.team_id = t.id",
+            )
+            .expect("aggregate joined duplicates")
+            .rows,
+        vec![vec![
+            ScalarValue::UInt64(3),
+            ScalarValue::UInt64(3),
+            ScalarValue::Text("Core".into()),
+        ]]
+    );
 
     let filtered = database
         .query(

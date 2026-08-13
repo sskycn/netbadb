@@ -206,18 +206,21 @@ join reordering, hash/merge/index join, or multi-table DML.
 Heap metadata version 1 has no migration path and is rejected explicitly. The
 experimental format may continue to change between versions.
 
-## Phase 3D — Aggregate + Sort (ORDER BY slice complete)
+## Phase 3D — Aggregate + Sort (ORDER BY and global aggregates complete)
 
 - typed multi-key source-column `ORDER BY` with qualified/unqualified
   resolution, explicit/default direction and NULL placement, stable in-memory
   execution, and sort-before-projection planning (complete);
-- `COUNT`, `SUM`, `MIN`, and `MAX`;
-- `GROUP BY` and aggregate NULL semantics;
-- typed logical/physical operators and deterministic execution tests.
+- typed global `COUNT`, numeric `SUM`, and ordered-type `MIN`/`MAX`, including
+  empty-input and NULL semantics, checked overflow, derived output metadata,
+  and one-pass deterministic execution (complete);
+- `GROUP BY` and grouped aggregate semantics;
+- grouped logical/physical operators and deterministic execution tests.
 
-This slice does not support sort expressions, projection aliases, ordinals,
-aggregation, or `GROUP BY`. No persistent page, heap metadata, WAL record,
-recovery, checkpoint, or transaction format changed for sorting.
+The completed slices do not support sort expressions, projection aliases,
+ordinals, aggregate aliases/expressions, DISTINCT, HAVING, aggregate-aware
+ordering, or `GROUP BY`. No persistent page, heap metadata, WAL record,
+recovery, checkpoint, or transaction format changed for sorting or aggregation.
 
 ## Phase 4 — Indexing and planning
 

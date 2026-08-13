@@ -40,15 +40,15 @@ The current embedded path is synchronous:
 ```text
 Rust Schema API
     ↓
-SELECT / INNER JOIN / ORDER BY + typed INSERT / UPDATE / DELETE parser
+SELECT / JOIN / ORDER BY / global aggregate + typed DML parser
     ↓
 Typed HIR
     ↓
 Logical query / DML statement plan
     ↓
-Sequential scan + nested-loop join + stable in-memory sort physical plan
+Scan + nested-loop join + sort + global aggregate physical plan
     ↓
-Join / filter / sort / projection / limit + RowId mutation executor
+Join / filter / sort / aggregate / projection / limit + mutation executor
     ↓
 Heap
     ↓
@@ -137,7 +137,8 @@ The current code genuinely supports:
   semantic type metadata, unified validation, and stable schema fingerprints;
 - parser support for `SELECT`, qualified columns, `AS` and shorthand table
   aliases, chained `JOIN`/`INNER JOIN ... ON`, explicit-column single-row `INSERT`, `UPDATE`,
-  `DELETE`, optional DML `WHERE`, multi-key source-column `ORDER BY`, `LIMIT`, wildcard projection,
+  `DELETE`, optional DML `WHERE`, multi-key source-column `ORDER BY`, contextual
+  `COUNT`/`SUM`/`MIN`/`MAX`, `LIMIT`, wildcard projection,
   `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
   boolean/NULL literals, and parentheses;
 - name resolution and expression type checking with nominal semantic types and
@@ -161,8 +162,9 @@ The current code genuinely supports:
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - RowId-based insert, update, delete, scan, file reopen, row encoding, and row
   decoding;
-- executor support for INNER JOIN, filter, stable in-memory sort, projection, limit, typed DML, affected-row
-  results, SQL three-valued boolean logic, and NULL comparisons;
+- executor support for INNER JOIN, filter, stable in-memory sort, one-pass
+  global aggregates, projection, limit, typed DML, affected-row results, SQL
+  three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
@@ -319,6 +321,23 @@ in-memory lexicographic sort. Stability makes ties repeatable for the current
 input order, but it is not a permanent ordering guarantee across future plan
 changes; callers that need a total order must include sufficient keys.
 
+Global aggregates accept `COUNT(*)` or source-column arguments to `COUNT`,
+`SUM`, `MIN`, and `MAX`. Aggregate names are contextual in projection, so a
+plain column named `count`, `sum`, `min`, or `max` remains selectable. The
+aggregate plan is `Scan/Join -> Filter -> Aggregate -> Limit`, and one input
+pass updates every aggregate state. `COUNT(*)` counts rows, while
+`COUNT(column)` ignores NULL; both return non-null `UInt64`. Numeric `SUM`
+ignores NULL, returns NULL for empty/all-NULL input, uses checked arithmetic,
+and strips nominal meaning from its result. `MIN`/`MAX` support all current
+ordered physical types, ignore NULL, return NULL for empty/all-NULL input, and
+preserve the input `SemanticType`.
+
+Aggregate outputs are derived typed fields, not synthetic catalog columns, so
+they have no fabricated table, binding, or column IDs. Until `GROUP BY` and
+aggregate-aware ordering exist, aggregate projections cannot mix source
+columns and reject `ORDER BY`. Aliases, `DISTINCT`, aggregate expressions, and
+nested aggregates are also outside this slice.
+
 ## Go and protocol strategy
 
 Go is no longer treated as the database implementation language. The intended
@@ -385,8 +404,8 @@ The implementation sequence is intentionally vertical:
    self joins, nested-loop execution, and NULL-aware join predicates. Complete.
 10. Data-page integrity — Page v4 CRC32C bound to PageId, recovery-safe pageLSN
     validation, checkpoint-baseline corruption detection, and page fuzzing.
-11. Aggregate + Sort (Phase 3D) — typed source-column `ORDER BY` is complete;
-    aggregate functions, `GROUP BY`, and aggregate NULL semantics remain.
+11. Aggregate + Sort (Phase 3D) — typed source-column `ORDER BY` and global
+    `COUNT`/`SUM`/`MIN`/`MAX` are complete; `GROUP BY` remains.
 12. Indexing — B+Tree and planner access-path selection.
 13. Server mode — protocol, sessions, and `netbadbd`.
 14. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
