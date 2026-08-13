@@ -318,9 +318,11 @@ impl WalManager {
         };
         let file = match create_generation_file(&root_path, header, None) {
             Ok(file) => file,
-            Err(error) => {
-                let _ = std::fs::remove_file(&root_path);
-                return Err(error);
+            Err(failure) => {
+                if failure.file_created {
+                    let _ = std::fs::remove_file(&root_path);
+                }
+                return Err(failure.error);
             }
         };
         if let Err(error) = sync_parent_directory(&root_path) {
@@ -650,9 +652,9 @@ impl WalManager {
         let failure_after = None;
         let file = match create_generation_file(&target, header, failure_after) {
             Ok(file) => file,
-            Err(error) => {
+            Err(failure) => {
                 self.poisoned = true;
-                return Err(error);
+                return Err(failure.error);
             }
         };
         if let Err(error) = sync_parent_directory(&target) {
@@ -805,26 +807,55 @@ fn validate_header(header: WalHeader) -> Result<(), WalError> {
     Ok(())
 }
 
+struct GenerationCreateFailure {
+    error: WalError,
+    file_created: bool,
+}
+
 fn create_generation_file(
     path: &Path,
     header: WalHeader,
     fail_after: Option<usize>,
-) -> Result<File, WalError> {
-    let bytes = encode_header(header)?;
+) -> Result<File, GenerationCreateFailure> {
+    let bytes = encode_header(header).map_err(|error| GenerationCreateFailure {
+        error,
+        file_created: false,
+    })?;
     let mut file = OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| GenerationCreateFailure {
+            error: error.into(),
+            file_created: false,
+        })?;
     if let Some(prefix_len) = fail_after {
-        file.write_all(&bytes[..prefix_len.min(bytes.len())])?;
-        file.sync_all()?;
-        return Err(WalError::Io(std::io::Error::other(
-            "injected partial WAL generation creation failure",
-        )));
+        file.write_all(&bytes[..prefix_len.min(bytes.len())])
+            .map_err(|error| GenerationCreateFailure {
+                error: error.into(),
+                file_created: true,
+            })?;
+        file.sync_all().map_err(|error| GenerationCreateFailure {
+            error: error.into(),
+            file_created: true,
+        })?;
+        return Err(GenerationCreateFailure {
+            error: WalError::Io(std::io::Error::other(
+                "injected partial WAL generation creation failure",
+            )),
+            file_created: true,
+        });
     }
-    file.write_all(&bytes)?;
-    file.sync_all()?;
+    file.write_all(&bytes)
+        .map_err(|error| GenerationCreateFailure {
+            error: error.into(),
+            file_created: true,
+        })?;
+    file.sync_all().map_err(|error| GenerationCreateFailure {
+        error: error.into(),
+        file_created: true,
+    })?;
     Ok(file)
 }
 
@@ -1318,6 +1349,32 @@ mod tests {
 
     fn initial_physical_offset(lsn: netbadb_types::Lsn) -> u64 {
         super::WAL_HEADER_SIZE as u64 + lsn.0 - super::INITIAL_BASE_LSN.0
+    }
+
+    #[test]
+    fn create_does_not_remove_an_existing_wal() {
+        let path = test_path("wal-create-existing");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = WalManager::create(&path).expect("create original WAL");
+        let begin = wal
+            .append(TxnId(7), None, WalRecordKind::Begin)
+            .expect("append original record");
+        wal.flush_through(begin).expect("flush original record");
+        drop(wal);
+        let original = std::fs::read(&path).expect("read original WAL");
+
+        assert!(matches!(
+            WalManager::create(&path),
+            Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read WAL after rejected create"),
+            original
+        );
+        let mut reopened = WalManager::open(&path).expect("reopen original WAL");
+        assert_eq!(reopened.scan().expect("scan original WAL").len(), 1);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

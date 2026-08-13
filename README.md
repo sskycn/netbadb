@@ -40,15 +40,15 @@ The current embedded path is synchronous:
 ```text
 Rust Schema API
     ↓
-SELECT + typed INSERT / UPDATE / DELETE statement parser
+SELECT / INNER JOIN + typed INSERT / UPDATE / DELETE statement parser
     ↓
 Typed HIR
     ↓
 Logical query / DML statement plan
     ↓
-Sequential-scan physical plan
+Sequential scan + nested-loop join physical plan
     ↓
-Filter / projection / limit + RowId mutation executor
+Join / filter / projection / limit + RowId mutation executor
     ↓
 Heap
     ↓
@@ -66,8 +66,10 @@ application-specific Rust structs.
 
 ## Strong types
 
-Internal identifiers are newtypes such as `TableId`, `ColumnId`, `PageId`, and
-`RowId`. Schema columns preserve both a physical representation and an
+Internal identifiers are newtypes such as `TableId`, `RelationBindingId`,
+`ColumnId`, `PageId`, and `RowId`. A relation binding identifies one
+query-local table occurrence, so two aliases of the same `TableId` remain
+distinct in a self join. Schema columns preserve both a physical representation and an
 optional nominal semantic type:
 
 ```text
@@ -130,14 +132,15 @@ The current code genuinely supports:
 - Cargo workspace compilation and unit/integration tests;
 - Canonical schema definitions with nullable, primary-key, physical, and
   semantic type metadata;
-- parser support for `SELECT`, explicit-column single-row `INSERT`, `UPDATE`,
+- parser support for `SELECT`, qualified columns, `AS` and shorthand table
+  aliases, chained `JOIN`/`INNER JOIN ... ON`, explicit-column single-row `INSERT`, `UPDATE`,
   `DELETE`, optional DML `WHERE`, `LIMIT`, wildcard projection,
   `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
   boolean/NULL literals, and parentheses;
 - name resolution and expression type checking with nominal semantic types and
   explicit nullability;
 - typed query/DML HIR and logical relational IR;
-- sequential-scan physical planning;
+- sequential-scan and left-major/right-minor nested-loop join physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
 - version 3 slotted heap pages with persistent pageLSNs, explicit deleted-slot
   tombstones, and checked bounds;
@@ -155,7 +158,7 @@ The current code genuinely supports:
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
 - RowId-based insert, update, delete, scan, file reopen, row encoding, and row
   decoding;
-- executor support for filter, projection, limit, typed DML, affected-row
+- executor support for INNER JOIN, filter, projection, limit, typed DML, affected-row
   results, SQL three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
@@ -265,6 +268,22 @@ Implicit DML owns one transaction. `execute_in` supports multiple statements
 in an explicit transaction; until savepoints exist, an execution-time DML
 failure rolls back that whole transaction.
 
+Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
+in source order. An alias hides the underlying table name. Qualified columns
+resolve through the exposed relation name; unqualified columns are accepted
+only when exactly one visible relation provides the name. Each `ON` expression
+can see the complete left subtree and its current right relation, but not later
+joins. HIR preserves nominal types and requires BOOL (nullable BOOL is valid).
+At execution, only TRUE matches; FALSE and UNKNOWN, including `NULL = NULL`,
+do not. `SELECT *` emits columns in left-to-right relation/schema order, and
+the nested-loop operator preserves duplicates in deterministic left-major,
+right-minor order.
+
+The core composes multiple unchanged one-table heap files with
+`Database::create_tables`/`open_tables`; `insert_into` targets a table for
+embedded data loading. No page, heap, WAL, recovery, checkpoint, or transaction
+format changed for JOIN. Multi-table write transactions remain unsupported.
+
 ## Go and protocol strategy
 
 Go is no longer treated as the database implementation language. The intended
@@ -328,11 +347,13 @@ The implementation sequence is intentionally vertical:
 8. Typed DML (Phase 3B) — typed insert/update/delete plans, stable-RowId page
    mutation, affected-row results, and atomic WAL-backed execution. Complete.
 9. Join execution (Phase 3C) — qualified columns, aliases, typed INNER JOIN,
-   nested-loop execution, and NULL-aware join predicates.
-10. Indexing — B+Tree and planner access-path selection.
-11. Server mode — protocol, sessions, and `netbadbd`.
-12. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-13. Advanced optimization — statistics, cost model, and rewrite rules.
+   self joins, nested-loop execution, and NULL-aware join predicates. Complete.
+10. Aggregate + Sort (Phase 3D) — `ORDER BY`, aggregate functions, `GROUP BY`,
+    and aggregate NULL semantics.
+11. Indexing — B+Tree and planner access-path selection.
+12. Server mode — protocol, sessions, and `netbadbd`.
+13. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+14. Advanced optimization — statistics, cost model, and rewrite rules.
 
 Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
 are roadmap items, not implemented features in this slice.
@@ -341,4 +362,6 @@ See [`docs/architecture.md`](docs/architecture.md) and
 
 ## License
 
-TBD.
+NetbaDB is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).
+
+This project is identified as `AGPL-3.0-or-later` in its Cargo package metadata.

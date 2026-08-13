@@ -52,14 +52,64 @@ source → AST → resolved/type-checked HIR → logical plan → physical plan
 ```
 
 HIR owns source-level resolution and semantic type checking. Relational IR
-owns relational meaning and column provenance. The planner only chooses the
-currently available sequential scan. The executor evaluates typed expressions
-against rows returned by storage.
+owns relational meaning and column provenance. The planner selects sequential
+scans and the correctness-first nested-loop implementation for logical INNER
+JOIN. The executor evaluates typed expressions against rows returned by
+storage.
 
 The implementation uses IDs and owned values between layers. It does not keep
 long-lived references to pages, frames, or tuples, leaving room for future
 buffer management and concurrent execution without spreading lifetimes across
 the whole system.
+
+## Relation bindings and INNER JOIN
+
+`TableId` identifies a catalog table; `RelationBindingId` identifies one
+query-local occurrence in a FROM/JOIN tree and is never persisted. Bindings are
+allocated deterministically in source order. This distinction makes a self
+join such as `employees e JOIN employees m` two independent relation instances
+even though both scans target the same `TableId` and use the same `ColumnId`
+values.
+
+Each binding records its catalog table and exposed name. With an alias, only
+the alias is exposed; otherwise the table name is exposed. Duplicate exposed
+names are rejected. Qualified lookup first resolves that name and then the
+column. Unqualified lookup searches all visible bindings and succeeds only for
+exactly one candidate; zero candidates are unknown and multiple candidates are
+ambiguous. JOIN scopes grow from left to right: an `ON` expression sees the
+left subtree plus its current right binding, never a future relation.
+
+Resolved HIR and relational `ColumnRef` values carry binding, table, and column
+IDs. Alias strings remain diagnostic metadata and are not used by execution.
+Logical scans carry their binding identity, and chained joins form a
+left-associated tree:
+
+```text
+LogicalPlan::Join(left plan, right plan, Inner, typed predicate)
+    ↓ planner (no reordering or cost model)
+PhysicalPlan::NestedLoopJoin(left plan, right plan, typed predicate)
+```
+
+Every physical node has binding-aware output columns. Expression and projection
+lookup uses `RelationBindingId + ColumnId`, which remains unambiguous for self
+joins. A scan row retains one hidden `RowId` for Phase 3B DML; a joined row
+combines scalar values and intentionally drops mutation identity because
+multi-table UPDATE/DELETE are not supported.
+
+The executor materializes each right child, iterates left rows outside and
+right rows inside, concatenates values in that order, and emits only rows whose
+typed `ON` predicate evaluates to TRUE. FALSE and UNKNOWN do not match, so
+ordinary equality never joins NULL to NULL. The existing expression checker
+requires BOOL while allowing nullable BOOL, and nominal compatibility prevents
+JOIN from comparing distinct semantic types with the same physical encoding.
+This algorithm preserves duplicates and deterministic left-major/right-minor
+order. WHERE remains a Filter above Join, followed by Project and Limit;
+`SELECT *` follows left-to-right relation and schema order.
+
+Core multi-table catalogs compose one existing heap file per `TableId`. JOIN
+therefore introduces no persistent format or transaction-layer changes: page
+version 3, heap metadata, WAL, recovery, checkpoints, and single-writer rules
+are unchanged.
 
 ## Typed expressions and NULL
 

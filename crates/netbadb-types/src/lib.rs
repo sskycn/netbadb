@@ -11,6 +11,10 @@ macro_rules! id_type {
 
 id_type!(DatabaseId, u64);
 id_type!(TableId, u64);
+/// Query-local identity for one occurrence of a relation in a FROM tree.
+/// Unlike [`TableId`], this identifier is never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RelationBindingId(pub u32);
 id_type!(ColumnId, u32);
 id_type!(IndexId, u64);
 id_type!(PageId, u64);

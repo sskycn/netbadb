@@ -1,13 +1,21 @@
 //! Physical planning kept separate from logical relational meaning.
 
-use netbadb_rel::{Assignment, ColumnRef, Expr, LogicalStatement};
-use netbadb_types::TableId;
+use netbadb_rel::{Assignment, ColumnRef, Expr, JoinKind, LogicalStatement};
+use netbadb_types::{RelationBindingId, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhysicalPlan {
     SeqScan {
+        binding_id: RelationBindingId,
         table_id: TableId,
         table_name: String,
+        columns: Vec<ColumnRef>,
+    },
+    NestedLoopJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        kind: JoinKind,
+        predicate: Expr,
         columns: Vec<ColumnRef>,
     },
     Filter {
@@ -47,7 +55,9 @@ impl PhysicalPlan {
     #[must_use]
     pub fn output_columns(&self) -> &[ColumnRef] {
         match self {
-            Self::SeqScan { columns, .. } | Self::Project { columns, .. } => columns,
+            Self::SeqScan { columns, .. }
+            | Self::NestedLoopJoin { columns, .. }
+            | Self::Project { columns, .. } => columns,
             Self::Filter { input, .. } | Self::Limit { input, .. } => input.output_columns(),
         }
     }
@@ -57,12 +67,27 @@ impl PhysicalPlan {
 pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
     match logical {
         netbadb_rel::LogicalPlan::Scan {
+            binding_id,
             table_id,
             table_name,
             columns,
         } => PhysicalPlan::SeqScan {
+            binding_id: *binding_id,
             table_id: *table_id,
             table_name: table_name.clone(),
+            columns: columns.clone(),
+        },
+        netbadb_rel::LogicalPlan::Join {
+            left,
+            right,
+            kind,
+            predicate,
+            columns,
+        } => PhysicalPlan::NestedLoopJoin {
+            left: Box::new(plan(left)),
+            right: Box::new(plan(right)),
+            kind: *kind,
+            predicate: predicate.clone(),
             columns: columns.clone(),
         },
         netbadb_rel::LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
@@ -114,18 +139,21 @@ mod tests {
     use super::{PhysicalPlan, PhysicalStatement, plan, plan_statement};
     use netbadb_rel::ColumnRef;
     use netbadb_rel::{LogicalPlan, LogicalStatement};
-    use netbadb_types::{ColumnId, PhysicalType, SemanticType, TableId};
+    use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, SemanticType, TableId};
 
     #[test]
     fn creates_a_sequence_scan_physical_plan() {
         let column = ColumnRef {
+            binding_id: RelationBindingId(0),
             table_id: TableId(1),
             column_id: ColumnId(1),
+            relation_name: "users".into(),
             name: "id".into(),
             data_type: SemanticType::physical(PhysicalType::Int64),
             nullable: false,
         };
         let logical = LogicalPlan::Scan {
+            binding_id: RelationBindingId(0),
             table_id: TableId(1),
             table_name: "users".into(),
             columns: vec![column],
@@ -137,6 +165,7 @@ mod tests {
     fn preserves_a_dml_operator_above_its_physical_input() {
         let logical = LogicalStatement::Delete {
             input: LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
                 table_id: TableId(1),
                 table_name: "users".into(),
                 columns: Vec::new(),
@@ -149,6 +178,37 @@ mod tests {
                 input: PhysicalPlan::SeqScan { .. },
                 table_id: TableId(1),
             }
+        ));
+    }
+
+    #[test]
+    fn lowers_logical_join_directly_to_nested_loop_join() {
+        let logical = LogicalPlan::Join {
+            left: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "employees".into(),
+                columns: Vec::new(),
+            }),
+            right: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(1),
+                table_id: TableId(1),
+                table_name: "employees".into(),
+                columns: Vec::new(),
+            }),
+            kind: netbadb_rel::JoinKind::Inner,
+            predicate: netbadb_rel::Expr {
+                kind: netbadb_rel::ExprKind::Literal(netbadb_types::ScalarValue::Bool(true)),
+                expr_type: netbadb_types::ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            },
+            columns: Vec::new(),
+        };
+        assert!(matches!(
+            plan(&logical),
+            PhysicalPlan::NestedLoopJoin { .. }
         ));
     }
 }

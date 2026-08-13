@@ -10,8 +10,15 @@ use netbadb_storage::{HeapStorage, StorageError, Transaction};
 use netbadb_types::{RowId, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultColumn {
+    pub name: String,
+    pub data_type: netbadb_types::SemanticType,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryResult {
-    pub columns: Vec<ColumnRef>,
+    pub columns: Vec<ResultColumn>,
     pub rows: Vec<Vec<ScalarValue>>,
 }
 
@@ -29,6 +36,8 @@ pub enum ExecutionError {
     TypeMismatch,
     TransactionRequired,
     AffectedRowsOverflow,
+    MissingRowIdentity,
+    MissingTableStorage(TableId),
     TableMismatch { planned: TableId, storage: TableId },
 }
 
@@ -48,6 +57,12 @@ impl fmt::Display for ExecutionError {
                 formatter.write_str("a mutating statement requires an active transaction")
             }
             Self::AffectedRowsOverflow => formatter.write_str("affected row count overflowed u64"),
+            Self::MissingRowIdentity => {
+                formatter.write_str("mutation input does not contain a base row identity")
+            }
+            Self::MissingTableStorage(table_id) => {
+                write!(formatter, "no storage is attached for table {}", table_id.0)
+            }
             Self::TableMismatch { planned, storage } => write!(
                 formatter,
                 "physical plan targets table {}, but storage contains table {}",
@@ -76,9 +91,26 @@ pub fn execute(
     plan: &PhysicalPlan,
     storage: &mut HeapStorage,
 ) -> Result<QueryResult, ExecutionError> {
-    let result = execute_rows(plan, storage)?;
+    execute_with_storages(plan, std::slice::from_mut(storage))
+}
+
+/// Executes a read-only physical query against the table heaps in `storages`.
+/// Each planned `TableId` must have exactly one corresponding heap.
+pub fn execute_with_storages(
+    plan: &PhysicalPlan,
+    storages: &mut [HeapStorage],
+) -> Result<QueryResult, ExecutionError> {
+    let result = execute_rows(plan, storages)?;
     Ok(QueryResult {
-        columns: result.columns,
+        columns: result
+            .columns
+            .into_iter()
+            .map(|column| ResultColumn {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+            })
+            .collect(),
         rows: result.rows.into_iter().map(|row| row.values).collect(),
     })
 }
@@ -111,7 +143,7 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows(input, storage)?;
+            let input = execute_rows(input, std::slice::from_mut(storage))?;
             let replacements = build_replacements(&input, assignments)?;
             let affected = u64::try_from(replacements.len())
                 .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
@@ -124,11 +156,14 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows(input, storage)?;
+            let input = execute_rows(input, std::slice::from_mut(storage))?;
             let affected = u64::try_from(input.rows.len())
                 .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
             for row in input.rows {
-                storage.delete_in(transaction, row.row_id)?;
+                storage.delete_in(
+                    transaction,
+                    row.row_id.ok_or(ExecutionError::MissingRowIdentity)?,
+                )?;
             }
             Ok(ExecutionResult::AffectedRows(affected))
         }
@@ -137,7 +172,7 @@ pub fn execute_statement(
 
 #[derive(Debug)]
 struct ExecutionRow {
-    row_id: RowId,
+    row_id: Option<RowId>,
     values: Vec<ScalarValue>,
 }
 
@@ -149,25 +184,58 @@ struct ExecutionRows {
 
 fn execute_rows(
     plan: &PhysicalPlan,
-    storage: &mut HeapStorage,
+    storages: &mut [HeapStorage],
 ) -> Result<ExecutionRows, ExecutionError> {
     match plan {
         PhysicalPlan::SeqScan {
             table_id, columns, ..
         } => {
-            ensure_table(*table_id, storage)?;
+            let storage = storage_for_table(storages, *table_id)?;
             let rows = storage
                 .scan()?
                 .into_iter()
-                .map(|(row_id, values)| ExecutionRow { row_id, values })
+                .map(|(row_id, values)| ExecutionRow {
+                    row_id: Some(row_id),
+                    values,
+                })
                 .collect();
             Ok(ExecutionRows {
                 columns: columns.clone(),
                 rows,
             })
         }
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            predicate,
+            columns,
+            ..
+        } => {
+            let left = execute_rows(left, storages)?;
+            let right = execute_rows(right, storages)?;
+            let mut rows = Vec::new();
+            for left_row in left.rows {
+                for right_row in &right.rows {
+                    let mut values = Vec::with_capacity(
+                        left_row.values.len().saturating_add(right_row.values.len()),
+                    );
+                    values.extend(left_row.values.iter().cloned());
+                    values.extend(right_row.values.iter().cloned());
+                    if evaluate_truth(predicate, &values, columns)? == TruthValue::True {
+                        rows.push(ExecutionRow {
+                            row_id: None,
+                            values,
+                        });
+                    }
+                }
+            }
+            Ok(ExecutionRows {
+                columns: columns.clone(),
+                rows,
+            })
+        }
         PhysicalPlan::Filter { input, predicate } => {
-            let mut result = execute_rows(input, storage)?;
+            let mut result = execute_rows(input, storages)?;
             let columns = result.columns.clone();
             result.rows = result
                 .rows
@@ -183,7 +251,7 @@ fn execute_rows(
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
-            let input_result = execute_rows(input, storage)?;
+            let input_result = execute_rows(input, storages)?;
             let positions = columns
                 .iter()
                 .map(|column| {
@@ -191,7 +259,7 @@ fn execute_rows(
                         .columns
                         .iter()
                         .position(|candidate| {
-                            candidate.table_id == column.table_id
+                            candidate.binding_id == column.binding_id
                                 && candidate.column_id == column.column_id
                         })
                         .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
@@ -217,12 +285,22 @@ fn execute_rows(
             })
         }
         PhysicalPlan::Limit { input, limit } => {
-            let mut result = execute_rows(input, storage)?;
+            let mut result = execute_rows(input, storages)?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
         }
     }
+}
+
+fn storage_for_table(
+    storages: &mut [HeapStorage],
+    table_id: TableId,
+) -> Result<&mut HeapStorage, ExecutionError> {
+    storages
+        .iter_mut()
+        .find(|storage| storage.table().id == table_id)
+        .ok_or(ExecutionError::MissingTableStorage(table_id))
 }
 
 fn ensure_table(table_id: TableId, storage: &HeapStorage) -> Result<(), ExecutionError> {
@@ -251,7 +329,7 @@ fn build_replacements(
                         .columns
                         .iter()
                         .position(|column| {
-                            column.table_id == assignment.column.table_id
+                            column.binding_id == assignment.column.binding_id
                                 && column.column_id == assignment.column.column_id
                         })
                         .ok_or_else(|| {
@@ -265,7 +343,10 @@ fn build_replacements(
             for (position, value) in evaluated {
                 replacement[position] = value;
             }
-            Ok((row.row_id, replacement))
+            Ok((
+                row.row_id.ok_or(ExecutionError::MissingRowIdentity)?,
+                replacement,
+            ))
         })
         .collect()
 }
@@ -280,7 +361,8 @@ fn evaluate(
             let position = columns
                 .iter()
                 .position(|candidate| {
-                    candidate.table_id == column.table_id && candidate.column_id == column.column_id
+                    candidate.binding_id == column.binding_id
+                        && candidate.column_id == column.column_id
                 })
                 .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
             row.get(position)
@@ -428,7 +510,9 @@ mod tests {
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
-    use netbadb_types::{ColumnId, ExprType, PhysicalType, ScalarValue, SemanticType, TableId};
+    use netbadb_types::{
+        ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+    };
 
     #[test]
     fn executes_filter_projection_and_limit() {
@@ -449,15 +533,19 @@ mod tests {
             .insert(&[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())])
             .expect("insert");
         let id = ColumnRef {
+            binding_id: RelationBindingId(0),
             table_id: TableId(1),
             column_id: ColumnId(1),
+            relation_name: "users".into(),
             name: "id".into(),
             data_type: SemanticType::physical(PhysicalType::Int64),
             nullable: false,
         };
         let name = ColumnRef {
+            binding_id: RelationBindingId(0),
             table_id: TableId(1),
             column_id: ColumnId(2),
+            relation_name: "users".into(),
             name: "name".into(),
             data_type: SemanticType::physical(PhysicalType::Text),
             nullable: false,
@@ -466,6 +554,7 @@ mod tests {
             input: Box::new(LogicalPlan::Project {
                 input: Box::new(LogicalPlan::Filter {
                     input: Box::new(LogicalPlan::Scan {
+                        binding_id: RelationBindingId(0),
                         table_id: TableId(1),
                         table_name: "users".into(),
                         columns: vec![id.clone(), name.clone()],

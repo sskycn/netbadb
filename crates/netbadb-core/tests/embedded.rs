@@ -540,3 +540,410 @@ fn foreign_transaction_is_rejected_without_rolling_back_its_owner() {
     cleanup(&first_path);
     cleanup(&second_path);
 }
+
+#[test]
+fn failed_multi_table_create_removes_only_files_created_by_that_call() {
+    let base = std::env::temp_dir().join(format!(
+        "netbadb-core-create-rollback-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let first_path = base.with_extension("first.db");
+    let existing_path = base.with_extension("existing.db");
+    let first = TableDef::new(
+        TableId(41),
+        "first",
+        vec![ColumnDef::new(
+            ColumnId(1),
+            "id",
+            TypeSpec::Physical(PhysicalType::Int64),
+        )],
+    );
+    let existing = TableDef::new(
+        TableId(42),
+        "existing",
+        vec![ColumnDef::new(
+            ColumnId(1),
+            "id",
+            TypeSpec::Physical(PhysicalType::Int64),
+        )],
+    );
+    cleanup(&first_path);
+    cleanup(&existing_path);
+    Database::create(&existing_path, existing.clone())
+        .expect("create existing target")
+        .close()
+        .expect("close existing target");
+
+    assert!(
+        Database::create_tables(vec![
+            (first_path.clone(), first),
+            (existing_path.clone(), existing.clone()),
+        ])
+        .is_err()
+    );
+    assert!(!first_path.exists());
+    let first_wal = netbadb_storage::wal_path(&first_path);
+    assert!(!first_wal.exists());
+    assert!(!netbadb_storage::wal_alternate_path(&first_wal).exists());
+
+    Database::open(&existing_path, existing)
+        .expect("pre-existing target remains intact")
+        .close()
+        .expect("close pre-existing target");
+    cleanup(&first_path);
+    cleanup(&existing_path);
+}
+
+#[test]
+fn table_bound_transaction_rejects_cross_table_writes_without_rollback() {
+    let base = std::env::temp_dir().join(format!(
+        "netbadb-core-table-transaction-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let users_path = base.with_extension("users.db");
+    let teams_path = base.with_extension("teams.db");
+    let users = users();
+    let teams = TableDef::new(
+        TableId(2),
+        "teams",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    );
+    let mut database = Database::create_tables(vec![
+        (users_path.clone(), users),
+        (teams_path.clone(), teams),
+    ])
+    .expect("create catalog");
+    let mut transaction = database
+        .begin_transaction_for(TableId(1))
+        .expect("begin users transaction");
+    database
+        .insert_into_in(
+            TableId(1),
+            &mut transaction,
+            &[ScalarValue::Int64(1), ScalarValue::Text("temporary".into())],
+        )
+        .expect("insert into owning table");
+
+    assert!(matches!(
+        database.insert_into_in(
+            TableId(2),
+            &mut transaction,
+            &[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("wrong table".into())
+            ],
+        ),
+        Err(DatabaseError::Storage(StorageError::Transaction(_)))
+    ));
+    assert_eq!(transaction.state(), TransactionState::Active);
+    transaction.rollback().expect("owner can still roll back");
+    assert!(
+        database
+            .query("SELECT id FROM users")
+            .expect("query owner table")
+            .rows
+            .is_empty()
+    );
+
+    database.close().expect("close catalog");
+    cleanup(&users_path);
+    cleanup(&teams_path);
+}
+
+#[test]
+fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates() {
+    let base = std::env::temp_dir().join(format!(
+        "netbadb-core-join-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let users_path = base.with_extension("users.db");
+    let teams_path = base.with_extension("teams.db");
+    let users = TableDef::new(
+        TableId(11),
+        "users",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ColumnDef::new(
+                ColumnId(3),
+                "team_id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+        ],
+    );
+    let teams = TableDef::new(
+        TableId(12),
+        "teams",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64))
+                .nullable(true),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    );
+    let mut database = Database::create_tables(vec![
+        (users_path.clone(), users.clone()),
+        (teams_path.clone(), teams.clone()),
+    ])
+    .expect("create catalog");
+    for values in [
+        vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Text("Ada".into()),
+            ScalarValue::Int64(10),
+        ],
+        vec![
+            ScalarValue::Int64(2),
+            ScalarValue::Text("Lin".into()),
+            ScalarValue::Int64(20),
+        ],
+        vec![
+            ScalarValue::Int64(3),
+            ScalarValue::Text("Bo".into()),
+            ScalarValue::Null,
+        ],
+    ] {
+        database
+            .insert_into(TableId(11), &values)
+            .expect("insert user");
+    }
+    assert!(
+        database
+            .query("SELECT * FROM users u JOIN teams t ON u.team_id = t.id")
+            .expect("right-empty join")
+            .rows
+            .is_empty()
+    );
+    for values in [
+        vec![ScalarValue::Int64(10), ScalarValue::Text("Core".into())],
+        vec![ScalarValue::Int64(10), ScalarValue::Text("Core-2".into())],
+        vec![ScalarValue::Int64(20), ScalarValue::Text("Tools".into())],
+        vec![ScalarValue::Null, ScalarValue::Text("No team".into())],
+    ] {
+        database
+            .insert_into(TableId(12), &values)
+            .expect("insert team");
+    }
+
+    let joined = database
+        .query(
+            "SELECT u.name, t.name FROM users AS u JOIN teams AS t \
+             ON u.team_id = t.id",
+        )
+        .expect("join");
+    assert_eq!(
+        joined.rows,
+        vec![
+            vec![
+                ScalarValue::Text("Ada".into()),
+                ScalarValue::Text("Core".into())
+            ],
+            vec![
+                ScalarValue::Text("Ada".into()),
+                ScalarValue::Text("Core-2".into())
+            ],
+            vec![
+                ScalarValue::Text("Lin".into()),
+                ScalarValue::Text("Tools".into())
+            ],
+        ]
+    );
+    assert_eq!(joined.columns[0].name, "name");
+    assert_eq!(joined.columns[1].name, "name");
+
+    let filtered = database
+        .query(
+            "SELECT u.name FROM users u JOIN teams t ON u.team_id = t.id \
+             WHERE t.name = 'Core' LIMIT 1",
+        )
+        .expect("filtered join");
+    assert_eq!(filtered.rows, vec![vec![ScalarValue::Text("Ada".into())]]);
+
+    let star = database
+        .query("SELECT * FROM users u JOIN teams t ON u.team_id = t.id LIMIT 1")
+        .expect("star join");
+    assert_eq!(
+        star.rows[0],
+        vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Text("Ada".into()),
+            ScalarValue::Int64(10),
+            ScalarValue::Int64(10),
+            ScalarValue::Text("Core".into()),
+        ]
+    );
+    assert_eq!(star.columns.len(), 5);
+
+    database.close().expect("close catalog");
+    let mut reopened = Database::open_tables(vec![
+        (users_path.clone(), users),
+        (teams_path.clone(), teams),
+    ])
+    .expect("reopen catalog");
+    assert_eq!(
+        reopened
+            .query("SELECT u.name FROM users u JOIN teams t ON u.team_id = t.id")
+            .expect("join after reopen")
+            .rows
+            .len(),
+        3
+    );
+    reopened.close().expect("close reopened catalog");
+    cleanup(&users_path);
+    cleanup(&teams_path);
+}
+
+#[test]
+fn chained_join_executes_left_associatively_and_handles_an_empty_left_side() {
+    let base = std::env::temp_dir().join(format!(
+        "netbadb-core-multi-join-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let a_path = base.with_extension("a.db");
+    let b_path = base.with_extension("b.db");
+    let c_path = base.with_extension("c.db");
+    let a = TableDef::new(
+        TableId(31),
+        "a",
+        vec![ColumnDef::new(
+            ColumnId(1),
+            "id",
+            TypeSpec::Physical(PhysicalType::Int64),
+        )],
+    );
+    let b = TableDef::new(
+        TableId(32),
+        "b",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "a_id", TypeSpec::Physical(PhysicalType::Int64)),
+        ],
+    );
+    let c = TableDef::new(
+        TableId(33),
+        "c",
+        vec![
+            ColumnDef::new(ColumnId(1), "b_id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    );
+    let mut database = Database::create_tables(vec![
+        (a_path.clone(), a),
+        (b_path.clone(), b),
+        (c_path.clone(), c),
+    ])
+    .expect("create three-table catalog");
+    database
+        .insert_into(
+            TableId(32),
+            &[ScalarValue::Int64(20), ScalarValue::Int64(10)],
+        )
+        .expect("insert b");
+    database
+        .insert_into(
+            TableId(33),
+            &[ScalarValue::Int64(20), ScalarValue::Text("match".into())],
+        )
+        .expect("insert c");
+    assert!(
+        database
+            .query(
+                "SELECT c.name FROM a JOIN b ON a.id = b.a_id \
+                 JOIN c ON b.id = c.b_id",
+            )
+            .expect("left-empty multi join")
+            .rows
+            .is_empty()
+    );
+    database
+        .insert_into(TableId(31), &[ScalarValue::Int64(10)])
+        .expect("insert a");
+    assert_eq!(
+        database
+            .query(
+                "SELECT a.id, c.name FROM a JOIN b ON a.id = b.a_id \
+                 JOIN c ON b.id = c.b_id",
+            )
+            .expect("multi join")
+            .rows,
+        vec![vec![
+            ScalarValue::Int64(10),
+            ScalarValue::Text("match".into()),
+        ]]
+    );
+    database.close().expect("close three-table catalog");
+    cleanup(&a_path);
+    cleanup(&b_path);
+    cleanup(&c_path);
+}
+
+#[test]
+fn self_join_uses_independent_relation_bindings() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-core-self-join-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let employees = TableDef::new(
+        TableId(21),
+        "employees",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                ColumnId(2),
+                "manager_id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+            ColumnDef::new(ColumnId(3), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    );
+    let mut database = Database::create(&path, employees).expect("create employees");
+    for row in [
+        vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Null,
+            ScalarValue::Text("CEO".into()),
+        ],
+        vec![
+            ScalarValue::Int64(2),
+            ScalarValue::Int64(1),
+            ScalarValue::Text("Ada".into()),
+        ],
+        vec![
+            ScalarValue::Int64(3),
+            ScalarValue::Int64(1),
+            ScalarValue::Text("Lin".into()),
+        ],
+    ] {
+        database.insert(&row).expect("insert employee");
+    }
+    let result = database
+        .query(
+            "SELECT e.name, m.name FROM employees e JOIN employees m \
+             ON e.manager_id = m.id",
+        )
+        .expect("self join");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                ScalarValue::Text("Ada".into()),
+                ScalarValue::Text("CEO".into())
+            ],
+            vec![
+                ScalarValue::Text("Lin".into()),
+                ScalarValue::Text("CEO".into())
+            ],
+        ]
+    );
+    database.close().expect("close employees");
+    cleanup(&path);
+}

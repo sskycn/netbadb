@@ -2,16 +2,16 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use netbadb_compiler::{CompileError, compile_statement};
-use netbadb_executor::{ExecutionError, execute_statement};
+use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages};
 use netbadb_planner::PhysicalStatement;
 use netbadb_schema::{Schema, TableDef};
-use netbadb_storage::{HeapStorage, StorageError};
-use netbadb_types::ScalarValue;
+use netbadb_storage::{HeapStorage, StorageError, TransactionError};
+use netbadb_types::{ScalarValue, TableId};
 
-pub use netbadb_executor::{ExecutionResult, QueryResult};
+pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_storage::{Transaction, TransactionState};
 
 #[derive(Debug)]
@@ -20,6 +20,16 @@ pub enum DatabaseError {
     Storage(StorageError),
     Execution(ExecutionError),
     ExpectedQuery,
+    EmptyCatalog,
+    TableSelectionRequired,
+    DuplicateTableId(TableId),
+    DuplicateTableName(String),
+    DuplicateStoragePath(PathBuf),
+    CreateTablesRollback {
+        creation: StorageError,
+        cleanup_path: PathBuf,
+        cleanup: std::io::Error,
+    },
 }
 
 impl fmt::Display for DatabaseError {
@@ -29,6 +39,38 @@ impl fmt::Display for DatabaseError {
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
             Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
+            Self::EmptyCatalog => formatter.write_str("database requires at least one table"),
+            Self::TableSelectionRequired => formatter
+                .write_str("this catalog has multiple tables; use a table-specific embedded API"),
+            Self::DuplicateTableId(table_id) => {
+                write!(
+                    formatter,
+                    "table ID {} is registered more than once",
+                    table_id.0
+                )
+            }
+            Self::DuplicateTableName(name) => {
+                write!(
+                    formatter,
+                    "table name `{name}` is registered more than once"
+                )
+            }
+            Self::DuplicateStoragePath(path) => {
+                write!(
+                    formatter,
+                    "storage path `{}` is registered more than once",
+                    path.display()
+                )
+            }
+            Self::CreateTablesRollback {
+                creation,
+                cleanup_path,
+                cleanup,
+            } => write!(
+                formatter,
+                "failed to create catalog: {creation}; also failed to remove newly created file `{}`: {cleanup}",
+                cleanup_path.display()
+            ),
         }
     }
 }
@@ -39,7 +81,13 @@ impl Error for DatabaseError {
             Self::Compile(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
-            Self::ExpectedQuery => None,
+            Self::CreateTablesRollback { creation, .. } => Some(creation),
+            Self::ExpectedQuery
+            | Self::EmptyCatalog
+            | Self::TableSelectionRequired
+            | Self::DuplicateTableId(_)
+            | Self::DuplicateTableName(_)
+            | Self::DuplicateStoragePath(_) => None,
         }
     }
 }
@@ -64,7 +112,7 @@ impl From<ExecutionError> for DatabaseError {
 
 pub struct Database {
     schema: Schema,
-    storage: HeapStorage,
+    storages: Vec<HeapStorage>,
 }
 
 impl Database {
@@ -72,7 +120,7 @@ impl Database {
         let storage = HeapStorage::create(path, table.clone())?;
         Ok(Self {
             schema: Schema::new(vec![table]),
-            storage,
+            storages: vec![storage],
         })
     }
 
@@ -80,17 +128,84 @@ impl Database {
         let storage = HeapStorage::open(path, table.clone())?;
         Ok(Self {
             schema: Schema::new(vec![table]),
-            storage,
+            storages: vec![storage],
+        })
+    }
+
+    /// Creates one existing heap-format file per table and composes them into
+    /// one query catalog. Persistent heap, page, WAL, and checkpoint formats
+    /// are unchanged; this is a core-layer composition API.
+    pub fn create_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
+        validate_catalog_entries(&tables)?;
+        let mut storages = Vec::with_capacity(tables.len());
+        let mut definitions = Vec::with_capacity(tables.len());
+        let mut created_paths = Vec::with_capacity(tables.len());
+        for (path, table) in tables {
+            match HeapStorage::create(&path, table.clone()) {
+                Ok(storage) => {
+                    storages.push(storage);
+                    definitions.push(table);
+                    created_paths.push(path);
+                }
+                Err(creation) => {
+                    // All paths in `created_paths` were created successfully by
+                    // this invocation. Release their handles before removing
+                    // only those exact database and WAL files.
+                    drop(storages);
+                    if let Some((cleanup_path, cleanup)) =
+                        cleanup_created_table_files(&created_paths)
+                    {
+                        return Err(DatabaseError::CreateTablesRollback {
+                            creation,
+                            cleanup_path,
+                            cleanup,
+                        });
+                    }
+                    return Err(creation.into());
+                }
+            }
+        }
+        Ok(Self {
+            schema: Schema::new(definitions),
+            storages,
+        })
+    }
+
+    /// Opens one existing heap-format file per table as a single query catalog.
+    pub fn open_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
+        validate_catalog_entries(&tables)?;
+        let mut storages = Vec::with_capacity(tables.len());
+        let mut definitions = Vec::with_capacity(tables.len());
+        for (path, table) in tables {
+            storages.push(HeapStorage::open(path, table.clone())?);
+            definitions.push(table);
+        }
+        Ok(Self {
+            schema: Schema::new(definitions),
+            storages,
         })
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<(), DatabaseError> {
-        self.storage.insert(values)?;
+        self.primary_storage_mut()?.insert(values)?;
         Ok(())
     }
 
     pub fn begin_transaction(&mut self) -> Result<Transaction, DatabaseError> {
-        Ok(self.storage.begin_transaction()?)
+        Ok(self.primary_storage_mut()?.begin_transaction()?)
+    }
+
+    /// Begins a transaction owned by the heap for `table_id`.
+    ///
+    /// The returned handle is valid only for writes to that same table through
+    /// [`Self::insert_into_in`] or [`Self::execute_in`]. A transaction cannot
+    /// span multiple table heaps; attempting to use it with another table
+    /// returns a foreign-transaction error without rolling back its owner.
+    pub fn begin_transaction_for(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<Transaction, DatabaseError> {
+        Ok(self.storage_mut(table_id)?.begin_transaction()?)
     }
 
     pub fn insert_in(
@@ -98,38 +213,68 @@ impl Database {
         transaction: &mut Transaction,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
-        self.storage.insert_in(transaction, values)?;
+        self.primary_storage_mut()?.insert_in(transaction, values)?;
+        Ok(())
+    }
+
+    /// Inserts one row into a specific table using that heap's implicit
+    /// transaction. This is the direct embedded data-loading counterpart to
+    /// multi-table query catalogs.
+    pub fn insert_into(
+        &mut self,
+        table_id: TableId,
+        values: &[ScalarValue],
+    ) -> Result<(), DatabaseError> {
+        self.storage_mut(table_id)?.insert(values)?;
+        Ok(())
+    }
+
+    /// Inserts into `table_id` using a transaction created by
+    /// [`Self::begin_transaction_for`] for that same table.
+    ///
+    /// Cross-table use is rejected as a foreign transaction. NetbaDB does not
+    /// currently provide atomic write transactions spanning multiple heaps.
+    pub fn insert_into_in(
+        &mut self,
+        table_id: TableId,
+        transaction: &mut Transaction,
+        values: &[ScalarValue],
+    ) -> Result<(), DatabaseError> {
+        self.storage_mut(table_id)?.insert_in(transaction, values)?;
         Ok(())
     }
 
     /// Flushes dirty pages and reports any write or sync failure.
     pub fn flush(&self) -> Result<(), DatabaseError> {
-        self.storage.flush()?;
+        for storage in &self.storages {
+            storage.flush()?;
+        }
         Ok(())
     }
 
     /// Creates a quiescent checkpoint and recycles the previous WAL history.
     pub fn checkpoint(&mut self) -> Result<(), DatabaseError> {
-        self.storage.checkpoint()?;
+        for storage in &mut self.storages {
+            storage.checkpoint()?;
+        }
         Ok(())
     }
 
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
-        self.storage.close()?;
+        for storage in self.storages {
+            storage.close()?;
+        }
         Ok(())
     }
 
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
         let compiled = compile_statement(&self.schema, source)?;
         let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
-        let PhysicalStatement::Query(_) = physical else {
+        let PhysicalStatement::Query(plan) = physical else {
             return Err(DatabaseError::ExpectedQuery);
         };
-        match execute_statement(&physical, &mut self.storage, None)? {
-            ExecutionResult::Query(result) => Ok(result),
-            ExecutionResult::AffectedRows(_) => Err(DatabaseError::ExpectedQuery),
-        }
+        Ok(execute_with_storages(&plan, &mut self.storages)?)
     }
 
     /// Executes SELECT or one typed DML statement. DML runs in one implicit
@@ -137,12 +282,17 @@ impl Database {
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
         let compiled = compile_statement(&self.schema, source)?;
         let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
-        if matches!(physical, PhysicalStatement::Query(_)) {
-            return Ok(execute_statement(&physical, &mut self.storage, None)?);
+        if let PhysicalStatement::Query(plan) = &physical {
+            return Ok(ExecutionResult::Query(execute_with_storages(
+                plan,
+                &mut self.storages,
+            )?));
         }
 
-        let mut transaction = self.storage.begin_transaction()?;
-        match execute_statement(&physical, &mut self.storage, Some(&mut transaction)) {
+        let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
+        let storage = self.storage_mut(table_id)?;
+        let mut transaction = storage.begin_transaction()?;
+        match execute_statement(&physical, storage, Some(&mut transaction)) {
             Ok(result) => {
                 transaction.commit()?;
                 Ok(result)
@@ -154,22 +304,30 @@ impl Database {
         }
     }
 
-    /// Executes a statement using an existing transaction. Until savepoints
-    /// exist, an execution-time DML failure rolls back the whole transaction.
+    /// Executes a statement using an existing transaction. Mutating statements
+    /// must target the same table passed to [`Self::begin_transaction_for`].
+    /// Until savepoints exist, an execution-time DML failure rolls back the
+    /// whole transaction.
     pub fn execute_in(
         &mut self,
         transaction: &mut Transaction,
         source: &str,
     ) -> Result<ExecutionResult, DatabaseError> {
-        // Reject inactive or foreign handles before compilation/execution. In
-        // particular, a foreign handle must never be rolled back by this DB.
-        self.storage.validate_transaction(transaction)?;
+        // Reject inactive or foreign handles before compilation/execution. A
+        // foreign handle must never be rolled back by this database object.
+        self.validate_transaction(transaction)?;
         let compiled = compile_statement(&self.schema, source)?;
         let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
-        if matches!(physical, PhysicalStatement::Query(_)) {
-            return Ok(execute_statement(&physical, &mut self.storage, None)?);
+        if let PhysicalStatement::Query(plan) = &physical {
+            return Ok(ExecutionResult::Query(execute_with_storages(
+                plan,
+                &mut self.storages,
+            )?));
         }
-        match execute_statement(&physical, &mut self.storage, Some(transaction)) {
+        let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
+        let storage = self.storage_mut(table_id)?;
+        storage.validate_transaction(transaction)?;
+        match execute_statement(&physical, storage, Some(transaction)) {
             Ok(result) => Ok(result),
             Err(error) => match transaction.rollback() {
                 Ok(()) => Err(error.into()),
@@ -182,6 +340,91 @@ impl Database {
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn primary_storage_mut(&mut self) -> Result<&mut HeapStorage, DatabaseError> {
+        match self.storages.as_mut_slice() {
+            [] => Err(DatabaseError::EmptyCatalog),
+            [storage] => Ok(storage),
+            [_, ..] => Err(DatabaseError::TableSelectionRequired),
+        }
+    }
+
+    fn storage_mut(&mut self, table_id: TableId) -> Result<&mut HeapStorage, DatabaseError> {
+        self.storages
+            .iter_mut()
+            .find(|storage| storage.table().id == table_id)
+            .ok_or_else(|| ExecutionError::MissingTableStorage(table_id).into())
+    }
+
+    fn validate_transaction(&self, transaction: &Transaction) -> Result<(), DatabaseError> {
+        let mut foreign = None;
+        for storage in &self.storages {
+            match storage.validate_transaction(transaction) {
+                Ok(()) => return Ok(()),
+                Err(StorageError::Transaction(TransactionError::ForeignTransaction { .. })) => {
+                    foreign = Some(StorageError::Transaction(
+                        TransactionError::ForeignTransaction {
+                            txn_id: transaction.id(),
+                        },
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(foreign.ok_or(DatabaseError::EmptyCatalog)?.into())
+    }
+}
+
+fn statement_table_id(statement: &PhysicalStatement) -> Option<TableId> {
+    match statement {
+        PhysicalStatement::Query(_) => None,
+        PhysicalStatement::Insert { table_id, .. }
+        | PhysicalStatement::Update { table_id, .. }
+        | PhysicalStatement::Delete { table_id, .. } => Some(*table_id),
+    }
+}
+
+fn validate_catalog_entries(entries: &[(PathBuf, TableDef)]) -> Result<(), DatabaseError> {
+    if entries.is_empty() {
+        return Err(DatabaseError::EmptyCatalog);
+    }
+    for (index, (path, table)) in entries.iter().enumerate() {
+        for (other_path, other_table) in &entries[..index] {
+            if path == other_path {
+                return Err(DatabaseError::DuplicateStoragePath(path.clone()));
+            }
+            if table.id == other_table.id {
+                return Err(DatabaseError::DuplicateTableId(table.id));
+            }
+            if table.name == other_table.name {
+                return Err(DatabaseError::DuplicateTableName(table.name.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::Error)> {
+    let mut first_error = None;
+    for database_path in paths.iter().rev() {
+        let wal_path = netbadb_storage::wal_path(database_path);
+        let targets = [
+            database_path.clone(),
+            wal_path.clone(),
+            netbadb_storage::wal_alternate_path(&wal_path),
+        ];
+        for target in targets {
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some((target, error));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    first_error
 }
 
 #[cfg(test)]

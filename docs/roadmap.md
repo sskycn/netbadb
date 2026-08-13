@@ -135,13 +135,29 @@ UPDATE preserves RowId but does not relocate a row. A replacement that cannot
 fit on its current page fails atomically. INSERT is currently one row with an
 explicit column list; there are no defaults, RETURNING, UPSERT, or subqueries.
 
-## Phase 3C — Join Execution
+## Phase 3C — Typed INNER JOIN (complete)
 
-- qualified columns and table aliases;
-- typed INNER JOIN syntax and predicates;
-- row-at-a-time nested-loop join physical execution;
-- SQL NULL join-predicate semantics;
-- deterministic compiler, planner, executor, and end-to-end tests.
+- query-local `RelationBindingId` values distinct from catalog `TableId`;
+- qualified/unqualified name resolution, aliases, ambiguity rejection, and
+  left-to-right JOIN scope construction;
+- typed chained INNER JOIN predicates with nominal safety and nullable BOOL;
+- logical Join and physical row-at-a-time NestedLoopJoin operators;
+- binding-aware self joins, SQL NULL predicate semantics, duplicate
+  preservation, and deterministic left-major/right-minor results;
+- multi-heap core composition without page, WAL, recovery, checkpoint, or
+  transaction format changes;
+- parser, resolver, type, planner, executor, self-join, multi-join, and embedded
+  close/reopen tests.
+
+Phase 3C supports only INNER JOIN with `ON`. There is no outer join, `USING`,
+join reordering, hash/merge/index join, or multi-table DML.
+
+## Phase 3D — Aggregate + Sort
+
+- `ORDER BY` with explicit NULL ordering semantics;
+- `COUNT`, `SUM`, `MIN`, and `MAX`;
+- `GROUP BY` and aggregate NULL semantics;
+- typed logical/physical operators and deterministic execution tests.
 
 ## Phase 4 — Indexing and planning
 

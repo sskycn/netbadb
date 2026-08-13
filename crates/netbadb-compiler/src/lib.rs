@@ -4,11 +4,13 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_hir::{
-    ColumnRef as HirColumnRef, HirError, TypedExpr, TypedExprKind, TypedQuery, TypedStatement,
+    ColumnRef as HirColumnRef, HirError, TypedExpr, TypedExprKind, TypedQuery, TypedRelation,
+    TypedStatement,
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
-    Assignment, BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement, UnaryOp,
+    Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement,
+    UnaryOp,
 };
 use netbadb_schema::Schema;
 
@@ -63,39 +65,7 @@ impl From<HirError> for CompileError {
 pub fn compile(schema: &Schema, source: &str) -> Result<CompiledQuery, CompileError> {
     let ast = parse(source)?;
     let hir = netbadb_hir::lower_query(schema, &ast)?;
-    let table = schema.table(&hir.table_name).ok_or_else(|| {
-        CompileError::Hir(HirError::UnknownTable {
-            name: hir.table_name.clone(),
-            span: netbadb_parser::Span { start: 0, end: 0 },
-        })
-    })?;
-    let scan_columns = table
-        .columns
-        .iter()
-        .map(|column| column_ref(hir.table_id, column))
-        .collect();
-    let mut logical_plan = LogicalPlan::Scan {
-        table_id: hir.table_id,
-        table_name: hir.table_name.clone(),
-        columns: scan_columns,
-    };
-
-    if let Some(predicate) = &hir.selection {
-        logical_plan = LogicalPlan::Filter {
-            input: Box::new(logical_plan),
-            predicate: lower_expr(predicate),
-        };
-    }
-    logical_plan = LogicalPlan::Project {
-        input: Box::new(logical_plan),
-        columns: hir.projection.iter().map(column_ref_from_hir).collect(),
-    };
-    if let Some(limit) = hir.limit {
-        logical_plan = LogicalPlan::Limit {
-            input: Box::new(logical_plan),
-            limit,
-        };
-    }
+    let logical_plan = lower_query_plan(&hir);
 
     Ok(CompiledQuery { hir, logical_plan })
 }
@@ -148,11 +118,19 @@ fn lower_statement(statement: &TypedStatement) -> LogicalStatement {
 }
 
 fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
-    let mut plan = LogicalPlan::Scan {
-        table_id: query.table_id,
-        table_name: query.table_name.clone(),
-        columns: query.columns.iter().map(column_ref_from_hir).collect(),
-    };
+    let mut plan = lower_scan(&query.from);
+    for join in &query.joins {
+        let right = lower_scan(&join.right);
+        let mut columns = plan.output_columns().to_vec();
+        columns.extend_from_slice(right.output_columns());
+        plan = LogicalPlan::Join {
+            left: Box::new(plan),
+            right: Box::new(right),
+            kind: JoinKind::Inner,
+            predicate: lower_expr(&join.predicate),
+            columns,
+        };
+    }
     if let Some(predicate) = &query.selection {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
@@ -172,6 +150,15 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
     plan
 }
 
+fn lower_scan(relation: &TypedRelation) -> LogicalPlan {
+    LogicalPlan::Scan {
+        binding_id: relation.binding_id,
+        table_id: relation.table_id,
+        table_name: relation.table_name.clone(),
+        columns: relation.columns.iter().map(column_ref_from_hir).collect(),
+    }
+}
+
 fn scan_and_filter(
     table_id: netbadb_types::TableId,
     table_name: &str,
@@ -179,6 +166,11 @@ fn scan_and_filter(
     selection: Option<&TypedExpr>,
 ) -> LogicalPlan {
     let mut plan = LogicalPlan::Scan {
+        binding_id: columns
+            .first()
+            .map_or(netbadb_types::RelationBindingId(0), |column| {
+                column.binding_id
+            }),
         table_id,
         table_name: table_name.to_owned(),
         columns: columns.iter().map(column_ref_from_hir).collect(),
@@ -192,20 +184,12 @@ fn scan_and_filter(
     plan
 }
 
-fn column_ref(table_id: netbadb_types::TableId, column: &netbadb_schema::ColumnDef) -> ColumnRef {
-    ColumnRef {
-        table_id,
-        column_id: column.id,
-        name: column.name.clone(),
-        data_type: column.semantic_type(),
-        nullable: column.nullable,
-    }
-}
-
 fn column_ref_from_hir(column: &HirColumnRef) -> ColumnRef {
     ColumnRef {
+        binding_id: column.binding_id,
         table_id: column.table_id,
         column_id: column.column_id,
+        relation_name: column.relation_name.clone(),
         name: column.name.clone(),
         data_type: column.data_type.clone(),
         nullable: column.nullable,
@@ -262,7 +246,7 @@ mod tests {
     use super::{compile, compile_statement};
     use netbadb_rel::{ExprKind, LogicalPlan, LogicalStatement};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, TableId};
+    use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
 
     #[test]
     fn compiles_source_to_a_logical_plan() {
@@ -344,5 +328,57 @@ mod tests {
                 .logical_statement,
             LogicalStatement::Delete { .. }
         ));
+    }
+
+    #[test]
+    fn compiles_left_associative_join_plans_with_binding_aware_scans() {
+        let schema = Schema::new(vec![
+            TableDef::new(
+                TableId(1),
+                "a",
+                vec![ColumnDef::new(
+                    ColumnId(1),
+                    "id",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )],
+            ),
+            TableDef::new(
+                TableId(2),
+                "b",
+                vec![
+                    ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                    ColumnDef::new(ColumnId(2), "a_id", TypeSpec::Physical(PhysicalType::Int64)),
+                ],
+            ),
+            TableDef::new(
+                TableId(3),
+                "c",
+                vec![ColumnDef::new(
+                    ColumnId(1),
+                    "b_id",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )],
+            ),
+        ]);
+        let compiled = compile(
+            &schema,
+            "SELECT a.id, c.b_id FROM a JOIN b ON a.id = b.a_id \
+             JOIN c ON b.id = c.b_id",
+        )
+        .expect("compile joins");
+        let LogicalPlan::Project { input, .. } = compiled.logical_plan else {
+            panic!("expected project");
+        };
+        let LogicalPlan::Join { left, right, .. } = *input else {
+            panic!("expected outer join");
+        };
+        assert!(matches!(
+            *right,
+            LogicalPlan::Scan {
+                binding_id: RelationBindingId(2),
+                ..
+            }
+        ));
+        assert!(matches!(*left, LogicalPlan::Join { .. }));
     }
 }

@@ -5,19 +5,44 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_parser::{
-    BinaryOp as AstBinaryOp, Expr as AstExpr, Ident, Literal, Query, Span,
+    BinaryOp as AstBinaryOp, ColumnName, Expr as AstExpr, FromItem, Ident, Literal, Query, Span,
     Statement as AstStatement, UnaryOp as AstUnaryOp,
 };
 use netbadb_schema::{Schema, TableDef};
-use netbadb_types::{ColumnId, ExprType, PhysicalType, ScalarValue, SemanticType, TableId};
+use netbadb_types::{
+    ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
+    pub binding_id: RelationBindingId,
     pub table_id: TableId,
     pub column_id: ColumnId,
+    pub relation_name: String,
     pub name: String,
     pub data_type: SemanticType,
     pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedRelation {
+    pub binding_id: RelationBindingId,
+    pub table_id: TableId,
+    pub table_name: String,
+    pub exposed_name: String,
+    pub columns: Vec<ColumnRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedJoin {
+    pub kind: JoinKind,
+    pub right: TypedRelation,
+    pub predicate: TypedExpr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,8 +90,8 @@ pub enum TypedExprKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedQuery {
-    pub table_id: TableId,
-    pub table_name: String,
+    pub from: TypedRelation,
+    pub joins: Vec<TypedJoin>,
     pub columns: Vec<ColumnRef>,
     pub projection: Vec<ColumnRef>,
     pub selection: Option<TypedExpr>,
@@ -123,6 +148,21 @@ pub enum HirError {
         name: String,
         span: Span,
     },
+    UnknownRelationQualifier {
+        name: String,
+        span: Span,
+    },
+    DuplicateRelationName {
+        name: String,
+        span: Span,
+    },
+    AmbiguousColumn {
+        name: String,
+        span: Span,
+    },
+    TooManyRelations {
+        span: Span,
+    },
     TypeMismatch {
         expected: SemanticType,
         actual: SemanticType,
@@ -164,6 +204,21 @@ impl fmt::Display for HirError {
             Self::UnknownTable { name, .. } => write!(formatter, "unknown table `{name}`"),
             Self::UnknownColumn { table, name, .. } => {
                 write!(formatter, "unknown column `{table}.{name}`")
+            }
+            Self::UnknownRelationQualifier { name, .. } => {
+                write!(formatter, "unknown relation qualifier `{name}`")
+            }
+            Self::DuplicateRelationName { name, .. } => {
+                write!(
+                    formatter,
+                    "relation name `{name}` is exposed more than once"
+                )
+            }
+            Self::AmbiguousColumn { name, .. } => {
+                write!(formatter, "column `{name}` is ambiguous")
+            }
+            Self::TooManyRelations { .. } => {
+                formatter.write_str("query contains too many relation bindings")
             }
             Self::TypeMismatch {
                 expected, actual, ..
@@ -211,12 +266,20 @@ pub fn lower_statement(
 }
 
 pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirError> {
-    let table = schema
-        .table(&query.from.name)
-        .ok_or_else(|| HirError::UnknownTable {
-            name: query.from.name.clone(),
-            span: query.from.span,
-        })?;
+    let mut scope = RelationScope::default();
+    let from = scope.add(schema, &query.from)?;
+    let bool_type = SemanticType::physical(PhysicalType::Bool);
+    let mut joins = Vec::with_capacity(query.joins.len());
+    for join in &query.joins {
+        let right = scope.add(schema, &join.right)?;
+        let predicate = lower_expr_in_scope(&scope, &join.condition, Some(&bool_type))?;
+        require_type(&predicate, &bool_type)?;
+        joins.push(TypedJoin {
+            kind: JoinKind::Inner,
+            right,
+            predicate,
+        });
+    }
 
     let projection = query
         .projection
@@ -224,25 +287,19 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         .try_fold(Vec::new(), |mut columns, item| {
             match item {
                 netbadb_parser::SelectItem::Wildcard(_) => {
-                    columns.extend(
-                        table
-                            .columns
-                            .iter()
-                            .map(|column| column_ref(table.id, column)),
-                    );
+                    columns.extend(scope.columns());
                 }
                 netbadb_parser::SelectItem::Column(column) => {
-                    columns.push(resolve_column(table, column)?);
+                    columns.push(scope.resolve(column)?);
                 }
             }
             Ok::<_, HirError>(columns)
         })?;
 
-    let bool_type = SemanticType::physical(PhysicalType::Bool);
     let selection = query
         .selection
         .as_ref()
-        .map(|expression| lower_expr(table, expression, Some(&bool_type)))
+        .map(|expression| lower_expr_in_scope(&scope, expression, Some(&bool_type)))
         .transpose()?;
     if let Some(predicate) = &selection {
         if predicate.expr_type.data_type != bool_type {
@@ -255,17 +312,147 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
     }
 
     Ok(TypedQuery {
-        table_id: table.id,
-        table_name: table.name.clone(),
-        columns: table
-            .columns
-            .iter()
-            .map(|column| column_ref(table.id, column))
-            .collect(),
+        from,
+        joins,
+        columns: scope.columns(),
         projection,
         selection,
         limit: query.limit,
     })
+}
+
+#[derive(Default)]
+struct RelationScope<'a> {
+    bindings: Vec<ScopeBinding<'a>>,
+}
+
+struct ScopeBinding<'a> {
+    binding_id: RelationBindingId,
+    exposed_name: String,
+    table: &'a TableDef,
+}
+
+impl<'a> RelationScope<'a> {
+    fn single(table: &'a TableDef) -> Self {
+        Self {
+            bindings: vec![ScopeBinding {
+                binding_id: RelationBindingId(0),
+                exposed_name: table.name.clone(),
+                table,
+            }],
+        }
+    }
+
+    fn add(&mut self, schema: &'a Schema, item: &FromItem) -> Result<TypedRelation, HirError> {
+        let table = schema
+            .table(&item.table.name)
+            .ok_or_else(|| HirError::UnknownTable {
+                name: item.table.name.clone(),
+                span: item.table.span,
+            })?;
+        let exposed = item.alias.as_ref().unwrap_or(&item.table);
+        if self
+            .bindings
+            .iter()
+            .any(|binding| binding.exposed_name == exposed.name)
+        {
+            return Err(HirError::DuplicateRelationName {
+                name: exposed.name.clone(),
+                span: exposed.span,
+            });
+        }
+        let ordinal = u32::try_from(self.bindings.len())
+            .map_err(|_| HirError::TooManyRelations { span: item.span })?;
+        let binding_id = RelationBindingId(ordinal);
+        let binding = ScopeBinding {
+            binding_id,
+            exposed_name: exposed.name.clone(),
+            table,
+        };
+        let relation = binding.typed_relation();
+        self.bindings.push(binding);
+        Ok(relation)
+    }
+
+    fn resolve(&self, column: &ColumnName) -> Result<ColumnRef, HirError> {
+        if let Some(qualifier) = &column.qualifier {
+            let binding = self
+                .bindings
+                .iter()
+                .find(|binding| binding.exposed_name == qualifier.name)
+                .ok_or_else(|| HirError::UnknownRelationQualifier {
+                    name: qualifier.name.clone(),
+                    span: qualifier.span,
+                })?;
+            return binding
+                .column(&column.name)
+                .ok_or_else(|| HirError::UnknownColumn {
+                    table: binding.exposed_name.clone(),
+                    name: column.name.name.clone(),
+                    span: column.name.span,
+                });
+        }
+
+        let mut matches = self
+            .bindings
+            .iter()
+            .filter_map(|binding| binding.column(&column.name));
+        let resolved = matches.next().ok_or_else(|| HirError::UnknownColumn {
+            table: "query scope".into(),
+            name: column.name.name.clone(),
+            span: column.name.span,
+        })?;
+        if matches.next().is_some() {
+            return Err(HirError::AmbiguousColumn {
+                name: column.name.name.clone(),
+                span: column.span,
+            });
+        }
+        Ok(resolved)
+    }
+
+    fn columns(&self) -> Vec<ColumnRef> {
+        self.bindings
+            .iter()
+            .flat_map(ScopeBinding::columns)
+            .collect()
+    }
+}
+
+impl ScopeBinding<'_> {
+    fn column(&self, name: &Ident) -> Option<ColumnRef> {
+        self.table.column(&name.name).map(|column| ColumnRef {
+            binding_id: self.binding_id,
+            table_id: self.table.id,
+            column_id: column.id,
+            relation_name: self.exposed_name.clone(),
+            name: column.name.clone(),
+            data_type: column.semantic_type(),
+            nullable: column.nullable,
+        })
+    }
+
+    fn columns(&self) -> impl Iterator<Item = ColumnRef> + '_ {
+        self.table.columns.iter().map(|column| ColumnRef {
+            binding_id: self.binding_id,
+            table_id: self.table.id,
+            column_id: column.id,
+            relation_name: self.exposed_name.clone(),
+            name: column.name.clone(),
+            data_type: column.semantic_type(),
+            nullable: column.nullable,
+        })
+    }
+
+    fn typed_relation(&self) -> TypedRelation {
+        TypedRelation {
+            binding_id: self.binding_id,
+            table_id: self.table.id,
+            table_name: self.table.name.clone(),
+            exposed_name: self.exposed_name.clone(),
+            columns: self.columns().collect(),
+        }
+    }
 }
 
 fn lower_insert(
@@ -363,7 +550,7 @@ fn lower_update(
         columns: table
             .columns
             .iter()
-            .map(|column| column_ref(table.id, column))
+            .map(|column| column_ref(table, column))
             .collect(),
         assignments,
         selection,
@@ -381,7 +568,7 @@ fn lower_delete(
         columns: table
             .columns
             .iter()
-            .map(|column| column_ref(table.id, column))
+            .map(|column| column_ref(table, column))
             .collect(),
         selection: lower_selection(table, delete.selection.as_ref())?,
     })
@@ -469,9 +656,17 @@ fn lower_expr(
     expression: &AstExpr,
     expected: Option<&SemanticType>,
 ) -> Result<TypedExpr, HirError> {
+    lower_expr_in_scope(&RelationScope::single(table), expression, expected)
+}
+
+fn lower_expr_in_scope(
+    scope: &RelationScope<'_>,
+    expression: &AstExpr,
+    expected: Option<&SemanticType>,
+) -> Result<TypedExpr, HirError> {
     match expression {
         AstExpr::Column(column) => {
-            let resolved = resolve_column(table, column)?;
+            let resolved = scope.resolve(column)?;
             Ok(TypedExpr {
                 expr_type: ExprType {
                     data_type: resolved.data_type.clone(),
@@ -525,8 +720,8 @@ fn lower_expr(
             let bool_type = SemanticType::physical(PhysicalType::Bool);
             let (left, right) = match operator {
                 BinaryOp::And | BinaryOp::Or => {
-                    let left = lower_expr(table, left, Some(&bool_type))?;
-                    let right = lower_expr(table, right, Some(&bool_type))?;
+                    let left = lower_expr_in_scope(scope, left, Some(&bool_type))?;
+                    let right = lower_expr_in_scope(scope, right, Some(&bool_type))?;
                     require_type(&left, &bool_type)?;
                     require_type(&right, &bool_type)?;
                     (left, right)
@@ -537,7 +732,7 @@ fn lower_expr(
                 | BinaryOp::LtEq
                 | BinaryOp::Gt
                 | BinaryOp::GtEq => {
-                    let (left, right) = lower_comparison_operands(table, left, right)?;
+                    let (left, right) = lower_comparison_operands(scope, left, right)?;
                     if !left
                         .expr_type
                         .data_type
@@ -572,7 +767,7 @@ fn lower_expr(
             span,
         } => {
             let bool_type = SemanticType::physical(PhysicalType::Bool);
-            let expression = lower_expr(table, expression, Some(&bool_type))?;
+            let expression = lower_expr_in_scope(scope, expression, Some(&bool_type))?;
             require_type(&expression, &bool_type)?;
             Ok(TypedExpr {
                 expr_type: ExprType {
@@ -595,9 +790,9 @@ fn lower_expr(
         } => {
             let bool_type = SemanticType::physical(PhysicalType::Bool);
             let expression = if is_null_literal(expression) {
-                lower_expr(table, expression, Some(&bool_type))?
+                lower_expr_in_scope(scope, expression, Some(&bool_type))?
             } else {
-                lower_expr(table, expression, None)?
+                lower_expr_in_scope(scope, expression, None)?
             };
             Ok(TypedExpr {
                 expr_type: ExprType {
@@ -615,7 +810,7 @@ fn lower_expr(
 }
 
 fn lower_comparison_operands(
-    table: &TableDef,
+    scope: &RelationScope<'_>,
     left: &AstExpr,
     right: &AstExpr,
 ) -> Result<(TypedExpr, TypedExpr), HirError> {
@@ -625,23 +820,23 @@ fn lower_comparison_operands(
             // both runtime values remain NULL and comparison yields UNKNOWN.
             let carrier = SemanticType::physical(PhysicalType::Bool);
             Ok((
-                lower_expr(table, left, Some(&carrier))?,
-                lower_expr(table, right, Some(&carrier))?,
+                lower_expr_in_scope(scope, left, Some(&carrier))?,
+                lower_expr_in_scope(scope, right, Some(&carrier))?,
             ))
         }
         (true, false) => {
-            let right = lower_expr(table, right, None)?;
-            let left = lower_expr(table, left, Some(&right.expr_type.data_type))?;
+            let right = lower_expr_in_scope(scope, right, None)?;
+            let left = lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type))?;
             Ok((left, right))
         }
         (false, true) => {
-            let left = lower_expr(table, left, None)?;
-            let right = lower_expr(table, right, Some(&left.expr_type.data_type))?;
+            let left = lower_expr_in_scope(scope, left, None)?;
+            let right = lower_expr_in_scope(scope, right, Some(&left.expr_type.data_type))?;
             Ok((left, right))
         }
         (false, false) => Ok((
-            lower_expr(table, left, None)?,
-            lower_expr(table, right, None)?,
+            lower_expr_in_scope(scope, left, None)?,
+            lower_expr_in_scope(scope, right, None)?,
         )),
     }
 }
@@ -671,7 +866,7 @@ fn require_type(expression: &TypedExpr, expected: &SemanticType) -> Result<(), H
 fn resolve_column(table: &TableDef, column: &Ident) -> Result<ColumnRef, HirError> {
     table
         .column(&column.name)
-        .map(|column_def| column_ref(table.id, column_def))
+        .map(|column_def| column_ref(table, column_def))
         .ok_or_else(|| HirError::UnknownColumn {
             table: table.name.clone(),
             name: column.name.clone(),
@@ -679,10 +874,12 @@ fn resolve_column(table: &TableDef, column: &Ident) -> Result<ColumnRef, HirErro
         })
 }
 
-fn column_ref(table_id: TableId, column: &netbadb_schema::ColumnDef) -> ColumnRef {
+fn column_ref(table: &TableDef, column: &netbadb_schema::ColumnDef) -> ColumnRef {
     ColumnRef {
-        table_id,
+        binding_id: RelationBindingId(0),
+        table_id: table.id,
         column_id: column.id,
+        relation_name: table.name.clone(),
         name: column.name.clone(),
         data_type: column.semantic_type(),
         nullable: column.nullable,
@@ -707,44 +904,94 @@ mod tests {
     use super::{HirError, TypedExprKind, TypedStatement, UnaryOp, lower_query, lower_statement};
     use netbadb_parser::{parse, parse_statement};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, TableId};
+    use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
 
     fn schema() -> Schema {
-        Schema::new(vec![TableDef::new(
-            TableId(1),
-            "users",
-            vec![
-                ColumnDef::new(
-                    ColumnId(1),
-                    "id",
-                    TypeSpec::Semantic {
-                        name: "UserId".into(),
-                        physical: PhysicalType::UInt64,
-                    },
-                ),
-                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
-                ColumnDef::new(
-                    ColumnId(3),
-                    "active",
-                    TypeSpec::Physical(PhysicalType::Bool),
-                )
-                .nullable(true),
-                ColumnDef::new(
-                    ColumnId(4),
-                    "nickname",
-                    TypeSpec::Physical(PhysicalType::Text),
-                )
-                .nullable(true),
-                ColumnDef::new(
-                    ColumnId(5),
-                    "team_id",
-                    TypeSpec::Semantic {
-                        name: "TeamId".into(),
-                        physical: PhysicalType::UInt64,
-                    },
-                ),
-            ],
-        )])
+        Schema::new(vec![
+            TableDef::new(
+                TableId(1),
+                "users",
+                vec![
+                    ColumnDef::new(
+                        ColumnId(1),
+                        "id",
+                        TypeSpec::Semantic {
+                            name: "UserId".into(),
+                            physical: PhysicalType::UInt64,
+                        },
+                    ),
+                    ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+                    ColumnDef::new(
+                        ColumnId(3),
+                        "active",
+                        TypeSpec::Physical(PhysicalType::Bool),
+                    )
+                    .nullable(true),
+                    ColumnDef::new(
+                        ColumnId(4),
+                        "nickname",
+                        TypeSpec::Physical(PhysicalType::Text),
+                    )
+                    .nullable(true),
+                    ColumnDef::new(
+                        ColumnId(5),
+                        "team_id",
+                        TypeSpec::Semantic {
+                            name: "TeamId".into(),
+                            physical: PhysicalType::UInt64,
+                        },
+                    )
+                    .nullable(true),
+                ],
+            ),
+            TableDef::new(
+                TableId(2),
+                "teams",
+                vec![
+                    ColumnDef::new(
+                        ColumnId(1),
+                        "id",
+                        TypeSpec::Semantic {
+                            name: "TeamId".into(),
+                            physical: PhysicalType::UInt64,
+                        },
+                    ),
+                    ColumnDef::new(
+                        ColumnId(2),
+                        "owner_id",
+                        TypeSpec::Semantic {
+                            name: "UserId".into(),
+                            physical: PhysicalType::UInt64,
+                        },
+                    ),
+                    ColumnDef::new(ColumnId(3), "name", TypeSpec::Physical(PhysicalType::Text)),
+                ],
+            ),
+            TableDef::new(
+                TableId(3),
+                "employees",
+                vec![
+                    ColumnDef::new(
+                        ColumnId(1),
+                        "id",
+                        TypeSpec::Semantic {
+                            name: "EmployeeId".into(),
+                            physical: PhysicalType::UInt64,
+                        },
+                    ),
+                    ColumnDef::new(
+                        ColumnId(2),
+                        "manager_id",
+                        TypeSpec::Semantic {
+                            name: "EmployeeId".into(),
+                            physical: PhysicalType::UInt64,
+                        },
+                    )
+                    .nullable(true),
+                    ColumnDef::new(ColumnId(3), "name", TypeSpec::Physical(PhysicalType::Text)),
+                ],
+            ),
+        ])
     }
 
     #[test]
@@ -914,5 +1161,101 @@ mod tests {
             lower_statement(&schema(), &delete).expect("lower delete"),
             TypedStatement::Delete(delete) if delete.selection.is_some()
         ));
+    }
+
+    #[test]
+    fn resolves_qualified_and_unique_unqualified_join_columns() {
+        let typed = lower_query(
+            &schema(),
+            &parse(
+                "SELECT u.active, t.owner_id FROM users AS u JOIN teams AS t \
+                 ON u.team_id = t.id WHERE active IS NULL",
+            )
+            .expect("parse"),
+        )
+        .expect("lower");
+        assert_eq!(typed.from.binding_id, RelationBindingId(0));
+        assert_eq!(typed.joins[0].right.binding_id, RelationBindingId(1));
+        assert_eq!(typed.projection[0].relation_name, "u");
+        assert!(typed.joins[0].predicate.expr_type.nullable);
+    }
+
+    #[test]
+    fn rejects_ambiguous_unknown_and_duplicate_relation_names() {
+        let ambiguous =
+            parse("SELECT id FROM users u JOIN teams t ON u.team_id = t.id").expect("parse");
+        assert!(matches!(
+            lower_query(&schema(), &ambiguous),
+            Err(HirError::AmbiguousColumn { name, .. }) if name == "id"
+        ));
+
+        let unknown_qualifier = parse("SELECT x.id FROM users u").expect("parse unknown qualifier");
+        assert!(matches!(
+            lower_query(&schema(), &unknown_qualifier),
+            Err(HirError::UnknownRelationQualifier { name, .. }) if name == "x"
+        ));
+
+        let hidden_table = parse("SELECT users.id FROM users AS u").expect("parse hidden table");
+        assert!(matches!(
+            lower_query(&schema(), &hidden_table),
+            Err(HirError::UnknownRelationQualifier { name, .. }) if name == "users"
+        ));
+
+        let duplicate = parse("SELECT x.id FROM users x JOIN teams x ON x.team_id = x.id")
+            .expect("parse duplicate alias");
+        assert!(matches!(
+            lower_query(&schema(), &duplicate),
+            Err(HirError::DuplicateRelationName { name, .. }) if name == "x"
+        ));
+    }
+
+    #[test]
+    fn join_on_scope_does_not_include_future_relations() {
+        let query = parse(
+            "SELECT u.id FROM users u JOIN teams t ON e.id = t.id \
+             JOIN employees e ON e.id = u.id",
+        )
+        .expect("parse");
+        assert!(matches!(
+            lower_query(&schema(), &query),
+            Err(HirError::UnknownRelationQualifier { name, .. }) if name == "e"
+        ));
+    }
+
+    #[test]
+    fn self_join_uses_distinct_bindings_and_nominal_predicate_types() {
+        let typed = lower_query(
+            &schema(),
+            &parse(
+                "SELECT e.name, m.name FROM employees e JOIN employees m \
+                 ON e.manager_id = m.id",
+            )
+            .expect("parse"),
+        )
+        .expect("self join lowers");
+        assert_eq!(typed.projection[0].table_id, typed.projection[1].table_id);
+        assert_ne!(
+            typed.projection[0].binding_id,
+            typed.projection[1].binding_id
+        );
+
+        let nominal_mismatch =
+            parse("SELECT u.id FROM users u JOIN teams t ON u.id = t.id").expect("parse mismatch");
+        assert!(matches!(
+            lower_query(&schema(), &nominal_mismatch),
+            Err(HirError::IncompatibleComparison { .. })
+        ));
+
+        let non_boolean =
+            parse("SELECT u.id FROM users u JOIN teams t ON t.id").expect("parse non-bool");
+        assert!(matches!(
+            lower_query(&schema(), &non_boolean),
+            Err(HirError::TypeMismatch { .. })
+        ));
+
+        let is_null = parse("SELECT u.id FROM users u JOIN teams t ON u.team_id IS NULL")
+            .expect("parse IS NULL join");
+        let typed = lower_query(&schema(), &is_null).expect("IS NULL is a valid ON expression");
+        assert!(!typed.joins[0].predicate.expr_type.nullable);
     }
 }

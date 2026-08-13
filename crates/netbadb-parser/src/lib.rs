@@ -18,9 +18,37 @@ pub struct Ident {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     pub projection: Vec<SelectItem>,
-    pub from: Ident,
+    pub from: FromItem,
+    pub joins: Vec<Join>,
     pub selection: Option<Expr>,
     pub limit: Option<u64>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromItem {
+    pub table: Ident,
+    pub alias: Option<Ident>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub right: FromItem,
+    pub condition: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnName {
+    pub qualifier: Option<Ident>,
+    pub name: Ident,
     pub span: Span,
 }
 
@@ -65,12 +93,12 @@ pub struct DeleteStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
     Wildcard(Span),
-    Column(Ident),
+    Column(ColumnName),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
-    Column(Ident),
+    Column(ColumnName),
     Literal {
         value: Literal,
         span: Span,
@@ -148,6 +176,10 @@ enum TokenKind {
     Update,
     Set,
     Delete,
+    As,
+    Join,
+    Inner,
+    On,
     And,
     Or,
     Is,
@@ -159,6 +191,7 @@ enum TokenKind {
     Number(i64),
     String(String),
     Comma,
+    Dot,
     Star,
     Eq,
     NotEq,
@@ -213,6 +246,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             b',' => {
                 position += 1;
                 TokenKind::Comma
+            }
+            b'.' => {
+                position += 1;
+                TokenKind::Dot
             }
             b'*' => {
                 position += 1;
@@ -308,6 +345,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "UPDATE" => TokenKind::Update,
                     "SET" => TokenKind::Set,
                     "DELETE" => TokenKind::Delete,
+                    "AS" => TokenKind::As,
+                    "JOIN" => TokenKind::Join,
+                    "INNER" => TokenKind::Inner,
+                    "ON" => TokenKind::On,
                     "AND" => TokenKind::And,
                     "OR" => TokenKind::Or,
                     "IS" => TokenKind::Is,
@@ -371,7 +412,11 @@ impl Parser {
         let start = self.expect_simple(TokenKind::Select)?.span.start;
         let projection = self.parse_projection()?;
         self.expect_simple(TokenKind::From)?;
-        let from = self.expect_ident()?;
+        let from = self.parse_from_item()?;
+        let mut joins = Vec::new();
+        while self.matches(&TokenKind::Join) || self.matches(&TokenKind::Inner) {
+            joins.push(self.parse_join()?);
+        }
         let selection = if self.matches(&TokenKind::Where) {
             self.position += 1;
             Some(self.parse_expr(0)?)
@@ -395,8 +440,53 @@ impl Parser {
         Ok(Query {
             projection,
             from,
+            joins,
             selection,
             limit,
+            span: Span { start, end },
+        })
+    }
+
+    fn parse_from_item(&mut self) -> Result<FromItem, ParseError> {
+        let table = self.expect_ident()?;
+        let alias = if self.matches(&TokenKind::As) {
+            self.position += 1;
+            Some(self.expect_ident()?)
+        } else if matches!(self.current().kind, TokenKind::Ident(_)) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        let end = alias
+            .as_ref()
+            .map_or(table.span.end, |alias| alias.span.end);
+        Ok(FromItem {
+            span: Span {
+                start: table.span.start,
+                end,
+            },
+            table,
+            alias,
+        })
+    }
+
+    fn parse_join(&mut self) -> Result<Join, ParseError> {
+        let start = if self.matches(&TokenKind::Inner) {
+            let start = self.current().span.start;
+            self.position += 1;
+            self.expect_simple(TokenKind::Join)?;
+            start
+        } else {
+            self.expect_simple(TokenKind::Join)?.span.start
+        };
+        let right = self.parse_from_item()?;
+        self.expect_simple(TokenKind::On)?;
+        let condition = self.parse_expr(0)?;
+        let end = expr_span(&condition).end;
+        Ok(Join {
+            kind: JoinKind::Inner,
+            right,
+            condition,
             span: Span { start, end },
         })
     }
@@ -509,10 +599,10 @@ impl Parser {
             return Ok(vec![SelectItem::Wildcard(span)]);
         }
 
-        let mut projection = vec![SelectItem::Column(self.expect_ident()?)];
+        let mut projection = vec![SelectItem::Column(self.parse_column_name()?)];
         while self.matches(&TokenKind::Comma) {
             self.position += 1;
-            projection.push(SelectItem::Column(self.expect_ident()?));
+            projection.push(SelectItem::Column(self.parse_column_name()?));
         }
         Ok(projection)
     }
@@ -592,10 +682,11 @@ impl Parser {
         match token.kind {
             TokenKind::Ident(name) => {
                 self.position += 1;
-                Ok(Expr::Column(Ident {
+                let first = Ident {
                     name,
                     span: token.span,
-                }))
+                };
+                Ok(Expr::Column(self.finish_column_name(first)?))
             }
             TokenKind::Number(value) => {
                 self.position += 1;
@@ -667,6 +758,32 @@ impl Parser {
         }
     }
 
+    fn parse_column_name(&mut self) -> Result<ColumnName, ParseError> {
+        let first = self.expect_ident()?;
+        self.finish_column_name(first)
+    }
+
+    fn finish_column_name(&mut self, first: Ident) -> Result<ColumnName, ParseError> {
+        if self.matches(&TokenKind::Dot) {
+            self.position += 1;
+            let name = self.expect_ident()?;
+            Ok(ColumnName {
+                span: Span {
+                    start: first.span.start,
+                    end: name.span.end,
+                },
+                qualifier: Some(first),
+                name,
+            })
+        } else {
+            Ok(ColumnName {
+                span: first.span,
+                qualifier: None,
+                name: first,
+            })
+        }
+    }
+
     fn expect_simple(&mut self, expected: TokenKind) -> Result<Token, ParseError> {
         let token = self.current().clone();
         if token.kind == expected {
@@ -720,7 +837,7 @@ mod tests {
     fn parses_the_initial_query_subset() {
         let query = parse("SELECT id, name FROM users WHERE id >= 2 AND name != 'bob' LIMIT 10")
             .expect("query parses");
-        assert_eq!(query.from.name, "users");
+        assert_eq!(query.from.table.name, "users");
         assert_eq!(query.projection.len(), 2);
         assert_eq!(query.limit, Some(10));
         assert!(matches!(query.projection[0], SelectItem::Column(_)));
@@ -879,5 +996,45 @@ mod tests {
     #[test]
     fn rejects_multiple_statements() {
         assert!(parse_statement("DELETE FROM users; DELETE FROM users").is_err());
+    }
+
+    #[test]
+    fn parses_aliases_qualified_columns_and_left_associative_joins() {
+        let query = parse(
+            "SELECT u.id, o.name FROM users AS u INNER JOIN teams t \
+             ON u.team_id = t.id JOIN organizations o ON t.org_id = o.id \
+             WHERE o.active = true",
+        )
+        .expect("join query parses");
+        assert_eq!(query.from.alias.as_ref().expect("alias").name, "u");
+        assert_eq!(query.joins.len(), 2);
+        assert_eq!(query.joins[0].right.table.name, "teams");
+        assert_eq!(
+            query.joins[0].right.alias.as_ref().expect("alias").name,
+            "t"
+        );
+        let SelectItem::Column(first) = &query.projection[0] else {
+            panic!("expected projected column");
+        };
+        assert_eq!(first.qualifier.as_ref().expect("qualifier").name, "u");
+        assert_eq!(first.name.name, "id");
+        assert!(query.selection.is_some());
+    }
+
+    #[test]
+    fn join_keywords_are_not_consumed_as_shorthand_aliases() {
+        let query =
+            parse("SELECT * FROM users JOIN teams ON users.id = teams.id").expect("join parses");
+        assert!(query.from.alias.is_none());
+        assert!(query.joins[0].right.alias.is_none());
+
+        for source in [
+            "SELECT * FROM users JOIN ON users.id = teams.id",
+            "SELECT * FROM users INNER teams ON users.id = teams.id",
+            "SELECT * FROM users JOIN teams users.id = teams.id",
+            "SELECT * FROM users AS JOIN teams ON users.id = teams.id",
+        ] {
+            assert!(parse(source).is_err(), "{source} must fail");
+        }
     }
 }
