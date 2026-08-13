@@ -37,6 +37,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "index_catalog_decode"
+path = "fuzz_targets/index_catalog_decode.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
 

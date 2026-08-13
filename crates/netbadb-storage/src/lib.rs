@@ -13,6 +13,7 @@ mod wal;
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::HeapStorage;
+pub use netbadb_index::IndexDefinition;
 pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
     PageType, SLOT_SIZE, Slot, SlotRef, SlotState,

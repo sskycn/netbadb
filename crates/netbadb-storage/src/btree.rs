@@ -428,7 +428,7 @@ impl<'a> BTree<'a> {
         Ok(self.read_meta(handle)?.spec)
     }
 
-    fn read_meta(&self, handle: BTreeHandle) -> Result<MetaNode, StorageError> {
+    pub(crate) fn read_meta(&self, handle: BTreeHandle) -> Result<MetaNode, StorageError> {
         self.validate_child(handle.meta_page)?;
         let page = self.storage.buffer().read_page(handle.meta_page)?;
         if page.page().header()?.page_type != PageType::BTreeMeta {
@@ -1612,10 +1612,10 @@ mod tests {
                 nullable: false,
             })
             .expect("create mixed tree");
-        assert_eq!(handle.meta_page, PageId(2));
+        assert_eq!(handle.meta_page, PageId(3));
 
         let mut value = 1_u64;
-        while heap_rows.last().expect("heap row").page == PageId(1) {
+        while heap_rows.last().expect("heap row").page == PageId(2) {
             heap_rows.push(
                 storage
                     .insert(&[ScalarValue::UInt64(value)])
@@ -1623,7 +1623,7 @@ mod tests {
             );
             value += 1;
         }
-        assert_eq!(heap_rows.last().expect("new heap page").page, PageId(4));
+        assert_eq!(heap_rows.last().expect("new heap page").page, PageId(5));
         for (ordinal, row) in heap_rows.iter().copied().enumerate() {
             storage
                 .btree()
@@ -1859,7 +1859,7 @@ mod tests {
     fn run_crash_child(case: &str, path: &std::path::Path) {
         let trigger = split_trigger_ordinal();
         let handle = BTreeHandle {
-            meta_page: PageId(2),
+            meta_page: PageId(3),
         };
         let mut storage =
             HeapStorage::open_with_buffer_pool_size(path, table(), 1).expect("open crash tree");

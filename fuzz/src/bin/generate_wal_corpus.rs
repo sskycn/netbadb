@@ -1,11 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use netbadb_index::{
-    IndexEntry, IndexSpec, InternalNode, InternalSeparator, LeafNode, MetaNode, encode_internal,
-    encode_leaf, encode_meta,
+    BTreeHandle, IndexCatalogNode, IndexDefinition, IndexEntry, IndexSpec, InternalNode,
+    InternalSeparator, LeafNode, MetaNode, encode_index_catalog, encode_internal, encode_leaf,
+    encode_meta,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_storage::{HeapStorage, Page, PageType, WalManager, WalRecordKind, wal_path};
+use netbadb_storage::{
+    HeapStorage, Page, PageManager, PageType, WalManager, WalRecordKind, wal_alternate_path,
+    wal_path,
+};
 use netbadb_types::{
     ColumnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType, TableId, TxnId,
 };
@@ -42,6 +46,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     write_page_decode_seed(&output)?;
     write_btree_decode_seeds(&output)?;
+    write_index_catalog_decode_seeds(&output)?;
+    Ok(())
+}
+
+fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = wal_output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("index_catalog_decode");
+    std::fs::create_dir_all(&output)?;
+    std::fs::write(output.join("empty"), [])?;
+    let empty = encode_index_catalog(&IndexCatalogNode::empty())?;
+    std::fs::write(output.join("valid-empty-catalog"), &empty)?;
+    let one = encode_index_catalog(&IndexCatalogNode {
+        next_catalog: None,
+        definitions: vec![IndexDefinition {
+            column_id: ColumnId(1),
+            handle: BTreeHandle {
+                meta_page: PageId(3),
+            },
+        }],
+    })?;
+    std::fs::write(output.join("valid-one-entry"), &one)?;
+    std::fs::write(
+        output.join("valid-catalog-with-next"),
+        encode_index_catalog(&IndexCatalogNode {
+            next_catalog: Some(PageId(9)),
+            definitions: vec![],
+        })?,
+    )?;
+    std::fs::write(output.join("truncated"), &one[..one.len() - 1])?;
+    let mut bad_count = empty;
+    bad_count[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(output.join("bad-count"), bad_count)?;
     Ok(())
 }
 
@@ -103,12 +141,7 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
             },
         )?,
     )?;
-    write_btree_seed(
-        &output,
-        "truncated-leaf",
-        1,
-        &leaf[..leaf.len() - 1],
-    )?;
+    write_btree_seed(&output, "truncated-leaf", 1, &leaf[..leaf.len() - 1])?;
     Ok(())
 }
 
@@ -132,6 +165,20 @@ fn write_page_decode_seed(wal_output: &Path) -> Result<(), Box<dyn std::error::E
         std::fs::remove_file(old_seed)?;
     }
     std::fs::write(output.join("valid-page-v5"), page.bytes())?;
+
+    let database_path =
+        std::env::temp_dir().join(format!("netbadb-page-corpus-{}-heap", std::process::id()));
+    let wal_file = wal_path(&database_path);
+    let _ = std::fs::remove_file(&database_path);
+    let _ = std::fs::remove_file(&wal_file);
+    let _ = std::fs::remove_file(wal_alternate_path(&wal_file));
+    HeapStorage::create(&database_path, fuzz_table())?.close()?;
+    let mut pages = PageManager::open(&database_path)?;
+    let catalog = pages.read_page(PageId(1))?;
+    std::fs::write(output.join("valid-index-catalog-page-v5"), catalog.bytes())?;
+    drop(pages);
+    std::fs::remove_file(wal_file)?;
+    std::fs::remove_file(database_path)?;
     Ok(())
 }
 

@@ -128,7 +128,7 @@ follows left-to-right relation and schema order.
 
 Core multi-table catalogs compose one existing heap file per `TableId`. JOIN
 therefore introduces no transaction-layer changes: the current page format is
-version 5, heap metadata is version 2, WAL is version 3 with record version 2,
+version 5, heap metadata is version 3, WAL is version 3 with record version 2,
 recovery, checkpoints, and single-writer rules are unchanged.
 
 ## Typed ORDER BY
@@ -336,24 +336,27 @@ Database file
   allocation, transaction/WAL ordering, publication, and recovery integration.
 
 The experimental container retains the legacy `NBPG` file-root marker. Heap
-metadata has its own `NBD1` marker and version 2 little-endian layout inside
+metadata has its own `NBD1` marker and version 3 little-endian layout inside
 the header page:
 
 ```text
 16..20  NBD1 heap metadata magic
-20..22  u16 heap metadata version (2)
+20..22  u16 heap metadata version (3)
 22..24  reserved bytes (zero)
 24..32  u64 table ID
 32..34  u16 declared column count
 34..66  SHA-256 canonical table-schema fingerprint
+66..74  u64 IndexCatalog root PageId
+74..80  reserved bytes (zero)
 ```
 
 Create validates the complete table before creating the WAL or heap file. Open
 validates metadata and schema identity before recovery can mutate storage, then
 checks it again after recovery. A table-ID mismatch and a schema-fingerprint
-mismatch are distinct typed storage errors. Heap metadata version 1 is rejected
-without migration; the file format remains experimental and may change again
-between versions.
+mismatch are distinct typed storage errors. Heap metadata versions 1 and 2 are
+rejected without migration; the file format remains experimental and may
+change again between versions. New files reserve page 1 for the empty catalog
+root and page 2 for the initial Heap page.
 
 Page 0 is legacy container/heap metadata and is not interpreted as a Page v5
 data page. Data pages use the following version 5 little-endian layout:
@@ -361,8 +364,8 @@ data page. Data pages use the following version 5 little-endian layout:
 ```text
 0..4    NBP1 page magic
 4..6    u16 page format version (5)
-6       u8 page type (2 heap, 3 BTreeMeta, 4 BTreeInternal, 5 BTreeLeaf;
-        tag 1 remains reserved)
+6       u8 page type (2 heap, 3 BTreeMeta, 4 BTreeInternal, 5 BTreeLeaf,
+        6 IndexCatalog; tag 1 remains reserved)
 7       reserved byte (zero)
 8..10   u16 slot count
 10..12  u16 free-space lower bound
@@ -482,9 +485,35 @@ preflighted before WAL publication and logged bottom-up with metadata last.
 Delete never allocates or shrinks the file. Removed right pages and old roots
 remain valid but unreachable orphan index pages; reclamation is deferred.
 
-Phase 4C2 deliberately has no sibling redistribution, orphan-page reclamation,
-uniqueness, automatic heap DML maintenance, persistent IndexDef/catalog,
-SQL index DDL, IndexScan operator, optimizer choice, or statistics.
+Phase 4C2 deliberately has no sibling redistribution or orphan-page
+reclamation. Uniqueness, automatic heap DML maintenance, SQL index DDL,
+IndexScan, optimizer choice, and statistics remain deferred.
+
+## Persistent index registry
+
+Heap metadata v3 points to a fixed `IndexCatalog` root. Catalog pages are
+ordinary checksummed Page v5 single-payload pages containing version-1 `NBIC`
+payloads. They form an append-only, cycle-checked linked chain in creation
+order; each fixed-width little-endian entry maps one `ColumnId` to a stable
+`BTreeHandle` metadata PageId. Overflow logs the new catalog page before the
+old tail link, flushes through both records before extending the file, and
+therefore follows the existing reverse-order rollback contract.
+
+A registered table index is distinct from a raw tree created through
+`HeapStorage::btree().create`: raw trees are never discovered by scanning page
+types. Open follows only the metadata root, rejects cycles, duplicates,
+out-of-range links, and wrong page kinds, then verifies every column against
+the canonical `TableDef` and every BTree metadata `IndexSpec` against that
+column's nominal type and nullability. The validated definitions are cached in
+persistent creation order; roots and heights are deliberately not cached.
+
+`HeapStorage::create_index` owns one transaction and single-writer lease. It
+creates the tree, materializes the current live heap rows, backfills every
+typed `(value, RowId)` entry, and writes the catalog registration as the final
+logical mutation. Only a successful durable commit updates the in-memory
+registry, so crashes or errors before commit leave no visible partial index.
+Phase 4D1 does not maintain registered indexes for later INSERT, UPDATE, or
+DELETE operations; that atomic DML integration is Phase 4D2.
 
 ## Transaction and WAL boundary
 

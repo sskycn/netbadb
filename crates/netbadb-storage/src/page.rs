@@ -34,6 +34,7 @@ pub enum PageType {
     BTreeMeta,
     BTreeInternal,
     BTreeLeaf,
+    IndexCatalog,
 }
 
 impl PageType {
@@ -43,6 +44,7 @@ impl PageType {
             Self::BTreeMeta => 3,
             Self::BTreeInternal => 4,
             Self::BTreeLeaf => 5,
+            Self::IndexCatalog => 6,
         }
     }
 
@@ -52,6 +54,7 @@ impl PageType {
             3 => Ok(Self::BTreeMeta),
             4 => Ok(Self::BTreeInternal),
             5 => Ok(Self::BTreeLeaf),
+            6 => Ok(Self::IndexCatalog),
             other => Err(PageError::UnknownPageType(other)),
         }
     }
@@ -1247,6 +1250,7 @@ mod tests {
             PageType::BTreeMeta,
             PageType::BTreeInternal,
             PageType::BTreeLeaf,
+            PageType::IndexCatalog,
         ] {
             let mut page = Page::new(PageId(30), page_type);
             page.initialize_single_payload(page_type, b"node")

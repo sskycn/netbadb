@@ -117,6 +117,11 @@ impl TableDef {
         self.columns.iter().find(|column| column.name == name)
     }
 
+    #[must_use]
+    pub fn column_by_id(&self, id: ColumnId) -> Option<&ColumnDef> {
+        self.columns.iter().find(|column| column.id == id)
+    }
+
     /// Validates all invariants local to one canonical table definition.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.name.is_empty() {

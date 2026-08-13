@@ -167,21 +167,24 @@ The current code genuinely supports:
 - persistent transactional B+Tree create, insert, exact delete, merge-only
   rebalance/root collapse, and duplicate-preserving point lookup with typed
   keys, arbitrary height, and buffer capacity one;
+- a persistent append-only index registry plus atomic existing-row backfill,
+  reopen discovery, and `TableId`/`ColumnId` embedded APIs;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
-Heap metadata version 2 adds the canonical table-schema fingerprint; version 1
-is rejected rather than guessed or migrated. Phase 2A bumped
+Heap metadata version 3 retains the canonical table-schema fingerprint and adds
+the stable IndexCatalog root PageId; versions 1 and 2 are rejected rather than
+guessed or migrated. Phase 2A bumped
 data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
 version 3 because a formerly invalid slot encoding now means Deleted. Page v4
 added a 28-byte header and CRC32C integrity; Page v5 expands each slot with a
 generation used for safe tombstone reuse. Versions 1 through 4 are rejected
 rather than guessed or migrated. Files created by
 the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
-The legacy metadata page 0 retains its separate version-2 layout and is not a
+The legacy metadata page 0 retains its separate version-3 layout and is not a
 checksummed Page v5 data page.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
@@ -309,9 +312,9 @@ failure rolls back that whole transaction.
 
 Heap and B+Tree pages share one database file, buffer pool, transaction chain,
 WAL, recovery pass, and checkpoint. Page v5 assigns distinct page-type tags to
-Heap, BTreeMeta, BTreeInternal, and BTreeLeaf pages. Index pages contain exactly
-one generation-1 payload slot; heap scans and first-fit allocation validate and
-skip well-formed index pages, while RowId access rejects them as non-heap.
+Heap, BTreeMeta, BTreeInternal, BTreeLeaf, and IndexCatalog pages. Non-heap
+pages contain exactly one generation-1 payload slot; heap scans and first-fit
+allocation validate and skip them, while RowId access rejects them as non-heap.
 
 `BTreeHandle` is a stable metadata-page identity. Its `NBTM` version-1 payload
 stores the current root, height, and `IndexSpec`; root splits can therefore
@@ -333,10 +336,12 @@ merge-only rebalance, recursive parent compaction, and root collapse. Removed
 right pages and old roots remain valid, unreachable index pages and are not
 reclaimed or reused yet.
 
-This Phase 4C2 API is storage-only. It does not automatically maintain indexes
-for heap DML, persist an IndexDef/catalog mapping from columns to BTreeHandles,
-validate that referenced RowIds are currently live, enforce uniqueness, expose
-SQL index DDL, add IndexScan, or change the planner's SeqScan policy.
+The Phase 4D1 registry persists `ColumnId -> BTreeHandle` separately from raw
+B+Trees. `create_index` atomically backfills current rows and registers only
+after the full build; reopen discovers and validates the mapping. It does not
+automatically maintain indexes for later heap DML, validate that referenced
+RowIds remain live, enforce uniqueness, expose SQL index DDL, add IndexScan, or
+change the planner's SeqScan policy.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -469,13 +474,15 @@ The implementation sequence is intentionally vertical:
 14. Persistent B+Tree (Phase 4C1) — transactional create/insert/point lookup,
     mixed pages, split recovery, and explicit typed codecs. Complete.
 15. B+Tree exact delete/merge/root-collapse (Phase 4C2) — complete.
-16. Transactional heap/index maintenance and persistent IndexDef discovery
-    (Phase 4D), IndexScan (Phase 4E), then statistics/costing (Phase 4F).
-17. Server mode — protocol, sessions, and `netbadbd`.
-18. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-19. Advanced optimization — statistics, cost model, and rewrite rules.
+16. Persistent IndexCatalog discovery and transactional existing-row backfill
+    (Phase 4D1) — complete.
+17. Atomic heap/index DML maintenance (Phase 4D2), IndexScan (Phase 4E), then
+    statistics/costing (Phase 4F).
+18. Server mode — protocol, sessions, and `netbadbd`.
+19. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+20. Advanced optimization — statistics, cost model, and rewrite rules.
 
-Isolation/MVCC, index catalog/heap maintenance and SQL/planner integration,
+Isolation/MVCC, automatic index/heap maintenance and SQL/planner integration,
 server networking,
 and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and

@@ -9,10 +9,10 @@ use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages}
 use netbadb_planner::PhysicalStatement;
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{HeapStorage, StorageError, TransactionError};
-use netbadb_types::{ScalarValue, TableId};
+use netbadb_types::{ColumnId, ScalarValue, TableId};
 
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
-pub use netbadb_storage::{Transaction, TransactionState};
+pub use netbadb_storage::{IndexDefinition, Transaction, TransactionState};
 
 #[derive(Debug)]
 pub enum DatabaseError {
@@ -245,6 +245,21 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically backfills and registers one non-unique single-column index.
+    /// Heap DML performed after this call is not maintained until Phase 4D2.
+    pub fn create_index(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, DatabaseError> {
+        Ok(self.storage_mut(table_id)?.create_index(column_id)?)
+    }
+
+    /// Returns this table's registered indexes in persistent creation order.
+    pub fn indexes(&self, table_id: TableId) -> Result<&[IndexDefinition], DatabaseError> {
+        Ok(self.storage(table_id)?.indexes())
+    }
+
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
         for storage in self.storages {
@@ -337,6 +352,13 @@ impl Database {
     fn storage_mut(&mut self, table_id: TableId) -> Result<&mut HeapStorage, DatabaseError> {
         self.storages
             .iter_mut()
+            .find(|storage| storage.table().id == table_id)
+            .ok_or_else(|| ExecutionError::MissingTableStorage(table_id).into())
+    }
+
+    fn storage(&self, table_id: TableId) -> Result<&HeapStorage, DatabaseError> {
+        self.storages
+            .iter()
             .find(|storage| storage.table().id == table_id)
             .ok_or_else(|| ExecutionError::MissingTableStorage(table_id).into())
     }
@@ -514,6 +536,34 @@ mod tests {
         assert_eq!(
             reopened.query("SELECT id FROM users").expect("query").rows,
             vec![vec![ScalarValue::Int64(1)]]
+        );
+        reopened.close().expect("close reopened database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn embedded_database_creates_and_rediscovers_registered_index() {
+        let path = std::env::temp_dir().join(format!("netbadb-core-index-{}", std::process::id()));
+        let mut database = Database::create(&path, table()).expect("create database");
+        database
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert existing row");
+        let definition = database
+            .create_index(TableId(1), ColumnId(2))
+            .expect("create registered index");
+        assert_eq!(
+            database.indexes(TableId(1)).expect("list indexes"),
+            std::slice::from_ref(&definition)
+        );
+        database.close().expect("close database");
+
+        let reopened = Database::open(&path, table()).expect("reopen database");
+        assert_eq!(
+            reopened.indexes(TableId(1)).expect("rediscover index"),
+            std::slice::from_ref(&definition)
         );
         reopened.close().expect("close reopened database");
         let wal = netbadb_storage::wal_path(&path);

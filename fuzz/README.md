@@ -8,13 +8,17 @@ before and after every iteration.
 
 `page_decode` accepts at most one 4096-byte page, zero-pads shorter inputs,
 and exercises the public Page v5 header, generation-aware slot-state, and
-record decoders. Its valid seed uses `PageId(7)` because the CRC32C binds the
-expected logical page ID.
+record decoders. Its Heap seed uses `PageId(7)` because the CRC32C binds the
+expected logical page ID; a second seed is a valid page-1 IndexCatalog root.
 
 `btree_decode` accepts at most one 4060-byte index payload plus a one-byte node
 selector and directly exercises the public versioned Meta, Leaf, and Internal
 decoders with a nullable UInt64 `IndexSpec`. Arbitrary bytes must return a node
 or typed `IndexError` without panicking, unbounded allocation, or traversal.
+
+`index_catalog_decode` accepts at most one 4060-byte `NBIC` payload and
+exercises the independent version-1 registry decoder. Arbitrary counts and
+bytes must remain bounded and return either a catalog node or typed error.
 
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 
@@ -23,11 +27,14 @@ cargo run --manifest-path fuzz/Cargo.toml --bin generate_wal_corpus
 cargo +nightly fuzz run wal_recovery -- -runs=1000
 cargo +nightly fuzz run page_decode -- -runs=1000
 cargo +nightly fuzz run btree_decode -- -runs=1000
+cargo +nightly fuzz run index_catalog_decode -- -runs=1000
 ```
 
 The generated WAL corpus contains empty input, a valid v3 header, Begin,
 Begin+Commit, a PageUpdate carrying Page v5 images, and a structurally valid
 truncated final record. A separate legal Page v5 seed is generated for
 `page_decode`. The B+Tree corpus adds empty input, valid metadata,
-empty/one-entry leaves, one internal separator, and a truncated leaf. Do not
-commit generated findings or large corpora.
+empty/one-entry leaves, one internal separator, and a truncated leaf. The
+index-catalog corpus covers an empty registry, one entry, a next-page link,
+truncation, and an impossible entry count. Do not commit generated findings or
+large corpora.

@@ -137,8 +137,8 @@ remains v2 and canonical schema encoding remains v1.
 
 Page v5 retains this checksum unchanged while extending slot entries with a
 generation; versions 1 through 4 are unsupported experimental formats. Page 0
-retains heap metadata v2 and is outside data-page checksum coverage. WAL v3,
-record v2, heap metadata v2, and canonical schema v1 are unchanged. Page CRC
+now carries heap metadata v3 and remains outside data-page checksum coverage.
+WAL v3, record v2, and canonical schema v1 are unchanged. Page CRC
 detects persistent data-page corruption independently of WAL CRC after log
 recycling; neither checksum repairs corruption nor authenticates malicious
 changes.
@@ -201,12 +201,13 @@ join reordering, hash/merge/index join, or multi-table DML.
 
 - unified typed validation for canonical schemas and table definitions;
 - explicit canonical table-schema encoding version 1 and SHA-256 fingerprint;
-- heap metadata format version 2 with persisted schema identity;
+- heap metadata format version 2 originally added persisted schema identity;
 - pre-recovery rejection of table-ID and full-schema mismatches;
 - deterministic golden, sensitivity, invalid-schema, and reopen tests.
 
-Heap metadata version 1 has no migration path and is rejected explicitly. The
-experimental format may continue to change between versions.
+Heap metadata versions 1 and 2 have no migration path and are rejected by the
+current version 3 decoder. The experimental format may continue to change
+between versions.
 
 ## Phase 3D — Aggregate + Sort (complete)
 
@@ -254,7 +255,12 @@ sorting or aggregation.
   rollback/STEAL/NO-FORCE crash durability;
 - Phase 4C2 intentionally defers sibling redistribution and physical
   reclamation/reuse of orphan pages left by merge and root collapse;
-- next Phase 4D: atomic heap/index DML maintenance;
+- Phase 4D1 complete: Heap metadata v3 anchors an append-only persistent index
+  registry, and one transaction creates, fully backfills, registers, commits,
+  and exposes each single-column non-unique index for reopen discovery;
+- Phase 4D1 intentionally keeps raw B+Trees unregistered and does not maintain
+  registered indexes for later Heap DML;
+- next Phase 4D2: atomic heap/index DML maintenance;
 - next Phase 4E: index scan physical operator;
 - next Phase 4F: catalog statistics and deterministic cost-based access-path
   selection.

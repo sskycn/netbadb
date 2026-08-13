@@ -7,9 +7,10 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
-use netbadb_types::{PageId, PhysicalType, RowId, ScalarValue, SemanticType};
+use netbadb_types::{ColumnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType};
 
 pub const BTREE_FORMAT_VERSION: u16 = 1;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 1;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -17,6 +18,9 @@ const COMMON_HEADER_SIZE: usize = 8;
 const NODE_HEADER_SIZE: usize = COMMON_HEADER_SIZE + 4 + 8;
 const ROW_ID_SIZE: usize = 8 + 2 + 4;
 const MIN_ENTRY_SIZE: usize = 1 + ROW_ID_SIZE;
+const INDEX_CATALOG_MAGIC: &[u8; 4] = b"NBIC";
+const INDEX_CATALOG_HEADER_SIZE: usize = 24;
+const INDEX_DEFINITION_SIZE: usize = 12;
 
 /// Persistent physical/nominal key identity and NULL acceptance for one tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +33,33 @@ pub struct IndexSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BTreeHandle {
     pub meta_page: PageId,
+}
+
+/// Persistent single-column registered-index identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDefinition {
+    pub column_id: ColumnId,
+    pub handle: BTreeHandle,
+}
+
+/// One append-only page in the persistent index registry chain.
+///
+/// The version-1 `NBIC` payload uses a 24-byte header followed by fixed
+/// little-endian 12-byte `(ColumnId u32, BTree meta PageId u64)` entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCatalogNode {
+    pub next_catalog: Option<PageId>,
+    pub definitions: Vec<IndexDefinition>,
+}
+
+impl IndexCatalogNode {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            next_catalog: None,
+            definitions: Vec::new(),
+        }
+    }
 }
 
 /// Complete ordered identity of one leaf entry or persistent internal fence.
@@ -129,6 +160,21 @@ pub enum IndexError {
         expected_right: PageId,
         actual_right: Option<PageId>,
     },
+    IndexAlreadyExists {
+        column_id: ColumnId,
+    },
+    UnknownIndexColumn {
+        column_id: ColumnId,
+    },
+    DuplicateRegisteredColumn {
+        column_id: ColumnId,
+    },
+    CatalogCycle {
+        page_id: PageId,
+    },
+    CatalogSpecMismatch {
+        column_id: ColumnId,
+    },
 }
 
 impl fmt::Display for IndexError {
@@ -213,6 +259,37 @@ impl fmt::Display for IndexError {
                 left_page.0,
                 actual_right.map(|page| page.0),
                 expected_right.0
+            ),
+            Self::IndexAlreadyExists { column_id } => {
+                write!(
+                    formatter,
+                    "column {} already has a registered index",
+                    column_id.0
+                )
+            }
+            Self::UnknownIndexColumn { column_id } => {
+                write!(
+                    formatter,
+                    "registered index column {} does not exist",
+                    column_id.0
+                )
+            }
+            Self::DuplicateRegisteredColumn { column_id } => write!(
+                formatter,
+                "index catalog contains duplicate column {}",
+                column_id.0
+            ),
+            Self::CatalogCycle { page_id } => {
+                write!(
+                    formatter,
+                    "index catalog chain cycles at page {}",
+                    page_id.0
+                )
+            }
+            Self::CatalogSpecMismatch { column_id } => write!(
+                formatter,
+                "registered index spec does not match column {}",
+                column_id.0
             ),
         }
     }
@@ -665,6 +742,109 @@ pub fn merge_internals_if_fits(
     };
     let payload = encode_internal(spec, &merged)?;
     Ok((payload.len() <= capacity).then_some(merged))
+}
+
+/// Encodes one explicit version-1 append-only index catalog page payload.
+pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
+    if let Some(next) = node.next_catalog {
+        validate_child(next)?;
+    }
+    validate_catalog_definitions(&node.definitions)?;
+    let count = u32::try_from(node.definitions.len()).map_err(|_| IndexError::LengthOverflow)?;
+    let capacity = INDEX_CATALOG_HEADER_SIZE
+        .checked_add(
+            node.definitions
+                .len()
+                .checked_mul(INDEX_DEFINITION_SIZE)
+                .ok_or(IndexError::LengthOverflow)?,
+        )
+        .ok_or(IndexError::LengthOverflow)?;
+    let mut output = Vec::with_capacity(capacity);
+    output.extend_from_slice(INDEX_CATALOG_MAGIC);
+    output.extend_from_slice(&INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(&node.next_catalog.map_or(0, |page| page.0).to_le_bytes());
+    output.extend_from_slice(&count.to_le_bytes());
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    for definition in &node.definitions {
+        output.extend_from_slice(&definition.column_id.0.to_le_bytes());
+        output.extend_from_slice(&definition.handle.meta_page.0.to_le_bytes());
+    }
+    Ok(output)
+}
+
+/// Decodes and validates one bounded version-1 index catalog page payload.
+pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
+    if input.len() < INDEX_CATALOG_HEADER_SIZE {
+        return Err(IndexError::Truncated);
+    }
+    if &input[..4] != INDEX_CATALOG_MAGIC {
+        return Err(IndexError::InvalidMagic {
+            expected: *INDEX_CATALOG_MAGIC,
+            actual: input[..4].try_into().map_err(|_| IndexError::Truncated)?,
+        });
+    }
+    let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
+    if version != INDEX_CATALOG_FORMAT_VERSION {
+        return Err(IndexError::UnsupportedVersion(version));
+    }
+    if input[6..8].iter().any(|byte| *byte != 0) || input[20..24].iter().any(|byte| *byte != 0) {
+        return Err(IndexError::InvalidReservedBytes);
+    }
+    let raw_next = u64::from_le_bytes(input[8..16].try_into().map_err(|_| IndexError::Truncated)?);
+    let next_catalog = (raw_next != 0).then_some(PageId(raw_next));
+    let count = u32::from_le_bytes(
+        input[16..20]
+            .try_into()
+            .map_err(|_| IndexError::Truncated)?,
+    ) as usize;
+    let expected = INDEX_CATALOG_HEADER_SIZE
+        .checked_add(
+            count
+                .checked_mul(INDEX_DEFINITION_SIZE)
+                .ok_or(IndexError::LengthOverflow)?,
+        )
+        .ok_or(IndexError::LengthOverflow)?;
+    if input.len() < expected {
+        return Err(IndexError::Truncated);
+    }
+    if input.len() != expected {
+        return Err(IndexError::ExtraBytes);
+    }
+    let mut definitions = Vec::with_capacity(count);
+    for chunk in input[INDEX_CATALOG_HEADER_SIZE..].chunks_exact(INDEX_DEFINITION_SIZE) {
+        let column_id = ColumnId(u32::from_le_bytes(
+            chunk[..4].try_into().map_err(|_| IndexError::Truncated)?,
+        ));
+        let meta_page = PageId(u64::from_le_bytes(
+            chunk[4..].try_into().map_err(|_| IndexError::Truncated)?,
+        ));
+        validate_child(meta_page)?;
+        definitions.push(IndexDefinition {
+            column_id,
+            handle: BTreeHandle { meta_page },
+        });
+    }
+    validate_catalog_definitions(&definitions)?;
+    Ok(IndexCatalogNode {
+        next_catalog,
+        definitions,
+    })
+}
+
+fn validate_catalog_definitions(definitions: &[IndexDefinition]) -> Result<(), IndexError> {
+    for (position, definition) in definitions.iter().enumerate() {
+        validate_child(definition.handle.meta_page)?;
+        if definitions[..position]
+            .iter()
+            .any(|existing| existing.column_id == definition.column_id)
+        {
+            return Err(IndexError::DuplicateRegisteredColumn {
+                column_id: definition.column_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn common_header(magic: &[u8; 4]) -> Vec<u8> {
@@ -1154,6 +1334,67 @@ mod tests {
         assert_eq!(merged.first_child, PageId(1));
         assert_eq!(merged.separators[0].key, fence);
         assert_eq!(merged.separators[0].right_child, PageId(2));
+    }
+
+    #[test]
+    fn index_catalog_codec_round_trips_and_rejects_corruption() {
+        let node = IndexCatalogNode {
+            next_catalog: Some(PageId(9)),
+            definitions: vec![IndexDefinition {
+                column_id: ColumnId(7),
+                handle: BTreeHandle {
+                    meta_page: PageId(11),
+                },
+            }],
+        };
+        let bytes = encode_index_catalog(&node).unwrap();
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        for end in 0..bytes.len() {
+            assert!(decode_index_catalog(&bytes[..end]).is_err());
+        }
+        let mut reserved = bytes.clone();
+        reserved[20] = 1;
+        assert_eq!(
+            decode_index_catalog(&reserved),
+            Err(IndexError::InvalidReservedBytes)
+        );
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(decode_index_catalog(&extra), Err(IndexError::ExtraBytes));
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            decode_index_catalog(&bad_magic),
+            Err(IndexError::InvalidMagic { .. })
+        ));
+        let mut old_version = bytes.clone();
+        old_version[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        assert_eq!(
+            decode_index_catalog(&old_version),
+            Err(IndexError::UnsupportedVersion(0))
+        );
+        let mut impossible_count = bytes.clone();
+        impossible_count[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_index_catalog(&impossible_count),
+            Err(IndexError::Truncated | IndexError::LengthOverflow)
+        ));
+        let mut zero_handle = bytes.clone();
+        zero_handle[28..36].fill(0);
+        assert_eq!(
+            decode_index_catalog(&zero_handle),
+            Err(IndexError::InvalidChild(PageId(0)))
+        );
+        let duplicate = IndexCatalogNode {
+            next_catalog: None,
+            definitions: vec![node.definitions[0].clone(), node.definitions[0].clone()],
+        };
+        assert_eq!(
+            encode_index_catalog(&duplicate),
+            Err(IndexError::DuplicateRegisteredColumn {
+                column_id: ColumnId(7)
+            })
+        );
     }
 
     #[test]

@@ -7,9 +7,9 @@ use netbadb_types::{PhysicalType, SemanticType};
 const MAX_PAYLOAD_SIZE: usize = 4_060;
 
 fuzz_target!(|data: &[u8]| {
-    let (kind, payload) = data.split_first().map_or((0, data), |(&kind, payload)| {
-        (kind, payload)
-    });
+    let (kind, payload) = data
+        .split_first()
+        .map_or((0, data), |(&kind, payload)| (kind, payload));
     if payload.len() > MAX_PAYLOAD_SIZE {
         return;
     }

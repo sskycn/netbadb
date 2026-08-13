@@ -31,6 +31,9 @@ pub(crate) enum TestCrashPoint {
     RelocationAfterFirstPagePublish,
     BTreeAfterFirstPageUpdateLog,
     BTreeAfterFirstPagePublish,
+    IndexBuildBeforeCatalogLog,
+    IndexBuildAfterCatalogLog,
+    IndexBuildAfterCatalogPublish,
     WalPartialFinalRecord,
 }
 
@@ -54,6 +57,9 @@ impl TestCrashPoint {
             Self::RelocationAfterFirstPagePublish => "relocation-after-first-page-publish",
             Self::BTreeAfterFirstPageUpdateLog => "btree-after-first-page-update-log",
             Self::BTreeAfterFirstPagePublish => "btree-after-first-page-publish",
+            Self::IndexBuildBeforeCatalogLog => "index-build-before-catalog-log",
+            Self::IndexBuildAfterCatalogLog => "index-build-after-catalog-log",
+            Self::IndexBuildAfterCatalogPublish => "index-build-after-catalog-publish",
             Self::WalPartialFinalRecord => "wal-partial-final-record",
         }
     }
