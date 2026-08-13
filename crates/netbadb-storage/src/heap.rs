@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use netbadb_schema::TableDef;
+use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{PageId, RowId, ScalarValue, SlotId};
 
 use crate::recovery::RecoveryManager;
@@ -16,12 +16,13 @@ use crate::{
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_DATA_PAGE: PageId = PageId(1);
 const HEADER_MAGIC: &[u8; 4] = b"NBD1";
-const HEAP_FORMAT_VERSION: u16 = 1;
+const HEAP_FORMAT_VERSION: u16 = 2;
 const HEAP_METADATA_OFFSET: usize = 16;
 const HEAP_VERSION_OFFSET: usize = HEAP_METADATA_OFFSET + 4;
 const HEAP_RESERVED_OFFSET: usize = HEAP_VERSION_OFFSET + 2;
 const HEAP_TABLE_ID_OFFSET: usize = HEAP_RESERVED_OFFSET + 2;
 const HEAP_COLUMN_COUNT_OFFSET: usize = HEAP_TABLE_ID_OFFSET + 8;
+const HEAP_SCHEMA_FINGERPRINT_OFFSET: usize = HEAP_COLUMN_COUNT_OFFSET + 2;
 
 /// Heap storage over the buffer pool. Heap code interprets pages as heap pages;
 /// the buffer pool and page manager remain generic over raw database pages.
@@ -44,7 +45,7 @@ impl HeapStorage {
         table: TableDef,
         buffer_pool_size: usize,
     ) -> Result<Self, StorageError> {
-        validate_table(&table)?;
+        let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
         let path = path.as_ref();
         let wal_path = wal_path(path);
@@ -61,7 +62,7 @@ impl HeapStorage {
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let mut header = buffer.write_page(HEADER_PAGE)?;
-            write_heap_metadata(header.page_mut().bytes_mut(), &table);
+            write_heap_metadata(header.page_mut().bytes_mut(), &table, fingerprint);
         }
         {
             let mut data_page = buffer.new_page()?;
@@ -90,10 +91,14 @@ impl HeapStorage {
         table: TableDef,
         buffer_pool_size: usize,
     ) -> Result<Self, StorageError> {
-        validate_table(&table)?;
+        let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
         let path = path.as_ref();
         let mut pages = PageManager::open(path)?;
+        if pages.page_count() < 2 {
+            return Err(crate::invalid_format("heap file has no data page"));
+        }
+        validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         let (mut wal_manager, records, truncated_wal_tail) =
             WalManager::open_for_recovery(wal_path(path))?;
         if let Err(error) =
@@ -104,14 +109,12 @@ impl HeapStorage {
                 recovery => recovery.into(),
             });
         }
-        if pages.page_count() < 2 {
-            return Err(crate::invalid_format("heap file has no data page"));
-        }
+        validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         let wal = Rc::new(RefCell::new(wal_manager));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let header = buffer.read_page(HEADER_PAGE)?;
-            validate_heap_metadata(header.page().bytes(), &table)?;
+            validate_heap_metadata(header.page().bytes(), &table, fingerprint)?;
         }
         let next_txn_id = wal.borrow().next_txn_id();
         let transactions = TransactionManager::new(wal, buffer.clone(), next_txn_id)?;
@@ -516,14 +519,19 @@ impl Drop for HeapStorage {
     }
 }
 
-fn validate_table(table: &TableDef) -> Result<(), StorageError> {
+fn validate_table(table: &TableDef) -> Result<SchemaFingerprint, StorageError> {
+    table.validate()?;
     if table.columns.len() > u16::MAX as usize {
         return Err(crate::invalid_format("table has more than 65535 columns"));
     }
-    Ok(())
+    Ok(table.fingerprint()?)
 }
 
-fn write_heap_metadata(bytes: &mut [u8; PAGE_SIZE], table: &TableDef) {
+fn write_heap_metadata(
+    bytes: &mut [u8; PAGE_SIZE],
+    table: &TableDef,
+    fingerprint: SchemaFingerprint,
+) {
     bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()]
         .copy_from_slice(HEADER_MAGIC);
     bytes[HEAP_VERSION_OFFSET..HEAP_VERSION_OFFSET + 2]
@@ -533,9 +541,16 @@ fn write_heap_metadata(bytes: &mut [u8; PAGE_SIZE], table: &TableDef) {
         .copy_from_slice(&table.id.0.to_le_bytes());
     bytes[HEAP_COLUMN_COUNT_OFFSET..HEAP_COLUMN_COUNT_OFFSET + 2]
         .copy_from_slice(&(table.columns.len() as u16).to_le_bytes());
+    bytes[HEAP_SCHEMA_FINGERPRINT_OFFSET
+        ..HEAP_SCHEMA_FINGERPRINT_OFFSET + SchemaFingerprint::LENGTH]
+        .copy_from_slice(fingerprint.as_bytes());
 }
 
-fn validate_heap_metadata(bytes: &[u8; PAGE_SIZE], table: &TableDef) -> Result<(), StorageError> {
+fn validate_heap_metadata(
+    bytes: &[u8; PAGE_SIZE],
+    table: &TableDef,
+    expected_fingerprint: SchemaFingerprint,
+) -> Result<(), StorageError> {
     if &bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()] != HEADER_MAGIC {
         return Err(MetadataError::InvalidMagic.into());
     }
@@ -552,16 +567,25 @@ fn validate_heap_metadata(bytes: &[u8; PAGE_SIZE], table: &TableDef) -> Result<(
     let table_id = read_u64(bytes, HEAP_TABLE_ID_OFFSET)?;
     let column_count = usize::from(read_u16(bytes, HEAP_COLUMN_COUNT_OFFSET)?);
     if table_id != table.id.0 {
+        return Err(StorageError::TableIdMismatch {
+            expected: table.id,
+            actual: netbadb_types::TableId(table_id),
+        });
+    }
+    let actual_fingerprint =
+        SchemaFingerprint::from_bytes(read_array_at(bytes, HEAP_SCHEMA_FINGERPRINT_OFFSET)?);
+    if actual_fingerprint != expected_fingerprint {
         return Err(StorageError::SchemaMismatch {
-            expected: format!("table id {}", table.id.0),
-            actual: format!("table id {table_id}"),
+            expected: expected_fingerprint,
+            actual: actual_fingerprint,
         });
     }
     if column_count != table.columns.len() {
-        return Err(StorageError::SchemaMismatch {
-            expected: format!("{} columns", table.columns.len()),
-            actual: format!("{column_count} columns"),
-        });
+        return Err(MetadataError::InvalidColumnCount {
+            stored: column_count as u16,
+            expected: table.columns.len(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -703,7 +727,7 @@ mod tests {
         TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
         WalRecordKind, wal_alternate_path, wal_path,
     };
-    use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+    use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
 
     fn table() -> TableDef {
@@ -729,6 +753,32 @@ mod tests {
         let _ = std::fs::remove_file(wal);
     }
 
+    fn identity_table() -> TableDef {
+        TableDef::new(
+            TableId(17),
+            "users",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "id",
+                    TypeSpec::Semantic {
+                        name: "UserId".into(),
+                        physical: PhysicalType::UInt64,
+                    },
+                )
+                .primary_key(true),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "team_id",
+                    TypeSpec::Semantic {
+                        name: "TeamId".into(),
+                        physical: PhysicalType::UInt64,
+                    },
+                ),
+            ],
+        )
+    }
+
     #[test]
     fn insert_write_read_decode_round_trip() {
         let path = test_path("heap-round-trip");
@@ -746,6 +796,136 @@ mod tests {
             rows[0].1,
             vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reopen_requires_the_complete_canonical_schema_identity() {
+        let path = test_path("heap-schema-identity");
+        cleanup(&path);
+        let baseline = identity_table();
+        let mut storage = HeapStorage::create(&path, baseline.clone()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::UInt64(1), ScalarValue::UInt64(9)])
+            .expect("insert row");
+        storage.close().expect("close heap");
+
+        let mut identical = HeapStorage::open(&path, baseline.clone()).expect("identical schema");
+        assert_eq!(
+            identical.scan().expect("scan matching heap")[0].1,
+            vec![ScalarValue::UInt64(1), ScalarValue::UInt64(9)]
+        );
+        identical.close().expect("close matching heap");
+
+        let mut variants = Vec::new();
+        let mut column_order = baseline.clone();
+        column_order.columns.swap(0, 1);
+        variants.push(column_order);
+        let mut column_id = baseline.clone();
+        column_id.columns[0].id = ColumnId(3);
+        variants.push(column_id);
+        let mut column_name = baseline.clone();
+        column_name.columns[0].name = "user_id".into();
+        variants.push(column_name);
+        let mut physical_type = baseline.clone();
+        physical_type.columns[0].type_spec = TypeSpec::Semantic {
+            name: "UserId".into(),
+            physical: PhysicalType::Int64,
+        };
+        variants.push(physical_type);
+        let mut semantic_type = baseline.clone();
+        semantic_type.columns[0].type_spec = TypeSpec::Semantic {
+            name: "TeamId".into(),
+            physical: PhysicalType::UInt64,
+        };
+        semantic_type.columns[1].type_spec = TypeSpec::Semantic {
+            name: "UserId".into(),
+            physical: PhysicalType::UInt64,
+        };
+        variants.push(semantic_type);
+        let mut nullable = baseline.clone();
+        nullable.columns[0].nullable = true;
+        variants.push(nullable);
+        let mut primary_key = baseline.clone();
+        primary_key.columns[0].primary_key = false;
+        variants.push(primary_key);
+        let mut table_name = baseline.clone();
+        table_name.name = "members".into();
+        variants.push(table_name);
+
+        for variant in variants {
+            assert!(matches!(
+                HeapStorage::open(&path, variant),
+                Err(StorageError::SchemaMismatch { .. })
+            ));
+        }
+        let mut table_id = baseline;
+        table_id.id = TableId(18);
+        assert!(matches!(
+            HeapStorage::open(&path, table_id),
+            Err(StorageError::TableIdMismatch {
+                expected: TableId(18),
+                actual: TableId(17)
+            })
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn invalid_schema_is_rejected_before_heap_or_wal_creation() {
+        let path = test_path("heap-invalid-schema");
+        cleanup(&path);
+        let mut invalid = identity_table();
+        invalid.columns[1].id = ColumnId(1);
+
+        assert!(matches!(
+            HeapStorage::create(&path, invalid),
+            Err(StorageError::Schema(SchemaError::DuplicateColumnId {
+                column_id: ColumnId(1),
+                ..
+            }))
+        ));
+        assert!(!path.exists());
+        assert!(!wal_path(&path).exists());
+        assert!(!wal_alternate_path(wal_path(&path)).exists());
+    }
+
+    #[test]
+    fn heap_metadata_persists_versioned_schema_fingerprint_and_checks_its_count() {
+        let path = test_path("heap-schema-metadata");
+        cleanup(&path);
+        let table = identity_table();
+        HeapStorage::create(&path, table.clone())
+            .expect("create heap")
+            .close()
+            .expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut header = pages.read_page(PageId(0)).expect("read metadata page");
+        let bytes = header.bytes();
+        assert_eq!(&bytes[16..20], b"NBD1");
+        assert_eq!(&bytes[20..22], &2_u16.to_le_bytes());
+        assert_eq!(&bytes[22..24], &[0, 0]);
+        assert_eq!(&bytes[24..32], &table.id.0.to_le_bytes());
+        assert_eq!(&bytes[32..34], &2_u16.to_le_bytes());
+        assert_eq!(
+            &bytes[34..66],
+            table.fingerprint().expect("table fingerprint").as_bytes()
+        );
+
+        header.bytes_mut()[32..34].copy_from_slice(&1_u16.to_le_bytes());
+        pages.write_page(&header).expect("write corrupt count");
+        pages.sync().expect("sync corrupt count");
+        drop(pages);
+        assert!(matches!(
+            HeapStorage::open(&path, table),
+            Err(StorageError::Metadata(
+                crate::MetadataError::InvalidColumnCount {
+                    stored: 1,
+                    expected: 2
+                }
+            ))
+        ));
         cleanup(&path);
     }
 
@@ -1175,6 +1355,30 @@ mod tests {
             HeapStorage::open(&path, table()),
             Err(StorageError::Metadata(
                 crate::MetadataError::UnsupportedVersion(99)
+            ))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn previous_heap_metadata_version_is_not_reinterpreted() {
+        let path = test_path("heap-old-metadata-version");
+        let storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage.close().expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut header = pages.read_page(PageId(0)).expect("read metadata page");
+        header.bytes_mut()[20..22].copy_from_slice(&1_u16.to_le_bytes());
+        pages
+            .write_page(&header)
+            .expect("write old metadata version");
+        pages.sync().expect("sync old metadata version");
+        drop(pages);
+
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Metadata(
+                crate::MetadataError::UnsupportedVersion(1)
             ))
         ));
         cleanup(&path);

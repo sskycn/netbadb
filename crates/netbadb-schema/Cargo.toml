@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 netbadb-types = { path = "../netbadb-types" }
+sha2.workspace = true
 
 [lints]
 workspace = true

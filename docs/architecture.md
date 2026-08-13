@@ -39,9 +39,22 @@ independent of any application language. A column has:
 - nullability;
 - primary-key metadata.
 
-The Rust types are an implementation of this in-memory IR, not a persistence
-format. Serialization and compatibility rules can be added later without
-making JSON the execution representation.
+`Schema::validate` is the common invariant path used before persistence and by
+the core composition API. It rejects duplicate table IDs/names, duplicate
+column IDs/names within a table, and empty table, column, or semantic-type
+names. Name equality remains case-sensitive, matching current resolution.
+Zero-column tables remain valid and receive an identity with column count zero.
+Primary-key metadata is preserved in identity, but this phase does not add key
+enforcement; nullability remains the independently enforced write constraint.
+
+Each validated `TableDef` has canonical encoding version 1. It starts with
+`NBTS`, an explicit little-endian version and reserved field, then encodes the
+table ID/name and declared column count. Every column follows in declaration
+order with its ID/name, an explicit physical-type tag, optional semantic-type
+name, nullability, and primary-key booleans. Strings are UTF-8 with little-endian
+`u32` byte lengths. SHA-256 over these bytes is the 32-byte
+`SchemaFingerprint`; no Rust enum discriminant, layout, `Debug` output, or map
+iteration order participates.
 
 ## Compiler and plans
 
@@ -230,8 +243,26 @@ Database file
   lifetimes.
 
 The experimental container retains the legacy `NBPG` file-root marker. Heap
-metadata has its own `NBD1` marker and explicit version. Data pages use the
-following version 3 little-endian layout:
+metadata has its own `NBD1` marker and version 2 little-endian layout inside
+the header page:
+
+```text
+16..20  NBD1 heap metadata magic
+20..22  u16 heap metadata version (2)
+22..24  reserved bytes (zero)
+24..32  u64 table ID
+32..34  u16 declared column count
+34..66  SHA-256 canonical table-schema fingerprint
+```
+
+Create validates the complete table before creating the WAL or heap file. Open
+validates metadata and schema identity before recovery can mutate storage, then
+checks it again after recovery. A table-ID mismatch and a schema-fingerprint
+mismatch are distinct typed storage errors. Heap metadata version 1 is rejected
+without migration; the file format remains experimental and may change again
+between versions.
+
+Data pages use the following version 3 little-endian layout:
 
 ```text
 0..4    NBP1 page magic

@@ -152,6 +152,17 @@ explicit column list; there are no defaults, RETURNING, UPSERT, or subqueries.
 Phase 3C supports only INNER JOIN with `ON`. There is no outer join, `USING`,
 join reordering, hash/merge/index join, or multi-table DML.
 
+## Phase 3C.5 — Foundation Hardening (complete)
+
+- unified typed validation for canonical schemas and table definitions;
+- explicit canonical table-schema encoding version 1 and SHA-256 fingerprint;
+- heap metadata format version 2 with persisted schema identity;
+- pre-recovery rejection of table-ID and full-schema mismatches;
+- deterministic golden, sensitivity, invalid-schema, and reopen tests.
+
+Heap metadata version 1 has no migration path and is rejected explicitly. The
+experimental format may continue to change between versions.
+
 ## Phase 3D — Aggregate + Sort
 
 - `ORDER BY` with explicit NULL ordering semantics;

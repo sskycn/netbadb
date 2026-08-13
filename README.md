@@ -79,7 +79,10 @@ semantic: UserId
 
 `UserId` and `TeamId` therefore remain distinct even when their physical
 representation is the same. The storage format encodes physical values; the
-Canonical Schema remains the source of semantic meaning.
+Canonical Schema remains the source of semantic meaning. Each validated table
+also has a versioned canonical byte encoding and SHA-256 schema fingerprint.
+Heap metadata persists that fingerprint, and reopen requires the caller's full
+table identity—including semantic types and column order—to match.
 
 ## Repository layout
 
@@ -131,7 +134,7 @@ The current code genuinely supports:
 
 - Cargo workspace compilation and unit/integration tests;
 - Canonical schema definitions with nullable, primary-key, physical, and
-  semantic type metadata;
+  semantic type metadata, unified validation, and stable schema fingerprints;
 - parser support for `SELECT`, qualified columns, `AS` and shorthand table
   aliases, chained `JOIN`/`INNER JOIN ... ON`, explicit-column single-row `INSERT`, `UPDATE`,
   `DELETE`, optional DML `WHERE`, `LIMIT`, wildcard projection,
@@ -162,7 +165,9 @@ The current code genuinely supports:
   results, SQL three-valued boolean logic, and NULL comparisons;
 - a native embedded `netbadb-core::Database` API.
 
-The experimental storage format uses versioned slotted pages. Phase 2A bumped
+The experimental storage format uses versioned heap metadata and slotted pages.
+Heap metadata version 2 adds the canonical table-schema fingerprint; version 1
+is rejected rather than guessed or migrated. Phase 2A bumped
 data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
 version 3 because a formerly invalid slot encoding now means Deleted. Versions
 1 and 2 are rejected rather than guessed or migrated. Files created by the

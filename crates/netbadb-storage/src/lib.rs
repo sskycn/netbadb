@@ -23,7 +23,8 @@ pub use wal::{
 use std::error::Error;
 use std::fmt;
 
-use netbadb_types::{PageId, PhysicalType, SlotId};
+use netbadb_schema::{SchemaError, SchemaFingerprint};
+use netbadb_types::{PageId, PhysicalType, SlotId, TableId};
 
 /// Errors raised while validating or mutating a raw database page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +259,7 @@ pub enum MetadataError {
     InvalidMagic,
     UnsupportedVersion(u16),
     InvalidReservedBytes,
+    InvalidColumnCount { stored: u16, expected: usize },
 }
 
 impl fmt::Display for MetadataError {
@@ -270,6 +272,10 @@ impl fmt::Display for MetadataError {
             Self::InvalidReservedBytes => {
                 formatter.write_str("heap metadata reserved bytes are non-zero")
             }
+            Self::InvalidColumnCount { stored, expected } => write!(
+                formatter,
+                "heap metadata stores {stored} columns but its schema fingerprint identifies {expected}"
+            ),
         }
     }
 }
@@ -385,6 +391,7 @@ impl Error for CheckpointError {}
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
+    Schema(SchemaError),
     InvalidFormat(String),
     Page(PageError),
     Buffer(BufferError),
@@ -394,9 +401,13 @@ pub enum StorageError {
     Wal(WalError),
     Transaction(TransactionError),
     Checkpoint(CheckpointError),
+    TableIdMismatch {
+        expected: TableId,
+        actual: TableId,
+    },
     SchemaMismatch {
-        expected: String,
-        actual: String,
+        expected: SchemaFingerprint,
+        actual: SchemaFingerprint,
     },
     InvalidRowLength {
         expected: usize,
@@ -429,6 +440,7 @@ impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
+            Self::Schema(error) => write!(formatter, "schema error: {error}"),
             Self::InvalidFormat(message) => write!(formatter, "invalid database format: {message}"),
             Self::Page(error) => write!(formatter, "page error: {error}"),
             Self::Buffer(error) => write!(formatter, "buffer pool error: {error}"),
@@ -438,9 +450,14 @@ impl fmt::Display for StorageError {
             Self::Wal(error) => write!(formatter, "write-ahead log error: {error}"),
             Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
+            Self::TableIdMismatch { expected, actual } => write!(
+                formatter,
+                "table ID mismatch: expected {}, found {}",
+                expected.0, actual.0
+            ),
             Self::SchemaMismatch { expected, actual } => write!(
                 formatter,
-                "schema mismatch: expected {expected}, found {actual}"
+                "schema fingerprint mismatch: expected {expected}, found {actual}"
             ),
             Self::InvalidRowLength { expected, actual } => {
                 write!(formatter, "expected {expected} row values, found {actual}")
@@ -485,6 +502,7 @@ impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Schema(error) => Some(error),
             Self::Page(error) => Some(error),
             Self::Buffer(error) => Some(error),
             Self::Codec(error) => Some(error),
@@ -501,6 +519,12 @@ impl Error for StorageError {
 impl From<std::io::Error> for StorageError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<SchemaError> for StorageError {
+    fn from(error: SchemaError) -> Self {
+        Self::Schema(error)
     }
 }
 

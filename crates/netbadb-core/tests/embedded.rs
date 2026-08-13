@@ -1,6 +1,6 @@
 use netbadb_core::{Database, DatabaseError, ExecutionResult, TransactionState};
 use netbadb_executor::ExecutionError;
-use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
 use netbadb_storage::{PageError, StorageError};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
@@ -593,6 +593,112 @@ fn failed_multi_table_create_removes_only_files_created_by_that_call() {
         .expect("close pre-existing target");
     cleanup(&first_path);
     cleanup(&existing_path);
+}
+
+#[test]
+fn invalid_multi_table_schema_is_rejected_before_any_storage_is_created() {
+    let base = std::env::temp_dir().join(format!(
+        "netbadb-core-invalid-schema-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let users_path = base.with_extension("users.db");
+    let teams_path = base.with_extension("teams.db");
+    cleanup(&users_path);
+    cleanup(&teams_path);
+    let invalid_teams = TableDef::new(
+        TableId(82),
+        "teams",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::UInt64)),
+            ColumnDef::new(
+                ColumnId(1),
+                "owner_id",
+                TypeSpec::Physical(PhysicalType::UInt64),
+            ),
+        ],
+    );
+    assert!(matches!(
+        Database::create_tables(vec![
+            (
+                users_path.clone(),
+                TableDef::new(TableId(81), "users", Vec::new())
+            ),
+            (teams_path.clone(), invalid_teams),
+        ]),
+        Err(DatabaseError::Schema(SchemaError::DuplicateColumnId {
+            table,
+            column_id: ColumnId(1)
+        })) if table == "teams"
+    ));
+    for path in [&users_path, &teams_path] {
+        assert!(!path.exists());
+        let wal = netbadb_storage::wal_path(path);
+        assert!(!wal.exists());
+        assert!(!netbadb_storage::wal_alternate_path(&wal).exists());
+    }
+}
+
+#[test]
+fn reopen_rejects_swapped_nominal_types_with_identical_physical_layout() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-core-schema-fingerprint-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    cleanup(&path);
+    let users = TableDef::new(
+        TableId(91),
+        "users",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Semantic {
+                    name: "UserId".into(),
+                    physical: PhysicalType::UInt64,
+                },
+            ),
+            ColumnDef::new(
+                ColumnId(2),
+                "team_id",
+                TypeSpec::Semantic {
+                    name: "TeamId".into(),
+                    physical: PhysicalType::UInt64,
+                },
+            ),
+        ],
+    );
+    let mut database = Database::create(&path, users.clone()).expect("create database");
+    database
+        .insert(&[ScalarValue::UInt64(1), ScalarValue::UInt64(7)])
+        .expect("insert nominal row");
+    database.close().expect("close database");
+
+    let mut swapped = users.clone();
+    swapped.columns[0].type_spec = TypeSpec::Semantic {
+        name: "TeamId".into(),
+        physical: PhysicalType::UInt64,
+    };
+    swapped.columns[1].type_spec = TypeSpec::Semantic {
+        name: "UserId".into(),
+        physical: PhysicalType::UInt64,
+    };
+    assert!(matches!(
+        Database::open(&path, swapped),
+        Err(DatabaseError::Storage(StorageError::SchemaMismatch { .. }))
+    ));
+
+    let mut reopened = Database::open(&path, users).expect("matching schema still opens");
+    assert_eq!(
+        reopened
+            .query("SELECT id, team_id FROM users")
+            .expect("read preserved row")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1), ScalarValue::UInt64(7)]]
+    );
+    reopened.close().expect("close matching database");
+    cleanup(&path);
 }
 
 #[test]

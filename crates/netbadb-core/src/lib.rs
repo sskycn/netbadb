@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use netbadb_compiler::{CompileError, compile_statement};
 use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages};
 use netbadb_planner::PhysicalStatement;
-use netbadb_schema::{Schema, TableDef};
+use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{HeapStorage, StorageError, TransactionError};
 use netbadb_types::{ScalarValue, TableId};
 
@@ -17,13 +17,12 @@ pub use netbadb_storage::{Transaction, TransactionState};
 #[derive(Debug)]
 pub enum DatabaseError {
     Compile(CompileError),
+    Schema(SchemaError),
     Storage(StorageError),
     Execution(ExecutionError),
     ExpectedQuery,
     EmptyCatalog,
     TableSelectionRequired,
-    DuplicateTableId(TableId),
-    DuplicateTableName(String),
     DuplicateStoragePath(PathBuf),
     CreateTablesRollback {
         creation: StorageError,
@@ -36,25 +35,13 @@ impl fmt::Display for DatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Compile(error) => error.fmt(formatter),
+            Self::Schema(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
             Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
             Self::EmptyCatalog => formatter.write_str("database requires at least one table"),
             Self::TableSelectionRequired => formatter
                 .write_str("this catalog has multiple tables; use a table-specific embedded API"),
-            Self::DuplicateTableId(table_id) => {
-                write!(
-                    formatter,
-                    "table ID {} is registered more than once",
-                    table_id.0
-                )
-            }
-            Self::DuplicateTableName(name) => {
-                write!(
-                    formatter,
-                    "table name `{name}` is registered more than once"
-                )
-            }
             Self::DuplicateStoragePath(path) => {
                 write!(
                     formatter,
@@ -79,14 +66,13 @@ impl Error for DatabaseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Compile(error) => Some(error),
+            Self::Schema(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
             Self::CreateTablesRollback { creation, .. } => Some(creation),
             Self::ExpectedQuery
             | Self::EmptyCatalog
             | Self::TableSelectionRequired
-            | Self::DuplicateTableId(_)
-            | Self::DuplicateTableName(_)
             | Self::DuplicateStoragePath(_) => None,
         }
     }
@@ -95,6 +81,12 @@ impl Error for DatabaseError {
 impl From<CompileError> for DatabaseError {
     fn from(error: CompileError) -> Self {
         Self::Compile(error)
+    }
+}
+
+impl From<SchemaError> for DatabaseError {
+    fn from(error: SchemaError) -> Self {
+        Self::Schema(error)
     }
 }
 
@@ -117,34 +109,34 @@ pub struct Database {
 
 impl Database {
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
-        let storage = HeapStorage::create(path, table.clone())?;
+        let schema = Schema::try_new(vec![table.clone()])?;
+        let storage = HeapStorage::create(path, table)?;
         Ok(Self {
-            schema: Schema::new(vec![table]),
+            schema,
             storages: vec![storage],
         })
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
-        let storage = HeapStorage::open(path, table.clone())?;
+        let schema = Schema::try_new(vec![table.clone()])?;
+        let storage = HeapStorage::open(path, table)?;
         Ok(Self {
-            schema: Schema::new(vec![table]),
+            schema,
             storages: vec![storage],
         })
     }
 
-    /// Creates one existing heap-format file per table and composes them into
-    /// one query catalog. Persistent heap, page, WAL, and checkpoint formats
-    /// are unchanged; this is a core-layer composition API.
+    /// Creates one heap file per validated table and composes them into one
+    /// query catalog. Each heap persists the table's schema fingerprint.
     pub fn create_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
-        validate_catalog_entries(&tables)?;
+        validate_catalog_paths(&tables)?;
+        let schema = Schema::try_new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
-        let mut definitions = Vec::with_capacity(tables.len());
         let mut created_paths = Vec::with_capacity(tables.len());
         for (path, table) in tables {
-            match HeapStorage::create(&path, table.clone()) {
+            match HeapStorage::create(&path, table) {
                 Ok(storage) => {
                     storages.push(storage);
-                    definitions.push(table);
                     created_paths.push(path);
                 }
                 Err(creation) => {
@@ -165,25 +157,18 @@ impl Database {
                 }
             }
         }
-        Ok(Self {
-            schema: Schema::new(definitions),
-            storages,
-        })
+        Ok(Self { schema, storages })
     }
 
     /// Opens one existing heap-format file per table as a single query catalog.
     pub fn open_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
-        validate_catalog_entries(&tables)?;
+        validate_catalog_paths(&tables)?;
+        let schema = Schema::try_new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
-        let mut definitions = Vec::with_capacity(tables.len());
         for (path, table) in tables {
-            storages.push(HeapStorage::open(path, table.clone())?);
-            definitions.push(table);
+            storages.push(HeapStorage::open(path, table)?);
         }
-        Ok(Self {
-            schema: Schema::new(definitions),
-            storages,
-        })
+        Ok(Self { schema, storages })
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<(), DatabaseError> {
@@ -384,20 +369,14 @@ fn statement_table_id(statement: &PhysicalStatement) -> Option<TableId> {
     }
 }
 
-fn validate_catalog_entries(entries: &[(PathBuf, TableDef)]) -> Result<(), DatabaseError> {
+fn validate_catalog_paths(entries: &[(PathBuf, TableDef)]) -> Result<(), DatabaseError> {
     if entries.is_empty() {
         return Err(DatabaseError::EmptyCatalog);
     }
-    for (index, (path, table)) in entries.iter().enumerate() {
-        for (other_path, other_table) in &entries[..index] {
+    for (index, (path, _)) in entries.iter().enumerate() {
+        for (other_path, _) in &entries[..index] {
             if path == other_path {
                 return Err(DatabaseError::DuplicateStoragePath(path.clone()));
-            }
-            if table.id == other_table.id {
-                return Err(DatabaseError::DuplicateTableId(table.id));
-            }
-            if table.name == other_table.name {
-                return Err(DatabaseError::DuplicateTableName(table.name.clone()));
             }
         }
     }
