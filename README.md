@@ -292,9 +292,12 @@ tombstone. A later insertion may reuse the lowest eligible tombstone after a
 checked generation increment. Before reuse, the old locator reports
 `RowDeleted`; afterward it reports `StaleRowId` and cannot access the new
 occupant. UPDATE rebuilds the current 4 KiB page while preserving the slot and
-generation. If a larger replacement cannot
-fit on that page, the statement returns `UpdateWouldOverflowPage` and rolls
-back atomically; row relocation and forwarding pointers are not implemented.
+generation when it fits. Otherwise storage relocates the replacement to the
+lowest existing PageId accepted by normal Page v5 insertion, or allocates a new
+page, and returns the current `RowId`. The source becomes a same-generation
+tombstone (`RowDeleted`) until later reuse makes the old locator stale. Heap
+insertion uses the same deterministic linear first-fit search across all data
+pages. There is no persistent free-space map or forwarding pointer.
 Implicit DML owns one transaction. `execute_in` supports multiple statements
 in an explicit transaction; until savepoints exist, an execution-time DML
 failure rolls back that whole transaction.
@@ -424,10 +427,13 @@ The implementation sequence is intentionally vertical:
     aggregates, and in-memory `GROUP BY`/grouped aggregates are complete.
 12. Versioned RowId + slot reuse (Phase 4A) — Page v5 slot generations,
     generation-safe tombstone reuse, and stale-locator detection. Complete.
-13. Indexing — B+Tree and planner access-path selection.
-14. Server mode — protocol, sessions, and `netbadbd`.
-15. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-16. Advanced optimization — statistics, cost model, and rewrite rules.
+13. Heap-wide reuse + safe relocation (Phase 4B) — deterministic first-fit,
+    RowId-returning UPDATE relocation, and rollback-required multi-page
+    mutation safety. Complete.
+14. Indexing — B+Tree and planner access-path selection.
+15. Server mode — protocol, sessions, and `netbadbd`.
+16. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+17. Advanced optimization — statistics, cost model, and rewrite rules.
 
 Isolation/MVCC, B+Tree indexes, server networking, and Go wire-protocol code
 are roadmap items, not implemented features in this slice.

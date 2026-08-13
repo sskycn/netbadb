@@ -9,8 +9,8 @@ use crate::recovery::RecoveryManager;
 use crate::transaction::TransactionManager;
 use crate::{
     BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE,
-    Page, PageError, PageManager, PageType, SLOT_SIZE, SlotState, StorageError, Transaction,
-    TransactionError, WalManager, wal_path,
+    Page, PageError, PageManager, PageType, SLOT_SIZE, SlotRef, SlotState, StorageError,
+    Transaction, TransactionError, WalManager, wal_path,
 };
 
 const HEADER_PAGE: PageId = PageId(0);
@@ -33,6 +33,29 @@ pub struct HeapStorage {
     transactions: TransactionManager,
     #[cfg(test)]
     skip_drop_flush: bool,
+    #[cfg(test)]
+    fail_relocation_second_log: bool,
+    #[cfg(test)]
+    fail_relocation_source_publish: bool,
+}
+
+#[derive(Debug)]
+struct PreparedInsert {
+    page_id: PageId,
+    before: Page,
+    after: Page,
+    slot_ref: SlotRef,
+    new_page: bool,
+}
+
+impl PreparedInsert {
+    fn row_id(&self) -> RowId {
+        RowId {
+            page: self.page_id,
+            slot: self.slot_ref.slot.0,
+            generation: self.slot_ref.generation,
+        }
+    }
 }
 
 impl HeapStorage {
@@ -79,6 +102,10 @@ impl HeapStorage {
             transactions,
             #[cfg(test)]
             skip_drop_flush: false,
+            #[cfg(test)]
+            fail_relocation_second_log: false,
+            #[cfg(test)]
+            fail_relocation_source_publish: false,
         })
     }
 
@@ -124,6 +151,10 @@ impl HeapStorage {
             transactions,
             #[cfg(test)]
             skip_drop_flush: false,
+            #[cfg(test)]
+            fail_relocation_second_log: false,
+            #[cfg(test)]
+            fail_relocation_source_publish: false,
         })
     }
 
@@ -141,12 +172,15 @@ impl HeapStorage {
         }
     }
 
-    pub fn update(&mut self, row_id: RowId, values: &[ScalarValue]) -> Result<(), StorageError> {
+    /// Replaces a row and returns its current physical locator. The locator is
+    /// unchanged when the replacement fits its source page; otherwise the row
+    /// is relocated and the old locator becomes a tombstone.
+    pub fn update(&mut self, row_id: RowId, values: &[ScalarValue]) -> Result<RowId, StorageError> {
         let mut transaction = self.begin_transaction()?;
         match self.update_in(&mut transaction, row_id, values) {
-            Ok(()) => {
+            Ok(current_row_id) => {
                 transaction.commit()?;
-                Ok(())
+                Ok(current_row_id)
             }
             Err(error) => match transaction.rollback() {
                 Ok(()) => Err(error),
@@ -208,56 +242,8 @@ impl HeapStorage {
             .into());
         }
         transaction.acquire_writer()?;
-
-        let last_page = self
-            .buffer
-            .page_count()
-            .checked_sub(1)
-            .ok_or_else(|| crate::invalid_format("heap file has no pages"))?;
-        let existing = {
-            let mut page = self.buffer.write_page(PageId(last_page))?;
-            let before = page.page().clone();
-            let mut after = before.clone();
-            match after.insert_record(&payload) {
-                Ok(slot) => {
-                    transaction.log_page_update(&before, &mut after)?;
-                    *page.page_mut() = after;
-                    Ok(Some(slot))
-                }
-                Err(StorageError::Page(PageError::PageFull { .. })) => Ok(None),
-                Err(error) => Err(error),
-            }
-        };
-        let (page_id, slot_ref) = match existing {
-            Ok(Some(slot_ref)) => (PageId(last_page), slot_ref),
-            Ok(None) => {
-                let expected_page_id = PageId(self.buffer.page_count());
-                let before = Page::zero(expected_page_id);
-                let mut after = Page::new(expected_page_id, PageType::Heap);
-                let slot_ref = after.insert_record(&payload)?;
-                let update_lsn = transaction.log_page_update(&before, &mut after)?;
-                // Extending the database file writes a zero-filled page before
-                // the buffer can install the logged after-image. Make the WAL
-                // durable first so even allocation obeys write-ahead ordering.
-                transaction.flush_through(update_lsn)?;
-                let mut page = self.buffer.new_page()?;
-                let page_id = page.page_id();
-                if page_id != expected_page_id {
-                    return Err(crate::invalid_format(format!(
-                        "allocated page {}, expected {}",
-                        page_id.0, expected_page_id.0
-                    )));
-                }
-                *page.page_mut() = after;
-                (page_id, slot_ref)
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(RowId {
-            page: page_id,
-            slot: slot_ref.slot.0,
-            generation: slot_ref.generation,
-        })
+        let prepared = self.prepare_insert(&payload, None)?;
+        self.apply_single_page_insert(transaction, prepared)
     }
 
     pub fn read_row(&self, row_id: RowId) -> Result<Vec<ScalarValue>, StorageError> {
@@ -272,32 +258,53 @@ impl HeapStorage {
         )
     }
 
+    /// Transactional form of [`Self::update`]. A failure after relocation has
+    /// appended partial physical history leaves the transaction requiring
+    /// rollback, so it cannot commit or perform another write.
     pub fn update_in(
         &mut self,
         transaction: &mut Transaction,
         row_id: RowId,
         values: &[ScalarValue],
-    ) -> Result<(), StorageError> {
+    ) -> Result<RowId, StorageError> {
         self.validate_transaction(transaction)?;
         self.ensure_row_page(row_id)?;
-        {
+        let source_before = {
             let page = self.buffer.read_page(row_id.page)?;
             validate_row_slot(page.page(), row_id)?;
-        }
+            page.page().clone()
+        };
         self.validate_row(values)?;
         let payload = encode_row(values)?;
-        transaction.acquire_writer()?;
-
-        let mut page = self.buffer.write_page(row_id.page)?;
-        let before = page.page().clone();
-        let mut after = before.clone();
-        let slot = validate_row_slot(&after, row_id)?;
-        after
-            .replace_record(slot, &payload)
-            .map_err(|error| map_row_error(error, row_id))?;
-        transaction.log_page_update(&before, &mut after)?;
-        *page.page_mut() = after;
-        Ok(())
+        let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
+        if payload.len() > max_record_size {
+            return Err(PageError::RecordTooLarge {
+                size: payload.len(),
+                capacity: max_record_size,
+            }
+            .into());
+        }
+        let slot = validate_row_slot(&source_before, row_id)?;
+        let mut source_replacement = source_before.clone();
+        match source_replacement.replace_record(slot, &payload) {
+            Ok(()) => {
+                transaction.acquire_writer()?;
+                let mut page = self.buffer.write_page(row_id.page)?;
+                let before = page.page().clone();
+                let mut after = before.clone();
+                let slot = validate_row_slot(&after, row_id)?;
+                after
+                    .replace_record(slot, &payload)
+                    .map_err(|error| map_row_error(error, row_id))?;
+                transaction.log_page_update(&before, &mut after)?;
+                *page.page_mut() = after;
+                Ok(row_id)
+            }
+            Err(StorageError::Page(PageError::UpdateWouldOverflowPage { .. })) => {
+                self.relocate_update(transaction, row_id, slot, source_before, &payload)
+            }
+            Err(error) => Err(map_row_error(error, row_id)),
+        }
     }
 
     pub fn delete_in(
@@ -322,6 +329,164 @@ impl HeapStorage {
             .map_err(|error| map_row_error(error, row_id))?;
         transaction.log_page_update(&before, &mut after)?;
         *page.page_mut() = after;
+        Ok(())
+    }
+
+    fn prepare_insert(
+        &self,
+        payload: &[u8],
+        excluded_page: Option<PageId>,
+    ) -> Result<PreparedInsert, StorageError> {
+        let page_count = self.buffer.page_count();
+        for page_number in FIRST_DATA_PAGE.0..page_count {
+            let page_id = PageId(page_number);
+            if excluded_page == Some(page_id) {
+                continue;
+            }
+            let page = self.buffer.read_page(page_id)?;
+            let before = page.page().clone();
+            drop(page);
+            let mut after = before.clone();
+            match after.insert_record(payload) {
+                Ok(slot_ref) => {
+                    return Ok(PreparedInsert {
+                        page_id,
+                        before,
+                        after,
+                        slot_ref,
+                        new_page: false,
+                    });
+                }
+                Err(StorageError::Page(PageError::PageFull { .. })) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let page_id = PageId(page_count);
+        let before = Page::zero(page_id);
+        let mut after = Page::new(page_id, PageType::Heap);
+        let slot_ref = after.insert_record(payload)?;
+        Ok(PreparedInsert {
+            page_id,
+            before,
+            after,
+            slot_ref,
+            new_page: true,
+        })
+    }
+
+    fn apply_single_page_insert(
+        &mut self,
+        transaction: &mut Transaction,
+        mut prepared: PreparedInsert,
+    ) -> Result<RowId, StorageError> {
+        let update_lsn = transaction.log_page_update(&prepared.before, &mut prepared.after)?;
+        let publication = if prepared.new_page {
+            transaction
+                .flush_through(update_lsn)
+                .and_then(|()| self.publish_new_page(&prepared))
+        } else {
+            self.publish_existing_page(&prepared)
+        };
+        if let Err(error) = publication {
+            transaction.require_rollback();
+            return Err(error);
+        }
+        Ok(prepared.row_id())
+    }
+
+    fn relocate_update(
+        &mut self,
+        transaction: &mut Transaction,
+        row_id: RowId,
+        source_slot: SlotId,
+        source_before: Page,
+        payload: &[u8],
+    ) -> Result<RowId, StorageError> {
+        let mut source_after = source_before.clone();
+        source_after.delete_record(source_slot)?;
+        let mut destination = self.prepare_insert(payload, Some(row_id.page))?;
+        transaction.acquire_writer()?;
+
+        transaction.log_page_update(&destination.before, &mut destination.after)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::RelocationAfterFirstPageUpdateLog,
+        );
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_relocation_second_log) {
+            self.transactions
+                .wal()
+                .try_borrow_mut()
+                .map_err(|_| TransactionError::WalBusy)?
+                .inject_partial_append_failure(0);
+        }
+        let source_lsn = match transaction.log_page_update(&source_before, &mut source_after) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                transaction.require_rollback();
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::RelocationAfterBothPageUpdateLogs,
+        );
+
+        let publish_destination = if destination.new_page {
+            transaction
+                .flush_through(source_lsn)
+                .and_then(|()| self.publish_new_page(&destination))
+        } else {
+            self.publish_existing_page(&destination)
+        };
+        if let Err(error) = publish_destination {
+            transaction.require_rollback();
+            return Err(error);
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_relocation_source_publish) {
+            self.buffer.inject_page_write_failure();
+        }
+        #[cfg(test)]
+        if crate::crash_test::is_enabled(
+            crate::crash_test::TestCrashPoint::RelocationAfterFirstPagePublish,
+        ) {
+            // Exercise the mixed STEAL state: destination is durable while
+            // source still contains its before-image and no Commit exists.
+            if let Err(error) = self.buffer.flush_page(destination.page_id) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+            crate::crash_test::crash_now();
+        }
+        if let Err(error) = self.publish_page_image(row_id.page, source_after) {
+            transaction.require_rollback();
+            return Err(error);
+        }
+        Ok(destination.row_id())
+    }
+
+    fn publish_existing_page(&self, prepared: &PreparedInsert) -> Result<(), StorageError> {
+        self.publish_page_image(prepared.page_id, prepared.after.clone())
+    }
+
+    fn publish_page_image(&self, page_id: PageId, image: Page) -> Result<(), StorageError> {
+        let mut page = self.buffer.write_page(page_id)?;
+        *page.page_mut() = image;
+        Ok(())
+    }
+
+    fn publish_new_page(&self, prepared: &PreparedInsert) -> Result<(), StorageError> {
+        let mut page = self.buffer.new_page()?;
+        let actual_page_id = page.page_id();
+        if actual_page_id != prepared.page_id {
+            return Err(crate::invalid_format(format!(
+                "allocated page {}, expected {}",
+                actual_page_id.0, prepared.page_id.0
+            )));
+        }
+        *page.page_mut() = prepared.after.clone();
         Ok(())
     }
 
@@ -461,6 +626,16 @@ impl HeapStorage {
             .map_err(|_| TransactionError::WalBusy)?
             .inject_partial_rotation_failure(after_bytes);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_relocation_second_log_failure(&mut self) {
+        self.fail_relocation_second_log = true;
+    }
+
+    #[cfg(test)]
+    fn inject_relocation_source_publish_failure(&mut self) {
+        self.fail_relocation_source_publish = true;
     }
 
     #[cfg(test)]
@@ -749,9 +924,9 @@ mod tests {
     use super::{HeapStorage, decode_row, encode_row};
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
-        BufferError, CheckpointError, PageManager, SlotId, StorageError, TransactionError,
-        TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
-        WalRecordKind, wal_alternate_path, wal_path,
+        BufferError, CheckpointError, PageError, PageManager, SlotId, StorageError,
+        TransactionError, TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError,
+        WalManager, WalRecordKind, wal_alternate_path, wal_path,
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, Lsn, PageId, PhysicalType, ScalarValue, TableId};
@@ -803,6 +978,13 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    fn text_row(id: i64, length: usize, byte: u8) -> Vec<ScalarValue> {
+        vec![
+            ScalarValue::Int64(id),
+            ScalarValue::Text(String::from_utf8(vec![byte; length]).expect("ASCII test row")),
+        ]
     }
 
     #[test]
@@ -1177,6 +1359,491 @@ mod tests {
             Err(StorageError::StaleRowId { .. })
         ));
         assert_eq!(reopened.scan().expect("scan reopened")[0].0, new);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn heap_insert_reuses_earlier_page_tombstone_with_capacity_one() {
+        let path = test_path("heap-first-fit-tombstone");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let earlier = storage
+            .insert(&text_row(1, 3_900, b'a'))
+            .expect("fill page 1");
+        let later = storage
+            .insert(&text_row(2, 300, b'b'))
+            .expect("create page 2");
+        assert_eq!(earlier.page, PageId(1));
+        assert_eq!(later.page, PageId(2));
+        let page_count = storage.buffer.page_count();
+
+        storage.delete(earlier).expect("delete earlier row");
+        let reused = storage
+            .insert(&text_row(3, 100, b'c'))
+            .expect("reuse page 1");
+        assert_eq!(reused.page, PageId(1));
+        assert_eq!(reused.slot, earlier.slot);
+        assert_eq!(reused.generation, earlier.generation + 1);
+        assert_eq!(storage.buffer.page_count(), page_count);
+        assert_eq!(
+            storage.read_row(later).expect("later row remains"),
+            text_row(2, 300, b'b')
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn heap_insert_uses_lowest_page_free_payload_without_growing_file() {
+        let path = test_path("heap-first-fit-free-payload");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let first = storage
+            .insert(&text_row(1, 3_500, b'a'))
+            .expect("fill page 1");
+        let second = storage
+            .insert(&text_row(2, 1_000, b'b'))
+            .expect("create page 2");
+        let third = storage
+            .insert(&text_row(3, 3_000, b'c'))
+            .expect("fill page 2");
+        assert_eq!(
+            (first.page, second.page, third.page),
+            (PageId(1), PageId(2), PageId(2))
+        );
+        storage
+            .update(first, &text_row(1, 10, b'd'))
+            .expect("shrink page 1");
+        storage
+            .update(second, &text_row(2, 10, b'e'))
+            .expect("shrink page 2");
+        let page_count = storage.buffer.page_count();
+
+        for id in 10..15 {
+            let inserted = storage
+                .insert(&text_row(id, 500, b'f'))
+                .expect("reuse free payload");
+            assert_eq!(inserted.page, PageId(1));
+        }
+        assert_eq!(storage.buffer.page_count(), page_count);
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn first_fit_does_not_skip_a_corrupt_earlier_page() {
+        let path = test_path("heap-first-fit-corruption");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&text_row(1, 3_900, b'a'))
+            .expect("fill page 1");
+        storage
+            .insert(&text_row(2, 100, b'b'))
+            .expect("create page 2");
+        let page_count = storage.buffer.page_count();
+        {
+            let mut page = storage.buffer.write_page(PageId(1)).expect("write page 1");
+            page.page_mut().bytes_mut()[4..6].copy_from_slice(&99_u16.to_le_bytes());
+        }
+
+        assert!(matches!(
+            storage.insert(&text_row(3, 10, b'c')),
+            Err(StorageError::Page(PageError::UnsupportedVersion(99)))
+        ));
+        assert_eq!(storage.buffer.page_count(), page_count);
+        storage.simulate_crash();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_prefers_in_place_then_relocates_and_tracks_old_locator_lifecycle() {
+        let path = test_path("heap-update-relocation");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let old = storage
+            .insert(&text_row(1, 100, b'a'))
+            .expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let destination_seed = storage
+            .insert(&text_row(3, 300, b'c'))
+            .expect("create destination");
+        assert_eq!(destination_seed.page, PageId(2));
+
+        let unchanged = storage
+            .update(old, &text_row(1, 50, b'd'))
+            .expect("in-place update");
+        assert_eq!(unchanged, old);
+        let relocated = storage
+            .update(old, &text_row(1, 1_000, b'e'))
+            .expect("relocate update");
+        assert_eq!(relocated.page, PageId(2));
+        assert_ne!(relocated, old);
+        assert_eq!(
+            storage.read_row(relocated).expect("read relocation"),
+            text_row(1, 1_000, b'e')
+        );
+        assert!(
+            matches!(storage.read_row(old), Err(StorageError::RowDeleted { row_id }) if row_id == old)
+        );
+        assert!(matches!(
+            storage.update(old, &text_row(1, 10, b'x')),
+            Err(StorageError::RowDeleted { .. })
+        ));
+        assert!(matches!(
+            storage.delete(old),
+            Err(StorageError::RowDeleted { .. })
+        ));
+
+        let source_reuse = storage
+            .insert(&text_row(4, 20, b'f'))
+            .expect("reuse source slot");
+        assert_eq!((source_reuse.page, source_reuse.slot), (old.page, old.slot));
+        assert_eq!(source_reuse.generation, old.generation + 1);
+        assert!(matches!(
+            storage.read_row(old),
+            Err(StorageError::StaleRowId { .. })
+        ));
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn relocation_reuses_destination_tombstone_generation() {
+        let path = test_path("heap-relocation-tombstone");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let old = storage
+            .insert(&text_row(1, 100, b'a'))
+            .expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let destination = storage
+            .insert(&text_row(3, 300, b'c'))
+            .expect("destination row");
+        storage
+            .delete(destination)
+            .expect("create destination tombstone");
+
+        let relocated = storage
+            .update(old, &text_row(1, 1_000, b'd'))
+            .expect("relocate");
+        assert_eq!(
+            (relocated.page, relocated.slot),
+            (destination.page, destination.slot)
+        );
+        assert_eq!(relocated.generation, destination.generation + 1);
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn runtime_rollback_of_existing_page_relocation_restores_both_pages() {
+        let path = test_path("heap-relocation-existing-rollback");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let original = text_row(1, 100, b'a');
+        let old = storage.insert(&original).expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let destination = storage
+            .insert(&text_row(3, 300, b'c'))
+            .expect("destination row");
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+
+        let relocated = storage
+            .update_in(&mut transaction, old, &text_row(1, 1_000, b'd'))
+            .expect("relocate to existing page");
+        assert_eq!(relocated.page, destination.page);
+        let relocation_updates = storage
+            .wal_records()
+            .expect("scan relocation WAL")
+            .into_iter()
+            .filter_map(|record| match record.kind {
+                WalRecordKind::PageUpdate { page_id, .. } if record.txn_id == transaction.id() => {
+                    Some(page_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relocation_updates, vec![relocated.page, old.page]);
+        transaction.rollback().expect("rollback relocation");
+        assert_eq!(storage.read_row(old).expect("source restored"), original);
+        assert_eq!(
+            storage.read_row(destination).expect("destination restored"),
+            text_row(3, 300, b'c')
+        );
+        assert!(matches!(
+            storage.read_row(relocated),
+            Err(StorageError::RowNotFound { .. })
+                | Err(StorageError::RowDeleted { .. })
+                | Err(StorageError::StaleRowId { .. })
+        ));
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn committed_new_page_relocation_survives_checkpoint_and_reopen() {
+        let path = test_path("heap-relocation-new-page-checkpoint");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let old = storage
+            .insert(&text_row(1, 100, b'a'))
+            .expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let relocated = storage
+            .update(old, &text_row(1, 1_000, b'c'))
+            .expect("relocate");
+        assert_eq!(relocated.page, PageId(2));
+        storage.checkpoint().expect("checkpoint relocation");
+        storage.close().expect("close heap");
+
+        let reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert_eq!(
+            reopened.read_row(relocated).expect("read relocated row"),
+            text_row(1, 1_000, b'c')
+        );
+        assert!(matches!(
+            reopened.read_row(old),
+            Err(StorageError::RowDeleted { row_id }) if row_id == old
+        ));
+        reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn relocation_to_new_page_rolls_back_page_count_with_capacity_one() {
+        let path = test_path("heap-relocation-new-page-rollback");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let original = text_row(1, 100, b'a');
+        let old = storage.insert(&original).expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let page_count = storage.buffer.page_count();
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+        let relocated = storage
+            .update_in(&mut transaction, old, &text_row(1, 1_000, b'c'))
+            .expect("relocate to new page");
+        assert_eq!(relocated.page, PageId(page_count));
+        transaction.rollback().expect("rollback relocation");
+        assert_eq!(storage.buffer.page_count(), page_count);
+        assert_eq!(storage.read_row(old).expect("old row restored"), original);
+        assert!(matches!(
+            storage.read_row(relocated),
+            Err(StorageError::RowNotFound { .. })
+        ));
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn startup_undo_of_new_page_relocation_restores_page_count() {
+        let path = test_path("heap-relocation-new-page-startup-undo");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let original = text_row(1, 100, b'a');
+        let old = storage.insert(&original).expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let page_count = storage.buffer.page_count();
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+        let relocated = storage
+            .update_in(&mut transaction, old, &text_row(1, 1_000, b'c'))
+            .expect("relocate to new page");
+        assert_eq!(relocated.page, PageId(page_count));
+        storage.flush().expect("steal flush relocation");
+        drop(transaction);
+        storage.simulate_crash();
+
+        let reopened = HeapStorage::open(&path, table()).expect("startup undo relocation");
+        assert_eq!(reopened.buffer.page_count(), page_count);
+        assert_eq!(reopened.read_row(old).expect("source restored"), original);
+        reopened.close().expect("close recovered heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn startup_undo_of_tombstone_destination_restores_generation() {
+        let path = test_path("heap-relocation-tombstone-startup-undo");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let old = storage
+            .insert(&text_row(1, 100, b'a'))
+            .expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let tombstone = storage
+            .insert(&text_row(3, 300, b'c'))
+            .expect("destination row");
+        storage
+            .delete(tombstone)
+            .expect("commit destination tombstone");
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+        let relocated = storage
+            .update_in(&mut transaction, old, &text_row(1, 1_000, b'd'))
+            .expect("reuse destination tombstone");
+        assert_eq!(relocated.generation, tombstone.generation + 1);
+        storage.flush().expect("steal flush relocation");
+        drop(transaction);
+        storage.simulate_crash();
+
+        let reopened = HeapStorage::open(&path, table()).expect("startup undo relocation");
+        assert!(matches!(
+            reopened.read_row(tombstone),
+            Err(StorageError::RowDeleted { row_id }) if row_id == tombstone
+        ));
+        assert!(matches!(
+            reopened.read_row(relocated),
+            Err(StorageError::StaleRowId {
+                actual_generation,
+                ..
+            }) if actual_generation == tombstone.generation
+        ));
+        reopened.close().expect("close recovered heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn partial_relocation_log_failure_requires_rollback_and_blocks_commit() {
+        let path = test_path("heap-relocation-rollback-required");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let original = text_row(1, 100, b'a');
+        let old = storage.insert(&original).expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let destination_seed = storage
+            .insert(&text_row(3, 300, b'c'))
+            .expect("destination seed");
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+        storage.inject_relocation_second_log_failure();
+
+        assert!(matches!(
+            storage.update_in(&mut transaction, old, &text_row(1, 1_000, b'd')),
+            Err(StorageError::Wal(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        assert!(matches!(
+            transaction.commit(),
+            Err(StorageError::Transaction(TransactionError::NotActive {
+                state: TransactionState::RollbackRequired,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            storage.delete_in(&mut transaction, destination_seed),
+            Err(StorageError::Transaction(TransactionError::NotActive {
+                state: TransactionState::RollbackRequired,
+                ..
+            }))
+        ));
+        transaction.rollback().expect("rollback partial relocation");
+        assert_eq!(storage.read_row(old).expect("source intact"), original);
+        assert_eq!(
+            storage
+                .read_row(destination_seed)
+                .expect("destination intact"),
+            text_row(3, 300, b'c')
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn new_page_allocation_failure_requires_rollback_and_restores_partial_extension() {
+        let path = test_path("heap-relocation-allocation-failure");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let original = text_row(1, 100, b'a');
+        let old = storage.insert(&original).expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let page_count = storage.buffer.page_count();
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+        storage.buffer.inject_partial_page_allocation_failure(137);
+
+        assert!(matches!(
+            storage.update_in(&mut transaction, old, &text_row(1, 1_000, b'c')),
+            Err(StorageError::Io(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        assert!(transaction.commit().is_err());
+        transaction.rollback().expect("rollback failed allocation");
+        assert_eq!(storage.buffer.page_count(), page_count);
+        assert_eq!(storage.read_row(old).expect("source intact"), original);
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn source_publish_failure_requires_rollback_and_restores_both_pages() {
+        let path = test_path("heap-relocation-source-publish-failure");
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let original = text_row(1, 100, b'a');
+        let old = storage.insert(&original).expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let destination = storage
+            .insert(&text_row(3, 300, b'c'))
+            .expect("destination row");
+        let mut transaction = storage.begin_transaction().expect("begin relocation");
+        storage.inject_relocation_source_publish_failure();
+
+        assert!(matches!(
+            storage.update_in(&mut transaction, old, &text_row(1, 1_000, b'd')),
+            Err(StorageError::Io(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        assert!(transaction.commit().is_err());
+        transaction.rollback().expect("rollback publish failure");
+        assert_eq!(storage.read_row(old).expect("source intact"), original);
+        assert_eq!(
+            storage.read_row(destination).expect("destination intact"),
+            text_row(3, 300, b'c')
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn stale_update_does_not_poison_explicit_transaction() {
+        let path = test_path("heap-stale-update-transaction");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let stale = storage
+            .insert(&text_row(1, 20, b'a'))
+            .expect("insert stale source");
+        let valid = storage
+            .insert(&text_row(2, 20, b'b'))
+            .expect("insert valid source");
+        storage.delete(stale).expect("delete stale source");
+        storage
+            .insert(&text_row(3, 20, b'c'))
+            .expect("reuse stale source");
+        let mut transaction = storage.begin_transaction().expect("begin transaction");
+
+        assert!(matches!(
+            storage.update_in(&mut transaction, stale, &text_row(1, 20, b'x')),
+            Err(StorageError::StaleRowId { .. })
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        let current = storage
+            .update_in(&mut transaction, valid, &text_row(2, 20, b'd'))
+            .expect("valid update");
+        assert_eq!(current, valid);
+        transaction.commit().expect("commit after ordinary error");
+        assert_eq!(
+            storage.read_row(valid).expect("read valid update"),
+            text_row(2, 20, b'd')
+        );
+        storage.close().expect("close heap");
         cleanup(&path);
     }
 
@@ -2656,6 +3323,17 @@ mod tests {
             .expect("update crash-test row");
     }
 
+    fn relocation_source(storage: &mut HeapStorage) -> netbadb_types::RowId {
+        storage
+            .scan()
+            .expect("scan relocation heap")
+            .into_iter()
+            .find_map(|(row_id, values)| {
+                (values.first() == Some(&ScalarValue::Int64(1))).then_some(row_id)
+            })
+            .expect("relocation source row")
+    }
+
     fn run_process_crash_child(case: &str, path: &std::path::Path) {
         match case {
             "active-writer-after-durable-page-flush" => {
@@ -2723,6 +3401,35 @@ mod tests {
                 assert_eq!(reused.generation, 2);
                 storage.flush().expect("durably flush reused loser page");
                 crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
+            }
+            "relocation-boundary" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open relocation heap");
+                let old = relocation_source(&mut storage);
+                let mut transaction = storage.begin_transaction().expect("begin relocation");
+                let _ = storage
+                    .update_in(&mut transaction, old, &text_row(1, 1_000, b'r'))
+                    .expect("relocate row");
+                panic!("relocation completed without reaching configured crash point");
+            }
+            "active-relocation-after-durable-page-flush" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open relocation heap");
+                let old = relocation_source(&mut storage);
+                let mut transaction = storage.begin_transaction().expect("begin relocation");
+                storage
+                    .update_in(&mut transaction, old, &text_row(1, 1_000, b'u'))
+                    .expect("relocate loser");
+                storage.flush().expect("flush uncommitted relocation");
+                crash_test::maybe_crash(TestCrashPoint::ActiveWriterAfterDurablePageFlush);
+            }
+            "committed-relocation-without-data-flush" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open relocation heap");
+                let old = relocation_source(&mut storage);
+                let mut transaction = storage.begin_transaction().expect("begin relocation");
+                storage
+                    .update_in(&mut transaction, old, &text_row(1, 1_000, b'c'))
+                    .expect("relocate winner");
+                transaction.commit().expect("commit relocation");
+                crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
             "recovery-open" => {
                 let _storage = HeapStorage::open(path, table()).expect("start child recovery");
@@ -2826,6 +3533,114 @@ mod tests {
             Err(StorageError::RowDeleted { row_id }) if row_id == old
         ));
         reopened.close().expect("close undone reuse");
+        cleanup(&path);
+    }
+
+    fn prepare_relocation_crash_baseline(case: &str) -> (std::path::PathBuf, netbadb_types::RowId) {
+        let path = test_path(case);
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create relocation baseline");
+        let old = storage
+            .insert(&text_row(1, 100, b'a'))
+            .expect("insert source");
+        storage
+            .insert(&text_row(2, 3_800, b'b'))
+            .expect("fill source page");
+        let destination = storage
+            .insert(&text_row(3, 300, b'd'))
+            .expect("create destination");
+        assert_eq!((old.page, destination.page), (PageId(1), PageId(2)));
+        storage.close().expect("close relocation baseline");
+        (path, old)
+    }
+
+    fn assert_relocation_loser_restored(path: &std::path::Path, old: netbadb_types::RowId) {
+        for _ in 0..2 {
+            let mut reopened = HeapStorage::open(path, table()).expect("recover relocation loser");
+            assert_eq!(
+                reopened.read_row(old).expect("source restored"),
+                text_row(1, 100, b'a')
+            );
+            let rows = reopened.scan().expect("scan restored heap");
+            assert_eq!(rows.len(), 3);
+            assert!(
+                rows.iter()
+                    .any(|(_, values)| *values == text_row(3, 300, b'd'))
+            );
+            reopened.close().expect("close recovered heap");
+        }
+    }
+
+    #[test]
+    fn process_crash_after_first_relocation_log_restores_both_pages() {
+        let (path, old) = prepare_relocation_crash_baseline("relocation-crash-first-log");
+        spawn_crash_child(
+            &path,
+            "relocation-boundary",
+            TestCrashPoint::RelocationAfterFirstPageUpdateLog,
+        );
+        assert_relocation_loser_restored(&path, old);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_after_both_relocation_logs_restores_both_pages() {
+        let (path, old) = prepare_relocation_crash_baseline("relocation-crash-both-logs");
+        spawn_crash_child(
+            &path,
+            "relocation-boundary",
+            TestCrashPoint::RelocationAfterBothPageUpdateLogs,
+        );
+        assert_relocation_loser_restored(&path, old);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_after_first_relocation_publish_restores_mixed_pages() {
+        let (path, old) = prepare_relocation_crash_baseline("relocation-crash-first-publish");
+        spawn_crash_child(
+            &path,
+            "relocation-boundary",
+            TestCrashPoint::RelocationAfterFirstPagePublish,
+        );
+        assert_relocation_loser_restored(&path, old);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_steal_loser_relocation_restores_source_and_destination() {
+        let (path, old) = prepare_relocation_crash_baseline("relocation-crash-steal");
+        spawn_crash_child(
+            &path,
+            "active-relocation-after-durable-page-flush",
+            TestCrashPoint::ActiveWriterAfterDurablePageFlush,
+        );
+        assert_relocation_loser_restored(&path, old);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_no_force_committed_relocation_redoes_both_pages() {
+        let (path, old) = prepare_relocation_crash_baseline("relocation-crash-winner");
+        spawn_crash_child(
+            &path,
+            "committed-relocation-without-data-flush",
+            TestCrashPoint::CommittedWithoutDataFlush,
+        );
+        let mut reopened = HeapStorage::open(&path, table()).expect("redo relocation winner");
+        assert!(matches!(
+            reopened.read_row(old),
+            Err(StorageError::RowDeleted { .. })
+        ));
+        let (current, values) = reopened
+            .scan()
+            .expect("scan relocation winner")
+            .into_iter()
+            .find(|(_, values)| values.first() == Some(&ScalarValue::Int64(1)))
+            .expect("relocated winner");
+        assert_ne!(current, old);
+        assert_eq!(values, text_row(1, 1_000, b'c'));
+        reopened.close().expect("close relocation winner");
         cleanup(&path);
     }
 

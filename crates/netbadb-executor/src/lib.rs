@@ -174,7 +174,7 @@ pub fn execute_statement(
             let affected = u64::try_from(replacements.len())
                 .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
             for (row_id, values) in replacements {
-                storage.update_in(transaction, row_id, &values)?;
+                let _current_row_id = storage.update_in(transaction, row_id, &values)?;
             }
             Ok(ExecutionResult::AffectedRows(affected))
         }

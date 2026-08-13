@@ -64,8 +64,8 @@ bounded WAL growth, or runtime full rollback guarantee.
 ## Phase 2B.1 — Single Writer + Runtime Rollback (complete)
 
 - lazy first-write ownership with read-only transactions admitted concurrently;
-- explicit Active, CommitPending, RollbackPending, Committed, and RolledBack
-  states;
+- explicit Active, RollbackRequired, CommitPending, RollbackPending,
+  Committed, and RolledBack states (RollbackRequired was added in Phase 4B);
 - retryable durable commit and durable Abort followed by synchronous physical
   before-image undo;
 - reverse-prevLSN rollback, including exact reverse removal of newly allocated
@@ -175,9 +175,10 @@ DML, joins, sorting, aggregation, indexes, or explain output.
 - parser, typing, page boundary, fault-injection, recovery, and embedded
   vertical integration tests.
 
-UPDATE preserves RowId but does not relocate a row. A replacement that cannot
-fit on its current page fails atomically. INSERT is currently one row with an
-explicit column list; there are no defaults, RETURNING, UPSERT, or subqueries.
+Phase 3B originally preserved RowId and rejected same-page overflow; Phase 4B
+later added relocation and returns the current RowId. INSERT remains one row
+with an explicit column list; there are no defaults, RETURNING, UPSERT, or
+subqueries.
 
 ## Phase 3C — Typed INNER JOIN (complete)
 
@@ -234,6 +235,13 @@ sorting or aggregation.
   stale RowIds are rejected before accessing a replacement occupant;
 - Phase 4A recovery complete: full-page WAL redo preserves committed reuse and
   before-image undo restores the prior tombstone generation;
+- Phase 4B complete: heap INSERT uses deterministic linear first-fit across
+  data pages without a persistent FSM;
+- Phase 4B complete: UPDATE prefers in-place replacement, otherwise relocates
+  to the lowest accepting PageId or a new page and returns the current RowId;
+- Phase 4B transaction safety complete: destination then source PageUpdates
+  form one transaction chain, and partial compound mutations enter
+  RollbackRequired so they cannot commit;
 - B+Tree index crate;
 - index scan physical operator;
 - catalog statistics;

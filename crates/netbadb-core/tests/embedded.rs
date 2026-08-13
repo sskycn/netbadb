@@ -981,11 +981,11 @@ fn explicit_transaction_mixed_dml_rolls_back_or_commits_as_one_unit() {
 }
 
 #[test]
-fn overflowing_multi_row_update_rolls_back_every_prior_replacement() {
+fn oversized_multi_row_update_rolls_back_every_prior_replacement() {
     let path = std::env::temp_dir().join(format!("netbadb-dml-atomic-{}", std::process::id()));
     let mut database = Database::create(&path, variable_rows()).expect("create database");
     let small_source = "a".repeat(100);
-    let large_source = "b".repeat(1_500);
+    let large_source = "b".repeat(2_500);
     let filler = "c".repeat(2_250);
     for sql in [
         format!("INSERT INTO variable_rows (id, target, source) VALUES (1, 'x', '{small_source}')"),
@@ -999,7 +999,7 @@ fn overflowing_multi_row_update_rolls_back_every_prior_replacement() {
     assert!(matches!(
         database.execute_in(&mut transaction, "UPDATE variable_rows SET target = source"),
         Err(DatabaseError::Execution(ExecutionError::Storage(
-            StorageError::Page(PageError::UpdateWouldOverflowPage { .. })
+            StorageError::Page(PageError::RecordTooLarge { .. })
         )))
     ));
     assert_eq!(transaction.state(), TransactionState::RolledBack);
@@ -1017,7 +1017,7 @@ fn overflowing_multi_row_update_rolls_back_every_prior_replacement() {
     assert!(matches!(
         database.execute("UPDATE variable_rows SET target = source"),
         Err(DatabaseError::Execution(ExecutionError::Storage(
-            StorageError::Page(PageError::UpdateWouldOverflowPage { .. })
+            StorageError::Page(PageError::RecordTooLarge { .. })
         )))
     ));
     assert_eq!(
@@ -1029,6 +1029,54 @@ fn overflowing_multi_row_update_rolls_back_every_prior_replacement() {
             vec![ScalarValue::Int64(1), ScalarValue::Text("x".into())],
             vec![ScalarValue::Int64(2), ScalarValue::Text("y".into())],
             vec![ScalarValue::Int64(3), ScalarValue::Text("z".into())],
+        ]
+    );
+    database.close().expect("close database");
+    cleanup(&path);
+}
+
+#[test]
+fn multi_row_update_relocation_updates_each_collected_target_once() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-dml-relocation-once-{}",
+        std::process::id()
+    ));
+    let mut database = Database::create(&path, variable_rows()).expect("create database");
+    let small = "a".repeat(100);
+    let large = "b".repeat(1_000);
+    // Keep the first page almost full so row 1 still updates in place while
+    // row 2 must relocate to the already-existing second page.
+    let filler = "c".repeat(2_700);
+    let second_page_seed = "d".repeat(300);
+    for sql in [
+        format!("INSERT INTO variable_rows (id, target, source) VALUES (1, 'x', '{small}')"),
+        format!("INSERT INTO variable_rows (id, target, source) VALUES (2, 'y', '{large}')"),
+        format!("INSERT INTO variable_rows (id, target, source) VALUES (3, 'z', '{filler}')"),
+        format!(
+            "INSERT INTO variable_rows (id, target, source) VALUES (4, 'w', '{second_page_seed}')"
+        ),
+    ] {
+        database.execute(&sql).expect("insert variable row");
+    }
+
+    assert_eq!(
+        affected(
+            database
+                .execute("UPDATE variable_rows SET target = source WHERE id < 3")
+                .expect("update collected targets")
+        ),
+        2
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, target FROM variable_rows ORDER BY id")
+            .expect("query updated targets")
+            .rows,
+        vec![
+            vec![ScalarValue::Int64(1), ScalarValue::Text(small)],
+            vec![ScalarValue::Int64(2), ScalarValue::Text(large)],
+            vec![ScalarValue::Int64(3), ScalarValue::Text("z".into())],
+            vec![ScalarValue::Int64(4), ScalarValue::Text("w".into())],
         ]
     );
     database.close().expect("close database");

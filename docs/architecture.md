@@ -319,9 +319,9 @@ Database file
   from the end of the page backward.
 - `TransactionManager` allocates strong `TxnId` values, appends `Begin`, and
   owns the per-open-database writer/health state. A transaction tracks
-  `Active`, `CommitPending`, `RollbackPending`, `Committed`, or `RolledBack`
-  and owns its last LSN. Writer ownership is acquired lazily before the first
-  heap mutation; read-only transactions do not reserve it.
+  `Active`, `RollbackRequired`, `CommitPending`, `RollbackPending`, `Committed`,
+  or `RolledBack` and owns its last LSN. Writer ownership is acquired lazily
+  before the first heap mutation; read-only transactions do not reserve it.
 - `HeapStorage` validates and encodes rows, constructs a candidate after-image,
   appends its `PageUpdate`, and only then publishes the page to the buffer
   frame. It no longer flushes the entire buffer after each insert. Page guards
@@ -386,17 +386,29 @@ live tuple area while retaining every slot index and generation. UPDATE retains
 both. INSERT deterministically reuses the lowest deleted SlotId whose generation
 is below `u32::MAX`, increments it with checked arithmetic, and otherwise
 appends a generation-1 slot. A generation-maximum tombstone is permanently
-ineligible, so generation can never wrap. A replacement that cannot fit on its
-current page returns
-`UpdateWouldOverflowPage`; this release has no row relocation or forwarding
-pointer.
+ineligible, so generation can never wrap.
+
+Heap insertion performs a deterministic linear first-fit search from the
+lowest data PageId. Each candidate is cloned and passed to
+`Page::insert_record`; only `PageFull` advances the search, while corruption or
+other errors fail immediately. If no existing page accepts the tuple, the
+existing WAL-before-file-extension protocol allocates a new page. This is
+intentionally O(number of heap pages); there is no persistent free-space map.
+
+UPDATE first attempts same-page replacement and returns the unchanged `RowId`
+when it fits. On `UpdateWouldOverflowPage`, it skips the source and relocates to
+the lowest PageId accepted by normal Page v5 insertion, or to a newly allocated
+page. Storage returns the destination `RowId`; SQL currently needs only its
+affected-row count. Relocation writes no forwarding pointer.
 
 `RowId` is the versioned physical locator `PageId + SlotId + generation`, not a
 business key, primary key, or globally monotonic identifier. A same-generation
 locator for a tombstone reports `RowDeleted`; after slot reuse, the old
 generation reports `StaleRowId` before live/deleted state is considered. Scans
 return the persisted generation, so executor UPDATE/DELETE retain the complete
-locator.
+locator. Relocation changes the locator: its source is a same-generation
+tombstone and therefore reports `RowDeleted` until reuse increments that slot,
+after which the source locator reports `StaleRowId`.
 
 Version 3 intentionally changed the meaning of a formerly invalid slot pair;
 version 4 added data-page integrity without moving existing header fields;
@@ -505,6 +517,15 @@ Active
     → RolledBack
 ```
 
+`RollbackRequired` is distinct from `RollbackPending`. The former means a
+compound logical operation has appended only part of its physical WAL history;
+no Abort exists yet, and only `rollback()` is permitted. The latter means Abort
+has been appended and physical undo is running or retryable. Relocation prepares
+both after-images before WAL publication, then deterministically logs the
+destination PageUpdate followed by the source PageUpdate. Any later logging,
+flush, allocation, buffer acquisition, or publication failure marks the
+transaction `RollbackRequired`, so a half relocation can never commit.
+
 Before-images restore their historical pageLSN; rollback does not generate
 ordinary PageUpdate records. A rollback error leaves `RollbackPending` and
 retains writer ownership, so calling `rollback` again safely repeats the
@@ -564,7 +585,8 @@ a checkpoint may already have recycled the page's complete history.
 
 Because full-page after-images can include another transaction's uncommitted
 contents, the runtime permits one writer and acquires that ownership before any
-heap page mutation or allocation. CommitPending and RollbackPending retain it.
+heap page mutation or allocation. RollbackRequired, CommitPending, and
+RollbackPending retain it.
 Commit durability or completed physical rollback releases it. Dropping an
 unfinished dirty writer marks the open storage recovery-required; later writes
 and close fail, while read-only handles may still be created. Analysis also
@@ -609,8 +631,9 @@ runtime health = Healthy
 outstanding transaction handles = 0
 ```
 
-It never waits or queues. Active, CommitPending, RollbackPending, read-only
-active, and RecoveryRequired states return typed errors. Clean close enforces
+It never waits or queues. Active, RollbackRequired, CommitPending,
+RollbackPending, read-only active, and RecoveryRequired states return typed
+errors. Clean close enforces
 the same no-outstanding-handle safety property so no live transaction can retain
 a prevLSN into recycled history.
 

@@ -29,6 +29,9 @@ type SharedRuntime = Rc<TransactionRuntime>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
     Active,
+    /// A compound logical operation logged only part of its physical work.
+    /// The transaction may be rolled back but cannot continue or commit.
+    RollbackRequired,
     CommitPending,
     RollbackPending,
     Committed,
@@ -117,7 +120,7 @@ impl Transaction {
     /// `RollbackPending` and retains an owned writer.
     pub fn rollback(&mut self) -> Result<(), StorageError> {
         match self.state {
-            TransactionState::Active => {
+            TransactionState::Active | TransactionState::RollbackRequired => {
                 let rollback_start_lsn = self.last_lsn;
                 let abort_lsn = self
                     .wal
@@ -208,6 +211,14 @@ impl Transaction {
             .into());
         }
         Ok(())
+    }
+
+    /// Prevents a transaction with a partially logged compound operation from
+    /// committing or performing more writes. Runtime rollback remains allowed.
+    pub(crate) fn require_rollback(&mut self) {
+        if self.state == TransactionState::Active {
+            self.state = TransactionState::RollbackRequired;
+        }
     }
 
     pub(crate) fn belongs_to(&self, wal: &SharedWal) -> bool {
@@ -354,7 +365,9 @@ impl Drop for Transaction {
         if owns_writer
             && (matches!(
                 self.state,
-                TransactionState::CommitPending | TransactionState::RollbackPending
+                TransactionState::RollbackRequired
+                    | TransactionState::CommitPending
+                    | TransactionState::RollbackPending
             ) || (self.state == TransactionState::Active && self.has_page_updates))
         {
             self.runtime.writer.set(WriterState::RecoveryRequired);
@@ -563,6 +576,60 @@ mod tests {
         assert_eq!(wal.borrow().durable_lsn(), Some(transaction.last_lsn()));
         assert!(transaction.rollback().is_err());
         drop(transaction);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn rollback_required_rejects_commit_and_writes_but_allows_rollback() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-rollback-required");
+        let mut transaction = manager.begin().expect("begin transaction");
+        transaction.acquire_writer().expect("acquire writer");
+        transaction.require_rollback();
+
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        assert!(matches!(
+            transaction.commit(),
+            Err(StorageError::Transaction(TransactionError::NotActive {
+                state: TransactionState::RollbackRequired,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            transaction.acquire_writer(),
+            Err(StorageError::Transaction(TransactionError::NotActive {
+                state: TransactionState::RollbackRequired,
+                ..
+            }))
+        ));
+        transaction
+            .rollback()
+            .expect("rollback required transaction");
+        assert_eq!(transaction.state(), TransactionState::RolledBack);
+
+        drop(transaction);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn dropping_rollback_required_writer_requires_recovery() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-drop-rollback-required");
+        let mut transaction = manager.begin().expect("begin transaction");
+        transaction.acquire_writer().expect("acquire writer");
+        transaction.require_rollback();
+        drop(transaction);
+
+        let next = manager.begin().expect("begin read-only transaction");
+        assert!(matches!(
+            next.acquire_writer(),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
+        drop(next);
         drop(manager);
         drop(wal);
         cleanup(page_path, wal_path);

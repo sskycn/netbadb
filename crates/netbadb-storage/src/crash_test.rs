@@ -26,6 +26,9 @@ pub(crate) enum TestCrashPoint {
     RecoveryAfterPageOperation,
     CheckpointAfterNewGenerationDurable,
     CheckpointAfterOldGenerationRemoved,
+    RelocationAfterFirstPageUpdateLog,
+    RelocationAfterBothPageUpdateLogs,
+    RelocationAfterFirstPagePublish,
     WalPartialFinalRecord,
 }
 
@@ -44,6 +47,9 @@ impl TestCrashPoint {
             Self::RecoveryAfterPageOperation => "recovery-after-page-operation",
             Self::CheckpointAfterNewGenerationDurable => "checkpoint-after-new-generation-durable",
             Self::CheckpointAfterOldGenerationRemoved => "checkpoint-after-old-generation-removed",
+            Self::RelocationAfterFirstPageUpdateLog => "relocation-after-first-page-update-log",
+            Self::RelocationAfterBothPageUpdateLogs => "relocation-after-both-page-update-logs",
+            Self::RelocationAfterFirstPagePublish => "relocation-after-first-page-publish",
             Self::WalPartialFinalRecord => "wal-partial-final-record",
         }
     }
