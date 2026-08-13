@@ -11,11 +11,15 @@ use crate::{PAGE_SIZE, Page};
 
 const WAL_MAGIC: &[u8; 4] = b"NBWL";
 const RECORD_MAGIC: &[u8; 4] = b"WREC";
-const RECORD_FORMAT_VERSION: u16 = 1;
+const RECORD_FORMAT_VERSION: u16 = 2;
 const RECORD_HEADER_SIZE: usize = 40;
 const PAGE_UPDATE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE * 2;
+const HEADER_CHECKSUM_OFFSET: usize = 40;
+const HEADER_CHECKSUM_END: usize = 44;
+const RECORD_CHECKSUM_OFFSET: usize = 12;
+const RECORD_CHECKSUM_END: usize = 16;
 
-pub const WAL_FORMAT_VERSION: u16 = 2;
+pub const WAL_FORMAT_VERSION: u16 = 3;
 pub const WAL_HEADER_SIZE: usize = 48;
 pub const WAL_MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE + PAGE_UPDATE_PAYLOAD_SIZE;
 
@@ -30,6 +34,10 @@ pub enum WalError {
     UnsupportedVersion(u16),
     InvalidHeaderSize(u16),
     InvalidReservedBytes,
+    HeaderChecksumMismatch {
+        stored: u32,
+        computed: u32,
+    },
     InvalidGeneration(u64),
     InvalidBaseLsn {
         base_lsn: Lsn,
@@ -60,10 +68,15 @@ pub enum WalError {
         lsn: Lsn,
         length: u32,
     },
-    InvalidPayloadLength {
+    UnexpectedRecordLength {
         lsn: Lsn,
         expected: u32,
         actual: u32,
+    },
+    RecordChecksumMismatch {
+        lsn: Lsn,
+        stored: u32,
+        computed: u32,
     },
     InvalidRecordedLsn {
         expected: Lsn,
@@ -73,9 +86,6 @@ pub enum WalError {
         lsn: Lsn,
         expected: Option<Lsn>,
         actual: Option<Lsn>,
-    },
-    InvalidPartialPrevLsn {
-        lsn: Lsn,
     },
     InvalidTransactionSequence {
         lsn: Lsn,
@@ -108,6 +118,10 @@ impl fmt::Display for WalError {
             }
             Self::InvalidHeaderSize(size) => write!(formatter, "invalid WAL header size {size}"),
             Self::InvalidReservedBytes => formatter.write_str("WAL reserved bytes are non-zero"),
+            Self::HeaderChecksumMismatch { stored, computed } => write!(
+                formatter,
+                "WAL header checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"
+            ),
             Self::InvalidGeneration(generation) => {
                 write!(formatter, "invalid WAL generation {generation}")
             }
@@ -153,13 +167,22 @@ impl fmt::Display for WalError {
                 "WAL record at {} exceeds the maximum length: {length}",
                 lsn.0
             ),
-            Self::InvalidPayloadLength {
+            Self::UnexpectedRecordLength {
                 lsn,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "WAL record at {} declares payload length {actual}, expected {expected}",
+                "WAL record at {} has length {actual}, expected {expected} for its type",
+                lsn.0
+            ),
+            Self::RecordChecksumMismatch {
+                lsn,
+                stored,
+                computed,
+            } => write!(
+                formatter,
+                "WAL record at {} has checksum {stored:#010x}, computed {computed:#010x}",
                 lsn.0
             ),
             Self::InvalidRecordedLsn { expected, actual } => write!(
@@ -174,11 +197,6 @@ impl fmt::Display for WalError {
             } => write!(
                 formatter,
                 "WAL record at {} has prevLSN {actual:?}, expected {expected:?}",
-                lsn.0
-            ),
-            Self::InvalidPartialPrevLsn { lsn } => write!(
-                formatter,
-                "partial WAL record at {} has a mismatched prevLSN prefix",
                 lsn.0
             ),
             Self::InvalidTransactionSequence {
@@ -764,6 +782,8 @@ fn encode_header(header: WalHeader) -> Result<[u8; WAL_HEADER_SIZE], WalError> {
     bytes[16..24].copy_from_slice(&header.base_lsn.0.to_le_bytes());
     bytes[24..32].copy_from_slice(&header.checkpoint_lsn.map_or(0, |lsn| lsn.0).to_le_bytes());
     bytes[32..40].copy_from_slice(&header.next_txn_id.0.to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes);
+    bytes[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
     Ok(bytes)
 }
 
@@ -786,8 +806,21 @@ fn read_header(file: &mut File) -> Result<WalHeader, WalError> {
     if usize::from(header_size) != WAL_HEADER_SIZE {
         return Err(WalError::InvalidHeaderSize(header_size));
     }
-    if bytes[40..48].iter().any(|byte| *byte != 0) {
+    if bytes[HEADER_CHECKSUM_END..WAL_HEADER_SIZE]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
         return Err(WalError::InvalidReservedBytes);
+    }
+    let stored_checksum = read_u32(&bytes, HEADER_CHECKSUM_OFFSET);
+    let mut checksum_bytes = bytes;
+    checksum_bytes[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_END].fill(0);
+    let computed_checksum = crc32c::crc32c(&checksum_bytes);
+    if stored_checksum != computed_checksum {
+        return Err(WalError::HeaderChecksumMismatch {
+            stored: stored_checksum,
+            computed: computed_checksum,
+        });
     }
     let raw_checkpoint = read_u64(&bytes, 24);
     let header = WalHeader {
@@ -899,7 +932,7 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
     bytes.push(record.kind.tag());
     bytes.push(0);
     bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
-    bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
     bytes.extend_from_slice(&record.lsn.0.to_le_bytes());
     bytes.extend_from_slice(&record.txn_id.0.to_le_bytes());
     bytes.extend_from_slice(&record.prev_lsn.map_or(0, |lsn| lsn.0).to_le_bytes());
@@ -913,6 +946,8 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
         bytes.extend_from_slice(before.as_ref());
         bytes.extend_from_slice(after.as_ref());
     }
+    let checksum = crc32c::crc32c(&bytes);
+    bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
     Ok(bytes)
 }
 
@@ -983,7 +1018,7 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
             let mut partial = vec![0_u8; remaining as usize];
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut partial)?;
-            validate_partial_record_header(lsn, &partial, &txn_last_lsn, &txn_states)?;
+            validate_partial_record_header(lsn, &partial)?;
             if tail_policy == TailPolicy::AllowIncompleteFinalRecord {
                 return Ok(ScanResult {
                     records,
@@ -996,56 +1031,33 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
         let mut record_header = [0_u8; RECORD_HEADER_SIZE];
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(&mut record_header)?;
-        if &record_header[0..4] != RECORD_MAGIC {
-            return Err(WalError::InvalidRecordMagic { lsn });
+        let (record_type, total_len) = validate_record_framing(lsn, &record_header)?;
+
+        if u64::from(total_len) > remaining {
+            if tail_policy == TailPolicy::AllowIncompleteFinalRecord {
+                return Ok(ScanResult {
+                    records,
+                    valid_end: offset,
+                    incomplete_tail: true,
+                });
+            }
+            return Err(WalError::TruncatedRecord { lsn });
         }
-        let record_version = read_u16(&record_header, 4);
-        if record_version != RECORD_FORMAT_VERSION {
-            return Err(WalError::UnsupportedRecordVersion {
-                lsn,
-                version: record_version,
-            });
-        }
-        if record_header[7] != 0 {
-            return Err(WalError::InvalidReservedBytes);
-        }
-        let total_len = read_u32(&record_header, 8);
-        if total_len < RECORD_HEADER_SIZE as u32 {
-            return Err(WalError::InvalidRecordLength {
-                lsn,
-                length: total_len,
-            });
-        }
-        if total_len as usize > WAL_MAX_RECORD_SIZE {
-            return Err(WalError::RecordTooLarge {
-                lsn,
-                length: total_len,
-            });
-        }
-        let payload_len = read_u32(&record_header, 12);
-        let expected_payload = total_len - RECORD_HEADER_SIZE as u32;
-        if payload_len != expected_payload {
-            return Err(WalError::InvalidPayloadLength {
-                lsn,
-                expected: expected_payload,
-                actual: payload_len,
-            });
-        }
-        let record_type = record_header[6];
-        require_payload_length(
-            lsn,
-            payload_len,
-            expected_payload_for_tag(lsn, record_type)?,
-        )?;
-        let actual_lsn = Lsn(read_u64(&record_header, 16));
+
+        let mut record_bytes = vec![0_u8; total_len as usize];
+        record_bytes[..RECORD_HEADER_SIZE].copy_from_slice(&record_header);
+        file.read_exact(&mut record_bytes[RECORD_HEADER_SIZE..])?;
+        verify_record_checksum(lsn, &record_bytes)?;
+
+        let actual_lsn = Lsn(read_u64(&record_bytes, 16));
         if actual_lsn != lsn {
             return Err(WalError::InvalidRecordedLsn {
                 expected: lsn,
                 actual: actual_lsn,
             });
         }
-        let txn_id = TxnId(read_u64(&record_header, 24));
-        let raw_prev = read_u64(&record_header, 32);
+        let txn_id = TxnId(read_u64(&record_bytes, 24));
+        let raw_prev = read_u64(&record_bytes, 32);
         let prev_lsn = (raw_prev != 0).then_some(Lsn(raw_prev));
         let expected_prev = txn_last_lsn.get(&txn_id).copied();
         if prev_lsn != expected_prev {
@@ -1062,27 +1074,11 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
             record_type,
         )?;
 
-        if u64::from(total_len) > remaining {
-            if tail_policy == TailPolicy::AllowIncompleteFinalRecord {
-                return Ok(ScanResult {
-                    records,
-                    valid_end: offset,
-                    incomplete_tail: true,
-                });
-            }
-            return Err(WalError::TruncatedRecord { lsn });
-        }
-
         let kind = match record_type {
-            1 => {
-                require_payload_length(lsn, payload_len, 0)?;
-                WalRecordKind::Begin
-            }
+            1 => WalRecordKind::Begin,
             2 => {
-                require_payload_length(lsn, payload_len, PAGE_UPDATE_PAYLOAD_SIZE as u32)?;
-                let mut payload = [0_u8; PAGE_UPDATE_PAYLOAD_SIZE];
-                file.read_exact(&mut payload)?;
-                let page_id = PageId(read_u64(&payload, 0));
+                let payload = &record_bytes[RECORD_HEADER_SIZE..];
+                let page_id = PageId(read_u64(payload, 0));
                 let mut before = Box::new([0_u8; PAGE_SIZE]);
                 before.copy_from_slice(&payload[8..8 + PAGE_SIZE]);
                 let mut after = Box::new([0_u8; PAGE_SIZE]);
@@ -1093,19 +1089,16 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
                     after,
                 }
             }
-            3 => {
-                require_payload_length(lsn, payload_len, 0)?;
-                WalRecordKind::Commit
+            3 => WalRecordKind::Commit,
+            4 => WalRecordKind::Abort,
+            5 => WalRecordKind::RollbackComplete,
+            // Framing validated this tag before reading or allocating the record.
+            _ => {
+                return Err(WalError::UnknownRecordType {
+                    lsn,
+                    tag: record_type,
+                });
             }
-            4 => {
-                require_payload_length(lsn, payload_len, 0)?;
-                WalRecordKind::Abort
-            }
-            5 => {
-                require_payload_length(lsn, payload_len, 0)?;
-                WalRecordKind::RollbackComplete
-            }
-            tag => return Err(WalError::UnknownRecordType { lsn, tag }),
         };
         validate_page_images(lsn, &kind)?;
         txn_last_lsn.insert(txn_id, lsn);
@@ -1127,12 +1120,67 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
     })
 }
 
-fn validate_partial_record_header(
+fn validate_record_framing(
     lsn: Lsn,
-    bytes: &[u8],
-    txn_last_lsn: &HashMap<TxnId, Lsn>,
-    txn_states: &HashMap<TxnId, WalTxnState>,
-) -> Result<(), WalError> {
+    record_header: &[u8; RECORD_HEADER_SIZE],
+) -> Result<(u8, u32), WalError> {
+    if &record_header[0..4] != RECORD_MAGIC {
+        return Err(WalError::InvalidRecordMagic { lsn });
+    }
+    let record_version = read_u16(record_header, 4);
+    if record_version != RECORD_FORMAT_VERSION {
+        return Err(WalError::UnsupportedRecordVersion {
+            lsn,
+            version: record_version,
+        });
+    }
+    if record_header[7] != 0 {
+        return Err(WalError::InvalidReservedBytes);
+    }
+    let record_type = record_header[6];
+    let expected_payload = expected_payload_for_tag(lsn, record_type)?;
+    let total_len = read_u32(record_header, 8);
+    if total_len < RECORD_HEADER_SIZE as u32 {
+        return Err(WalError::InvalidRecordLength {
+            lsn,
+            length: total_len,
+        });
+    }
+    if total_len as usize > WAL_MAX_RECORD_SIZE {
+        return Err(WalError::RecordTooLarge {
+            lsn,
+            length: total_len,
+        });
+    }
+    let expected = (RECORD_HEADER_SIZE as u32)
+        .checked_add(expected_payload)
+        .ok_or(WalError::LsnOverflow)?;
+    if total_len != expected {
+        return Err(WalError::UnexpectedRecordLength {
+            lsn,
+            expected,
+            actual: total_len,
+        });
+    }
+    Ok((record_type, total_len))
+}
+
+fn verify_record_checksum(lsn: Lsn, record_bytes: &[u8]) -> Result<(), WalError> {
+    let stored = read_u32(record_bytes, RECORD_CHECKSUM_OFFSET);
+    let mut checksum_bytes = record_bytes.to_vec();
+    checksum_bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_END].fill(0);
+    let computed = crc32c::crc32c(&checksum_bytes);
+    if stored != computed {
+        return Err(WalError::RecordChecksumMismatch {
+            lsn,
+            stored,
+            computed,
+        });
+    }
+    Ok(())
+}
+
+fn validate_partial_record_header(lsn: Lsn, bytes: &[u8]) -> Result<(), WalError> {
     let magic_len = bytes.len().min(RECORD_MAGIC.len());
     if bytes[..magic_len] != RECORD_MAGIC[..magic_len] {
         return Err(WalError::InvalidRecordMagic { lsn });
@@ -1163,45 +1211,15 @@ fn validate_partial_record_header(
                 length: total_len,
             });
         }
-    }
-    if bytes.len() >= 16 {
-        let total_len = read_u32(bytes, 8);
-        let payload_len = read_u32(bytes, 12);
-        let expected = total_len - RECORD_HEADER_SIZE as u32;
-        if payload_len != expected {
-            return Err(WalError::InvalidPayloadLength {
+        let expected = (RECORD_HEADER_SIZE as u32)
+            .checked_add(expected_payload_for_tag(lsn, bytes[6])?)
+            .ok_or(WalError::LsnOverflow)?;
+        if total_len != expected {
+            return Err(WalError::UnexpectedRecordLength {
                 lsn,
                 expected,
-                actual: payload_len,
+                actual: total_len,
             });
-        }
-        let kind_expected = expected_payload_for_tag(lsn, bytes[6])?;
-        require_payload_length(lsn, payload_len, kind_expected)?;
-    }
-    if bytes.len() >= 24 {
-        let actual = Lsn(read_u64(bytes, 16));
-        if actual != lsn {
-            return Err(WalError::InvalidRecordedLsn {
-                expected: lsn,
-                actual,
-            });
-        }
-    }
-    if bytes.len() >= 32 {
-        let txn_id = TxnId(read_u64(bytes, 24));
-        let record_type = bytes[6];
-        let state = txn_states.get(&txn_id).copied();
-        validate_transaction_tag_sequence(lsn, txn_id, state, record_type)?;
-        let available_prev = bytes.len().saturating_sub(32).min(8);
-        if available_prev > 0 {
-            let expected = txn_last_lsn
-                .get(&txn_id)
-                .copied()
-                .map_or(0, |prev_lsn| prev_lsn.0)
-                .to_le_bytes();
-            if bytes[32..32 + available_prev] != expected[..available_prev] {
-                return Err(WalError::InvalidPartialPrevLsn { lsn });
-            }
         }
     }
     Ok(())
@@ -1296,17 +1314,6 @@ fn validate_page_images(lsn: Lsn, kind: &WalRecordKind) -> Result<(), WalError> 
         return Err(WalError::InvalidPageLsn {
             record_lsn: lsn,
             page_lsn,
-        });
-    }
-    Ok(())
-}
-
-fn require_payload_length(lsn: Lsn, actual: u32, expected: u32) -> Result<(), WalError> {
-    if actual != expected {
-        return Err(WalError::InvalidPayloadLength {
-            lsn,
-            expected,
-            actual,
         });
     }
     Ok(())
@@ -1483,8 +1490,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_an_invalid_transaction_sequence_in_a_partial_page_update() {
-        let path = test_path("wal-invalid-partial-sequence");
+    fn recovery_truncates_a_structurally_valid_partial_record_before_semantic_decoding() {
+        let path = test_path("wal-partial-semantic-fields");
         let wal = WalManager::create(&path).expect("create WAL");
         let lsn = wal.next_lsn();
         drop(wal);
@@ -1494,7 +1501,6 @@ mod tests {
         header[4..6].copy_from_slice(&super::RECORD_FORMAT_VERSION.to_le_bytes());
         header[6] = 2;
         header[8..12].copy_from_slice(&(super::WAL_MAX_RECORD_SIZE as u32).to_le_bytes());
-        header[12..16].copy_from_slice(&(super::PAGE_UPDATE_PAYLOAD_SIZE as u32).to_le_bytes());
         header[16..24].copy_from_slice(&lsn.0.to_le_bytes());
         header[24..32].copy_from_slice(&999_u64.to_le_bytes());
         let mut file = OpenOptions::new()
@@ -1504,19 +1510,13 @@ mod tests {
         file.write_all(&header).expect("write record header");
         file.write_all(&[0_u8; 8]).expect("write partial payload");
         drop(file);
-        let length_before = std::fs::metadata(&path).expect("WAL metadata").len();
-
-        assert!(matches!(
-            WalManager::open_for_recovery(&path),
-            Err(WalError::InvalidTransactionSequence {
-                txn_id: TxnId(999),
-                record_type: 2,
-                ..
-            })
-        ));
+        let (_, records, truncated) =
+            WalManager::open_for_recovery(&path).expect("truncate incomplete record");
+        assert!(records.is_empty());
+        assert!(truncated);
         assert_eq!(
             std::fs::metadata(&path).expect("WAL metadata").len(),
-            length_before
+            WAL_HEADER_SIZE as u64
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1555,9 +1555,29 @@ mod tests {
             WalManager::open(&length_path),
             Err(WalError::InvalidRecordLength { .. })
         ));
+
+        let type_length_path = test_path("wal-type-length-mismatch");
+        let mut wal = WalManager::create(&type_length_path).expect("create WAL");
+        wal.append(TxnId(1), None, WalRecordKind::Begin)
+            .expect("append begin");
+        drop(wal);
+        overwrite(
+            &type_length_path,
+            WAL_HEADER_SIZE as u64 + 8,
+            &(super::WAL_MAX_RECORD_SIZE as u32).to_le_bytes(),
+        );
+        assert!(matches!(
+            WalManager::open(&type_length_path),
+            Err(WalError::UnexpectedRecordLength {
+                expected: 40,
+                actual,
+                ..
+            }) if actual == super::WAL_MAX_RECORD_SIZE as u32
+        ));
         let _ = std::fs::remove_file(magic_path);
         let _ = std::fs::remove_file(version_path);
         let _ = std::fs::remove_file(length_path);
+        let _ = std::fs::remove_file(type_length_path);
     }
 
     #[test]
@@ -1565,6 +1585,7 @@ mod tests {
         let generation_path = test_path("wal-zero-generation");
         drop(WalManager::create(&generation_path).expect("create WAL"));
         overwrite(&generation_path, 8, &0_u64.to_le_bytes());
+        rewrite_header_checksum(&generation_path);
         assert!(matches!(
             WalManager::open(&generation_path),
             Err(WalError::InvalidGeneration(0))
@@ -1573,6 +1594,7 @@ mod tests {
         let base_path = test_path("wal-invalid-base");
         drop(WalManager::create(&base_path).expect("create WAL"));
         overwrite(&base_path, 24, &1_u64.to_le_bytes());
+        rewrite_header_checksum(&base_path);
         assert!(matches!(
             WalManager::open(&base_path),
             Err(WalError::InvalidBaseLsn { .. })
@@ -1581,6 +1603,7 @@ mod tests {
         let txn_path = test_path("wal-zero-next-txn");
         drop(WalManager::create(&txn_path).expect("create WAL"));
         overwrite(&txn_path, 32, &0_u64.to_le_bytes());
+        rewrite_header_checksum(&txn_path);
         assert!(matches!(
             WalManager::open(&txn_path),
             Err(WalError::InvalidNextTxnId(0))
@@ -1631,6 +1654,7 @@ mod tests {
             + 8
             + crate::PAGE_SIZE as u64;
         overwrite(&path, after_image_offset + 4, &99_u16.to_le_bytes());
+        rewrite_record_checksum(&path, update_lsn);
         assert!(matches!(
             WalManager::open(&path),
             Err(WalError::InvalidPageImage { image: "after", .. })
@@ -1693,11 +1717,310 @@ mod tests {
         file.write_all(&999_u64.to_le_bytes())
             .expect("corrupt prevLSN");
         drop(file);
+        rewrite_record_checksum(&path, commit);
         assert!(matches!(
             WalManager::open(&path),
             Err(WalError::InvalidPrevLsn { .. })
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn checksum_encoding_has_stable_golden_values() {
+        let header = super::encode_header(super::WalHeader {
+            generation: 7,
+            base_lsn: netbadb_types::Lsn(41),
+            checkpoint_lsn: Some(netbadb_types::Lsn(40)),
+            next_txn_id: TxnId(99),
+        })
+        .expect("encode header");
+        assert_eq!(
+            super::read_u32(&header, super::HEADER_CHECKSUM_OFFSET),
+            0x7e39_6232
+        );
+
+        let begin = super::encode_record(&super::WalRecord {
+            lsn: netbadb_types::Lsn(123),
+            txn_id: TxnId(9),
+            prev_lsn: Some(netbadb_types::Lsn(80)),
+            kind: WalRecordKind::Begin,
+        })
+        .expect("encode Begin");
+        assert_eq!(
+            super::read_u32(&begin, super::RECORD_CHECKSUM_OFFSET),
+            0xa4d9_9237
+        );
+
+        let before = Page::new(PageId(5), PageType::Heap);
+        let mut after = before.clone();
+        after.insert_record(b"checksum-golden").expect("insert row");
+        after.set_page_lsn(netbadb_types::Lsn(123));
+        let update = super::encode_record(&super::WalRecord {
+            lsn: netbadb_types::Lsn(123),
+            txn_id: TxnId(9),
+            prev_lsn: Some(netbadb_types::Lsn(80)),
+            kind: super::page_update_kind(&before, &after),
+        })
+        .expect("encode PageUpdate");
+        let original_checksum = super::read_u32(&update, super::RECORD_CHECKSUM_OFFSET);
+        let mut changed = update;
+        changed[super::RECORD_HEADER_SIZE + 8 + crate::PAGE_SIZE + 100] ^= 1;
+        changed[super::RECORD_CHECKSUM_OFFSET..super::RECORD_CHECKSUM_END].fill(0);
+        assert_ne!(crc32c::crc32c(&changed), original_checksum);
+    }
+
+    #[test]
+    fn header_semantic_and_checksum_bit_flips_report_checksum_mismatch() {
+        for (index, offset) in [8_u64, 16, 32, super::HEADER_CHECKSUM_OFFSET as u64]
+            .into_iter()
+            .enumerate()
+        {
+            let path = test_path(&format!("wal-header-checksum-mutation-{index}"));
+            drop(WalManager::create(&path).expect("create WAL"));
+            flip_byte(&path, offset, 1);
+            assert!(matches!(
+                WalManager::open(&path),
+                Err(WalError::HeaderChecksumMismatch { .. })
+            ));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn record_semantic_and_payload_bit_flips_report_checksum_mismatch() {
+        let source = test_path("wal-record-checksum-source");
+        let lsns = write_committed_page_updates(&source, 1);
+        let update_offset = initial_physical_offset(lsns[1]);
+        let mutations = [
+            update_offset + 24,
+            update_offset + 32,
+            update_offset + super::RECORD_CHECKSUM_OFFSET as u64,
+            update_offset + super::RECORD_HEADER_SIZE as u64,
+            update_offset + super::RECORD_HEADER_SIZE as u64 + 8 + 100,
+            update_offset + super::RECORD_HEADER_SIZE as u64 + 8 + crate::PAGE_SIZE as u64 + 100,
+        ];
+        let source_bytes = std::fs::read(&source).expect("read valid WAL");
+
+        for (index, offset) in mutations.into_iter().enumerate() {
+            let path = test_path(&format!("wal-record-checksum-mutation-{index}"));
+            std::fs::write(&path, &source_bytes).expect("write mutated WAL baseline");
+            flip_byte(&path, offset, 1);
+            assert!(matches!(
+                WalManager::open(&path),
+                Err(WalError::RecordChecksumMismatch { lsn, .. }) if lsn == lsns[1]
+            ));
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn recovery_never_truncates_a_complete_corrupt_final_record() {
+        let path = test_path("wal-corrupt-complete-final");
+        let lsns = write_committed_page_updates(&path, 1);
+        let commit = *lsns.last().expect("commit LSN");
+        flip_byte(&path, initial_physical_offset(commit) + 24, 1);
+        let length = std::fs::metadata(&path).expect("WAL metadata").len();
+
+        assert!(matches!(
+            WalManager::open_for_recovery(&path),
+            Err(WalError::RecordChecksumMismatch { lsn, .. }) if lsn == commit
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("WAL metadata").len(),
+            length
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_rejects_a_corrupt_middle_record() {
+        let path = test_path("wal-corrupt-middle");
+        let lsns = write_committed_page_updates(&path, 2);
+        let first_update = lsns[1];
+        flip_byte(
+            &path,
+            initial_physical_offset(first_update)
+                + super::RECORD_HEADER_SIZE as u64
+                + 8
+                + crate::PAGE_SIZE as u64
+                + 100,
+            1,
+        );
+
+        assert!(matches!(
+            WalManager::open_for_recovery(&path),
+            Err(WalError::RecordChecksumMismatch { lsn, .. }) if lsn == first_update
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_truncates_valid_final_record_prefixes_at_structural_boundaries() {
+        let source = test_path("wal-truncation-source");
+        let lsns = write_committed_page_updates(&source, 1);
+        let update = lsns[1];
+        let valid_end = initial_physical_offset(update);
+        let source_bytes = std::fs::read(&source).expect("read valid WAL");
+        for (index, prefix_len) in [1_usize, 3, 5, 10, 14, 20, 36, 40, 140]
+            .into_iter()
+            .enumerate()
+        {
+            let path = test_path(&format!("wal-truncation-position-{index}"));
+            std::fs::write(&path, &source_bytes[..valid_end as usize + prefix_len])
+                .expect("write truncated WAL");
+            assert!(matches!(
+                WalManager::open(&path),
+                Err(WalError::TruncatedRecord { lsn }) if lsn == update
+            ));
+            let (manager, records, truncated) = WalManager::open_for_recovery(&path)
+                .expect("recover structurally valid partial tail");
+            assert!(truncated);
+            assert_eq!(records.len(), 1);
+            drop(manager);
+            assert_eq!(
+                std::fs::metadata(&path).expect("WAL metadata").len(),
+                valid_end
+            );
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn recovery_rejects_a_structurally_invalid_partial_tail_without_truncating() {
+        let path = test_path("wal-invalid-partial-prefix");
+        drop(WalManager::create(&path).expect("create WAL"));
+        let original_len = std::fs::metadata(&path).expect("WAL metadata").len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open WAL")
+            .write_all(b"X")
+            .expect("write invalid prefix");
+        assert!(matches!(
+            WalManager::open_for_recovery(&path),
+            Err(WalError::InvalidRecordMagic { .. })
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("WAL metadata").len(),
+            original_len + 1
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_wal_and_record_versions_are_explicitly_unsupported() {
+        let wal_path = test_path("wal-v2-unsupported");
+        drop(WalManager::create(&wal_path).expect("create WAL"));
+        overwrite(&wal_path, 4, &2_u16.to_le_bytes());
+        assert!(matches!(
+            WalManager::open(&wal_path),
+            Err(WalError::UnsupportedVersion(2))
+        ));
+
+        let record_path = test_path("wal-record-v1-unsupported");
+        let lsns = write_committed_page_updates(&record_path, 0);
+        overwrite(
+            &record_path,
+            initial_physical_offset(lsns[0]) + 4,
+            &1_u16.to_le_bytes(),
+        );
+        assert!(matches!(
+            WalManager::open(&record_path),
+            Err(WalError::UnsupportedRecordVersion { version: 1, .. })
+        ));
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(record_path);
+    }
+
+    #[test]
+    fn rotation_writes_a_checksummed_header_and_corrupt_newer_header_blocks_fallback() {
+        let path = test_path("wal-generation-header-checksum");
+        let mut wal = WalManager::create(&path).expect("create WAL");
+        let begin = wal
+            .append(TxnId(1), None, WalRecordKind::Begin)
+            .expect("append begin");
+        wal.flush_through(begin).expect("flush begin");
+        wal.inject_partial_rotation_failure(WAL_HEADER_SIZE);
+        assert!(matches!(wal.rotate(TxnId(2)), Err(WalError::Io(_))));
+        drop(wal);
+
+        let alternate = super::wal_alternate_path(&path);
+        let header = std::fs::read(&alternate).expect("read new generation header");
+        let stored = super::read_u32(&header, super::HEADER_CHECKSUM_OFFSET);
+        let mut checksum_bytes = header.clone();
+        checksum_bytes[super::HEADER_CHECKSUM_OFFSET..super::HEADER_CHECKSUM_END].fill(0);
+        assert_eq!(crc32c::crc32c(&checksum_bytes), stored);
+
+        flip_byte(&alternate, super::HEADER_CHECKSUM_OFFSET as u64, 1);
+        assert!(matches!(
+            WalManager::open(&path),
+            Err(WalError::HeaderChecksumMismatch { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(alternate);
+    }
+
+    #[test]
+    fn sampled_single_bit_mutations_never_decode_as_valid_or_panic() {
+        let source = test_path("wal-deterministic-mutation-source");
+        write_committed_page_updates(&source, 1);
+        let source_bytes = std::fs::read(&source).expect("read valid WAL");
+        let path = test_path("wal-deterministic-mutation-case");
+
+        for offset in (0..source_bytes.len()).step_by(257) {
+            for mask in [1_u8, 0x80] {
+                std::fs::write(&path, &source_bytes).expect("restore valid WAL");
+                flip_byte(&path, offset as u64, mask);
+                assert!(WalManager::open(&path).is_err());
+            }
+        }
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn write_committed_page_updates(
+        path: &std::path::Path,
+        update_count: usize,
+    ) -> Vec<netbadb_types::Lsn> {
+        let _ = std::fs::remove_file(path);
+        let mut wal = WalManager::create(path).expect("create WAL");
+        let mut lsns = Vec::with_capacity(update_count + 2);
+        let mut previous = wal
+            .append(TxnId(1), None, WalRecordKind::Begin)
+            .expect("append begin");
+        lsns.push(previous);
+        for index in 0..update_count {
+            let page_id = PageId(index as u64 + 1);
+            let before = Page::new(page_id, PageType::Heap);
+            let mut after = before.clone();
+            after
+                .insert_record(format!("row-{index}").as_bytes())
+                .expect("insert row");
+            let update_lsn = wal.next_lsn();
+            after.set_page_lsn(update_lsn);
+            previous = wal
+                .append(
+                    TxnId(1),
+                    Some(previous),
+                    super::page_update_kind(&before, &after),
+                )
+                .expect("append update");
+            lsns.push(previous);
+        }
+        let commit = wal
+            .append(TxnId(1), Some(previous), WalRecordKind::Commit)
+            .expect("append commit");
+        lsns.push(commit);
+        wal.flush_through(commit).expect("flush commit");
+        drop(wal);
+        lsns
+    }
+
+    fn flip_byte(path: &std::path::Path, offset: u64, mask: u8) {
+        let bytes = std::fs::read(path).expect("read WAL for mutation");
+        overwrite(path, offset, &[bytes[offset as usize] ^ mask]);
     }
 
     fn overwrite(path: &std::path::Path, offset: u64, bytes: &[u8]) {
@@ -1707,5 +2030,29 @@ mod tests {
             .expect("open WAL for corruption");
         file.seek(SeekFrom::Start(offset)).expect("seek WAL");
         file.write_all(bytes).expect("overwrite WAL bytes");
+    }
+
+    fn rewrite_header_checksum(path: &std::path::Path) {
+        let mut bytes = std::fs::read(path).expect("read WAL for header checksum");
+        bytes[super::HEADER_CHECKSUM_OFFSET..super::HEADER_CHECKSUM_END].fill(0);
+        let checksum = crc32c::crc32c(&bytes[..WAL_HEADER_SIZE]);
+        overwrite(
+            path,
+            super::HEADER_CHECKSUM_OFFSET as u64,
+            &checksum.to_le_bytes(),
+        );
+    }
+
+    fn rewrite_record_checksum(path: &std::path::Path, lsn: netbadb_types::Lsn) {
+        let offset = initial_physical_offset(lsn) as usize;
+        let mut bytes = std::fs::read(path).expect("read WAL for record checksum");
+        let total_len = super::read_u32(&bytes, offset + 8) as usize;
+        bytes[offset + super::RECORD_CHECKSUM_OFFSET..offset + super::RECORD_CHECKSUM_END].fill(0);
+        let checksum = crc32c::crc32c(&bytes[offset..offset + total_len]);
+        overwrite(
+            path,
+            (offset + super::RECORD_CHECKSUM_OFFSET) as u64,
+            &checksum.to_le_bytes(),
+        );
     }
 }

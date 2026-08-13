@@ -41,9 +41,9 @@ migrated.
   failure tests;
 - clean close/reopen and multi-page transaction tests.
 
-Phase 2A's runtime remains non-isolated: uncommitted changes are not hidden and
-abort itself does not synchronously roll pages back. The WAL has no checksum in
-this format version.
+Phase 2A's original runtime was non-isolated: uncommitted changes were not
+hidden and abort itself did not synchronously roll pages back. Its original WAL
+format had no checksum; the current experimental WAL v3 adds integrity checks.
 
 ## Phase 2B — Crash Recovery (complete)
 
@@ -101,6 +101,24 @@ the next mutation would add another persistent state machine. Phase 2C remains
 synchronous and explicit: there is no fuzzy checkpoint, background policy, WAL
 archive, replication, or PITR. Subprocess termination tests model abrupt process
 loss without Rust destructors, not machine or storage-device power loss.
+
+## WAL integrity hardening (complete)
+
+- WAL format v3 keeps the 48-byte generation header and adds a whole-header
+  CRC32C in bytes 40..44;
+- record format v2 replaces the redundant payload length with a whole-record
+  CRC32C, preserving the 40-byte record header and existing record sizes;
+- bounded framing and type-derived length checks run before allocation, while
+  checksum verification precedes LSN, transaction-chain, and page-image
+  semantics;
+- physically incomplete, structurally valid final records remain recoverable
+  crash tails, while complete checksum failures are hard corruption errors;
+- golden vectors, semantic/payload mutation tests, generation corruption,
+  truncation boundaries, and a file-level WAL recovery fuzz target cover the
+  decoder.
+
+WAL v2 and record v1 remain unsupported experimental formats. Heap metadata
+remains v2, data pages remain v3, and canonical schema encoding remains v1.
 
 ## Phase 3A — Typed Expressions + NULL Semantics (complete)
 

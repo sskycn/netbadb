@@ -222,11 +222,17 @@ opens skip transactions whose completion is durable.
 
 An incomplete final WAL record caused by EOF is discarded at the recovery
 boundary only when its available header bytes are structurally valid. Invalid
-magic, versions, tags, lengths, transaction chains, middle records, and page
-images remain hard errors. Existing data pages are fully validated before
-their pageLSN can suppress redo. The active WAL generation currently has no
-checksum. WAL header format v2 separates physical file offsets from logical
-LSNs: for a record at physical offset `P`,
+magic, versions, tags, lengths, checksums, transaction chains, middle records,
+and page images remain hard errors. Existing data pages are fully validated
+before their pageLSN can suppress redo. WAL format v3 protects its 48-byte
+header and every record with CRC32C. Record format v2 reuses bytes 12..16 for
+the checksum, so the fixed record header remains 40 bytes and record sizes and
+logical LSN spacing do not grow. Both checksums cover the complete header or
+record with the checksum field treated as zero. A physically complete record
+whose checksum fails is corruption and is never truncated as a crash tail.
+
+The WAL header separates physical file offsets from logical LSNs: for a record
+at physical offset `P`,
 `LSN = base_lsn + (P - 48)`. A checkpoint chooses the old logical end as the
 new base, so LSNs never move backward even though physical WAL bytes are
 recycled and historical pageLSNs remain unchanged.

@@ -1,0 +1,37 @@
+[package]
+name = "netbadb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+netbadb-schema = { path = "../crates/netbadb-schema" }
+netbadb-storage = { path = "../crates/netbadb-storage" }
+netbadb-types = { path = "../crates/netbadb-types" }
+
+[[bin]]
+name = "wal_recovery"
+path = "fuzz_targets/wal_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[lints]
+workspace = true
+
+[workspace]
+members = ["."]
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"

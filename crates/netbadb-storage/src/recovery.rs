@@ -945,10 +945,7 @@ mod tests {
         drop(file);
         assert!(matches!(
             recover(&path),
-            Err(RecoveryError::Wal(WalError::InvalidPageImage {
-                image: "after",
-                ..
-            }))
+            Err(RecoveryError::Wal(WalError::RecordChecksumMismatch { .. }))
         ));
 
         cleanup(&path);

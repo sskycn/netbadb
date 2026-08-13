@@ -322,31 +322,34 @@ The WAL file header is:
 
 ```text
 0..4    NBWL magic
-4..6    u16 WAL format version (2)
+4..6    u16 WAL format version (3)
 6..8    u16 header size (48)
 8..16   u64 generation ID (starts at 1)
 16..24  u64 base logical LSN (non-zero)
 24..32  u64 checkpoint LSN (zero means no prior checkpoint)
 32..40  u64 next transaction ID high-water mark (non-zero)
-40..48  reserved bytes (zero)
+40..44  u32 CRC32C (little-endian)
+44..48  reserved bytes (zero)
 ```
 
-WAL v1 is rejected explicitly; this experimental format has no migration
-framework. WAL remains version 2 and PageUpdate remains a pair of complete
-page images. Only the separately versioned data-page format changed to version
-3 for deleted-slot semantics; logical LSN and checkpoint generation encodings
-did not change.
+The header checksum covers all 48 bytes with bytes 40..44 treated as zero.
+Magic, version, header size, and reserved bytes are checked before CRC32C; only
+after checksum verification are generation, base LSN, checkpoint LSN, and the
+transaction high-water mark trusted. WAL versions 1 and 2 are rejected
+explicitly; this experimental format has no migration framework. PageUpdate
+remains a pair of complete page images. The separately versioned data-page
+format remains version 3.
 
 Every record has a 40-byte fixed header followed by a bounded payload:
 
 ```text
 0..4    WREC magic
-4..6    u16 record format version (1)
+4..6    u16 record format version (2)
 6       u8 record type (Begin=1, PageUpdate=2, Commit=3, Abort=4,
                         RollbackComplete=5)
 7       reserved byte (zero)
 8..12   u32 total record length
-12..16  u32 payload length
+12..16  u32 CRC32C (little-endian)
 16..24  u64 logical LSN
 24..32  u64 transaction ID
 32..40  u64 prevLSN (zero only for Begin)
@@ -356,10 +359,17 @@ Every record has a 40-byte fixed header followed by a bounded payload:
 `Begin`, `Commit`, `Abort`, and `RollbackComplete` have no payload.
 `PageUpdate` stores an explicit u64 page ID, one 4 KiB before-image, and one 4
 KiB after-image. Consequently, the maximum accepted record is 8,240 bytes. The
-scanner validates magic, versions, reserved bytes, lengths, truncation, stored
-LSN, transaction state, and the prevLSN chain before exposing a record. The
-format does not yet include a checksum; checksum selection remains an explicit
-future format decision.
+record type determines the only valid total length; there is no stored payload
+length. The CRC32C covers the complete header and payload with bytes 12..16
+treated as zero. The scanner first validates framing and bounded type-derived
+lengths without allocation, confirms the complete record physically exists,
+then verifies CRC32C before decoding LSN, transaction state, prevLSN, or page
+images. Record format version 1 is explicitly unsupported.
+
+A final record whose physical bytes end before its validated total length may
+be truncated during recovery after its available prefix passes structural
+validation. A complete record with a checksum mismatch is corruption, even at
+EOF, and is never converted into a crash-tail truncation.
 
 The write ordering invariant is:
 
