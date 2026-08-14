@@ -313,15 +313,25 @@ join, sort avoidance, and uniqueness enforcement remain advanced work.
 - SessionState response-row policy before wire-message expansion;
 - standard-library atomic runtime metrics with read-only snapshots.
 
-### Phase 5C2 — Secure remote transport (next)
+### Phase 5C2a — Secure remote transport (complete)
 
-- authentication and authorization;
-- TLS;
-- authenticated client identity and secure non-loopback listening.
+- mandatory mutual TLS with runtime-generated certificate integration tests;
+- verified client leaf-certificate SHA-256 identity;
+- secure non-loopback listening with loopback plaintext retained for local
+  development;
+- TLS handshake admission, timeouts, shutdown, and runtime metrics before
+  worker session creation.
 
-Protocol v1 has no authentication payload. Remote identity and transport
-security require an explicit protocol and threat-model design rather than
-adding secrets to the existing Hello message.
+Protocol v1 has no authentication payload and remains byte-for-byte unchanged;
+TLS establishes identity before Hello.
+
+### Phase 5C2b — Per-client authorization (next)
+
+- per-client authorization policy;
+- table and operation scopes;
+- authorization preflight before execution.
+
+All clients trusted by the configured CA currently have equal capabilities.
 
 ## Phase 6 — SDK and tooling
 

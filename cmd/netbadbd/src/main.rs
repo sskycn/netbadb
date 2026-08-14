@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use netbadb_server::{ServerConfig, TcpServer};
 
 const HELP: &str =
-    "Usage: netbadbd --manifest <path>\n\nStarts the loopback-only NetbaDB TCP server.";
+    "Usage: netbadbd --manifest <path>\n\nStarts the manifest-configured NetbaDB TCP server.";
 
 fn main() -> ExitCode {
     match parse_args(env::args_os().skip(1)) {
@@ -39,10 +39,11 @@ fn run_server(manifest: PathBuf) -> Result<(), Box<dyn Error>> {
     let max_connections = config.limits().max_connections();
     let server = TcpServer::new(config).start()?;
     eprintln!(
-        "netbadbd listening on {} with {} table(s), max {} connections",
+        "netbadbd listening on {} with {} table(s), max {} connections, transport {}",
         server.local_addr(),
         server.table_count(),
-        max_connections
+        max_connections,
+        server.transport_kind()
     );
     server.wait()?;
     Ok(())

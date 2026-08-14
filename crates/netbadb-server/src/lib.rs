@@ -4,6 +4,7 @@ mod limits;
 mod manifest;
 mod metrics;
 mod runtime;
+mod tls;
 
 use std::error::Error;
 use std::fmt;
@@ -25,6 +26,7 @@ pub use limits::{
 pub use manifest::{ManifestError, ServerConfig, TableBootstrap};
 pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
+pub use tls::{AuthenticatedClientIdentity, ClientIdentity, TlsConfigError, TransportKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseBatch {

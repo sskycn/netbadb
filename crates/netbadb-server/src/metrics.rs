@@ -17,6 +17,9 @@ pub struct ServerMetricsSnapshot {
     pub query_response_limit_errors_total: u64,
     pub idle_timeouts_total: u64,
     pub write_failures_total: u64,
+    pub tls_handshakes_total: u64,
+    pub tls_handshake_failures_total: u64,
+    pub authenticated_connections_total: u64,
 }
 
 /// Cloneable, read-only access to a running server's operational metrics.
@@ -71,6 +74,18 @@ impl ServerMetricsHandle {
     pub(crate) fn write_failure(&self) {
         saturating_increment(&self.inner.write_failures_total);
     }
+
+    pub(crate) fn tls_handshake(&self) {
+        saturating_increment(&self.inner.tls_handshakes_total);
+    }
+
+    pub(crate) fn tls_handshake_failure(&self) {
+        saturating_increment(&self.inner.tls_handshake_failures_total);
+    }
+
+    pub(crate) fn authenticated_connection(&self) {
+        saturating_increment(&self.inner.authenticated_connections_total);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +99,9 @@ struct ServerMetrics {
     query_response_limit_errors_total: AtomicU64,
     idle_timeouts_total: AtomicU64,
     write_failures_total: AtomicU64,
+    tls_handshakes_total: AtomicU64,
+    tls_handshake_failures_total: AtomicU64,
+    authenticated_connections_total: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -100,6 +118,11 @@ impl ServerMetrics {
                 .load(Ordering::Relaxed),
             idle_timeouts_total: self.idle_timeouts_total.load(Ordering::Relaxed),
             write_failures_total: self.write_failures_total.load(Ordering::Relaxed),
+            tls_handshakes_total: self.tls_handshakes_total.load(Ordering::Relaxed),
+            tls_handshake_failures_total: self.tls_handshake_failures_total.load(Ordering::Relaxed),
+            authenticated_connections_total: self
+                .authenticated_connections_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -130,6 +153,9 @@ mod tests {
         metrics.query_response_limit_error();
         metrics.idle_timeout();
         metrics.write_failure();
+        metrics.tls_handshake();
+        metrics.tls_handshake_failure();
+        metrics.authenticated_connection();
         metrics.rejected();
         metrics.closed();
         assert_eq!(
@@ -144,6 +170,9 @@ mod tests {
                 query_response_limit_errors_total: 1,
                 idle_timeouts_total: 1,
                 write_failures_total: 1,
+                tls_handshakes_total: 1,
+                tls_handshake_failures_total: 1,
+                authenticated_connections_total: 1,
             }
         );
     }

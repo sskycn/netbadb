@@ -8,12 +8,14 @@ use netbadb_schema::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 use serde::Deserialize;
 
+use crate::tls::{MutualTlsConfig, TlsMaterialPaths, TransportSecurity};
 use crate::{
     DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
     ServerLimits, ServerLimitsError,
 };
+use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 2;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 3;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -28,6 +30,7 @@ pub struct ServerConfig {
     listen: SocketAddr,
     tables: Vec<TableBootstrap>,
     limits: ServerLimits,
+    tls: Option<MutualTlsConfig>,
 }
 
 impl ServerConfig {
@@ -52,7 +55,6 @@ impl ServerConfig {
                 .map_err(|source| ManifestError::InvalidListen { value, source })?,
             None => DEFAULT_LISTEN_ADDRESS,
         };
-        validate_loopback(listen)?;
         let limits = manifest
             .limits
             .map_or_else(|| Ok(ServerLimits::default()), ManifestLimits::into_limits)
@@ -67,6 +69,14 @@ impl ServerConfig {
                 path: path.to_path_buf(),
                 source,
             })?;
+        let tls = manifest
+            .tls
+            .map(|tls| {
+                let paths = tls.resolve(&manifest_directory)?;
+                MutualTlsConfig::load(paths).map_err(ManifestError::TlsConfiguration)
+            })
+            .transpose()?;
+        validate_listener_security(listen, tls.is_some())?;
         let mut tables = Vec::with_capacity(manifest.tables.len());
         let mut paths = HashSet::with_capacity(manifest.tables.len());
         for table in manifest.tables {
@@ -114,6 +124,7 @@ impl ServerConfig {
             listen,
             tables,
             limits,
+            tls,
         })
     }
 
@@ -132,16 +143,40 @@ impl ServerConfig {
         self.limits
     }
 
-    pub(crate) fn into_parts(self) -> (SocketAddr, Vec<TableBootstrap>, ServerLimits) {
-        (self.listen, self.tables, self.limits)
+    #[must_use]
+    pub const fn transport_kind(&self) -> TransportKind {
+        if self.tls.is_some() {
+            TransportKind::MutualTls
+        } else {
+            TransportKind::PlaintextLoopback
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SocketAddr,
+        Vec<TableBootstrap>,
+        ServerLimits,
+        TransportSecurity,
+    ) {
+        let security = self
+            .tls
+            .map_or(TransportSecurity::PlaintextLoopback, |tls| {
+                tls.into_transport()
+            });
+        (self.listen, self.tables, self.limits, security)
     }
 }
 
-pub(crate) fn validate_loopback(address: SocketAddr) -> Result<(), ManifestError> {
-    if address.ip().is_loopback() {
+pub(crate) fn validate_listener_security(
+    address: SocketAddr,
+    mutual_tls: bool,
+) -> Result<(), ManifestError> {
+    if address.ip().is_loopback() || mutual_tls {
         Ok(())
     } else {
-        Err(ManifestError::RemoteListenRequiresNetworkHardening(address))
+        Err(ManifestError::RemoteListenRequiresMutualTls(address))
     }
 }
 
@@ -158,7 +193,7 @@ pub enum ManifestError {
         value: String,
         source: AddrParseError,
     },
-    RemoteListenRequiresNetworkHardening(SocketAddr),
+    RemoteListenRequiresMutualTls(SocketAddr),
     ManifestDirectory {
         path: PathBuf,
         source: std::io::Error,
@@ -170,6 +205,16 @@ pub enum ManifestError {
     TablePathIsNotFile(PathBuf),
     DuplicateStoragePath(PathBuf),
     Limits(ServerLimitsError),
+    TlsPath {
+        field: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    TlsPathIsNotFile {
+        field: &'static str,
+        path: PathBuf,
+    },
+    TlsConfiguration(TlsConfigError),
     Schema(SchemaError),
 }
 
@@ -194,9 +239,9 @@ impl fmt::Display for ManifestError {
             Self::InvalidListen { value, .. } => {
                 write!(formatter, "invalid TCP listen address `{value}`")
             }
-            Self::RemoteListenRequiresNetworkHardening(address) => write!(
+            Self::RemoteListenRequiresMutualTls(address) => write!(
                 formatter,
-                "unauthenticated Phase 5B server only allows loopback addresses; `{address}` requires network hardening"
+                "non-loopback listener `{address}` requires mutual TLS"
             ),
             Self::ManifestDirectory { path, source } => write!(
                 formatter,
@@ -217,6 +262,21 @@ impl fmt::Display for ManifestError {
                 path.display()
             ),
             Self::Limits(error) => error.fmt(formatter),
+            Self::TlsPath {
+                field,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "failed to resolve TLS field `{field}` path `{}`: {source}",
+                path.display()
+            ),
+            Self::TlsPathIsNotFile { field, path } => write!(
+                formatter,
+                "TLS field `{field}` path `{}` is not a file",
+                path.display()
+            ),
+            Self::TlsConfiguration(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
         }
     }
@@ -227,16 +287,19 @@ impl Error for ManifestError {
         match self {
             Self::Read { source, .. }
             | Self::ManifestDirectory { source, .. }
-            | Self::TablePath { source, .. } => Some(source),
+            | Self::TablePath { source, .. }
+            | Self::TlsPath { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             Self::InvalidListen { source, .. } => Some(source),
             Self::Limits(error) => Some(error),
+            Self::TlsConfiguration(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::UnsupportedVersion(_)
             | Self::EmptyTables
-            | Self::RemoteListenRequiresNetworkHardening(_)
+            | Self::RemoteListenRequiresMutualTls(_)
             | Self::TablePathIsNotFile(_)
-            | Self::DuplicateStoragePath(_) => None,
+            | Self::DuplicateStoragePath(_)
+            | Self::TlsPathIsNotFile { .. } => None,
         }
     }
 }
@@ -247,7 +310,66 @@ struct DeploymentManifest {
     version: u32,
     listen: Option<String>,
     limits: Option<ManifestLimits>,
+    tls: Option<ManifestTls>,
     tables: Vec<ManifestTable>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestTls {
+    server_certificate: String,
+    server_private_key: String,
+    client_ca: String,
+}
+
+impl ManifestTls {
+    fn resolve(self, manifest_directory: &Path) -> Result<TlsMaterialPaths, ManifestError> {
+        Ok(TlsMaterialPaths {
+            server_certificate: resolve_tls_path(
+                manifest_directory,
+                "server_certificate",
+                self.server_certificate,
+            )?,
+            server_private_key: resolve_tls_path(
+                manifest_directory,
+                "server_private_key",
+                self.server_private_key,
+            )?,
+            client_ca: resolve_tls_path(manifest_directory, "client_ca", self.client_ca)?,
+        })
+    }
+}
+
+fn resolve_tls_path(
+    manifest_directory: &Path,
+    field: &'static str,
+    configured: String,
+) -> Result<PathBuf, ManifestError> {
+    let configured = PathBuf::from(configured);
+    let resolved = if configured.is_absolute() {
+        configured
+    } else {
+        manifest_directory.join(configured)
+    };
+    let resolved = resolved
+        .canonicalize()
+        .map_err(|source| ManifestError::TlsPath {
+            field,
+            path: resolved,
+            source,
+        })?;
+    let metadata = std::fs::metadata(&resolved).map_err(|source| ManifestError::TlsPath {
+        field,
+        path: resolved.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ManifestError::TlsPathIsNotFile {
+            field,
+            path: resolved,
+        });
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,7 +494,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 2,
+                "version": 3,
                 {listen}
                 "tables": [{{
                     "path": "{path}",
@@ -432,13 +554,13 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        std::fs::write(&manifest, r#"{"version":1,"tables":[]}"#).unwrap();
+        std::fs::write(&manifest, r#"{"version":2,"tables":[]}"#).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::UnsupportedVersion(1))
+            Err(ManifestError::UnsupportedVersion(2))
         ));
 
-        std::fs::write(&manifest, r#"{"version":2,"unexpected":true,"tables":[]}"#).unwrap();
+        std::fs::write(&manifest, r#"{"version":3,"unexpected":true,"tables":[]}"#).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
             Err(ManifestError::Json(_))
@@ -451,7 +573,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::RemoteListenRequiresNetworkHardening(_))
+            Err(ManifestError::RemoteListenRequiresMutualTls(_))
         ));
 
         std::fs::write(

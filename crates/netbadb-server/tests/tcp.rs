@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use netbadb_core::Database;
@@ -9,9 +10,15 @@ use netbadb_protocol::{
     encode_client_frame, read_server_frame, write_client_frame,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_server::{ServerConfig, ServerHandle, TcpServer, TcpServerError};
+use netbadb_server::{ServerConfig, ServerHandle, TcpServer, TcpServerError, TransportKind};
 use netbadb_storage::{wal_alternate_path, wal_path};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 fn test_directory(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("netbadb-tcp-{name}-{}", std::process::id()))
@@ -46,12 +53,23 @@ fn manifest_json(heap_name: &str, semantic_name: &str) -> String {
 }
 
 fn manifest_json_with_limits(heap_name: &str, semantic_name: &str, limits: Option<&str>) -> String {
+    manifest_json_with_transport(heap_name, semantic_name, limits, None)
+}
+
+fn manifest_json_with_transport(
+    heap_name: &str,
+    semantic_name: &str,
+    limits: Option<&str>,
+    tls: Option<&str>,
+) -> String {
     let limits = limits.map_or_else(String::new, |limits| format!("\"limits\": {limits},"));
+    let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 2,
+            "version": 3,
             "listen": "127.0.0.1:0",
             {limits}
+            {tls}
             "tables": [{{
                 "path": "{heap_name}",
                 "id": 1,
@@ -107,6 +125,146 @@ fn create_manifest_server_with_limits(
     (directory, heap, table, server)
 }
 
+struct TestIdentity {
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+}
+
+struct TestPki {
+    ca_certificate: Certificate,
+    server_certificate: Certificate,
+    server_private_key: KeyPair,
+    valid_client: TestIdentity,
+    untrusted_client: TestIdentity,
+}
+
+impl TestPki {
+    fn generate() -> Self {
+        let (ca_certificate, ca_private_key) = generate_ca();
+        let (server_certificate, server_private_key) =
+            generate_leaf(&ca_certificate, &ca_private_key, true);
+        let (valid_client_certificate, valid_client_private_key) =
+            generate_leaf(&ca_certificate, &ca_private_key, false);
+        let (untrusted_ca, untrusted_ca_key) = generate_ca();
+        let (untrusted_client_certificate, untrusted_client_private_key) =
+            generate_leaf(&untrusted_ca, &untrusted_ca_key, false);
+        Self {
+            ca_certificate,
+            server_certificate,
+            server_private_key,
+            valid_client: TestIdentity {
+                certificate: valid_client_certificate.der().to_vec(),
+                private_key: valid_client_private_key.serialize_der(),
+            },
+            untrusted_client: TestIdentity {
+                certificate: untrusted_client_certificate.der().to_vec(),
+                private_key: untrusted_client_private_key.serialize_der(),
+            },
+        }
+    }
+
+    fn write_server_material(&self, directory: &Path) -> String {
+        std::fs::write(directory.join("server.pem"), self.server_certificate.pem()).unwrap();
+        std::fs::write(
+            directory.join("server-key.pem"),
+            self.server_private_key.serialize_pem(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("client-ca.pem"), self.ca_certificate.pem()).unwrap();
+        r#"{
+            "server_certificate": "server.pem",
+            "server_private_key": "server-key.pem",
+            "client_ca": "client-ca.pem"
+        }"#
+        .into()
+    }
+
+    fn client_config(&self, identity: Option<&TestIdentity>) -> Arc<ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(self.ca_certificate.der().to_vec()))
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots);
+        let config = match identity {
+            Some(identity) => builder
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(identity.certificate.clone())],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone())),
+                )
+                .unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+        Arc::new(config)
+    }
+}
+
+fn generate_ca() -> (Certificate, KeyPair) {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let certificate = params.self_signed(&key).unwrap();
+    (certificate, key)
+}
+
+fn generate_leaf(
+    issuer: &Certificate,
+    issuer_key: &KeyPair,
+    server: bool,
+) -> (Certificate, KeyPair) {
+    let key = KeyPair::generate().unwrap();
+    let names = if server {
+        vec!["localhost".into(), "127.0.0.1".into()]
+    } else {
+        Vec::new()
+    };
+    let mut params = CertificateParams::new(names).unwrap();
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![if server {
+        ExtendedKeyUsagePurpose::ServerAuth
+    } else {
+        ExtendedKeyUsagePurpose::ClientAuth
+    }];
+    let certificate = params.signed_by(&key, issuer, issuer_key).unwrap();
+    (certificate, key)
+}
+
+fn create_manifest_tls_server_with_limits(
+    name: &str,
+    limits: Option<&str>,
+) -> (PathBuf, PathBuf, TableDef, TestPki, ServerHandle) {
+    let directory = test_directory(name);
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let heap = directory.join("users.ndb");
+    let table = users_table("UserId");
+    Database::create(&heap, table.clone())
+        .unwrap()
+        .close()
+        .unwrap();
+    let pki = TestPki::generate();
+    let tls = pki.write_server_material(&directory);
+    let manifest = directory.join("server.json");
+    std::fs::write(
+        &manifest,
+        manifest_json_with_transport("users.ndb", "UserId", limits, Some(&tls)),
+    )
+    .unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    assert_eq!(config.transport_kind(), TransportKind::MutualTls);
+    let server = TcpServer::new(config).start().unwrap();
+    assert_eq!(server.transport_kind(), TransportKind::MutualTls);
+    (directory, heap, table, pki, server)
+}
+
 fn wait_for_metrics(
     metrics: &netbadb_server::ServerMetricsHandle,
     predicate: impl Fn(netbadb_server::ServerMetricsSnapshot) -> bool,
@@ -137,35 +295,7 @@ impl Client {
     }
 
     fn request(&mut self, request_id: u64, message: ClientMessage) -> Vec<ServerMessage> {
-        write_client_frame(
-            &mut self.stream,
-            &Frame {
-                request_id,
-                message,
-            },
-        )
-        .unwrap();
-        self.stream.flush().unwrap();
-
-        let first = read_server_frame(&mut self.stream).unwrap().unwrap();
-        assert_eq!(first.request_id, request_id);
-        let is_query = matches!(first.message, ServerMessage::QueryStart { .. });
-        let mut messages = vec![first.message];
-        if is_query {
-            loop {
-                let frame = read_server_frame(&mut self.stream).unwrap().unwrap();
-                assert_eq!(frame.request_id, request_id);
-                let terminal = matches!(
-                    frame.message,
-                    ServerMessage::QueryEnd { .. } | ServerMessage::Error { .. }
-                );
-                messages.push(frame.message);
-                if terminal {
-                    break;
-                }
-            }
-        }
-        messages
+        request(&mut self.stream, request_id, message)
     }
 
     fn hello(&mut self) -> Vec<ServerMessage> {
@@ -176,6 +306,82 @@ impl Client {
         self.stream.shutdown(Shutdown::Write).unwrap();
         assert!(read_server_frame(&mut self.stream).unwrap().is_none());
     }
+}
+
+struct TlsClient {
+    stream: StreamOwned<ClientConnection, TcpStream>,
+}
+
+impl TlsClient {
+    fn connect(address: SocketAddr, config: Arc<ClientConfig>) -> std::io::Result<Self> {
+        let mut socket = TcpStream::connect(address)?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let mut connection = ClientConnection::new(config, server_name)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        while connection.is_handshaking() {
+            connection.complete_io(&mut socket)?;
+        }
+        Ok(Self {
+            stream: StreamOwned::new(connection, socket),
+        })
+    }
+
+    fn request(&mut self, request_id: u64, message: ClientMessage) -> Vec<ServerMessage> {
+        request(&mut self.stream, request_id, message)
+    }
+
+    fn hello(&mut self) -> Vec<ServerMessage> {
+        self.request(1, ClientMessage::Hello)
+    }
+
+    fn close_clean(mut self) {
+        self.stream.conn.send_close_notify();
+        self.stream.flush().unwrap();
+        self.stream.get_ref().shutdown(Shutdown::Write).unwrap();
+        assert!(read_server_frame(&mut self.stream).unwrap().is_none());
+    }
+
+    fn disconnect(self) {
+        self.stream.get_ref().shutdown(Shutdown::Both).unwrap();
+    }
+}
+
+fn request(
+    stream: &mut (impl Read + Write),
+    request_id: u64,
+    message: ClientMessage,
+) -> Vec<ServerMessage> {
+    write_client_frame(
+        &mut *stream,
+        &Frame {
+            request_id,
+            message,
+        },
+    )
+    .unwrap();
+    stream.flush().unwrap();
+
+    let first = read_server_frame(&mut *stream).unwrap().unwrap();
+    assert_eq!(first.request_id, request_id);
+    let is_query = matches!(first.message, ServerMessage::QueryStart { .. });
+    let mut messages = vec![first.message];
+    if is_query {
+        loop {
+            let frame = read_server_frame(&mut *stream).unwrap().unwrap();
+            assert_eq!(frame.request_id, request_id);
+            let terminal = matches!(
+                frame.message,
+                ServerMessage::QueryEnd { .. } | ServerMessage::Error { .. }
+            );
+            messages.push(frame.message);
+            if terminal {
+                break;
+            }
+        }
+    }
+    messages
 }
 
 fn assert_error(messages: &[ServerMessage], code: ProtocolErrorCode, state: WireTransactionState) {
@@ -392,6 +598,301 @@ fn assert_connection_closes(mut stream: TcpStream) {
         .unwrap();
     let mut byte = [0_u8; 1];
     assert_eq!(stream.read(&mut byte).unwrap(), 0);
+}
+
+fn assert_tls_handshake_rejected(address: SocketAddr, config: Arc<ClientConfig>) {
+    match TlsClient::connect(address, config) {
+        Err(_) => {}
+        Ok(mut client) => {
+            let mut byte = [0_u8; 1];
+            assert!(matches!(client.stream.read(&mut byte), Ok(0) | Err(_)));
+        }
+    }
+}
+
+#[test]
+fn manifest_v3_validates_tls_material_and_allows_secure_remote_configuration() {
+    let directory = test_directory("tls-manifest");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let heap = directory.join("users.ndb");
+    Database::create(&heap, users_table("UserId"))
+        .unwrap()
+        .close()
+        .unwrap();
+    let pki = TestPki::generate();
+    let tls = pki.write_server_material(&directory);
+    let manifest = directory.join("server.json");
+
+    let secure_remote = manifest_json_with_transport("users.ndb", "UserId", None, Some(&tls))
+        .replace("127.0.0.1:0", "192.0.2.1:7878");
+    std::fs::write(&manifest, secure_remote).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    assert_eq!(config.transport_kind(), TransportKind::MutualTls);
+
+    let missing_field = manifest_json_with_transport(
+        "users.ndb",
+        "UserId",
+        None,
+        Some(
+            r#"{
+                "server_certificate": "server.pem",
+                "server_private_key": "server-key.pem"
+            }"#,
+        ),
+    );
+    std::fs::write(&manifest, missing_field).unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+
+    let unknown_field = tls.replace("\"client_ca\"", "\"allow_anonymous\": true, \"client_ca\"");
+    std::fs::write(
+        &manifest,
+        manifest_json_with_transport("users.ndb", "UserId", None, Some(&unknown_field)),
+    )
+    .unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+
+    std::fs::write(directory.join("server.pem"), "").unwrap();
+    std::fs::write(
+        &manifest,
+        manifest_json_with_transport("users.ndb", "UserId", None, Some(&tls)),
+    )
+    .unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+    std::fs::write(directory.join("server.pem"), pki.server_certificate.pem()).unwrap();
+
+    std::fs::write(directory.join("server-key.pem"), "not a private key").unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+
+    let unrelated_key = KeyPair::generate().unwrap();
+    std::fs::write(
+        directory.join("server-key.pem"),
+        unrelated_key.serialize_pem(),
+    )
+    .unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+    std::fs::write(
+        directory.join("server-key.pem"),
+        format!(
+            "{}{}",
+            pki.server_private_key.serialize_pem(),
+            unrelated_key.serialize_pem()
+        ),
+    )
+    .unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+    std::fs::write(
+        directory.join("server-key.pem"),
+        pki.server_private_key.serialize_pem(),
+    )
+    .unwrap();
+
+    std::fs::write(directory.join("client-ca.pem"), "").unwrap();
+    assert!(ServerConfig::from_manifest_path(&manifest).is_err());
+    cleanup(&directory);
+}
+
+#[test]
+fn mutual_tls_serves_protocol_and_preserves_result_policy() {
+    let limits = r#"{
+        "max_result_rows": 2,
+        "idle_timeout_ms": 5000,
+        "write_timeout_ms": 5000
+    }"#;
+    let (directory, _heap, table, pki, server) =
+        create_manifest_tls_server_with_limits("tls-vertical", Some(limits));
+    let metrics = server.metrics_handle();
+    let mut client = TlsClient::connect(
+        server.local_addr(),
+        pki.client_config(Some(&pki.valid_client)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        client.hello().as_slice(),
+        [ServerMessage::HelloAck { tables, .. }]
+            if tables.len() == 1
+                && tables[0].table_id == table.id
+                && tables[0].fingerprint == *table.fingerprint().unwrap().as_bytes()
+    ));
+    assert_eq!(
+        client.request(2, ClientMessage::Ping),
+        vec![ServerMessage::Pong]
+    );
+    for id in 1..=3 {
+        assert_eq!(
+            client.request(
+                id + 2,
+                ClientMessage::Execute {
+                    sql: format!("INSERT INTO users (id, name) VALUES ({id}, 'tls')"),
+                },
+            ),
+            vec![ServerMessage::AffectedRows { count: 1 }]
+        );
+    }
+    let limited = client.request(
+        6,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users ORDER BY id".into(),
+        },
+    );
+    assert_error(
+        &limited,
+        ProtocolErrorCode::ResponseTooLarge,
+        WireTransactionState::None,
+    );
+    assert_eq!(
+        client.request(7, ClientMessage::Ping),
+        vec![ServerMessage::Pong]
+    );
+    client.close_clean();
+
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    assert_eq!(snapshot.tls_handshakes_total, 1);
+    assert_eq!(snapshot.tls_handshake_failures_total, 0);
+    assert_eq!(snapshot.authenticated_connections_total, 1);
+    assert_eq!(snapshot.query_response_limit_errors_total, 1);
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn mutual_tls_rejects_unauthenticated_untrusted_and_plaintext_clients() {
+    let (directory, _heap, _table, pki, server) =
+        create_manifest_tls_server_with_limits("tls-auth-failures", None);
+    let address = server.local_addr();
+    let metrics = server.metrics_handle();
+
+    assert_tls_handshake_rejected(address, pki.client_config(None));
+    assert_tls_handshake_rejected(address, pki.client_config(Some(&pki.untrusted_client)));
+
+    let mut plaintext = TcpStream::connect(address).unwrap();
+    plaintext
+        .write_all(&encode_client_frame(1, &ClientMessage::Hello).unwrap())
+        .unwrap();
+    plaintext.shutdown(Shutdown::Write).unwrap();
+    plaintext
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = plaintext.read_to_end(&mut response);
+    if let Ok(Some(frame)) = read_server_frame(&mut response.as_slice()) {
+        assert!(!matches!(frame.message, ServerMessage::Error { .. }));
+    }
+
+    let failures = wait_for_metrics(&metrics, |snapshot| {
+        snapshot.tls_handshake_failures_total == 3 && snapshot.active_connections == 0
+    });
+    assert_eq!(failures.tls_handshakes_total, 0);
+    assert_eq!(failures.authenticated_connections_total, 0);
+    assert_eq!(failures.protocol_failures_total, 0);
+
+    let mut healthy =
+        TlsClient::connect(address, pki.client_config(Some(&pki.valid_client))).unwrap();
+    healthy.hello();
+    assert_eq!(
+        healthy.request(2, ClientMessage::Ping),
+        vec![ServerMessage::Pong]
+    );
+    healthy.close_clean();
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    assert_eq!(snapshot.tls_handshakes_total, 1);
+    assert_eq!(snapshot.tls_handshake_failures_total, 3);
+    assert_eq!(snapshot.authenticated_connections_total, 1);
+
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn mutual_tls_disconnect_rolls_back_active_transaction() {
+    let (directory, _heap, _table, pki, server) =
+        create_manifest_tls_server_with_limits("tls-rollback", None);
+    let config = pki.client_config(Some(&pki.valid_client));
+    let mut writer = TlsClient::connect(server.local_addr(), Arc::clone(&config)).unwrap();
+    writer.hello();
+    writer.request(
+        2,
+        ClientMessage::Begin {
+            table_id: TableId(1),
+        },
+    );
+    writer.request(
+        3,
+        ClientMessage::Execute {
+            sql: "INSERT INTO users (id, name) VALUES (9, 'rollback')".into(),
+        },
+    );
+    writer.disconnect();
+
+    let metrics = server.metrics_handle();
+    wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    let mut reader = TlsClient::connect(server.local_addr(), config).unwrap();
+    reader.hello();
+    assert!(matches!(
+        reader
+            .request(
+                2,
+                ClientMessage::Execute {
+                    sql: "SELECT id FROM users".into(),
+                },
+            )
+            .as_slice(),
+        [
+            ServerMessage::QueryStart { .. },
+            ServerMessage::QueryEnd { row_count: 0 }
+        ]
+    ));
+    reader.close_clean();
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn tls_handshake_timeout_connection_cap_and_shutdown_are_bounded() {
+    let limits = r#"{
+        "max_connections": 2,
+        "idle_timeout_ms": 5000,
+        "write_timeout_ms": 5000
+    }"#;
+    let (directory, _heap, _table, _pki, server) =
+        create_manifest_tls_server_with_limits("tls-cap-shutdown", Some(limits));
+    let address = server.local_addr();
+    let metrics = server.metrics_handle();
+    let pending_a = TcpStream::connect(address).unwrap();
+    let pending_b = TcpStream::connect(address).unwrap();
+    wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 2);
+    assert_connection_closes(TcpStream::connect(address).unwrap());
+    assert_eq!(
+        wait_for_metrics(&metrics, |snapshot| snapshot.rejected_connections_total
+            == 1)
+        .accepted_connections_total,
+        2
+    );
+
+    let started = Instant::now();
+    server.shutdown().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(metrics.snapshot().active_connections, 0);
+    drop(pending_a);
+    drop(pending_b);
+    cleanup(&directory);
+
+    let timeout_limits = r#"{
+        "max_connections": 1,
+        "idle_timeout_ms": 200,
+        "write_timeout_ms": 5000
+    }"#;
+    let (directory, _heap, _table, _pki, server) =
+        create_manifest_tls_server_with_limits("tls-timeout", Some(timeout_limits));
+    let metrics = server.metrics_handle();
+    assert_connection_closes(TcpStream::connect(server.local_addr()).unwrap());
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    assert_eq!(snapshot.tls_handshake_failures_total, 1);
+    assert_eq!(snapshot.idle_timeouts_total, 1);
+    assert_eq!(snapshot.authenticated_connections_total, 0);
+    server.shutdown().unwrap();
+    cleanup(&directory);
 }
 
 #[test]

@@ -10,11 +10,15 @@ netbadb-core = { path = "../netbadb-core" }
 netbadb-protocol = { path = "../netbadb-protocol" }
 netbadb-schema = { path = "../netbadb-schema" }
 netbadb-types = { path = "../netbadb-types" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 netbadb-storage = { path = "../netbadb-storage" }
+rcgen = "0.13.2"
 
 [lints]
 workspace = true

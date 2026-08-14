@@ -1,6 +1,9 @@
 # NetbaDB deployment manifest v2
 
-Deployment manifest v2 is the current human-readable startup configuration for
+> Historical experimental format. Current `netbadbd` requires
+> [deployment manifest v3](server-manifest-v3.md); v2 is rejected explicitly.
+
+Deployment manifest v2 was the human-readable startup configuration for
 `netbadbd`. It is not a database file format, protocol payload, or canonical
 schema encoding. JSON field order and whitespace never participate in
 `SchemaFingerprint`; decoded values construct ordinary validated `TableDef`

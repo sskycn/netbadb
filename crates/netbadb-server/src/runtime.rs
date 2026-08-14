@@ -12,10 +12,11 @@ use netbadb_protocol::{
     ClientMessage, Frame, ProtocolError, read_client_frame, write_server_frame,
 };
 
-use crate::manifest::validate_loopback;
+use crate::manifest::validate_listener_security;
+use crate::tls::{ConnectionStream, TlsHandshakeError, TransportSecurity};
 use crate::{
-    ManifestError, ServerConfig, ServerLimits, ServerMetricsHandle, SessionPolicy, SessionResponse,
-    SessionState, TableBootstrap,
+    ClientIdentity, ManifestError, ServerConfig, ServerLimits, ServerMetricsHandle, SessionPolicy,
+    SessionResponse, SessionState, TableBootstrap, TransportKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,9 +147,10 @@ impl TcpServer {
     }
 
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
-        let (listen, tables, limits) = self.config.into_parts();
-        validate_loopback(listen)?;
+        let (listen, tables, limits, security) = self.config.into_parts();
+        validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
+        let transport_kind = security.kind();
         let worker = DatabaseWorker::start(tables, limits.session_policy())?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -187,7 +189,14 @@ impl TcpServer {
                 let worker = worker_rx
                     .recv()
                     .map_err(|_| TcpServerError::WorkerStopped)?;
-                run_accept_loop(listener, shutdown_rx, worker, limits, server_metrics)
+                run_accept_loop(
+                    listener,
+                    shutdown_rx,
+                    worker,
+                    limits,
+                    security,
+                    server_metrics,
+                )
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -208,6 +217,7 @@ impl TcpServer {
         Ok(ServerHandle {
             local_addr,
             table_count,
+            transport_kind,
             metrics,
             shutdown_tx,
             join: Some(join),
@@ -222,6 +232,7 @@ impl TcpServer {
 pub struct ServerHandle {
     local_addr: SocketAddr,
     table_count: usize,
+    transport_kind: TransportKind,
     metrics: ServerMetricsHandle,
     shutdown_tx: Sender<()>,
     join: Option<JoinHandle<Result<(), TcpServerError>>>,
@@ -236,6 +247,11 @@ impl ServerHandle {
     #[must_use]
     pub fn table_count(&self) -> usize {
         self.table_count
+    }
+
+    #[must_use]
+    pub const fn transport_kind(&self) -> TransportKind {
+        self.transport_kind
     }
 
     #[must_use]
@@ -273,10 +289,18 @@ struct WorkerClient {
 }
 
 impl WorkerClient {
-    fn open_session(&self, session_id: SessionId) -> Result<(), WorkerRequestError> {
+    fn open_session(
+        &self,
+        session_id: SessionId,
+        identity: ClientIdentity,
+    ) -> Result<bool, WorkerRequestError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.commands
-            .send(WorkerCommand::OpenSession { session_id, reply })
+            .send(WorkerCommand::OpenSession {
+                session_id,
+                identity,
+                reply,
+            })
             .map_err(|_| WorkerRequestError::Stopped)?;
         response.recv().map_err(|_| WorkerRequestError::Stopped)?
     }
@@ -434,7 +458,8 @@ fn finish_startup_failure(worker: DatabaseWorker, startup: TcpServerError) -> Tc
 enum WorkerCommand {
     OpenSession {
         session_id: SessionId,
-        reply: SyncSender<Result<(), WorkerRequestError>>,
+        identity: ClientIdentity,
+        reply: SyncSender<Result<bool, WorkerRequestError>>,
     },
     Request {
         session_id: SessionId,
@@ -479,8 +504,26 @@ impl fmt::Display for WorkerRequestError {
 
 struct DatabaseWorkerState {
     database: Option<Database>,
-    sessions: HashMap<SessionId, SessionState>,
+    sessions: HashMap<SessionId, WorkerSession>,
     session_policy: SessionPolicy,
+}
+
+struct WorkerSession {
+    state: SessionState,
+    identity: ClientIdentity,
+}
+
+impl WorkerSession {
+    fn new(policy: SessionPolicy, identity: ClientIdentity) -> Self {
+        Self {
+            state: SessionState::with_policy(policy),
+            identity,
+        }
+    }
+
+    fn is_authenticated(&self) -> bool {
+        self.identity.is_authenticated()
+    }
 }
 
 impl DatabaseWorkerState {
@@ -500,6 +543,7 @@ impl DatabaseWorkerState {
             }
         })?;
         session
+            .state
             .close()
             .map_err(|error| WorkerFatalError::SessionCloseFailed {
                 session_id,
@@ -537,15 +581,19 @@ fn run_database_worker(
     let mut state = DatabaseWorkerState::new(database, session_policy);
     while let Ok(command) = commands.recv() {
         match command {
-            WorkerCommand::OpenSession { session_id, reply } => {
+            WorkerCommand::OpenSession {
+                session_id,
+                identity,
+                reply,
+            } => {
                 if state.sessions.contains_key(&session_id) {
                     let _ = reply.send(Err(WorkerRequestError::DuplicateSession(session_id)));
                     continue;
                 }
-                state
-                    .sessions
-                    .insert(session_id, SessionState::with_policy(state.session_policy));
-                if reply.send(Ok(())).is_err() {
+                let session = WorkerSession::new(state.session_policy, identity);
+                let authenticated = session.is_authenticated();
+                state.sessions.insert(session_id, session);
+                if reply.send(Ok(authenticated)).is_err() {
                     if let Err(error) = state.close_session(session_id) {
                         let _ = events.send(error.clone());
                         return Err(error);
@@ -570,7 +618,9 @@ fn run_database_worker(
                     return Err(error);
                 };
                 let response =
-                    session.handle_with_metadata(database, frame.request_id, frame.message);
+                    session
+                        .state
+                        .handle_with_metadata(database, frame.request_id, frame.message);
                 let _ = reply.send(Ok(response));
             }
             WorkerCommand::CloseSession { session_id, reply } => {
@@ -617,6 +667,7 @@ fn run_accept_loop(
     shutdown: Receiver<()>,
     worker: DatabaseWorker,
     limits: ServerLimits,
+    security: TransportSecurity,
     metrics: ServerMetricsHandle,
 ) -> Result<(), TcpServerError> {
     let client = worker.client();
@@ -665,6 +716,7 @@ fn run_accept_loop(
                     session_id,
                     &client,
                     limits,
+                    security.clone(),
                     &metrics,
                     &mut connections,
                 ) {
@@ -728,31 +780,30 @@ fn register_connection(
     session_id: SessionId,
     worker: &WorkerClient,
     limits: ServerLimits,
+    security: TransportSecurity,
     metrics: &ServerMetricsHandle,
     connections: &mut Vec<ConnectionThread>,
 ) -> Result<(), ConnectionError> {
     configure_connection_stream(&stream, limits).map_err(ConnectionError::Configure)?;
-    worker
-        .open_session(session_id)
-        .map_err(ConnectionError::Worker)?;
     let control = match stream.try_clone() {
         Ok(control) => control,
-        Err(error) => {
-            let _ = worker.close_session(session_id);
-            return Err(ConnectionError::Configure(error));
-        }
+        Err(error) => return Err(ConnectionError::Configure(error)),
     };
     let connection_worker = worker.clone();
     let connection_metrics = metrics.clone();
     let join = match thread::Builder::new()
         .name(format!("netbadb-connection-{}", session_id.get()))
-        .spawn(move || run_connection(stream, session_id, connection_worker, connection_metrics))
-    {
+        .spawn(move || {
+            run_connection(
+                stream,
+                session_id,
+                connection_worker,
+                security,
+                connection_metrics,
+            )
+        }) {
         Ok(join) => join,
-        Err(error) => {
-            let _ = worker.close_session(session_id);
-            return Err(ConnectionError::Spawn(error));
-        }
+        Err(error) => return Err(ConnectionError::Spawn(error)),
     };
     connections.push(ConnectionThread {
         session_id,
@@ -770,22 +821,36 @@ fn configure_connection_stream(stream: &TcpStream, limits: ServerLimits) -> io::
 }
 
 fn run_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     session_id: SessionId,
     worker: WorkerClient,
+    security: TransportSecurity,
     metrics: ServerMetricsHandle,
 ) -> Result<(), ConnectionError> {
+    let tls_enabled = security.kind() == TransportKind::MutualTls;
+    let (mut stream, identity) = security
+        .establish(stream)
+        .map_err(ConnectionError::TlsHandshake)?;
+    if tls_enabled {
+        metrics.tls_handshake();
+    }
+    let authenticated = worker
+        .open_session(session_id, identity)
+        .map_err(ConnectionError::Worker)?;
+    if authenticated {
+        metrics.authenticated_connection();
+    }
     let request_result = run_connection_requests(&mut stream, session_id, &worker, &metrics);
     let close_result = worker
         .close_session(session_id)
         .map_err(ConnectionError::Worker);
-    let _ = stream.shutdown(Shutdown::Both);
+    stream.close();
     close_result?;
     request_result
 }
 
 fn run_connection_requests(
-    stream: &mut TcpStream,
+    stream: &mut ConnectionStream,
     session_id: SessionId,
     worker: &WorkerClient,
     metrics: &ServerMetricsHandle,
@@ -872,6 +937,7 @@ fn join_connection(
 enum ConnectionError {
     Configure(io::Error),
     Spawn(io::Error),
+    TlsHandshake(TlsHandshakeError),
     Read(ProtocolError),
     WriteProtocol(ProtocolError),
     Flush(io::Error),
@@ -881,6 +947,12 @@ enum ConnectionError {
 impl ConnectionError {
     fn record(&self, metrics: &ServerMetricsHandle) {
         match self {
+            Self::TlsHandshake(error) => {
+                metrics.tls_handshake_failure();
+                if error.is_timeout() {
+                    metrics.idle_timeout();
+                }
+            }
             Self::Read(ProtocolError::Io(error)) if is_timeout(error) => metrics.idle_timeout(),
             Self::Read(ProtocolError::Io(_)) => {}
             Self::Read(_) => metrics.protocol_failure(),
@@ -895,6 +967,7 @@ impl fmt::Display for ConnectionError {
         match self {
             Self::Configure(error) => write!(formatter, "socket configuration failed: {error}"),
             Self::Spawn(error) => write!(formatter, "connection thread spawn failed: {error}"),
+            Self::TlsHandshake(error) => error.fmt(formatter),
             Self::Read(error) => write!(formatter, "request read failed: {error}"),
             Self::WriteProtocol(error) => write!(formatter, "response write failed: {error}"),
             Self::Flush(error) => write!(formatter, "response flush failed: {error}"),

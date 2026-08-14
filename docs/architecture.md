@@ -902,12 +902,13 @@ optional table-scoped transaction while borrowing the database owner for each
 request.
 
 The blocking TCP runtime uses one OS thread per accepted connection and one
-dedicated database worker thread. Connection threads own only TcpStreams,
-SessionIds, decoded client frames, and response batches. Typed channels carry
-those Send-safe values to the worker. The worker constructs and exclusively
-owns the Database, every SessionState, and every Transaction, so storage's
-Rc/RefCell transaction internals never cross a thread boundary and are not
-replaced by networking-driven Arc/Mutex state.
+dedicated database worker thread. Connection threads own the socket, optional
+rustls connection state, authenticated transport identity, SessionId, decoded
+client frames, and response batches. Typed channels carry only Send-safe values
+to the worker. The worker constructs and exclusively owns the Database, every
+SessionState, every Transaction, and the association between a SessionId and
+its ClientIdentity. Storage's Rc/RefCell transaction internals never cross a
+thread boundary and are not replaced by networking-driven Arc/Mutex state.
 
 Network connections may progress concurrently while reading or writing, but
 the worker consumes one FIFO command queue and serializes all database request
@@ -931,11 +932,22 @@ than dropping a retryable transaction and continuing service. Graceful server
 shutdown closes connection sockets, joins their threads, closes remaining
 sessions, explicitly closes the Database, and joins the worker.
 
-`netbadbd` reads deployment manifest v2 before startup. Relative heap paths are
-resolved against the manifest directory, and the worker calls
-`Database::open_tables` before the listener is bound. The manifest supplies
-complete TableDefs because a heap fingerprint cannot reconstruct schema. The
-listener is restricted to loopback until authentication and TLS exist.
+`netbadbd` reads deployment manifest v3 before startup. Relative heap and TLS
+paths are resolved against the manifest directory. Certificate, private-key,
+and client-CA material is parsed into a mandatory-client-auth rustls config
+before the database worker starts; the worker then calls `Database::open_tables`
+before the listener is bound. The manifest supplies complete TableDefs because
+a heap fingerprint cannot reconstruct schema. Plaintext listeners are
+restricted to loopback, while non-loopback listeners require mutual TLS.
+
+Connection admission and socket read/write timeouts happen before TLS. A
+connection thread explicitly completes certificate verification, derives
+SHA-256 over the verified client leaf DER, and only then asks the worker to
+create a `WorkerSession`. Failed TLS peers therefore consume a bounded socket
+and thread while handshaking but never own SessionState or Transaction. The raw
+control-socket clone remains available so shutdown interrupts both TLS and
+NDBP reads. ClientIdentity is runtime metadata only; SessionState and all core,
+protocol, and persistent layers remain TLS-unaware.
 
 Operational limits remain at server boundaries. The accept loop reaps finished
 threads and uses its connection-vector length to reject excess sockets before
@@ -952,15 +964,17 @@ of protocol messages but is not a complete executor-memory limit.
 
 Runtime metrics use only standard-library atomics and expose read-only
 snapshots. They count admitted, rejected, active, and closed connections;
-worker requests; protocol failures; idle timeouts; write failures; and
+successful and failed TLS handshakes; authenticated connections; worker
+requests; protocol failures; idle timeouts; write failures; and
 response-row-limit errors. Metrics never control admission or database
-correctness and contain no SQL, values, table names, or client-address labels.
+correctness and contain no SQL, values, table names, certificate contents, or
+client-address labels.
 
 Networking remains synchronous and must not leak async into parser, compiler,
 planner, executor, page, storage, WAL, or recovery.
 Protocol v1 is a network contract, not a database-file format: Canonical Schema
 v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
-remain unchanged. Deployment manifest v2 is configuration, not a database
+remain unchanged. Deployment manifest v3 is configuration, not a database
 format or canonical schema identity.
 
 Rust applications use the native SDK. Go applications should use a generated

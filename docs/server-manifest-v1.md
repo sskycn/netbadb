@@ -1,7 +1,8 @@
 # NetbaDB deployment manifest v1
 
 > Historical experimental manifest format. Current `netbadbd` requires
-> [deployment manifest v2](server-manifest-v2.md); v1 is rejected explicitly.
+> [deployment manifest v3](server-manifest-v3.md); v1 and v2 are rejected
+> explicitly.
 
 The deployment manifest is human-readable startup configuration for
 `netbadbd`. It is not a database file format, protocol payload, or canonical

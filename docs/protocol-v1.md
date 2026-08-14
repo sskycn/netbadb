@@ -107,8 +107,8 @@ Capability bits are:
 | 1 | `0x2` | explicit ANALYZE API |
 | 2 | `0x4` | streamed query-result messages |
 
-TLS and authentication are not advertised because protocol v1 transport does
-not implement them.
+TLS and authentication are not advertised because transport security is
+established before the Protocol v1 Hello and does not alter capability bits.
 
 ## Query results
 
@@ -239,12 +239,14 @@ Begin, Execute, result metadata and values, affected rows, and errors. A change
 to layout, byte order, tags, or scalar/type encoding requires an explicit
 protocol compatibility decision rather than silently updating those bytes.
 
-Protocol v1 does not define TCP lifecycle, TLS, authentication, prepared
-statements, parameter binding, index/checkpoint administration, or a remote
-SDK. TCP transport processes one request completely before reading the next
-request on that connection. Query execution and `ResponseBatch` construction
-remain fully materialized; QueryRow framing avoids one giant wire frame but is
-not an incremental executor cursor.
+Protocol v1 does not define TCP or TLS lifecycle, authentication policy,
+prepared statements, parameter binding, index/checkpoint administration, or a
+remote SDK. The exact same Protocol v1 bytes may run over plaintext loopback or
+mutually authenticated TLS. TLS negotiation and client-certificate
+authentication complete before the NDBP Hello. TCP transport processes one
+request completely before reading the next request on that connection. Query
+execution and `ResponseBatch` construction remain fully materialized; QueryRow
+framing avoids one giant wire frame but is not an incremental executor cursor.
 
 Server connection limits and socket read/write timeouts are transport policy,
 not wire capabilities. A socket read timeout closes the connection and its
