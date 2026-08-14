@@ -354,6 +354,20 @@ impl LeafNode {
         self.entries.remove(position);
         Ok(())
     }
+
+    /// Reports whether the complete `(key, RowId)` identity is present.
+    pub fn contains_exact(
+        &self,
+        spec: &IndexSpec,
+        entry: &IndexEntryKey,
+    ) -> Result<bool, IndexError> {
+        spec.validate_key(&entry.key)?;
+        validate_row_id(entry.row_id)?;
+        Ok(self
+            .entries
+            .binary_search_by(|existing| compare_entry_keys(existing, entry))
+            .is_ok())
+    }
 }
 
 impl InternalNode {
@@ -436,16 +450,19 @@ pub fn compare_key_to_entry(key: &ScalarValue, entry: &IndexEntryKey) -> Orderin
     compare_values(key, &entry.key)
 }
 
-/// Ensures an entry can fit both a leaf and a future internal separator.
-pub fn ensure_entry_fits(
+/// Ensures a key can fit both a leaf entry and a future internal separator.
+///
+/// The fixed-width RowId payload is included without requiring a fabricated
+/// physical locator, making this suitable for preflighting heap inserts.
+pub fn ensure_key_fits(
     spec: &IndexSpec,
-    entry: &IndexEntry,
+    key: &ScalarValue,
     capacity: usize,
 ) -> Result<(), IndexError> {
-    spec.validate_key(&entry.key)?;
-    validate_row_id(entry.row_id)?;
+    spec.validate_key(key)?;
     let leaf_size = NODE_HEADER_SIZE
-        .checked_add(encoded_entry_len(entry)?)
+        .checked_add(encoded_key_len(key)?)
+        .and_then(|size| size.checked_add(ROW_ID_SIZE))
         .ok_or(IndexError::LengthOverflow)?;
     let internal_size = leaf_size.checked_add(8).ok_or(IndexError::LengthOverflow)?;
     if internal_size > capacity {
@@ -455,6 +472,17 @@ pub fn ensure_entry_fits(
         });
     }
     Ok(())
+}
+
+/// Ensures an entry can fit both a leaf and a future internal separator.
+pub fn ensure_entry_fits(
+    spec: &IndexSpec,
+    entry: &IndexEntry,
+    capacity: usize,
+) -> Result<(), IndexError> {
+    spec.validate_key(&entry.key)?;
+    validate_row_id(entry.row_id)?;
+    ensure_key_fits(spec, &entry.key, capacity)
 }
 
 /// Encodes one validated `NBTM` version-1 payload.
@@ -954,16 +982,20 @@ fn encode_entry(output: &mut Vec<u8>, entry: &IndexEntry) -> Result<(), IndexErr
     Ok(())
 }
 
-fn encoded_entry_len(entry: &IndexEntry) -> Result<usize, IndexError> {
-    let key = match &entry.key {
+fn encoded_key_len(key: &ScalarValue) -> Result<usize, IndexError> {
+    Ok(match key {
         ScalarValue::Null => 1,
         ScalarValue::Bool(_) => 2,
         ScalarValue::Int64(_) | ScalarValue::UInt64(_) => 9,
         ScalarValue::Text(value) => 5_usize
             .checked_add(value.len())
             .ok_or(IndexError::LengthOverflow)?,
-    };
-    key.checked_add(ROW_ID_SIZE)
+    })
+}
+
+fn encoded_entry_len(entry: &IndexEntry) -> Result<usize, IndexError> {
+    encoded_key_len(&entry.key)?
+        .checked_add(ROW_ID_SIZE)
         .ok_or(IndexError::LengthOverflow)
 }
 
@@ -1422,6 +1454,20 @@ mod tests {
             Err(IndexError::KeyTooLarge {
                 size: 129,
                 capacity: 125,
+            })
+        );
+        assert_eq!(
+            ensure_key_fits(&spec, &entry.key, 125),
+            Err(IndexError::KeyTooLarge {
+                size: 129,
+                capacity: 125,
+            })
+        );
+        assert_eq!(
+            ensure_key_fits(&spec, &ScalarValue::UInt64(1), 125),
+            Err(IndexError::TypeMismatch {
+                expected: PhysicalType::Text,
+                actual: Some(PhysicalType::UInt64),
             })
         );
     }

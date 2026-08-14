@@ -258,9 +258,11 @@ sorting or aggregation.
 - Phase 4D1 complete: Heap metadata v3 anchors an append-only persistent index
   registry, and one transaction creates, fully backfills, registers, commits,
   and exposes each single-column non-unique index for reopen discovery;
-- Phase 4D1 intentionally keeps raw B+Trees unregistered and does not maintain
-  registered indexes for later Heap DML;
-- next Phase 4D2: atomic heap/index DML maintenance;
+- Phase 4D1 keeps raw B+Trees unregistered and independent from table DML;
+- Phase 4D2 complete: all Heap and SQL INSERT/UPDATE/DELETE operations maintain
+  registered indexes in one transaction, propagate RowId relocation, preserve
+  deterministic multi-index ordering, and recover runtime and crash failures
+  under STEAL/NO-FORCE;
 - next Phase 4E: index scan physical operator;
 - next Phase 4F: catalog statistics and deterministic cost-based access-path
   selection.

@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use netbadb_index::{
     IndexCatalogNode, IndexDefinition, IndexError, IndexSpec, decode_index_catalog,
-    encode_index_catalog,
+    encode_index_catalog, ensure_key_fits,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{ColumnId, PageId, RowId, ScalarValue, SlotId};
@@ -41,6 +41,7 @@ pub struct HeapStorage {
     table: TableDef,
     transactions: TransactionManager,
     indexes: Vec<IndexDefinition>,
+    index_plans: Vec<RegisteredIndexPlan>,
     index_catalog_root: PageId,
     #[cfg(test)]
     skip_drop_flush: bool,
@@ -52,6 +53,15 @@ pub struct HeapStorage {
     fail_index_catalog_log: bool,
     #[cfg(test)]
     index_catalog_payload_capacity: Option<usize>,
+    #[cfg(test)]
+    fail_registered_mutation_after: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredIndexPlan {
+    definition: IndexDefinition,
+    column_position: usize,
+    spec: IndexSpec,
 }
 
 #[derive(Debug)]
@@ -140,6 +150,7 @@ impl HeapStorage {
             table,
             transactions,
             indexes: Vec::new(),
+            index_plans: Vec::new(),
             index_catalog_root: FIRST_MANAGED_PAGE,
             #[cfg(test)]
             skip_drop_flush: false,
@@ -151,6 +162,8 @@ impl HeapStorage {
             fail_index_catalog_log: false,
             #[cfg(test)]
             index_catalog_payload_capacity: None,
+            #[cfg(test)]
+            fail_registered_mutation_after: None,
         })
     }
 
@@ -204,6 +217,7 @@ impl HeapStorage {
             table,
             transactions,
             indexes: Vec::new(),
+            index_plans: Vec::new(),
             index_catalog_root: catalog_root,
             #[cfg(test)]
             skip_drop_flush: false,
@@ -215,8 +229,11 @@ impl HeapStorage {
             fail_index_catalog_log: false,
             #[cfg(test)]
             index_catalog_payload_capacity: None,
+            #[cfg(test)]
+            fail_registered_mutation_after: None,
         };
         storage.indexes = storage.load_index_registry(catalog_root)?;
+        storage.index_plans = storage.build_registered_index_plans()?;
         Ok(storage)
     }
 
@@ -236,7 +253,7 @@ impl HeapStorage {
 
     /// Atomically builds a non-unique single-column index over all currently
     /// live rows, then registers it as the transaction's final logical step.
-    /// Later heap DML is not maintained until Phase 4D2.
+    /// Subsequent heap DML maintains every registered index automatically.
     pub fn create_index(&mut self, column_id: ColumnId) -> Result<IndexDefinition, StorageError> {
         let (column_position, spec) = self
             .table
@@ -262,7 +279,7 @@ impl HeapStorage {
         transaction.acquire_writer()?;
         let result =
             (|| {
-                let handle = self.btree().create_in(&mut transaction, spec)?;
+                let handle = self.btree().create_in(&mut transaction, spec.clone())?;
                 // Writer ownership is already held. Materialize the stable heap
                 // snapshot before further BTree growth extends shared PageIds.
                 let rows = self.scan()?;
@@ -284,13 +301,19 @@ impl HeapStorage {
                     crate::crash_test::TestCrashPoint::IndexBuildBeforeCatalogLog,
                 );
                 self.append_index_definition(&mut transaction, &definition)?;
-                Ok(definition)
+                Ok(RegisteredIndexPlan {
+                    definition,
+                    column_position,
+                    spec: spec.clone(),
+                })
             })();
 
         match result {
-            Ok(definition) => {
+            Ok(plan) => {
                 transaction.commit()?;
+                let definition = plan.definition.clone();
                 self.indexes.push(definition.clone());
+                self.index_plans.push(plan);
                 Ok(definition)
             }
             Err(error) => match transaction.rollback() {
@@ -565,13 +588,7 @@ impl HeapStorage {
         transaction: &mut Transaction,
         values: &[ScalarValue],
     ) -> Result<RowId, StorageError> {
-        if !transaction.belongs_to(self.transactions.wal()) {
-            return Err(TransactionError::ForeignTransaction {
-                txn_id: transaction.id(),
-            }
-            .into());
-        }
-        transaction.ensure_active()?;
+        self.validate_transaction(transaction)?;
         self.validate_row(values)?;
         let payload = encode_row(values)?;
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
@@ -583,8 +600,34 @@ impl HeapStorage {
             .into());
         }
         transaction.acquire_writer()?;
-        let prepared = self.prepare_insert(&payload, None)?;
-        self.apply_single_page_insert(transaction, prepared)
+        let plans = self.index_plans.clone();
+        for plan in &plans {
+            ensure_key_fits(
+                &plan.spec,
+                &values[plan.column_position],
+                Page::single_payload_capacity(),
+            )?;
+        }
+
+        let row_id = self.insert_heap_in(transaction, &payload)?;
+        #[cfg(test)]
+        self.crash_after_registered_publish(
+            crate::crash_test::TestCrashPoint::RegisteredInsertAfterHeapPublish,
+        )?;
+        for (completed_index_mutations, plan) in plans.into_iter().enumerate() {
+            self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
+            let result = self.btree().insert_in(
+                transaction,
+                plan.definition.handle,
+                values[plan.column_position].clone(),
+                row_id,
+            );
+            if let Err(error) = result {
+                transaction.require_rollback();
+                return Err(error);
+            }
+        }
+        Ok(row_id)
     }
 
     pub fn read_row(&self, row_id: RowId) -> Result<Vec<ScalarValue>, StorageError> {
@@ -609,12 +652,7 @@ impl HeapStorage {
         values: &[ScalarValue],
     ) -> Result<RowId, StorageError> {
         self.validate_transaction(transaction)?;
-        self.ensure_row_page(row_id)?;
-        let source_before = {
-            let page = self.buffer.read_page(row_id.page)?;
-            validate_row_slot(page.page(), row_id)?;
-            page.page().clone()
-        };
+        let old_values = self.read_row(row_id)?;
         self.validate_row(values)?;
         let payload = encode_row(values)?;
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
@@ -625,24 +663,87 @@ impl HeapStorage {
             }
             .into());
         }
+        transaction.acquire_writer()?;
+        let plans = self.index_plans.clone();
+        for plan in &plans {
+            let old_key = &old_values[plan.column_position];
+            let new_key = &values[plan.column_position];
+            ensure_key_fits(&plan.spec, new_key, Page::single_payload_capacity())?;
+            if !self
+                .btree()
+                .contains_exact(plan.definition.handle, old_key, row_id)?
+            {
+                return Err(IndexError::EntryNotFound.into());
+            }
+        }
+
+        let current_row_id = self.update_heap_in(transaction, row_id, &payload)?;
+        #[cfg(test)]
+        self.crash_after_registered_publish(
+            crate::crash_test::TestCrashPoint::RegisteredUpdateAfterHeapPublish,
+        )?;
+        let mut completed_index_mutations = 0;
+        for plan in plans {
+            let old_key = &old_values[plan.column_position];
+            let new_key = &values[plan.column_position];
+            if old_key == new_key && row_id == current_row_id {
+                continue;
+            }
+
+            self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
+            if let Err(error) =
+                self.btree()
+                    .delete_in(transaction, plan.definition.handle, old_key.clone(), row_id)
+            {
+                transaction.require_rollback();
+                return Err(error);
+            }
+            completed_index_mutations += 1;
+
+            self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
+            if let Err(error) = self.btree().insert_in(
+                transaction,
+                plan.definition.handle,
+                new_key.clone(),
+                current_row_id,
+            ) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+            completed_index_mutations += 1;
+        }
+        Ok(current_row_id)
+    }
+
+    fn update_heap_in(
+        &mut self,
+        transaction: &mut Transaction,
+        row_id: RowId,
+        payload: &[u8],
+    ) -> Result<RowId, StorageError> {
+        self.ensure_row_page(row_id)?;
+        let source_before = {
+            let page = self.buffer.read_page(row_id.page)?;
+            validate_row_slot(page.page(), row_id)?;
+            page.page().clone()
+        };
         let slot = validate_row_slot(&source_before, row_id)?;
         let mut source_replacement = source_before.clone();
-        match source_replacement.replace_record(slot, &payload) {
+        match source_replacement.replace_record(slot, payload) {
             Ok(()) => {
-                transaction.acquire_writer()?;
                 let mut page = self.buffer.write_page(row_id.page)?;
                 let before = page.page().clone();
                 let mut after = before.clone();
                 let slot = validate_row_slot(&after, row_id)?;
                 after
-                    .replace_record(slot, &payload)
+                    .replace_record(slot, payload)
                     .map_err(|error| map_row_error(error, row_id))?;
                 transaction.log_page_update(&before, &mut after)?;
                 *page.page_mut() = after;
                 Ok(row_id)
             }
             Err(StorageError::Page(PageError::UpdateWouldOverflowPage { .. })) => {
-                self.relocate_update(transaction, row_id, slot, source_before, &payload)
+                self.relocate_update(transaction, row_id, slot, source_before, payload)
             }
             Err(error) => Err(map_row_error(error, row_id)),
         }
@@ -654,13 +755,56 @@ impl HeapStorage {
         row_id: RowId,
     ) -> Result<(), StorageError> {
         self.validate_transaction(transaction)?;
-        self.ensure_row_page(row_id)?;
-        {
-            let page = self.buffer.read_page(row_id.page)?;
-            validate_row_slot(page.page(), row_id)?;
-        }
+        let old_values = self.read_row(row_id)?;
         transaction.acquire_writer()?;
+        let plans = self.index_plans.clone();
+        for plan in &plans {
+            if !self.btree().contains_exact(
+                plan.definition.handle,
+                &old_values[plan.column_position],
+                row_id,
+            )? {
+                return Err(IndexError::EntryNotFound.into());
+            }
+        }
 
+        let mut completed_index_mutations = 0;
+        for plan in plans {
+            self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
+            if let Err(error) = self.btree().delete_in(
+                transaction,
+                plan.definition.handle,
+                old_values[plan.column_position].clone(),
+                row_id,
+            ) {
+                if completed_index_mutations != 0 {
+                    transaction.require_rollback();
+                }
+                return Err(error);
+            }
+            completed_index_mutations += 1;
+            #[cfg(test)]
+            if completed_index_mutations == 1 {
+                self.crash_after_registered_publish(
+                    crate::crash_test::TestCrashPoint::RegisteredDeleteAfterFirstIndexPublish,
+                )?;
+            }
+        }
+
+        if let Err(error) = self.delete_heap_in(transaction, row_id) {
+            if completed_index_mutations != 0 {
+                transaction.require_rollback();
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn delete_heap_in(
+        &mut self,
+        transaction: &mut Transaction,
+        row_id: RowId,
+    ) -> Result<(), StorageError> {
         let mut page = self.buffer.write_page(row_id.page)?;
         let before = page.page().clone();
         let mut after = before.clone();
@@ -670,6 +814,77 @@ impl HeapStorage {
             .map_err(|error| map_row_error(error, row_id))?;
         transaction.log_page_update(&before, &mut after)?;
         *page.page_mut() = after;
+        Ok(())
+    }
+
+    fn insert_heap_in(
+        &mut self,
+        transaction: &mut Transaction,
+        payload: &[u8],
+    ) -> Result<RowId, StorageError> {
+        let prepared = self.prepare_insert(payload, None)?;
+        self.apply_single_page_insert(transaction, prepared)
+    }
+
+    fn build_registered_index_plans(&mut self) -> Result<Vec<RegisteredIndexPlan>, StorageError> {
+        let definitions = self.indexes.clone();
+        let mut plans = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let (column_position, column) = self
+                .table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, column)| column.id == definition.column_id)
+                .ok_or(IndexError::UnknownIndexColumn {
+                    column_id: definition.column_id,
+                })?;
+            let spec = IndexSpec {
+                data_type: column.semantic_type(),
+                nullable: column.nullable,
+            };
+            if self.btree().spec(definition.handle)? != spec {
+                return Err(IndexError::CatalogSpecMismatch {
+                    column_id: definition.column_id,
+                }
+                .into());
+            }
+            plans.push(RegisteredIndexPlan {
+                definition,
+                column_position,
+                spec,
+            });
+        }
+        Ok(plans)
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_registered_mutation(&mut self, transaction: &Transaction, completed: usize) {
+        if self.fail_registered_mutation_after == Some(completed) {
+            self.fail_registered_mutation_after = None;
+            transaction.inject_partial_append_failure(0);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_fail_registered_mutation(&mut self, _transaction: &Transaction, _completed: usize) {}
+
+    #[cfg(test)]
+    fn inject_registered_mutation_failure_after(&mut self, completed: usize) {
+        self.fail_registered_mutation_after = Some(completed);
+    }
+
+    #[cfg(test)]
+    fn crash_after_registered_publish(
+        &self,
+        point: crate::crash_test::TestCrashPoint,
+    ) -> Result<(), StorageError> {
+        if crate::crash_test::is_enabled(point) {
+            // Force the deliberately mixed uncommitted Heap/index state to
+            // disk so startup recovery must undo the whole WAL chain.
+            self.buffer.flush_all()?;
+            crate::crash_test::crash_now();
+        }
         Ok(())
     }
 
@@ -1489,7 +1704,6 @@ mod tests {
             vec![row_ids[3]]
         );
 
-        // Phase 4D1 deliberately backfills only the snapshot at creation.
         let later = storage
             .insert(&[
                 ScalarValue::UInt64(5),
@@ -1498,10 +1712,10 @@ mod tests {
             ])
             .expect("insert after build");
         assert!(
-            !storage
+            storage
                 .btree()
                 .lookup(definition.handle, &ScalarValue::UInt64(10))
-                .expect("lookup remains snapshot")
+                .expect("lookup maintained index")
                 .contains(&later)
         );
         storage.close().expect("close indexed heap");
@@ -1514,7 +1728,7 @@ mod tests {
                 .btree()
                 .lookup(definition.handle, &ScalarValue::UInt64(10))
                 .expect("lookup reopened index"),
-            row_ids[..2]
+            vec![row_ids[0], row_ids[1], later]
         );
         reopened.close().expect("close reopened heap");
         cleanup(&path);
@@ -1538,6 +1752,372 @@ mod tests {
         storage.close().expect("close empty index");
         let reopened = HeapStorage::open(&path, indexed_table()).expect("reopen empty index");
         assert_eq!(reopened.indexes(), std::slice::from_ref(&definition));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn registered_indexes_track_insert_update_relocation_delete_null_and_duplicates() {
+        let path = test_path("registered-index-dml");
+        cleanup(&path);
+        let schema = indexed_table();
+        let mut storage = HeapStorage::create_with_buffer_pool_size(&path, schema.clone(), 1)
+            .expect("create indexed heap");
+        let team = storage.create_index(ColumnId(2)).expect("team index");
+        let name = storage.create_index(ColumnId(3)).expect("name index");
+
+        let first = storage
+            .insert(&[
+                ScalarValue::UInt64(1),
+                ScalarValue::UInt64(10),
+                ScalarValue::Text("A".into()),
+            ])
+            .expect("insert first");
+        let duplicate = storage
+            .insert(&[
+                ScalarValue::UInt64(2),
+                ScalarValue::UInt64(10),
+                ScalarValue::Text("B".into()),
+            ])
+            .expect("insert duplicate key");
+        storage
+            .insert(&[
+                ScalarValue::UInt64(3),
+                ScalarValue::UInt64(30),
+                ScalarValue::Text("f".repeat(1500)),
+            ])
+            .expect("fill source page for relocation");
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(team.handle, &ScalarValue::UInt64(10))
+                .expect("lookup duplicates"),
+            vec![first, duplicate]
+        );
+
+        let page_updates_before = storage
+            .wal_records()
+            .unwrap()
+            .iter()
+            .filter(|record| matches!(record.kind, WalRecordKind::PageUpdate { .. }))
+            .count();
+        let same = storage
+            .update(
+                first,
+                &[
+                    ScalarValue::UInt64(1),
+                    ScalarValue::UInt64(10),
+                    ScalarValue::Text("A".into()),
+                ],
+            )
+            .expect("unchanged update");
+        assert_eq!(same, first);
+        let page_updates_after = storage
+            .wal_records()
+            .unwrap()
+            .iter()
+            .filter(|record| matches!(record.kind, WalRecordKind::PageUpdate { .. }))
+            .count();
+        assert_eq!(page_updates_after - page_updates_before, 1);
+
+        let key_changed = storage
+            .update(
+                first,
+                &[
+                    ScalarValue::UInt64(1),
+                    ScalarValue::Null,
+                    ScalarValue::Text("A".into()),
+                ],
+            )
+            .expect("key change");
+        assert_eq!(key_changed, first);
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(team.handle, &ScalarValue::UInt64(10))
+                .expect("old duplicate key"),
+            vec![duplicate]
+        );
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(team.handle, &ScalarValue::Null)
+                .expect("new NULL key"),
+            vec![first]
+        );
+
+        let relocated = storage
+            .update(
+                first,
+                &[
+                    ScalarValue::UInt64(1),
+                    ScalarValue::UInt64(20),
+                    ScalarValue::Text("Z".repeat(3000)),
+                ],
+            )
+            .expect("relocating key update");
+        assert_ne!(relocated, first);
+        for (handle, old_key, new_key) in [
+            (team.handle, ScalarValue::Null, ScalarValue::UInt64(20)),
+            (
+                name.handle,
+                ScalarValue::Text("A".into()),
+                ScalarValue::Text("Z".repeat(3000)),
+            ),
+        ] {
+            assert!(
+                !storage
+                    .btree()
+                    .contains_exact(handle, &old_key, first)
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .btree()
+                    .contains_exact(handle, &new_key, relocated)
+                    .unwrap()
+            );
+        }
+
+        let same_key_old = duplicate;
+        let same_key_relocated = storage
+            .update(
+                same_key_old,
+                &[
+                    ScalarValue::UInt64(2),
+                    ScalarValue::UInt64(10),
+                    ScalarValue::Text("Q".repeat(3000)),
+                ],
+            )
+            .expect("relocate without changing team key");
+        assert_ne!(same_key_relocated, same_key_old);
+        assert!(
+            !storage
+                .btree()
+                .contains_exact(team.handle, &ScalarValue::UInt64(10), same_key_old)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .btree()
+                .contains_exact(team.handle, &ScalarValue::UInt64(10), same_key_relocated,)
+                .unwrap()
+        );
+
+        storage.delete(relocated).expect("delete relocated row");
+        assert!(
+            storage
+                .btree()
+                .lookup(team.handle, &ScalarValue::UInt64(20))
+                .unwrap()
+                .is_empty()
+        );
+        storage.checkpoint().expect("checkpoint maintained indexes");
+        storage.close().expect("close indexed heap");
+
+        let mut reopened = HeapStorage::open_with_buffer_pool_size(&path, schema, 1)
+            .expect("reopen maintained indexes");
+        assert_eq!(
+            reopened
+                .btree()
+                .lookup(team.handle, &ScalarValue::UInt64(10))
+                .unwrap(),
+            vec![same_key_relocated]
+        );
+        reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn registered_index_key_preflight_and_missing_entry_leave_transaction_active() {
+        let path = test_path("registered-index-preflight");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
+        let definition = storage.create_index(ColumnId(3)).expect("name index");
+        let old = storage
+            .insert(&[
+                ScalarValue::UInt64(1),
+                ScalarValue::UInt64(10),
+                ScalarValue::Text("small".into()),
+            ])
+            .expect("insert baseline");
+
+        let too_large = "x".repeat(4020);
+        let mut transaction = storage.begin_transaction().expect("begin preflight");
+        assert!(matches!(
+            storage.insert_in(
+                &mut transaction,
+                &[
+                    ScalarValue::UInt64(2),
+                    ScalarValue::UInt64(20),
+                    ScalarValue::Text(too_large.clone()),
+                ],
+            ),
+            Err(StorageError::Index(IndexError::KeyTooLarge { .. }))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        assert!(matches!(
+            storage.update_in(
+                &mut transaction,
+                old,
+                &[
+                    ScalarValue::UInt64(1),
+                    ScalarValue::UInt64(10),
+                    ScalarValue::Text(too_large),
+                ],
+            ),
+            Err(StorageError::Index(IndexError::KeyTooLarge { .. }))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        transaction
+            .rollback()
+            .expect("finish preflight transaction");
+        assert_eq!(
+            storage.read_row(old).unwrap()[2],
+            ScalarValue::Text("small".into())
+        );
+
+        // Deliberately create a registry/heap inconsistency through the raw
+        // tree API, then verify DML refuses to enlarge it before touching Heap.
+        storage
+            .btree()
+            .delete(definition.handle, ScalarValue::Text("small".into()), old)
+            .expect("remove registered entry through raw API");
+        let mut transaction = storage.begin_transaction().expect("begin missing entry");
+        assert!(matches!(
+            storage.update_in(
+                &mut transaction,
+                old,
+                &[
+                    ScalarValue::UInt64(1),
+                    ScalarValue::UInt64(10),
+                    ScalarValue::Text("changed".into()),
+                ],
+            ),
+            Err(StorageError::Index(IndexError::EntryNotFound))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        assert_eq!(
+            storage.read_row(old).unwrap()[2],
+            ScalarValue::Text("small".into())
+        );
+        assert!(matches!(
+            storage.delete_in(&mut transaction, old),
+            Err(StorageError::Index(IndexError::EntryNotFound))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        assert_eq!(
+            storage.read_row(old).unwrap()[2],
+            ScalarValue::Text("small".into())
+        );
+        transaction
+            .rollback()
+            .expect("finish missing-entry transaction");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn registered_index_partial_failure_requires_and_supports_full_rollback() {
+        let path = test_path("registered-index-partial-failure");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
+        let team = storage.create_index(ColumnId(2)).expect("team index");
+        let name = storage.create_index(ColumnId(3)).expect("name index");
+        let baseline = storage.scan().expect("empty baseline");
+
+        for completed in [0, 1] {
+            let mut transaction = storage.begin_transaction().expect("begin failed insert");
+            storage.inject_registered_mutation_failure_after(completed);
+            assert!(
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::UInt64(1),
+                            ScalarValue::UInt64(10),
+                            ScalarValue::Text("A".into()),
+                        ],
+                    )
+                    .is_err()
+            );
+            assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+            assert!(transaction.commit().is_err());
+            transaction.rollback().expect("rollback partial insert");
+            assert_eq!(storage.scan().unwrap(), baseline);
+            assert!(
+                storage
+                    .btree()
+                    .lookup(team.handle, &ScalarValue::UInt64(10))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                storage
+                    .btree()
+                    .lookup(name.handle, &ScalarValue::Text("A".into()))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let row = storage
+            .insert(&[
+                ScalarValue::UInt64(2),
+                ScalarValue::UInt64(10),
+                ScalarValue::Text("B".into()),
+            ])
+            .expect("insert update baseline");
+        let mut transaction = storage.begin_transaction().expect("begin failed update");
+        storage.inject_registered_mutation_failure_after(1);
+        assert!(
+            storage
+                .update_in(
+                    &mut transaction,
+                    row,
+                    &[
+                        ScalarValue::UInt64(2),
+                        ScalarValue::UInt64(20),
+                        ScalarValue::Text("B".into()),
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        transaction
+            .rollback()
+            .expect("rollback delete-insert window");
+        assert_eq!(storage.read_row(row).unwrap()[1], ScalarValue::UInt64(10));
+        assert!(
+            storage
+                .btree()
+                .contains_exact(team.handle, &ScalarValue::UInt64(10), row)
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .btree()
+                .contains_exact(team.handle, &ScalarValue::UInt64(20), row)
+                .unwrap()
+        );
+
+        let before_delete = storage.read_row(row).expect("read delete baseline");
+        let mut transaction = storage.begin_transaction().expect("begin failed delete");
+        storage.inject_registered_mutation_failure_after(1);
+        assert!(storage.delete_in(&mut transaction, row).is_err());
+        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+        transaction.rollback().expect("rollback partial delete");
+        assert_eq!(storage.read_row(row).unwrap(), before_delete);
+        assert!(
+            storage
+                .btree()
+                .contains_exact(team.handle, &ScalarValue::UInt64(10), row)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .btree()
+                .contains_exact(name.handle, &ScalarValue::Text("B".into()), row)
+                .unwrap()
+        );
         cleanup(&path);
     }
 
@@ -1616,6 +2196,26 @@ mod tests {
         assert_eq!(
             storage.wal_records().expect("scan unchanged WAL").len(),
             wal_count
+        );
+        let row = storage
+            .insert(&[
+                ScalarValue::UInt64(1),
+                ScalarValue::UInt64(10),
+                ScalarValue::Text("raw-independent".into()),
+            ])
+            .expect("insert with registered index");
+        assert!(
+            storage
+                .btree()
+                .lookup(raw, &ScalarValue::UInt64(10))
+                .expect("lookup untouched raw tree")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .btree()
+                .contains_exact(registered.handle, &ScalarValue::UInt64(10), row)
+                .expect("lookup maintained registered tree")
         );
         storage.close().expect("close heap");
 
@@ -4342,6 +4942,107 @@ mod tests {
                     .expect("commit index build");
                 crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
+            "registered-insert-loser" => {
+                let mut storage =
+                    HeapStorage::open(path, indexed_table()).expect("open registered heap");
+                let mut transaction = storage.begin_transaction().expect("begin insert loser");
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::UInt64(9),
+                            ScalarValue::UInt64(90),
+                            ScalarValue::Text("loser-insert".into()),
+                        ],
+                    )
+                    .expect("reach registered insert crash point");
+            }
+            "registered-update-loser" => {
+                let mut storage =
+                    HeapStorage::open(path, indexed_table()).expect("open registered heap");
+                let old = storage
+                    .scan()
+                    .unwrap()
+                    .into_iter()
+                    .find(|(_, values)| values[0] == ScalarValue::UInt64(1))
+                    .unwrap()
+                    .0;
+                let mut transaction = storage.begin_transaction().expect("begin update loser");
+                storage
+                    .update_in(
+                        &mut transaction,
+                        old,
+                        &[
+                            ScalarValue::UInt64(1),
+                            ScalarValue::UInt64(99),
+                            ScalarValue::Text("U".repeat(3000)),
+                        ],
+                    )
+                    .expect("reach registered update crash point");
+            }
+            "registered-delete-loser" => {
+                let mut storage =
+                    HeapStorage::open(path, indexed_table()).expect("open registered heap");
+                let old = storage
+                    .scan()
+                    .unwrap()
+                    .into_iter()
+                    .find(|(_, values)| values[0] == ScalarValue::UInt64(1))
+                    .unwrap()
+                    .0;
+                let mut transaction = storage.begin_transaction().expect("begin delete loser");
+                storage
+                    .delete_in(&mut transaction, old)
+                    .expect("reach registered delete crash point");
+            }
+            "registered-insert-winner"
+            | "registered-update-winner"
+            | "registered-delete-winner" => {
+                let mut storage =
+                    HeapStorage::open(path, indexed_table()).expect("open registered heap");
+                match case {
+                    "registered-insert-winner" => {
+                        storage
+                            .insert(&[
+                                ScalarValue::UInt64(9),
+                                ScalarValue::UInt64(90),
+                                ScalarValue::Text("winner-insert".into()),
+                            ])
+                            .expect("commit registered insert");
+                    }
+                    "registered-update-winner" => {
+                        let old = storage
+                            .scan()
+                            .unwrap()
+                            .into_iter()
+                            .find(|(_, values)| values[0] == ScalarValue::UInt64(1))
+                            .unwrap()
+                            .0;
+                        storage
+                            .update(
+                                old,
+                                &[
+                                    ScalarValue::UInt64(1),
+                                    ScalarValue::UInt64(99),
+                                    ScalarValue::Text("W".repeat(3000)),
+                                ],
+                            )
+                            .expect("commit registered update");
+                    }
+                    "registered-delete-winner" => {
+                        let old = storage
+                            .scan()
+                            .unwrap()
+                            .into_iter()
+                            .find(|(_, values)| values[0] == ScalarValue::UInt64(1))
+                            .unwrap()
+                            .0;
+                        storage.delete(old).expect("commit registered delete");
+                    }
+                    _ => unreachable!(),
+                }
+                crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
+            }
             "recovery-open" => {
                 let _storage = HeapStorage::open(path, table()).expect("start child recovery");
             }
@@ -4455,6 +5156,153 @@ mod tests {
         );
         reopened.close().expect("close index winner");
         cleanup(&path);
+    }
+
+    fn prepare_registered_dml_crash_baseline(case: &str) -> std::path::PathBuf {
+        let path = test_path(case);
+        cleanup(&path);
+        let mut storage = HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 1)
+            .expect("create registered DML baseline");
+        storage
+            .insert(&[
+                ScalarValue::UInt64(1),
+                ScalarValue::UInt64(10),
+                ScalarValue::Text("before".into()),
+            ])
+            .expect("insert registered baseline");
+        storage
+            .insert(&[
+                ScalarValue::UInt64(2),
+                ScalarValue::UInt64(20),
+                ScalarValue::Text("F".repeat(1500)),
+            ])
+            .expect("insert relocation filler");
+        storage.create_index(ColumnId(2)).expect("team index");
+        storage.create_index(ColumnId(3)).expect("name index");
+        storage.close().expect("close registered baseline");
+        path
+    }
+
+    fn assert_registered_dml_state(path: &std::path::Path, case: &str, winner: bool) {
+        let mut storage = HeapStorage::open_with_buffer_pool_size(path, indexed_table(), 1)
+            .expect("recover registered DML");
+        let team = storage.index_for_column(ColumnId(2)).unwrap().handle;
+        let name = storage.index_for_column(ColumnId(3)).unwrap().handle;
+        let rows = storage.scan().expect("scan recovered registered DML");
+        let row_one = rows
+            .iter()
+            .find(|(_, values)| values[0] == ScalarValue::UInt64(1));
+        match case {
+            "insert" if winner => {
+                let (row_id, _) = rows
+                    .iter()
+                    .find(|(_, values)| values[0] == ScalarValue::UInt64(9))
+                    .expect("winner insert row");
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(team, &ScalarValue::UInt64(90), *row_id)
+                        .unwrap()
+                );
+            }
+            "insert" => {
+                assert!(
+                    rows.iter()
+                        .all(|(_, values)| values[0] != ScalarValue::UInt64(9))
+                );
+                assert!(
+                    storage
+                        .btree()
+                        .lookup(team, &ScalarValue::UInt64(90))
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            "update" if winner => {
+                let (row_id, values) = row_one.expect("winner updated row");
+                assert_eq!(values[1], ScalarValue::UInt64(99));
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(team, &ScalarValue::UInt64(99), *row_id)
+                        .unwrap()
+                );
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(name, &ScalarValue::Text("W".repeat(3000)), *row_id)
+                        .unwrap()
+                );
+            }
+            "update" => {
+                let (row_id, values) = row_one.expect("restored updated row");
+                assert_eq!(values[1], ScalarValue::UInt64(10));
+                assert_eq!(values[2], ScalarValue::Text("before".into()));
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(team, &ScalarValue::UInt64(10), *row_id)
+                        .unwrap()
+                );
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(name, &ScalarValue::Text("before".into()), *row_id)
+                        .unwrap()
+                );
+            }
+            "delete" if winner => assert!(row_one.is_none()),
+            "delete" => {
+                let (row_id, _) = row_one.expect("restored deleted row");
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(team, &ScalarValue::UInt64(10), *row_id)
+                        .unwrap()
+                );
+                assert!(
+                    storage
+                        .btree()
+                        .contains_exact(name, &ScalarValue::Text("before".into()), *row_id)
+                        .unwrap()
+                );
+            }
+            _ => unreachable!(),
+        }
+        storage.close().expect("close recovered registered DML");
+    }
+
+    #[test]
+    fn process_crash_registered_dml_losers_undo_heap_and_indexes() {
+        for (case, point) in [
+            ("insert", TestCrashPoint::RegisteredInsertAfterHeapPublish),
+            ("update", TestCrashPoint::RegisteredUpdateAfterHeapPublish),
+            (
+                "delete",
+                TestCrashPoint::RegisteredDeleteAfterFirstIndexPublish,
+            ),
+        ] {
+            let path = prepare_registered_dml_crash_baseline(&format!("registered-{case}-loser"));
+            spawn_crash_child(&path, &format!("registered-{case}-loser"), point);
+            assert_registered_dml_state(&path, case, false);
+            assert_registered_dml_state(&path, case, false);
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn process_crash_registered_dml_winners_redo_heap_and_indexes() {
+        for case in ["insert", "update", "delete"] {
+            let path = prepare_registered_dml_crash_baseline(&format!("registered-{case}-winner"));
+            spawn_crash_child(
+                &path,
+                &format!("registered-{case}-winner"),
+                TestCrashPoint::CommittedWithoutDataFlush,
+            );
+            assert_registered_dml_state(&path, case, true);
+            assert_registered_dml_state(&path, case, true);
+            cleanup(&path);
+        }
     }
 
     fn prepare_reuse_crash_baseline(case: &str) -> (std::path::PathBuf, netbadb_types::RowId) {

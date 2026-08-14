@@ -168,7 +168,8 @@ The current code genuinely supports:
   rebalance/root collapse, and duplicate-preserving point lookup with typed
   keys, arbitrary height, and buffer capacity one;
 - a persistent append-only index registry plus atomic existing-row backfill,
-  reopen discovery, and `TableId`/`ColumnId` embedded APIs;
+  reopen discovery, automatic Heap/registered-index DML maintenance, and
+  `TableId`/`ColumnId` embedded APIs;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
@@ -336,12 +337,13 @@ merge-only rebalance, recursive parent compaction, and root collapse. Removed
 right pages and old roots remain valid, unreachable index pages and are not
 reclaimed or reused yet.
 
-The Phase 4D1 registry persists `ColumnId -> BTreeHandle` separately from raw
-B+Trees. `create_index` atomically backfills current rows and registers only
-after the full build; reopen discovers and validates the mapping. It does not
-automatically maintain indexes for later heap DML, validate that referenced
-RowIds remain live, enforce uniqueness, expose SQL index DDL, add IndexScan, or
-change the planner's SeqScan policy.
+The registry persists `ColumnId -> BTreeHandle` separately from raw B+Trees.
+`create_index` atomically backfills current rows and registers only after the
+full build; reopen discovers and validates the mapping. Later Heap and SQL DML
+maintains all registered indexes in the same transaction and propagates every
+RowId relocation. Raw B+Trees remain independent. Index reads still do not
+validate referenced Heap rows, enforce uniqueness, expose SQL index DDL, add
+IndexScan, or change the planner's SeqScan policy.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -476,14 +478,13 @@ The implementation sequence is intentionally vertical:
 15. B+Tree exact delete/merge/root-collapse (Phase 4C2) — complete.
 16. Persistent IndexCatalog discovery and transactional existing-row backfill
     (Phase 4D1) — complete.
-17. Atomic heap/index DML maintenance (Phase 4D2), IndexScan (Phase 4E), then
-    statistics/costing (Phase 4F).
-18. Server mode — protocol, sessions, and `netbadbd`.
-19. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-20. Advanced optimization — statistics, cost model, and rewrite rules.
+17. Atomic heap/index DML maintenance (Phase 4D2) — complete.
+18. IndexScan (Phase 4E), then statistics/costing (Phase 4F).
+19. Server mode — protocol, sessions, and `netbadbd`.
+20. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+21. Advanced optimization — statistics, cost model, and rewrite rules.
 
-Isolation/MVCC, automatic index/heap maintenance and SQL/planner integration,
-server networking,
+Isolation/MVCC, index-aware planning, server networking,
 and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

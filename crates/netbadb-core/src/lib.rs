@@ -246,7 +246,7 @@ impl Database {
     }
 
     /// Atomically backfills and registers one non-unique single-column index.
-    /// Heap DML performed after this call is not maintained until Phase 4D2.
+    /// Subsequent heap and SQL DML maintain the index in the same transaction.
     pub fn create_index(
         &mut self,
         table_id: TableId,
@@ -566,6 +566,102 @@ mod tests {
             std::slice::from_ref(&definition)
         );
         reopened.close().expect("close reopened database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn sql_dml_maintains_registered_index_without_executor_index_knowledge() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-index-dml-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut database = Database::create(&path, table()).expect("create database");
+        let definition = database
+            .create_index(TableId(1), ColumnId(2))
+            .expect("create registered index");
+
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .expect("SQL insert");
+        let inserted = database
+            .storage_mut(TableId(1))
+            .unwrap()
+            .btree()
+            .lookup(definition.handle, &ScalarValue::Text("Ada".into()))
+            .expect("lookup inserted index entry");
+        assert_eq!(inserted.len(), 1);
+
+        database
+            .execute("UPDATE users SET name = 'Grace' WHERE id = 1")
+            .expect("SQL update");
+        assert!(
+            database
+                .storage_mut(TableId(1))
+                .unwrap()
+                .btree()
+                .lookup(definition.handle, &ScalarValue::Text("Ada".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .storage_mut(TableId(1))
+                .unwrap()
+                .btree()
+                .lookup(definition.handle, &ScalarValue::Text("Grace".into()))
+                .unwrap(),
+            inserted
+        );
+
+        database
+            .execute("DELETE FROM users WHERE id = 1")
+            .expect("SQL delete");
+        assert!(
+            database
+                .storage_mut(TableId(1))
+                .unwrap()
+                .btree()
+                .lookup(definition.handle, &ScalarValue::Text("Grace".into()))
+                .unwrap()
+                .is_empty()
+        );
+
+        database
+            .execute("INSERT INTO users (id, name) VALUES (2, 'A')")
+            .expect("first multi-row insert");
+        database
+            .execute("INSERT INTO users (id, name) VALUES (3, 'B')")
+            .expect("second multi-row insert");
+        database
+            .execute("UPDATE users SET name = 'shared' WHERE id >= 2")
+            .expect("multi-row SQL update");
+        assert_eq!(
+            database
+                .storage_mut(TableId(1))
+                .unwrap()
+                .btree()
+                .lookup(definition.handle, &ScalarValue::Text("shared".into()))
+                .unwrap()
+                .len(),
+            2
+        );
+        database
+            .execute("DELETE FROM users WHERE id >= 2")
+            .expect("multi-row SQL delete");
+        assert!(
+            database
+                .storage_mut(TableId(1))
+                .unwrap()
+                .btree()
+                .lookup(definition.handle, &ScalarValue::Text("shared".into()))
+                .unwrap()
+                .is_empty()
+        );
+        database.close().expect("close database");
         let wal = netbadb_storage::wal_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));

@@ -422,6 +422,24 @@ impl<'a> BTree<'a> {
         Ok(rows)
     }
 
+    /// Reports whether one complete `(key, RowId)` leaf identity exists.
+    /// This does not validate whether the referenced heap row is live.
+    pub fn contains_exact(
+        &self,
+        handle: BTreeHandle,
+        key: &ScalarValue,
+        row_id: RowId,
+    ) -> Result<bool, StorageError> {
+        let meta = self.read_meta(handle)?;
+        let entry = IndexEntryKey {
+            key: key.clone(),
+            row_id,
+        };
+        ensure_entry_fits(&meta.spec, &entry, Page::single_payload_capacity())?;
+        let (_, leaf, _) = self.find_leaf_for_entry(&meta, &entry)?;
+        Ok(leaf.contains_exact(&meta.spec, &entry)?)
+    }
+
     /// Reads the physical, nominal, and nullability identity persisted in the
     /// tree's stable metadata page.
     pub fn spec(&self, handle: BTreeHandle) -> Result<IndexSpec, StorageError> {
@@ -964,6 +982,18 @@ mod tests {
                 .lookup(handle, &ScalarValue::Null)
                 .expect("lookup NULL"),
             vec![null_a, null_b]
+        );
+        assert!(
+            storage
+                .btree()
+                .contains_exact(handle, &ScalarValue::UInt64(42), expected[0])
+                .expect("contains exact duplicate")
+        );
+        assert!(
+            !storage
+                .btree()
+                .contains_exact(handle, &ScalarValue::UInt64(42), null_a)
+                .expect("reject mismatched exact identity")
         );
         assert!(matches!(
             storage

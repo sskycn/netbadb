@@ -486,8 +486,8 @@ Delete never allocates or shrinks the file. Removed right pages and old roots
 remain valid but unreachable orphan index pages; reclamation is deferred.
 
 Phase 4C2 deliberately has no sibling redistribution or orphan-page
-reclamation. Uniqueness, automatic heap DML maintenance, SQL index DDL,
-IndexScan, optimizer choice, and statistics remain deferred.
+reclamation. Uniqueness, SQL index DDL, IndexScan, optimizer choice, and
+statistics remain deferred.
 
 ## Persistent index registry
 
@@ -512,8 +512,16 @@ creates the tree, materializes the current live heap rows, backfills every
 typed `(value, RowId)` entry, and writes the catalog registration as the final
 logical mutation. Only a successful durable commit updates the in-memory
 registry, so crashes or errors before commit leave no visible partial index.
-Phase 4D1 does not maintain registered indexes for later INSERT, UPDATE, or
-DELETE operations; that atomic DML integration is Phase 4D2.
+For every committed live Heap row and every registered index, exactly one leaf
+entry `(row[column], current RowId)` exists. Raw B+Trees are outside this
+invariant. INSERT publishes the Heap row before registered-index inserts in
+persistent creation order. DELETE removes registered entries in creation order
+before tombstoning the Heap row. UPDATE changes an index exactly when its key
+or the physical RowId changes, always deleting the old exact identity before
+inserting the new one. All operations share the caller's transaction, buffer
+pool, WAL, and prevLSN chain. Pure key-size and exact old-entry preflight run
+while holding the single-writer lease before the first physical mutation; any
+later failure marks the transaction `RollbackRequired`.
 
 ## Transaction and WAL boundary
 
@@ -714,7 +722,7 @@ The current model is single-writer, STEAL, NO-FORCE, WAL-protected, and supports
 synchronous physical runtime rollback plus startup crash recovery. `abort` is
 an alias for that rollback operation. Reads have no snapshot or visibility
 isolation and may observe active-writer pages. There is no MVCC, fuzzy
-checkpoint, B+Tree, concurrent writer queue, or cross-process writer lock.
+checkpoint, concurrent writer queue, or cross-process writer lock.
 
 ## Checkpoint and WAL lifecycle
 
