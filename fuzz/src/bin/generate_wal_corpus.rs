@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use netbadb_index::{
-    BTreeHandle, IndexCatalogNode, IndexDefinition, IndexEntry, IndexSpec, InternalNode,
-    InternalSeparator, LeafNode, MetaNode, encode_index_catalog, encode_internal, encode_leaf,
-    encode_meta,
+    BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexEntry, IndexSpec,
+    IndexStatistics, InternalNode, InternalSeparator, LeafNode, MetaNode, TableStatistics,
+    encode_index_catalog, encode_internal, encode_leaf, encode_meta,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::{
@@ -59,27 +59,76 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(output.join("empty"), [])?;
     let empty = encode_index_catalog(&IndexCatalogNode::empty())?;
     std::fs::write(output.join("valid-empty-catalog"), &empty)?;
+    std::fs::write(
+        output.join("valid-analyzed-root"),
+        encode_index_catalog(&IndexCatalogNode {
+            next_catalog: None,
+            table_statistics: Some(TableStatistics {
+                row_count: 10,
+                managed_page_count: 4,
+            }),
+            entries: vec![],
+        })?,
+    )?;
     let one = encode_index_catalog(&IndexCatalogNode {
         next_catalog: None,
-        definitions: vec![IndexDefinition {
-            column_id: ColumnId(1),
-            handle: BTreeHandle {
-                meta_page: PageId(3),
+        table_statistics: None,
+        entries: vec![IndexCatalogEntry {
+            definition: IndexDefinition {
+                column_id: ColumnId(1),
+                handle: BTreeHandle {
+                    meta_page: PageId(3),
+                },
             },
+            statistics: None,
         }],
     })?;
     std::fs::write(output.join("valid-one-entry"), &one)?;
+    std::fs::write(output.join("valid-missing-stats-entry"), &one)?;
+    std::fs::write(output.join("valid-continuation-page"), &one)?;
+    std::fs::write(
+        output.join("valid-analyzed-index-entry"),
+        encode_index_catalog(&IndexCatalogNode {
+            next_catalog: None,
+            table_statistics: Some(TableStatistics {
+                row_count: 10,
+                managed_page_count: 4,
+            }),
+            entries: vec![IndexCatalogEntry {
+                definition: IndexDefinition {
+                    column_id: ColumnId(1),
+                    handle: BTreeHandle {
+                        meta_page: PageId(3),
+                    },
+                },
+                statistics: Some(IndexStatistics {
+                    distinct_non_null_keys: 8,
+                    null_count: 2,
+                    tree_height: 2,
+                }),
+            }],
+        })?,
+    )?;
     std::fs::write(
         output.join("valid-catalog-with-next"),
         encode_index_catalog(&IndexCatalogNode {
             next_catalog: Some(PageId(9)),
-            definitions: vec![],
+            table_statistics: None,
+            entries: vec![],
         })?,
     )?;
     std::fs::write(output.join("truncated"), &one[..one.len() - 1])?;
     let mut bad_count = empty;
     bad_count[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
     std::fs::write(output.join("bad-count"), bad_count)?;
+    let mut version_one = Vec::new();
+    version_one.extend_from_slice(b"NBIC");
+    version_one.extend_from_slice(&1_u16.to_le_bytes());
+    version_one.extend_from_slice(&0_u16.to_le_bytes());
+    version_one.extend_from_slice(&0_u64.to_le_bytes());
+    version_one.extend_from_slice(&0_u32.to_le_bytes());
+    version_one.extend_from_slice(&0_u32.to_le_bytes());
+    std::fs::write(output.join("unsupported-v1"), version_one)?;
     Ok(())
 }
 

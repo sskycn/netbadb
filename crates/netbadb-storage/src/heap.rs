@@ -4,8 +4,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use netbadb_index::{
-    IndexCatalogNode, IndexDefinition, IndexError, IndexSpec, decode_index_catalog,
-    encode_index_catalog, ensure_key_fits,
+    IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexError, IndexSpec, IndexStatistics,
+    TableStatistics, decode_index_catalog, encode_index_catalog, ensure_key_fits,
+    validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{ColumnId, PageId, RowId, ScalarValue, SlotId};
@@ -42,6 +43,8 @@ pub struct HeapStorage {
     transactions: TransactionManager,
     indexes: Vec<IndexDefinition>,
     index_plans: Vec<RegisteredIndexPlan>,
+    table_statistics: Option<TableStatistics>,
+    index_statistics: Vec<Option<IndexStatistics>>,
     index_catalog_root: PageId,
     #[cfg(test)]
     skip_drop_flush: bool,
@@ -55,6 +58,8 @@ pub struct HeapStorage {
     index_catalog_payload_capacity: Option<usize>,
     #[cfg(test)]
     fail_registered_mutation_after: Option<usize>,
+    #[cfg(test)]
+    fail_analyze_after_catalog_updates: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +76,13 @@ struct PreparedInsert {
     after: Page,
     slot_ref: SlotRef,
     new_page: bool,
+}
+
+#[derive(Debug)]
+struct PreparedCatalogUpdate {
+    page_id: PageId,
+    before: Page,
+    after: Page,
 }
 
 impl PreparedInsert {
@@ -151,6 +163,8 @@ impl HeapStorage {
             transactions,
             indexes: Vec::new(),
             index_plans: Vec::new(),
+            table_statistics: None,
+            index_statistics: Vec::new(),
             index_catalog_root: FIRST_MANAGED_PAGE,
             #[cfg(test)]
             skip_drop_flush: false,
@@ -164,6 +178,8 @@ impl HeapStorage {
             index_catalog_payload_capacity: None,
             #[cfg(test)]
             fail_registered_mutation_after: None,
+            #[cfg(test)]
+            fail_analyze_after_catalog_updates: None,
         })
     }
 
@@ -218,6 +234,8 @@ impl HeapStorage {
             transactions,
             indexes: Vec::new(),
             index_plans: Vec::new(),
+            table_statistics: None,
+            index_statistics: Vec::new(),
             index_catalog_root: catalog_root,
             #[cfg(test)]
             skip_drop_flush: false,
@@ -231,8 +249,16 @@ impl HeapStorage {
             index_catalog_payload_capacity: None,
             #[cfg(test)]
             fail_registered_mutation_after: None,
+            #[cfg(test)]
+            fail_analyze_after_catalog_updates: None,
         };
-        storage.indexes = storage.load_index_registry(catalog_root)?;
+        let (table_statistics, entries) = storage.load_index_registry(catalog_root)?;
+        storage.table_statistics = table_statistics;
+        storage.indexes = entries
+            .iter()
+            .map(|entry| entry.definition.clone())
+            .collect();
+        storage.index_statistics = entries.iter().map(|entry| entry.statistics).collect();
         storage.index_plans = storage.build_registered_index_plans()?;
         Ok(storage)
     }
@@ -249,6 +275,21 @@ impl HeapStorage {
         self.indexes
             .iter()
             .find(|definition| definition.column_id == column_id)
+    }
+
+    /// Returns the last explicit `ANALYZE` snapshot, if one has been recorded.
+    #[must_use]
+    pub fn table_statistics(&self) -> Option<TableStatistics> {
+        self.table_statistics
+    }
+
+    /// Returns one registered index's last explicit `ANALYZE` snapshot.
+    #[must_use]
+    pub fn index_statistics(&self, column_id: ColumnId) -> Option<IndexStatistics> {
+        self.indexes
+            .iter()
+            .position(|definition| definition.column_id == column_id)
+            .and_then(|position| self.index_statistics.get(position).copied().flatten())
     }
 
     /// Atomically builds a non-unique single-column index over all currently
@@ -314,6 +355,7 @@ impl HeapStorage {
                 let definition = plan.definition.clone();
                 self.indexes.push(definition.clone());
                 self.index_plans.push(plan);
+                self.index_statistics.push(None);
                 Ok(definition)
             }
             Err(error) => match transaction.rollback() {
@@ -323,17 +365,207 @@ impl HeapStorage {
         }
     }
 
+    /// Replaces optimizer statistics with one explicit, transactionally
+    /// persisted snapshot of the current heap and all registered indexes.
+    /// Ordinary DML intentionally leaves this snapshot unchanged.
+    pub fn analyze(&mut self) -> Result<(), StorageError> {
+        let mut transaction = self.begin_transaction()?;
+        transaction.acquire_writer()?;
+        let result = (|| {
+            let managed_page_count = self
+                .buffer
+                .page_count()
+                .checked_sub(1)
+                .ok_or(IndexError::LengthOverflow)?;
+            if managed_page_count == 0 {
+                return Err(IndexError::InvalidManagedPageCount(0).into());
+            }
+
+            let index_inputs = self
+                .index_plans
+                .iter()
+                .map(|plan| (plan.column_position, plan.definition.handle))
+                .collect::<Vec<_>>();
+            let rows = self.scan()?;
+            let row_count = u64::try_from(rows.len()).map_err(|_| IndexError::LengthOverflow)?;
+            let mut distinct = (0..index_inputs.len())
+                .map(|_| HashSet::new())
+                .collect::<Vec<HashSet<ScalarValue>>>();
+            let mut null_counts = vec![0_u64; index_inputs.len()];
+            for (_, values) in rows {
+                for (position, (column_position, _)) in index_inputs.iter().enumerate() {
+                    let value =
+                        values
+                            .get(*column_position)
+                            .ok_or(StorageError::InvalidRowLength {
+                                expected: self.table.columns.len(),
+                                actual: values.len(),
+                            })?;
+                    if matches!(value, ScalarValue::Null) {
+                        null_counts[position] = null_counts[position]
+                            .checked_add(1)
+                            .ok_or(IndexError::LengthOverflow)?;
+                    } else {
+                        distinct[position].insert(value.clone());
+                    }
+                }
+            }
+
+            let table_statistics = TableStatistics {
+                row_count,
+                managed_page_count,
+            };
+            let mut index_statistics = Vec::with_capacity(index_inputs.len());
+            for ((_, handle), (keys, null_count)) in index_inputs
+                .iter()
+                .zip(distinct.into_iter().zip(null_counts))
+            {
+                let statistics = IndexStatistics {
+                    distinct_non_null_keys: u64::try_from(keys.len())
+                        .map_err(|_| IndexError::LengthOverflow)?,
+                    null_count,
+                    tree_height: self.btree().height(*handle)?,
+                };
+                validate_catalog_index_statistics(Some(&table_statistics), &statistics)?;
+                index_statistics.push(statistics);
+            }
+            self.rewrite_catalog_statistics(&mut transaction, table_statistics, &index_statistics)?;
+            Ok((table_statistics, index_statistics))
+        })();
+
+        match result {
+            Ok((table_statistics, index_statistics)) => {
+                transaction.commit()?;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::AnalyzeAfterCommit,
+                );
+                self.table_statistics = Some(table_statistics);
+                self.index_statistics = index_statistics.into_iter().map(Some).collect();
+                Ok(())
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
+        }
+    }
+
+    fn rewrite_catalog_statistics(
+        &mut self,
+        transaction: &mut Transaction,
+        table_statistics: TableStatistics,
+        index_statistics: &[IndexStatistics],
+    ) -> Result<(), StorageError> {
+        if index_statistics.len() != self.indexes.len() {
+            return Err(crate::invalid_format(
+                "index statistics count does not match the registry",
+            ));
+        }
+        let page_count = self.buffer.page_count();
+        let mut page_id = self.index_catalog_root;
+        let mut visited = HashSet::new();
+        let mut index_position = 0_usize;
+        let mut root = true;
+        let mut updates = Vec::new();
+        loop {
+            if !visited.insert(page_id) || visited.len() as u64 > page_count {
+                return Err(IndexError::CatalogCycle { page_id }.into());
+            }
+            let page = self.buffer.read_page(page_id)?;
+            if page.page().header()?.page_type != PageType::IndexCatalog {
+                return Err(IndexError::InvalidNodeType.into());
+            }
+            let before = page.page().clone();
+            let mut node =
+                decode_index_catalog(page.page().single_payload(PageType::IndexCatalog)?)?;
+            drop(page);
+            node.table_statistics = root.then_some(table_statistics);
+            for entry in &mut node.entries {
+                let expected = self.indexes.get(index_position).ok_or_else(|| {
+                    crate::invalid_format("catalog contains more indexes than the registry cache")
+                })?;
+                if entry.definition != *expected {
+                    return Err(IndexError::CatalogSpecMismatch {
+                        column_id: entry.definition.column_id,
+                    }
+                    .into());
+                }
+                entry.statistics = Some(index_statistics[index_position]);
+                index_position += 1;
+            }
+            let next_catalog = node.next_catalog;
+            let mut after = before.clone();
+            after.replace_single_payload(PageType::IndexCatalog, &encode_index_catalog(&node)?)?;
+            updates.push(PreparedCatalogUpdate {
+                page_id,
+                before,
+                after,
+            });
+            root = false;
+            match next_catalog {
+                Some(next) => {
+                    if next.0 == 0 || next.0 >= page_count {
+                        return Err(IndexError::InvalidChild(next).into());
+                    }
+                    page_id = next;
+                }
+                None => break,
+            }
+        }
+        if index_position != index_statistics.len() {
+            return Err(crate::invalid_format(
+                "catalog contains fewer indexes than the registry cache",
+            ));
+        }
+
+        for (completed, mut update) in updates.into_iter().enumerate() {
+            self.maybe_fail_analyze(transaction, completed);
+            if let Err(error) = transaction.log_page_update(&update.before, &mut update.after) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+            if let Err(error) = self.publish_page_image(update.page_id, update.after) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+        }
+        #[cfg(test)]
+        if crate::crash_test::is_enabled(
+            crate::crash_test::TestCrashPoint::AnalyzeAfterCatalogPublish,
+        ) {
+            self.buffer.flush_all()?;
+            crate::crash_test::maybe_crash(
+                crate::crash_test::TestCrashPoint::AnalyzeAfterCatalogPublish,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_analyze(&mut self, transaction: &Transaction, completed: usize) {
+        if self.fail_analyze_after_catalog_updates == Some(completed) {
+            self.fail_analyze_after_catalog_updates = None;
+            transaction.inject_partial_append_failure(0);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_fail_analyze(&mut self, _transaction: &Transaction, _completed: usize) {}
+
     fn load_index_registry(
         &mut self,
         root_page: PageId,
-    ) -> Result<Vec<IndexDefinition>, StorageError> {
+    ) -> Result<(Option<TableStatistics>, Vec<IndexCatalogEntry>), StorageError> {
         let page_count = self.buffer.page_count();
         if root_page.0 == 0 || root_page.0 >= page_count {
             return Err(IndexError::InvalidChild(root_page).into());
         }
         let mut page_id = root_page;
         let mut visited = HashSet::new();
-        let mut definitions: Vec<IndexDefinition> = Vec::new();
+        let mut table_statistics = None;
+        let mut entries: Vec<IndexCatalogEntry> = Vec::new();
+        let mut root = true;
         loop {
             if !visited.insert(page_id) || visited.len() as u64 > page_count {
                 return Err(IndexError::CatalogCycle { page_id }.into());
@@ -344,10 +576,16 @@ impl HeapStorage {
             }
             let node = decode_index_catalog(page.page().single_payload(PageType::IndexCatalog)?)?;
             drop(page);
-            for definition in node.definitions {
-                if definitions
+            if root {
+                table_statistics = node.table_statistics;
+            } else if node.table_statistics.is_some() {
+                return Err(IndexError::TableStatisticsOnContinuation { page_id }.into());
+            }
+            for entry in node.entries {
+                let definition = &entry.definition;
+                if entries
                     .iter()
-                    .any(|existing| existing.column_id == definition.column_id)
+                    .any(|existing| existing.definition.column_id == definition.column_id)
                 {
                     return Err(IndexError::DuplicateRegisteredColumn {
                         column_id: definition.column_id,
@@ -370,8 +608,12 @@ impl HeapStorage {
                     }
                     .into());
                 }
-                definitions.push(definition);
+                if let Some(statistics) = entry.statistics.as_ref() {
+                    validate_catalog_index_statistics(table_statistics.as_ref(), statistics)?;
+                }
+                entries.push(entry);
             }
+            root = false;
             match node.next_catalog {
                 Some(next) => {
                     if next.0 == 0 || next.0 >= page_count {
@@ -382,7 +624,7 @@ impl HeapStorage {
                 None => break,
             }
         }
-        Ok(definitions)
+        Ok((table_statistics, entries))
     }
 
     fn append_index_definition(
@@ -415,7 +657,10 @@ impl HeapStorage {
             }
         };
 
-        tail_node.definitions.push(definition.clone());
+        tail_node.entries.push(IndexCatalogEntry {
+            definition: definition.clone(),
+            statistics: None,
+        });
         let payload = encode_index_catalog(&tail_node)?;
         if payload.len() <= self.index_catalog_payload_capacity() {
             let mut after = tail_page.clone();
@@ -441,11 +686,15 @@ impl HeapStorage {
             return Ok(());
         }
 
-        tail_node.definitions.pop();
+        tail_node.entries.pop();
         let new_page_id = PageId(page_count);
         let new_node = IndexCatalogNode {
             next_catalog: None,
-            definitions: vec![definition.clone()],
+            table_statistics: None,
+            entries: vec![IndexCatalogEntry {
+                definition: definition.clone(),
+                statistics: None,
+            }],
         };
         let mut new_after = Page::new(new_page_id, PageType::IndexCatalog);
         new_after
@@ -1511,8 +1760,8 @@ mod tests {
         WalManager, WalRecordKind, wal_alternate_path, wal_path,
     };
     use netbadb_index::{
-        BTreeHandle, IndexCatalogNode, IndexError, IndexSpec, decode_index_catalog,
-        encode_index_catalog,
+        BTreeHandle, IndexCatalogNode, IndexError, IndexSpec, IndexStatistics, TableStatistics,
+        decode_index_catalog, encode_index_catalog,
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, Lsn, PageId, PhysicalType, ScalarValue, SemanticType, TableId};
@@ -1645,11 +1894,27 @@ mod tests {
             .expect("catalog payload")
             .to_vec();
         assert_eq!(u32::from_le_bytes(payload[16..20].try_into().unwrap()), 1);
-        let entry = payload[24..36].to_vec();
+        let entry = payload[48..88].to_vec();
         payload[16..20].copy_from_slice(&2_u32.to_le_bytes());
         payload.extend_from_slice(&entry);
         page.replace_single_payload(PageType::IndexCatalog, &payload)
             .expect("replace duplicate catalog payload");
+        page.refresh_checksum();
+        pages.write_page(&page).expect("write catalog root");
+        pages.sync().expect("sync catalog root");
+    }
+
+    fn remove_root_table_statistics(path: &std::path::Path) {
+        let mut pages = PageManager::open(path).expect("open catalog pages");
+        let mut page = pages.read_page(PageId(1)).expect("read catalog root");
+        let mut payload = page
+            .single_payload(PageType::IndexCatalog)
+            .expect("catalog payload")
+            .to_vec();
+        payload[6] = 0;
+        payload[24..40].fill(0);
+        page.replace_single_payload(PageType::IndexCatalog, &payload)
+            .expect("replace catalog payload");
         page.refresh_checksum();
         pages.write_page(&page).expect("write catalog root");
         pages.sync().expect("sync catalog root");
@@ -1731,6 +1996,216 @@ mod tests {
             vec![row_ids[0], row_ids[1], later]
         );
         reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn analyze_persists_snapshot_statistics_and_dml_leaves_them_stale() {
+        let path = test_path("analyze-statistics");
+        cleanup(&path);
+        let schema = indexed_table();
+        let mut storage = HeapStorage::create_with_buffer_pool_size(&path, schema.clone(), 1)
+            .expect("create heap");
+        assert_eq!(storage.table_statistics(), None);
+        for row in indexed_rows() {
+            storage.insert(&row).expect("insert analyzed row");
+        }
+        let team = storage.create_index(ColumnId(2)).expect("team index");
+        assert_eq!(storage.index_statistics(ColumnId(2)), None);
+
+        storage.analyze().expect("analyze table");
+        let first_table = storage.table_statistics().expect("table statistics");
+        assert_eq!(first_table.row_count, 4);
+        assert_eq!(
+            first_table.managed_page_count,
+            storage.buffer.page_count() - 1
+        );
+        let first_team = storage
+            .index_statistics(ColumnId(2))
+            .expect("team statistics");
+        assert_eq!(
+            first_team,
+            IndexStatistics {
+                distinct_non_null_keys: 2,
+                null_count: 1,
+                tree_height: storage.btree().height(team.handle).expect("tree height"),
+            }
+        );
+
+        storage
+            .insert(&[
+                ScalarValue::UInt64(5),
+                ScalarValue::UInt64(30),
+                ScalarValue::Text("E".into()),
+            ])
+            .expect("make statistics stale");
+        assert_eq!(storage.table_statistics(), Some(first_table));
+        assert_eq!(storage.index_statistics(ColumnId(2)), Some(first_team));
+
+        storage.create_index(ColumnId(3)).expect("name index");
+        assert_eq!(storage.table_statistics(), Some(first_table));
+        assert_eq!(storage.index_statistics(ColumnId(2)), Some(first_team));
+        assert_eq!(storage.index_statistics(ColumnId(3)), None);
+
+        storage.analyze().expect("refresh statistics");
+        assert_eq!(storage.table_statistics().unwrap().row_count, 5);
+        assert_eq!(
+            storage
+                .index_statistics(ColumnId(2))
+                .unwrap()
+                .distinct_non_null_keys,
+            3
+        );
+        assert_eq!(
+            storage
+                .index_statistics(ColumnId(3))
+                .unwrap()
+                .distinct_non_null_keys,
+            5
+        );
+        let expected_table = storage.table_statistics();
+        let expected_team = storage.index_statistics(ColumnId(2));
+        let expected_name = storage.index_statistics(ColumnId(3));
+        storage.checkpoint().expect("checkpoint statistics");
+        storage.close().expect("close analyzed heap");
+
+        let reopened = HeapStorage::open_with_buffer_pool_size(&path, schema, 1)
+            .expect("reopen analyzed heap");
+        assert_eq!(reopened.table_statistics(), expected_table);
+        assert_eq!(reopened.index_statistics(ColumnId(2)), expected_team);
+        assert_eq!(reopened.index_statistics(ColumnId(3)), expected_name);
+        reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn analyze_rewrites_multi_page_catalog_once_and_rolls_back_partial_failure() {
+        let path = test_path("analyze-multi-page-rollback");
+        cleanup(&path);
+        let schema = indexed_table();
+        let mut storage = HeapStorage::create_with_buffer_pool_size(&path, schema.clone(), 1)
+            .expect("create heap");
+        storage.index_catalog_payload_capacity = Some(88);
+        for row in indexed_rows() {
+            storage.insert(&row).expect("insert row");
+        }
+        storage.create_index(ColumnId(2)).expect("first index");
+        storage.create_index(ColumnId(3)).expect("overflow index");
+        storage.analyze().expect("initial analyze");
+        let old_table = storage.table_statistics();
+        let old_team = storage.index_statistics(ColumnId(2));
+        let old_name = storage.index_statistics(ColumnId(3));
+
+        storage
+            .insert(&[
+                ScalarValue::UInt64(5),
+                ScalarValue::UInt64(30),
+                ScalarValue::Text("E".into()),
+            ])
+            .expect("change distribution");
+        storage.fail_analyze_after_catalog_updates = Some(1);
+        storage.analyze().expect_err("second catalog log must fail");
+        assert_eq!(storage.table_statistics(), old_table);
+        assert_eq!(storage.index_statistics(ColumnId(2)), old_team);
+        assert_eq!(storage.index_statistics(ColumnId(3)), old_name);
+        storage.close().expect("close rolled-back heap");
+
+        let reopened = HeapStorage::open_with_buffer_pool_size(&path, schema, 1)
+            .expect("reopen rolled-back statistics");
+        assert_eq!(reopened.table_statistics(), old_table);
+        assert_eq!(reopened.index_statistics(ColumnId(2)), old_team);
+        assert_eq!(reopened.index_statistics(ColumnId(3)), old_name);
+        reopened.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn analyze_empty_table_records_table_and_index_zero_cardinality() {
+        let path = test_path("analyze-empty");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
+        storage.index_catalog_payload_capacity = Some(88);
+        storage.create_index(ColumnId(2)).expect("create index");
+        storage
+            .create_index(ColumnId(3))
+            .expect("create overflow index");
+        storage.analyze().expect("analyze empty table");
+        assert_eq!(storage.table_statistics().unwrap().row_count, 0);
+        assert_eq!(
+            storage.index_statistics(ColumnId(2)),
+            Some(IndexStatistics {
+                distinct_non_null_keys: 0,
+                null_count: 0,
+                tree_height: 1,
+            })
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn catalog_rejects_index_statistics_without_root_table_statistics() {
+        let path = test_path("catalog-index-stats-without-table-stats");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
+        storage
+            .insert(&indexed_rows()[0])
+            .expect("insert analyzed row");
+        storage.create_index(ColumnId(2)).expect("create index");
+        storage.analyze().expect("analyze catalog");
+        storage.close().expect("close catalog");
+        remove_root_table_statistics(&path);
+        assert!(matches!(
+            HeapStorage::open(&path, indexed_table()),
+            Err(StorageError::Index(IndexError::MissingTableStatistics))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn catalog_rejects_table_statistics_on_a_continuation_page() {
+        let path = test_path("catalog-table-stats-on-continuation");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
+        storage.index_catalog_payload_capacity = Some(88);
+        storage.create_index(ColumnId(2)).expect("first index");
+        storage.create_index(ColumnId(3)).expect("overflow index");
+        storage.close().expect("close catalog");
+
+        let mut pages = PageManager::open(&path).expect("open catalog pages");
+        let root = pages.read_page(PageId(1)).expect("read catalog root");
+        let root_node = decode_index_catalog(
+            root.single_payload(PageType::IndexCatalog)
+                .expect("root payload"),
+        )
+        .expect("decode root");
+        let continuation = root_node.next_catalog.expect("continuation page");
+        let mut page = pages.read_page(continuation).expect("read continuation");
+        let mut node = decode_index_catalog(
+            page.single_payload(PageType::IndexCatalog)
+                .expect("continuation payload"),
+        )
+        .expect("decode continuation");
+        node.table_statistics = Some(TableStatistics {
+            row_count: 0,
+            managed_page_count: pages.page_count() - 1,
+        });
+        page.replace_single_payload(
+            PageType::IndexCatalog,
+            &encode_index_catalog(&node).expect("encode corrupt continuation"),
+        )
+        .expect("replace continuation");
+        page.refresh_checksum();
+        pages.write_page(&page).expect("write continuation");
+        pages.sync().expect("sync continuation");
+        drop(pages);
+
+        assert!(matches!(
+            HeapStorage::open(&path, indexed_table()),
+            Err(StorageError::Index(
+                IndexError::TableStatisticsOnContinuation { .. }
+            ))
+        ));
         cleanup(&path);
     }
 
@@ -2357,6 +2832,17 @@ mod tests {
                 .height
                 >= 3
         );
+        storage.analyze().expect("analyze deep index");
+        assert_eq!(
+            storage
+                .index_statistics(ColumnId(1))
+                .expect("deep index statistics")
+                .tree_height,
+            storage
+                .btree()
+                .height(definition.handle)
+                .expect("read analyzed height")
+        );
         for (key, row_id) in expected.iter().step_by(7) {
             assert_eq!(
                 storage
@@ -2397,9 +2883,9 @@ mod tests {
                 duplicate_first_catalog_entry(&path);
             } else {
                 rewrite_catalog(&path, |node| match case {
-                    "unknown-column" => node.definitions[0].column_id = ColumnId(99),
+                    "unknown-column" => node.entries[0].definition.column_id = ColumnId(99),
                     "wrong-handle" => {
-                        node.definitions[0].handle = BTreeHandle {
+                        node.entries[0].definition.handle = BTreeHandle {
                             meta_page: FIRST_HEAP_PAGE,
                         };
                     }
@@ -2457,7 +2943,7 @@ mod tests {
             })
             .expect("create mismatched raw tree");
         storage.close().expect("close heap");
-        rewrite_catalog(&path, |node| node.definitions[0].handle = raw);
+        rewrite_catalog(&path, |node| node.entries[0].definition.handle = raw);
         assert!(matches!(
             HeapStorage::open(&path, indexed_table()),
             Err(StorageError::Index(IndexError::CatalogSpecMismatch {
@@ -4942,6 +5428,11 @@ mod tests {
                     .expect("commit index build");
                 crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
+            "analyze-loser" | "analyze-winner" => {
+                let mut storage =
+                    HeapStorage::open(path, indexed_table()).expect("open analyzed heap");
+                storage.analyze().expect("analyze until crash point");
+            }
             "registered-insert-loser" => {
                 let mut storage =
                     HeapStorage::open(path, indexed_table()).expect("open registered heap");
@@ -5111,6 +5602,65 @@ mod tests {
         assert!(reopened.indexes().is_empty());
         assert_eq!(reopened.scan().expect("scan index loser heap").len(), 4);
         reopened.close().expect("close recovered index loser");
+    }
+
+    fn prepare_analyze_crash_baseline(case: &str) -> std::path::PathBuf {
+        let path = test_path(case);
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
+        storage.index_catalog_payload_capacity = Some(88);
+        for row in indexed_rows() {
+            storage.insert(&row).expect("insert baseline row");
+        }
+        storage.create_index(ColumnId(2)).expect("create index");
+        storage
+            .create_index(ColumnId(3))
+            .expect("create overflow index");
+        storage.analyze().expect("record old statistics");
+        storage
+            .insert(&[
+                ScalarValue::UInt64(5),
+                ScalarValue::UInt64(30),
+                ScalarValue::Text("E".into()),
+            ])
+            .expect("make old statistics stale");
+        storage.close().expect("close analyze baseline");
+        path
+    }
+
+    fn assert_analyze_recovery(path: &std::path::Path, expected_rows: u64) {
+        let mut reopened = HeapStorage::open(path, indexed_table()).expect("recover analyze");
+        assert_eq!(reopened.scan().expect("scan unchanged heap").len(), 5);
+        assert_eq!(
+            reopened
+                .table_statistics()
+                .expect("persisted statistics")
+                .row_count,
+            expected_rows
+        );
+        reopened.close().expect("close recovered analyze");
+    }
+
+    #[test]
+    fn process_crash_analyze_loser_restores_old_statistics() {
+        let path = prepare_analyze_crash_baseline("process-crash-analyze-loser");
+        spawn_crash_child(
+            &path,
+            "analyze-loser",
+            TestCrashPoint::AnalyzeAfterCatalogPublish,
+        );
+        assert_analyze_recovery(&path, 4);
+        assert_analyze_recovery(&path, 4);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn process_crash_analyze_winner_redoes_new_statistics() {
+        let path = prepare_analyze_crash_baseline("process-crash-analyze-winner");
+        spawn_crash_child(&path, "analyze-winner", TestCrashPoint::AnalyzeAfterCommit);
+        assert_analyze_recovery(&path, 5);
+        assert_analyze_recovery(&path, 5);
+        cleanup(&path);
     }
 
     #[test]

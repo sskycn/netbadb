@@ -446,6 +446,12 @@ impl<'a> BTree<'a> {
         Ok(self.read_meta(handle)?.spec)
     }
 
+    /// Returns the persisted number of tree levels without exposing metadata
+    /// page representation to callers.
+    pub fn height(&self, handle: BTreeHandle) -> Result<u32, StorageError> {
+        Ok(self.read_meta(handle)?.height)
+    }
+
     pub(crate) fn read_meta(&self, handle: BTreeHandle) -> Result<MetaNode, StorageError> {
         self.validate_child(handle.meta_page)?;
         let page = self.storage.buffer().read_page(handle.meta_page)?;

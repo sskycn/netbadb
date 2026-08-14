@@ -6,13 +6,17 @@ use std::path::{Path, PathBuf};
 
 use netbadb_compiler::{CompileError, compile_statement};
 use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages};
-use netbadb_planner::{IndexAccessPath, PhysicalStatement, plan_statement_with_access_paths};
+use netbadb_planner::{
+    IndexAccessPath, PhysicalStatement, TableAccessStatistics, plan_statement_with_statistics,
+};
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{HeapStorage, StorageError, TransactionError};
 use netbadb_types::{ColumnId, ScalarValue, TableId};
 
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
-pub use netbadb_storage::{IndexDefinition, Transaction, TransactionState};
+pub use netbadb_storage::{
+    IndexDefinition, IndexStatistics, TableStatistics, Transaction, TransactionState,
+};
 
 #[derive(Debug)]
 pub enum DatabaseError {
@@ -260,6 +264,13 @@ impl Database {
         Ok(self.storage(table_id)?.indexes())
     }
 
+    /// Persists a fresh optimizer snapshot for one table and all of its
+    /// registered indexes. DML does not maintain this snapshot automatically.
+    pub fn analyze(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        self.storage_mut(table_id)?.analyze()?;
+        Ok(())
+    }
+
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
         for storage in self.storages {
@@ -340,11 +351,23 @@ impl Database {
 
     fn plan_source(&self, source: &str) -> Result<PhysicalStatement, DatabaseError> {
         let compiled = compile_statement(&self.schema, source)?;
+        let table_statistics = self.planner_table_statistics();
         let access_paths = self.planner_access_paths();
-        Ok(plan_statement_with_access_paths(
+        Ok(plan_statement_with_statistics(
             &compiled.logical_statement,
+            &table_statistics,
             &access_paths,
         ))
+    }
+
+    fn planner_table_statistics(&self) -> Vec<TableAccessStatistics> {
+        self.storages
+            .iter()
+            .map(|storage| TableAccessStatistics {
+                table_id: storage.table().id,
+                statistics: storage.table_statistics(),
+            })
+            .collect()
     }
 
     fn planner_access_paths(&self) -> Vec<IndexAccessPath> {
@@ -359,6 +382,7 @@ impl Database {
                         table_id,
                         column_id: definition.column_id,
                         handle: definition.handle,
+                        statistics: storage.index_statistics(definition.column_id),
                     })
             })
             .collect()
@@ -962,6 +986,98 @@ mod tests {
                 .expect("query reopened text index")
                 .rows,
             vec![vec![ScalarValue::Int64(1)]]
+        );
+        reopened.close().expect("close reopened database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn analyze_changes_access_path_costs_while_stale_statistics_preserve_results() {
+        let path =
+            std::env::temp_dir().join(format!("netbadb-core-analyze-{}", std::process::id()));
+        let schema = indexed_table();
+        let mut database = Database::create(&path, schema.clone()).expect("create database");
+        for id_value in 0..80_i64 {
+            database
+                .insert(&[
+                    ScalarValue::Int64(id_value),
+                    ScalarValue::Int64(id_value % 2),
+                    ScalarValue::Text(format!("user-{id_value:03}-{}", "x".repeat(500))),
+                    ScalarValue::Bool(true),
+                ])
+                .expect("insert cost row");
+        }
+        let team = database
+            .create_index(TableId(9), ColumnId(2))
+            .expect("create duplicate-heavy index");
+        let id = database
+            .create_index(TableId(9), ColumnId(1))
+            .expect("create selective index");
+
+        let source = "SELECT name FROM members WHERE team_id = 0 AND id = 42";
+        assert_eq!(
+            planned_statement_index(&database.plan_source(source).expect("fallback plan")),
+            Some((team.handle.meta_page, &ScalarValue::Int64(0)))
+        );
+        database.analyze(TableId(9)).expect("analyze table");
+        assert_eq!(
+            planned_statement_index(&database.plan_source(source).expect("costed plan")),
+            Some((id.handle.meta_page, &ScalarValue::Int64(42)))
+        );
+
+        assert_eq!(
+            affected(
+                database
+                    .execute("UPDATE members SET id = 1 WHERE active = true")
+                    .expect("change indexed distribution")
+            ),
+            80
+        );
+        let stale_source = "SELECT name FROM members WHERE team_id = 0 AND id = 1";
+        assert_eq!(
+            planned_statement_index(
+                &database
+                    .plan_source(stale_source)
+                    .expect("stale statistics plan")
+            ),
+            Some((id.handle.meta_page, &ScalarValue::Int64(1)))
+        );
+        assert_eq!(
+            database
+                .query(stale_source)
+                .expect("query through stale plan")
+                .rows
+                .len(),
+            40
+        );
+
+        database.analyze(TableId(9)).expect("refresh statistics");
+        assert!(
+            planned_statement_index(&database.plan_source(stale_source).expect("refreshed plan"))
+                .is_none()
+        );
+        assert_eq!(
+            database
+                .query(stale_source)
+                .expect("query through refreshed plan")
+                .rows
+                .len(),
+            40
+        );
+        database.checkpoint().expect("checkpoint statistics");
+        database.close().expect("close database");
+
+        let reopened = Database::open(&path, schema).expect("reopen database");
+        assert!(
+            planned_statement_index(
+                &reopened
+                    .plan_source(stale_source)
+                    .expect("reopened costed plan")
+            )
+            .is_none()
         );
         reopened.close().expect("close reopened database");
         let wal = netbadb_storage::wal_path(&path);

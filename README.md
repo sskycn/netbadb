@@ -171,6 +171,8 @@ The current code genuinely supports:
 - a persistent append-only index registry plus atomic existing-row backfill,
   reopen discovery, automatic Heap/registered-index DML maintenance, and
   `TableId`/`ColumnId` embedded APIs;
+- explicit `Database::analyze` optimizer snapshots with persisted table/index
+  statistics and deterministic point-access cost selection;
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
@@ -188,6 +190,11 @@ rather than guessed or migrated. Files created by
 the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-3 layout and is not a
 checksummed Page v5 data page.
+
+IndexCatalog payload version 2 stores optional table and per-index optimizer
+statistics in explicit fixed-width little-endian fields. Version 1 is rejected
+without migration. These values are snapshots created only by explicit
+`ANALYZE`; ordinary DML deliberately does not update or invalidate them.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`. Creation uses create-new semantics and refuses to
@@ -344,13 +351,19 @@ full build; reopen discovers and validates the mapping. Later Heap and SQL DML
 maintains all registered indexes in the same transaction and propagates every
 RowId relocation. Raw B+Trees remain independent. Raw BTree lookup alone does
 not validate referenced Heap rows or enforce uniqueness, and SQL index DDL
-remains deferred. Core maps only registered definitions into an ordered,
-read-only planner access-path snapshot. Eligible
+remains deferred. Core maps registered definitions and their cached optimizer
+snapshots into an ordered, read-only planner context. Eligible
 `column = non-NULL literal`, commuted equality, and nullable `column IS NULL`
 predicates use exact point `IndexScan`;
 the executor then fetches complete Heap rows by generation-safe RowId. The
-original SQL Filter remains above every IndexScan. Range access, index joins,
-index-only scans, and cost-based selection remain deferred.
+original SQL Filter remains above every IndexScan. Without statistics, the
+first eligible registered index still wins. With statistics, SeqScan costs
+`managed_page_count`, point IndexScan costs
+`1 + tree_height + estimated_matches`, equality uses average non-NULL
+frequency, and `IS NULL` uses `null_count`. SeqScan wins an equal cost; equal
+index costs preserve registration order. Stale snapshots can change only plan
+choice and performance, never query semantics. Range access, index joins, and
+index-only scans remain deferred.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -487,12 +500,13 @@ The implementation sequence is intentionally vertical:
     (Phase 4D1) — complete.
 17. Atomic heap/index DML maintenance (Phase 4D2) — complete.
 18. Deterministic registered-index point IndexScan (Phase 4E) — complete.
-19. Statistics and cost-based access-path selection (Phase 4F).
+19. Explicit ANALYZE statistics and deterministic cost-based point access-path
+    selection (Phase 4F) — complete.
 20. Server mode — protocol, sessions, and `netbadbd`.
 21. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-22. Advanced optimization — statistics, cost model, and rewrite rules.
+22. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
-Isolation/MVCC, cost-based index planning, server networking,
+Isolation/MVCC, range/index-join planning, server networking,
 and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

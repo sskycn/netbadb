@@ -34,6 +34,8 @@ pub(crate) enum TestCrashPoint {
     IndexBuildBeforeCatalogLog,
     IndexBuildAfterCatalogLog,
     IndexBuildAfterCatalogPublish,
+    AnalyzeAfterCatalogPublish,
+    AnalyzeAfterCommit,
     RegisteredInsertAfterHeapPublish,
     RegisteredUpdateAfterHeapPublish,
     RegisteredDeleteAfterFirstIndexPublish,
@@ -63,6 +65,8 @@ impl TestCrashPoint {
             Self::IndexBuildBeforeCatalogLog => "index-build-before-catalog-log",
             Self::IndexBuildAfterCatalogLog => "index-build-after-catalog-log",
             Self::IndexBuildAfterCatalogPublish => "index-build-after-catalog-publish",
+            Self::AnalyzeAfterCatalogPublish => "analyze-after-catalog-publish",
+            Self::AnalyzeAfterCommit => "analyze-after-commit",
             Self::RegisteredInsertAfterHeapPublish => "registered-insert-after-heap-publish",
             Self::RegisteredUpdateAfterHeapPublish => "registered-update-after-heap-publish",
             Self::RegisteredDeleteAfterFirstIndexPublish => {

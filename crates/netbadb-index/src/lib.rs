@@ -10,7 +10,7 @@ use std::fmt;
 use netbadb_types::{ColumnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType};
 
 pub const BTREE_FORMAT_VERSION: u16 = 1;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 1;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 2;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -19,8 +19,8 @@ const NODE_HEADER_SIZE: usize = COMMON_HEADER_SIZE + 4 + 8;
 const ROW_ID_SIZE: usize = 8 + 2 + 4;
 const MIN_ENTRY_SIZE: usize = 1 + ROW_ID_SIZE;
 const INDEX_CATALOG_MAGIC: &[u8; 4] = b"NBIC";
-const INDEX_CATALOG_HEADER_SIZE: usize = 24;
-const INDEX_DEFINITION_SIZE: usize = 12;
+const INDEX_CATALOG_HEADER_SIZE: usize = 48;
+const INDEX_CATALOG_ENTRY_SIZE: usize = 40;
 
 /// Persistent physical/nominal key identity and NULL acceptance for one tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,14 +42,37 @@ pub struct IndexDefinition {
     pub handle: BTreeHandle,
 }
 
+/// Optimizer snapshot for one table at the last explicit `ANALYZE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableStatistics {
+    pub row_count: u64,
+    pub managed_page_count: u64,
+}
+
+/// Optimizer snapshot for one registered index at the last explicit `ANALYZE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStatistics {
+    pub distinct_non_null_keys: u64,
+    pub null_count: u64,
+    pub tree_height: u32,
+}
+
+/// One registered-index identity plus its optional optimizer snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCatalogEntry {
+    pub definition: IndexDefinition,
+    pub statistics: Option<IndexStatistics>,
+}
+
 /// One append-only page in the persistent index registry chain.
 ///
-/// The version-1 `NBIC` payload uses a 24-byte header followed by fixed
-/// little-endian 12-byte `(ColumnId u32, BTree meta PageId u64)` entries.
+/// The version-2 `NBIC` payload uses a fixed-width little-endian header and
+/// fixed-width entries. Storage validates root/continuation-page invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
     pub next_catalog: Option<PageId>,
-    pub definitions: Vec<IndexDefinition>,
+    pub table_statistics: Option<TableStatistics>,
+    pub entries: Vec<IndexCatalogEntry>,
 }
 
 impl IndexCatalogNode {
@@ -57,7 +80,8 @@ impl IndexCatalogNode {
     pub fn empty() -> Self {
         Self {
             next_catalog: None,
-            definitions: Vec::new(),
+            table_statistics: None,
+            entries: Vec::new(),
         }
     }
 }
@@ -120,6 +144,7 @@ pub enum IndexError {
     InvalidPhysicalType(u8),
     InvalidNullable(u8),
     InvalidSemanticNamePresence(u8),
+    InvalidStatisticsPresence(u8),
     InvalidValueTag(u8),
     InvalidBoolean(u8),
     InvalidUtf8,
@@ -172,8 +197,21 @@ pub enum IndexError {
     CatalogCycle {
         page_id: PageId,
     },
+    TableStatisticsOnContinuation {
+        page_id: PageId,
+    },
     CatalogSpecMismatch {
         column_id: ColumnId,
+    },
+    MissingTableStatistics,
+    InvalidManagedPageCount(u64),
+    InvalidNullCount {
+        null_count: u64,
+        row_count: u64,
+    },
+    InvalidDistinctCount {
+        distinct_non_null_keys: u64,
+        non_null_rows: u64,
     },
 }
 
@@ -205,6 +243,9 @@ impl fmt::Display for IndexError {
             }
             Self::InvalidSemanticNamePresence(value) => {
                 write!(formatter, "invalid semantic-name presence flag {value}")
+            }
+            Self::InvalidStatisticsPresence(value) => {
+                write!(formatter, "invalid statistics presence flag {value}")
             }
             Self::InvalidValueTag(tag) => write!(formatter, "invalid index value tag {tag}"),
             Self::InvalidBoolean(value) => write!(formatter, "invalid index boolean {value}"),
@@ -286,10 +327,35 @@ impl fmt::Display for IndexError {
                     page_id.0
                 )
             }
+            Self::TableStatisticsOnContinuation { page_id } => write!(
+                formatter,
+                "index catalog continuation page {} contains table statistics",
+                page_id.0
+            ),
             Self::CatalogSpecMismatch { column_id } => write!(
                 formatter,
                 "registered index spec does not match column {}",
                 column_id.0
+            ),
+            Self::MissingTableStatistics => {
+                formatter.write_str("index statistics require table statistics")
+            }
+            Self::InvalidManagedPageCount(count) => {
+                write!(formatter, "invalid managed page count {count}")
+            }
+            Self::InvalidNullCount {
+                null_count,
+                row_count,
+            } => write!(
+                formatter,
+                "index NULL count {null_count} exceeds table row count {row_count}"
+            ),
+            Self::InvalidDistinctCount {
+                distinct_non_null_keys,
+                non_null_rows,
+            } => write!(
+                formatter,
+                "index distinct non-NULL count {distinct_non_null_keys} is invalid for {non_null_rows} non-NULL rows"
             ),
         }
     }
@@ -772,36 +838,69 @@ pub fn merge_internals_if_fits(
     Ok((payload.len() <= capacity).then_some(merged))
 }
 
-/// Encodes one explicit version-1 append-only index catalog page payload.
+/// Encodes one explicit version-2 append-only index catalog page payload.
 pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
     if let Some(next) = node.next_catalog {
         validate_child(next)?;
     }
-    validate_catalog_definitions(&node.definitions)?;
-    let count = u32::try_from(node.definitions.len()).map_err(|_| IndexError::LengthOverflow)?;
+    if let Some(statistics) = node.table_statistics {
+        validate_table_statistics(&statistics)?;
+        for entry in &node.entries {
+            if let Some(index_statistics) = entry.statistics {
+                validate_index_statistics(&statistics, &index_statistics)?;
+            }
+        }
+    } else {
+        for entry in &node.entries {
+            if let Some(statistics) = entry.statistics {
+                validate_index_statistics_intrinsic(&statistics)?;
+            }
+        }
+    }
+    validate_catalog_entries(&node.entries)?;
+    let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
     let capacity = INDEX_CATALOG_HEADER_SIZE
         .checked_add(
-            node.definitions
+            node.entries
                 .len()
-                .checked_mul(INDEX_DEFINITION_SIZE)
+                .checked_mul(INDEX_CATALOG_ENTRY_SIZE)
                 .ok_or(IndexError::LengthOverflow)?,
         )
         .ok_or(IndexError::LengthOverflow)?;
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(INDEX_CATALOG_MAGIC);
     output.extend_from_slice(&INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
-    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.push(u8::from(node.table_statistics.is_some()));
+    output.push(0);
     output.extend_from_slice(&node.next_catalog.map_or(0, |page| page.0).to_le_bytes());
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&0_u32.to_le_bytes());
-    for definition in &node.definitions {
-        output.extend_from_slice(&definition.column_id.0.to_le_bytes());
-        output.extend_from_slice(&definition.handle.meta_page.0.to_le_bytes());
+    let table_statistics = node.table_statistics.unwrap_or(TableStatistics {
+        row_count: 0,
+        managed_page_count: 0,
+    });
+    output.extend_from_slice(&table_statistics.row_count.to_le_bytes());
+    output.extend_from_slice(&table_statistics.managed_page_count.to_le_bytes());
+    output.extend_from_slice(&0_u64.to_le_bytes());
+    for entry in &node.entries {
+        output.extend_from_slice(&entry.definition.column_id.0.to_le_bytes());
+        output.push(u8::from(entry.statistics.is_some()));
+        output.extend_from_slice(&[0; 3]);
+        output.extend_from_slice(&entry.definition.handle.meta_page.0.to_le_bytes());
+        let statistics = entry.statistics.unwrap_or(IndexStatistics {
+            distinct_non_null_keys: 0,
+            null_count: 0,
+            tree_height: 0,
+        });
+        output.extend_from_slice(&statistics.distinct_non_null_keys.to_le_bytes());
+        output.extend_from_slice(&statistics.null_count.to_le_bytes());
+        output.extend_from_slice(&statistics.tree_height.to_le_bytes());
+        output.extend_from_slice(&0_u32.to_le_bytes());
     }
     Ok(output)
 }
 
-/// Decodes and validates one bounded version-1 index catalog page payload.
+/// Decodes and validates one bounded version-2 index catalog page payload.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -816,7 +915,11 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
     if version != INDEX_CATALOG_FORMAT_VERSION {
         return Err(IndexError::UnsupportedVersion(version));
     }
-    if input[6..8].iter().any(|byte| *byte != 0) || input[20..24].iter().any(|byte| *byte != 0) {
+    let table_statistics_present = decode_statistics_presence(input[6])?;
+    if input[7] != 0
+        || input[20..24].iter().any(|byte| *byte != 0)
+        || input[40..48].iter().any(|byte| *byte != 0)
+    {
         return Err(IndexError::InvalidReservedBytes);
     }
     let raw_next = u64::from_le_bytes(input[8..16].try_into().map_err(|_| IndexError::Truncated)?);
@@ -829,7 +932,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
     let expected = INDEX_CATALOG_HEADER_SIZE
         .checked_add(
             count
-                .checked_mul(INDEX_DEFINITION_SIZE)
+                .checked_mul(INDEX_CATALOG_ENTRY_SIZE)
                 .ok_or(IndexError::LengthOverflow)?,
         )
         .ok_or(IndexError::LengthOverflow)?;
@@ -839,36 +942,156 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
     if input.len() != expected {
         return Err(IndexError::ExtraBytes);
     }
-    let mut definitions = Vec::with_capacity(count);
-    for chunk in input[INDEX_CATALOG_HEADER_SIZE..].chunks_exact(INDEX_DEFINITION_SIZE) {
+    let raw_table_statistics = TableStatistics {
+        row_count: u64::from_le_bytes(
+            input[24..32]
+                .try_into()
+                .map_err(|_| IndexError::Truncated)?,
+        ),
+        managed_page_count: u64::from_le_bytes(
+            input[32..40]
+                .try_into()
+                .map_err(|_| IndexError::Truncated)?,
+        ),
+    };
+    let table_statistics = if table_statistics_present {
+        validate_table_statistics(&raw_table_statistics)?;
+        Some(raw_table_statistics)
+    } else {
+        if raw_table_statistics.row_count != 0 || raw_table_statistics.managed_page_count != 0 {
+            return Err(IndexError::InvalidReservedBytes);
+        }
+        None
+    };
+    let mut entries = Vec::with_capacity(count);
+    for chunk in input[INDEX_CATALOG_HEADER_SIZE..].chunks_exact(INDEX_CATALOG_ENTRY_SIZE) {
         let column_id = ColumnId(u32::from_le_bytes(
             chunk[..4].try_into().map_err(|_| IndexError::Truncated)?,
         ));
+        let statistics_present = decode_statistics_presence(chunk[4])?;
+        if chunk[5..8].iter().any(|byte| *byte != 0) || chunk[36..40].iter().any(|byte| *byte != 0)
+        {
+            return Err(IndexError::InvalidReservedBytes);
+        }
         let meta_page = PageId(u64::from_le_bytes(
-            chunk[4..].try_into().map_err(|_| IndexError::Truncated)?,
+            chunk[8..16].try_into().map_err(|_| IndexError::Truncated)?,
         ));
         validate_child(meta_page)?;
-        definitions.push(IndexDefinition {
-            column_id,
-            handle: BTreeHandle { meta_page },
+        let raw_statistics = IndexStatistics {
+            distinct_non_null_keys: u64::from_le_bytes(
+                chunk[16..24]
+                    .try_into()
+                    .map_err(|_| IndexError::Truncated)?,
+            ),
+            null_count: u64::from_le_bytes(
+                chunk[24..32]
+                    .try_into()
+                    .map_err(|_| IndexError::Truncated)?,
+            ),
+            tree_height: u32::from_le_bytes(
+                chunk[32..36]
+                    .try_into()
+                    .map_err(|_| IndexError::Truncated)?,
+            ),
+        };
+        let statistics = if statistics_present {
+            validate_index_statistics_intrinsic(&raw_statistics)?;
+            if let Some(table_statistics) = table_statistics.as_ref() {
+                validate_index_statistics(table_statistics, &raw_statistics)?;
+            }
+            Some(raw_statistics)
+        } else {
+            if raw_statistics.distinct_non_null_keys != 0
+                || raw_statistics.null_count != 0
+                || raw_statistics.tree_height != 0
+            {
+                return Err(IndexError::InvalidReservedBytes);
+            }
+            None
+        };
+        entries.push(IndexCatalogEntry {
+            definition: IndexDefinition {
+                column_id,
+                handle: BTreeHandle { meta_page },
+            },
+            statistics,
         });
     }
-    validate_catalog_definitions(&definitions)?;
+    validate_catalog_entries(&entries)?;
     Ok(IndexCatalogNode {
         next_catalog,
-        definitions,
+        table_statistics,
+        entries,
     })
 }
 
-fn validate_catalog_definitions(definitions: &[IndexDefinition]) -> Result<(), IndexError> {
-    for (position, definition) in definitions.iter().enumerate() {
-        validate_child(definition.handle.meta_page)?;
-        if definitions[..position]
+fn decode_statistics_presence(value: u8) -> Result<bool, IndexError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(IndexError::InvalidStatisticsPresence(other)),
+    }
+}
+
+/// Validates the table-level invariants of one persisted optimizer snapshot.
+pub fn validate_table_statistics(statistics: &TableStatistics) -> Result<(), IndexError> {
+    if statistics.managed_page_count == 0 {
+        return Err(IndexError::InvalidManagedPageCount(0));
+    }
+    Ok(())
+}
+
+/// Validates one index snapshot against the table snapshot from the root page.
+pub fn validate_index_statistics(
+    table: &TableStatistics,
+    index: &IndexStatistics,
+) -> Result<(), IndexError> {
+    validate_table_statistics(table)?;
+    validate_index_statistics_intrinsic(index)?;
+    if index.null_count > table.row_count {
+        return Err(IndexError::InvalidNullCount {
+            null_count: index.null_count,
+            row_count: table.row_count,
+        });
+    }
+    let non_null_rows = table.row_count - index.null_count;
+    if index.distinct_non_null_keys > non_null_rows
+        || (non_null_rows == 0 && index.distinct_non_null_keys != 0)
+        || (non_null_rows > 0 && index.distinct_non_null_keys == 0)
+    {
+        return Err(IndexError::InvalidDistinctCount {
+            distinct_non_null_keys: index.distinct_non_null_keys,
+            non_null_rows,
+        });
+    }
+    Ok(())
+}
+
+/// Validates that an index snapshot belongs to a catalog with table statistics.
+pub fn validate_catalog_index_statistics(
+    table: Option<&TableStatistics>,
+    index: &IndexStatistics,
+) -> Result<(), IndexError> {
+    let table = table.ok_or(IndexError::MissingTableStatistics)?;
+    validate_index_statistics(table, index)
+}
+
+fn validate_index_statistics_intrinsic(statistics: &IndexStatistics) -> Result<(), IndexError> {
+    if statistics.tree_height == 0 {
+        return Err(IndexError::InvalidHeight(0));
+    }
+    Ok(())
+}
+
+fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), IndexError> {
+    for (position, entry) in entries.iter().enumerate() {
+        validate_child(entry.definition.handle.meta_page)?;
+        if entries[..position]
             .iter()
-            .any(|existing| existing.column_id == definition.column_id)
+            .any(|existing| existing.definition.column_id == entry.definition.column_id)
         {
             return Err(IndexError::DuplicateRegisteredColumn {
-                column_id: definition.column_id,
+                column_id: entry.definition.column_id,
             });
         }
     }
@@ -1372,11 +1595,22 @@ mod tests {
     fn index_catalog_codec_round_trips_and_rejects_corruption() {
         let node = IndexCatalogNode {
             next_catalog: Some(PageId(9)),
-            definitions: vec![IndexDefinition {
-                column_id: ColumnId(7),
-                handle: BTreeHandle {
-                    meta_page: PageId(11),
+            table_statistics: Some(TableStatistics {
+                row_count: 10,
+                managed_page_count: 4,
+            }),
+            entries: vec![IndexCatalogEntry {
+                definition: IndexDefinition {
+                    column_id: ColumnId(7),
+                    handle: BTreeHandle {
+                        meta_page: PageId(11),
+                    },
                 },
+                statistics: Some(IndexStatistics {
+                    distinct_non_null_keys: 8,
+                    null_count: 2,
+                    tree_height: 2,
+                }),
             }],
         };
         let bytes = encode_index_catalog(&node).unwrap();
@@ -1400,10 +1634,10 @@ mod tests {
             Err(IndexError::InvalidMagic { .. })
         ));
         let mut old_version = bytes.clone();
-        old_version[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        old_version[4..6].copy_from_slice(&1_u16.to_le_bytes());
         assert_eq!(
             decode_index_catalog(&old_version),
-            Err(IndexError::UnsupportedVersion(0))
+            Err(IndexError::UnsupportedVersion(1))
         );
         let mut impossible_count = bytes.clone();
         impossible_count[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1412,20 +1646,83 @@ mod tests {
             Err(IndexError::Truncated | IndexError::LengthOverflow)
         ));
         let mut zero_handle = bytes.clone();
-        zero_handle[28..36].fill(0);
+        zero_handle[56..64].fill(0);
         assert_eq!(
             decode_index_catalog(&zero_handle),
             Err(IndexError::InvalidChild(PageId(0)))
         );
         let duplicate = IndexCatalogNode {
             next_catalog: None,
-            definitions: vec![node.definitions[0].clone(), node.definitions[0].clone()],
+            table_statistics: node.table_statistics,
+            entries: vec![node.entries[0].clone(), node.entries[0].clone()],
         };
         assert_eq!(
             encode_index_catalog(&duplicate),
             Err(IndexError::DuplicateRegisteredColumn {
                 column_id: ColumnId(7)
             })
+        );
+
+        let mut invalid_table_flag = bytes.clone();
+        invalid_table_flag[6] = 2;
+        assert_eq!(
+            decode_index_catalog(&invalid_table_flag),
+            Err(IndexError::InvalidStatisticsPresence(2))
+        );
+        let mut invalid_index_flag = bytes.clone();
+        invalid_index_flag[52] = 3;
+        assert_eq!(
+            decode_index_catalog(&invalid_index_flag),
+            Err(IndexError::InvalidStatisticsPresence(3))
+        );
+        let mut entry_reserved = bytes.clone();
+        entry_reserved[53] = 1;
+        assert_eq!(
+            decode_index_catalog(&entry_reserved),
+            Err(IndexError::InvalidReservedBytes)
+        );
+        let mut zero_managed_pages = bytes.clone();
+        zero_managed_pages[32..40].fill(0);
+        assert_eq!(
+            decode_index_catalog(&zero_managed_pages),
+            Err(IndexError::InvalidManagedPageCount(0))
+        );
+        let mut null_overflow = bytes.clone();
+        null_overflow[72..80].copy_from_slice(&11_u64.to_le_bytes());
+        assert_eq!(
+            decode_index_catalog(&null_overflow),
+            Err(IndexError::InvalidNullCount {
+                null_count: 11,
+                row_count: 10
+            })
+        );
+        let mut distinct_overflow = bytes.clone();
+        distinct_overflow[64..72].copy_from_slice(&9_u64.to_le_bytes());
+        assert_eq!(
+            decode_index_catalog(&distinct_overflow),
+            Err(IndexError::InvalidDistinctCount {
+                distinct_non_null_keys: 9,
+                non_null_rows: 8
+            })
+        );
+        let mut zero_distinct = bytes.clone();
+        zero_distinct[64..72].fill(0);
+        assert_eq!(
+            decode_index_catalog(&zero_distinct),
+            Err(IndexError::InvalidDistinctCount {
+                distinct_non_null_keys: 0,
+                non_null_rows: 8
+            })
+        );
+        let mut zero_height = bytes.clone();
+        zero_height[80..84].fill(0);
+        assert_eq!(
+            decode_index_catalog(&zero_height),
+            Err(IndexError::InvalidHeight(0))
+        );
+        assert_eq!(
+            validate_catalog_index_statistics(None, &node.entries[0].statistics.unwrap()),
+            Err(IndexError::MissingTableStatistics)
         );
     }
 

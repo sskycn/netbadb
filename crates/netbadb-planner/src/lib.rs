@@ -1,6 +1,6 @@
 //! Physical planning kept separate from logical relational meaning.
 
-use netbadb_index::BTreeHandle;
+use netbadb_index::{BTreeHandle, IndexStatistics, TableStatistics};
 use netbadb_rel::{
     AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind, LogicalPlan,
     LogicalStatement, OutputField, SortKey,
@@ -9,13 +9,21 @@ use netbadb_types::{ColumnId, RelationBindingId, ScalarValue, TableId};
 
 /// One registered point-lookup capability available to physical planning.
 ///
-/// Callers preserve their desired priority in the slice order. The planner
-/// deliberately receives no storage objects or statistics through this type.
+/// Callers preserve registration order in the slice. The planner receives
+/// immutable domain snapshots, never storage objects or catalog pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexAccessPath {
     pub table_id: TableId,
     pub column_id: ColumnId,
     pub handle: BTreeHandle,
+    pub statistics: Option<IndexStatistics>,
+}
+
+/// Optional optimizer snapshot for one table visible to physical planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableAccessStatistics {
+    pub table_id: TableId,
+    pub statistics: Option<TableStatistics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +124,17 @@ pub fn plan_with_access_paths(
     logical: &LogicalPlan,
     access_paths: &[IndexAccessPath],
 ) -> PhysicalPlan {
+    plan_with_statistics(logical, &[], access_paths)
+}
+
+/// Selects physical operators using ordered access paths and optional explicit
+/// `ANALYZE` snapshots. Missing table statistics preserve the Phase 4E rule.
+#[must_use]
+pub fn plan_with_statistics(
+    logical: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[IndexAccessPath],
+) -> PhysicalPlan {
     match logical {
         LogicalPlan::Scan {
             binding_id,
@@ -135,8 +154,8 @@ pub fn plan_with_access_paths(
             predicate,
             columns,
         } => PhysicalPlan::NestedLoopJoin {
-            left: Box::new(plan_with_access_paths(left, access_paths)),
-            right: Box::new(plan_with_access_paths(right, access_paths)),
+            left: Box::new(plan_with_statistics(left, table_statistics, access_paths)),
+            right: Box::new(plan_with_statistics(right, table_statistics, access_paths)),
             kind: *kind,
             predicate: predicate.clone(),
             columns: columns.clone(),
@@ -154,10 +173,11 @@ pub fn plan_with_access_paths(
                     *table_id,
                     table_name,
                     columns,
+                    table_statistics,
                     access_paths,
                 )
-                .unwrap_or_else(|| plan_with_access_paths(input, access_paths)),
-                _ => plan_with_access_paths(input, access_paths),
+                .unwrap_or_else(|| plan_with_statistics(input, table_statistics, access_paths)),
+                _ => plan_with_statistics(input, table_statistics, access_paths),
             };
             PhysicalPlan::Filter {
                 input: Box::new(input),
@@ -165,11 +185,11 @@ pub fn plan_with_access_paths(
             }
         }
         LogicalPlan::Sort { input, keys } => PhysicalPlan::Sort {
-            input: Box::new(plan_with_access_paths(input, access_paths)),
+            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
             keys: keys.clone(),
         },
         LogicalPlan::Project { input, columns } => PhysicalPlan::Project {
-            input: Box::new(plan_with_access_paths(input, access_paths)),
+            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
             columns: columns.clone(),
         },
         LogicalPlan::Aggregate {
@@ -177,12 +197,12 @@ pub fn plan_with_access_paths(
             group_keys,
             outputs,
         } => PhysicalPlan::Aggregate {
-            input: Box::new(plan_with_access_paths(input, access_paths)),
+            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
             group_keys: group_keys.clone(),
             outputs: outputs.clone(),
         },
         LogicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
-            input: Box::new(plan_with_access_paths(input, access_paths)),
+            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
             limit: *limit,
         },
     }
@@ -194,24 +214,101 @@ fn choose_point_index(
     table_id: TableId,
     table_name: &str,
     columns: &[ColumnRef],
+    table_statistics: &[TableAccessStatistics],
     access_paths: &[IndexAccessPath],
 ) -> Option<PhysicalPlan> {
-    access_paths.iter().find_map(|access_path| {
-        if access_path.table_id != table_id {
-            return None;
-        }
-        let (index_column, key) =
-            find_point_constraint(predicate, binding_id, table_id, access_path.column_id)?;
-        Some(PhysicalPlan::IndexScan {
-            binding_id,
-            table_id,
-            table_name: table_name.to_owned(),
-            columns: columns.to_vec(),
-            index_column,
-            handle: access_path.handle,
-            key,
+    let eligible = access_paths
+        .iter()
+        .filter_map(|access_path| {
+            if access_path.table_id != table_id {
+                return None;
+            }
+            let (index_column, key) =
+                find_point_constraint(predicate, binding_id, table_id, access_path.column_id)?;
+            Some((access_path, index_column, key))
         })
+        .collect::<Vec<_>>();
+    let first = eligible.first()?;
+    let analyzed_table = table_statistics
+        .iter()
+        .find(|entry| entry.table_id == table_id)
+        .and_then(|entry| entry.statistics.as_ref());
+    let selected = match analyzed_table {
+        None => first,
+        Some(table) => {
+            let mut best: Option<(&(&IndexAccessPath, ColumnRef, ScalarValue), u128)> = None;
+            for candidate in &eligible {
+                let Some(index) = candidate.0.statistics.as_ref() else {
+                    continue;
+                };
+                let Some(cost) = index_scan_cost(table, index, &candidate.2) else {
+                    continue;
+                };
+                if best.is_none_or(|(_, best_cost)| cost < best_cost) {
+                    best = Some((candidate, cost));
+                }
+            }
+            let Some((candidate, cost)) = best else {
+                return build_index_scan(first, binding_id, table_id, table_name, columns);
+            };
+            if cost >= seq_scan_cost(table) {
+                return None;
+            }
+            candidate
+        }
+    };
+    build_index_scan(selected, binding_id, table_id, table_name, columns)
+}
+
+fn build_index_scan(
+    candidate: &(&IndexAccessPath, ColumnRef, ScalarValue),
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    table_name: &str,
+    columns: &[ColumnRef],
+) -> Option<PhysicalPlan> {
+    Some(PhysicalPlan::IndexScan {
+        binding_id,
+        table_id,
+        table_name: table_name.to_owned(),
+        columns: columns.to_vec(),
+        index_column: candidate.1.clone(),
+        handle: candidate.0.handle,
+        key: candidate.2.clone(),
     })
+}
+
+fn seq_scan_cost(statistics: &TableStatistics) -> u128 {
+    u128::from(statistics.managed_page_count)
+}
+
+fn index_scan_cost(
+    table: &TableStatistics,
+    index: &IndexStatistics,
+    key: &ScalarValue,
+) -> Option<u128> {
+    let estimated_matches = estimate_point_rows(table, index, key)?;
+    Some(1 + u128::from(index.tree_height) + estimated_matches)
+}
+
+fn estimate_point_rows(
+    table: &TableStatistics,
+    index: &IndexStatistics,
+    key: &ScalarValue,
+) -> Option<u128> {
+    if matches!(key, ScalarValue::Null) {
+        return Some(u128::from(index.null_count));
+    }
+    let non_null_rows = table.row_count.checked_sub(index.null_count)?;
+    if non_null_rows == 0 {
+        return Some(0);
+    }
+    if index.distinct_non_null_keys == 0 {
+        return None;
+    }
+    let quotient = non_null_rows / index.distinct_non_null_keys;
+    let remainder = non_null_rows % index.distinct_non_null_keys;
+    Some(u128::from(quotient) + u128::from(remainder != 0))
 }
 
 fn find_point_constraint(
@@ -289,9 +386,20 @@ pub fn plan_statement_with_access_paths(
     logical: &LogicalStatement,
     access_paths: &[IndexAccessPath],
 ) -> PhysicalStatement {
+    plan_statement_with_statistics(logical, &[], access_paths)
+}
+
+/// Plans one statement with the same access-path statistics context used for
+/// queries, UPDATE, and DELETE.
+#[must_use]
+pub fn plan_statement_with_statistics(
+    logical: &LogicalStatement,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[IndexAccessPath],
+) -> PhysicalStatement {
     match logical {
         LogicalStatement::Query(query) => {
-            PhysicalStatement::Query(plan_with_access_paths(query, access_paths))
+            PhysicalStatement::Query(plan_with_statistics(query, table_statistics, access_paths))
         }
         LogicalStatement::Insert {
             table_id,
@@ -307,12 +415,12 @@ pub fn plan_statement_with_access_paths(
             table_id,
             assignments,
         } => PhysicalStatement::Update {
-            input: plan_with_access_paths(input, access_paths),
+            input: plan_with_statistics(input, table_statistics, access_paths),
             table_id: *table_id,
             assignments: assignments.clone(),
         },
         LogicalStatement::Delete { input, table_id } => PhysicalStatement::Delete {
-            input: plan_with_access_paths(input, access_paths),
+            input: plan_with_statistics(input, table_statistics, access_paths),
             table_id: *table_id,
         },
     }
@@ -321,10 +429,11 @@ pub fn plan_statement_with_access_paths(
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexAccessPath, PhysicalPlan, PhysicalStatement, plan, plan_statement,
-        plan_statement_with_access_paths, plan_with_access_paths,
+        IndexAccessPath, PhysicalPlan, PhysicalStatement, TableAccessStatistics, plan,
+        plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
+        plan_with_access_paths, plan_with_statistics,
     };
-    use netbadb_index::BTreeHandle;
+    use netbadb_index::{BTreeHandle, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
     use netbadb_types::{
         ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
@@ -595,6 +704,33 @@ mod tests {
             handle: BTreeHandle {
                 meta_page: PageId(page_id),
             },
+            statistics: None,
+        }
+    }
+
+    fn analyzed_path(
+        column_id: u32,
+        page_id: u64,
+        distinct_non_null_keys: u64,
+        null_count: u64,
+        tree_height: u32,
+    ) -> IndexAccessPath {
+        let mut path = access_path(column_id, page_id);
+        path.statistics = Some(IndexStatistics {
+            distinct_non_null_keys,
+            null_count,
+            tree_height,
+        });
+        path
+    }
+
+    fn analyzed_table(row_count: u64, managed_page_count: u64) -> TableAccessStatistics {
+        TableAccessStatistics {
+            table_id: TableId(1),
+            statistics: Some(TableStatistics {
+                row_count,
+                managed_page_count,
+            }),
         }
     }
 
@@ -760,6 +896,192 @@ mod tests {
                 key: ScalarValue::Int64(10),
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn analyzed_costs_compare_point_indexes_with_sequence_scan() {
+        let id = test_column(1, "id", false);
+        let predicate = binary(
+            BinaryOp::Eq,
+            column_expr(&id),
+            literal(ScalarValue::Int64(42)),
+        );
+        let logical = filtered_scan(predicate, vec![id]);
+
+        let small = plan_with_statistics(
+            &logical,
+            &[analyzed_table(1, 3)],
+            &[analyzed_path(1, 40, 1, 0, 1)],
+        );
+        assert!(matches!(
+            index_scan_input(&small),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+
+        let selective = plan_with_statistics(
+            &logical,
+            &[analyzed_table(1_000, 100)],
+            &[analyzed_path(1, 40, 1_000, 0, 1)],
+        );
+        assert!(matches!(
+            index_scan_input(&selective),
+            Some(PhysicalPlan::IndexScan { .. })
+        ));
+
+        let duplicate_heavy = plan_with_statistics(
+            &logical,
+            &[analyzed_table(1_000, 10)],
+            &[analyzed_path(1, 40, 2, 0, 1)],
+        );
+        assert!(matches!(
+            index_scan_input(&duplicate_heavy),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+    }
+
+    #[test]
+    fn analyzed_null_cost_uses_null_count() {
+        let nullable = test_column(2, "team_id", true);
+        let logical = filtered_scan(
+            Expr {
+                kind: ExprKind::IsNull {
+                    expression: Box::new(column_expr(&nullable)),
+                    negated: false,
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            },
+            vec![nullable],
+        );
+        let sparse = plan_with_statistics(
+            &logical,
+            &[analyzed_table(1_000, 100)],
+            &[analyzed_path(2, 40, 999, 1, 1)],
+        );
+        assert!(matches!(
+            index_scan_input(&sparse),
+            Some(PhysicalPlan::IndexScan { .. })
+        ));
+        let dense = plan_with_statistics(
+            &logical,
+            &[analyzed_table(1_000, 20)],
+            &[analyzed_path(2, 40, 900, 100, 1)],
+        );
+        assert!(matches!(
+            index_scan_input(&dense),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+    }
+
+    #[test]
+    fn analyzed_candidates_use_cost_then_registration_order_and_ignore_unknowns() {
+        let team = test_column(2, "team_id", false);
+        let name = test_column(3, "name", false);
+        let logical = filtered_scan(
+            binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&team),
+                    literal(ScalarValue::Int64(10)),
+                ),
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&name),
+                    literal(ScalarValue::Int64(9)),
+                ),
+            ),
+            vec![team, name],
+        );
+        let table = [analyzed_table(1_000, 100)];
+        let cheaper_later = plan_with_statistics(
+            &logical,
+            &table,
+            &[
+                analyzed_path(2, 50, 2, 0, 1),
+                analyzed_path(3, 60, 1_000, 0, 1),
+            ],
+        );
+        assert!(matches!(
+            index_scan_input(&cheaper_later),
+            Some(PhysicalPlan::IndexScan {
+                handle: BTreeHandle {
+                    meta_page: PageId(60)
+                },
+                ..
+            })
+        ));
+
+        let tied = plan_with_statistics(
+            &logical,
+            &table,
+            &[
+                analyzed_path(2, 50, 1_000, 0, 1),
+                analyzed_path(3, 60, 1_000, 0, 1),
+            ],
+        );
+        assert!(matches!(
+            index_scan_input(&tied),
+            Some(PhysicalPlan::IndexScan {
+                handle: BTreeHandle {
+                    meta_page: PageId(50)
+                },
+                ..
+            })
+        ));
+
+        let unknown_first = access_path(2, 50);
+        let known_second = analyzed_path(3, 60, 1_000, 0, 1);
+        let partial = plan_with_statistics(&logical, &table, &[unknown_first, known_second]);
+        assert!(matches!(
+            index_scan_input(&partial),
+            Some(PhysicalPlan::IndexScan {
+                handle: BTreeHandle {
+                    meta_page: PageId(60)
+                },
+                ..
+            })
+        ));
+
+        let only_unknown = plan_with_statistics(&logical, &table, &[access_path(2, 50)]);
+        assert!(matches!(
+            index_scan_input(&only_unknown),
+            Some(PhysicalPlan::IndexScan {
+                handle: BTreeHandle {
+                    meta_page: PageId(50)
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dml_uses_the_same_costed_access_path_context() {
+        let id = test_column(1, "id", false);
+        let logical = LogicalStatement::Delete {
+            input: filtered_scan(
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(42)),
+                ),
+                vec![id],
+            ),
+            table_id: TableId(1),
+        };
+        assert!(matches!(
+            plan_statement_with_statistics(
+                &logical,
+                &[analyzed_table(1_000, 3)],
+                &[analyzed_path(1, 40, 1_000, 0, 1)],
+            ),
+            PhysicalStatement::Delete {
+                input: PhysicalPlan::Filter { input, .. },
+                ..
+            } if matches!(*input, PhysicalPlan::SeqScan { .. })
         ));
     }
 

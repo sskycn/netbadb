@@ -106,7 +106,7 @@ left-associated tree:
 
 ```text
 LogicalPlan::Join(left plan, right plan, Inner, typed predicate)
-    ↓ planner (no reordering or cost model)
+    ↓ planner (no join reordering or join cost model)
 PhysicalPlan::NestedLoopJoin(left plan, right plan, typed predicate)
 ```
 
@@ -487,26 +487,60 @@ Delete never allocates or shrinks the file. Removed right pages and old roots
 remain valid but unreachable orphan index pages; reclamation is deferred.
 
 Phase 4C2 deliberately has no sibling redistribution or orphan-page
-reclamation. Uniqueness, SQL index DDL, range lookup, and statistics remain
-deferred.
+reclamation. Uniqueness, SQL index DDL, and range lookup remain deferred.
 
 ## Persistent index registry
 
 Heap metadata v3 points to a fixed `IndexCatalog` root. Catalog pages are
-ordinary checksummed Page v5 single-payload pages containing version-1 `NBIC`
-payloads. They form an append-only, cycle-checked linked chain in creation
-order; each fixed-width little-endian entry maps one `ColumnId` to a stable
-`BTreeHandle` metadata PageId. Overflow logs the new catalog page before the
-old tail link, flushes through both records before extending the file, and
-therefore follows the existing reverse-order rollback contract.
+ordinary checksummed Page v5 single-payload pages containing version-2 `NBIC`
+payloads; v1 is rejected without migration. They form an append-only,
+cycle-checked linked chain in creation order. Overflow logs the new catalog
+page before the old tail link, flushes through both records before extending
+the file, and therefore follows the existing reverse-order rollback contract.
+
+The v2 payload is fixed-width and little-endian:
+
+```text
+header (48 bytes)
+0..4    NBIC magic
+4..6    u16 version (2)
+6       u8 table-statistics presence (0 or 1)
+7       reserved zero
+8..16   u64 next catalog PageId (0 means none)
+16..20  u32 entry count
+20..24  reserved zero
+24..32  u64 row_count (zero when absent)
+32..40  u64 managed_page_count (zero when absent)
+40..48  reserved zero
+
+entry (40 bytes)
+0..4    u32 ColumnId
+4       u8 index-statistics presence (0 or 1)
+5..8    reserved zero
+8..16   u64 BTree metadata PageId
+16..24  u64 distinct_non_null_keys (zero when absent)
+24..32  u64 null_count (zero when absent)
+32..36  u32 tree_height (zero when absent)
+36..40  reserved zero
+```
+
+Only the root may contain table statistics. Index statistics on any page
+require root table statistics. Loading checks nonzero managed-page count, NULL
+count at most row count, a valid distinct count for the non-NULL population,
+and tree height at least one. It deliberately does not compare a persisted
+snapshot with current rows or current tree height.
+
+Phase 4F changes only IndexCatalog v1 to v2. Canonical Schema v1, Heap metadata
+v3, Page v5, BTree payload v1, WAL v3, and WAL record v2 remain unchanged.
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees are never discovered by scanning page
 types. Open follows only the metadata root, rejects cycles, duplicates,
 out-of-range links, and wrong page kinds, then verifies every column against
 the canonical `TableDef` and every BTree metadata `IndexSpec` against that
-column's nominal type and nullability. The validated definitions are cached in
-persistent creation order; roots and heights are deliberately not cached.
+column's nominal type and nullability. Validated definitions and optional
+optimizer snapshots are cached in persistent creation order. BTree roots
+remain uncached; analyzed height is a snapshot, not authoritative metadata.
 
 `HeapStorage::create_index` owns one transaction and single-writer lease. It
 creates the tree, materializes the current live heap rows, backfills every
@@ -524,24 +558,48 @@ pool, WAL, and prevLSN chain. Pure key-size and exact old-entry preflight run
 while holding the single-writer lease before the first physical mutation; any
 later failure marks the transaction `RollbackRequired`.
 
-## Deterministic point IndexScan
+## ANALYZE snapshots and deterministic point IndexScan
 
 Logical plans remain storage-independent: query meaning is still represented
 as `Filter(Scan)`, never as a logical index operator. Core walks table storage
-order and each heap's persistent index-registration order to materialize a
-plain `Vec<IndexAccessPath>`. Each entry contains only `TableId`, `ColumnId`,
-and the stable `BTreeHandle`. The planner depends on the pure `netbadb-index`
-domain crate, not on `netbadb-storage`, and receives no page, WAL, buffer,
-cardinality, or cost state.
+order and each heap's persistent index-registration order to materialize plain
+table/index planning context. Entries contain stable IDs, handles, and optional
+`TableStatistics`/`IndexStatistics` domain values. The planner depends on the
+pure `netbadb-index` domain crate, not on `netbadb-storage`, and receives no
+page, WAL, buffer, or catalog representation.
 
-For a Filter directly above a Scan, the first eligible registered access path
-in that stable order wins. Phase 4E recognizes only `indexed_column = non-NULL
+For a Filter directly above a Scan, Phase 4E recognizes only `indexed_column = non-NULL
 literal`, its commuted form, and `IS NULL` on a nullable indexed column. It may
 search left-to-right through AND because either side is a necessary condition;
 it never descends through OR or NOT. Equality with NULL, IS NOT NULL, ranges,
 column-to-column comparisons, joins, index intersection/union, and full scans
-are not point access paths. This rule is deterministic, not cost-based or a
-selectivity claim.
+are not point access paths.
+
+`HeapStorage::analyze` owns one transaction and writer lease, scans the Heap
+once for all registered indexes, reads each BTree's actual height, rewrites
+every catalog page at most once in root-to-tail WAL order, commits, and only
+then replaces the cache. `Database::analyze(table_id)` exposes that operation.
+Table statistics contain live row count and all managed pages (`page_count -
+1`); index statistics contain distinct non-NULL keys, NULL count, and analyzed
+tree height. DML neither maintains nor invalidates these values. They are
+optimizer snapshots and may become stale.
+
+Without table statistics, or when all eligible indexes lack statistics, the
+first eligible registered path wins exactly as in Phase 4E. With a table
+snapshot, analyzed eligible candidates exclude unknown candidates and are
+compared with SeqScan using integer `u128` page-visit estimates:
+
+```text
+SeqScan             = managed_page_count
+Point IndexScan     = 1 + tree_height + estimated_matches
+equality matches    = ceil((row_count - null_count) / distinct_non_null_keys)
+IS NULL matches     = null_count
+```
+
+IndexScan must be strictly cheaper; a tie selects SeqScan. Equal index costs
+preserve registration order. If the only eligible index is unknown it retains
+the Phase 4E fallback. These choices apply identically to SELECT, UPDATE, and
+DELETE.
 
 The physical shape always retains the complete predicate:
 
@@ -555,9 +613,11 @@ loads every complete Heap row through `HeapStorage::read_row`. A stale,
 deleted, missing, or corrupt locator is an error; execution never hides it by
 falling back to SeqScan. UPDATE and DELETE therefore finish index traversal and
 target materialization before maintaining the same index, avoiding iterator
-invalidation or revisiting newly inserted keys. Index-only scans, range scans,
-index nested-loop joins, sort elimination, and statistics/costing remain
-future work.
+invalidation or revisiting newly inserted keys. Because the complete Filter
+remains, stale statistics can affect performance and plan shape but not query
+semantics. Index-only scans, range scans and costing, histograms/MCVs, index
+intersection/union, index nested-loop joins, join ordering, and sort
+elimination remain future work.
 
 ## Transaction and WAL boundary
 

@@ -202,6 +202,7 @@ join reordering, hash/merge/index join, or multi-table DML.
 - unified typed validation for canonical schemas and table definitions;
 - explicit canonical table-schema encoding version 1 and SHA-256 fingerprint;
 - heap metadata format version 2 originally added persisted schema identity;
+  at that phase metadata remained v2, while the current format is v3;
 - pre-recovery rejection of table-ID and full-schema mismatches;
 - deterministic golden, sensitivity, invalid-schema, and reopen tests.
 
@@ -268,8 +269,16 @@ sorting or aggregation.
   can select deterministic point IndexScan for SELECT/UPDATE/DELETE while the
   full SQL Filter remains responsible for truth semantics and Heap rows are
   fetched by generation-safe RowId;
-- next Phase 4F: catalog statistics and deterministic cost-based access-path
-  selection.
+- Phase 4F complete: explicit `ANALYZE` persists optional table/index optimizer
+  snapshots in IndexCatalog v2 without DML maintenance; deterministic integer
+  page-visit costs compare eligible point indexes with SeqScan, preserve the
+  Phase 4E fallback when statistics are absent, and retain the full Filter so
+  stale snapshots cannot change query semantics.
+
+Phase 4 now provides baseline registered indexing, atomic DML maintenance,
+point IndexScan execution, and point access-path cost planning. Histograms,
+range scans/costing, index intersection/union, join ordering, index nested-loop
+join, sort avoidance, and uniqueness enforcement remain advanced work.
 
 ## Phase 5 — Server and protocol
 
@@ -287,7 +296,7 @@ sorting or aggregation.
 
 ## Phase 7 — Advanced optimization
 
-- statistics and cost model improvements;
+- histograms/MCVs and more sophisticated cost models;
 - predicate rewrites and property inference;
 - join ordering and algorithms;
 - benchmarks before introducing complexity.
