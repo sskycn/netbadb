@@ -242,6 +242,50 @@ pub enum LogicalStatement {
     },
 }
 
+impl LogicalStatement {
+    /// Returns query source tables in logical first-occurrence order.
+    /// Current DML statements report only their mutation target through
+    /// [`Self::write_tables`]; target-row evaluation is part of write access.
+    #[must_use]
+    pub fn read_tables(&self) -> Vec<TableId> {
+        let mut tables = Vec::new();
+        if let Self::Query(plan) = self {
+            collect_scan_tables(plan, &mut tables);
+        }
+        tables
+    }
+
+    /// Returns mutation target tables in logical first-occurrence order.
+    #[must_use]
+    pub fn write_tables(&self) -> Vec<TableId> {
+        match self {
+            Self::Query(_) => Vec::new(),
+            Self::Insert { table_id, .. }
+            | Self::Update { table_id, .. }
+            | Self::Delete { table_id, .. } => vec![*table_id],
+        }
+    }
+}
+
+fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<TableId>) {
+    match plan {
+        LogicalPlan::Scan { table_id, .. } => {
+            if !tables.contains(table_id) {
+                tables.push(*table_id);
+            }
+        }
+        LogicalPlan::Join { left, right, .. } => {
+            collect_scan_tables(left, tables);
+            collect_scan_tables(right, tables);
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Limit { input, .. } => collect_scan_tables(input, tables),
+    }
+}
+
 impl LogicalPlan {
     #[must_use]
     pub fn output_fields(&self) -> Vec<OutputField> {

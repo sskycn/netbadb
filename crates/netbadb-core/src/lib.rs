@@ -18,6 +18,26 @@ pub use netbadb_storage::{
     IndexDefinition, IndexStatistics, TableStatistics, Transaction, TransactionState,
 };
 
+/// Canonical table identities read or written by one successfully compiled SQL
+/// statement. This exposes no syntax, compiler IR, plan, or storage details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementAccess {
+    read_tables: Vec<TableId>,
+    write_tables: Vec<TableId>,
+}
+
+impl StatementAccess {
+    #[must_use]
+    pub fn read_tables(&self) -> &[TableId] {
+        &self.read_tables
+    }
+
+    #[must_use]
+    pub fn write_tables(&self) -> &[TableId] {
+        &self.write_tables
+    }
+}
+
 #[derive(Debug)]
 pub enum DatabaseError {
     Compile(CompileError),
@@ -287,6 +307,16 @@ impl Database {
         Ok(execute_with_storages(&plan, &mut self.storages)?)
     }
 
+    /// Compiles SQL and reports its canonical table access without planning,
+    /// reading rows, starting a transaction, or touching persistent state.
+    pub fn statement_access(&self, source: &str) -> Result<StatementAccess, DatabaseError> {
+        let compiled = compile_statement(&self.schema, source)?;
+        Ok(StatementAccess {
+            read_tables: compiled.logical_statement.read_tables(),
+            write_tables: compiled.logical_statement.write_tables(),
+        })
+    }
+
     /// Executes SELECT or one typed DML statement. DML runs in one implicit
     /// transaction and returns an explicit affected-row count.
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
@@ -477,7 +507,7 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, ExecutionResult, PhysicalStatement, TransactionState};
+    use super::{Database, DatabaseError, ExecutionResult, PhysicalStatement, TransactionState};
     use netbadb_planner::PhysicalPlan;
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
@@ -515,6 +545,18 @@ mod tests {
         )
     }
 
+    fn teams_table() -> TableDef {
+        TableDef::new(
+            TableId(2),
+            "teams",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        )
+    }
+
     fn planned_index(plan: &PhysicalPlan) -> Option<(PageId, &ScalarValue)> {
         match plan {
             PhysicalPlan::IndexScan { handle, key, .. } => Some((handle.meta_page, key)),
@@ -543,6 +585,68 @@ mod tests {
         match result {
             ExecutionResult::AffectedRows(rows) => rows,
             ExecutionResult::Query(_) => panic!("expected affected rows"),
+        }
+    }
+
+    #[test]
+    fn statement_access_uses_typed_logical_table_identity_without_storage_mutation() {
+        let users_path =
+            std::env::temp_dir().join(format!("netbadb-core-access-users-{}", std::process::id()));
+        let teams_path =
+            std::env::temp_dir().join(format!("netbadb-core-access-teams-{}", std::process::id()));
+        let users_wal = netbadb_storage::wal_path(&users_path);
+        let teams_wal = netbadb_storage::wal_path(&teams_path);
+        for path in [&users_path, &users_wal, &teams_path, &teams_wal] {
+            let _ = std::fs::remove_file(path);
+        }
+        let mut database = Database::create_tables(vec![
+            (users_path.clone(), table()),
+            (teams_path.clone(), teams_table()),
+        ])
+        .unwrap();
+
+        let users = database
+            .statement_access("SELECT u.name FROM users u")
+            .unwrap();
+        assert_eq!(users.read_tables(), &[TableId(1)]);
+        assert!(users.write_tables().is_empty());
+
+        let joined = database
+            .statement_access("SELECT u.name FROM users u JOIN teams t ON u.id = t.id")
+            .unwrap();
+        assert_eq!(joined.read_tables(), &[TableId(1), TableId(2)]);
+        assert!(joined.write_tables().is_empty());
+
+        let self_join = database
+            .statement_access("SELECT e.name FROM users e JOIN users m ON e.id = m.id")
+            .unwrap();
+        assert_eq!(self_join.read_tables(), &[TableId(1)]);
+
+        for source in [
+            "INSERT INTO users (id, name) VALUES (1, 'Ada')",
+            "UPDATE users SET name = 'Grace' WHERE id = 1",
+            "DELETE FROM users WHERE id = 1",
+        ] {
+            let access = database.statement_access(source).unwrap();
+            assert!(access.read_tables().is_empty());
+            assert_eq!(access.write_tables(), &[TableId(1)]);
+        }
+
+        assert!(matches!(
+            database.statement_access("SELECT FROM"),
+            Err(DatabaseError::Compile(_))
+        ));
+        assert!(
+            database
+                .query("SELECT id FROM users")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        database.close().unwrap();
+        for path in [&users_path, &users_wal, &teams_path, &teams_wal] {
+            let _ = std::fs::remove_file(path);
         }
     }
 

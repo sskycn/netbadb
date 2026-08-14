@@ -14,6 +14,14 @@
   MUST use mandatory mutual TLS, and TLS authentication MUST complete before a
   worker session is created. A malformed frame is connection-fatal; do not
   guess a request identity or attempt to resynchronize the stream.
+- Keep transport authentication in connection handling, principal admission
+  and authorization in the database worker, and SQL access extraction at the
+  typed core/compiler boundary. `SessionState`, Protocol v1, and persistent
+  database layers MUST remain identity- and policy-unaware.
+- Authorization MUST run after handshake sequencing and successful SQL
+  compilation but before planning, execution, writer acquisition, or ANALYZE.
+  Commit, Rollback, session close, and shutdown MUST remain available for safe
+  cleanup regardless of table grants.
 - Disconnect and shutdown cleanup MUST join connection and worker threads. A
   failed session rollback is fatal to the worker and MUST NOT be discarded so
   the process can continue serving requests.

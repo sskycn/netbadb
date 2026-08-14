@@ -1,5 +1,6 @@
 //! Transport-neutral synchronous NetbaDB protocol sessions.
 
+mod authorization;
 mod limits;
 mod manifest;
 mod metrics;
@@ -18,6 +19,7 @@ use netbadb_protocol::{
     WireTransactionState, validate_server_message,
 };
 
+pub use authorization::AuthorizationConfigError;
 pub use limits::{
     DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
     MAX_CONFIGURED_CONNECTIONS, MAX_CONFIGURED_RESULT_ROWS, MAX_SOCKET_TIMEOUT, ServerLimits,
@@ -38,6 +40,7 @@ pub struct ResponseBatch {
 pub(crate) struct SessionResponse {
     pub(crate) batch: ResponseBatch,
     pub(crate) result_row_limit_exceeded: bool,
+    pub(crate) authorization_denied: bool,
 }
 
 impl SessionResponse {
@@ -45,6 +48,7 @@ impl SessionResponse {
         Self {
             batch,
             result_row_limit_exceeded: false,
+            authorization_denied: false,
         }
     }
 }
@@ -369,6 +373,7 @@ impl SessionState {
         SessionResponse {
             batch: self.server_error_batch(request_id, error),
             result_row_limit_exceeded,
+            authorization_denied: false,
         }
     }
 

@@ -56,6 +56,11 @@ impl AuthenticatedClientIdentity {
     pub const fn certificate_sha256(&self) -> &[u8; 32] {
         &self.certificate_sha256
     }
+
+    #[cfg(test)]
+    pub(crate) const fn from_certificate_sha256_for_test(certificate_sha256: [u8; 32]) -> Self {
+        Self { certificate_sha256 }
+    }
 }
 
 impl fmt::Debug for AuthenticatedClientIdentity {

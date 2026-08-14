@@ -189,18 +189,19 @@ The current code genuinely supports:
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
   dedicated synchronous worker owns the Database and every SessionState, plus
-  strict deployment manifest v3 bootstrap, authenticated certificate identity,
-  secure remote listen, bounded connections/socket inactivity, response-row
-  policy, in-process metrics, and the standalone `netbadbd` executable;
+  strict deployment manifest v4 bootstrap, authenticated certificate identity,
+  per-certificate and local-plaintext table/operation authorization, secure
+  remote listen, bounded connections/socket inactivity, response-row policy,
+  in-process metrics, and the standalone `netbadbd` executable;
 - a native embedded `netbadb-core::Database` API.
 
 Protocol v1 is specified byte-for-byte in
 [`docs/protocol-v1.md`](docs/protocol-v1.md), and current standalone
 configuration is documented in
-[`docs/server-manifest-v3.md`](docs/server-manifest-v3.md). Manifests v1 and v2
-are retained as historical documentation and rejected by current `netbadbd`.
-Phase 5C2a keeps the database core synchronous and adds transport-level mTLS;
-per-client authorization remains Phase 5C2b.
+[`docs/server-manifest-v4.md`](docs/server-manifest-v4.md). Manifests v1 through
+v3 are retained as historical documentation and rejected by current
+`netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
+database worker authorizes compiler-resolved TableIds before execution.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -536,12 +537,14 @@ The implementation sequence is intentionally vertical:
     socket timeouts, response-row policy, and in-process metrics. Complete.
 23. Secure remote transport (Phase 5C2a) — mutual TLS, authenticated
     certificate identity, and secure non-loopback listening. Complete.
-24. Per-client authorization (Phase 5C2b) — table and operation scopes.
+24. Per-client authorization (Phase 5C2b) — certificate/local principals,
+    table and operation scopes, typed SQL preflight, and filtered Hello schema
+    visibility. Complete.
 25. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
 26. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
-Isolation/MVCC, range/index-join planning, per-client authorization, and Go
-wire-protocol code are roadmap items, not implemented features here.
+Isolation/MVCC, range/index-join planning, and Go wire-protocol code are roadmap
+items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

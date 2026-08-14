@@ -109,6 +109,10 @@ Capability bits are:
 
 TLS and authentication are not advertised because transport security is
 established before the Protocol v1 Hello and does not alter capability bits.
+Server authorization also occurs outside the wire contract. An admitted
+principal's HelloAck table list may be filtered to tables for which it has at
+least one operation permission; retained tables remain in canonical schema
+order.
 
 ## Query results
 
@@ -218,6 +222,14 @@ truncate oversized diagnostics at a UTF-8 boundary. Stable error codes are:
 | 11 | Database |
 | 12 | ResponseTooLarge |
 | 13 | InternalResultMismatch |
+
+Protocol v1 has no dedicated authorization-denied code. The server reports
+operation-level authorization denials through code 11, Database, with an
+`authorization denied ...` diagnostic and the current transaction state. A
+future protocol version may add a dedicated stable code. A CA-trusted mTLS
+identity absent from the deployment allowlist is disconnected before Hello and
+therefore receives no Protocol v1 Error. These semantics do not change any
+Protocol v1 field, tag, or byte encoding.
 
 Wire transaction-state tags are independent of Rust enum discriminants:
 

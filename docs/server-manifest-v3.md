@@ -1,8 +1,10 @@
 # NetbaDB deployment manifest v3
 
-Deployment manifest v3 is the current experimental startup configuration for
-`netbadbd`. It adds one secure transport mode without changing Protocol v1 or
-any persistent database format.
+> Historical format. Current `netbadbd` requires
+> [deployment manifest v4](server-manifest-v4.md); v3 is rejected explicitly.
+
+Deployment manifest v3 added one secure transport mode without changing
+Protocol v1 or any persistent database format.
 
 ```json
 {
@@ -53,9 +55,9 @@ There are exactly two supported modes:
   listener requires mTLS.
 
 There is no anonymous TLS, optional client authentication, or insecure
-verification switch. Every certificate that chains to `client_ca` currently
-receives the same database capabilities. Per-client, table, and operation
-authorization is deferred to Phase 5C2b; CA membership is authentication, not
+verification switch. In v3, every certificate that chained to `client_ca`
+received the same database capabilities. Per-client, table, and operation
+authorization arrived with v4; CA membership alone is authentication, not
 fine-grained authorization.
 
 The server certificate file may contain a normal chain and must contain at

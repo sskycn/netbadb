@@ -8,14 +8,15 @@ use netbadb_schema::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 use serde::Deserialize;
 
+use crate::authorization::{AuthorizationPolicy, TablePermissions, parse_certificate_sha256};
 use crate::tls::{MutualTlsConfig, TlsMaterialPaths, TransportSecurity};
 use crate::{
-    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
-    ServerLimits, ServerLimitsError,
+    AuthorizationConfigError, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT, ServerLimits, ServerLimitsError,
 };
 use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 3;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 4;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -31,6 +32,7 @@ pub struct ServerConfig {
     tables: Vec<TableBootstrap>,
     limits: ServerLimits,
     tls: Option<MutualTlsConfig>,
+    authorization: AuthorizationPolicy,
 }
 
 impl ServerConfig {
@@ -40,11 +42,13 @@ impl ServerConfig {
             path: path.to_path_buf(),
             source,
         })?;
+        let version: ManifestVersion =
+            serde_json::from_str(&source).map_err(ManifestError::Json)?;
+        if version.version != DEPLOYMENT_MANIFEST_VERSION {
+            return Err(ManifestError::UnsupportedVersion(version.version));
+        }
         let manifest: DeploymentManifest =
             serde_json::from_str(&source).map_err(ManifestError::Json)?;
-        if manifest.version != DEPLOYMENT_MANIFEST_VERSION {
-            return Err(ManifestError::UnsupportedVersion(manifest.version));
-        }
         if manifest.tables.is_empty() {
             return Err(ManifestError::EmptyTables);
         }
@@ -120,11 +124,25 @@ impl ServerConfig {
         }
         Schema::new(tables.iter().map(|entry| entry.table.clone()).collect())
             .map_err(ManifestError::Schema)?;
+        let transport = if tls.is_some() {
+            TransportKind::MutualTls
+        } else {
+            TransportKind::PlaintextLoopback
+        };
+        let known_tables = tables
+            .iter()
+            .map(|entry| entry.table.id)
+            .collect::<Vec<_>>();
+        let authorization = manifest
+            .authorization
+            .into_policy(transport, &known_tables)
+            .map_err(ManifestError::Authorization)?;
         Ok(Self {
             listen,
             tables,
             limits,
             tls,
+            authorization,
         })
     }
 
@@ -159,13 +177,20 @@ impl ServerConfig {
         Vec<TableBootstrap>,
         ServerLimits,
         TransportSecurity,
+        AuthorizationPolicy,
     ) {
         let security = self
             .tls
             .map_or(TransportSecurity::PlaintextLoopback, |tls| {
                 tls.into_transport()
             });
-        (self.listen, self.tables, self.limits, security)
+        (
+            self.listen,
+            self.tables,
+            self.limits,
+            security,
+            self.authorization,
+        )
     }
 }
 
@@ -215,6 +240,7 @@ pub enum ManifestError {
         path: PathBuf,
     },
     TlsConfiguration(TlsConfigError),
+    Authorization(AuthorizationConfigError),
     Schema(SchemaError),
 }
 
@@ -277,6 +303,7 @@ impl fmt::Display for ManifestError {
                 path.display()
             ),
             Self::TlsConfiguration(error) => error.fmt(formatter),
+            Self::Authorization(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
         }
     }
@@ -293,6 +320,7 @@ impl Error for ManifestError {
             Self::InvalidListen { source, .. } => Some(source),
             Self::Limits(error) => Some(error),
             Self::TlsConfiguration(error) => Some(error),
+            Self::Authorization(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::UnsupportedVersion(_)
             | Self::EmptyTables
@@ -305,13 +333,100 @@ impl Error for ManifestError {
 }
 
 #[derive(Debug, Deserialize)]
+struct ManifestVersion {
+    version: u32,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeploymentManifest {
-    version: u32,
+    #[serde(rename = "version")]
+    _version: u32,
     listen: Option<String>,
     limits: Option<ManifestLimits>,
     tls: Option<ManifestTls>,
+    authorization: ManifestAuthorization,
     tables: Vec<ManifestTable>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestAuthorization {
+    local_plaintext: Option<ManifestPrincipal>,
+    #[serde(default)]
+    clients: Vec<ManifestClient>,
+}
+
+impl ManifestAuthorization {
+    fn into_policy(
+        self,
+        transport: TransportKind,
+        known_tables: &[TableId],
+    ) -> Result<AuthorizationPolicy, AuthorizationConfigError> {
+        let local_plaintext = self
+            .local_plaintext
+            .map(ManifestPrincipal::into_permissions);
+        let clients = self
+            .clients
+            .into_iter()
+            .map(|client| {
+                Ok((
+                    parse_certificate_sha256(&client.certificate_sha256)?,
+                    client.principal.into_permissions(),
+                ))
+            })
+            .collect::<Result<Vec<_>, AuthorizationConfigError>>()?;
+        AuthorizationPolicy::new(transport, local_plaintext, clients, known_tables)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestClient {
+    certificate_sha256: String,
+    #[serde(flatten)]
+    principal: ManifestPrincipal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPrincipal {
+    tables: Vec<ManifestTablePermissions>,
+}
+
+impl ManifestPrincipal {
+    fn into_permissions(self) -> Vec<TablePermissions> {
+        self.tables
+            .into_iter()
+            .map(ManifestTablePermissions::into_permissions)
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestTablePermissions {
+    table_id: u64,
+    #[serde(default)]
+    read: bool,
+    #[serde(default)]
+    write: bool,
+    #[serde(default)]
+    transaction: bool,
+    #[serde(default)]
+    analyze: bool,
+}
+
+impl ManifestTablePermissions {
+    const fn into_permissions(self) -> TablePermissions {
+        TablePermissions::new(
+            TableId(self.table_id),
+            self.read,
+            self.write,
+            self.transaction,
+            self.analyze,
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,6 +572,7 @@ mod tests {
     use netbadb_core::Database;
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
+    use serde_json::json;
 
     use super::*;
 
@@ -494,8 +610,20 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 3,
+                "version": 4,
                 {listen}
+                "authorization": {{
+                    "local_plaintext": {{
+                        "tables": [{{
+                            "table_id": 1,
+                            "read": true,
+                            "write": true,
+                            "transaction": true,
+                            "analyze": true
+                        }}]
+                    }},
+                    "clients": []
+                }},
                 "tables": [{{
                     "path": "{path}",
                     "id": 1,
@@ -554,13 +682,19 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        std::fs::write(&manifest, r#"{"version":2,"tables":[]}"#).unwrap();
-        assert!(matches!(
-            ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::UnsupportedVersion(2))
-        ));
+        for version in 1..=3 {
+            std::fs::write(&manifest, format!(r#"{{"version":{version},"tables":[]}}"#)).unwrap();
+            assert!(matches!(
+                ServerConfig::from_manifest_path(&manifest),
+                Err(ManifestError::UnsupportedVersion(actual)) if actual == version
+            ));
+        }
 
-        std::fs::write(&manifest, r#"{"version":3,"unexpected":true,"tables":[]}"#).unwrap();
+        std::fs::write(
+            &manifest,
+            r#"{"version":4,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
+        )
+        .unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
             Err(ManifestError::Json(_))
@@ -599,8 +733,8 @@ mod tests {
         let manifest = directory.join("server.json");
 
         let source = manifest_json(None, "users.ndb", "UserId").replace(
-            "\"tables\":",
-            "\"limits\": {\"max_connections\": 2, \"idle_timeout_ms\": 250, \"max_result_rows\": 3}, \"tables\":",
+            "\"authorization\":",
+            "\"limits\": {\"max_connections\": 2, \"idle_timeout_ms\": 250, \"max_result_rows\": 3}, \"authorization\":",
         );
         std::fs::write(&manifest, source).unwrap();
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -610,8 +744,8 @@ mod tests {
         assert_eq!(config.limits().max_result_rows(), 3);
 
         let invalid = manifest_json(None, "users.ndb", "UserId").replace(
-            "\"tables\":",
-            "\"limits\": {\"max_connections\": 0}, \"tables\":",
+            "\"authorization\":",
+            "\"limits\": {\"max_connections\": 0}, \"authorization\":",
         );
         std::fs::write(&manifest, invalid).unwrap();
         assert!(matches!(
@@ -620,10 +754,92 @@ mod tests {
         ));
 
         let unknown = manifest_json(None, "users.ndb", "UserId").replace(
-            "\"tables\":",
-            "\"limits\": {\"connection_limit\": 2}, \"tables\":",
+            "\"authorization\":",
+            "\"limits\": {\"connection_limit\": 2}, \"authorization\":",
         );
         std::fs::write(&manifest, unknown).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Json(_))
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn manifest_v4_authorization_is_required_strict_and_schema_bound() {
+        let directory = test_directory("authorization");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let base = manifest_json(None, "users.ndb", "UserId");
+
+        let mut missing: serde_json::Value = serde_json::from_str(&base).unwrap();
+        missing.as_object_mut().unwrap().remove("authorization");
+        std::fs::write(&manifest, serde_json::to_vec(&missing).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Json(_))
+        ));
+
+        let mut no_local: serde_json::Value = serde_json::from_str(&base).unwrap();
+        no_local["authorization"] = json!({"clients": []});
+        std::fs::write(&manifest, serde_json::to_vec(&no_local).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Authorization(
+                AuthorizationConfigError::PlaintextLocalPolicyRequired
+            ))
+        ));
+
+        let mut unknown_table: serde_json::Value = serde_json::from_str(&base).unwrap();
+        unknown_table["authorization"]["local_plaintext"]["tables"] =
+            json!([{"table_id": 9, "read": true}]);
+        std::fs::write(&manifest, serde_json::to_vec(&unknown_table).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Authorization(
+                AuthorizationConfigError::UnknownTable {
+                    table_id: TableId(9)
+                }
+            ))
+        ));
+
+        let mut duplicate_table: serde_json::Value = serde_json::from_str(&base).unwrap();
+        duplicate_table["authorization"]["local_plaintext"]["tables"] = json!([
+            {"table_id": 1, "read": true},
+            {"table_id": 1, "write": true}
+        ]);
+        std::fs::write(&manifest, serde_json::to_vec(&duplicate_table).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Authorization(
+                AuthorizationConfigError::DuplicateTableGrant {
+                    table_id: TableId(1)
+                }
+            ))
+        ));
+
+        for fingerprint in ["ab".to_owned(), format!("{}z", "0".repeat(63))] {
+            let mut invalid: serde_json::Value = serde_json::from_str(&base).unwrap();
+            invalid["authorization"]["clients"] = json!([{
+                "certificate_sha256": fingerprint,
+                "tables": [{"table_id": 1, "read": true}]
+            }]);
+            std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(matches!(
+                ServerConfig::from_manifest_path(&manifest),
+                Err(ManifestError::Authorization(
+                    AuthorizationConfigError::InvalidFingerprintLength { .. }
+                        | AuthorizationConfigError::InvalidFingerprintHex { .. }
+                ))
+            ));
+        }
+
+        let mut unknown_field: serde_json::Value = serde_json::from_str(&base).unwrap();
+        unknown_field["authorization"]["local_plaintext"]["tables"][0]["select"] = json!(true);
+        std::fs::write(&manifest, serde_json::to_vec(&unknown_field).unwrap()).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
             Err(ManifestError::Json(_))

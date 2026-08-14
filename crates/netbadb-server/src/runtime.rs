@@ -9,14 +9,18 @@ use std::time::Duration;
 
 use netbadb_core::{Database, DatabaseError};
 use netbadb_protocol::{
-    ClientMessage, Frame, ProtocolError, read_client_frame, write_server_frame,
+    ClientMessage, Frame, ProtocolError, ProtocolErrorCode, ServerMessage, read_client_frame,
+    write_server_frame,
 };
 
+use crate::authorization::{
+    AuthorizationAction, AuthorizationDenied, AuthorizationPolicy, PrincipalAuthorization,
+};
 use crate::manifest::validate_listener_security;
 use crate::tls::{ConnectionStream, TlsHandshakeError, TransportSecurity};
 use crate::{
-    ClientIdentity, ManifestError, ServerConfig, ServerLimits, ServerMetricsHandle, SessionPolicy,
-    SessionResponse, SessionState, TableBootstrap, TransportKind,
+    ClientIdentity, ManifestError, ResponseBatch, ServerConfig, ServerLimits, ServerMetricsHandle,
+    SessionPolicy, SessionResponse, SessionState, TableBootstrap, TransportKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,11 +151,11 @@ impl TcpServer {
     }
 
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
-        let (listen, tables, limits, security) = self.config.into_parts();
+        let (listen, tables, limits, security, authorization) = self.config.into_parts();
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
-        let worker = DatabaseWorker::start(tables, limits.session_policy())?;
+        let worker = DatabaseWorker::start(tables, limits.session_policy(), authorization)?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -342,6 +346,7 @@ impl DatabaseWorker {
     fn start(
         tables: Vec<TableBootstrap>,
         session_policy: SessionPolicy,
+        authorization: AuthorizationPolicy,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -367,7 +372,13 @@ impl DatabaseWorker {
                         }
                     });
                 }
-                run_database_worker(database, session_policy, command_rx, events_tx)
+                run_database_worker(
+                    database,
+                    session_policy,
+                    authorization,
+                    command_rx,
+                    events_tx,
+                )
             })
             .map_err(TcpServerError::ThreadSpawn)?;
         match ready_rx.recv() {
@@ -479,6 +490,7 @@ enum WorkerCommand {
 enum WorkerRequestError {
     DuplicateSession(SessionId),
     MissingSession(SessionId),
+    AuthorizationDenied(AuthorizationDenied),
     Stopped,
     Fatal(WorkerFatalError),
 }
@@ -496,6 +508,7 @@ impl fmt::Display for WorkerRequestError {
             Self::MissingSession(session_id) => {
                 write!(formatter, "session {} is not registered", session_id.get())
             }
+            Self::AuthorizationDenied(error) => error.fmt(formatter),
             Self::Stopped => formatter.write_str("database worker stopped"),
             Self::Fatal(error) => error.fmt(formatter),
         }
@@ -506,32 +519,147 @@ struct DatabaseWorkerState {
     database: Option<Database>,
     sessions: HashMap<SessionId, WorkerSession>,
     session_policy: SessionPolicy,
+    authorization: AuthorizationPolicy,
 }
 
 struct WorkerSession {
     state: SessionState,
     identity: ClientIdentity,
+    authorization: PrincipalAuthorization,
 }
 
 impl WorkerSession {
-    fn new(policy: SessionPolicy, identity: ClientIdentity) -> Self {
+    fn new(
+        policy: SessionPolicy,
+        identity: ClientIdentity,
+        authorization: PrincipalAuthorization,
+    ) -> Self {
         Self {
             state: SessionState::with_policy(policy),
             identity,
+            authorization,
         }
     }
 
     fn is_authenticated(&self) -> bool {
         self.identity.is_authenticated()
     }
+
+    fn handle(
+        &mut self,
+        database: &mut Database,
+        request_id: u64,
+        request: ClientMessage,
+    ) -> SessionResponse {
+        if !self.state.is_handshaken() || matches!(request, ClientMessage::Hello) {
+            let first_hello =
+                !self.state.is_handshaken() && matches!(request, ClientMessage::Hello);
+            let mut response = self
+                .state
+                .handle_with_metadata(database, request_id, request);
+            if first_hello && self.state.is_handshaken() {
+                for message in &mut response.batch.messages {
+                    if let netbadb_protocol::ServerMessage::HelloAck { tables, .. } = message {
+                        tables.retain(|table| self.authorization.can_see(table.table_id));
+                    }
+                }
+            }
+            return response;
+        }
+
+        let denial = match &request {
+            ClientMessage::Hello
+            | ClientMessage::Ping
+            | ClientMessage::Commit
+            | ClientMessage::Rollback => None,
+            ClientMessage::Begin { table_id } => {
+                if self.state.transaction_state() != netbadb_protocol::WireTransactionState::None
+                    || !database
+                        .schema()
+                        .tables()
+                        .iter()
+                        .any(|table| table.id == *table_id)
+                {
+                    None
+                } else {
+                    self.authorization
+                        .authorize(AuthorizationAction::Transaction, *table_id)
+                        .err()
+                }
+            }
+            ClientMessage::Analyze { table_id } => {
+                if self.state.transaction_state() != netbadb_protocol::WireTransactionState::None
+                    || !database
+                        .schema()
+                        .tables()
+                        .iter()
+                        .any(|table| table.id == *table_id)
+                {
+                    None
+                } else {
+                    self.authorization
+                        .authorize(AuthorizationAction::Analyze, *table_id)
+                        .err()
+                }
+            }
+            ClientMessage::Execute { sql } => match database.statement_access(sql) {
+                Ok(access) => access
+                    .read_tables()
+                    .iter()
+                    .find_map(|table_id| {
+                        self.authorization
+                            .authorize(AuthorizationAction::Read, *table_id)
+                            .err()
+                    })
+                    .or_else(|| {
+                        access.write_tables().iter().find_map(|table_id| {
+                            self.authorization
+                                .authorize(AuthorizationAction::Write, *table_id)
+                                .err()
+                        })
+                    }),
+                Err(_) => None,
+            },
+        };
+        match denial {
+            Some(denial) => authorization_denied_response(&self.state, request_id, denial),
+            None => self
+                .state
+                .handle_with_metadata(database, request_id, request),
+        }
+    }
+}
+
+fn authorization_denied_response(
+    state: &SessionState,
+    request_id: u64,
+    denial: AuthorizationDenied,
+) -> SessionResponse {
+    SessionResponse {
+        batch: ResponseBatch {
+            request_id,
+            messages: vec![ServerMessage::Error {
+                code: ProtocolErrorCode::Database,
+                transaction_state: state.transaction_state(),
+                message: crate::bounded_error_message(&denial.to_string()),
+            }],
+        },
+        result_row_limit_exceeded: false,
+        authorization_denied: true,
+    }
 }
 
 impl DatabaseWorkerState {
-    fn new(database: Database, session_policy: SessionPolicy) -> Self {
+    fn new(
+        database: Database,
+        session_policy: SessionPolicy,
+        authorization: AuthorizationPolicy,
+    ) -> Self {
         Self {
             database: Some(database),
             sessions: HashMap::new(),
             session_policy,
+            authorization,
         }
     }
 
@@ -575,10 +703,11 @@ impl DatabaseWorkerState {
 fn run_database_worker(
     database: Database,
     session_policy: SessionPolicy,
+    authorization: AuthorizationPolicy,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerFatalError>,
 ) -> Result<(), WorkerFatalError> {
-    let mut state = DatabaseWorkerState::new(database, session_policy);
+    let mut state = DatabaseWorkerState::new(database, session_policy, authorization);
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::OpenSession {
@@ -590,7 +719,14 @@ fn run_database_worker(
                     let _ = reply.send(Err(WorkerRequestError::DuplicateSession(session_id)));
                     continue;
                 }
-                let session = WorkerSession::new(state.session_policy, identity);
+                let principal = match state.authorization.admit(&identity) {
+                    Ok(principal) => principal,
+                    Err(error) => {
+                        let _ = reply.send(Err(WorkerRequestError::AuthorizationDenied(error)));
+                        continue;
+                    }
+                };
+                let session = WorkerSession::new(state.session_policy, identity, principal);
                 let authenticated = session.is_authenticated();
                 state.sessions.insert(session_id, session);
                 if reply.send(Ok(authenticated)).is_err() {
@@ -617,10 +753,7 @@ fn run_database_worker(
                     let _ = events.send(error.clone());
                     return Err(error);
                 };
-                let response =
-                    session
-                        .state
-                        .handle_with_metadata(database, frame.request_id, frame.message);
+                let response = session.handle(database, frame.request_id, frame.message);
                 let _ = reply.send(Ok(response));
             }
             WorkerCommand::CloseSession { session_id, reply } => {
@@ -867,6 +1000,9 @@ fn run_connection_requests(
         if response.result_row_limit_exceeded {
             metrics.query_response_limit_error();
         }
+        if response.authorization_denied {
+            metrics.authorization_denial();
+        }
         let response = response.batch;
         for message in response.messages {
             write_server_frame(
@@ -957,6 +1093,9 @@ impl ConnectionError {
             Self::Read(ProtocolError::Io(_)) => {}
             Self::Read(_) => metrics.protocol_failure(),
             Self::WriteProtocol(_) | Self::Flush(_) => metrics.write_failure(),
+            Self::Worker(WorkerRequestError::AuthorizationDenied(_)) => {
+                metrics.authorization_denial();
+            }
             Self::Configure(_) | Self::Spawn(_) | Self::Worker(_) => {}
         }
     }

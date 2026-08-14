@@ -20,6 +20,7 @@ pub struct ServerMetricsSnapshot {
     pub tls_handshakes_total: u64,
     pub tls_handshake_failures_total: u64,
     pub authenticated_connections_total: u64,
+    pub authorization_denials_total: u64,
 }
 
 /// Cloneable, read-only access to a running server's operational metrics.
@@ -86,6 +87,10 @@ impl ServerMetricsHandle {
     pub(crate) fn authenticated_connection(&self) {
         saturating_increment(&self.inner.authenticated_connections_total);
     }
+
+    pub(crate) fn authorization_denial(&self) {
+        saturating_increment(&self.inner.authorization_denials_total);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +107,7 @@ struct ServerMetrics {
     tls_handshakes_total: AtomicU64,
     tls_handshake_failures_total: AtomicU64,
     authenticated_connections_total: AtomicU64,
+    authorization_denials_total: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -123,6 +129,7 @@ impl ServerMetrics {
             authenticated_connections_total: self
                 .authenticated_connections_total
                 .load(Ordering::Relaxed),
+            authorization_denials_total: self.authorization_denials_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -156,6 +163,7 @@ mod tests {
         metrics.tls_handshake();
         metrics.tls_handshake_failure();
         metrics.authenticated_connection();
+        metrics.authorization_denial();
         metrics.rejected();
         metrics.closed();
         assert_eq!(
@@ -173,6 +181,7 @@ mod tests {
                 tls_handshakes_total: 1,
                 tls_handshake_failures_total: 1,
                 authenticated_connections_total: 1,
+                authorization_denials_total: 1,
             }
         );
     }

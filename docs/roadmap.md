@@ -325,13 +325,17 @@ join, sort avoidance, and uniqueness enforcement remain advanced work.
 Protocol v1 has no authentication payload and remains byte-for-byte unchanged;
 TLS establishes identity before Hello.
 
-### Phase 5C2b — Per-client authorization (next)
+### Phase 5C2b — Per-client authorization (complete)
 
-- per-client authorization policy;
-- table and operation scopes;
-- authorization preflight before execution.
+- required manifest v4 local-plaintext and certificate-fingerprint principals;
+- explicit per-TableId read, write, transaction, and analyze scopes;
+- typed compiler-resolved StatementAccess preflight before execution;
+- authorization-filtered Hello table visibility and low-cardinality denial
+  metrics;
+- trusted-but-unlisted mTLS admission denial before Protocol Hello.
 
-All clients trusted by the configured CA currently have equal capabilities.
+Protocol v1 remains byte-for-byte unchanged and maps operation denials to its
+generic Database error code.
 
 ## Phase 6 — SDK and tooling
 

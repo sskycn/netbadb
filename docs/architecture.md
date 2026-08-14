@@ -932,13 +932,32 @@ than dropping a retryable transaction and continuing service. Graceful server
 shutdown closes connection sockets, joins their threads, closes remaining
 sessions, explicitly closes the Database, and joins the worker.
 
-`netbadbd` reads deployment manifest v3 before startup. Relative heap and TLS
+`netbadbd` reads deployment manifest v4 before startup. Relative heap and TLS
 paths are resolved against the manifest directory. Certificate, private-key,
 and client-CA material is parsed into a mandatory-client-auth rustls config
 before the database worker starts; the worker then calls `Database::open_tables`
 before the listener is bound. The manifest supplies complete TableDefs because
 a heap fingerprint cannot reconstruct schema. Plaintext listeners are
 restricted to loopback, while non-loopback listeners require mutual TLS.
+
+Authentication, authorization, compilation, and execution remain separate.
+The TLS connection thread authenticates a transport peer and derives the
+verified leaf-certificate fingerprint. During `OpenSession`, the database
+worker resolves that identity to an immutable principal policy; a trusted but
+unlisted certificate is closed before SessionState and Hello. The worker keeps
+the resolved grants beside the transport-neutral SessionState. For Execute it
+asks `netbadb-core::Database::statement_access` to compile SQL and expose only
+ordered canonical read/write TableIds. The worker checks those IDs before
+calling SessionState's execution path. Core describes access but knows nothing
+about clients or policy; TLS, authorization, and server dependencies never flow
+into compiler, planner, executor, storage, or persistent formats.
+
+Handshake and session sequencing precede authorization, while successful SQL
+compilation precedes SQL permission checks. Begin and Analyze validate table
+existence before their independent grants. Commit, Rollback, disconnect close,
+and shutdown bypass grants so an owned transaction can always be resolved.
+HelloAck visibility is filtered by the worker after SessionState builds the
+canonical schema-ordered identities; protocol capabilities remain unfiltered.
 
 Connection admission and socket read/write timeouts happen before TLS. A
 connection thread explicitly completes certificate verification, derives
@@ -966,7 +985,7 @@ Runtime metrics use only standard-library atomics and expose read-only
 snapshots. They count admitted, rejected, active, and closed connections;
 successful and failed TLS handshakes; authenticated connections; worker
 requests; protocol failures; idle timeouts; write failures; and
-response-row-limit errors. Metrics never control admission or database
+response-row-limit and authorization-denial errors. Metrics never control admission or database
 correctness and contain no SQL, values, table names, certificate contents, or
 client-address labels.
 
@@ -974,7 +993,7 @@ Networking remains synchronous and must not leak async into parser, compiler,
 planner, executor, page, storage, WAL, or recovery.
 Protocol v1 is a network contract, not a database-file format: Canonical Schema
 v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
-remain unchanged. Deployment manifest v3 is configuration, not a database
+remain unchanged. Deployment manifest v4 is configuration, not a database
 format or canonical schema identity.
 
 Rust applications use the native SDK. Go applications should use a generated
