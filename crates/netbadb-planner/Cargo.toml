@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+netbadb-index = { path = "../netbadb-index" }
 netbadb-rel = { path = "../netbadb-rel" }
 netbadb-types = { path = "../netbadb-types" }
 

@@ -118,7 +118,7 @@ schema -> types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
-planner -> rel + types
+planner -> index + rel + types
 index -> types
 storage -> index + schema + types
 executor -> planner + rel + storage + types
@@ -146,7 +146,8 @@ The current code genuinely supports:
 - name resolution and expression type checking with nominal semantic types and
   explicit nullability;
 - typed query/DML HIR and logical relational IR;
-- sequential-scan and left-major/right-minor nested-loop join physical planning;
+- deterministic registered-index point scans, sequential scans, and
+  left-major/right-minor nested-loop join physical planning;
 - synchronous heap storage with fixed 4 KiB pages;
 - version 5 slotted heap pages with persistent pageLSNs, PageId-bound full-page
   CRC32C, generation-bearing reusable tombstones, and checked bounds;
@@ -341,9 +342,15 @@ The registry persists `ColumnId -> BTreeHandle` separately from raw B+Trees.
 `create_index` atomically backfills current rows and registers only after the
 full build; reopen discovers and validates the mapping. Later Heap and SQL DML
 maintains all registered indexes in the same transaction and propagates every
-RowId relocation. Raw B+Trees remain independent. Index reads still do not
-validate referenced Heap rows, enforce uniqueness, expose SQL index DDL, add
-IndexScan, or change the planner's SeqScan policy.
+RowId relocation. Raw B+Trees remain independent. Raw BTree lookup alone does
+not validate referenced Heap rows or enforce uniqueness, and SQL index DDL
+remains deferred. Core maps only registered definitions into an ordered,
+read-only planner access-path snapshot. Eligible
+`column = non-NULL literal`, commuted equality, and nullable `column IS NULL`
+predicates use exact point `IndexScan`;
+the executor then fetches complete Heap rows by generation-safe RowId. The
+original SQL Filter remains above every IndexScan. Range access, index joins,
+index-only scans, and cost-based selection remain deferred.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -479,12 +486,13 @@ The implementation sequence is intentionally vertical:
 16. Persistent IndexCatalog discovery and transactional existing-row backfill
     (Phase 4D1) — complete.
 17. Atomic heap/index DML maintenance (Phase 4D2) — complete.
-18. IndexScan (Phase 4E), then statistics/costing (Phase 4F).
-19. Server mode — protocol, sessions, and `netbadbd`.
-20. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-21. Advanced optimization — statistics, cost model, and rewrite rules.
+18. Deterministic registered-index point IndexScan (Phase 4E) — complete.
+19. Statistics and cost-based access-path selection (Phase 4F).
+20. Server mode — protocol, sessions, and `netbadbd`.
+21. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+22. Advanced optimization — statistics, cost model, and rewrite rules.
 
-Isolation/MVCC, index-aware planning, server networking,
+Isolation/MVCC, cost-based index planning, server networking,
 and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

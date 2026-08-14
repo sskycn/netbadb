@@ -263,7 +263,11 @@ sorting or aggregation.
   registered indexes in one transaction, propagate RowId relocation, preserve
   deterministic multi-index ordering, and recover runtime and crash failures
   under STEAL/NO-FORCE;
-- next Phase 4E: index scan physical operator;
+- Phase 4E complete: Core exposes registered indexes as an ordered read-only
+  planner access-path snapshot; exact equality and nullable IS NULL predicates
+  can select deterministic point IndexScan for SELECT/UPDATE/DELETE while the
+  full SQL Filter remains responsible for truth semantics and Heap rows are
+  fetched by generation-safe RowId;
 - next Phase 4F: catalog statistics and deterministic cost-based access-path
   selection.
 

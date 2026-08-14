@@ -91,7 +91,7 @@ schema -> types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
-planner -> rel + types
+planner -> index + rel + types
 index -> types
 storage -> index + schema + types
 executor -> planner + rel + storage + types

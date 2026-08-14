@@ -16,8 +16,8 @@ netbadb-hir -> netbadb-parser + netbadb-schema + netbadb-types
 netbadb-rel -> netbadb-types
 netbadb-compiler -> netbadb-hir + netbadb-parser + netbadb-rel
                     + netbadb-schema + netbadb-types
-netbadb-planner -> netbadb-rel + netbadb-types
 netbadb-index -> netbadb-types
+netbadb-planner -> netbadb-index + netbadb-rel + netbadb-types
 netbadb-storage -> netbadb-index + netbadb-schema + netbadb-types
 netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
@@ -71,10 +71,11 @@ source → AST → resolved/type-checked HIR → logical plan → physical plan
 ```
 
 HIR owns source-level resolution and semantic type checking. Relational IR
-owns relational meaning and column provenance. The planner selects sequential
-scans and the correctness-first nested-loop implementation for logical INNER
-JOIN. The executor evaluates typed expressions against rows returned by
-storage.
+owns relational meaning and column provenance. Core snapshots registered
+indexes into lightweight planner access paths; the planner selects exact point
+IndexScan or SeqScan access and the correctness-first nested-loop
+implementation for logical INNER JOIN. The executor evaluates typed
+expressions against rows returned by storage.
 
 The implementation uses IDs and owned values between layers. It does not keep
 long-lived references to pages, frames, or tuples, leaving room for future
@@ -486,8 +487,8 @@ Delete never allocates or shrinks the file. Removed right pages and old roots
 remain valid but unreachable orphan index pages; reclamation is deferred.
 
 Phase 4C2 deliberately has no sibling redistribution or orphan-page
-reclamation. Uniqueness, SQL index DDL, IndexScan, optimizer choice, and
-statistics remain deferred.
+reclamation. Uniqueness, SQL index DDL, range lookup, and statistics remain
+deferred.
 
 ## Persistent index registry
 
@@ -522,6 +523,41 @@ inserting the new one. All operations share the caller's transaction, buffer
 pool, WAL, and prevLSN chain. Pure key-size and exact old-entry preflight run
 while holding the single-writer lease before the first physical mutation; any
 later failure marks the transaction `RollbackRequired`.
+
+## Deterministic point IndexScan
+
+Logical plans remain storage-independent: query meaning is still represented
+as `Filter(Scan)`, never as a logical index operator. Core walks table storage
+order and each heap's persistent index-registration order to materialize a
+plain `Vec<IndexAccessPath>`. Each entry contains only `TableId`, `ColumnId`,
+and the stable `BTreeHandle`. The planner depends on the pure `netbadb-index`
+domain crate, not on `netbadb-storage`, and receives no page, WAL, buffer,
+cardinality, or cost state.
+
+For a Filter directly above a Scan, the first eligible registered access path
+in that stable order wins. Phase 4E recognizes only `indexed_column = non-NULL
+literal`, its commuted form, and `IS NULL` on a nullable indexed column. It may
+search left-to-right through AND because either side is a necessary condition;
+it never descends through OR or NOT. Equality with NULL, IS NOT NULL, ranges,
+column-to-column comparisons, joins, index intersection/union, and full scans
+are not point access paths. This rule is deterministic, not cost-based or a
+selectivity claim.
+
+The physical shape always retains the complete predicate:
+
+```text
+PhysicalPlan::Filter(original predicate)
+    -> PhysicalPlan::IndexScan(registered handle, exact key)
+```
+
+IndexScan performs `BTree::lookup`, materializes the returned RowIds, and then
+loads every complete Heap row through `HeapStorage::read_row`. A stale,
+deleted, missing, or corrupt locator is an error; execution never hides it by
+falling back to SeqScan. UPDATE and DELETE therefore finish index traversal and
+target materialization before maintaining the same index, avoiding iterator
+invalidation or revisiting newly inserted keys. Index-only scans, range scans,
+index nested-loop joins, sort elimination, and statistics/costing remain
+future work.
 
 ## Transaction and WAL boundary
 

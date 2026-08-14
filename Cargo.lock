@@ -129,6 +129,7 @@ version = "0.1.0"
 name = "netbadb-planner"
 version = "0.1.0"
 dependencies = [
+ "netbadb-index",
  "netbadb-rel",
  "netbadb-types",
 ]

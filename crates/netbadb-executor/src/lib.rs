@@ -230,6 +230,29 @@ fn execute_rows(
                 rows,
             })
         }
+        PhysicalPlan::IndexScan {
+            table_id,
+            columns,
+            handle,
+            key,
+            ..
+        } => {
+            let storage = storage_for_table(storages, *table_id)?;
+            let row_ids = storage.btree().lookup(*handle, key)?;
+            let rows = row_ids
+                .into_iter()
+                .map(|row_id| {
+                    Ok(ExecutionRow {
+                        row_id: Some(row_id),
+                        values: storage.read_row(row_id)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            Ok(ExecutionRows {
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
+                rows,
+            })
+        }
         PhysicalPlan::NestedLoopJoin {
             left,
             right,
@@ -912,8 +935,8 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionError, QueryResult, TruthValue, evaluate_binary, execute};
-    use netbadb_planner::plan;
+    use super::{ExecutionError, QueryResult, TruthValue, evaluate_binary, execute, execute_rows};
+    use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
         AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
         DerivedField, Expr, ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
@@ -1000,6 +1023,145 @@ mod tests {
         let result: QueryResult = execute(&plan(&logical), &mut storage).expect("execute");
         assert_eq!(result.rows, vec![vec![ScalarValue::Text("Lin".into())]]);
         storage.close().expect("close storage");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn point_index_scan_fetches_complete_rows_and_retains_residual_filtering() {
+        let table = TableDef::new(
+            TableId(101),
+            "users",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "team_id",
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                ),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+            ],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-executor-index-scan-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut storage = HeapStorage::create(&path, table).expect("create indexed heap");
+        let first = storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::UInt64(10),
+                ScalarValue::Bool(true),
+            ])
+            .expect("insert first duplicate");
+        storage
+            .insert(&[
+                ScalarValue::Int64(2),
+                ScalarValue::UInt64(10),
+                ScalarValue::Bool(false),
+            ])
+            .expect("insert second duplicate");
+        storage
+            .insert(&[
+                ScalarValue::Int64(3),
+                ScalarValue::UInt64(20),
+                ScalarValue::Bool(true),
+            ])
+            .expect("insert other key");
+        let definition = storage
+            .create_index(ColumnId(2))
+            .expect("create team index");
+
+        let columns = [
+            (1, "id", PhysicalType::Int64),
+            (2, "team_id", PhysicalType::UInt64),
+            (3, "active", PhysicalType::Bool),
+        ]
+        .map(|(id, name, physical)| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(101),
+            column_id: ColumnId(id),
+            relation_name: "users".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable: false,
+        })
+        .to_vec();
+        let scan = PhysicalPlan::IndexScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(101),
+            table_name: "users".into(),
+            columns: columns.clone(),
+            index_column: columns[1].clone(),
+            handle: definition.handle,
+            key: ScalarValue::UInt64(10),
+        };
+
+        let candidates =
+            execute_rows(&scan, std::slice::from_mut(&mut storage)).expect("execute point lookup");
+        assert_eq!(candidates.rows.len(), 2);
+        assert!(candidates.rows.iter().all(|row| row.row_id.is_some()));
+        assert_eq!(candidates.rows[0].values.len(), 3);
+
+        let active = Expr {
+            kind: ExprKind::Column(columns[2].clone()),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let predicate = Expr {
+            kind: ExprKind::Binary {
+                operator: BinaryOp::Eq,
+                left: Box::new(active),
+                right: Box::new(Expr {
+                    kind: ExprKind::Literal(ScalarValue::Bool(true)),
+                    expr_type: ExprType {
+                        data_type: SemanticType::physical(PhysicalType::Bool),
+                        nullable: false,
+                    },
+                }),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let result = execute(
+            &PhysicalPlan::Filter {
+                input: Box::new(scan.clone()),
+                predicate,
+            },
+            &mut storage,
+        )
+        .expect("execute residual filter");
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                ScalarValue::Int64(1),
+                ScalarValue::UInt64(10),
+                ScalarValue::Bool(true),
+            ]]
+        );
+
+        storage.delete(first).expect("delete indexed row");
+        storage
+            .btree()
+            .insert(definition.handle, ScalarValue::UInt64(10), first)
+            .expect("inject deleted locator");
+        assert!(matches!(
+            execute(&scan, &mut storage),
+            Err(ExecutionError::Storage(
+                netbadb_storage::StorageError::RowDeleted { .. }
+            ))
+        ));
+
+        storage.close().expect("close indexed heap");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }

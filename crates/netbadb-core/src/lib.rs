@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use netbadb_compiler::{CompileError, compile_statement};
 use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages};
-use netbadb_planner::PhysicalStatement;
+use netbadb_planner::{IndexAccessPath, PhysicalStatement, plan_statement_with_access_paths};
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{HeapStorage, StorageError, TransactionError};
 use netbadb_types::{ColumnId, ScalarValue, TableId};
@@ -269,8 +269,7 @@ impl Database {
     }
 
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
-        let compiled = compile_statement(&self.schema, source)?;
-        let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
+        let physical = self.plan_source(source)?;
         let PhysicalStatement::Query(plan) = physical else {
             return Err(DatabaseError::ExpectedQuery);
         };
@@ -280,8 +279,7 @@ impl Database {
     /// Executes SELECT or one typed DML statement. DML runs in one implicit
     /// transaction and returns an explicit affected-row count.
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
-        let compiled = compile_statement(&self.schema, source)?;
-        let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
+        let physical = self.plan_source(source)?;
         if let PhysicalStatement::Query(plan) = &physical {
             return Ok(ExecutionResult::Query(execute_with_storages(
                 plan,
@@ -316,8 +314,7 @@ impl Database {
         // Reject inactive or foreign handles before compilation/execution. A
         // foreign handle must never be rolled back by this database object.
         self.validate_transaction(transaction)?;
-        let compiled = compile_statement(&self.schema, source)?;
-        let physical = netbadb_planner::plan_statement(&compiled.logical_statement);
+        let physical = self.plan_source(source)?;
         if let PhysicalStatement::Query(plan) = &physical {
             return Ok(ExecutionResult::Query(execute_with_storages(
                 plan,
@@ -339,6 +336,32 @@ impl Database {
     #[must_use]
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn plan_source(&self, source: &str) -> Result<PhysicalStatement, DatabaseError> {
+        let compiled = compile_statement(&self.schema, source)?;
+        let access_paths = self.planner_access_paths();
+        Ok(plan_statement_with_access_paths(
+            &compiled.logical_statement,
+            &access_paths,
+        ))
+    }
+
+    fn planner_access_paths(&self) -> Vec<IndexAccessPath> {
+        self.storages
+            .iter()
+            .flat_map(|storage| {
+                let table_id = storage.table().id;
+                storage
+                    .indexes()
+                    .iter()
+                    .map(move |definition| IndexAccessPath {
+                        table_id,
+                        column_id: definition.column_id,
+                        handle: definition.handle,
+                    })
+            })
+            .collect()
     }
 
     fn primary_storage_mut(&mut self) -> Result<&mut HeapStorage, DatabaseError> {
@@ -430,9 +453,10 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, TransactionState};
+    use super::{Database, ExecutionResult, PhysicalStatement, TransactionState};
+    use netbadb_planner::PhysicalPlan;
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+    use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
 
     fn table() -> TableDef {
         TableDef::new(
@@ -443,6 +467,59 @@ mod tests {
                 ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
             ],
         )
+    }
+
+    fn indexed_table() -> TableDef {
+        TableDef::new(
+            TableId(9),
+            "members",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "team_id",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+                ColumnDef::new(ColumnId(3), "name", TypeSpec::Physical(PhysicalType::Text)),
+                ColumnDef::new(
+                    ColumnId(4),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+            ],
+        )
+    }
+
+    fn planned_index(plan: &PhysicalPlan) -> Option<(PageId, &ScalarValue)> {
+        match plan {
+            PhysicalPlan::IndexScan { handle, key, .. } => Some((handle.meta_page, key)),
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Aggregate { input, .. }
+            | PhysicalPlan::Limit { input, .. } => planned_index(input),
+            PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+                planned_index(left).or_else(|| planned_index(right))
+            }
+            PhysicalPlan::SeqScan { .. } => None,
+        }
+    }
+
+    fn planned_statement_index(statement: &PhysicalStatement) -> Option<(PageId, &ScalarValue)> {
+        match statement {
+            PhysicalStatement::Query(plan)
+            | PhysicalStatement::Update { input: plan, .. }
+            | PhysicalStatement::Delete { input: plan, .. } => planned_index(plan),
+            PhysicalStatement::Insert { .. } => None,
+        }
+    }
+
+    fn affected(result: ExecutionResult) -> u64 {
+        match result {
+            ExecutionResult::AffectedRows(rows) => rows,
+            ExecutionResult::Query(_) => panic!("expected affected rows"),
+        }
     }
 
     #[test]
@@ -662,6 +739,231 @@ mod tests {
                 .is_empty()
         );
         database.close().expect("close database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn registered_point_scans_cover_planning_null_dml_reopen_and_read_your_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-index-scan-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let schema = indexed_table();
+        let mut database = Database::create(&path, schema.clone()).expect("create database");
+        for row in [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(10),
+                ScalarValue::Text("Ada".into()),
+                ScalarValue::Bool(true),
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::Int64(10),
+                ScalarValue::Text("Bea".into()),
+                ScalarValue::Bool(false),
+            ],
+            vec![
+                ScalarValue::Int64(3),
+                ScalarValue::Int64(10),
+                ScalarValue::Text("Cal".into()),
+                ScalarValue::Bool(true),
+            ],
+            vec![
+                ScalarValue::Int64(4),
+                ScalarValue::Int64(20),
+                ScalarValue::Text("Dee".into()),
+                ScalarValue::Bool(true),
+            ],
+            vec![
+                ScalarValue::Int64(5),
+                ScalarValue::Null,
+                ScalarValue::Text("Eve".into()),
+                ScalarValue::Bool(true),
+            ],
+        ] {
+            database.insert(&row).expect("insert indexed row");
+        }
+        let team = database
+            .create_index(TableId(9), ColumnId(2))
+            .expect("create team index");
+        let name = database
+            .create_index(TableId(9), ColumnId(3))
+            .expect("create name index");
+
+        let select = database
+            .plan_source("SELECT name FROM members m WHERE m.team_id = 10 AND m.active = true")
+            .expect("plan indexed select");
+        assert_eq!(
+            planned_statement_index(&select),
+            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+        );
+        assert_eq!(
+            database
+                .query("SELECT name FROM members m WHERE m.team_id = 10 AND m.active = true")
+                .expect("query residual predicate")
+                .rows,
+            vec![
+                vec![ScalarValue::Text("Ada".into())],
+                vec![ScalarValue::Text("Cal".into())],
+            ]
+        );
+
+        let deterministic = database
+            .plan_source("SELECT id FROM members WHERE name = 'Ada' AND team_id = 10")
+            .expect("plan deterministic choice");
+        assert_eq!(
+            planned_statement_index(&deterministic),
+            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+        );
+        assert_ne!(team.handle, name.handle);
+
+        let is_null = database
+            .plan_source("SELECT id FROM members WHERE team_id IS NULL")
+            .expect("plan IS NULL");
+        assert_eq!(
+            planned_statement_index(&is_null),
+            Some((team.handle.meta_page, &ScalarValue::Null))
+        );
+        assert_eq!(
+            database
+                .query("SELECT id FROM members WHERE team_id IS NULL")
+                .expect("query NULL key")
+                .rows,
+            vec![vec![ScalarValue::Int64(5)]]
+        );
+        let equals_null = database
+            .plan_source("SELECT id FROM members WHERE team_id = NULL")
+            .expect("plan NULL equality");
+        assert!(planned_statement_index(&equals_null).is_none());
+        assert!(
+            database
+                .query("SELECT id FROM members WHERE team_id = NULL")
+                .expect("query NULL equality")
+                .rows
+                .is_empty()
+        );
+
+        let mut transaction = database.begin_transaction().expect("begin transaction");
+        assert_eq!(
+            affected(
+                database
+                    .execute_in(
+                        &mut transaction,
+                        "UPDATE members SET team_id = 30 WHERE id = 4",
+                    )
+                    .expect("update indexed key in transaction")
+            ),
+            1
+        );
+        let visible = database
+            .execute_in(
+                &mut transaction,
+                "SELECT id FROM members WHERE team_id = 30",
+            )
+            .expect("read own indexed write");
+        assert!(matches!(
+            visible,
+            ExecutionResult::Query(result)
+                if result.rows == vec![vec![ScalarValue::Int64(4)]]
+        ));
+        transaction.rollback().expect("rollback indexed write");
+        assert!(
+            database
+                .query("SELECT id FROM members WHERE team_id = 30")
+                .expect("query rolled back key")
+                .rows
+                .is_empty()
+        );
+
+        let update = database
+            .plan_source("UPDATE members SET team_id = 20 WHERE team_id = 10")
+            .expect("plan self-index update");
+        assert_eq!(
+            planned_statement_index(&update),
+            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+        );
+        assert_eq!(
+            affected(
+                database
+                    .execute("UPDATE members SET team_id = 20 WHERE team_id = 10")
+                    .expect("execute self-index update")
+            ),
+            3
+        );
+        assert!(
+            database
+                .storage_mut(TableId(9))
+                .unwrap()
+                .btree()
+                .lookup(team.handle, &ScalarValue::Int64(10))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .storage_mut(TableId(9))
+                .unwrap()
+                .btree()
+                .lookup(team.handle, &ScalarValue::Int64(20))
+                .unwrap()
+                .len(),
+            4
+        );
+
+        for id in [6, 7] {
+            database
+                .execute(&format!(
+                    "INSERT INTO members (id, team_id, name, active) VALUES ({id}, 10, 'X{id}', true)"
+                ))
+                .expect("insert delete target");
+        }
+        let delete = database
+            .plan_source("DELETE FROM members WHERE team_id = 10")
+            .expect("plan self-index delete");
+        assert_eq!(
+            planned_statement_index(&delete),
+            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+        );
+        assert_eq!(
+            affected(
+                database
+                    .execute("DELETE FROM members WHERE team_id = 10")
+                    .expect("execute self-index delete")
+            ),
+            2
+        );
+        assert!(
+            database
+                .storage_mut(TableId(9))
+                .unwrap()
+                .btree()
+                .lookup(team.handle, &ScalarValue::Int64(10))
+                .unwrap()
+                .is_empty()
+        );
+
+        database.close().expect("close indexed database");
+        let mut reopened = Database::open(&path, schema).expect("reopen indexed database");
+        let reopened_plan = reopened
+            .plan_source("SELECT id FROM members WHERE name = 'Ada'")
+            .expect("plan reopened text lookup");
+        assert_eq!(
+            planned_statement_index(&reopened_plan),
+            Some((name.handle.meta_page, &ScalarValue::Text("Ada".into())))
+        );
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM members WHERE name = 'Ada'")
+                .expect("query reopened text index")
+                .rows,
+            vec![vec![ScalarValue::Int64(1)]]
+        );
+        reopened.close().expect("close reopened database");
         let wal = netbadb_storage::wal_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
