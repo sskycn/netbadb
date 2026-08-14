@@ -1,6 +1,8 @@
 //! Transport-neutral synchronous NetbaDB protocol sessions.
 
+mod limits;
 mod manifest;
+mod metrics;
 mod runtime;
 
 use std::error::Error;
@@ -15,13 +17,34 @@ use netbadb_protocol::{
     WireTransactionState, validate_server_message,
 };
 
+pub use limits::{
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
+    MAX_CONFIGURED_CONNECTIONS, MAX_CONFIGURED_RESULT_ROWS, MAX_SOCKET_TIMEOUT, ServerLimits,
+    ServerLimitsError, SessionPolicy,
+};
 pub use manifest::{ManifestError, ServerConfig, TableBootstrap};
+pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseBatch {
     pub request_id: u64,
     pub messages: Vec<ServerMessage>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionResponse {
+    pub(crate) batch: ResponseBatch,
+    pub(crate) result_row_limit_exceeded: bool,
+}
+
+impl SessionResponse {
+    fn standard(batch: ResponseBatch) -> Self {
+        Self {
+            batch,
+            result_row_limit_exceeded: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -34,6 +57,10 @@ pub enum ServerError {
         reason: &'static str,
     },
     ResponseTooLarge,
+    ResultRowLimitExceeded {
+        rows: usize,
+        limit: usize,
+    },
 }
 
 impl fmt::Display for ServerError {
@@ -55,6 +82,10 @@ impl fmt::Display for ServerError {
             Self::ResponseTooLarge => {
                 formatter.write_str("one response message exceeds the protocol frame limit")
             }
+            Self::ResultRowLimitExceeded { rows, limit } => write!(
+                formatter,
+                "query result has {rows} rows and exceeds the configured server row limit {limit}"
+            ),
         }
     }
 }
@@ -64,7 +95,9 @@ impl Error for ServerError {
         match self {
             Self::Database(error) => Some(error),
             Self::Protocol(error) => Some(error),
-            Self::InternalResultMismatch { .. } | Self::ResponseTooLarge => None,
+            Self::InternalResultMismatch { .. }
+            | Self::ResponseTooLarge
+            | Self::ResultRowLimitExceeded { .. } => None,
         }
     }
 }
@@ -90,12 +123,21 @@ impl From<ProtocolError> for ServerError {
 pub struct SessionState {
     handshaken: bool,
     transaction: Option<Transaction>,
+    policy: SessionPolicy,
 }
 
 impl SessionState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_policy(policy: SessionPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
     }
 
     #[must_use]
@@ -120,34 +162,44 @@ impl SessionState {
         request_id: u64,
         request: ClientMessage,
     ) -> ResponseBatch {
+        self.handle_with_metadata(database, request_id, request)
+            .batch
+    }
+
+    pub(crate) fn handle_with_metadata(
+        &mut self,
+        database: &mut Database,
+        request_id: u64,
+        request: ClientMessage,
+    ) -> SessionResponse {
         if request_id == 0 {
-            return self.error_batch(
+            return SessionResponse::standard(self.error_batch(
                 request_id,
                 ProtocolErrorCode::Protocol,
                 "request ID zero is reserved",
-            );
+            ));
         }
         if !self.handshaken {
             return match request {
                 ClientMessage::Hello => match build_hello_ack(database) {
                     Ok(message) => {
                         if let Err(error) = validate_server_message(&message) {
-                            self.server_error_batch(request_id, error.into())
+                            self.classified_server_error_batch(request_id, error.into())
                         } else {
                             self.handshaken = true;
-                            ResponseBatch {
+                            SessionResponse::standard(ResponseBatch {
                                 request_id,
                                 messages: vec![message],
-                            }
+                            })
                         }
                     }
-                    Err(error) => self.server_error_batch(request_id, error),
+                    Err(error) => self.classified_server_error_batch(request_id, error),
                 },
-                _ => self.error_batch(
+                _ => SessionResponse::standard(self.error_batch(
                     request_id,
                     ProtocolErrorCode::HandshakeRequired,
                     "Hello must be the first request in a session",
-                ),
+                )),
             };
         }
 
@@ -177,12 +229,16 @@ impl SessionState {
         };
 
         match result {
-            Ok(messages) => self.success_batch(request_id, messages),
+            Ok(messages) => SessionResponse::standard(self.success_batch(request_id, messages)),
             Err(SessionFailure::Fixed { code, message }) => {
-                self.error_batch(request_id, code, message)
+                SessionResponse::standard(self.error_batch(request_id, code, message))
             }
-            Err(SessionFailure::Database(error)) => self.database_error_batch(request_id, error),
-            Err(SessionFailure::Server(error)) => self.server_error_batch(request_id, error),
+            Err(SessionFailure::Database(error)) => {
+                SessionResponse::standard(self.database_error_batch(request_id, error))
+            }
+            Err(SessionFailure::Server(error)) => {
+                self.classified_server_error_batch(request_id, error)
+            }
         }
     }
 
@@ -226,7 +282,8 @@ impl SessionState {
         let result = result.map_err(SessionFailure::Database)?;
         match result {
             ExecutionResult::Query(query) => {
-                build_query_messages(query).map_err(SessionFailure::Server)
+                build_query_messages(query, self.policy.max_result_rows())
+                    .map_err(SessionFailure::Server)
             }
             ExecutionResult::AffectedRows(count) => Ok(vec![ServerMessage::AffectedRows { count }]),
         }
@@ -290,12 +347,27 @@ impl SessionState {
 
     fn server_error_batch(&self, request_id: u64, error: ServerError) -> ResponseBatch {
         let code = match &error {
-            ServerError::ResponseTooLarge => ProtocolErrorCode::ResponseTooLarge,
+            ServerError::ResponseTooLarge | ServerError::ResultRowLimitExceeded { .. } => {
+                ProtocolErrorCode::ResponseTooLarge
+            }
             ServerError::InternalResultMismatch { .. } => ProtocolErrorCode::InternalResultMismatch,
             ServerError::Protocol(_) => ProtocolErrorCode::Protocol,
             ServerError::Database(database) => database_error_code(database),
         };
         self.error_batch(request_id, code, &error.to_string())
+    }
+
+    fn classified_server_error_batch(
+        &self,
+        request_id: u64,
+        error: ServerError,
+    ) -> SessionResponse {
+        let result_row_limit_exceeded =
+            matches!(&error, ServerError::ResultRowLimitExceeded { .. });
+        SessionResponse {
+            batch: self.server_error_batch(request_id, error),
+            result_row_limit_exceeded,
+        }
     }
 
     fn database_error_batch(&self, request_id: u64, error: DatabaseError) -> ResponseBatch {
@@ -368,7 +440,16 @@ fn build_hello_ack(database: &Database) -> Result<ServerMessage, ServerError> {
     })
 }
 
-fn build_query_messages(query: QueryResult) -> Result<Vec<ServerMessage>, ServerError> {
+fn build_query_messages(
+    query: QueryResult,
+    max_result_rows: usize,
+) -> Result<Vec<ServerMessage>, ServerError> {
+    if query.rows.len() > max_result_rows {
+        return Err(ServerError::ResultRowLimitExceeded {
+            rows: query.rows.len(),
+            limit: max_result_rows,
+        });
+    }
     let columns = query
         .columns
         .iter()
@@ -980,13 +1061,88 @@ mod tests {
             vec![vec![ScalarValue::Text("wrong".into())]],
         ] {
             assert!(matches!(
-                build_query_messages(QueryResult {
-                    columns: vec![column.clone()],
-                    rows,
-                }),
+                build_query_messages(
+                    QueryResult {
+                        columns: vec![column.clone()],
+                        rows,
+                    },
+                    usize::MAX
+                ),
                 Err(ServerError::InternalResultMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn result_row_limit_returns_one_error_and_preserves_an_active_transaction() {
+        let path = test_path("result-row-limit");
+        cleanup(&path);
+        let mut database = Database::create(&path, users_table()).unwrap();
+        for id in 1..=3 {
+            database
+                .execute(&format!(
+                    "INSERT INTO users (id, name) VALUES ({id}, 'row')"
+                ))
+                .unwrap();
+        }
+        let mut session = SessionState::with_policy(SessionPolicy::new(2).unwrap());
+        hello(&mut session, &mut database);
+        session.handle(
+            &mut database,
+            2,
+            ClientMessage::Begin {
+                table_id: TableId(1),
+            },
+        );
+
+        let limited = session.handle_with_metadata(
+            &mut database,
+            3,
+            ClientMessage::Execute {
+                sql: "SELECT id FROM users ORDER BY id".into(),
+            },
+        );
+        assert!(limited.result_row_limit_exceeded);
+        let limited = limited.batch;
+        assert_error(
+            &limited,
+            ProtocolErrorCode::ResponseTooLarge,
+            WireTransactionState::Active,
+        );
+        assert_eq!(limited.messages.len(), 1);
+
+        let successful = session.handle(
+            &mut database,
+            4,
+            ClientMessage::Execute {
+                sql: "SELECT id FROM users ORDER BY id LIMIT 1".into(),
+            },
+        );
+        assert!(matches!(
+            successful.messages.as_slice(),
+            [
+                ServerMessage::QueryStart { .. },
+                ServerMessage::QueryRow { .. },
+                ServerMessage::QueryEnd { row_count: 1 }
+            ]
+        ));
+        assert_eq!(
+            session
+                .handle(&mut database, 5, ClientMessage::Rollback)
+                .messages,
+            vec![ServerMessage::TransactionRolledBack]
+        );
+
+        let frame_limited = session.classified_server_error_batch(6, ServerError::ResponseTooLarge);
+        assert!(!frame_limited.result_row_limit_exceeded);
+        assert_error(
+            &frame_limited.batch,
+            ProtocolErrorCode::ResponseTooLarge,
+            WireTransactionState::None,
+        );
+
+        database.close().unwrap();
+        cleanup(&path);
     }
 
     #[test]

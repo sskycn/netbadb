@@ -13,7 +13,10 @@ use netbadb_protocol::{
 };
 
 use crate::manifest::validate_loopback;
-use crate::{ManifestError, ResponseBatch, ServerConfig, SessionState, TableBootstrap};
+use crate::{
+    ManifestError, ServerConfig, ServerLimits, ServerMetricsHandle, SessionPolicy, SessionResponse,
+    SessionState, TableBootstrap,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(u64);
@@ -143,10 +146,11 @@ impl TcpServer {
     }
 
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
-        let (listen, tables) = self.config.into_parts();
+        let (listen, tables, limits) = self.config.into_parts();
         validate_loopback(listen)?;
         let table_count = tables.len();
-        let worker = DatabaseWorker::start(tables)?;
+        let worker = DatabaseWorker::start(tables, limits.session_policy())?;
+        let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
             Err(source) => {
@@ -176,13 +180,14 @@ impl TcpServer {
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::sync_channel(0);
+        let server_metrics = metrics.clone();
         let join = match thread::Builder::new()
             .name("netbadb-tcp-server".into())
             .spawn(move || {
                 let worker = worker_rx
                     .recv()
                     .map_err(|_| TcpServerError::WorkerStopped)?;
-                run_accept_loop(listener, shutdown_rx, worker)
+                run_accept_loop(listener, shutdown_rx, worker, limits, server_metrics)
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -203,6 +208,7 @@ impl TcpServer {
         Ok(ServerHandle {
             local_addr,
             table_count,
+            metrics,
             shutdown_tx,
             join: Some(join),
         })
@@ -216,6 +222,7 @@ impl TcpServer {
 pub struct ServerHandle {
     local_addr: SocketAddr,
     table_count: usize,
+    metrics: ServerMetricsHandle,
     shutdown_tx: Sender<()>,
     join: Option<JoinHandle<Result<(), TcpServerError>>>,
 }
@@ -229,6 +236,16 @@ impl ServerHandle {
     #[must_use]
     pub fn table_count(&self) -> usize {
         self.table_count
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> crate::ServerMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    #[must_use]
+    pub fn metrics_handle(&self) -> ServerMetricsHandle {
+        self.metrics.clone()
     }
 
     pub fn shutdown(mut self) -> Result<(), TcpServerError> {
@@ -268,7 +285,8 @@ impl WorkerClient {
         &self,
         session_id: SessionId,
         frame: Frame<ClientMessage>,
-    ) -> Result<ResponseBatch, WorkerRequestError> {
+        metrics: &ServerMetricsHandle,
+    ) -> Result<SessionResponse, WorkerRequestError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.commands
             .send(WorkerCommand::Request {
@@ -277,6 +295,7 @@ impl WorkerClient {
                 reply,
             })
             .map_err(|_| WorkerRequestError::Stopped)?;
+        metrics.worker_request();
         response.recv().map_err(|_| WorkerRequestError::Stopped)?
     }
 
@@ -296,7 +315,10 @@ struct DatabaseWorker {
 }
 
 impl DatabaseWorker {
-    fn start(tables: Vec<TableBootstrap>) -> Result<Self, TcpServerError> {
+    fn start(
+        tables: Vec<TableBootstrap>,
+        session_policy: SessionPolicy,
+    ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -321,7 +343,7 @@ impl DatabaseWorker {
                         }
                     });
                 }
-                run_database_worker(database, command_rx, events_tx)
+                run_database_worker(database, session_policy, command_rx, events_tx)
             })
             .map_err(TcpServerError::ThreadSpawn)?;
         match ready_rx.recv() {
@@ -417,7 +439,7 @@ enum WorkerCommand {
     Request {
         session_id: SessionId,
         frame: Frame<ClientMessage>,
-        reply: SyncSender<Result<ResponseBatch, WorkerRequestError>>,
+        reply: SyncSender<Result<SessionResponse, WorkerRequestError>>,
     },
     CloseSession {
         session_id: SessionId,
@@ -458,13 +480,15 @@ impl fmt::Display for WorkerRequestError {
 struct DatabaseWorkerState {
     database: Option<Database>,
     sessions: HashMap<SessionId, SessionState>,
+    session_policy: SessionPolicy,
 }
 
 impl DatabaseWorkerState {
-    fn new(database: Database) -> Self {
+    fn new(database: Database, session_policy: SessionPolicy) -> Self {
         Self {
             database: Some(database),
             sessions: HashMap::new(),
+            session_policy,
         }
     }
 
@@ -506,10 +530,11 @@ impl DatabaseWorkerState {
 
 fn run_database_worker(
     database: Database,
+    session_policy: SessionPolicy,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerFatalError>,
 ) -> Result<(), WorkerFatalError> {
-    let mut state = DatabaseWorkerState::new(database);
+    let mut state = DatabaseWorkerState::new(database, session_policy);
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::OpenSession { session_id, reply } => {
@@ -517,7 +542,9 @@ fn run_database_worker(
                     let _ = reply.send(Err(WorkerRequestError::DuplicateSession(session_id)));
                     continue;
                 }
-                state.sessions.insert(session_id, SessionState::new());
+                state
+                    .sessions
+                    .insert(session_id, SessionState::with_policy(state.session_policy));
                 if reply.send(Ok(())).is_err() {
                     if let Err(error) = state.close_session(session_id) {
                         let _ = events.send(error.clone());
@@ -542,7 +569,8 @@ fn run_database_worker(
                     let _ = events.send(error.clone());
                     return Err(error);
                 };
-                let response = session.handle(database, frame.request_id, frame.message);
+                let response =
+                    session.handle_with_metadata(database, frame.request_id, frame.message);
                 let _ = reply.send(Ok(response));
             }
             WorkerCommand::CloseSession { session_id, reply } => {
@@ -588,6 +616,8 @@ fn run_accept_loop(
     listener: TcpListener,
     shutdown: Receiver<()>,
     worker: DatabaseWorker,
+    limits: ServerLimits,
+    metrics: ServerMetricsHandle,
 ) -> Result<(), TcpServerError> {
     let client = worker.client();
     let mut connections = Vec::new();
@@ -605,37 +635,58 @@ fn run_accept_loop(
                 break;
             }
             Ok(None) => {}
-            Err(error) => return finish_accept_loop(connections, worker, Err(error)),
+            Err(error) => {
+                return finish_accept_loop(connections, worker, &metrics, Err(error));
+            }
         }
-        reap_connections(&mut connections, &client);
+        reap_connections(&mut connections, &client, &metrics);
 
         match listener.accept() {
             Ok((stream, _peer)) => {
+                if connections.len() >= limits.max_connections() {
+                    metrics.rejected();
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
                 let session_id = SessionId(next_session_id);
                 next_session_id = match next_session_id.checked_add(1) {
                     Some(0) | None => {
                         return finish_accept_loop(
                             connections,
                             worker,
+                            &metrics,
                             Err(TcpServerError::SessionIdExhausted),
                         );
                     }
                     Some(next) => next,
                 };
-                if let Err(error) =
-                    register_connection(stream, session_id, &client, &mut connections)
-                {
-                    eprintln!(
-                        "netbadb connection {} setup failed: {error}",
-                        session_id.get()
-                    );
+                match register_connection(
+                    stream,
+                    session_id,
+                    &client,
+                    limits,
+                    &metrics,
+                    &mut connections,
+                ) {
+                    Ok(()) => metrics.accepted(),
+                    Err(error) => {
+                        eprintln!(
+                            "netbadb connection {} setup failed: {error}",
+                            session_id.get()
+                        );
+                    }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => {
-                return finish_accept_loop(connections, worker, Err(TcpServerError::Accept(error)));
+                return finish_accept_loop(
+                    connections,
+                    worker,
+                    &metrics,
+                    Err(TcpServerError::Accept(error)),
+                );
             }
         }
     }
@@ -643,7 +694,7 @@ fn run_accept_loop(
     for connection in &connections {
         let _ = connection.control.shutdown(Shutdown::Both);
     }
-    join_connections(connections, &client);
+    join_connections(connections, &client, &metrics);
     if fatal.is_none() {
         if let Ok(Some(error)) = worker.poll_fatal() {
             fatal = Some(error);
@@ -658,13 +709,14 @@ fn run_accept_loop(
 fn finish_accept_loop(
     connections: Vec<ConnectionThread>,
     worker: DatabaseWorker,
+    metrics: &ServerMetricsHandle,
     result: Result<(), TcpServerError>,
 ) -> Result<(), TcpServerError> {
     for connection in &connections {
         let _ = connection.control.shutdown(Shutdown::Both);
     }
     let client = worker.client();
-    join_connections(connections, &client);
+    join_connections(connections, &client, metrics);
     match worker.shutdown() {
         Ok(()) => result,
         Err(error) => Err(error),
@@ -675,14 +727,11 @@ fn register_connection(
     stream: TcpStream,
     session_id: SessionId,
     worker: &WorkerClient,
+    limits: ServerLimits,
+    metrics: &ServerMetricsHandle,
     connections: &mut Vec<ConnectionThread>,
 ) -> Result<(), ConnectionError> {
-    stream
-        .set_nonblocking(false)
-        .map_err(ConnectionError::Configure)?;
-    stream
-        .set_nodelay(true)
-        .map_err(ConnectionError::Configure)?;
+    configure_connection_stream(&stream, limits).map_err(ConnectionError::Configure)?;
     worker
         .open_session(session_id)
         .map_err(ConnectionError::Worker)?;
@@ -694,9 +743,10 @@ fn register_connection(
         }
     };
     let connection_worker = worker.clone();
+    let connection_metrics = metrics.clone();
     let join = match thread::Builder::new()
         .name(format!("netbadb-connection-{}", session_id.get()))
-        .spawn(move || run_connection(stream, session_id, connection_worker))
+        .spawn(move || run_connection(stream, session_id, connection_worker, connection_metrics))
     {
         Ok(join) => join,
         Err(error) => {
@@ -712,12 +762,20 @@ fn register_connection(
     Ok(())
 }
 
+fn configure_connection_stream(stream: &TcpStream, limits: ServerLimits) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(limits.idle_timeout()))?;
+    stream.set_write_timeout(Some(limits.write_timeout()))
+}
+
 fn run_connection(
     mut stream: TcpStream,
     session_id: SessionId,
     worker: WorkerClient,
+    metrics: ServerMetricsHandle,
 ) -> Result<(), ConnectionError> {
-    let request_result = run_connection_requests(&mut stream, session_id, &worker);
+    let request_result = run_connection_requests(&mut stream, session_id, &worker, &metrics);
     let close_result = worker
         .close_session(session_id)
         .map_err(ConnectionError::Worker);
@@ -730,16 +788,21 @@ fn run_connection_requests(
     stream: &mut TcpStream,
     session_id: SessionId,
     worker: &WorkerClient,
+    metrics: &ServerMetricsHandle,
 ) -> Result<(), ConnectionError> {
     loop {
         let frame = match read_client_frame(stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
-            Err(error) => return Err(ConnectionError::Protocol(error)),
+            Err(error) => return Err(ConnectionError::Read(error)),
         };
         let response = worker
-            .request(session_id, frame)
+            .request(session_id, frame, metrics)
             .map_err(ConnectionError::Worker)?;
+        if response.result_row_limit_exceeded {
+            metrics.query_response_limit_error();
+        }
+        let response = response.batch;
         for message in response.messages {
             write_server_frame(
                 stream,
@@ -748,37 +811,52 @@ fn run_connection_requests(
                     message,
                 },
             )
-            .map_err(ConnectionError::Protocol)?;
+            .map_err(ConnectionError::WriteProtocol)?;
         }
-        stream.flush().map_err(ConnectionError::Write)?;
+        stream.flush().map_err(ConnectionError::Flush)?;
     }
 }
 
-fn reap_connections(connections: &mut Vec<ConnectionThread>, worker: &WorkerClient) {
+fn reap_connections(
+    connections: &mut Vec<ConnectionThread>,
+    worker: &WorkerClient,
+    metrics: &ServerMetricsHandle,
+) {
     let mut index = 0;
     while index < connections.len() {
         if connections[index].join.is_finished() {
             let connection = connections.swap_remove(index);
-            join_connection(connection, worker);
+            join_connection(connection, worker, metrics);
         } else {
             index += 1;
         }
     }
 }
 
-fn join_connections(connections: Vec<ConnectionThread>, worker: &WorkerClient) {
+fn join_connections(
+    connections: Vec<ConnectionThread>,
+    worker: &WorkerClient,
+    metrics: &ServerMetricsHandle,
+) {
     for connection in connections {
-        join_connection(connection, worker);
+        join_connection(connection, worker, metrics);
     }
 }
 
-fn join_connection(connection: ConnectionThread, worker: &WorkerClient) {
+fn join_connection(
+    connection: ConnectionThread,
+    worker: &WorkerClient,
+    metrics: &ServerMetricsHandle,
+) {
     match connection.join.join() {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!(
-            "netbadb connection {} closed: {error}",
-            connection.session_id.get()
-        ),
+        Ok(Err(error)) => {
+            error.record(metrics);
+            eprintln!(
+                "netbadb connection {} closed: {error}",
+                connection.session_id.get()
+            );
+        }
         Err(_) => {
             eprintln!(
                 "netbadb connection {} thread panicked",
@@ -787,15 +865,29 @@ fn join_connection(connection: ConnectionThread, worker: &WorkerClient) {
             let _ = worker.close_session(connection.session_id);
         }
     }
+    metrics.closed();
 }
 
 #[derive(Debug)]
 enum ConnectionError {
     Configure(io::Error),
     Spawn(io::Error),
-    Protocol(ProtocolError),
-    Write(io::Error),
+    Read(ProtocolError),
+    WriteProtocol(ProtocolError),
+    Flush(io::Error),
     Worker(WorkerRequestError),
+}
+
+impl ConnectionError {
+    fn record(&self, metrics: &ServerMetricsHandle) {
+        match self {
+            Self::Read(ProtocolError::Io(error)) if is_timeout(error) => metrics.idle_timeout(),
+            Self::Read(ProtocolError::Io(_)) => {}
+            Self::Read(_) => metrics.protocol_failure(),
+            Self::WriteProtocol(_) | Self::Flush(_) => metrics.write_failure(),
+            Self::Configure(_) | Self::Spawn(_) | Self::Worker(_) => {}
+        }
+    }
 }
 
 impl fmt::Display for ConnectionError {
@@ -803,11 +895,43 @@ impl fmt::Display for ConnectionError {
         match self {
             Self::Configure(error) => write!(formatter, "socket configuration failed: {error}"),
             Self::Spawn(error) => write!(formatter, "connection thread spawn failed: {error}"),
-            Self::Protocol(error) => {
-                write!(formatter, "protocol violation or I/O failure: {error}")
-            }
-            Self::Write(error) => write!(formatter, "response flush failed: {error}"),
+            Self::Read(error) => write!(formatter, "request read failed: {error}"),
+            Self::WriteProtocol(error) => write!(formatter, "response write failed: {error}"),
+            Self::Flush(error) => write!(formatter, "response flush failed: {error}"),
             Self::Worker(error) => error.fmt(formatter),
         }
+    }
+}
+
+fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn connection_configuration_applies_read_and_write_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let limits =
+            ServerLimits::new(1, Duration::from_millis(250), Duration::from_millis(500), 1)
+                .unwrap();
+
+        configure_connection_stream(&stream, limits).unwrap();
+        assert!(stream.nodelay().unwrap());
+        assert_eq!(stream.read_timeout().unwrap(), Some(limits.idle_timeout()));
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            Some(limits.write_timeout())
+        );
+        drop(client);
     }
 }

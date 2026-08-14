@@ -246,6 +246,12 @@ request on that connection. Query execution and `ResponseBatch` construction
 remain fully materialized; QueryRow framing avoids one giant wire frame but is
 not an incremental executor cursor.
 
+Server connection limits and socket read/write timeouts are transport policy,
+not wire capabilities. A socket read timeout closes the connection and its
+session; it is not a database statement execution timeout or cancellation.
+Result-row policy uses the existing `ResponseTooLarge` Error after execution
+materializes the complete result and does not add or modify protocol tags.
+
 Request IDs correlate responses only. They do not provide retry deduplication
 or exactly-once semantics. If a connection fails after execution but before the
 client receives the response, an implicit DML or explicit Commit may already be

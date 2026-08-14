@@ -8,7 +8,12 @@ use netbadb_schema::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 use serde::Deserialize;
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 1;
+use crate::{
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
+    ServerLimits, ServerLimitsError,
+};
+
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 2;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -22,6 +27,7 @@ pub struct TableBootstrap {
 pub struct ServerConfig {
     listen: SocketAddr,
     tables: Vec<TableBootstrap>,
+    limits: ServerLimits,
 }
 
 impl ServerConfig {
@@ -47,6 +53,10 @@ impl ServerConfig {
             None => DEFAULT_LISTEN_ADDRESS,
         };
         validate_loopback(listen)?;
+        let limits = manifest
+            .limits
+            .map_or_else(|| Ok(ServerLimits::default()), ManifestLimits::into_limits)
+            .map_err(ManifestError::Limits)?;
 
         let manifest_directory = path
             .parent()
@@ -100,7 +110,11 @@ impl ServerConfig {
         }
         Schema::new(tables.iter().map(|entry| entry.table.clone()).collect())
             .map_err(ManifestError::Schema)?;
-        Ok(Self { listen, tables })
+        Ok(Self {
+            listen,
+            tables,
+            limits,
+        })
     }
 
     #[must_use]
@@ -113,8 +127,13 @@ impl ServerConfig {
         &self.tables
     }
 
-    pub(crate) fn into_parts(self) -> (SocketAddr, Vec<TableBootstrap>) {
-        (self.listen, self.tables)
+    #[must_use]
+    pub const fn limits(&self) -> ServerLimits {
+        self.limits
+    }
+
+    pub(crate) fn into_parts(self) -> (SocketAddr, Vec<TableBootstrap>, ServerLimits) {
+        (self.listen, self.tables, self.limits)
     }
 }
 
@@ -150,6 +169,7 @@ pub enum ManifestError {
     },
     TablePathIsNotFile(PathBuf),
     DuplicateStoragePath(PathBuf),
+    Limits(ServerLimitsError),
     Schema(SchemaError),
 }
 
@@ -196,6 +216,7 @@ impl fmt::Display for ManifestError {
                 "table file `{}` is configured more than once",
                 path.display()
             ),
+            Self::Limits(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
         }
     }
@@ -209,6 +230,7 @@ impl Error for ManifestError {
             | Self::TablePath { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             Self::InvalidListen { source, .. } => Some(source),
+            Self::Limits(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::UnsupportedVersion(_)
             | Self::EmptyTables
@@ -224,7 +246,32 @@ impl Error for ManifestError {
 struct DeploymentManifest {
     version: u32,
     listen: Option<String>,
+    limits: Option<ManifestLimits>,
     tables: Vec<ManifestTable>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestLimits {
+    max_connections: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    write_timeout_ms: Option<u64>,
+    max_result_rows: Option<u64>,
+}
+
+impl ManifestLimits {
+    fn into_limits(self) -> Result<ServerLimits, ServerLimitsError> {
+        ServerLimits::from_millis(
+            self.max_connections
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS as u64),
+            self.idle_timeout_ms
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT.as_millis() as u64),
+            self.write_timeout_ms
+                .unwrap_or(DEFAULT_WRITE_TIMEOUT.as_millis() as u64),
+            self.max_result_rows
+                .unwrap_or(DEFAULT_MAX_RESULT_ROWS as u64),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +330,7 @@ impl ManifestPhysicalType {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
 
     use netbadb_core::Database;
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
@@ -324,7 +372,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 1,
+                "version": 2,
                 {listen}
                 "tables": [{{
                     "path": "{path}",
@@ -365,6 +413,7 @@ mod tests {
 
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
         assert_eq!(config.listen(), DEFAULT_LISTEN_ADDRESS);
+        assert_eq!(config.limits(), ServerLimits::default());
         assert_eq!(config.tables().len(), 1);
         assert_eq!(config.tables()[0].path, heap.canonicalize().unwrap());
         assert_eq!(config.tables()[0].table, users_table("UserId"));
@@ -383,13 +432,13 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        std::fs::write(&manifest, r#"{"version":2,"tables":[]}"#).unwrap();
+        std::fs::write(&manifest, r#"{"version":1,"tables":[]}"#).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::UnsupportedVersion(2))
+            Err(ManifestError::UnsupportedVersion(1))
         ));
 
-        std::fs::write(&manifest, r#"{"version":1,"unexpected":true,"tables":[]}"#).unwrap();
+        std::fs::write(&manifest, r#"{"version":2,"unexpected":true,"tables":[]}"#).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
             Err(ManifestError::Json(_))
@@ -413,6 +462,49 @@ mod tests {
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
             Err(ManifestError::TablePath { .. })
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn limits_are_partial_strict_and_bounded() {
+        let directory = test_directory("limits");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let heap = directory.join("users.ndb");
+        create_heap(&heap);
+        let manifest = directory.join("server.json");
+
+        let source = manifest_json(None, "users.ndb", "UserId").replace(
+            "\"tables\":",
+            "\"limits\": {\"max_connections\": 2, \"idle_timeout_ms\": 250, \"max_result_rows\": 3}, \"tables\":",
+        );
+        std::fs::write(&manifest, source).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert_eq!(config.limits().max_connections(), 2);
+        assert_eq!(config.limits().idle_timeout(), Duration::from_millis(250));
+        assert_eq!(config.limits().write_timeout(), DEFAULT_WRITE_TIMEOUT);
+        assert_eq!(config.limits().max_result_rows(), 3);
+
+        let invalid = manifest_json(None, "users.ndb", "UserId").replace(
+            "\"tables\":",
+            "\"limits\": {\"max_connections\": 0}, \"tables\":",
+        );
+        std::fs::write(&manifest, invalid).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Limits(error)) if error.field() == "max_connections"
+        ));
+
+        let unknown = manifest_json(None, "users.ndb", "UserId").replace(
+            "\"tables\":",
+            "\"limits\": {\"connection_limit\": 2}, \"tables\":",
+        );
+        std::fs::write(&manifest, unknown).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::Json(_))
         ));
 
         std::fs::remove_dir_all(directory).unwrap();

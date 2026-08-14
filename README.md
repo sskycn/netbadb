@@ -188,15 +188,17 @@ The current code genuinely supports:
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a loopback-only blocking TCP runtime whose dedicated synchronous worker owns
-  the Database and every SessionState, plus strict deployment manifest v1
-  bootstrap and the standalone `netbadbd` executable;
+  the Database and every SessionState, plus strict deployment manifest v2
+  bootstrap, bounded connections/socket inactivity, response-row policy,
+  in-process metrics, and the standalone `netbadbd` executable;
 - a native embedded `netbadb-core::Database` API.
 
 Protocol v1 is specified byte-for-byte in
-[`docs/protocol-v1.md`](docs/protocol-v1.md), and standalone configuration is
-documented in [`docs/server-manifest-v1.md`](docs/server-manifest-v1.md).
-Phase 5B deliberately has no async runtime, authentication, TLS, remote listen,
-connection limits, or socket timeouts.
+[`docs/protocol-v1.md`](docs/protocol-v1.md), and current standalone
+configuration is documented in
+[`docs/server-manifest-v2.md`](docs/server-manifest-v2.md). Manifest v1 is
+retained as historical documentation and rejected by current `netbadbd`.
+Phase 5C1 still has no async runtime, authentication, TLS, or remote listen.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -528,12 +530,14 @@ The implementation sequence is intentionally vertical:
 21. Network server (Phase 5B) — manifest bootstrap, loopback `netbadbd`, TCP
     connection lifecycle, a dedicated synchronous database worker, disconnect
     rollback, graceful shutdown, and multiple sessions. Complete.
-22. Network hardening (Phase 5C) — authentication, TLS, limits, timeouts, and
-    operational observability.
-23. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-24. Advanced optimization — histograms, richer cost models, and rewrite rules.
+22. Operational resource hardening (Phase 5C1) — connection/thread caps,
+    socket timeouts, response-row policy, and in-process metrics. Complete.
+23. Secure remote transport (Phase 5C2) — TLS, authenticated identity,
+    authorization, and secure non-loopback listening.
+24. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+25. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
-Isolation/MVCC, range/index-join planning, network hardening, and Go
+Isolation/MVCC, range/index-join planning, secure remote transport, and Go
 wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

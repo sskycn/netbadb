@@ -913,7 +913,7 @@ Network connections may progress concurrently while reading or writing, but
 the worker consumes one FIFO command queue and serializes all database request
 execution. Each connection sends one request, waits for its complete response,
 writes and flushes that batch, and only then reads the next request. A long
-query therefore delays other sessions; Phase 5B does not claim concurrent
+query therefore delays other sessions; Phase 5C1 does not claim concurrent
 database execution.
 
 Protocol requests execute one at a time. Query results become `QueryStart`,
@@ -931,17 +931,36 @@ than dropping a retryable transaction and continuing service. Graceful server
 shutdown closes connection sockets, joins their threads, closes remaining
 sessions, explicitly closes the Database, and joins the worker.
 
-`netbadbd` reads deployment manifest v1 before startup. Relative heap paths are
+`netbadbd` reads deployment manifest v2 before startup. Relative heap paths are
 resolved against the manifest directory, and the worker calls
 `Database::open_tables` before the listener is bound. The manifest supplies
 complete TableDefs because a heap fingerprint cannot reconstruct schema. The
 listener is restricted to loopback until authentication and TLS exist.
 
+Operational limits remain at server boundaries. The accept loop reaps finished
+threads and uses its connection-vector length to reject excess sockets before
+creating a SessionState or connection thread. Every admitted blocking stream
+has a read timeout for idle and partial-frame clients and a write timeout for
+blocked response delivery. Timeout cleanup uses the same fallible
+`SessionState::close` path as every other disconnect.
+
+The database worker remains synchronous and cannot be safely preempted. Socket
+read inactivity is therefore not a statement execution timeout. Likewise,
+`max_result_rows` is checked by SessionState only after core execution has
+fully materialized QueryResult. It prevents expansion into an excessive number
+of protocol messages but is not a complete executor-memory limit.
+
+Runtime metrics use only standard-library atomics and expose read-only
+snapshots. They count admitted, rejected, active, and closed connections;
+worker requests; protocol failures; idle timeouts; write failures; and
+response-row-limit errors. Metrics never control admission or database
+correctness and contain no SQL, values, table names, or client-address labels.
+
 Networking remains synchronous and must not leak async into parser, compiler,
 planner, executor, page, storage, WAL, or recovery.
 Protocol v1 is a network contract, not a database-file format: Canonical Schema
 v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
-remain unchanged. Deployment manifest v1 is configuration, not a database
+remain unchanged. Deployment manifest v2 is configuration, not a database
 format or canonical schema identity.
 
 Rust applications use the native SDK. Go applications should use a generated

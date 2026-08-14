@@ -1,5 +1,8 @@
 # NetbaDB deployment manifest v1
 
+> Historical experimental manifest format. Current `netbadbd` requires
+> [deployment manifest v2](server-manifest-v2.md); v1 is rejected explicitly.
+
 The deployment manifest is human-readable startup configuration for
 `netbadbd`. It is not a database file format, protocol payload, or canonical
 schema encoding. JSON whitespace, field order, and Serde behavior never
@@ -82,6 +85,6 @@ canonical table fingerprint against the fingerprint persisted in the heap. A
 change to semantic type, nullability, column identity, order, or any other
 canonical field therefore fails startup before the TCP listener is bound.
 
-Deployment manifest v1 is new configuration only. Canonical Schema v1, Heap
-metadata v3, Page v5, WAL v3/record v2, BTree payload v1, IndexCatalog v2, and
-wire Protocol v1 remain unchanged.
+Deployment manifest v1 changed configuration only and is now obsolete.
+Canonical Schema v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree payload
+v1, IndexCatalog v2, and wire Protocol v1 remain unchanged.

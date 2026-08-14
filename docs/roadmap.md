@@ -305,11 +305,23 @@ join, sort avoidance, and uniqueness enforcement remain advanced work.
 - real TCP handshake, query/DML, transaction, multi-client, malformed-frame,
   schema-mismatch, and shutdown integration tests.
 
-### Phase 5C — Network hardening (next)
+### Phase 5C1 — Operational resource hardening (complete)
+
+- strict deployment manifest v2 with bounded defaults;
+- admitted connection/thread cap enforced before session and thread creation;
+- blocking socket read-inactivity and write-delivery timeouts;
+- SessionState response-row policy before wire-message expansion;
+- standard-library atomic runtime metrics with read-only snapshots.
+
+### Phase 5C2 — Secure remote transport (next)
 
 - authentication and authorization;
 - TLS;
-- connection limits, idle timeouts, and operational controls.
+- authenticated client identity and secure non-loopback listening.
+
+Protocol v1 has no authentication payload. Remote identity and transport
+security require an explicit protocol and threat-model design rather than
+adding secrets to the existing Hello message.
 
 ## Phase 6 — SDK and tooling
 

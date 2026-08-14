@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use netbadb_core::Database;
 use netbadb_protocol::{
@@ -41,10 +42,16 @@ fn users_table(semantic_name: &str) -> TableDef {
 }
 
 fn manifest_json(heap_name: &str, semantic_name: &str) -> String {
+    manifest_json_with_limits(heap_name, semantic_name, None)
+}
+
+fn manifest_json_with_limits(heap_name: &str, semantic_name: &str, limits: Option<&str>) -> String {
+    let limits = limits.map_or_else(String::new, |limits| format!("\"limits\": {limits},"));
     format!(
         r#"{{
-            "version": 1,
+            "version": 2,
             "listen": "127.0.0.1:0",
+            {limits}
             "tables": [{{
                 "path": "{heap_name}",
                 "id": 1,
@@ -73,6 +80,13 @@ fn manifest_json(heap_name: &str, semantic_name: &str) -> String {
 }
 
 fn create_manifest_server(name: &str) -> (PathBuf, PathBuf, TableDef, ServerHandle) {
+    create_manifest_server_with_limits(name, None)
+}
+
+fn create_manifest_server_with_limits(
+    name: &str,
+    limits: Option<&str>,
+) -> (PathBuf, PathBuf, TableDef, ServerHandle) {
     let directory = test_directory(name);
     cleanup(&directory);
     std::fs::create_dir_all(&directory).unwrap();
@@ -83,10 +97,32 @@ fn create_manifest_server(name: &str) -> (PathBuf, PathBuf, TableDef, ServerHand
         .close()
         .unwrap();
     let manifest = directory.join("server.json");
-    std::fs::write(&manifest, manifest_json("users.ndb", "UserId")).unwrap();
+    std::fs::write(
+        &manifest,
+        manifest_json_with_limits("users.ndb", "UserId", limits),
+    )
+    .unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
     let server = TcpServer::new(config).start().unwrap();
     (directory, heap, table, server)
+}
+
+fn wait_for_metrics(
+    metrics: &netbadb_server::ServerMetricsHandle,
+    predicate: impl Fn(netbadb_server::ServerMetricsSnapshot) -> bool,
+) -> netbadb_server::ServerMetricsSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = metrics.snapshot();
+        if predicate(snapshot) {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metrics condition timed out: {snapshot:?}"
+        );
+        std::thread::yield_now();
+    }
 }
 
 struct Client {
@@ -350,10 +386,207 @@ fn assert_bad_frame_closes_only_its_connection(address: SocketAddr, bytes: &[u8]
     healthy.close_clean();
 }
 
+fn assert_connection_closes(mut stream: TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(stream.read(&mut byte).unwrap(), 0);
+}
+
+#[test]
+fn connection_limit_counts_unhandshaken_clients_and_updates_metrics() {
+    let limits = r#"{
+        "max_connections": 2,
+        "idle_timeout_ms": 5000,
+        "write_timeout_ms": 5000
+    }"#;
+    let (directory, _heap, _table, server) =
+        create_manifest_server_with_limits("connection-limit", Some(limits));
+    let address = server.local_addr();
+    let metrics = server.metrics_handle();
+
+    let client_a = TcpStream::connect(address).unwrap();
+    let client_b = TcpStream::connect(address).unwrap();
+    wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 2);
+
+    let rejected = TcpStream::connect(address).unwrap();
+    assert_connection_closes(rejected);
+    let snapshot = wait_for_metrics(&metrics, |snapshot| {
+        snapshot.rejected_connections_total == 1
+    });
+    assert_eq!(snapshot.accepted_connections_total, 2);
+
+    client_a.shutdown(Shutdown::Both).unwrap();
+    drop(client_a);
+    wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 1);
+
+    let mut replacement = Client::connect(address);
+    replacement.hello();
+    assert_eq!(
+        replacement.request(2, ClientMessage::Ping),
+        vec![ServerMessage::Pong]
+    );
+    replacement.close_clean();
+    client_b.shutdown(Shutdown::Both).unwrap();
+    drop(client_b);
+
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    assert_eq!(snapshot.accepted_connections_total, 3);
+    assert_eq!(snapshot.rejected_connections_total, 1);
+    assert_eq!(snapshot.closed_connections_total, 3);
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn idle_and_partial_frame_timeouts_close_connections_and_rollback_transactions() {
+    let limits = r#"{
+        "max_connections": 4,
+        "idle_timeout_ms": 250,
+        "write_timeout_ms": 5000
+    }"#;
+    let (directory, _heap, _table, server) =
+        create_manifest_server_with_limits("idle-timeouts", Some(limits));
+    let address = server.local_addr();
+    let metrics = server.metrics_handle();
+
+    assert_connection_closes(TcpStream::connect(address).unwrap());
+
+    let mut partial = TcpStream::connect(address).unwrap();
+    let hello = encode_client_frame(1, &ClientMessage::Hello).unwrap();
+    partial.write_all(&hello[..10]).unwrap();
+    partial.flush().unwrap();
+    assert_connection_closes(partial);
+
+    let mut transaction = Client::connect(address);
+    transaction.hello();
+    transaction.request(
+        2,
+        ClientMessage::Begin {
+            table_id: TableId(1),
+        },
+    );
+    transaction.request(
+        3,
+        ClientMessage::Execute {
+            sql: "INSERT INTO users (id, name) VALUES (9, 'timeout')".into(),
+        },
+    );
+    assert!(
+        read_server_frame(&mut transaction.stream)
+            .unwrap()
+            .is_none()
+    );
+    drop(transaction);
+
+    let mut healthy = Client::connect(address);
+    healthy.hello();
+    let rows = healthy.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users".into(),
+        },
+    );
+    assert!(matches!(
+        rows.as_slice(),
+        [
+            ServerMessage::QueryStart { .. },
+            ServerMessage::QueryEnd { row_count: 0 }
+        ]
+    ));
+    healthy.close_clean();
+
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    assert_eq!(snapshot.idle_timeouts_total, 3);
+    assert_eq!(snapshot.protocol_failures_total, 0);
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn result_row_limit_returns_one_error_without_poisoning_the_session() {
+    let directory = test_directory("result-limit");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let heap = directory.join("users.ndb");
+    let table = users_table("UserId");
+    let mut database = Database::create(&heap, table).unwrap();
+    for id in 1..=3 {
+        database
+            .execute(&format!(
+                "INSERT INTO users (id, name) VALUES ({id}, 'row')"
+            ))
+            .unwrap();
+    }
+    database.close().unwrap();
+    let manifest = directory.join("server.json");
+    std::fs::write(
+        &manifest,
+        manifest_json_with_limits("users.ndb", "UserId", Some(r#"{"max_result_rows": 2}"#)),
+    )
+    .unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let server = TcpServer::new(config).start().unwrap();
+    let metrics = server.metrics_handle();
+    let mut client = Client::connect(server.local_addr());
+    client.hello();
+    client.request(
+        2,
+        ClientMessage::Begin {
+            table_id: TableId(1),
+        },
+    );
+
+    let limited = client.request(
+        3,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users ORDER BY id".into(),
+        },
+    );
+    assert_error(
+        &limited,
+        ProtocolErrorCode::ResponseTooLarge,
+        WireTransactionState::Active,
+    );
+    assert_eq!(limited.len(), 1);
+    assert_eq!(
+        client.request(4, ClientMessage::Ping),
+        vec![ServerMessage::Pong]
+    );
+    assert!(matches!(
+        client
+            .request(
+                5,
+                ClientMessage::Execute {
+                    sql: "SELECT id FROM users ORDER BY id LIMIT 1".into(),
+                },
+            )
+            .as_slice(),
+        [
+            ServerMessage::QueryStart { .. },
+            ServerMessage::QueryRow { .. },
+            ServerMessage::QueryEnd { row_count: 1 }
+        ]
+    ));
+    assert_eq!(
+        client.request(6, ClientMessage::Rollback),
+        vec![ServerMessage::TransactionRolledBack]
+    );
+    client.close_clean();
+
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 0);
+    assert_eq!(snapshot.query_response_limit_errors_total, 1);
+    assert_eq!(snapshot.worker_requests_total, 6);
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
 #[test]
 fn malformed_truncated_and_zero_id_frames_are_connection_fatal_only() {
     let (directory, _heap, _table, server) = create_manifest_server("bad-frames");
     let address = server.local_addr();
+    let metrics = server.metrics_handle();
     let hello = encode_client_frame(1, &ClientMessage::Hello).unwrap();
 
     let mut bad_magic = hello.clone();
@@ -388,6 +621,9 @@ fn malformed_truncated_and_zero_id_frames_are_connection_fatal_only() {
     );
     after_abandoned_response.close_clean();
 
+    let snapshot = wait_for_metrics(&metrics, |snapshot| snapshot.protocol_failures_total == 3);
+    assert_eq!(snapshot.idle_timeouts_total, 0);
+
     server.shutdown().unwrap();
     cleanup(&directory);
 }
@@ -396,6 +632,7 @@ fn malformed_truncated_and_zero_id_frames_are_connection_fatal_only() {
 fn graceful_shutdown_closes_idle_sessions_rolls_back_and_closes_database() {
     let (directory, heap, table, server) = create_manifest_server("shutdown");
     let address = server.local_addr();
+    let metrics = server.metrics_handle();
     let mut active = Client::connect(address);
     let mut idle = Client::connect(address);
     active.hello();
@@ -414,6 +651,10 @@ fn graceful_shutdown_closes_idle_sessions_rolls_back_and_closes_database() {
     );
 
     server.shutdown().unwrap();
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.accepted_connections_total, 2);
+    assert_eq!(snapshot.closed_connections_total, 2);
+    assert_eq!(snapshot.active_connections, 0);
     drop(active);
     drop(idle);
 

@@ -16,5 +16,11 @@
 - Disconnect and shutdown cleanup MUST join connection and worker threads. A
   failed session rollback is fatal to the worker and MUST NOT be discarded so
   the process can continue serving requests.
+- Connection admission, socket timeouts, and runtime metrics belong at the TCP
+  runtime boundary. The connection-vector length is the admission-limit truth;
+  metrics MUST NOT decide correctness.
+- Result-row policy belongs in transport-neutral `SessionState`, but is checked
+  only after core execution materializes the complete `QueryResult`. Do not
+  describe it as an executor memory limit or statement timeout.
 - Wire responses MUST expose stable protocol domain values and errors, never
   internal Rust layouts, discriminants, debug strings, pages, or row locators.

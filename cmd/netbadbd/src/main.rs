@@ -36,11 +36,13 @@ fn main() -> ExitCode {
 
 fn run_server(manifest: PathBuf) -> Result<(), Box<dyn Error>> {
     let config = ServerConfig::from_manifest_path(manifest)?;
+    let max_connections = config.limits().max_connections();
     let server = TcpServer::new(config).start()?;
     eprintln!(
-        "netbadbd listening on {} with {} table(s)",
+        "netbadbd listening on {} with {} table(s), max {} connections",
         server.local_addr(),
-        server.table_count()
+        server.table_count(),
+        max_connections
     );
     server.wait()?;
     Ok(())
