@@ -5,6 +5,10 @@ use netbadb_index::{
     IndexStatistics, InternalNode, InternalSeparator, LeafNode, MetaNode, TableStatistics,
     encode_index_catalog, encode_internal, encode_leaf, encode_meta,
 };
+use netbadb_protocol::{
+    ClientMessage, MAX_FRAME_PAYLOAD, ProtocolErrorCode, ServerMessage, WireResultColumn,
+    WireTransactionState, encode_client_frame, encode_server_frame,
+};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::{
     HeapStorage, Page, PageManager, PageType, WalManager, WalRecordKind, wal_alternate_path,
@@ -47,6 +51,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_page_decode_seed(&output)?;
     write_btree_decode_seeds(&output)?;
     write_index_catalog_decode_seeds(&output)?;
+    write_protocol_decode_seeds(&output)?;
+    Ok(())
+}
+
+fn write_protocol_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = wal_output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("protocol_decode");
+    std::fs::create_dir_all(&output)?;
+    std::fs::write(output.join("empty"), [])?;
+
+    let hello = encode_client_frame(1, &ClientMessage::Hello)?;
+    std::fs::write(output.join("valid-hello"), &hello)?;
+    std::fs::write(
+        output.join("valid-execute"),
+        encode_client_frame(
+            2,
+            &ClientMessage::Execute {
+                sql: "SELECT id FROM users".into(),
+            },
+        )?,
+    )?;
+    std::fs::write(
+        output.join("valid-query-start"),
+        encode_server_frame(
+            3,
+            &ServerMessage::QueryStart {
+                columns: vec![WireResultColumn {
+                    name: "id".into(),
+                    data_type: SemanticType::named("UserId", PhysicalType::UInt64),
+                    nullable: false,
+                }],
+            },
+        )?,
+    )?;
+    std::fs::write(
+        output.join("valid-query-row"),
+        encode_server_frame(
+            4,
+            &ServerMessage::QueryRow {
+                values: vec![ScalarValue::UInt64(42), ScalarValue::Null],
+            },
+        )?,
+    )?;
+    std::fs::write(
+        output.join("valid-error"),
+        encode_server_frame(
+            5,
+            &ServerMessage::Error {
+                code: ProtocolErrorCode::Compile,
+                transaction_state: WireTransactionState::Active,
+                message: "invalid SQL".into(),
+            },
+        )?,
+    )?;
+    std::fs::write(output.join("truncated-frame"), &hello[..10])?;
+    let mut oversized = hello;
+    oversized[12..16].copy_from_slice(&(MAX_FRAME_PAYLOAD + 1).to_le_bytes());
+    std::fs::write(output.join("oversized-length-header"), oversized)?;
     Ok(())
 }
 

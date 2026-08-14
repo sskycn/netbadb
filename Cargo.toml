@@ -12,6 +12,8 @@ members = [
     "crates/netbadb-storage",
     "crates/netbadb-executor",
     "crates/netbadb-core",
+    "crates/netbadb-protocol",
+    "crates/netbadb-server",
     "sdk/rust",
 ]
 

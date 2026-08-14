@@ -22,6 +22,8 @@ netbadb-storage -> netbadb-index + netbadb-schema + netbadb-types
 netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
 netbadb-core -> compiler + planner + executor + storage + schema + types
+netbadb-protocol -> netbadb-types
+netbadb-server -> netbadb-core + netbadb-protocol + netbadb-types
 netbadb-sdk -> netbadb-core + netbadb-executor + netbadb-schema
                + netbadb-types
 ```
@@ -891,11 +893,28 @@ kernel, machine, controller, or storage-device power loss.
 
 ## Embedded and server modes
 
-`netbadb-core` is synchronous and embedded. A future server crate may add an
-async network layer around the same core API, but async should not leak into
-parser, compiler, planner, executor, page, or storage internals without a
-measured need.
+`netbadb-core` remains synchronous and embedded. `netbadb-protocol` defines a
+transport-independent binary v1 contract and depends only on shared types.
+`netbadb-server::SessionState` is also synchronous: it owns handshake and one
+optional table-scoped transaction while borrowing the database owner for each
+request. It never owns or moves a `Database` into a connection.
+
+Protocol requests execute one at a time. Query results become `QueryStart`,
+zero or more `QueryRow` messages, and `QueryEnd`; they are not encoded as one
+unbounded result frame. Hello returns each table's stable `TableId` and
+canonical 32-byte schema fingerprint in schema declaration order. Stable wire
+error codes and protocol transaction-state tags are mapped explicitly rather
+than exposing Rust enum layout or debug output.
+
+Phase 5A has no socket implementation. A Phase 5B async network layer may own
+connections around a dedicated synchronous database worker, but async must not
+leak into parser, compiler, planner, executor, page, storage, WAL, or recovery.
+Disconnect handling calls the session's explicit fallible `close` operation so
+an active transaction is rolled back or its retryable failure remains visible.
+Protocol v1 is a network contract, not a database-file format: Canonical Schema
+v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
+remain unchanged.
 
 Rust applications use the native SDK. Go applications should use a generated
-SDK over a versioned protocol once server mode exists. FFI is an optional
+SDK over the versioned protocol once network transport exists. FFI is an optional
 escape hatch, not the primary Go integration strategy.

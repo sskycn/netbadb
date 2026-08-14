@@ -1,0 +1,18 @@
+[package]
+name = "netbadb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+netbadb-core = { path = "../netbadb-core" }
+netbadb-protocol = { path = "../netbadb-protocol" }
+netbadb-types = { path = "../netbadb-types" }
+
+[dev-dependencies]
+netbadb-schema = { path = "../netbadb-schema" }
+netbadb-storage = { path = "../netbadb-storage" }
+
+[lints]
+workspace = true

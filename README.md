@@ -101,7 +101,9 @@ netbadb/
 │   ├── netbadb-index/       typed B+Tree ordering, nodes, codecs, and splits
 │   ├── netbadb-storage/     transactions, WAL, pages, buffer pool, heap, B+Tree
 │   ├── netbadb-executor/    synchronous physical-plan execution
-│   └── netbadb-core/        native embedded database API
+│   ├── netbadb-core/        native embedded database API
+│   ├── netbadb-protocol/    versioned language-neutral binary wire contract
+│   └── netbadb-server/      synchronous transport-neutral session engine
 ├── sdk/
 │   ├── rust/                Rust application-facing re-export surface
 │   └── go/                  Go SDK / protocol direction and contract notes
@@ -123,6 +125,8 @@ index -> types
 storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
+protocol -> types
+server -> core + protocol + types
 Rust SDK -> core + executor + schema + types
 ```
 
@@ -176,7 +180,15 @@ The current code genuinely supports:
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
+- versioned protocol v1 framing, schema-fingerprint handshake, streamed query
+  response messages, bounded synchronous codecs, and stable wire errors;
+- a synchronous transport-neutral `SessionState` for handshake, query/DML,
+  explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a native embedded `netbadb-core::Database` API.
+
+Protocol v1 is specified byte-for-byte in
+[`docs/protocol-v1.md`](docs/protocol-v1.md). Phase 5A does not include a TCP
+listener, `netbadbd`, async networking, authentication, or TLS.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -502,11 +514,15 @@ The implementation sequence is intentionally vertical:
 18. Deterministic registered-index point IndexScan (Phase 4E) — complete.
 19. Explicit ANALYZE statistics and deterministic cost-based point access-path
     selection (Phase 4F) — complete.
-20. Server mode — protocol, sessions, and `netbadbd`.
-21. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-22. Advanced optimization — histograms, richer cost models, and rewrite rules.
+20. Protocol v1 + synchronous sessions (Phase 5A) — binary framing, schema
+    handshake, streamed results, stable errors, and transaction lifecycle.
+    Complete.
+21. Network server (Phase 5B) — `netbadbd`, TCP connection lifecycle, a
+    dedicated synchronous database worker, and multiple sessions.
+22. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+23. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
-Isolation/MVCC, range/index-join planning, server networking,
+Isolation/MVCC, range/index-join planning, TCP server networking,
 and Go wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.

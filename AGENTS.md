@@ -8,6 +8,8 @@ Scoped rules currently live in:
 - `crates/AGENTS.md` for Rust libraries and compiler/execution layers;
 - `crates/netbadb-index/AGENTS.md` for typed index ordering and node codecs;
 - `crates/netbadb-storage/AGENTS.md` for persistent formats, pages, heap, and index storage;
+- `crates/netbadb-protocol/AGENTS.md` for the versioned wire contract;
+- `crates/netbadb-server/AGENTS.md` for synchronous session lifecycle;
 - `sdk/AGENTS.md` for Rust, Go, and future language SDKs.
 
 Do not create a directory or crate only to hold an instruction file. Add server,
@@ -96,6 +98,8 @@ index -> types
 storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
+protocol -> types
+server -> core + protocol + types
 Rust SDK -> core + executor + schema + types
 ```
 
@@ -108,8 +112,8 @@ compiler -X-> executor / server
 types / schema / rel -X-> core / server / SDK
 ```
 
-`netbadb-core` MAY compose lower-level crates. A future server MAY depend on
-core. If two layers need a primitive, move it to the lowest appropriate common
+`netbadb-core` MAY compose lower-level crates. `netbadb-server` MAY depend on
+core and protocol; neither may depend back on server. If two layers need a primitive, move it to the lowest appropriate common
 crate instead of creating a cycle, global state, or incidental dynamic
 dispatch.
 

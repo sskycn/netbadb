@@ -135,6 +135,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-protocol"
+version = "0.1.0"
+dependencies = [
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-rel"
 version = "0.1.0"
 dependencies = [
@@ -156,6 +163,17 @@ dependencies = [
  "netbadb-core",
  "netbadb-executor",
  "netbadb-schema",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-server"
+version = "0.1.0"
+dependencies = [
+ "netbadb-core",
+ "netbadb-protocol",
+ "netbadb-schema",
+ "netbadb-storage",
  "netbadb-types",
 ]
 

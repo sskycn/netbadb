@@ -282,10 +282,28 @@ join, sort avoidance, and uniqueness enforcement remain advanced work.
 
 ## Phase 5 — Server and protocol
 
-- `netbadbd` session layer;
-- versioned language-neutral wire protocol;
-- authentication, TLS, and connection management;
-- protocol integration tests.
+### Phase 5A — Protocol v1 and synchronous sessions (complete)
+
+- explicit bounded `NDBP` binary frames and fixed client/server message tags;
+- schema-fingerprint handshake and capability advertisement;
+- streamed `QueryStart` / `QueryRow` / `QueryEnd` response batches;
+- stable wire errors and transaction-state reporting;
+- synchronous transport-neutral `SessionState` for query/DML, table-scoped
+  explicit transactions, `ANALYZE`, ping, and fallible disconnect rollback;
+- golden bytes, malformed-input coverage, protocol fuzzing, and real database
+  session integration tests.
+
+### Phase 5B — Network transport (next)
+
+- `netbadbd` TCP listener and connection lifecycle;
+- dedicated synchronous database owner/worker;
+- multiple network sessions with one request completed at a time per session.
+
+### Phase 5C — Network hardening
+
+- authentication and authorization;
+- TLS;
+- connection limits, idle timeouts, and operational controls.
 
 ## Phase 6 — SDK and tooling
 
