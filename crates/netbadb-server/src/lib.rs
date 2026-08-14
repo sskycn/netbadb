@@ -1,5 +1,8 @@
 //! Transport-neutral synchronous NetbaDB protocol sessions.
 
+mod manifest;
+mod runtime;
+
 use std::error::Error;
 use std::fmt;
 
@@ -11,6 +14,9 @@ use netbadb_protocol::{
     ProtocolErrorCode, SERVER_CAPABILITIES, ServerMessage, TableSchemaIdentity, WireResultColumn,
     WireTransactionState, validate_server_message,
 };
+
+pub use manifest::{ManifestError, ServerConfig, TableBootstrap};
+pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseBatch {

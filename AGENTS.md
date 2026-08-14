@@ -99,7 +99,8 @@ storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
 protocol -> types
-server -> core + protocol + types
+server -> core + protocol + schema + types
+netbadbd -> server
 Rust SDK -> core + executor + schema + types
 ```
 

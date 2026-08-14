@@ -103,7 +103,9 @@ netbadb/
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
-│   └── netbadb-server/      synchronous transport-neutral session engine
+│   └── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
+├── cmd/
+│   └── netbadbd/            standalone manifest-driven server executable
 ├── sdk/
 │   ├── rust/                Rust application-facing re-export surface
 │   └── go/                  Go SDK / protocol direction and contract notes
@@ -126,7 +128,8 @@ storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
 protocol -> types
-server -> core + protocol + types
+server -> core + protocol + schema + types
+netbadbd -> server
 Rust SDK -> core + executor + schema + types
 ```
 
@@ -184,11 +187,16 @@ The current code genuinely supports:
   response messages, bounded synchronous codecs, and stable wire errors;
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
+- a loopback-only blocking TCP runtime whose dedicated synchronous worker owns
+  the Database and every SessionState, plus strict deployment manifest v1
+  bootstrap and the standalone `netbadbd` executable;
 - a native embedded `netbadb-core::Database` API.
 
 Protocol v1 is specified byte-for-byte in
-[`docs/protocol-v1.md`](docs/protocol-v1.md). Phase 5A does not include a TCP
-listener, `netbadbd`, async networking, authentication, or TLS.
+[`docs/protocol-v1.md`](docs/protocol-v1.md), and standalone configuration is
+documented in [`docs/server-manifest-v1.md`](docs/server-manifest-v1.md).
+Phase 5B deliberately has no async runtime, authentication, TLS, remote listen,
+connection limits, or socket timeouts.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -517,13 +525,16 @@ The implementation sequence is intentionally vertical:
 20. Protocol v1 + synchronous sessions (Phase 5A) — binary framing, schema
     handshake, streamed results, stable errors, and transaction lifecycle.
     Complete.
-21. Network server (Phase 5B) — `netbadbd`, TCP connection lifecycle, a
-    dedicated synchronous database worker, and multiple sessions.
-22. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
-23. Advanced optimization — histograms, richer cost models, and rewrite rules.
+21. Network server (Phase 5B) — manifest bootstrap, loopback `netbadbd`, TCP
+    connection lifecycle, a dedicated synchronous database worker, disconnect
+    rollback, graceful shutdown, and multiple sessions. Complete.
+22. Network hardening (Phase 5C) — authentication, TLS, limits, timeouts, and
+    operational observability.
+23. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+24. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
-Isolation/MVCC, range/index-join planning, TCP server networking,
-and Go wire-protocol code are roadmap items, not implemented features here.
+Isolation/MVCC, range/index-join planning, network hardening, and Go
+wire-protocol code are roadmap items, not implemented features here.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

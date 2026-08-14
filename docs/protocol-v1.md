@@ -9,6 +9,12 @@ Protocol v1 processes one complete request before the next request. There is no
 pipelining or multiplexing. A client request ID must be nonzero, and every
 response frame for that request echoes it.
 
+At the TCP transport boundary, malformed or undecodable client frames are
+connection-fatal. The server does not send an Error response because a valid
+request identity and reliable frame boundary may not exist. Application and
+session errors for successfully decoded frames continue to use the Error
+message defined below.
+
 ## Frame
 
 Every client and server message uses this 24-byte header:
@@ -235,4 +241,13 @@ protocol compatibility decision rather than silently updating those bytes.
 
 Protocol v1 does not define TCP lifecycle, TLS, authentication, prepared
 statements, parameter binding, index/checkpoint administration, or a remote
-SDK. Those are later phases and do not change database file formats.
+SDK. TCP transport processes one request completely before reading the next
+request on that connection. Query execution and `ResponseBatch` construction
+remain fully materialized; QueryRow framing avoids one giant wire frame but is
+not an incremental executor cursor.
+
+Request IDs correlate responses only. They do not provide retry deduplication
+or exactly-once semantics. If a connection fails after execution but before the
+client receives the response, an implicit DML or explicit Commit may already be
+durable and its outcome is ambiguous to that client. These transport rules do
+not change protocol v1 bytes or any database file format.

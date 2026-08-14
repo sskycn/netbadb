@@ -23,7 +23,9 @@ netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
 netbadb-core -> compiler + planner + executor + storage + schema + types
 netbadb-protocol -> netbadb-types
-netbadb-server -> netbadb-core + netbadb-protocol + netbadb-types
+netbadb-server -> netbadb-core + netbadb-protocol + netbadb-schema
+                    + netbadb-types
+netbadbd -> netbadb-server
 netbadb-sdk -> netbadb-core + netbadb-executor + netbadb-schema
                + netbadb-types
 ```
@@ -897,7 +899,22 @@ kernel, machine, controller, or storage-device power loss.
 transport-independent binary v1 contract and depends only on shared types.
 `netbadb-server::SessionState` is also synchronous: it owns handshake and one
 optional table-scoped transaction while borrowing the database owner for each
-request. It never owns or moves a `Database` into a connection.
+request.
+
+The blocking TCP runtime uses one OS thread per accepted connection and one
+dedicated database worker thread. Connection threads own only TcpStreams,
+SessionIds, decoded client frames, and response batches. Typed channels carry
+those Send-safe values to the worker. The worker constructs and exclusively
+owns the Database, every SessionState, and every Transaction, so storage's
+Rc/RefCell transaction internals never cross a thread boundary and are not
+replaced by networking-driven Arc/Mutex state.
+
+Network connections may progress concurrently while reading or writing, but
+the worker consumes one FIFO command queue and serializes all database request
+execution. Each connection sends one request, waits for its complete response,
+writes and flushes that batch, and only then reads the next request. A long
+query therefore delays other sessions; Phase 5B does not claim concurrent
+database execution.
 
 Protocol requests execute one at a time. Query results become `QueryStart`,
 zero or more `QueryRow` messages, and `QueryEnd`; they are not encoded as one
@@ -906,15 +923,27 @@ canonical 32-byte schema fingerprint in schema declaration order. Stable wire
 error codes and protocol transaction-state tags are mapped explicitly rather
 than exposing Rust enum layout or debug output.
 
-Phase 5A has no socket implementation. A Phase 5B async network layer may own
-connections around a dedicated synchronous database worker, but async must not
-leak into parser, compiler, planner, executor, page, storage, WAL, or recovery.
-Disconnect handling calls the session's explicit fallible `close` operation so
-an active transaction is rolled back or its retryable failure remains visible.
+The listener is nonblocking only so a shutdown command can stop acceptance;
+accepted streams are explicitly restored to blocking mode. Clean EOF, protocol
+violations, and response I/O failures all close the corresponding SessionState
+through the worker. A close rollback failure is fatal to that worker rather
+than dropping a retryable transaction and continuing service. Graceful server
+shutdown closes connection sockets, joins their threads, closes remaining
+sessions, explicitly closes the Database, and joins the worker.
+
+`netbadbd` reads deployment manifest v1 before startup. Relative heap paths are
+resolved against the manifest directory, and the worker calls
+`Database::open_tables` before the listener is bound. The manifest supplies
+complete TableDefs because a heap fingerprint cannot reconstruct schema. The
+listener is restricted to loopback until authentication and TLS exist.
+
+Networking remains synchronous and must not leak async into parser, compiler,
+planner, executor, page, storage, WAL, or recovery.
 Protocol v1 is a network contract, not a database-file format: Canonical Schema
 v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
-remain unchanged.
+remain unchanged. Deployment manifest v1 is configuration, not a database
+format or canonical schema identity.
 
 Rust applications use the native SDK. Go applications should use a generated
-SDK over the versioned protocol once network transport exists. FFI is an optional
+SDK over the versioned protocol once that remote SDK exists. FFI is an optional
 escape hatch, not the primary Go integration strategy.

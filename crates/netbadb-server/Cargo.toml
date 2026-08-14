@@ -8,10 +8,12 @@ rust-version.workspace = true
 [dependencies]
 netbadb-core = { path = "../netbadb-core" }
 netbadb-protocol = { path = "../netbadb-protocol" }
+netbadb-schema = { path = "../netbadb-schema" }
 netbadb-types = { path = "../netbadb-types" }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-netbadb-schema = { path = "../netbadb-schema" }
 netbadb-storage = { path = "../netbadb-storage" }
 
 [lints]

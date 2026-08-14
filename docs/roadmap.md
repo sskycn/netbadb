@@ -293,13 +293,19 @@ join, sort avoidance, and uniqueness enforcement remain advanced work.
 - golden bytes, malformed-input coverage, protocol fuzzing, and real database
   session integration tests.
 
-### Phase 5B — Network transport (next)
+### Phase 5B — Network transport (complete)
 
-- `netbadbd` TCP listener and connection lifecycle;
-- dedicated synchronous database owner/worker;
-- multiple network sessions with one request completed at a time per session.
+- strict deployment manifest v1 and standalone `netbadbd` bootstrap;
+- loopback-only blocking TCP listener and per-connection OS threads;
+- dedicated synchronous database owner/worker with FIFO typed commands;
+- multiple isolated SessionStates with one request completed at a time per
+  connection;
+- disconnect rollback, fatal rollback-failure policy, and graceful thread/
+  database shutdown;
+- real TCP handshake, query/DML, transaction, multi-client, malformed-frame,
+  schema-mismatch, and shutdown integration tests.
 
-### Phase 5C — Network hardening
+### Phase 5C — Network hardening (next)
 
 - authentication and authorization;
 - TLS;
