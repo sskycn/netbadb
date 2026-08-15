@@ -996,6 +996,19 @@ v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
 remain unchanged. Deployment manifest v4 is configuration, not a database
 format or canonical schema identity.
 
-Rust applications use the native SDK. Go applications should use a generated
-SDK over the versioned protocol once that remote SDK exists. FFI is an optional
-escape hatch, not the primary Go integration strategy.
+Rust applications use the native SDK. Go applications can use the independent
+Protocol v1 client under `sdk/go`:
+
+```text
+Go remote client
+    -> Protocol v1
+    -> netbadbd
+```
+
+The Go transport, codec, values, result streaming, transaction lifecycle, and
+schema-fingerprint gate use only the Go standard library. They share no Rust
+memory or layout, use no cgo or FFI, and do not replace typed wire messages with
+JSON execution IR. Canonical schema fingerprint generation remains
+Rust-authoritative; the Go client compares expected generated constants with
+HelloAck identities. A generated, nullability-aware typed Go schema/query layer
+is a later phase above this client.

@@ -23,3 +23,23 @@ jobs:
         with:
           toolchain: 1.85.0
       - run: cargo check --workspace --all-targets
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/go.mod
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Check Go formatting
+        working-directory: sdk/go
+        run: test -z "$(gofmt -l .)"
+      - name: Test Go client
+        working-directory: sdk/go
+        run: go test ./...
+      - name: Vet Go client
+        working-directory: sdk/go
+        run: go vet ./...
+      - name: Test Go and Rust interoperability
+        run: ./scripts/test-go-sdk.sh

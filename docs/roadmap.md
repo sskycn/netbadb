@@ -339,10 +339,27 @@ generic Database error code.
 
 ## Phase 6 — SDK and tooling
 
-- generated Go schema/query SDK;
-- Rust SDK stabilization;
-- CLI, LSP, MCP, and plan/schema inspection APIs;
-- shared diagnostics across compiler and tooling.
+### Phase 6A — Go Protocol v1 client (complete)
+
+- independent standard-library Go frame encoder and untrusted-server decoder;
+- explicit scalar, semantic type, stable remote error, and transaction-state
+  domains;
+- loopback plaintext and verified mutual-TLS Dial with automatic Hello;
+- required schema-fingerprint and capability gates;
+- streaming Query, Exec, table-scoped transactions, Analyze, and Ping;
+- independent Go/Rust golden bytes plus real plaintext and mutual-TLS
+  `netbadbd` integration.
+
+### Phase 6B — Generated typed Go SDK (next)
+
+- generated schema/query APIs and semantic ID wrappers;
+- nullability-aware row decoding;
+- a language-neutral code-generation input contract and reproducible output.
+
+Later Phase 6 work includes Rust remote-client/SDK stabilization (6C), CLI and
+inspection tooling (6D), then LSP/MCP integration (6E). There is currently no
+Go `database/sql` driver, connection pool, ORM/query builder, prepared
+statement support, or typed parameter protocol.
 
 ## Phase 7 — Advanced optimization
 

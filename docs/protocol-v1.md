@@ -271,3 +271,9 @@ or exactly-once semantics. If a connection fails after execution but before the
 client receives the response, an implicit DML or explicit Commit may already be
 durable and its outcome is ambiguous to that client. These transport rules do
 not change protocol v1 bytes or any database file format.
+
+An independent standard-library Go implementation of this byte contract lives
+under `sdk/go`. Its hard-coded golden vectors are checked against the Rust
+protocol crate's vectors, and a separate integration harness runs it against a
+real `netbadbd` session over loopback plaintext and mutual TLS. This adds no
+Protocol v1 field, tag, capability, or encoding.
