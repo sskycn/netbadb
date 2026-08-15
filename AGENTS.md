@@ -9,6 +9,7 @@ Scoped rules currently live in:
 - `crates/netbadb-index/AGENTS.md` for typed index ordering and node codecs;
 - `crates/netbadb-storage/AGENTS.md` for persistent formats, pages, heap, and index storage;
 - `crates/netbadb-protocol/AGENTS.md` for the versioned wire contract;
+- `crates/netbadb-client/AGENTS.md` for synchronous remote-client lifecycle;
 - `crates/netbadb-server/AGENTS.md` for synchronous session lifecycle;
 - `sdk/AGENTS.md` for Rust, Go, and future language SDKs.
 
@@ -100,9 +101,11 @@ storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
 protocol -> types
+client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
-Rust SDK -> core + executor + schema + types
+Rust SDK embedded -> core + schema + types
+Rust SDK remote -> client + schema + types
 ```
 
 Lower-level crates MUST NOT depend on higher-level policy. In particular:

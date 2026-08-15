@@ -24,11 +24,12 @@ netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
 netbadb-core -> compiler + planner + executor + storage + schema + types
 netbadb-protocol -> netbadb-types
+netbadb-client -> netbadb-protocol + netbadb-schema + netbadb-types
 netbadb-server -> netbadb-core + netbadb-protocol + netbadb-schema
                     + netbadb-types
 netbadbd -> netbadb-server
-netbadb-sdk -> netbadb-core + netbadb-executor + netbadb-schema
-               + netbadb-types
+netbadb-sdk embedded -> netbadb-core + netbadb-schema + netbadb-types
+netbadb-sdk remote -> netbadb-client + netbadb-schema + netbadb-types
 ```
 
 No lower layer depends on a higher layer. In particular, storage does not
@@ -997,8 +998,37 @@ v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
 remain unchanged. Deployment manifest v4 is configuration, not a database
 format or canonical schema identity.
 
-Rust applications use the native SDK. Go applications can use generated typed
-bindings above the independent Protocol v1 client under `sdk/go`:
+Rust applications choose either the default embedded SDK or the optional
+synchronous remote surface:
+
+```text
+Embedded Rust application
+    -> netbadb-sdk (default `embedded` feature)
+    -> netbadb-core
+
+Remote Rust application
+    -> netbadb-sdk::remote (`remote` feature)
+    -> netbadb-client
+    -> netbadb-protocol
+    -> netbadbd
+```
+
+`netbadb-client` owns blocking TCP/rustls transport and the Protocol v1 client
+state machine. It has no production dependency on core, server, executor,
+planner, or storage. It reuses the authoritative Rust protocol frame and value
+codec, while the Go client intentionally remains an independent implementation
+that proves the wire contract is language-neutral.
+
+Remote Rust `Rows` and `Transaction` values exclusively borrow their Client,
+preventing multiplexed requests at the type boundary. Explicit `Rows::close`
+drains to QueryEnd; dropping unfinished rows closes the connection. Explicit
+commit and rollback wait for a server response, while dropping an active
+transaction only closes the transport and relies on disconnect rollback. A
+lost response can therefore leave DML, commit, or rollback outcome ambiguous;
+the client never reconnects, retries, or replays a request.
+
+Go applications can use generated typed bindings above the independent
+Protocol v1 client under `sdk/go`:
 
 ```text
 Language-neutral SDK Schema Spec v1

@@ -366,10 +366,27 @@ has no typed parameter binding, and primary-key metadata is not uniqueness
 enforcement, so interpolating runtime values or promising one-row key lookup
 would create false contracts.
 
-Later Phase 6 work includes Rust remote-client/SDK stabilization (6C), CLI and
-inspection tooling (6D), then LSP/MCP integration (6E). There is currently no
-Go `database/sql` driver, connection pool, ORM/query builder, prepared
-statement support, or typed parameter protocol.
+### Phase 6C — Synchronous Rust remote client (complete)
+
+- blocking `netbadb-client` transport reusing the authoritative
+  `netbadb-protocol` codec, with resolved-peer loopback plaintext safety and
+  mandatory verified mutual TLS;
+- automatic Hello, capability and canonical schema-fingerprint gates, retained
+  ServerInfo, checked request IDs, and no multiplexing, retry, or replay;
+- borrowed streaming Rows with exact shape/type/nullability/count validation,
+  explicit drain-on-close, and connection-closing unfinished Drop;
+- borrowed table-scoped transactions whose wire error state controls local
+  terminal state, with explicit commit/rollback and connection-closing active
+  Drop preserving ambiguous network outcomes;
+- `netbadb-sdk` default `embedded` feature plus optional `remote`, including a
+  remote-only build with no core, executor, planner, or storage dependency;
+- scripted protocol-state tests and real plaintext/mTLS/authorization/
+  disconnect-rollback integration tests.
+
+Later Phase 6 work includes CLI and inspection tooling (6D), then LSP/MCP
+integration (6E). There is currently no Go `database/sql` driver, connection
+pool, ORM/query builder, prepared statement support, typed parameter protocol,
+or Rust generated query layer.
 
 ## Phase 7 — Advanced optimization
 

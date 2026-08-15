@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["embedded"]
+embedded = ["dep:netbadb-core"]
+remote = ["dep:netbadb-client"]
+
 [dependencies]
-netbadb-core = { path = "../../crates/netbadb-core" }
-netbadb-executor = { path = "../../crates/netbadb-executor" }
+netbadb-client = { path = "../../crates/netbadb-client", optional = true }
+netbadb-core = { path = "../../crates/netbadb-core", optional = true }
 netbadb-schema = { path = "../../crates/netbadb-schema" }
 netbadb-types = { path = "../../crates/netbadb-types" }
 

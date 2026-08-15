@@ -12,6 +12,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --all-targets
+      - run: cargo check -p netbadb-sdk --no-default-features
+      - run: cargo check -p netbadb-sdk --no-default-features --features remote
+      - run: cargo check -p netbadb-sdk --all-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
@@ -23,6 +26,7 @@ jobs:
         with:
           toolchain: 1.85.0
       - run: cargo check --workspace --all-targets
+      - run: cargo check -p netbadb-sdk --no-default-features --features remote
 
   go:
     runs-on: ubuntu-latest

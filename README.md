@@ -3,10 +3,10 @@
 NetbaDB is a strongly typed relational database core written in Rust.
 
 The project separates application-language schemas from the database engine
-through a language-independent Canonical Schema IR. Rust provides the native
-embedded API. Go and future languages are intended to use generated SDKs or a
-versioned NetbaDB protocol client rather than coupling the database core to an
-application runtime.
+through a language-independent Canonical Schema IR. Rust provides native
+embedded and synchronous remote APIs. Go and future languages use generated
+SDKs or a versioned NetbaDB protocol client rather than coupling the database
+core to an application runtime.
 
 > NetbaDB is experimental. The implemented subset is intentionally small, but
 > it is a real Rust workspace with a parser-to-storage vertical slice.
@@ -103,6 +103,7 @@ netbadb/
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
+│   ├── netbadb-client/      synchronous Protocol v1 remote client
 │   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
 │   └── netbadb-codegen/     strict Schema Spec v1 and typed Go generation
 ├── cmd/
@@ -130,9 +131,11 @@ storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + planner + executor + storage + schema + types
 protocol -> types
+client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
-Rust SDK -> core + executor + schema + types
+Rust SDK embedded -> core + schema + types
+Rust SDK remote -> client + schema + types
 ```
 
 Storage has no dependency on the planner or executor. The executor consumes a
@@ -196,6 +199,9 @@ The current code genuinely supports:
   remote listen, bounded connections/socket inactivity, response-row policy,
   in-process metrics, and the standalone `netbadbd` executable;
 - a native embedded `netbadb-core::Database` API;
+- a blocking Rust Protocol v1 client with loopback plaintext, verified mTLS,
+  schema/capability gates, streamed rows, and explicit transaction lifecycle,
+  exposed under the optional `netbadb-sdk::remote` feature;
 - an independent standard-library Go Protocol v1 client plus deterministic
   Rust-generated semantic types, canonical IDs/fingerprints, nullable full-row
   decoders, typed row streams, and automatic schema gates.
@@ -452,14 +458,15 @@ order guarantee despite the executor's first-seen implementation order.
 HAVING, aliases, `DISTINCT`, GROUP BY expressions, aggregate expressions,
 nested aggregates, grouping sets, rollup, and cube remain unsupported.
 
-## Go and protocol strategy
+## SDK and protocol strategy
 
 Go is no longer treated as the database implementation language. The intended
 support boundary is:
 
 ```text
-Rust: native core and embedded SDK
-Go:   generated typed bindings over the NetbaDB Protocol v1 client
+Rust embedded: netbadb-sdk -> netbadb-core
+Rust remote:   netbadb-sdk::remote -> netbadb-client -> Protocol v1
+Go remote:     generated typed bindings over the independent Go Protocol v1 client
 ```
 
 The language-neutral SDK Schema Spec v1 is validated and fingerprinted by the
@@ -468,6 +475,13 @@ independent Protocol v1 client. The JSON spec is neither Canonical Schema
 encoding nor deployment configuration. Generated full-row wrappers validate
 exact result order, names, physical and semantic types, and nullability before
 decoding; they do not generate SQL, CRUD, or query-builder APIs.
+
+The blocking Rust remote client deliberately reuses the authoritative
+`netbadb-protocol` codec. It supports loopback plaintext or verified mutual
+TLS, automatic capability/schema gates, streamed rows, and explicit
+transactions. The SDK default remains the embedded API; remote-only users can
+disable default features and enable `remote`. See
+[`sdk/rust/README.md`](sdk/rust/README.md).
 
 ## Development
 
@@ -551,9 +565,10 @@ The implementation sequence is intentionally vertical:
     table and operation scopes, typed SQL preflight, and filtered Hello schema
     visibility. Complete.
 25. Go Protocol v1 client and generated typed bindings (Phases 6A and 6B) —
-    complete. Rust remote-client stabilization, CLI/inspection, LSP, and MCP
-    remain later Phase 6 work.
-26. Advanced optimization — histograms, richer cost models, and rewrite rules.
+    complete.
+26. Synchronous Rust remote client and SDK feature stabilization (Phase 6C) —
+    complete. CLI/inspection, LSP, and MCP remain later Phase 6 work.
+27. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
 Isolation/MVCC and range/index-join planning remain roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and
