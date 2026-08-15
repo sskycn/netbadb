@@ -350,11 +350,21 @@ generic Database error code.
 - independent Go/Rust golden bytes plus real plaintext and mutual-TLS
   `netbadbd` integration.
 
-### Phase 6B — Generated typed Go SDK (next)
+### Phase 6B — Generated typed Go SDK (complete)
 
-- generated schema/query APIs and semantic ID wrappers;
-- nullability-aware row decoding;
-- a language-neutral code-generation input contract and reproducible output.
+- strict language-neutral SDK Schema Spec v1 converted through canonical Rust
+  schema validation and fingerprinting;
+- deterministic Rust-to-Go generation with selection by TableId, semantic
+  nominal types, table/column IDs, embedded fingerprints, and stale-output CI;
+- `Nullable[T]`, explicit full-row decoders, exact result-shape validation,
+  typed row streams for both Client and Tx, and automatic generated schema
+  gates;
+- committed generated tests plus real Rust-server typed Go integration.
+
+Phase 6B deliberately generates no CRUD or query-builder methods. Protocol v1
+has no typed parameter binding, and primary-key metadata is not uniqueness
+enforcement, so interpolating runtime values or promising one-row key lookup
+would create false contracts.
 
 Later Phase 6 work includes Rust remote-client/SDK stabilization (6C), CLI and
 inspection tooling (6D), then LSP/MCP integration (6E). There is currently no

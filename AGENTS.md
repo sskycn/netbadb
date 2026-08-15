@@ -90,6 +90,7 @@ The intended dependency direction is:
 
 ```text
 schema -> types
+codegen -> schema + types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types

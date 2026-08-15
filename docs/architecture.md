@@ -12,6 +12,7 @@ In this graph, `A -> B` means A depends on B. The current crate graph is:
 
 ```text
 netbadb-schema -> netbadb-types
+netbadb-codegen -> netbadb-schema + netbadb-types
 netbadb-hir -> netbadb-parser + netbadb-schema + netbadb-types
 netbadb-rel -> netbadb-types
 netbadb-compiler -> netbadb-hir + netbadb-parser + netbadb-rel
@@ -996,11 +997,14 @@ v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
 remain unchanged. Deployment manifest v4 is configuration, not a database
 format or canonical schema identity.
 
-Rust applications use the native SDK. Go applications can use the independent
-Protocol v1 client under `sdk/go`:
+Rust applications use the native SDK. Go applications can use generated typed
+bindings above the independent Protocol v1 client under `sdk/go`:
 
 ```text
-Go remote client
+Language-neutral SDK Schema Spec v1
+    -> Rust validation and canonical TableDef fingerprints
+    -> deterministic generated Go bindings
+    -> Go Protocol v1 client
     -> Protocol v1
     -> netbadbd
 ```
@@ -1009,6 +1013,15 @@ The Go transport, codec, values, result streaming, transaction lifecycle, and
 schema-fingerprint gate use only the Go standard library. They share no Rust
 memory or layout, use no cgo or FFI, and do not replace typed wire messages with
 JSON execution IR. Canonical schema fingerprint generation remains
-Rust-authoritative; the Go client compares expected generated constants with
-HelloAck identities. A generated, nullability-aware typed Go schema/query layer
-is a later phase above this client.
+Rust-authoritative; generated Go code embeds those bytes and compares them with
+HelloAck identities. Schema Spec JSON ordering or serialization never defines
+identity. Generated table wrappers accept only the complete canonical table row
+shape in canonical column order and explicitly decode nominal and nullable
+values without reflection.
+
+Schema Spec v1 is code-generation input only. It is not Canonical Schema v1's
+binary identity encoding, cannot configure listeners, TLS, authorization, or
+heap paths, and is not the server's deployment source of truth. Server startup
+still gates manifest `TableDef` against heap metadata, while generated `Dial`
+gates embedded fingerprints against authorized HelloAck tables. These two hard
+failures detect drift while the inputs remain separate.

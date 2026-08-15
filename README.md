@@ -103,7 +103,8 @@ netbadb/
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
-│   └── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
+│   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
+│   └── netbadb-codegen/     strict Schema Spec v1 and typed Go generation
 ├── cmd/
 │   └── netbadbd/            standalone manifest-driven server executable
 ├── sdk/
@@ -119,6 +120,7 @@ The direction is acyclic:
 
 ```text
 schema -> types
+codegen -> schema + types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
@@ -193,13 +195,18 @@ The current code genuinely supports:
   per-certificate and local-plaintext table/operation authorization, secure
   remote listen, bounded connections/socket inactivity, response-row policy,
   in-process metrics, and the standalone `netbadbd` executable;
-- a native embedded `netbadb-core::Database` API.
+- a native embedded `netbadb-core::Database` API;
+- an independent standard-library Go Protocol v1 client plus deterministic
+  Rust-generated semantic types, canonical IDs/fingerprints, nullable full-row
+  decoders, typed row streams, and automatic schema gates.
 
 Protocol v1 is specified byte-for-byte in
 [`docs/protocol-v1.md`](docs/protocol-v1.md), and current standalone
 configuration is documented in
-[`docs/server-manifest-v4.md`](docs/server-manifest-v4.md). Manifests v1 through
-v3 are retained as historical documentation and rejected by current
+[`docs/server-manifest-v4.md`](docs/server-manifest-v4.md). The generated SDK
+input contract is documented in
+[`docs/sdk-schema-v1.md`](docs/sdk-schema-v1.md). Manifests v1 through v3 are
+retained as historical documentation and rejected by current
 `netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
 database worker authorizes compiler-resolved TableIds before execution.
 
@@ -452,13 +459,15 @@ support boundary is:
 
 ```text
 Rust: native core and embedded SDK
-Go:   generated SDK and NetbaDB protocol client
+Go:   generated typed bindings over the NetbaDB Protocol v1 client
 ```
 
-The Go directory currently documents the boundary; no Go runtime implementation
-or protocol wire format existed in the starting repository, so none is
-pretended to be complete. A future `netbadbd` server must make the protocol
-versioned and language-neutral before the Go client is generated around it.
+The language-neutral SDK Schema Spec v1 is validated and fingerprinted by the
+Rust `netbadb-codegen` crate, which emits deterministic Go source above the
+independent Protocol v1 client. The JSON spec is neither Canonical Schema
+encoding nor deployment configuration. Generated full-row wrappers validate
+exact result order, names, physical and semantic types, and nullability before
+decoding; they do not generate SQL, CRUD, or query-builder APIs.
 
 ## Development
 
@@ -484,8 +493,9 @@ make test
 make msrv-check
 ```
 
-The Go SDK notes are under [`sdk/go`](sdk/go/README.md). Once executable Go
-client code exists, it should be tested from that module with `go test ./...`.
+The Go SDK notes are under [`sdk/go`](sdk/go/README.md). Test it from that
+module with `go test ./...`; use `scripts/check-generated-sdk.sh` to verify
+committed generated source.
 
 ## Roadmap
 
@@ -540,11 +550,12 @@ The implementation sequence is intentionally vertical:
 24. Per-client authorization (Phase 5C2b) — certificate/local principals,
     table and operation scopes, typed SQL preflight, and filtered Hello schema
     visibility. Complete.
-25. SDKs and tooling — generated Go client, CLI, LSP, and MCP.
+25. Go Protocol v1 client and generated typed bindings (Phases 6A and 6B) —
+    complete. Rust remote-client stabilization, CLI/inspection, LSP, and MCP
+    remain later Phase 6 work.
 26. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
-Isolation/MVCC, range/index-join planning, and Go wire-protocol code are roadmap
-items, not implemented features here.
+Isolation/MVCC and range/index-join planning remain roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

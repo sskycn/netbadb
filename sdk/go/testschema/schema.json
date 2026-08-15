@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "id": 1,
+      "name": "users",
+      "columns": [
+        {
+          "id": 1,
+          "name": "id",
+          "physical_type": "int64",
+          "semantic_type": "UserId",
+          "nullable": false,
+          "primary_key": true
+        },
+        {
+          "id": 2,
+          "name": "name",
+          "physical_type": "text",
+          "semantic_type": null,
+          "nullable": true,
+          "primary_key": false
+        }
+      ]
+    }
+  ]
+}

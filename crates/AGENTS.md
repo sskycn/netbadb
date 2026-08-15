@@ -14,6 +14,9 @@ instruction file.
   on it.
 - Shared IDs and scalar primitives belong in `netbadb-types`; canonical schema
   concepts belong in `netbadb-schema`.
+- Code generators MUST convert their input through `netbadb-schema` and use
+  its canonical fingerprint implementation rather than reproducing schema
+  validation or identity algorithms in a target language.
 - An executor MUST consume physical decisions. It MUST NOT rediscover planner
   policy or compile raw syntax.
 

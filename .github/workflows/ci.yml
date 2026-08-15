@@ -32,6 +32,8 @@ jobs:
         with:
           go-version-file: sdk/go/go.mod
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Check generated Go SDK source
+        run: ./scripts/check-generated-sdk.sh
       - name: Check Go formatting
         working-directory: sdk/go
         run: test -z "$(gofmt -l .)"

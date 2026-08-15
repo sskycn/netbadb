@@ -11,8 +11,13 @@ These rules apply under `sdk/` in addition to the repository root rules.
   parameter types, result shape, and cardinality.
 - Independent processes SHOULD use a versioned language-neutral protocol. FFI
   is not the default cross-language mechanism.
-- Generated files MUST identify their source and generation command and SHOULD
-  be reproducible in CI once generation exists.
+- The SDK Schema Spec is language-neutral code-generation input, not Canonical
+  Schema encoding or a deployment manifest.
+- Go generation MUST use Rust `TableDef` fingerprints; Go code compares
+  fingerprints and MUST NOT implement the canonical fingerprint algorithm.
+- Generated files MUST NOT be manually edited. They MUST identify their source
+  and exact regeneration command and remain byte-reproducible under the CI
+  generated-source check.
 
 If FFI is justified:
 

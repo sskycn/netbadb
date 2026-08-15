@@ -88,3 +88,9 @@ func (*ExpectedQueryError) Error() string { return "netbadb: statement returned 
 type ClientStateError struct{ Reason string }
 
 func (e *ClientStateError) Error() string { return "netbadb client state error: " + e.Reason }
+
+// ResultShapeError reports a local mismatch between a generated typed result
+// contract and the base client's result metadata or scalar values.
+type ResultShapeError struct{ Reason string }
+
+func (e *ResultShapeError) Error() string { return "netbadb result shape error: " + e.Reason }

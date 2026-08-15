@@ -5,6 +5,9 @@ import "fmt"
 // TableID is a stable canonical table identity.
 type TableID uint64
 
+// ColumnID is a stable canonical column identity.
+type ColumnID uint32
+
 // SchemaFingerprint is the Rust-authoritative SHA-256 fingerprint of a
 // canonical table schema. This package compares fingerprints but never creates
 // them.
@@ -14,6 +17,19 @@ type TableIdentity struct {
 	TableID     TableID
 	Fingerprint SchemaFingerprint
 }
+
+// Nullable represents a generated typed application value that may be
+// database NULL. Its zero value is NULL.
+type Nullable[T any] struct {
+	Value T
+	Valid bool
+}
+
+// Some constructs a non-NULL generated application value.
+func Some[T any](value T) Nullable[T] { return Nullable[T]{Value: value, Valid: true} }
+
+// Get returns the value and whether it is non-NULL.
+func (value Nullable[T]) Get() (T, bool) { return value.Value, value.Valid }
 
 type PhysicalType uint8
 
