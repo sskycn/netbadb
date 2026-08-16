@@ -1107,7 +1107,7 @@ fn expected_null_ids(rows: u64, distribution: NullDistribution) -> Observation {
     }
 }
 
-fn expected_range_ids(start: u64, end: u64) -> Observation {
+const fn expected_range_ids(start: u64, end: u64) -> Observation {
     Observation {
         rows: end - start,
         checksum: arithmetic_sum(end) - arithmetic_sum(start),
@@ -1144,8 +1144,19 @@ fn expected_join(rows: u64, cardinality: u64) -> Observation {
 
 const fn arithmetic_sum(end: u64) -> u128 {
     let end = end as u128;
-    end * (end - 1) / 2
+    if end == 0 { 0 } else { end * (end - 1) / 2 }
 }
+
+const _: () = {
+    assert!(arithmetic_sum(0) == 0);
+    assert!(arithmetic_sum(1) == 0);
+    assert!(arithmetic_sum(2) == 1);
+    assert!(arithmetic_sum(10) == 45);
+
+    let range = expected_range_ids(0, 10);
+    assert!(range.rows == 10);
+    assert!(range.checksum == 45);
+};
 
 fn require_observation(
     scenario: &str,
