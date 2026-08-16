@@ -454,9 +454,24 @@ reporting.
 - no optimizer, planner, executor, storage, protocol, or persistent-format
   behavior changes.
 
-Phase 7B must use measured Phase 7A scenarios to choose its optimization work.
-The presence of a slow scenario alone does not select or justify a particular
-implementation.
+### Phase 7B — Costed bounded integer RangeIndexScan (complete)
+
+- typed inclusive/exclusive index ranges and read-only B+Tree leaf-chain
+  traversal, including duplicates spanning leaves and corruption checks;
+- nested-AND extraction and tightening of two-sided Int64/UInt64 literal
+  bounds, including reversed operands and empty ranges;
+- integer-only cost comparison using existing ANALYZE snapshots and exact
+  discrete bound cardinality, with narrow ranges eligible and wide ranges
+  retaining SeqScan;
+- complete residual Filter and generation-safe Heap fetch for SELECT, UPDATE,
+  and DELETE, with DML targets materialized before index maintenance;
+- deterministic inspection text and current Inspection JSON v2, while v1
+  remains a historical documented/golden contract;
+- no BTree payload, IndexCatalog, statistics, protocol, schema-spec, manifest,
+  or other database persistent-format change.
+
+Phase 7C must be selected from post-7B benchmark results. Candidate ranking is
+therefore a measured follow-up, not a preselected hash-join or rewrite project.
 
 ### Later Phase 7 work
 

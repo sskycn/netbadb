@@ -1,11 +1,13 @@
+use netbadb_index::IndexBound;
 use netbadb_inspect::{
     AggregateFunctionInspection, AggregateInputInspection, AggregateOutputInspection,
     AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
     ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
-    IndexStatisticsInspection, JoinKindInspection, NullOrderInspection, PlanNodeInspection,
-    ResultFieldInspection, SortDirectionInspection, SortKeyInspection, SourceColumnInspection,
-    StatementAccessInspection, StatementInspection, StatementKind, StatementPlanInspection,
-    StatementResultInspection, TableInspection, TableStatisticsInspection, UnaryOpInspection,
+    IndexRangeInspection, IndexStatisticsInspection, JoinKindInspection, NullOrderInspection,
+    PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SortDirectionInspection,
+    SortKeyInspection, SourceColumnInspection, StatementAccessInspection, StatementInspection,
+    StatementKind, StatementPlanInspection, StatementResultInspection, TableInspection,
+    TableStatisticsInspection, UnaryOpInspection,
 };
 use netbadb_planner::{PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
@@ -230,6 +232,25 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
             index_column: column_reference(index_column),
             key: key.clone(),
         },
+        PhysicalPlan::RangeIndexScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            index_column,
+            handle: _,
+            range,
+        } => PlanNodeInspection::RangeIndexScan {
+            binding_id: *binding_id,
+            table_id: *table_id,
+            table_name: table_name.clone(),
+            columns: columns.iter().map(column_reference).collect(),
+            index_column: column_reference(index_column),
+            range: IndexRangeInspection {
+                lower: range_bound(&range.lower),
+                upper: range_bound(&range.upper),
+            },
+        },
         PhysicalPlan::NestedLoopJoin {
             left,
             right,
@@ -267,6 +288,14 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
             limit: *limit,
             input: Box::new(inspect_plan(input)),
         },
+    }
+}
+
+fn range_bound(bound: &IndexBound) -> RangeBoundInspection {
+    match bound {
+        IndexBound::Unbounded => RangeBoundInspection::Unbounded,
+        IndexBound::Included(value) => RangeBoundInspection::Included(value.clone()),
+        IndexBound::Excluded(value) => RangeBoundInspection::Excluded(value.clone()),
     }
 }
 

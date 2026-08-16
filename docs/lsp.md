@@ -52,7 +52,7 @@ recovery, or string-based guesses to fabricate additional errors.
 
 The language server does not open `.ndb` or WAL files, load deployment manifest
 v4, run recovery, start or contact `netbadbd`, execute SQL, or invoke physical
-planning. It does not spawn `netbadb inspect` or parse Inspection JSON v1.
+planning. It does not spawn `netbadb inspect` or parse Inspection JSON v2.
 Runtime inspection remains the separate Database → planner → inspection DTO
 path.
 

@@ -20,11 +20,11 @@ pub mod inspection {
         AggregateFunctionInspection, AggregateInputInspection, AggregateOutputInspection,
         AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
         ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
-        IndexStatisticsInspection, JoinKindInspection, NullOrderInspection, PlanNodeInspection,
-        ResultFieldInspection, SortDirectionInspection, SortKeyInspection, SourceColumnInspection,
-        StatementAccessInspection, StatementInspection, StatementKind, StatementPlanInspection,
-        StatementResultInspection, TableInspection, TableStatisticsInspection, UnaryOpInspection,
-        render_catalog, render_statement,
+        IndexRangeInspection, IndexStatisticsInspection, JoinKindInspection, NullOrderInspection,
+        PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SortDirectionInspection,
+        SortKeyInspection, SourceColumnInspection, StatementAccessInspection, StatementInspection,
+        StatementKind, StatementPlanInspection, StatementResultInspection, TableInspection,
+        TableStatisticsInspection, UnaryOpInspection, render_catalog, render_statement,
     };
 }
 

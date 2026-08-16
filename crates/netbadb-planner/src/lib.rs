@@ -1,13 +1,17 @@
 //! Physical planning kept separate from logical relational meaning.
 
-use netbadb_index::{BTreeHandle, IndexStatistics, TableStatistics};
+use std::cmp::Ordering;
+
+use netbadb_index::{
+    BTreeHandle, IndexBound, IndexRange, IndexStatistics, TableStatistics, compare_values,
+};
 use netbadb_rel::{
     AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind, LogicalPlan,
     LogicalStatement, OutputField, SortKey,
 };
 use netbadb_types::{ColumnId, RelationBindingId, ScalarValue, TableId};
 
-/// One registered point-lookup capability available to physical planning.
+/// One registered single-column lookup capability available to physical planning.
 ///
 /// Callers preserve registration order in the slice. The planner receives
 /// immutable domain snapshots, never storage objects or catalog pages.
@@ -42,6 +46,15 @@ pub enum PhysicalPlan {
         index_column: ColumnRef,
         handle: BTreeHandle,
         key: ScalarValue,
+    },
+    RangeIndexScan {
+        binding_id: RelationBindingId,
+        table_id: TableId,
+        table_name: String,
+        columns: Vec<ColumnRef>,
+        index_column: ColumnRef,
+        handle: BTreeHandle,
+        range: IndexRange,
     },
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
@@ -98,6 +111,7 @@ impl PhysicalPlan {
         match self {
             Self::SeqScan { columns, .. }
             | Self::IndexScan { columns, .. }
+            | Self::RangeIndexScan { columns, .. }
             | Self::NestedLoopJoin { columns, .. }
             | Self::Project { columns, .. } => {
                 columns.iter().cloned().map(OutputField::Source).collect()
@@ -118,7 +132,7 @@ pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
 }
 
 /// Selects physical operators from logical meaning and an ordered snapshot of
-/// registered point-lookup access paths.
+/// registered single-column access paths.
 #[must_use]
 pub fn plan_with_access_paths(
     logical: &LogicalPlan,
@@ -167,7 +181,7 @@ pub fn plan_with_statistics(
                     table_id,
                     table_name,
                     columns,
-                } => choose_point_index(
+                } => choose_index_access(
                     predicate,
                     *binding_id,
                     *table_id,
@@ -208,7 +222,25 @@ pub fn plan_with_statistics(
     }
 }
 
-fn choose_point_index(
+#[derive(Debug)]
+enum IndexLookupCandidate {
+    Point {
+        key: ScalarValue,
+    },
+    Range {
+        range: IndexRange,
+        possible_integer_keys: u128,
+    },
+}
+
+#[derive(Debug)]
+struct IndexCandidate<'a> {
+    access_path: &'a IndexAccessPath,
+    index_column: ColumnRef,
+    lookup: IndexLookupCandidate,
+}
+
+fn choose_index_access(
     predicate: &Expr,
     binding_id: RelationBindingId,
     table_id: TableId,
@@ -217,31 +249,49 @@ fn choose_point_index(
     table_statistics: &[TableAccessStatistics],
     access_paths: &[IndexAccessPath],
 ) -> Option<PhysicalPlan> {
-    let eligible = access_paths
+    let mut eligible = Vec::new();
+    for access_path in access_paths {
+        if access_path.table_id != table_id {
+            continue;
+        }
+        if let Some((index_column, key)) =
+            find_point_constraint(predicate, binding_id, table_id, access_path.column_id)
+        {
+            eligible.push(IndexCandidate {
+                access_path,
+                index_column,
+                lookup: IndexLookupCandidate::Point { key },
+            });
+        }
+        if let Some((index_column, range, possible_integer_keys)) =
+            find_range_constraint(predicate, binding_id, table_id, access_path.column_id)
+        {
+            eligible.push(IndexCandidate {
+                access_path,
+                index_column,
+                lookup: IndexLookupCandidate::Range {
+                    range,
+                    possible_integer_keys,
+                },
+            });
+        }
+    }
+    let first_point = eligible
         .iter()
-        .filter_map(|access_path| {
-            if access_path.table_id != table_id {
-                return None;
-            }
-            let (index_column, key) =
-                find_point_constraint(predicate, binding_id, table_id, access_path.column_id)?;
-            Some((access_path, index_column, key))
-        })
-        .collect::<Vec<_>>();
-    let first = eligible.first()?;
+        .find(|candidate| matches!(candidate.lookup, IndexLookupCandidate::Point { .. }));
     let analyzed_table = table_statistics
         .iter()
         .find(|entry| entry.table_id == table_id)
         .and_then(|entry| entry.statistics.as_ref());
     let selected = match analyzed_table {
-        None => first,
+        None => first_point?,
         Some(table) => {
-            let mut best: Option<(&(&IndexAccessPath, ColumnRef, ScalarValue), u128)> = None;
+            let mut best: Option<(&IndexCandidate<'_>, u128)> = None;
             for candidate in &eligible {
-                let Some(index) = candidate.0.statistics.as_ref() else {
+                let Some(index) = candidate.access_path.statistics.as_ref() else {
                     continue;
                 };
-                let Some(cost) = index_scan_cost(table, index, &candidate.2) else {
+                let Some(cost) = candidate_cost(table, index, &candidate.lookup) else {
                     continue;
                 };
                 if best.is_none_or(|(_, best_cost)| cost < best_cost) {
@@ -249,7 +299,9 @@ fn choose_point_index(
                 }
             }
             let Some((candidate, cost)) = best else {
-                return build_index_scan(first, binding_id, table_id, table_name, columns);
+                return first_point.map(|candidate| {
+                    build_index_scan(candidate, binding_id, table_id, table_name, columns)
+                });
             };
             if cost >= seq_scan_cost(table) {
                 return None;
@@ -257,38 +309,76 @@ fn choose_point_index(
             candidate
         }
     };
-    build_index_scan(selected, binding_id, table_id, table_name, columns)
+    Some(build_index_scan(
+        selected, binding_id, table_id, table_name, columns,
+    ))
 }
 
 fn build_index_scan(
-    candidate: &(&IndexAccessPath, ColumnRef, ScalarValue),
+    candidate: &IndexCandidate<'_>,
     binding_id: RelationBindingId,
     table_id: TableId,
     table_name: &str,
     columns: &[ColumnRef],
-) -> Option<PhysicalPlan> {
-    Some(PhysicalPlan::IndexScan {
-        binding_id,
-        table_id,
-        table_name: table_name.to_owned(),
-        columns: columns.to_vec(),
-        index_column: candidate.1.clone(),
-        handle: candidate.0.handle,
-        key: candidate.2.clone(),
-    })
+) -> PhysicalPlan {
+    match &candidate.lookup {
+        IndexLookupCandidate::Point { key } => PhysicalPlan::IndexScan {
+            binding_id,
+            table_id,
+            table_name: table_name.to_owned(),
+            columns: columns.to_vec(),
+            index_column: candidate.index_column.clone(),
+            handle: candidate.access_path.handle,
+            key: key.clone(),
+        },
+        IndexLookupCandidate::Range { range, .. } => PhysicalPlan::RangeIndexScan {
+            binding_id,
+            table_id,
+            table_name: table_name.to_owned(),
+            columns: columns.to_vec(),
+            index_column: candidate.index_column.clone(),
+            handle: candidate.access_path.handle,
+            range: range.clone(),
+        },
+    }
 }
 
 fn seq_scan_cost(statistics: &TableStatistics) -> u128 {
     u128::from(statistics.managed_page_count)
 }
 
-fn index_scan_cost(
+fn candidate_cost(
     table: &TableStatistics,
     index: &IndexStatistics,
-    key: &ScalarValue,
+    candidate: &IndexLookupCandidate,
 ) -> Option<u128> {
-    let estimated_matches = estimate_point_rows(table, index, key)?;
+    let estimated_matches = match candidate {
+        IndexLookupCandidate::Point { key } => estimate_point_rows(table, index, key)?,
+        IndexLookupCandidate::Range {
+            possible_integer_keys,
+            ..
+        } => estimate_range_rows(table, index, *possible_integer_keys)?,
+    };
     Some(1 + u128::from(index.tree_height) + estimated_matches)
+}
+
+fn estimate_range_rows(
+    table: &TableStatistics,
+    index: &IndexStatistics,
+    possible_integer_keys: u128,
+) -> Option<u128> {
+    let non_null_rows = table.row_count.checked_sub(index.null_count)?;
+    if non_null_rows == 0 {
+        return Some(0);
+    }
+    if index.distinct_non_null_keys == 0 {
+        return None;
+    }
+    let quotient = non_null_rows / index.distinct_non_null_keys;
+    let remainder = non_null_rows % index.distinct_non_null_keys;
+    let average_duplicates = u128::from(quotient) + u128::from(remainder != 0);
+    let estimated = possible_integer_keys.checked_mul(average_duplicates)?;
+    Some(estimated.min(u128::from(non_null_rows)))
 }
 
 fn estimate_point_rows(
@@ -341,6 +431,231 @@ fn find_point_constraint(
             }
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn find_range_constraint(
+    predicate: &Expr,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<(ColumnRef, IndexRange, u128)> {
+    let mut column = None;
+    let mut lower = None;
+    let mut upper = None;
+    collect_range_bounds(
+        predicate,
+        binding_id,
+        table_id,
+        column_id,
+        &mut column,
+        &mut lower,
+        &mut upper,
+    );
+    let column = column?;
+    if !matches!(
+        column.data_type.physical,
+        netbadb_types::PhysicalType::Int64 | netbadb_types::PhysicalType::UInt64
+    ) {
+        return None;
+    }
+    let range = IndexRange {
+        lower: lower?,
+        upper: upper?,
+    };
+    let possible_integer_keys = estimated_integer_key_count(&range)?;
+    Some((column, range, possible_integer_keys))
+}
+
+fn collect_range_bounds(
+    predicate: &Expr,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    column_id: ColumnId,
+    column: &mut Option<ColumnRef>,
+    lower: &mut Option<IndexBound>,
+    upper: &mut Option<IndexBound>,
+) {
+    let ExprKind::Binary {
+        operator,
+        left,
+        right,
+    } = &predicate.kind
+    else {
+        return;
+    };
+    if *operator == BinaryOp::And {
+        collect_range_bounds(left, binding_id, table_id, column_id, column, lower, upper);
+        collect_range_bounds(right, binding_id, table_id, column_id, column, lower, upper);
+        return;
+    }
+    let Some((matched_column, bound, is_lower)) =
+        comparison_bound(*operator, left, right, binding_id, table_id, column_id)
+    else {
+        return;
+    };
+    *column = Some(matched_column);
+    if is_lower {
+        tighten_lower(lower, bound);
+    } else {
+        tighten_upper(upper, bound);
+    }
+}
+
+fn comparison_bound(
+    operator: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<(ColumnRef, IndexBound, bool)> {
+    comparison_bound_ordered(operator, left, right, binding_id, table_id, column_id).or_else(|| {
+        comparison_bound_ordered(
+            reverse_comparison(operator)?,
+            right,
+            left,
+            binding_id,
+            table_id,
+            column_id,
+        )
+    })
+}
+
+fn comparison_bound_ordered(
+    operator: BinaryOp,
+    column: &Expr,
+    literal: &Expr,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<(ColumnRef, IndexBound, bool)> {
+    let ExprKind::Column(column) = &column.kind else {
+        return None;
+    };
+    let ExprKind::Literal(value) = &literal.kind else {
+        return None;
+    };
+    if matches!(value, ScalarValue::Null)
+        || !column_matches(column, binding_id, table_id, column_id)
+    {
+        return None;
+    }
+    let (bound, is_lower) = match operator {
+        BinaryOp::Gt => (IndexBound::Excluded(value.clone()), true),
+        BinaryOp::GtEq => (IndexBound::Included(value.clone()), true),
+        BinaryOp::Lt => (IndexBound::Excluded(value.clone()), false),
+        BinaryOp::LtEq => (IndexBound::Included(value.clone()), false),
+        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::And | BinaryOp::Or => return None,
+    };
+    Some((column.clone(), bound, is_lower))
+}
+
+const fn reverse_comparison(operator: BinaryOp) -> Option<BinaryOp> {
+    match operator {
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::LtEq => Some(BinaryOp::GtEq),
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::GtEq => Some(BinaryOp::LtEq),
+        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::And | BinaryOp::Or => None,
+    }
+}
+
+fn tighten_lower(current: &mut Option<IndexBound>, candidate: IndexBound) {
+    let replace = current
+        .as_ref()
+        .is_none_or(|existing| compare_bounds(existing, &candidate, true) == Ordering::Less);
+    if replace {
+        *current = Some(candidate);
+    }
+}
+
+fn tighten_upper(current: &mut Option<IndexBound>, candidate: IndexBound) {
+    let replace = current
+        .as_ref()
+        .is_none_or(|existing| compare_bounds(existing, &candidate, false) == Ordering::Greater);
+    if replace {
+        *current = Some(candidate);
+    }
+}
+
+fn compare_bounds(left: &IndexBound, right: &IndexBound, lower: bool) -> Ordering {
+    let Some((left_value, left_included)) = bound_value(left) else {
+        return Ordering::Equal;
+    };
+    let Some((right_value, right_included)) = bound_value(right) else {
+        return Ordering::Equal;
+    };
+    compare_values(left_value, right_value).then_with(|| {
+        if left_included == right_included {
+            Ordering::Equal
+        } else if lower {
+            left_included.cmp(&right_included).reverse()
+        } else {
+            left_included.cmp(&right_included)
+        }
+    })
+}
+
+fn bound_value(bound: &IndexBound) -> Option<(&ScalarValue, bool)> {
+    match bound {
+        IndexBound::Included(value) => Some((value, true)),
+        IndexBound::Excluded(value) => Some((value, false)),
+        IndexBound::Unbounded => None,
+    }
+}
+
+fn estimated_integer_key_count(range: &IndexRange) -> Option<u128> {
+    match (&range.lower, &range.upper) {
+        (IndexBound::Included(ScalarValue::Int64(lower)), _) => {
+            let lower = i128::from(*lower);
+            let upper = match &range.upper {
+                IndexBound::Included(ScalarValue::Int64(value)) => i128::from(*value) + 1,
+                IndexBound::Excluded(ScalarValue::Int64(value)) => i128::from(*value),
+                _ => return None,
+            };
+            if upper <= lower {
+                Some(0)
+            } else {
+                u128::try_from(upper - lower).ok()
+            }
+        }
+        (IndexBound::Excluded(ScalarValue::Int64(lower)), _) => {
+            let lower = i128::from(*lower) + 1;
+            let upper = match &range.upper {
+                IndexBound::Included(ScalarValue::Int64(value)) => i128::from(*value) + 1,
+                IndexBound::Excluded(ScalarValue::Int64(value)) => i128::from(*value),
+                _ => return None,
+            };
+            if upper <= lower {
+                Some(0)
+            } else {
+                u128::try_from(upper - lower).ok()
+            }
+        }
+        (IndexBound::Included(ScalarValue::UInt64(lower)), _) => {
+            let lower = u128::from(*lower);
+            let upper = match &range.upper {
+                IndexBound::Included(ScalarValue::UInt64(value)) => {
+                    u128::from(*value).checked_add(1)?
+                }
+                IndexBound::Excluded(ScalarValue::UInt64(value)) => u128::from(*value),
+                _ => return None,
+            };
+            Some(upper.saturating_sub(lower))
+        }
+        (IndexBound::Excluded(ScalarValue::UInt64(lower)), _) => {
+            let lower = u128::from(*lower).checked_add(1)?;
+            let upper = match &range.upper {
+                IndexBound::Included(ScalarValue::UInt64(value)) => {
+                    u128::from(*value).checked_add(1)?
+                }
+                IndexBound::Excluded(ScalarValue::UInt64(value)) => u128::from(*value),
+                _ => return None,
+            };
+            Some(upper.saturating_sub(lower))
+        }
         _ => None,
     }
 }
@@ -433,7 +748,7 @@ mod tests {
         plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
         plan_with_access_paths, plan_with_statistics,
     };
-    use netbadb_index::{BTreeHandle, IndexStatistics, TableStatistics};
+    use netbadb_index::{BTreeHandle, IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
     use netbadb_types::{
         ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
@@ -639,13 +954,22 @@ mod tests {
     }
 
     fn test_column(column_id: u32, name: &str, nullable: bool) -> ColumnRef {
+        typed_column(column_id, name, PhysicalType::Int64, nullable)
+    }
+
+    fn typed_column(
+        column_id: u32,
+        name: &str,
+        physical: PhysicalType,
+        nullable: bool,
+    ) -> ColumnRef {
         ColumnRef {
             binding_id: RelationBindingId(7),
             table_id: TableId(1),
             column_id: ColumnId(column_id),
             relation_name: "u".into(),
             name: name.into(),
-            data_type: SemanticType::physical(PhysicalType::Int64),
+            data_type: SemanticType::physical(physical),
             nullable,
         }
     }
@@ -739,6 +1063,323 @@ mod tests {
             PhysicalPlan::Filter { input, .. } => Some(input),
             _ => None,
         }
+    }
+
+    fn bounded(column: &ColumnRef, lower: i64, upper: i64) -> Expr {
+        binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::GtEq,
+                column_expr(column),
+                literal(ScalarValue::Int64(lower)),
+            ),
+            binary(
+                BinaryOp::Lt,
+                column_expr(column),
+                literal(ScalarValue::Int64(upper)),
+            ),
+        )
+    }
+
+    #[test]
+    fn bounded_integer_ranges_require_statistics_and_compare_costs() {
+        let id = test_column(1, "id", false);
+        let access = [analyzed_path(1, 40, 10_000, 0, 2)];
+        let table = [analyzed_table(10_000, 1_000)];
+        let narrow = plan_with_statistics(
+            &filtered_scan(bounded(&id, 5_000, 5_100), vec![id.clone()]),
+            &table,
+            &access,
+        );
+        assert!(matches!(
+            index_scan_input(&narrow),
+            Some(PhysicalPlan::RangeIndexScan {
+                range: IndexRange {
+                    lower: IndexBound::Included(ScalarValue::Int64(5_000)),
+                    upper: IndexBound::Excluded(ScalarValue::Int64(5_100)),
+                },
+                ..
+            })
+        ));
+
+        let wide = plan_with_statistics(
+            &filtered_scan(bounded(&id, 2_500, 7_500), vec![id.clone()]),
+            &table,
+            &access,
+        );
+        assert!(matches!(
+            index_scan_input(&wide),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+        let without_statistics = plan_with_access_paths(
+            &filtered_scan(bounded(&id, 5_000, 5_100), vec![id]),
+            &[access_path(1, 40)],
+        );
+        assert!(matches!(
+            index_scan_input(&without_statistics),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+    }
+
+    #[test]
+    fn range_extraction_reverses_and_tightens_nested_bounds() {
+        let id = test_column(1, "id", false);
+        let predicate = binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::LtEq,
+                    literal(ScalarValue::Int64(100)),
+                    column_expr(&id),
+                ),
+                binary(
+                    BinaryOp::Gt,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(200)),
+                ),
+            ),
+            binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::Gt,
+                    literal(ScalarValue::Int64(1_000)),
+                    column_expr(&id),
+                ),
+                binary(
+                    BinaryOp::LtEq,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(900)),
+                ),
+            ),
+        );
+        let physical = plan_with_statistics(
+            &filtered_scan(predicate, vec![id]),
+            &[analyzed_table(10_000, 2_000)],
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+        );
+        assert!(matches!(
+            index_scan_input(&physical),
+            Some(PhysicalPlan::RangeIndexScan {
+                range: IndexRange {
+                    lower: IndexBound::Excluded(ScalarValue::Int64(200)),
+                    upper: IndexBound::Included(ScalarValue::Int64(900)),
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unsupported_range_shapes_remain_sequence_scans() {
+        let analyzed = [analyzed_table(10_000, 2_000)];
+        for physical in [PhysicalType::Int64, PhysicalType::Text, PhysicalType::Bool] {
+            let column = typed_column(1, "value", physical, false);
+            let (lower, upper) = match physical {
+                PhysicalType::Int64 => (ScalarValue::Int64(10), ScalarValue::Int64(20)),
+                PhysicalType::Text => {
+                    (ScalarValue::Text("a".into()), ScalarValue::Text("b".into()))
+                }
+                PhysicalType::Bool => (ScalarValue::Bool(false), ScalarValue::Bool(true)),
+                PhysicalType::UInt64 => return,
+            };
+            let predicate = binary(
+                BinaryOp::And,
+                binary(BinaryOp::GtEq, column_expr(&column), literal(lower)),
+                binary(BinaryOp::Lt, column_expr(&column), literal(upper)),
+            );
+            let plan = plan_with_statistics(
+                &filtered_scan(predicate, vec![column]),
+                &analyzed,
+                &[analyzed_path(1, 40, 10_000, 0, 2)],
+            );
+            if physical == PhysicalType::Int64 {
+                assert!(matches!(
+                    index_scan_input(&plan),
+                    Some(PhysicalPlan::RangeIndexScan { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    index_scan_input(&plan),
+                    Some(PhysicalPlan::SeqScan { .. })
+                ));
+            }
+        }
+
+        let id = test_column(1, "id", false);
+        let one_sided = plan_with_statistics(
+            &filtered_scan(
+                binary(
+                    BinaryOp::GtEq,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(10)),
+                ),
+                vec![id.clone()],
+            ),
+            &analyzed,
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+        );
+        assert!(matches!(
+            index_scan_input(&one_sided),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+        let disjunction = plan_with_statistics(
+            &filtered_scan(
+                binary(
+                    BinaryOp::Or,
+                    binary(
+                        BinaryOp::Lt,
+                        column_expr(&id),
+                        literal(ScalarValue::Int64(10)),
+                    ),
+                    binary(
+                        BinaryOp::Gt,
+                        column_expr(&id),
+                        literal(ScalarValue::Int64(9_000)),
+                    ),
+                ),
+                vec![id],
+            ),
+            &analyzed,
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+        );
+        assert!(matches!(
+            index_scan_input(&disjunction),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+    }
+
+    #[test]
+    fn integer_key_count_is_checked_at_signed_and_unsigned_boundaries() {
+        assert_eq!(
+            super::estimated_integer_key_count(&IndexRange {
+                lower: IndexBound::Included(ScalarValue::Int64(i64::MIN)),
+                upper: IndexBound::Included(ScalarValue::Int64(i64::MAX)),
+            }),
+            Some(1_u128 << 64)
+        );
+        assert_eq!(
+            super::estimated_integer_key_count(&IndexRange {
+                lower: IndexBound::Included(ScalarValue::UInt64(0)),
+                upper: IndexBound::Included(ScalarValue::UInt64(u64::MAX)),
+            }),
+            Some(1_u128 << 64)
+        );
+        assert_eq!(
+            super::estimated_integer_key_count(&IndexRange {
+                lower: IndexBound::Excluded(ScalarValue::Int64(10)),
+                upper: IndexBound::Excluded(ScalarValue::Int64(5)),
+            }),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn point_range_and_contradiction_candidates_share_one_costed_choice() {
+        let id = test_column(1, "id", false);
+        let bucket = test_column(2, "bucket", false);
+        let point_and_range = binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::Eq,
+                column_expr(&id),
+                literal(ScalarValue::Int64(42)),
+            ),
+            bounded(&id, 0, 100),
+        );
+        let point = plan_with_statistics(
+            &filtered_scan(point_and_range, vec![id.clone()]),
+            &[analyzed_table(10_000, 2_000)],
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+        );
+        assert!(matches!(
+            index_scan_input(&point),
+            Some(PhysicalPlan::IndexScan {
+                key: ScalarValue::Int64(42),
+                ..
+            })
+        ));
+
+        let contradiction = plan_with_statistics(
+            &filtered_scan(
+                binary(
+                    BinaryOp::And,
+                    binary(
+                        BinaryOp::Gt,
+                        column_expr(&id),
+                        literal(ScalarValue::Int64(100)),
+                    ),
+                    binary(
+                        BinaryOp::Lt,
+                        column_expr(&id),
+                        literal(ScalarValue::Int64(100)),
+                    ),
+                ),
+                vec![id.clone()],
+            ),
+            &[analyzed_table(10_000, 2_000)],
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+        );
+        assert!(matches!(
+            index_scan_input(&contradiction),
+            Some(PhysicalPlan::RangeIndexScan { .. })
+        ));
+
+        let mixed = plan_with_statistics(
+            &filtered_scan(
+                binary(
+                    BinaryOp::And,
+                    bounded(&id, 0, 100),
+                    binary(
+                        BinaryOp::Eq,
+                        column_expr(&bucket),
+                        literal(ScalarValue::Int64(7)),
+                    ),
+                ),
+                vec![id, bucket],
+            ),
+            &[analyzed_table(10_000, 2_000)],
+            &[
+                analyzed_path(1, 40, 10_000, 0, 2),
+                analyzed_path(2, 50, 10_000, 0, 2),
+            ],
+        );
+        assert!(matches!(
+            index_scan_input(&mixed),
+            Some(PhysicalPlan::IndexScan {
+                handle: BTreeHandle {
+                    meta_page: PageId(50)
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_uint64_range_is_costable() {
+        let id = typed_column(1, "id", PhysicalType::UInt64, false);
+        let predicate = binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::GtEq,
+                column_expr(&id),
+                literal(ScalarValue::UInt64(u64::MAX - 9)),
+            ),
+            binary(
+                BinaryOp::LtEq,
+                column_expr(&id),
+                literal(ScalarValue::UInt64(u64::MAX)),
+            ),
+        );
+        let physical = plan_with_statistics(
+            &filtered_scan(predicate, vec![id]),
+            &[analyzed_table(10_000, 2_000)],
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+        );
+        assert!(matches!(
+            index_scan_input(&physical),
+            Some(PhysicalPlan::RangeIndexScan { .. })
+        ));
     }
 
     #[test]

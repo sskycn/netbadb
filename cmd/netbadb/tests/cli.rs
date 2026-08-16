@@ -278,7 +278,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
     assert_eq!(first.stdout, second.stdout);
     let json = json_stdout(&first);
     assert_eq!(json["format"], "netbadb-inspection");
-    assert_eq!(json["version"], 1);
+    assert_eq!(json["version"], 2);
     assert_eq!(json["kind"], "catalog");
     assert_eq!(json["catalog"]["tables"][0]["name"], "users");
     assert_eq!(json["catalog"]["tables"][1]["name"], "admin_data");
@@ -304,6 +304,21 @@ fn statement_commands_report_real_plans_sql_files_bindings_and_aggregate_provena
     collect_operators(&indexed_json, &mut operators);
     assert!(operators.contains(&"filter"));
     assert!(operators.contains(&"index_scan"));
+
+    let ranged_sql = "SELECT id FROM users WHERE id >= 40 AND id < 45";
+    let ranged_text = statement(&fixture, ranged_sql, "text");
+    assert!(ranged_text.status.success(), "{}", stderr(&ranged_text));
+    assert!(stdout(&ranged_text).contains("RangeIndexScan"));
+    let ranged = json_stdout(&statement(&fixture, ranged_sql, "json"));
+    operators.clear();
+    collect_operators(&ranged, &mut operators);
+    assert!(operators.contains(&"range_index_scan"));
+    assert_eq!(ranged["version"], 2);
+    let range = &ranged["statement"]["plan"]["root"]["input"]["input"];
+    assert_eq!(range["lower_bound"]["kind"], "included");
+    assert_eq!(range["lower_bound"]["value"]["value"], 40);
+    assert_eq!(range["upper_bound"]["kind"], "excluded");
+    assert_eq!(range["upper_bound"]["value"]["value"], 45);
 
     let duplicate_heavy = statement(&fixture, "SELECT name FROM users WHERE team_id = 0", "json");
     let duplicate_json = json_stdout(&duplicate_heavy);

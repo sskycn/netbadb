@@ -1,0 +1,83 @@
+{
+  "format": "netbadb-inspection",
+  "version": 2,
+  "kind": "statement",
+  "statement": {
+    "kind": "query",
+    "access": {
+      "read_tables": [
+        1
+      ],
+      "write_tables": []
+    },
+    "result": {
+      "kind": "query",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": {
+            "physical": "int64",
+            "semantic_name": null
+          },
+          "nullable": false,
+          "source": {
+            "binding_id": 0,
+            "table_id": 1,
+            "column_id": 1,
+            "relation_name": "users",
+            "name": "id"
+          }
+        }
+      ]
+    },
+    "plan": {
+      "kind": "query",
+      "root": {
+        "operator": "range_index_scan",
+        "binding_id": 0,
+        "table_id": 1,
+        "table_name": "users",
+        "columns": [
+          {
+            "binding_id": 0,
+            "table_id": 1,
+            "column_id": 1,
+            "relation_name": "users",
+            "name": "id",
+            "data_type": {
+              "physical": "int64",
+              "semantic_name": null
+            },
+            "nullable": false
+          }
+        ],
+        "index_column": {
+          "binding_id": 0,
+          "table_id": 1,
+          "column_id": 1,
+          "relation_name": "users",
+          "name": "id",
+          "data_type": {
+            "physical": "int64",
+            "semantic_name": null
+          },
+          "nullable": false
+        },
+        "lower_bound": {
+          "kind": "included",
+          "value": {
+            "kind": "int64",
+            "value": 5000
+          }
+        },
+        "upper_bound": {
+          "kind": "excluded",
+          "value": {
+            "kind": "int64",
+            "value": 5100
+          }
+        }
+      }
+    }
+  }
+}

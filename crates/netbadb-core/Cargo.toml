@@ -9,6 +9,7 @@ rust-version.workspace = true
 netbadb-compiler = { path = "../netbadb-compiler" }
 netbadb-executor = { path = "../netbadb-executor" }
 netbadb-inspect = { path = "../netbadb-inspect" }
+netbadb-index = { path = "../netbadb-index" }
 netbadb-planner = { path = "../netbadb-planner" }
 netbadb-rel = { path = "../netbadb-rel" }
 netbadb-schema = { path = "../netbadb-schema" }

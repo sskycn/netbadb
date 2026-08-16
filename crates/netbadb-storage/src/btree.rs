@@ -2,10 +2,10 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use netbadb_index::{
-    BTreeHandle, IndexEntry, IndexEntryKey, IndexError, IndexSpec, InternalNode, InternalSeparator,
-    LeafNode, MetaNode, compare_entry_keys, compare_key_to_entry, decode_internal, decode_leaf,
-    decode_meta, encode_internal, encode_leaf, encode_meta, ensure_entry_fits,
-    merge_internals_if_fits, merge_leaves_if_fits, split_internal, split_leaf,
+    BTreeHandle, IndexBound, IndexEntry, IndexEntryKey, IndexError, IndexRange, IndexSpec,
+    InternalNode, InternalSeparator, LeafNode, MetaNode, compare_entry_keys, compare_key_to_entry,
+    decode_internal, decode_leaf, decode_meta, encode_internal, encode_leaf, encode_meta,
+    ensure_entry_fits, merge_internals_if_fits, merge_leaves_if_fits, split_internal, split_leaf,
 };
 use netbadb_types::{PageId, RowId, ScalarValue};
 
@@ -24,6 +24,22 @@ struct PathEntry {
     page_id: PageId,
     node: InternalNode,
     child_position: usize,
+}
+
+struct LeafChainState {
+    page_count: u64,
+    visited: HashSet<PageId>,
+    previous_leaf: Option<(PageId, IndexEntryKey)>,
+}
+
+impl LeafChainState {
+    fn new(page_count: u64) -> Self {
+        Self {
+            page_count,
+            visited: HashSet::new(),
+            previous_leaf: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -358,32 +374,11 @@ impl<'a> BTree<'a> {
         let meta = self.read_meta(handle)?;
         meta.spec.validate_key(key)?;
         let mut leaf_page = self.find_leaf_for_key(&meta, key)?;
-        let page_count = self.storage.buffer().page_count();
-        let mut visited = HashSet::new();
+        let mut chain = LeafChainState::new(self.storage.buffer().page_count());
         let mut rows = Vec::new();
-        let mut previous_leaf = None;
 
         loop {
-            if !visited.insert(leaf_page) || visited.len() as u64 > page_count {
-                return Err(IndexError::LeafChainCycle { page_id: leaf_page }.into());
-            }
-            let leaf = self.read_leaf(leaf_page, &meta.spec)?;
-            if leaf.entries.is_empty() && (meta.height > 1 || leaf.next_leaf.is_some()) {
-                return Err(IndexError::EmptyLeaf { page_id: leaf_page }.into());
-            }
-            if let Some((previous_page, previous_last)) = &previous_leaf {
-                let first = leaf
-                    .entries
-                    .first()
-                    .ok_or(IndexError::EmptyLeaf { page_id: leaf_page })?;
-                if compare_entry_keys(previous_last, first) != Ordering::Less {
-                    return Err(IndexError::LeafChainOrder {
-                        left_page: *previous_page,
-                        right_page: leaf_page,
-                    }
-                    .into());
-                }
-            }
+            let leaf = self.read_leaf_in_chain(leaf_page, &meta, &mut chain)?;
             let start = leaf
                 .entries
                 .partition_point(|entry| compare_key_to_entry(key, entry) == Ordering::Greater);
@@ -408,18 +403,61 @@ impl<'a> BTree<'a> {
             match (should_follow, leaf.next_leaf) {
                 (true, Some(next)) => {
                     self.validate_child(next)?;
-                    let last = leaf
-                        .entries
-                        .last()
-                        .cloned()
-                        .ok_or(IndexError::EmptyLeaf { page_id: leaf_page })?;
-                    previous_leaf = Some((leaf_page, last));
                     leaf_page = next;
                 }
                 _ => break,
             }
         }
         Ok(rows)
+    }
+
+    /// Returns RowIds in persistent `(key, RowId)` order for every key inside
+    /// `range`. This read-only traversal does not validate heap liveness.
+    pub fn lookup_range(
+        &self,
+        handle: BTreeHandle,
+        range: &IndexRange,
+    ) -> Result<Vec<RowId>, StorageError> {
+        let meta = self.read_meta(handle)?;
+        range.validate(&meta.spec)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut leaf_page = match &range.lower {
+            IndexBound::Unbounded => self.find_leftmost_leaf(&meta)?,
+            IndexBound::Included(key) | IndexBound::Excluded(key) => {
+                self.find_leaf_for_key(&meta, key)?
+            }
+        };
+        let mut chain = LeafChainState::new(self.storage.buffer().page_count());
+        let mut rows = Vec::new();
+
+        loop {
+            let leaf = self.read_leaf_in_chain(leaf_page, &meta, &mut chain)?;
+            let start = leaf.entries.partition_point(|entry| match &range.lower {
+                IndexBound::Unbounded => false,
+                IndexBound::Included(key) => compare_key_to_entry(key, entry) == Ordering::Greater,
+                IndexBound::Excluded(key) => compare_key_to_entry(key, entry) != Ordering::Less,
+            });
+            for entry in &leaf.entries[start..] {
+                let past_upper = match &range.upper {
+                    IndexBound::Unbounded => false,
+                    IndexBound::Included(key) => compare_key_to_entry(key, entry) == Ordering::Less,
+                    IndexBound::Excluded(key) => {
+                        compare_key_to_entry(key, entry) != Ordering::Greater
+                    }
+                };
+                if past_upper {
+                    return Ok(rows);
+                }
+                rows.push(entry.row_id);
+            }
+            let Some(next) = leaf.next_leaf else {
+                return Ok(rows);
+            };
+            self.validate_child(next)?;
+            leaf_page = next;
+        }
     }
 
     /// Reports whether one complete `(key, RowId)` leaf identity exists.
@@ -541,6 +579,52 @@ impl<'a> BTree<'a> {
             self.validate_child(page_id)?;
         }
         Err(IndexError::InvalidHeight(meta.height).into())
+    }
+
+    fn find_leftmost_leaf(&self, meta: &MetaNode) -> Result<PageId, StorageError> {
+        let mut page_id = meta.root_page;
+        for level in 1..=meta.height {
+            if level == meta.height {
+                self.read_leaf(page_id, &meta.spec)?;
+                return Ok(page_id);
+            }
+            let node = self.read_internal(page_id, &meta.spec)?;
+            page_id = node.first_child;
+            self.validate_child(page_id)?;
+        }
+        Err(IndexError::InvalidHeight(meta.height).into())
+    }
+
+    fn read_leaf_in_chain(
+        &self,
+        page_id: PageId,
+        meta: &MetaNode,
+        chain: &mut LeafChainState,
+    ) -> Result<LeafNode, StorageError> {
+        if !chain.visited.insert(page_id) || chain.visited.len() as u64 > chain.page_count {
+            return Err(IndexError::LeafChainCycle { page_id }.into());
+        }
+        let leaf = self.read_leaf(page_id, &meta.spec)?;
+        if leaf.entries.is_empty() && (meta.height > 1 || leaf.next_leaf.is_some()) {
+            return Err(IndexError::EmptyLeaf { page_id }.into());
+        }
+        if let Some((previous_page, previous_last)) = &chain.previous_leaf {
+            let first = leaf
+                .entries
+                .first()
+                .ok_or(IndexError::EmptyLeaf { page_id })?;
+            if compare_entry_keys(previous_last, first) != Ordering::Less {
+                return Err(IndexError::LeafChainOrder {
+                    left_page: *previous_page,
+                    right_page: page_id,
+                }
+                .into());
+            }
+        }
+        if let Some(last) = leaf.entries.last() {
+            chain.previous_leaf = Some((page_id, last.clone()));
+        }
+        Ok(leaf)
     }
 
     fn validate_child(&self, page_id: PageId) -> Result<(), StorageError> {
@@ -796,7 +880,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use netbadb_index::{
-        BTreeHandle, IndexEntry, IndexError, IndexSpec, LeafNode, encode_internal, encode_leaf,
+        BTreeHandle, IndexBound, IndexEntry, IndexError, IndexRange, IndexSpec, LeafNode,
+        encode_internal, encode_leaf,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{
@@ -848,6 +933,10 @@ mod tests {
             data_type: SemanticType::physical(PhysicalType::Text),
             nullable: false,
         }
+    }
+
+    fn range(lower: IndexBound, upper: IndexBound) -> IndexRange {
+        IndexRange { lower, upper }
     }
 
     fn split_key(ordinal: usize) -> ScalarValue {
@@ -914,6 +1003,14 @@ mod tests {
         }
         let meta = storage.btree().read_meta(handle).expect("read meta");
         assert!(meta.height >= 3, "expected an internal split");
+        let all_rows = expected.values().flatten().copied().collect::<Vec<_>>();
+        assert_eq!(
+            storage
+                .btree()
+                .lookup_range(handle, &range(IndexBound::Unbounded, IndexBound::Unbounded),)
+                .expect("arbitrary-height range"),
+            all_rows
+        );
         for (key, rows) in &expected {
             assert_eq!(
                 storage
@@ -931,6 +1028,13 @@ mod tests {
         assert_eq!(
             reopened.btree().spec(handle).expect("persisted spec"),
             text_spec()
+        );
+        assert_eq!(
+            reopened
+                .btree()
+                .lookup_range(handle, &range(IndexBound::Unbounded, IndexBound::Unbounded),)
+                .expect("arbitrary-height range after reopen"),
+            all_rows
         );
         for (key, rows) in &expected {
             assert_eq!(
@@ -1549,6 +1653,140 @@ mod tests {
     }
 
     #[test]
+    fn range_lookup_preserves_endpoint_semantics_and_reopens() {
+        let path = path("range-endpoints");
+        cleanup(&path);
+        let spec = IndexSpec {
+            data_type: SemanticType::physical(PhysicalType::UInt64),
+            nullable: true,
+        };
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let handle = storage.btree().create(spec).expect("create tree");
+        let values = [
+            ScalarValue::Null,
+            ScalarValue::UInt64(1),
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(3),
+        ];
+        for (ordinal, value) in values.iter().enumerate() {
+            storage
+                .btree()
+                .insert(handle, value.clone(), row_id(ordinal as u64 + 1))
+                .expect("insert key");
+        }
+        let cases = [
+            (
+                range(
+                    IndexBound::Included(ScalarValue::UInt64(1)),
+                    IndexBound::Included(ScalarValue::UInt64(3)),
+                ),
+                vec![row_id(2), row_id(3), row_id(4)],
+            ),
+            (
+                range(
+                    IndexBound::Included(ScalarValue::UInt64(1)),
+                    IndexBound::Excluded(ScalarValue::UInt64(3)),
+                ),
+                vec![row_id(2), row_id(3)],
+            ),
+            (
+                range(
+                    IndexBound::Excluded(ScalarValue::UInt64(1)),
+                    IndexBound::Included(ScalarValue::UInt64(3)),
+                ),
+                vec![row_id(3), row_id(4)],
+            ),
+            (
+                range(
+                    IndexBound::Excluded(ScalarValue::UInt64(1)),
+                    IndexBound::Excluded(ScalarValue::UInt64(3)),
+                ),
+                vec![row_id(3)],
+            ),
+            (
+                range(
+                    IndexBound::Excluded(ScalarValue::UInt64(3)),
+                    IndexBound::Included(ScalarValue::UInt64(1)),
+                ),
+                vec![],
+            ),
+            (
+                range(IndexBound::Unbounded, IndexBound::Unbounded),
+                vec![row_id(1), row_id(2), row_id(3), row_id(4)],
+            ),
+        ];
+        for (range, expected) in &cases {
+            assert_eq!(
+                storage
+                    .btree()
+                    .lookup_range(handle, range)
+                    .expect("range lookup"),
+                *expected
+            );
+        }
+        assert!(matches!(
+            storage.btree().lookup_range(
+                handle,
+                &range(
+                    IndexBound::Included(ScalarValue::Int64(1)),
+                    IndexBound::Unbounded,
+                )
+            ),
+            Err(StorageError::Index(IndexError::TypeMismatch { .. }))
+        ));
+        storage.close().expect("close heap");
+
+        let mut storage = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert_eq!(
+            storage
+                .btree()
+                .lookup_range(handle, &cases[1].0)
+                .expect("lookup after reopen"),
+            cases[1].1
+        );
+        storage.close().expect("close reopened heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn range_lookup_returns_duplicates_spanning_leaf_pages() {
+        let path = path("range-duplicates");
+        cleanup(&path);
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, table(), 1).expect("create heap");
+        let handle = storage
+            .btree()
+            .create(IndexSpec {
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            })
+            .expect("create tree");
+        let expected = (1..=500_u64).map(row_id).collect::<Vec<_>>();
+        for row in &expected {
+            storage
+                .btree()
+                .insert(handle, ScalarValue::UInt64(42), *row)
+                .expect("insert duplicate");
+        }
+        assert!(storage.btree().height(handle).expect("height") > 1);
+        assert_eq!(
+            storage
+                .btree()
+                .lookup_range(
+                    handle,
+                    &range(
+                        IndexBound::Included(ScalarValue::UInt64(42)),
+                        IndexBound::Included(ScalarValue::UInt64(42)),
+                    ),
+                )
+                .expect("duplicate range"),
+            expected
+        );
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
     fn create_partial_log_failure_requires_rollback_and_restores_page_count() {
         let path = path("create-partial-log-failure");
         cleanup(&path);
@@ -1873,6 +2111,91 @@ mod tests {
                         left_page: actual_left,
                         right_page: actual_right,
                     }) if actual_left == left_page && actual_right == right_page
+                ));
+            }
+            let range_error = storage
+                .btree()
+                .lookup_range(
+                    handle,
+                    &range(
+                        IndexBound::Included(left_last.key.clone()),
+                        IndexBound::Unbounded,
+                    ),
+                )
+                .expect_err("corrupt range leaf chain must fail");
+            if corruption == "empty" {
+                assert!(matches!(
+                    range_error,
+                    StorageError::Index(IndexError::EmptyLeaf { page_id })
+                        if page_id == right_page
+                ));
+            } else {
+                assert!(matches!(
+                    range_error,
+                    StorageError::Index(IndexError::LeafChainOrder {
+                        left_page: actual_left,
+                        right_page: actual_right,
+                    }) if actual_left == left_page && actual_right == right_page
+                ));
+            }
+            storage.simulate_crash();
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn range_lookup_rejects_cycle_and_invalid_next_leaf() {
+        for corruption in ["cycle", "invalid-child"] {
+            let case = format!("range-{corruption}");
+            let (path, handle, trigger) = prepare_split_baseline(&case);
+            let mut storage =
+                HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("open tree");
+            storage
+                .btree()
+                .insert(handle, split_key(trigger), row_id(trigger as u64))
+                .expect("split root leaf");
+            let (meta, left_page, mut left) = {
+                let tree = storage.btree();
+                let meta = tree.read_meta(handle).expect("read metadata");
+                let root = tree
+                    .read_internal(meta.root_page, &meta.spec)
+                    .expect("read root");
+                let left_page = root.first_child;
+                let left = tree
+                    .read_leaf(left_page, &meta.spec)
+                    .expect("read left leaf");
+                (meta, left_page, left)
+            };
+            let invalid = PageId(storage.buffer().page_count() + 10);
+            left.next_leaf = Some(if corruption == "cycle" {
+                left_page
+            } else {
+                invalid
+            });
+            let payload = encode_leaf(&meta.spec, &left).expect("encode corrupt leaf");
+            {
+                let mut page = storage
+                    .buffer()
+                    .write_page(left_page)
+                    .expect("write corrupt leaf");
+                page.page_mut()
+                    .replace_single_payload(PageType::BTreeLeaf, &payload)
+                    .expect("replace leaf payload");
+            }
+            let error = storage
+                .btree()
+                .lookup_range(handle, &range(IndexBound::Unbounded, IndexBound::Unbounded))
+                .expect_err("corrupt range chain must fail");
+            if corruption == "cycle" {
+                assert!(matches!(
+                    error,
+                    StorageError::Index(IndexError::LeafChainCycle { page_id })
+                        if page_id == left_page
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    StorageError::Index(IndexError::InvalidChild(page_id)) if page_id == invalid
                 ));
             }
             storage.simulate_crash();

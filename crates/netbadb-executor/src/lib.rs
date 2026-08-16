@@ -253,6 +253,29 @@ fn execute_rows(
                 rows,
             })
         }
+        PhysicalPlan::RangeIndexScan {
+            table_id,
+            columns,
+            handle,
+            range,
+            ..
+        } => {
+            let storage = storage_for_table(storages, *table_id)?;
+            let row_ids = storage.btree().lookup_range(*handle, range)?;
+            let rows = row_ids
+                .into_iter()
+                .map(|row_id| {
+                    Ok(ExecutionRow {
+                        row_id: Some(row_id),
+                        values: storage.read_row(row_id)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            Ok(ExecutionRows {
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
+                rows,
+            })
+        }
         PhysicalPlan::NestedLoopJoin {
             left,
             right,

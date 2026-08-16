@@ -182,6 +182,27 @@ fn statement_renderer_covers_seq_and_index_filter_plans() {
 }
 
 #[test]
+fn statement_renderer_covers_typed_range_index_scan() {
+    let id = column(0, 1, "items", 1, "id", PhysicalType::Int64);
+    let statement = query_statement(PlanNodeInspection::RangeIndexScan {
+        binding_id: RelationBindingId(0),
+        table_id: TableId(1),
+        table_name: "items".into(),
+        columns: vec![id.clone()],
+        index_column: id,
+        range: IndexRangeInspection {
+            lower: RangeBoundInspection::Included(ScalarValue::Int64(5_000)),
+            upper: RangeBoundInspection::Excluded(ScalarValue::Int64(5_100)),
+        },
+    });
+    assert!(render_statement(&statement).contains(concat!(
+        "RangeIndexScan table=items#1 binding=#0 ",
+        "columns=[items#0.id#1@table#1] index=id#1 ",
+        "lower=Included(INT64(5000)) upper=Excluded(INT64(5100))\n"
+    )));
+}
+
+#[test]
 fn statement_renderer_covers_join_aggregate_and_dml() {
     let employee = column(0, 1, "e", 1, "id", PhysicalType::Int64);
     let manager = column(1, 1, "m", 1, "id", PhysicalType::Int64);

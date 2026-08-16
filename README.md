@@ -214,7 +214,7 @@ The current code genuinely supports:
   handles and never drives execution;
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
-  versioned Inspection JSON v1 output;
+  current versioned Inspection JSON v2 output (with v1 retained historically);
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
@@ -430,16 +430,18 @@ not validate referenced Heap rows or enforce uniqueness, and SQL index DDL
 remains deferred. Core maps registered definitions and their cached optimizer
 snapshots into an ordered, read-only planner context. Eligible
 `column = non-NULL literal`, commuted equality, and nullable `column IS NULL`
-predicates use exact point `IndexScan`;
+predicates use exact point `IndexScan`; analyzed two-sided Int64/UInt64 bounds
+can use a costed `RangeIndexScan`;
 the executor then fetches complete Heap rows by generation-safe RowId. The
 original SQL Filter remains above every IndexScan. Without statistics, the
 first eligible registered index still wins. With statistics, SeqScan costs
 `managed_page_count`, point IndexScan costs
 `1 + tree_height + estimated_matches`, equality uses average non-NULL
-frequency, and `IS NULL` uses `null_count`. SeqScan wins an equal cost; equal
-index costs preserve registration order. Stale snapshots can change only plan
-choice and performance, never query semantics. Range access, index joins, and
-index-only scans remain deferred.
+frequency, `IS NULL` uses `null_count`, and bounded integer range estimates use
+the exact discrete bound count times average duplicates. SeqScan wins an equal
+cost; equal index costs preserve registration order. Stale snapshots can
+change only plan choice and performance, never query semantics. One-sided and
+Text/Bool range costing, index joins, and index-only scans remain deferred.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -607,13 +609,16 @@ The implementation sequence is intentionally vertical:
 26. Synchronous Rust remote client and SDK feature stabilization (Phase 6C) —
     complete.
 27. Structured inspection and offline local CLI (Phases 6D1 and 6D2) — stable
-    DTOs, deterministic text, manifest-v4 bootstrap, and Inspection JSON v1.
+    DTOs, deterministic text, manifest-v4 bootstrap, and historical Inspection
+    JSON v1. Complete; the current CLI contract is v2 after Phase 7B.
     Complete.
 28. Shared SQL diagnostics and diagnostics-only LSP (Phase 6E1) — complete.
 29. MCP and additional tooling adapters (Phase 6E2) — future work.
-30. Advanced optimization — histograms, richer cost models, and rewrite rules.
+30. Costed bounded Int64/UInt64 RangeIndexScan (Phase 7B) — complete.
+31. Further advanced optimization — select from post-7B benchmark evidence.
 
-Isolation/MVCC and range/index-join planning remain roadmap items.
+Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
+roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

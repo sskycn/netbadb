@@ -1,0 +1,42 @@
+{
+  "format": "netbadb-inspection",
+  "version": 2,
+  "kind": "catalog",
+  "catalog": {
+    "tables": [
+      {
+        "table_id": 1,
+        "name": "users",
+        "fingerprint": "abababababababababababababababababababababababababababababababab",
+        "columns": [
+          {
+            "column_id": 1,
+            "name": "id",
+            "data_type": {
+              "physical": "uint64",
+              "semantic_name": "UserId"
+            },
+            "nullable": false,
+            "primary_key": true
+          }
+        ],
+        "indexes": [
+          {
+            "column_id": 1,
+            "column_name": "id",
+            "registration_order": 0,
+            "statistics": {
+              "distinct_non_null_keys": 8,
+              "null_count": 0,
+              "tree_height": 1
+            }
+          }
+        ],
+        "statistics": {
+          "row_count": 8,
+          "managed_page_count": 2
+        }
+      }
+    ]
+  }
+}

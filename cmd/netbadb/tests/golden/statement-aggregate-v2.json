@@ -1,0 +1,116 @@
+{
+  "format": "netbadb-inspection",
+  "version": 2,
+  "kind": "statement",
+  "statement": {
+    "kind": "query",
+    "access": {
+      "read_tables": [
+        1
+      ],
+      "write_tables": []
+    },
+    "result": {
+      "kind": "query",
+      "columns": [
+        {
+          "name": "team_id",
+          "data_type": {
+            "physical": "uint64",
+            "semantic_name": null
+          },
+          "nullable": false,
+          "source": {
+            "binding_id": 0,
+            "table_id": 1,
+            "column_id": 2,
+            "relation_name": "users",
+            "name": "team_id"
+          }
+        },
+        {
+          "name": "count(*)",
+          "data_type": {
+            "physical": "uint64",
+            "semantic_name": null
+          },
+          "nullable": false,
+          "source": null
+        }
+      ]
+    },
+    "plan": {
+      "kind": "query",
+      "root": {
+        "operator": "aggregate",
+        "group_keys": [
+          {
+            "binding_id": 0,
+            "table_id": 1,
+            "column_id": 2,
+            "relation_name": "users",
+            "name": "team_id",
+            "data_type": {
+              "physical": "uint64",
+              "semantic_name": null
+            },
+            "nullable": false
+          }
+        ],
+        "outputs": [
+          {
+            "kind": "group_key",
+            "column": {
+              "binding_id": 0,
+              "table_id": 1,
+              "column_id": 2,
+              "relation_name": "users",
+              "name": "team_id",
+              "data_type": {
+                "physical": "uint64",
+                "semantic_name": null
+              },
+              "nullable": false
+            }
+          },
+          {
+            "kind": "aggregate",
+            "function": "count",
+            "input": {
+              "kind": "all"
+            },
+            "output": {
+              "name": "count(*)",
+              "data_type": {
+                "physical": "uint64",
+                "semantic_name": null
+              },
+              "nullable": false,
+              "source": null
+            }
+          }
+        ],
+        "input": {
+          "operator": "seq_scan",
+          "binding_id": 0,
+          "table_id": 1,
+          "table_name": "users",
+          "columns": [
+            {
+              "binding_id": 0,
+              "table_id": 1,
+              "column_id": 2,
+              "relation_name": "users",
+              "name": "team_id",
+              "data_type": {
+                "physical": "uint64",
+                "semantic_name": null
+              },
+              "nullable": false
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -59,7 +59,7 @@ Canonical Schema + source SQL               netbadb-inspect DTOs
         ↓                                           ↓
 netbadb-compiler                             embedded SDK / offline CLI
         ↓                                           ↓
-ToolingDiagnostic                           text / Inspection JSON v1
+ToolingDiagnostic                           text / Inspection JSON v2
         ↓
 netbadb-lsp UTF-16 adapter
 ```
@@ -120,7 +120,7 @@ netbadb-sdk embedded Database
           ↓
 netbadb-inspect DTOs
        ↙       ↘
-human text   Inspection JSON v1
+human text   Inspection JSON v2
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
@@ -667,7 +667,7 @@ pool, WAL, and prevLSN chain. Pure key-size and exact old-entry preflight run
 while holding the single-writer lease before the first physical mutation; any
 later failure marks the transaction `RollbackRequired`.
 
-## ANALYZE snapshots and deterministic point IndexScan
+## ANALYZE snapshots and costed index access
 
 Logical plans remain storage-independent: query meaning is still represented
 as `Filter(Scan)`, never as a logical index operator. Core walks table storage
@@ -677,12 +677,13 @@ table/index planning context. Entries contain stable IDs, handles, and optional
 pure `netbadb-index` domain crate, not on `netbadb-storage`, and receives no
 page, WAL, buffer, or catalog representation.
 
-For a Filter directly above a Scan, Phase 4E recognizes only `indexed_column = non-NULL
-literal`, its commuted form, and `IS NULL` on a nullable indexed column. It may
-search left-to-right through AND because either side is a necessary condition;
-it never descends through OR or NOT. Equality with NULL, IS NOT NULL, ranges,
-column-to-column comparisons, joins, index intersection/union, and full scans
-are not point access paths.
+For a Filter directly above a Scan, point access recognizes
+`indexed_column = non-NULL literal`, its commuted form, and nullable-column
+`IS NULL`. Bounded range access recognizes and tightens `>`, `>=`, `<`, and
+`<=` literal comparisons through nested AND, including reversed operands, for
+Int64/UInt64 indexes only. It never derives access through OR or NOT. Equality
+with NULL, IS NOT NULL, one-sided, Text/Bool, and column-to-column ranges,
+joins, and index intersection/union are not range access paths.
 
 `HeapStorage::analyze` owns one transaction and writer lease, scans the Heap
 once for all registered indexes, reads each BTree's actual height, rewrites
@@ -694,15 +695,18 @@ tree height. DML neither maintains nor invalidates these values. They are
 optimizer snapshots and may become stale.
 
 Without table statistics, or when all eligible indexes lack statistics, the
-first eligible registered path wins exactly as in Phase 4E. With a table
-snapshot, analyzed eligible candidates exclude unknown candidates and are
-compared with SeqScan using integer `u128` page-visit estimates:
+first eligible point path wins exactly as in Phase 4E; ranges require costable
+statistics. With a table snapshot, analyzed eligible point and range candidates
+are compared with SeqScan using integer `u128` page-visit estimates:
 
 ```text
 SeqScan             = managed_page_count
 Point IndexScan     = 1 + tree_height + estimated_matches
 equality matches    = ceil((row_count - null_count) / distinct_non_null_keys)
 IS NULL matches     = null_count
+RangeIndexScan      = 1 + tree_height + estimated_range_matches
+possible keys       = exact discrete count from the two integer bounds
+range matches       = min(non_null_rows, possible_keys * average_duplicates)
 ```
 
 IndexScan must be strictly cheaper; a tie selects SeqScan. Equal index costs
@@ -714,19 +718,25 @@ The physical shape always retains the complete predicate:
 
 ```text
 PhysicalPlan::Filter(original predicate)
-    -> PhysicalPlan::IndexScan(registered handle, exact key)
+    -> costed access selection
+         -> PhysicalPlan::SeqScan
+         -> PhysicalPlan::IndexScan(registered handle, exact key)
+         -> PhysicalPlan::RangeIndexScan(registered handle, typed bounds)
 ```
 
-IndexScan performs `BTree::lookup`, materializes the returned RowIds, and then
-loads every complete Heap row through `HeapStorage::read_row`. A stale,
+Point IndexScan performs `BTree::lookup`; RangeIndexScan locates the lower leaf
+and traverses ordered `next_leaf` links until the upper endpoint. Both
+materialize returned RowIds and then load every complete Heap row through
+`HeapStorage::read_row`. A stale,
 deleted, missing, or corrupt locator is an error; execution never hides it by
 falling back to SeqScan. UPDATE and DELETE therefore finish index traversal and
 target materialization before maintaining the same index, avoiding iterator
 invalidation or revisiting newly inserted keys. Because the complete Filter
 remains, stale statistics can affect performance and plan shape but not query
-semantics. Index-only scans, range scans and costing, histograms/MCVs, index
-intersection/union, index nested-loop joins, join ordering, and sort
-elimination remain future work.
+semantics. The range estimate needs no min/max, histogram, or MCV and changes
+neither BTree payload v1 nor IndexCatalog v2. Index-only scans, one-sided and
+Text/Bool range costing, histograms/MCVs, index intersection/union, index
+nested-loop joins, join ordering, and sort elimination remain future work.
 
 ## Transaction and WAL boundary
 

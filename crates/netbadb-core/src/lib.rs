@@ -633,7 +633,7 @@ mod tests {
             PhysicalPlan::NestedLoopJoin { left, right, .. } => {
                 planned_index(left).or_else(|| planned_index(right))
             }
-            PhysicalPlan::SeqScan { .. } => None,
+            PhysicalPlan::SeqScan { .. } | PhysicalPlan::RangeIndexScan { .. } => None,
         }
     }
 
@@ -666,7 +666,24 @@ mod tests {
             | PlanNodeInspection::Project { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_index(input),
-            PlanNodeInspection::SeqScan { .. } => None,
+            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::RangeIndexScan { .. } => None,
+        }
+    }
+
+    fn inspected_range(
+        plan: &PlanNodeInspection,
+    ) -> Option<&netbadb_inspect::IndexRangeInspection> {
+        match plan {
+            PlanNodeInspection::RangeIndexScan { range, .. } => Some(range),
+            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+                inspected_range(left).or_else(|| inspected_range(right))
+            }
+            PlanNodeInspection::Filter { input, .. }
+            | PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => inspected_range(input),
+            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::IndexScan { .. } => None,
         }
     }
 
@@ -687,6 +704,11 @@ mod tests {
                 ..
             }
             | PlanNodeInspection::IndexScan {
+                table_id,
+                binding_id,
+                ..
+            }
+            | PlanNodeInspection::RangeIndexScan {
                 table_id,
                 binding_id,
                 ..
@@ -713,7 +735,9 @@ mod tests {
             | PlanNodeInspection::Project { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_filter(input),
-            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::IndexScan { .. } => None,
+            PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::IndexScan { .. }
+            | PlanNodeInspection::RangeIndexScan { .. } => None,
         }
     }
 
@@ -1313,6 +1337,125 @@ mod tests {
             .is_none()
         );
         reopened.close().expect("close reopened database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn bounded_range_scan_executes_select_and_materialized_dml_with_rollback() {
+        let path =
+            std::env::temp_dir().join(format!("netbadb-core-range-index-{}", std::process::id()));
+        let schema = indexed_table();
+        let mut database = Database::create(&path, schema.clone()).expect("create database");
+        for id in 0..200_i64 {
+            database
+                .insert(&[
+                    ScalarValue::Int64(id),
+                    ScalarValue::Int64(id % 4),
+                    ScalarValue::Text(format!("member-{id:03}-{}", "x".repeat(500))),
+                    ScalarValue::Bool(id % 2 == 0),
+                ])
+                .expect("insert range row");
+        }
+        database
+            .create_index(TableId(9), ColumnId(2))
+            .expect("create team index");
+        database
+            .create_index(TableId(9), ColumnId(1))
+            .expect("create id index");
+
+        let range_sql = "SELECT id FROM members WHERE 100 <= id AND 110 > id AND active = true";
+        assert!(
+            inspected_range(inspected_root(
+                &database
+                    .inspect_statement(range_sql)
+                    .expect("inspect no-statistics range")
+                    .plan
+            ))
+            .is_none()
+        );
+        assert!(
+            inspected_index(inspected_root(
+                &database
+                    .inspect_statement("SELECT id FROM members WHERE id = 105")
+                    .expect("inspect fallback point")
+                    .plan
+            ))
+            .is_some()
+        );
+
+        database.analyze(TableId(9)).expect("analyze range table");
+        let inspected = database
+            .inspect_statement(range_sql)
+            .expect("inspect costed range");
+        let range = inspected_range(inspected_root(&inspected.plan)).expect("range scan");
+        assert!(matches!(
+            range.lower,
+            netbadb_inspect::RangeBoundInspection::Included(ScalarValue::Int64(100))
+        ));
+        assert!(matches!(
+            range.upper,
+            netbadb_inspect::RangeBoundInspection::Excluded(ScalarValue::Int64(110))
+        ));
+        assert_eq!(
+            database.query(range_sql).expect("execute range query").rows,
+            [100_i64, 102, 104, 106, 108].map(|id| vec![ScalarValue::Int64(id)])
+        );
+
+        let wide = database
+            .inspect_statement("SELECT id FROM members WHERE id >= 50 AND id < 150")
+            .expect("inspect wide range");
+        assert!(inspected_range(inspected_root(&wide.plan)).is_none());
+
+        let mut transaction = database.begin_transaction().expect("begin range update");
+        assert_eq!(
+            affected(
+                database
+                    .execute_in(
+                        &mut transaction,
+                        "UPDATE members SET team_id = 999 WHERE id >= 100 AND id < 110",
+                    )
+                    .expect("execute range update")
+            ),
+            10
+        );
+        transaction.rollback().expect("rollback range update");
+        assert!(
+            database
+                .query("SELECT id FROM members WHERE team_id = 999")
+                .expect("verify rollback")
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            affected(
+                database
+                    .execute("DELETE FROM members WHERE id >= 190 AND id < 200")
+                    .expect("execute range delete")
+            ),
+            10
+        );
+        assert!(
+            database
+                .query("SELECT id FROM members WHERE id >= 190 AND id < 200")
+                .expect("verify range delete")
+                .rows
+                .is_empty()
+        );
+
+        database.close().expect("close range database");
+        let mut reopened = Database::open(&path, schema).expect("reopen range database");
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM members WHERE id >= 100 AND id < 110")
+                .expect("query after reopen")
+                .rows
+                .len(),
+            10
+        );
+        reopened.close().expect("close reopened range database");
         let wal = netbadb_storage::wal_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));

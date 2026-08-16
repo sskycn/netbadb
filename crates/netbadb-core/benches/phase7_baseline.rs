@@ -213,6 +213,7 @@ impl NullDistribution {
 enum Operator {
     SeqScan,
     IndexScan,
+    RangeIndexScan,
     NestedLoopJoin,
     Filter,
     Sort,
@@ -226,6 +227,7 @@ impl Operator {
         match self {
             Self::SeqScan => "SeqScan",
             Self::IndexScan => "IndexScan",
+            Self::RangeIndexScan => "RangeIndexScan",
             Self::NestedLoopJoin => "NestedLoopJoin",
             Self::Filter => "Filter",
             Self::Sort => "Sort",
@@ -266,7 +268,7 @@ fn run_point_and_shape_scenarios(
         NullDistribution::Low,
         &point_sql,
         &[Operator::Filter, Operator::SeqScan],
-        &[Operator::IndexScan],
+        &[Operator::IndexScan, Operator::RangeIndexScan],
         Observation {
             rows: 1,
             checksum: u128::from(middle),
@@ -300,7 +302,7 @@ fn run_point_and_shape_scenarios(
         NullDistribution::Low,
         "SELECT id FROM items WHERE team_id = 0",
         &[Operator::Filter, Operator::SeqScan],
-        &[Operator::IndexScan],
+        &[Operator::IndexScan, Operator::RangeIndexScan],
         team_expected,
         settings,
         ids_observation,
@@ -364,8 +366,8 @@ fn run_point_and_shape_scenarios(
         &[ID_COLUMN_ID],
         NullDistribution::Low,
         &format!("SELECT id FROM items WHERE id >= {one_percent_start} AND id < {one_percent_end}"),
-        &[Operator::Filter, Operator::SeqScan],
-        &[Operator::IndexScan],
+        &[Operator::Filter, Operator::RangeIndexScan],
+        &[Operator::SeqScan, Operator::IndexScan],
         expected_range_ids(one_percent_start, one_percent_end),
         settings,
         ids_observation,
@@ -380,8 +382,21 @@ fn run_point_and_shape_scenarios(
         NullDistribution::Low,
         &format!("SELECT id FROM items WHERE id >= {half_start} AND id < {half_end}"),
         &[Operator::Filter, Operator::SeqScan],
-        &[Operator::IndexScan],
+        &[Operator::IndexScan, Operator::RangeIndexScan],
         expected_range_ids(half_start, half_end),
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_items_query(
+        "range_one_sided",
+        rows,
+        &[ID_COLUMN_ID],
+        NullDistribution::Low,
+        &format!("SELECT id FROM items WHERE id >= {one_percent_start}"),
+        &[Operator::Filter, Operator::SeqScan],
+        &[Operator::IndexScan, Operator::RangeIndexScan],
+        expected_range_ids(one_percent_start, rows),
         settings,
         ids_observation,
         measurements,
@@ -936,7 +951,9 @@ fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
             | PlanNodeInspection::Project { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => contains_operator(input, target),
-            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::IndexScan { .. } => false,
+            PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::IndexScan { .. }
+            | PlanNodeInspection::RangeIndexScan { .. } => false,
         }
 }
 
@@ -944,6 +961,7 @@ const fn operator(plan: &PlanNodeInspection) -> Operator {
     match plan {
         PlanNodeInspection::SeqScan { .. } => Operator::SeqScan,
         PlanNodeInspection::IndexScan { .. } => Operator::IndexScan,
+        PlanNodeInspection::RangeIndexScan { .. } => Operator::RangeIndexScan,
         PlanNodeInspection::NestedLoopJoin { .. } => Operator::NestedLoopJoin,
         PlanNodeInspection::Filter { .. } => Operator::Filter,
         PlanNodeInspection::Sort { .. } => Operator::Sort,
@@ -971,7 +989,9 @@ fn collect_operators(plan: &PlanNodeInspection, operators: &mut Vec<&'static str
         | PlanNodeInspection::Project { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => collect_operators(input, operators),
-        PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::IndexScan { .. } => {}
+        PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. } => {}
     }
 }
 
@@ -1177,7 +1197,7 @@ fn print_report(
     settings: ProfileSettings,
     measurements: &[Measurement],
 ) -> BenchResult<()> {
-    println!("NetbaDB Phase 7A reproducible performance baseline");
+    println!("NetbaDB Phase 7 reproducible performance baseline");
     println!("netbadb_version={}", env!("CARGO_PKG_VERSION"));
     println!("profile={}", profile.name());
     println!(
@@ -1207,8 +1227,9 @@ fn print_report(
     }
     println!();
     println!("Known current planner limitations represented by this baseline:");
-    println!("- equality/IS NULL point index access only;");
-    println!("- no range IndexScan;");
+    println!("- costed bounded Int64/UInt64 RangeIndexScan;");
+    println!("- one-sided and Text/Bool ranges remain SeqScan;");
+    println!("- no index union/intersection;");
     println!("- NestedLoopJoin only;");
     println!("- explicit in-memory Sort;");
     println!("- in-memory Aggregate;");

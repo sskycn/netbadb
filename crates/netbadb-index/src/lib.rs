@@ -29,6 +29,21 @@ pub struct IndexSpec {
     pub nullable: bool,
 }
 
+/// One explicit endpoint of an ordered index lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexBound {
+    Unbounded,
+    Included(ScalarValue),
+    Excluded(ScalarValue),
+}
+
+/// Typed lower and upper endpoints for one ordered index lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRange {
+    pub lower: IndexBound,
+    pub upper: IndexBound,
+}
+
 /// Stable external identity of a tree's metadata page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BTreeHandle {
@@ -381,6 +396,42 @@ impl IndexSpec {
             });
         }
         Ok(())
+    }
+}
+
+impl IndexRange {
+    /// Validates both endpoints against the tree's physical key identity and
+    /// NULL policy. Logically empty ranges remain valid.
+    pub fn validate(&self, spec: &IndexSpec) -> Result<(), IndexError> {
+        for bound in [&self.lower, &self.upper] {
+            match bound {
+                IndexBound::Unbounded => {}
+                IndexBound::Included(value) | IndexBound::Excluded(value) => {
+                    spec.validate_key(value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reports whether the explicit endpoints contain no ordered key.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        let (lower_value, lower_included) = match &self.lower {
+            IndexBound::Unbounded => return false,
+            IndexBound::Included(value) => (value, true),
+            IndexBound::Excluded(value) => (value, false),
+        };
+        let (upper_value, upper_included) = match &self.upper {
+            IndexBound::Unbounded => return false,
+            IndexBound::Included(value) => (value, true),
+            IndexBound::Excluded(value) => (value, false),
+        };
+        match compare_values(lower_value, upper_value) {
+            Ordering::Greater => true,
+            Ordering::Equal => !(lower_included && upper_included),
+            Ordering::Less => false,
+        }
     }
 }
 
@@ -1398,6 +1449,44 @@ mod tests {
             data_type: SemanticType::physical(physical),
             nullable,
         }
+    }
+
+    #[test]
+    fn index_range_validates_typed_bounds_and_accepts_empty_ranges() {
+        let nullable = spec(PhysicalType::Int64, true);
+        let empty = IndexRange {
+            lower: IndexBound::Excluded(ScalarValue::Int64(10)),
+            upper: IndexBound::Included(ScalarValue::Int64(10)),
+        };
+        empty.validate(&nullable).expect("valid typed range");
+        assert!(empty.is_empty());
+        let singleton = IndexRange {
+            lower: IndexBound::Included(ScalarValue::Int64(10)),
+            upper: IndexBound::Included(ScalarValue::Int64(10)),
+        };
+        assert!(!singleton.is_empty());
+        assert!(
+            IndexRange {
+                lower: IndexBound::Included(ScalarValue::UInt64(10)),
+                upper: IndexBound::Unbounded,
+            }
+            .validate(&nullable)
+            .is_err()
+        );
+        IndexRange {
+            lower: IndexBound::Included(ScalarValue::Null),
+            upper: IndexBound::Excluded(ScalarValue::Int64(10)),
+        }
+        .validate(&nullable)
+        .expect("nullable NULL bound");
+        assert!(matches!(
+            IndexRange {
+                lower: IndexBound::Included(ScalarValue::Null),
+                upper: IndexBound::Unbounded,
+            }
+            .validate(&spec(PhysicalType::Int64, false)),
+            Err(IndexError::NullNotAllowed)
+        ));
     }
 
     fn entry(key: ScalarValue, page: u64, slot: u16) -> IndexEntry {

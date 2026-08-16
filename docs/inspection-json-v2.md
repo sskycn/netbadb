@@ -1,9 +1,6 @@
-# NetbaDB Inspection JSON v1
+# NetbaDB Inspection JSON v2
 
-> Historical contract: the current CLI emits Inspection JSON v2. This file
-> and the v1 goldens remain unchanged references for the former contract.
-
-Inspection JSON v1 was the explicit machine-readable contract emitted by the
+Inspection JSON v2 is the explicit machine-readable contract emitted by the
 offline `netbadb inspect ... --format json` CLI. It is not serde serialization
 of Rust planner or inspection enums. The CLI converts stable inspection DTOs
 into separate, exhaustively matched JSON view types; planner, storage, page,
@@ -16,9 +13,13 @@ There are no timestamps, hostnames, PIDs, addresses, or other run-specific
 values.
 
 Removing a field, changing its meaning, changing an enum tag, or changing a
-typed scalar shape requires a new inspection JSON version. Any future
+typed scalar shape requires a future inspection JSON version. Any future
 machine-visible structural change must first be evaluated for a version bump;
-v1 goldens must not be silently rewritten.
+v2 goldens must not be silently rewritten.
+
+Version 2 extends the v1 plan vocabulary with a typed bounded range-index
+operator. Existing v1 operator shapes are unchanged; consumers can distinguish
+the contracts using the envelope version.
 
 ## Envelopes
 
@@ -27,7 +28,7 @@ Catalog output:
 ```json
 {
   "format": "netbadb-inspection",
-  "version": 1,
+  "version": 2,
   "kind": "catalog",
   "catalog": { "tables": [] }
 }
@@ -38,7 +39,7 @@ Statement output:
 ```json
 {
   "format": "netbadb-inspection",
-  "version": 1,
+  "version": 2,
   "kind": "statement",
   "statement": {
     "kind": "query",
@@ -153,6 +154,8 @@ Every plan node uses an `operator` tag:
 
 - `seq_scan`: `binding_id`, `table_id`, `table_name`, `columns`
 - `index_scan`: scan fields plus `index_column` and typed `key`
+- `range_index_scan`: scan fields plus `index_column`, `lower_bound`, and
+  `upper_bound`
 - `nested_loop_join`: `kind`, `predicate`, `left`, `right`; join kind is
   `inner`
 - `filter`: `predicate`, `input`
@@ -163,6 +166,32 @@ Every plan node uses an `operator` tag:
 
 No index handle, page/root identity, row locator, or estimated/rejected cost is
 present. The node reports the operator selected by the real planner.
+
+Range bounds preserve endpoint semantics and scalar identity:
+
+```json
+{
+  "operator": "range_index_scan",
+  "binding_id": 0,
+  "table_id": 1,
+  "table_name": "items",
+  "columns": [],
+  "index_column": {},
+  "lower_bound": {
+    "kind": "included",
+    "value": { "kind": "int64", "value": 5000 }
+  },
+  "upper_bound": {
+    "kind": "excluded",
+    "value": { "kind": "int64", "value": 5100 }
+  }
+}
+```
+
+Each bound kind is `included`, `excluded`, or `unbounded`; an unbounded bound
+has no `value` field. The current planner emits this operator only for costed,
+two-sided Int64/UInt64 predicates, while the DTO deliberately represents all
+three endpoint forms.
 
 A sort key contains `column`, `direction`, and `null_order`. Direction is
 `asc` or `desc`; NULL order is `first` or `last`.
@@ -218,7 +247,7 @@ numbers, never through `f64` or strings.
 
 ## Operational boundary
 
-JSON errors are not part of v1. Any usage, manifest, open/recovery, compile,
+JSON errors are not part of v2. Any usage, manifest, open/recovery, compile,
 inspection, serialization, or close failure writes a text diagnostic to
 stderr, returns a nonzero status, and leaves stdout empty. Output is emitted
 only after successful database close.

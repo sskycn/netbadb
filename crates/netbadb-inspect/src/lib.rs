@@ -196,6 +196,14 @@ pub enum PlanNodeInspection {
         index_column: ColumnReferenceInspection,
         key: ScalarValue,
     },
+    RangeIndexScan {
+        binding_id: RelationBindingId,
+        table_id: TableId,
+        table_name: String,
+        columns: Vec<ColumnReferenceInspection>,
+        index_column: ColumnReferenceInspection,
+        range: IndexRangeInspection,
+    },
     NestedLoopJoin {
         kind: JoinKindInspection,
         predicate: ExpressionInspection,
@@ -223,6 +231,21 @@ pub enum PlanNodeInspection {
         limit: u64,
         input: Box<PlanNodeInspection>,
     },
+}
+
+/// Stable inspection representation of one ordered index range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRangeInspection {
+    pub lower: RangeBoundInspection,
+    pub upper: RangeBoundInspection,
+}
+
+/// Stable inspection representation of one range endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeBoundInspection {
+    Unbounded,
+    Included(ScalarValue),
+    Excluded(ScalarValue),
 }
 
 /// Stable join semantic represented by a physical join node.
@@ -524,6 +547,27 @@ impl Renderer {
                     scalar_text(key)
                 ),
             ),
+            PlanNodeInspection::RangeIndexScan {
+                binding_id,
+                table_id,
+                table_name,
+                columns,
+                index_column,
+                range,
+            } => self.line(
+                depth,
+                format_args!(
+                    "RangeIndexScan table={}#{} binding=#{} columns={} index={}#{} lower={} upper={}",
+                    escape_text(table_name),
+                    table_id.0,
+                    binding_id.0,
+                    columns_text(columns),
+                    escape_text(&index_column.name),
+                    index_column.column_id.0,
+                    range_bound_text(&range.lower),
+                    range_bound_text(&range.upper)
+                ),
+            ),
             PlanNodeInspection::NestedLoopJoin {
                 kind,
                 predicate,
@@ -745,6 +789,14 @@ fn scalar_text(value: &ScalarValue) -> String {
         ScalarValue::Int64(value) => format!("INT64({value})"),
         ScalarValue::UInt64(value) => format!("UINT64({value})"),
         ScalarValue::Text(value) => format!("TEXT(\"{}\")", escape_text(value)),
+    }
+}
+
+fn range_bound_text(bound: &RangeBoundInspection) -> String {
+    match bound {
+        RangeBoundInspection::Unbounded => "Unbounded".to_owned(),
+        RangeBoundInspection::Included(value) => format!("Included({})", scalar_text(value)),
+        RangeBoundInspection::Excluded(value) => format!("Excluded({})", scalar_text(value)),
     }
 }
 
