@@ -30,6 +30,7 @@ netbadb-client -> netbadb-protocol + netbadb-schema + netbadb-types
 netbadb-server -> netbadb-core + netbadb-protocol + netbadb-schema
                     + netbadb-types
 netbadbd -> netbadb-server
+netbadb CLI -> netbadb-sdk embedded + netbadb-server + serde + serde_json
 netbadb-sdk embedded -> netbadb-core + netbadb-inspect + netbadb-schema
                         + netbadb-types
 netbadb-sdk remote -> netbadb-client + netbadb-schema + netbadb-types
@@ -51,7 +52,9 @@ compiler / planner / storage internal state
                     ↓
              netbadb-inspect
                     ↓
-       embedded SDK / future CLI / LSP / MCP
+          embedded SDK / LSP / MCP
+                    ↓
+       offline CLI text / explicit JSON v1
 ```
 
 `netbadb-inspect` depends only on canonical schema and type domains. Its DTOs
@@ -67,6 +70,34 @@ Inspection DTOs are observation results and never feed back into planning or
 execution. The explicit text renderer is deterministic human-readable output,
 not SQL, Rust `Debug`, a wire contract, or a versioned JSON API. Statistics are
 last-`ANALYZE` snapshots and may be stale.
+
+The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
+
+```text
+deployment manifest v4
+          ↓
+netbadb-server ServerConfig bootstrap
+          ↓
+netbadb-sdk embedded Database
+          ↓
+netbadb-inspect DTOs
+       ↙       ↘
+human text   Inspection JSON v1
+```
+
+The CLI uses `ServerConfig` only to validate deployment configuration and
+obtain table bootstrap paths and canonical definitions. It never starts a TCP
+server, creates a session, or applies network-principal authorization to local
+filesystem access. JSON v1 is an explicit external CLI contract converted
+exhaustively from inspection DTOs; the DTOs themselves remain serde-free, and
+future LSP/MCP adapters consume them directly rather than spawning the CLI.
+
+Local inspection requires exclusive process ownership because persistent files
+have no cross-process lock. `Database::open_tables` performs normal recovery,
+so opening after a crash may redo or undo WAL state before inspection. Output
+is fully rendered and the database successfully closed before stdout is
+written; inspected SQL, including DML, is compiled and planned but never
+executed.
 
 ## Canonical Schema IR
 

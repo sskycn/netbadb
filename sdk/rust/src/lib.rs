@@ -9,7 +9,9 @@ pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,
     TypeSpec,
 };
-pub use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
+pub use netbadb_types::{
+    ColumnId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+};
 
 /// Stable embedded catalog and physical-plan inspection values and renderers.
 #[cfg(feature = "embedded")]

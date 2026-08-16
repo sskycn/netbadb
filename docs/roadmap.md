@@ -117,8 +117,9 @@ loss without Rust destructors, not machine or storage-device power loss.
   truncation boundaries, and a file-level WAL recovery fuzz target cover the
   decoder.
 
-WAL v2 and record v1 remain unsupported experimental formats. Heap metadata
-remains v2 and canonical schema encoding remains v1.
+WAL v2 and record v1 remain unsupported experimental formats. At this
+WAL-integrity-hardening phase, heap metadata remained v2; the current heap
+metadata format is v3. Canonical schema encoding remains v1.
 
 ## Data-page integrity hardening (complete)
 
@@ -395,9 +396,22 @@ would create false contracts.
 - explicit deterministic catalog and statement text rendering avoids `Debug`,
   serde, and accidental machine-format commitments.
 
-Phase 6D2 will add the `netbadb` CLI, human text output, explicit versioned JSON
-output, and local database/bootstrap inspection. Phase 6E then adds LSP/MCP
-integration. There is currently no Go `database/sql` driver, connection
+### Phase 6D2 — Offline local inspection CLI (complete)
+
+- standalone `netbadb inspect catalog|statement` commands reuse deployment
+  manifest v4 and `netbadb-sdk` embedded inspection without depending directly
+  on compiler, planner, executor, or storage internals;
+- `--sql` and UTF-8 `--sql-file` support deterministic human text or explicit
+  Inspection JSON v1, with stdout delayed until successful database close;
+- the JSON contract explicitly tags statement, result, plan, expression,
+  aggregate, semantic-type, and typed-scalar shapes without adding serde to
+  inspection DTOs;
+- local inspection requires offline exclusive ownership, uses normal startup
+  recovery, ignores network-principal ACL filtering, and never executes the
+  inspected SQL.
+
+Phase 6E next adds LSP/MCP integration directly over inspection DTOs and shared
+compiler diagnostics. There is currently no Go `database/sql` driver, connection
 pool, ORM/query builder, prepared statement support, typed parameter protocol,
 Rust generated query layer, SQL EXPLAIN syntax, remote inspection protocol,
 cost explanation, or rejected-access-path reporting.

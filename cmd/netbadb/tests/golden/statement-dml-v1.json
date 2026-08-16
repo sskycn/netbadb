@@ -1,0 +1,83 @@
+{
+  "format": "netbadb-inspection",
+  "version": 1,
+  "kind": "statement",
+  "statement": {
+    "kind": "insert",
+    "access": {
+      "read_tables": [],
+      "write_tables": [
+        1
+      ]
+    },
+    "result": {
+      "kind": "affected_rows"
+    },
+    "plan": {
+      "kind": "insert",
+      "table_id": 1,
+      "table_name": "users",
+      "values": [
+        {
+          "kind": "literal",
+          "value": {
+            "kind": "null"
+          },
+          "data_type": {
+            "physical": "text",
+            "semantic_name": null
+          },
+          "nullable": false
+        },
+        {
+          "kind": "literal",
+          "value": {
+            "kind": "bool",
+            "value": true
+          },
+          "data_type": {
+            "physical": "bool",
+            "semantic_name": null
+          },
+          "nullable": false
+        },
+        {
+          "kind": "literal",
+          "value": {
+            "kind": "int64",
+            "value": -1
+          },
+          "data_type": {
+            "physical": "int64",
+            "semantic_name": null
+          },
+          "nullable": false
+        },
+        {
+          "kind": "literal",
+          "value": {
+            "kind": "uint64",
+            "value": 42
+          },
+          "data_type": {
+            "physical": "uint64",
+            "semantic_name": null
+          },
+          "nullable": false
+        },
+        {
+          "kind": "literal",
+          "value": {
+            "kind": "text",
+            "value": "Ada"
+          },
+          "data_type": {
+            "physical": "text",
+            "semantic_name": null
+          },
+          "nullable": false
+        }
+      ]
+    }
+  }
+}

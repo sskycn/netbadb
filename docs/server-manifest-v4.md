@@ -124,6 +124,24 @@ and sends no NDBP response.
 
 ## Operational notes
 
+The local `netbadb inspect` CLI reuses this manifest's complete validation and
+table bootstrap, but it is not a Protocol session. Server authorization protects
+Protocol sessions; it does not restrict a local process that already has
+filesystem access to the manifest and database files. Local catalog inspection
+therefore shows every configured table and never emits authorization grants,
+certificate fingerprints, TLS paths, listen addresses, or storage paths.
+
+Stop `netbadbd` and every embedded process using the configured database files
+before local inspection. NetbaDB currently has no cross-process database-file
+lock, and concurrent multi-process access is unsupported. The CLI does not use
+ports or process IDs to guess ownership.
+
+Offline opening uses normal `Database::open_tables` startup recovery. If the
+previous owner crashed, opening may redo or undo WAL state before inspection is
+returned. The CLI is not a forensic no-write reader and has no recovery-bypass
+option. The SQL supplied to `inspect statement`, including INSERT, UPDATE, or
+DELETE, is never executed.
+
 The v3 limits and transport rules remain: plaintext listeners are loopback
 only, non-loopback listeners require mTLS, limits are bounded, and disconnect
 cleanup rolls back active transactions. Metrics add

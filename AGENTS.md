@@ -105,6 +105,7 @@ protocol -> types
 client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
+netbadb CLI -> Rust SDK embedded + server + serde + serde_json
 Rust SDK embedded -> core + inspect + schema + types
 Rust SDK remote -> client + schema + types
 ```

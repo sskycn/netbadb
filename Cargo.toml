@@ -17,6 +17,7 @@ members = [
     "crates/netbadb-inspect",
     "crates/netbadb-server",
     "crates/netbadb-codegen",
+    "cmd/netbadb",
     "cmd/netbadbd",
     "sdk/rust",
 ]

@@ -1,0 +1,117 @@
+{
+  "format": "netbadb-inspection",
+  "version": 1,
+  "kind": "statement",
+  "statement": {
+    "kind": "query",
+    "access": {
+      "read_tables": [
+        1
+      ],
+      "write_tables": []
+    },
+    "result": {
+      "kind": "query",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": {
+            "physical": "uint64",
+            "semantic_name": null
+          },
+          "nullable": false,
+          "source": {
+            "binding_id": 0,
+            "table_id": 1,
+            "column_id": 1,
+            "relation_name": "users",
+            "name": "id"
+          }
+        }
+      ]
+    },
+    "plan": {
+      "kind": "query",
+      "root": {
+        "operator": "filter",
+        "predicate": {
+          "kind": "binary",
+          "operator": "eq",
+          "left": {
+            "kind": "column",
+            "column": {
+              "binding_id": 0,
+              "table_id": 1,
+              "column_id": 1,
+              "relation_name": "users",
+              "name": "id",
+              "data_type": {
+                "physical": "uint64",
+                "semantic_name": null
+              },
+              "nullable": false
+            },
+            "data_type": {
+              "physical": "uint64",
+              "semantic_name": null
+            },
+            "nullable": false
+          },
+          "right": {
+            "kind": "literal",
+            "value": {
+              "kind": "uint64",
+              "value": 42
+            },
+            "data_type": {
+              "physical": "uint64",
+              "semantic_name": null
+            },
+            "nullable": false
+          },
+          "data_type": {
+            "physical": "bool",
+            "semantic_name": null
+          },
+          "nullable": false
+        },
+        "input": {
+          "operator": "index_scan",
+          "binding_id": 0,
+          "table_id": 1,
+          "table_name": "users",
+          "columns": [
+            {
+              "binding_id": 0,
+              "table_id": 1,
+              "column_id": 1,
+              "relation_name": "users",
+              "name": "id",
+              "data_type": {
+                "physical": "uint64",
+                "semantic_name": null
+              },
+              "nullable": false
+            }
+          ],
+          "index_column": {
+            "binding_id": 0,
+            "table_id": 1,
+            "column_id": 1,
+            "relation_name": "users",
+            "name": "id",
+            "data_type": {
+              "physical": "uint64",
+              "semantic_name": null
+            },
+            "nullable": false
+          },
+          "key": {
+            "kind": "uint64",
+            "value": 42
+          }
+        }
+      }
+    }
+  }
+}

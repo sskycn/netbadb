@@ -1,0 +1,19 @@
+[package]
+name = "netbadb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "netbadb"
+path = "src/main.rs"
+
+[dependencies]
+netbadb-sdk = { path = "../../sdk/rust" }
+netbadb-server = { path = "../../crates/netbadb-server" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

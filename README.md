@@ -108,6 +108,7 @@ netbadb/
 │   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
 │   └── netbadb-codegen/     strict Schema Spec v1 and typed Go generation
 ├── cmd/
+│   ├── netbadb/             offline local inspection CLI
 │   └── netbadbd/            standalone manifest-driven server executable
 ├── sdk/
 │   ├── rust/                Rust application-facing re-export surface
@@ -136,6 +137,7 @@ protocol -> types
 client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
+netbadb CLI -> Rust SDK embedded + server + serde + serde_json
 Rust SDK embedded -> core + inspect + schema + types
 Rust SDK remote -> client + schema + types
 ```
@@ -204,6 +206,9 @@ The current code genuinely supports:
 - stable, read-only embedded catalog and chosen-plan inspection DTOs with an
   explicit deterministic text renderer that exposes no planner or storage
   handles and never drives execution;
+- an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
+  embedded inspection API, with deterministic human text and explicit
+  versioned Inspection JSON v1 output;
 - a blocking Rust Protocol v1 client with loopback plaintext, verified mTLS,
   schema/capability gates, streamed rows, and explicit transaction lifecycle,
   exposed under the optional `netbadb-sdk::remote` feature;
@@ -220,6 +225,15 @@ input contract is documented in
 retained as historical documentation and rejected by current
 `netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
 database worker authorizes compiler-resolved TableIds before execution.
+
+Offline catalog and statement inspection is documented in
+[`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
+contract is [`docs/inspection-json-v1.md`](docs/inspection-json-v1.md). Stop
+`netbadbd` and every embedded process using the same files before running the
+local CLI: NetbaDB does not yet provide cross-process file locking. Opening an
+offline database performs normal startup recovery and can redo or undo WAL
+state; this is not a forensic no-write reader. The inspected SQL itself is
+never executed.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -572,8 +586,12 @@ The implementation sequence is intentionally vertical:
 25. Go Protocol v1 client and generated typed bindings (Phases 6A and 6B) —
     complete.
 26. Synchronous Rust remote client and SDK feature stabilization (Phase 6C) —
-    complete. CLI/inspection, LSP, and MCP remain later Phase 6 work.
-27. Advanced optimization — histograms, richer cost models, and rewrite rules.
+    complete.
+27. Structured inspection and offline local CLI (Phases 6D1 and 6D2) — stable
+    DTOs, deterministic text, manifest-v4 bootstrap, and Inspection JSON v1.
+    Complete.
+28. LSP and MCP adapters (Phase 6E) — future work.
+29. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
 Isolation/MVCC and range/index-join planning remain roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and
