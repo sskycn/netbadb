@@ -383,10 +383,24 @@ would create false contracts.
 - scripted protocol-state tests and real plaintext/mTLS/authorization/
   disconnect-rollback integration tests.
 
-Later Phase 6 work includes CLI and inspection tooling (6D), then LSP/MCP
-integration (6E). There is currently no Go `database/sql` driver, connection
+### Phase 6D1 — Structured inspection API (complete)
+
+- low-level `netbadb-inspect` DTOs depend only on canonical schema and types;
+- embedded catalog inspection reports declaration-ordered schema,
+  registration-ordered indexes, fingerprints, and cached `ANALYZE` snapshots;
+- statement inspection exposes typed access, result provenance, expressions,
+  and the exact physical query/DML plan selected by the normal planner;
+- exhaustive core conversion removes BTree/Page/WAL handles and performs no
+  execution, transaction, writer acquisition, heap scan, or WAL mutation;
+- explicit deterministic catalog and statement text rendering avoids `Debug`,
+  serde, and accidental machine-format commitments.
+
+Phase 6D2 will add the `netbadb` CLI, human text output, explicit versioned JSON
+output, and local database/bootstrap inspection. Phase 6E then adds LSP/MCP
+integration. There is currently no Go `database/sql` driver, connection
 pool, ORM/query builder, prepared statement support, typed parameter protocol,
-or Rust generated query layer.
+Rust generated query layer, SQL EXPLAIN syntax, remote inspection protocol,
+cost explanation, or rejected-access-path reporting.
 
 ## Phase 7 — Advanced optimization
 

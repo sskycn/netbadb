@@ -14,6 +14,7 @@ members = [
     "crates/netbadb-core",
     "crates/netbadb-protocol",
     "crates/netbadb-client",
+    "crates/netbadb-inspect",
     "crates/netbadb-server",
     "crates/netbadb-codegen",
     "cmd/netbadbd",

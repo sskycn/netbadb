@@ -1,11 +1,14 @@
 //! Native synchronous embedded API for NetbaDB.
 
+mod inspection;
+
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use netbadb_compiler::{CompileError, compile_statement};
+use netbadb_compiler::{CompileError, CompiledStatement, compile_statement};
 use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages};
+use netbadb_inspect::{CatalogInspection, StatementInspection};
 use netbadb_planner::{
     IndexAccessPath, PhysicalStatement, TableAccessStatistics, plan_statement_with_statistics,
 };
@@ -48,6 +51,17 @@ pub enum DatabaseError {
     EmptyCatalog,
     TableSelectionRequired,
     DuplicateStoragePath(PathBuf),
+    InspectionStorageMissing {
+        table_id: TableId,
+    },
+    InspectionIndexColumnMissing {
+        table_id: TableId,
+        column_id: ColumnId,
+    },
+    InspectionRegistrationOrderOverflow {
+        table_id: TableId,
+        position: usize,
+    },
     CreateTablesRollback {
         creation: StorageError,
         cleanup_path: PathBuf,
@@ -73,6 +87,24 @@ impl fmt::Display for DatabaseError {
                     path.display()
                 )
             }
+            Self::InspectionStorageMissing { table_id } => write!(
+                formatter,
+                "inspection found no storage for catalog table {}",
+                table_id.0
+            ),
+            Self::InspectionIndexColumnMissing {
+                table_id,
+                column_id,
+            } => write!(
+                formatter,
+                "inspection found index column {} missing from table {}",
+                column_id.0, table_id.0
+            ),
+            Self::InspectionRegistrationOrderOverflow { table_id, position } => write!(
+                formatter,
+                "inspection index registration position {position} for table {} exceeds u32",
+                table_id.0
+            ),
             Self::CreateTablesRollback {
                 creation,
                 cleanup_path,
@@ -97,7 +129,10 @@ impl Error for DatabaseError {
             Self::ExpectedQuery
             | Self::EmptyCatalog
             | Self::TableSelectionRequired
-            | Self::DuplicateStoragePath(_) => None,
+            | Self::DuplicateStoragePath(_)
+            | Self::InspectionStorageMissing { .. }
+            | Self::InspectionIndexColumnMissing { .. }
+            | Self::InspectionRegistrationOrderOverflow { .. } => None,
         }
     }
 }
@@ -317,6 +352,23 @@ impl Database {
         })
     }
 
+    /// Returns canonical catalog metadata, persistent index registration
+    /// order, and cached `ANALYZE` snapshots without scanning data or
+    /// refreshing statistics.
+    pub fn inspect_catalog(&self) -> Result<CatalogInspection, DatabaseError> {
+        inspection::catalog(&self.schema, &self.storages)
+    }
+
+    /// Compiles and physically plans one statement, then converts that exact
+    /// plan into stable read-only inspection values without executing it.
+    pub fn inspect_statement(&self, source: &str) -> Result<StatementInspection, DatabaseError> {
+        let (compiled, physical) = self.compile_and_plan(source)?;
+        Ok(inspection::statement(
+            &compiled.logical_statement,
+            &physical,
+        ))
+    }
+
     /// Executes SELECT or one typed DML statement. DML runs in one implicit
     /// transaction and returns an explicit affected-row count.
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
@@ -380,14 +432,22 @@ impl Database {
     }
 
     fn plan_source(&self, source: &str) -> Result<PhysicalStatement, DatabaseError> {
+        self.compile_and_plan(source).map(|(_, physical)| physical)
+    }
+
+    fn compile_and_plan(
+        &self,
+        source: &str,
+    ) -> Result<(CompiledStatement, PhysicalStatement), DatabaseError> {
         let compiled = compile_statement(&self.schema, source)?;
         let table_statistics = self.planner_table_statistics();
         let access_paths = self.planner_access_paths();
-        Ok(plan_statement_with_statistics(
+        let physical = plan_statement_with_statistics(
             &compiled.logical_statement,
             &table_statistics,
             &access_paths,
-        ))
+        );
+        Ok((compiled, physical))
     }
 
     fn planner_table_statistics(&self) -> Vec<TableAccessStatistics> {
@@ -508,6 +568,11 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
 #[cfg(test)]
 mod tests {
     use super::{Database, DatabaseError, ExecutionResult, PhysicalStatement, TransactionState};
+    use netbadb_inspect::{
+        AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
+        ExpressionKindInspection, NullOrderInspection, PlanNodeInspection, SortDirectionInspection,
+        StatementPlanInspection, StatementResultInspection, UnaryOpInspection,
+    };
     use netbadb_planner::PhysicalPlan;
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
@@ -585,6 +650,70 @@ mod tests {
         match result {
             ExecutionResult::AffectedRows(rows) => rows,
             ExecutionResult::Query(_) => panic!("expected affected rows"),
+        }
+    }
+
+    fn inspected_index(plan: &PlanNodeInspection) -> Option<(ColumnId, &ScalarValue)> {
+        match plan {
+            PlanNodeInspection::IndexScan {
+                index_column, key, ..
+            } => Some((index_column.column_id, key)),
+            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+                inspected_index(left).or_else(|| inspected_index(right))
+            }
+            PlanNodeInspection::Filter { input, .. }
+            | PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => inspected_index(input),
+            PlanNodeInspection::SeqScan { .. } => None,
+        }
+    }
+
+    fn inspected_root(statement: &StatementPlanInspection) -> &PlanNodeInspection {
+        match statement {
+            StatementPlanInspection::Query { root } => root,
+            StatementPlanInspection::Update { input, .. }
+            | StatementPlanInspection::Delete { input, .. } => input,
+            StatementPlanInspection::Insert { .. } => panic!("insert has no input plan"),
+        }
+    }
+
+    fn scan_bindings(plan: &PlanNodeInspection, bindings: &mut Vec<(TableId, u32)>) {
+        match plan {
+            PlanNodeInspection::SeqScan {
+                table_id,
+                binding_id,
+                ..
+            }
+            | PlanNodeInspection::IndexScan {
+                table_id,
+                binding_id,
+                ..
+            } => bindings.push((*table_id, binding_id.0)),
+            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+                scan_bindings(left, bindings);
+                scan_bindings(right, bindings);
+            }
+            PlanNodeInspection::Filter { input, .. }
+            | PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => scan_bindings(input, bindings),
+        }
+    }
+
+    fn inspected_filter(plan: &PlanNodeInspection) -> Option<&ExpressionInspection> {
+        match plan {
+            PlanNodeInspection::Filter { predicate, .. } => Some(predicate),
+            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+                inspected_filter(left).or_else(|| inspected_filter(right))
+            }
+            PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => inspected_filter(input),
+            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::IndexScan { .. } => None,
         }
     }
 
@@ -1188,5 +1317,303 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn catalog_inspection_preserves_schema_registry_and_stale_statistics_order() {
+        let users_path = std::env::temp_dir().join(format!(
+            "netbadb-core-inspect-catalog-users-{}",
+            std::process::id()
+        ));
+        let teams_path = std::env::temp_dir().join(format!(
+            "netbadb-core-inspect-catalog-teams-{}",
+            std::process::id()
+        ));
+        let users_wal = netbadb_storage::wal_path(&users_path);
+        let teams_wal = netbadb_storage::wal_path(&teams_path);
+        for path in [&users_path, &users_wal, &teams_path, &teams_wal] {
+            let _ = std::fs::remove_file(path);
+        }
+        let users = TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "id",
+                    TypeSpec::Semantic {
+                        name: "UserId".into(),
+                        physical: PhysicalType::Int64,
+                    },
+                )
+                .primary_key(true),
+                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text))
+                    .nullable(true),
+            ],
+        );
+        let teams = teams_table();
+        let mut database = Database::create_tables(vec![
+            (users_path.clone(), users.clone()),
+            (teams_path.clone(), teams.clone()),
+        ])
+        .unwrap();
+        database
+            .insert_into(
+                users.id,
+                &[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())],
+            )
+            .unwrap();
+        database.create_index(users.id, ColumnId(2)).unwrap();
+        database.create_index(users.id, ColumnId(1)).unwrap();
+        database.analyze(users.id).unwrap();
+
+        let catalog = database.inspect_catalog().unwrap();
+        assert_eq!(
+            catalog
+                .tables
+                .iter()
+                .map(|table| table.table_id)
+                .collect::<Vec<_>>(),
+            vec![users.id, teams.id]
+        );
+        let inspected_users = &catalog.tables[0];
+        assert_eq!(inspected_users.fingerprint, users.fingerprint().unwrap());
+        assert_eq!(
+            inspected_users
+                .columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        assert_eq!(
+            inspected_users
+                .indexes
+                .iter()
+                .map(|index| (index.registration_order, index.column_id))
+                .collect::<Vec<_>>(),
+            vec![(0, ColumnId(2)), (1, ColumnId(1))]
+        );
+        assert_eq!(
+            inspected_users.columns[0].data_type.name.as_deref(),
+            Some("UserId")
+        );
+        assert!(inspected_users.columns[0].primary_key);
+        assert!(inspected_users.columns[1].nullable);
+        let analyzed = inspected_users.statistics.unwrap();
+        assert_eq!(analyzed.row_count, 1);
+        assert!(
+            inspected_users
+                .indexes
+                .iter()
+                .all(|index| index.statistics.is_some())
+        );
+
+        database
+            .insert_into(users.id, &[ScalarValue::Int64(2), ScalarValue::Null])
+            .unwrap();
+        assert_eq!(
+            database.inspect_catalog().unwrap().tables[0].statistics,
+            Some(analyzed)
+        );
+
+        database.close().unwrap();
+        for path in [&users_path, &users_wal, &teams_path, &teams_wal] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn statement_inspection_observes_real_plans_and_never_executes_dml() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-inspect-statement-{}",
+            std::process::id()
+        ));
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal);
+        let schema = indexed_table();
+        let mut database = Database::create(&path, schema).unwrap();
+        for id in 0..80_i64 {
+            database
+                .insert(&[
+                    ScalarValue::Int64(id),
+                    ScalarValue::Int64(id % 2),
+                    ScalarValue::Text(format!("member-{id:03}-{}", "x".repeat(500))),
+                    ScalarValue::Bool(id % 3 == 0),
+                ])
+                .unwrap();
+        }
+        database.create_index(TableId(9), ColumnId(2)).unwrap();
+        database.create_index(TableId(9), ColumnId(1)).unwrap();
+
+        let fallback = database
+            .inspect_statement("SELECT name FROM members WHERE team_id = 0 AND id = 42")
+            .unwrap();
+        assert_eq!(
+            inspected_index(inspected_root(&fallback.plan)),
+            Some((ColumnId(2), &ScalarValue::Int64(0)))
+        );
+
+        database.analyze(TableId(9)).unwrap();
+        let selective = database
+            .inspect_statement("SELECT name FROM members WHERE team_id = 0 AND id = 42")
+            .unwrap();
+        assert_eq!(
+            inspected_index(inspected_root(&selective.plan)),
+            Some((ColumnId(1), &ScalarValue::Int64(42)))
+        );
+        let duplicate_heavy = database
+            .inspect_statement("SELECT name FROM members WHERE team_id = 0")
+            .unwrap();
+        assert!(inspected_index(inspected_root(&duplicate_heavy.plan)).is_none());
+
+        let sorted = database
+            .inspect_statement("SELECT id FROM members ORDER BY team_id DESC NULLS LAST LIMIT 3")
+            .unwrap();
+        let PlanNodeInspection::Limit { limit: 3, input } = inspected_root(&sorted.plan) else {
+            panic!("expected LIMIT above the query plan");
+        };
+        let PlanNodeInspection::Project { input, .. } = input.as_ref() else {
+            panic!("expected projection below LIMIT");
+        };
+        let PlanNodeInspection::Sort { keys, .. } = input.as_ref() else {
+            panic!("expected sort below projection");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].column.column_id, ColumnId(2));
+        assert_eq!(keys[0].direction, SortDirectionInspection::Desc);
+        assert_eq!(keys[0].null_order, NullOrderInspection::Last);
+
+        let self_join = database
+            .inspect_statement(
+                "SELECT e.id, m.id FROM members e JOIN members m ON e.team_id = m.team_id",
+            )
+            .unwrap();
+        let mut bindings = Vec::new();
+        scan_bindings(inspected_root(&self_join.plan), &mut bindings);
+        assert_eq!(bindings, vec![(TableId(9), 0), (TableId(9), 1)]);
+
+        let aggregate = database
+            .inspect_statement("SELECT team_id, COUNT(*) FROM members GROUP BY team_id")
+            .unwrap();
+        let StatementResultInspection::Query { columns } = &aggregate.result else {
+            panic!("aggregate should return query fields");
+        };
+        assert!(columns[0].source.is_some());
+        assert!(columns[1].source.is_none());
+        let PlanNodeInspection::Aggregate { outputs, .. } = inspected_root(&aggregate.plan) else {
+            panic!("expected aggregate root");
+        };
+        assert!(matches!(
+            outputs.as_slice(),
+            [
+                AggregateOutputInspection::GroupKey(_),
+                AggregateOutputInspection::Aggregate { .. }
+            ]
+        ));
+
+        let expression = database
+            .inspect_statement(
+                "SELECT id FROM members WHERE team_id IS NULL AND NOT(active = false)",
+            )
+            .unwrap();
+        let predicate = inspected_filter(inspected_root(&expression.plan)).unwrap();
+        let ExpressionKindInspection::Binary {
+            operator: BinaryOpInspection::And,
+            left,
+            right,
+        } = &predicate.kind
+        else {
+            panic!("expected AND predicate");
+        };
+        assert!(matches!(
+            left.kind,
+            ExpressionKindInspection::IsNull { negated: false, .. }
+        ));
+        assert!(matches!(
+            right.kind,
+            ExpressionKindInspection::Unary {
+                operator: UnaryOpInspection::Not,
+                ..
+            }
+        ));
+
+        let before = database
+            .query("SELECT id FROM members ORDER BY id")
+            .unwrap()
+            .rows;
+        let wal_length = std::fs::metadata(&wal).unwrap().len();
+        let insert = database
+            .inspect_statement(
+                "INSERT INTO members (id, team_id, name, active) VALUES (100, 1, 'new', true)",
+            )
+            .unwrap();
+        assert!(matches!(
+            insert.plan,
+            StatementPlanInspection::Insert { .. }
+        ));
+        let update = database
+            .inspect_statement("UPDATE members SET name = 'Grace' WHERE id = 42")
+            .unwrap();
+        assert_eq!(
+            inspected_index(inspected_root(&update.plan)),
+            Some((ColumnId(1), &ScalarValue::Int64(42)))
+        );
+        let delete = database
+            .inspect_statement("DELETE FROM members WHERE id = 42")
+            .unwrap();
+        assert_eq!(
+            inspected_index(inspected_root(&delete.plan)),
+            Some((ColumnId(1), &ScalarValue::Int64(42)))
+        );
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_length);
+        assert_eq!(
+            database
+                .query("SELECT id FROM members ORDER BY id")
+                .unwrap()
+                .rows,
+            before
+        );
+        assert!(matches!(
+            database.inspect_statement("SELECT FROM"),
+            Err(DatabaseError::Compile(_))
+        ));
+
+        let mut transaction = database.begin_transaction().unwrap();
+        database
+            .insert_in(
+                &mut transaction,
+                &[
+                    ScalarValue::Int64(100),
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("writer still available".into()),
+                    ScalarValue::Bool(true),
+                ],
+            )
+            .unwrap();
+        transaction.rollback().unwrap();
+
+        assert_eq!(
+            affected(database.execute("UPDATE members SET id = 1").unwrap()),
+            80
+        );
+        let stale = database
+            .inspect_statement("SELECT name FROM members WHERE team_id = 0 AND id = 1")
+            .unwrap();
+        assert_eq!(
+            inspected_index(inspected_root(&stale.plan)),
+            Some((ColumnId(1), &ScalarValue::Int64(1)))
+        );
+        database.analyze(TableId(9)).unwrap();
+        let refreshed = database
+            .inspect_statement("SELECT name FROM members WHERE team_id = 0 AND id = 1")
+            .unwrap();
+        assert!(inspected_index(inspected_root(&refreshed.plan)).is_none());
+
+        database.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(&wal);
     }
 }

@@ -167,7 +167,9 @@ version = "0.1.0"
 dependencies = [
  "netbadb-compiler",
  "netbadb-executor",
+ "netbadb-inspect",
  "netbadb-planner",
+ "netbadb-rel",
  "netbadb-schema",
  "netbadb-storage",
  "netbadb-types",
@@ -197,6 +199,14 @@ dependencies = [
 name = "netbadb-index"
 version = "0.1.0"
 dependencies = [
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-inspect"
+version = "0.1.0"
+dependencies = [
+ "netbadb-schema",
  "netbadb-types",
 ]
 
@@ -241,6 +251,7 @@ version = "0.1.0"
 dependencies = [
  "netbadb-client",
  "netbadb-core",
+ "netbadb-inspect",
  "netbadb-schema",
  "netbadb-types",
 ]

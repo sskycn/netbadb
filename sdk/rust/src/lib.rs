@@ -11,6 +11,21 @@ pub use netbadb_schema::{
 };
 pub use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
 
+/// Stable embedded catalog and physical-plan inspection values and renderers.
+#[cfg(feature = "embedded")]
+pub mod inspection {
+    pub use netbadb_inspect::{
+        AggregateFunctionInspection, AggregateInputInspection, AggregateOutputInspection,
+        AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
+        ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
+        IndexStatisticsInspection, JoinKindInspection, NullOrderInspection, PlanNodeInspection,
+        ResultFieldInspection, SortDirectionInspection, SortKeyInspection, SourceColumnInspection,
+        StatementAccessInspection, StatementInspection, StatementKind, StatementPlanInspection,
+        StatementResultInspection, TableInspection, TableStatisticsInspection, UnaryOpInspection,
+        render_catalog, render_statement,
+    };
+}
+
 /// Synchronous Protocol v1 remote client APIs.
 #[cfg(feature = "remote")]
 pub mod remote {

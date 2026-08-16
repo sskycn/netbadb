@@ -20,6 +20,28 @@ use netbadb_sdk::{Database, ScalarValue, TableDef};
 `embedded` enables `netbadb-core`. Existing `Database`, `Transaction`,
 `ExecutionResult`, and schema/type imports remain at the crate root.
 
+Embedded applications can inspect canonical catalog metadata and the exact
+physical plan chosen by the normal planner without executing the statement:
+
+```rust,no_run
+use netbadb_sdk::{Database, inspection};
+
+# fn inspect(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+let catalog = database.inspect_catalog()?;
+println!("{}", inspection::render_catalog(&catalog));
+
+let statement = database.inspect_statement(
+    "SELECT id FROM users WHERE id = 42",
+)?;
+println!("{}", inspection::render_statement(&statement));
+# Ok(())
+# }
+```
+
+Inspection is read-only: it does not execute DML, scan heaps, refresh stale
+`ANALYZE` snapshots, acquire the writer, or append WAL. The deterministic text
+is human-readable diagnostic output, not a versioned machine format.
+
 ## Synchronous remote client
 
 A remote-only application can avoid compiling the embedded core and storage

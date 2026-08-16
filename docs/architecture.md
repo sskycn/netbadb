@@ -13,6 +13,7 @@ In this graph, `A -> B` means A depends on B. The current crate graph is:
 ```text
 netbadb-schema -> netbadb-types
 netbadb-codegen -> netbadb-schema + netbadb-types
+netbadb-inspect -> netbadb-schema + netbadb-types
 netbadb-hir -> netbadb-parser + netbadb-schema + netbadb-types
 netbadb-rel -> netbadb-types
 netbadb-compiler -> netbadb-hir + netbadb-parser + netbadb-rel
@@ -22,18 +23,50 @@ netbadb-planner -> netbadb-index + netbadb-rel + netbadb-types
 netbadb-storage -> netbadb-index + netbadb-schema + netbadb-types
 netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
-netbadb-core -> compiler + planner + executor + storage + schema + types
+netbadb-core -> compiler + inspect + planner + rel + executor + storage
+                 + schema + types
 netbadb-protocol -> netbadb-types
 netbadb-client -> netbadb-protocol + netbadb-schema + netbadb-types
 netbadb-server -> netbadb-core + netbadb-protocol + netbadb-schema
                     + netbadb-types
 netbadbd -> netbadb-server
-netbadb-sdk embedded -> netbadb-core + netbadb-schema + netbadb-types
+netbadb-sdk embedded -> netbadb-core + netbadb-inspect + netbadb-schema
+                        + netbadb-types
 netbadb-sdk remote -> netbadb-client + netbadb-schema + netbadb-types
 ```
 
 No lower layer depends on a higher layer. In particular, storage does not
 depend on planner or executor, and executor does not depend on an SDK.
+
+## Stable inspection boundary
+
+Catalog metadata and the physical plan selected by the real planner cross a
+one-way conversion boundary in `netbadb-core`:
+
+```text
+compiler / planner / storage internal state
+                    ↓
+              netbadb-core
+          exhaustive conversion
+                    ↓
+             netbadb-inspect
+                    ↓
+       embedded SDK / future CLI / LSP / MCP
+```
+
+`netbadb-inspect` depends only on canonical schema and type domains. Its DTOs
+retain stable table, relation-binding, column, semantic-type, expression, and
+chosen-operator meaning, but never contain BTree handles, page/row identities,
+WAL state, or planner IR. `Database::inspect_catalog` reads schema, persistent
+index registration order, and cached `ANALYZE` snapshots without scanning or
+refreshing them. `Database::inspect_statement` compiles once, invokes the same
+planning path as execution, and converts the chosen plan without executing it,
+opening a transaction, acquiring the writer, or appending WAL.
+
+Inspection DTOs are observation results and never feed back into planning or
+execution. The explicit text renderer is deterministic human-readable output,
+not SQL, Rust `Debug`, a wire contract, or a versioned JSON API. Statistics are
+last-`ANALYZE` snapshots and may be stale.
 
 ## Canonical Schema IR
 

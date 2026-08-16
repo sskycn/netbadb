@@ -520,6 +520,9 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::EmptyCatalog
         | DatabaseError::TableSelectionRequired
         | DatabaseError::DuplicateStoragePath(_)
+        | DatabaseError::InspectionStorageMissing { .. }
+        | DatabaseError::InspectionIndexColumnMissing { .. }
+        | DatabaseError::InspectionRegistrationOrderOverflow { .. }
         | DatabaseError::CreateTablesRollback { .. } => ProtocolErrorCode::Database,
     }
 }

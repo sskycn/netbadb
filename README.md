@@ -104,6 +104,7 @@ netbadb/
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
 │   ├── netbadb-client/      synchronous Protocol v1 remote client
+│   ├── netbadb-inspect/     stable inspection DTOs and deterministic text
 │   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
 │   └── netbadb-codegen/     strict Schema Spec v1 and typed Go generation
 ├── cmd/
@@ -122,6 +123,7 @@ The direction is acyclic:
 ```text
 schema -> types
 codegen -> schema + types
+inspect -> schema + types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
@@ -129,12 +131,12 @@ planner -> index + rel + types
 index -> types
 storage -> index + schema + types
 executor -> planner + rel + storage + types
-core -> compiler + planner + executor + storage + schema + types
+core -> compiler + inspect + planner + rel + executor + storage + schema + types
 protocol -> types
 client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
-Rust SDK embedded -> core + schema + types
+Rust SDK embedded -> core + inspect + schema + types
 Rust SDK remote -> client + schema + types
 ```
 
@@ -199,6 +201,9 @@ The current code genuinely supports:
   remote listen, bounded connections/socket inactivity, response-row policy,
   in-process metrics, and the standalone `netbadbd` executable;
 - a native embedded `netbadb-core::Database` API;
+- stable, read-only embedded catalog and chosen-plan inspection DTOs with an
+  explicit deterministic text renderer that exposes no planner or storage
+  handles and never drives execution;
 - a blocking Rust Protocol v1 client with loopback plaintext, verified mTLS,
   schema/capability gates, streamed rows, and explicit transaction lifecycle,
   exposed under the optional `netbadb-sdk::remote` feature;

@@ -8,7 +8,9 @@ rust-version.workspace = true
 [dependencies]
 netbadb-compiler = { path = "../netbadb-compiler" }
 netbadb-executor = { path = "../netbadb-executor" }
+netbadb-inspect = { path = "../netbadb-inspect" }
 netbadb-planner = { path = "../netbadb-planner" }
+netbadb-rel = { path = "../netbadb-rel" }
 netbadb-schema = { path = "../netbadb-schema" }
 netbadb-storage = { path = "../netbadb-storage" }
 netbadb-types = { path = "../netbadb-types" }

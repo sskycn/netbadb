@@ -92,6 +92,7 @@ The intended dependency direction is:
 ```text
 schema -> types
 codegen -> schema + types
+inspect -> schema + types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
@@ -99,12 +100,12 @@ planner -> index + rel + types
 index -> types
 storage -> index + schema + types
 executor -> planner + rel + storage + types
-core -> compiler + planner + executor + storage + schema + types
+core -> compiler + inspect + planner + rel + executor + storage + schema + types
 protocol -> types
 client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
-Rust SDK embedded -> core + schema + types
+Rust SDK embedded -> core + inspect + schema + types
 Rust SDK remote -> client + schema + types
 ```
 
