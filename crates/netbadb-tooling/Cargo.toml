@@ -1,15 +1,18 @@
 [package]
-name = "netbadb-codegen"
+name = "netbadb-tooling"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+netbadb-compiler = { path = "../netbadb-compiler" }
+netbadb-hir = { path = "../netbadb-hir" }
+netbadb-parser = { path = "../netbadb-parser" }
 netbadb-schema = { path = "../netbadb-schema" }
-netbadb-schema-spec = { path = "../netbadb-schema-spec" }
+
+[dev-dependencies]
 netbadb-types = { path = "../netbadb-types" }
-serde_json.workspace = true
 
 [lints]
 workspace = true

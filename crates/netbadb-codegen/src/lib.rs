@@ -8,104 +8,13 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use netbadb_schema::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
-use netbadb_types::{ColumnId, PhysicalType, TableId};
-use serde::Deserialize;
+use netbadb_schema_spec::SchemaSpecError;
+use netbadb_types::{PhysicalType, TableId};
 
-/// Version of the language-neutral SDK code-generation input.
-pub const SDK_SCHEMA_SPEC_VERSION: u32 = 1;
+pub use netbadb_schema_spec::{SDK_SCHEMA_SPEC_VERSION, SchemaSpec};
 
 const HELP: &str = "Usage: netbadb-codegen go --schema <path> --package <name> --output <path> [--table-id <u64>]... [--check]";
 const GO_IMPORT: &str = "github.com/sskycn/netbadb/sdk/go";
-
-#[derive(Debug, Deserialize)]
-struct SpecVersion {
-    version: u32,
-}
-
-/// Strict JSON input for SDK generation. It is not Canonical Schema encoding.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchemaSpec {
-    version: u32,
-    tables: Vec<TableSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TableSpec {
-    id: u64,
-    name: String,
-    columns: Vec<ColumnSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ColumnSpec {
-    id: u32,
-    name: String,
-    physical_type: PhysicalTypeSpec,
-    semantic_type: Option<String>,
-    nullable: bool,
-    primary_key: bool,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum PhysicalTypeSpec {
-    Bool,
-    Int64,
-    Uint64,
-    Text,
-}
-
-impl From<PhysicalTypeSpec> for PhysicalType {
-    fn from(value: PhysicalTypeSpec) -> Self {
-        match value {
-            PhysicalTypeSpec::Bool => Self::Bool,
-            PhysicalTypeSpec::Int64 => Self::Int64,
-            PhysicalTypeSpec::Uint64 => Self::UInt64,
-            PhysicalTypeSpec::Text => Self::Text,
-        }
-    }
-}
-
-impl SchemaSpec {
-    fn into_schema(self) -> Result<Schema, CodegenError> {
-        debug_assert_eq!(self.version, SDK_SCHEMA_SPEC_VERSION);
-        let tables = self
-            .tables
-            .into_iter()
-            .map(TableSpec::into_table)
-            .collect::<Vec<_>>();
-        Schema::new(tables).map_err(CodegenError::Schema)
-    }
-}
-
-impl TableSpec {
-    fn into_table(self) -> TableDef {
-        let columns = self
-            .columns
-            .into_iter()
-            .map(ColumnSpec::into_column)
-            .collect();
-        TableDef::new(TableId(self.id), self.name, columns)
-    }
-}
-
-impl ColumnSpec {
-    fn into_column(self) -> ColumnDef {
-        let physical = self.physical_type.into();
-        let type_spec = self
-            .semantic_type
-            .map_or(TypeSpec::Physical(physical), |name| TypeSpec::Semantic {
-                name,
-                physical,
-            });
-        ColumnDef::new(ColumnId(self.id), self.name, type_spec)
-            .nullable(self.nullable)
-            .primary_key(self.primary_key)
-    }
-}
 
 /// Complete deterministic Go-generation request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,12 +27,13 @@ pub struct GoGenerationRequest {
 
 /// Parses and validates a Schema Spec using the canonical Rust schema API.
 pub fn parse_schema_spec(source: &str) -> Result<Schema, CodegenError> {
-    let version: SpecVersion = serde_json::from_str(source).map_err(CodegenError::Json)?;
-    if version.version != SDK_SCHEMA_SPEC_VERSION {
-        return Err(CodegenError::UnsupportedSchemaSpecVersion(version.version));
-    }
-    let spec: SchemaSpec = serde_json::from_str(source).map_err(CodegenError::Json)?;
-    spec.into_schema()
+    netbadb_schema_spec::parse_schema_spec(source).map_err(|error| match error {
+        SchemaSpecError::Json(error) => CodegenError::Json(error),
+        SchemaSpecError::UnsupportedVersion(version) => {
+            CodegenError::UnsupportedSchemaSpecVersion(version)
+        }
+        SchemaSpecError::Schema(error) => CodegenError::Schema(error),
+    })
 }
 
 /// Generates one gofmt-compatible source file without accessing the filesystem.

@@ -410,11 +410,26 @@ would create false contracts.
   recovery, ignores network-principal ACL filtering, and never executes the
   inspected SQL.
 
-Phase 6E next adds LSP/MCP integration directly over inspection DTOs and shared
-compiler diagnostics. There is currently no Go `database/sql` driver, connection
-pool, ORM/query builder, prepared statement support, typed parameter protocol,
-Rust generated query layer, SQL EXPLAIN syntax, remote inspection protocol,
-cost explanation, or rejected-access-path reporting.
+### Phase 6E1 — Shared diagnostics and diagnostics-only LSP (complete)
+
+- SDK Schema Spec v1 has one strict `netbadb-schema-spec` parser shared by
+  codegen and tooling while generated Go output remains byte-identical;
+- `netbadb-tooling` exposes stable diagnostic codes, human messages, and exact
+  UTF-8 byte spans through exhaustive parser/HIR error conversion;
+- synchronous `netbadb-lsp --schema ...` provides stdio initialization, full
+  document synchronization, versioned open/change/close diagnostics, and
+  graceful shutdown without database or network access;
+- the LSP adapter performs checked UTF-8 byte to UTF-16 line/character
+  conversion and advertises no completion, hover, definition, formatting,
+  semantic-token, or physical-plan capability.
+
+Phase 6E2 next adds MCP schema-validation and optional offline-inspection tools
+by consuming tooling diagnostics and inspection DTOs directly. It will not
+spawn CLI processes or parse Inspection JSON. There is currently no Go
+`database/sql` driver, connection pool, ORM/query builder, prepared statement
+support, typed parameter protocol, Rust generated query layer, SQL EXPLAIN
+syntax, remote inspection protocol, cost explanation, or rejected-access-path
+reporting.
 
 ## Phase 7 — Advanced optimization
 

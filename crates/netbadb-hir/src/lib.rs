@@ -292,6 +292,34 @@ pub enum HirError {
     },
 }
 
+impl HirError {
+    /// Returns the exact UTF-8 byte span supplied by the parsed source node.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        match self {
+            Self::UnknownTable { span, .. }
+            | Self::UnknownColumn { span, .. }
+            | Self::UnknownRelationQualifier { span, .. }
+            | Self::DuplicateRelationName { span, .. }
+            | Self::AmbiguousColumn { span, .. }
+            | Self::TooManyRelations { span }
+            | Self::TypeMismatch { span, .. }
+            | Self::IncompatibleComparison { span, .. }
+            | Self::CannotInferNullType { span }
+            | Self::DuplicateColumn { span, .. }
+            | Self::ValueCountMismatch { span, .. }
+            | Self::MissingRequiredColumn { span, .. }
+            | Self::NullNotAllowed { span, .. }
+            | Self::InsertValueReferencesColumn { span }
+            | Self::UngroupedColumn { span, .. }
+            | Self::WildcardNotSupportedWithGroupBy { span }
+            | Self::OrderByNotSupportedWithGrouping { span }
+            | Self::InvalidAggregateArgument { span, .. }
+            | Self::InvalidAggregateType { span, .. } => *span,
+        }
+    }
+}
+
 impl fmt::Display for HirError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

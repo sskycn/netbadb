@@ -91,11 +91,13 @@ The intended dependency direction is:
 
 ```text
 schema -> types
-codegen -> schema + types
+schema-spec -> schema + types + serde + serde_json
+codegen -> schema-spec + schema + types
 inspect -> schema + types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
+tooling -> compiler + hir + parser + schema
 planner -> index + rel + types
 index -> types
 storage -> index + schema + types
@@ -106,6 +108,7 @@ client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
 netbadb CLI -> Rust SDK embedded + server + serde + serde_json
+netbadb-lsp -> tooling + schema-spec + lsp-server + lsp-types
 Rust SDK embedded -> core + inspect + schema + types
 Rust SDK remote -> client + schema + types
 ```

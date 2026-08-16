@@ -1,9 +1,13 @@
 # SDK Schema Spec v1
 
-SDK Schema Spec v1 is the language-neutral input to `netbadb-codegen`. It
-describes the database concepts needed to generate typed application bindings:
-stable table and column IDs, names, physical and optional semantic types,
-nullability, primary-key metadata, and declaration order.
+SDK Schema Spec v1 is the language-neutral schema input shared by code
+generation and editor tooling. The `netbadb-schema-spec` crate is its single
+strict parser and converts the JSON through canonical schema validation before
+returning a `Schema`. Current consumers are `netbadb-codegen` and
+`netbadb-lsp`; the format itself remains version 1.
+
+The spec describes stable table and column IDs, names, physical and optional
+semantic types, nullability, primary-key metadata, and declaration order.
 
 ```json
 {
@@ -32,9 +36,10 @@ Version values other than 1 are rejected as unsupported rather than guessed.
 ## Identity and boundaries
 
 Schema Spec JSON is not Canonical Schema encoding. JSON whitespace, object key
-order, and serializer choices never participate in identity. The generator
-explicitly converts every table to `netbadb_schema::TableDef`, constructs a
-validated `Schema`, then calls `TableDef::fingerprint()`. Canonical Schema v1's
+order, and serializer choices never participate in identity. The shared parser
+explicitly converts every table to `netbadb_schema::TableDef` and constructs a
+validated `Schema`; the generator then calls `TableDef::fingerprint()`.
+Canonical Schema v1's
 versioned binary bytes and SHA-256 implementation remain the sole identity
 authority; generated Go code only embeds and compares the resulting 32 bytes.
 
@@ -49,6 +54,10 @@ SDK Schema Spec -> generated fingerprint gate during client Dial
 
 Either mismatch is a hard failure, which detects drift without treating the
 code-generation input as runtime configuration.
+
+The diagnostics-only LSP loads this spec once at startup and uses the returned
+schema for parser/HIR diagnostics. It does not treat the spec as a deployment
+manifest, open database files, or derive physical planner state from it.
 
 ## Go target rules
 

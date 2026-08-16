@@ -93,10 +93,12 @@ netbadb/
 ├── crates/
 │   ├── netbadb-types/       shared IDs, physical and semantic types
 │   ├── netbadb-schema/      language-independent Canonical Schema IR
+│   ├── netbadb-schema-spec/ strict SDK Schema Spec v1 parsing
 │   ├── netbadb-parser/      small typed-query AST and parser
 │   ├── netbadb-hir/         name resolution and type checking
 │   ├── netbadb-rel/         typed logical relational IR
 │   ├── netbadb-compiler/    AST → HIR → logical plan
+│   ├── netbadb-tooling/     stable schema-driven SQL diagnostics
 │   ├── netbadb-planner/     logical plan → physical plan
 │   ├── netbadb-index/       typed B+Tree ordering, nodes, codecs, and splits
 │   ├── netbadb-storage/     transactions, WAL, pages, buffer pool, heap, B+Tree
@@ -109,6 +111,7 @@ netbadb/
 │   └── netbadb-codegen/     strict Schema Spec v1 and typed Go generation
 ├── cmd/
 │   ├── netbadb/             offline local inspection CLI
+│   ├── netbadb-lsp/         diagnostics-only stdio language server
 │   └── netbadbd/            standalone manifest-driven server executable
 ├── sdk/
 │   ├── rust/                Rust application-facing re-export surface
@@ -123,11 +126,13 @@ The direction is acyclic:
 
 ```text
 schema -> types
-codegen -> schema + types
+schema-spec -> schema + types + serde + serde_json
+codegen -> schema-spec + schema + types
 inspect -> schema + types
 hir -> parser + schema + types
 rel -> types
 compiler -> hir + parser + rel + schema + types
+tooling -> compiler + hir + parser + schema
 planner -> index + rel + types
 index -> types
 storage -> index + schema + types
@@ -138,6 +143,7 @@ client -> protocol + schema + types
 server -> core + protocol + schema + types
 netbadbd -> server
 netbadb CLI -> Rust SDK embedded + server + serde + serde_json
+netbadb-lsp -> tooling + schema-spec + lsp-server + lsp-types
 Rust SDK embedded -> core + inspect + schema + types
 Rust SDK remote -> client + schema + types
 ```
@@ -209,6 +215,9 @@ The current code genuinely supports:
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
   versioned Inspection JSON v1 output;
+- a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
+  Spec v1 once, compiles full editor buffers without database access, and maps
+  stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
 - a blocking Rust Protocol v1 client with loopback plaintext, verified mTLS,
   schema/capability gates, streamed rows, and explicit transaction lifecycle,
   exposed under the optional `netbadb-sdk::remote` feature;
@@ -234,6 +243,11 @@ local CLI: NetbaDB does not yet provide cross-process file locking. Opening an
 offline database performs normal startup recovery and can redo or undo WAL
 state; this is not a forensic no-write reader. The inspected SQL itself is
 never executed.
+
+Schema-driven editor diagnostics are documented in [`docs/lsp.md`](docs/lsp.md).
+Run `netbadb-lsp --schema schema.json` as an LSP stdio process. It neither opens
+database files nor reports physical plans; it validates one SQL statement per
+document against the canonical schema decoded from SDK Schema Spec v1.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -590,8 +604,9 @@ The implementation sequence is intentionally vertical:
 27. Structured inspection and offline local CLI (Phases 6D1 and 6D2) — stable
     DTOs, deterministic text, manifest-v4 bootstrap, and Inspection JSON v1.
     Complete.
-28. LSP and MCP adapters (Phase 6E) — future work.
-29. Advanced optimization — histograms, richer cost models, and rewrite rules.
+28. Shared SQL diagnostics and diagnostics-only LSP (Phase 6E1) — complete.
+29. MCP and additional tooling adapters (Phase 6E2) — future work.
+30. Advanced optimization — histograms, richer cost models, and rewrite rules.
 
 Isolation/MVCC and range/index-join planning remain roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and

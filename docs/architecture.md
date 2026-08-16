@@ -12,12 +12,15 @@ In this graph, `A -> B` means A depends on B. The current crate graph is:
 
 ```text
 netbadb-schema -> netbadb-types
-netbadb-codegen -> netbadb-schema + netbadb-types
+netbadb-schema-spec -> netbadb-schema + netbadb-types + serde + serde_json
+netbadb-codegen -> netbadb-schema-spec + netbadb-schema + netbadb-types
 netbadb-inspect -> netbadb-schema + netbadb-types
 netbadb-hir -> netbadb-parser + netbadb-schema + netbadb-types
 netbadb-rel -> netbadb-types
 netbadb-compiler -> netbadb-hir + netbadb-parser + netbadb-rel
                     + netbadb-schema + netbadb-types
+netbadb-tooling -> netbadb-compiler + netbadb-hir + netbadb-parser
+                    + netbadb-schema
 netbadb-index -> netbadb-types
 netbadb-planner -> netbadb-index + netbadb-rel + netbadb-types
 netbadb-storage -> netbadb-index + netbadb-schema + netbadb-types
@@ -31,13 +34,48 @@ netbadb-server -> netbadb-core + netbadb-protocol + netbadb-schema
                     + netbadb-types
 netbadbd -> netbadb-server
 netbadb CLI -> netbadb-sdk embedded + netbadb-server + serde + serde_json
+netbadb-lsp -> netbadb-tooling + netbadb-schema-spec + lsp-server + lsp-types
 netbadb-sdk embedded -> netbadb-core + netbadb-inspect + netbadb-schema
                         + netbadb-types
 netbadb-sdk remote -> netbadb-client + netbadb-schema + netbadb-types
 ```
 
 No lower layer depends on a higher layer. In particular, storage does not
-depend on planner or executor, and executor does not depend on an SDK.
+depend on planner or executor, executor does not depend on an SDK, and compiler
+layers do not depend on tooling or LSP protocol types.
+
+## Schema-driven tooling boundary
+
+Editor diagnostics and runtime inspection are deliberately separate paths:
+
+```text
+Schema-only editing                         Runtime inspection
+
+SDK Schema Spec v1                         Database runtime state
+        ↓                                           ↓
+netbadb-schema-spec                         real planner + storage metadata
+        ↓                                           ↓
+Canonical Schema + source SQL               netbadb-inspect DTOs
+        ↓                                           ↓
+netbadb-compiler                             embedded SDK / offline CLI
+        ↓                                           ↓
+ToolingDiagnostic                           text / Inspection JSON v1
+        ↓
+netbadb-lsp UTF-16 adapter
+```
+
+`netbadb-tooling` converts the compiler's first `ParseError` or `HirError` into
+a stable code, human message, and half-open UTF-8 byte span. It contains no LSP
+URI, range, document version, or severity types. `netbadb-lsp` is the adapter
+that tracks full editor buffers and converts those byte spans into zero-based
+UTF-16 line/character ranges. It loads a validated SDK Schema Spec once at
+startup and never opens a database, starts recovery, invokes physical planning,
+connects to `netbadbd`, spawns the inspection CLI, or parses Inspection JSON.
+
+The compiler remains fail-fast and each document represents one SQL statement,
+so the current LSP publishes at most one compiler diagnostic per document.
+Completion, hover, definitions, semantic tokens, and schema hot reload require
+separate parser/source-index designs and are not advertised.
 
 ## Stable inspection boundary
 
@@ -52,7 +90,7 @@ compiler / planner / storage internal state
                     ↓
              netbadb-inspect
                     ↓
-          embedded SDK / LSP / MCP
+             embedded SDK
                     ↓
        offline CLI text / explicit JSON v1
 ```
@@ -89,8 +127,9 @@ The CLI uses `ServerConfig` only to validate deployment configuration and
 obtain table bootstrap paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
 filesystem access. JSON v1 is an explicit external CLI contract converted
-exhaustively from inspection DTOs; the DTOs themselves remain serde-free, and
-future LSP/MCP adapters consume them directly rather than spawning the CLI.
+exhaustively from inspection DTOs; the DTOs themselves remain serde-free.
+Future runtime-inspection tooling, including MCP, consumes those DTOs directly
+rather than spawning the CLI. The diagnostics-only LSP does not use this path.
 
 Local inspection requires exclusive process ownership because persistent files
 have no cross-process lock. `Database::open_tables` performs normal recovery,
