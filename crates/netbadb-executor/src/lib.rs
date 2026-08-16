@@ -293,12 +293,20 @@ fn execute_rows(
             let mut rows = Vec::new();
             for left_row in left.rows {
                 for right_row in &right.rows {
-                    let mut values = Vec::with_capacity(
-                        left_row.values.len().saturating_add(right_row.values.len()),
-                    );
-                    values.extend(left_row.values.iter().cloned());
-                    values.extend(right_row.values.iter().cloned());
-                    if evaluate_truth(predicate, &values, &fields)? == TruthValue::True {
+                    if evaluate_truth_values(
+                        predicate,
+                        EvaluationValues::Joined {
+                            left: &left_row.values,
+                            right: &right_row.values,
+                        },
+                        &fields,
+                    )? == TruthValue::True
+                    {
+                        let mut values = Vec::with_capacity(
+                            left_row.values.len().saturating_add(right_row.values.len()),
+                        );
+                        values.extend(left_row.values.iter().cloned());
+                        values.extend(right_row.values.iter().cloned());
                         rows.push(ExecutionRow {
                             row_id: None,
                             values,
@@ -812,15 +820,38 @@ fn build_replacements(
         .collect()
 }
 
-fn evaluate(
+#[derive(Clone, Copy)]
+enum EvaluationValues<'a> {
+    Contiguous(&'a [ScalarValue]),
+    Joined {
+        left: &'a [ScalarValue],
+        right: &'a [ScalarValue],
+    },
+}
+
+impl<'a> EvaluationValues<'a> {
+    fn get(self, position: usize) -> Option<&'a ScalarValue> {
+        match self {
+            Self::Contiguous(values) => values.get(position),
+            Self::Joined { left, right } => left.get(position).or_else(|| {
+                position
+                    .checked_sub(left.len())
+                    .and_then(|index| right.get(index))
+            }),
+        }
+    }
+}
+
+fn evaluate_values(
     expression: &Expr,
-    row: &[ScalarValue],
+    values: EvaluationValues<'_>,
     fields: &[OutputField],
 ) -> Result<ScalarValue, ExecutionError> {
     match &expression.kind {
         ExprKind::Column(column) => {
             let position = find_source_position(fields, column)?;
-            row.get(position)
+            values
+                .get(position)
                 .cloned()
                 .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
         }
@@ -830,22 +861,43 @@ fn evaluate(
             left,
             right,
         } => {
-            let left = evaluate(left, row, fields)?;
-            let right = evaluate(right, row, fields)?;
+            let left = evaluate_values(left, values, fields)?;
+            let right = evaluate_values(right, values, fields)?;
             evaluate_binary(*operator, left, right)
         }
         ExprKind::Unary {
             operator: UnaryOp::Not,
             expression,
-        } => Ok(evaluate_truth(expression, row, fields)?.not().into_scalar()),
+        } => Ok(evaluate_truth_values(expression, values, fields)?
+            .not()
+            .into_scalar()),
         ExprKind::IsNull {
             expression,
             negated,
         } => {
-            let is_null = matches!(evaluate(expression, row, fields)?, ScalarValue::Null);
+            let is_null = matches!(
+                evaluate_values(expression, values, fields)?,
+                ScalarValue::Null
+            );
             Ok(ScalarValue::Bool(if *negated { !is_null } else { is_null }))
         }
     }
+}
+
+fn evaluate(
+    expression: &Expr,
+    row: &[ScalarValue],
+    fields: &[OutputField],
+) -> Result<ScalarValue, ExecutionError> {
+    evaluate_values(expression, EvaluationValues::Contiguous(row), fields)
+}
+
+fn evaluate_truth_values(
+    expression: &Expr,
+    values: EvaluationValues<'_>,
+    fields: &[OutputField],
+) -> Result<TruthValue, ExecutionError> {
+    TruthValue::from_scalar(evaluate_values(expression, values, fields)?)
 }
 
 fn evaluate_truth(
@@ -853,7 +905,7 @@ fn evaluate_truth(
     row: &[ScalarValue],
     fields: &[OutputField],
 ) -> Result<TruthValue, ExecutionError> {
-    TruthValue::from_scalar(evaluate(expression, row, fields)?)
+    evaluate_truth_values(expression, EvaluationValues::Contiguous(row), fields)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -958,11 +1010,15 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionError, QueryResult, TruthValue, evaluate_binary, execute, execute_rows};
+    use super::{
+        EvaluationValues, ExecutionError, QueryResult, TruthValue, evaluate, evaluate_binary,
+        evaluate_truth, evaluate_truth_values, evaluate_values, execute, execute_rows,
+    };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
         AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
-        DerivedField, Expr, ExprKind, LogicalPlan, NullOrder, SortDirection, SortKey,
+        DerivedField, Expr, ExprKind, LogicalPlan, NullOrder, OutputField, SortDirection, SortKey,
+        UnaryOp,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
@@ -1233,6 +1289,203 @@ mod tests {
                 evaluate_binary(operator, ScalarValue::Null, ScalarValue::Null)
                     .expect("comparison"),
                 ScalarValue::Null
+            );
+        }
+    }
+
+    #[test]
+    fn joined_and_contiguous_evaluation_are_equivalent() {
+        fn column_expr(column: &ColumnRef) -> Expr {
+            Expr {
+                kind: ExprKind::Column(column.clone()),
+                expr_type: ExprType {
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+            }
+        }
+
+        fn literal(value: ScalarValue, physical: PhysicalType) -> Expr {
+            Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(physical),
+                    nullable: matches!(value, ScalarValue::Null),
+                },
+                kind: ExprKind::Literal(value),
+            }
+        }
+
+        fn binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+            Expr {
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+            }
+        }
+
+        fn not(expression: Expr) -> Expr {
+            Expr {
+                kind: ExprKind::Unary {
+                    operator: UnaryOp::Not,
+                    expression: Box::new(expression),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+            }
+        }
+
+        fn is_null(expression: Expr, negated: bool) -> Expr {
+            Expr {
+                kind: ExprKind::IsNull {
+                    expression: Box::new(expression),
+                    negated,
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            }
+        }
+
+        let column = |binding_id: u32,
+                      column_id: u32,
+                      name: &str,
+                      physical: PhysicalType,
+                      nullable: bool| ColumnRef {
+            binding_id: RelationBindingId(binding_id),
+            table_id: TableId(u64::from(binding_id)),
+            column_id: ColumnId(column_id),
+            relation_name: format!("side_{binding_id}"),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable,
+        };
+        let left_columns = [
+            column(1, 1, "flag", PhysicalType::Bool, false),
+            column(1, 2, "signed", PhysicalType::Int64, false),
+            column(1, 3, "unsigned", PhysicalType::UInt64, false),
+            column(1, 4, "text", PhysicalType::Text, false),
+            column(1, 5, "nullable", PhysicalType::Int64, true),
+        ];
+        let right_columns = [
+            column(2, 1, "flag", PhysicalType::Bool, false),
+            column(2, 2, "signed", PhysicalType::Int64, false),
+            column(2, 3, "unsigned", PhysicalType::UInt64, false),
+            column(2, 4, "text", PhysicalType::Text, false),
+            column(2, 5, "nullable", PhysicalType::Int64, true),
+        ];
+        let fields = left_columns
+            .iter()
+            .chain(&right_columns)
+            .cloned()
+            .map(OutputField::Source)
+            .collect::<Vec<_>>();
+        let left = vec![
+            ScalarValue::Bool(true),
+            ScalarValue::Int64(7),
+            ScalarValue::UInt64(9),
+            ScalarValue::Text("shared".into()),
+            ScalarValue::Null,
+        ];
+        let right = vec![
+            ScalarValue::Bool(false),
+            ScalarValue::Int64(7),
+            ScalarValue::UInt64(11),
+            ScalarValue::Text("shared".into()),
+            ScalarValue::Null,
+        ];
+        let mut contiguous = left.clone();
+        contiguous.extend(right.iter().cloned());
+
+        let expressions = vec![
+            binary(
+                BinaryOp::Eq,
+                column_expr(&left_columns[1]),
+                column_expr(&right_columns[1]),
+            ),
+            binary(
+                BinaryOp::Eq,
+                column_expr(&right_columns[3]),
+                column_expr(&left_columns[3]),
+            ),
+            binary(
+                BinaryOp::Lt,
+                column_expr(&left_columns[2]),
+                column_expr(&right_columns[2]),
+            ),
+            binary(
+                BinaryOp::LtEq,
+                column_expr(&left_columns[1]),
+                column_expr(&right_columns[1]),
+            ),
+            binary(
+                BinaryOp::Gt,
+                column_expr(&right_columns[2]),
+                column_expr(&left_columns[2]),
+            ),
+            binary(
+                BinaryOp::GtEq,
+                column_expr(&right_columns[1]),
+                column_expr(&left_columns[1]),
+            ),
+            binary(
+                BinaryOp::And,
+                column_expr(&left_columns[0]),
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&left_columns[1]),
+                    literal(ScalarValue::Int64(7), PhysicalType::Int64),
+                ),
+            ),
+            binary(
+                BinaryOp::Or,
+                column_expr(&right_columns[0]),
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&right_columns[3]),
+                    literal(ScalarValue::Text("shared".into()), PhysicalType::Text),
+                ),
+            ),
+            not(column_expr(&right_columns[0])),
+            is_null(column_expr(&left_columns[4]), false),
+            is_null(column_expr(&right_columns[4]), true),
+            binary(
+                BinaryOp::Eq,
+                column_expr(&left_columns[4]),
+                literal(ScalarValue::Null, PhysicalType::Int64),
+            ),
+            binary(
+                BinaryOp::Eq,
+                column_expr(&left_columns[0]),
+                literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            ),
+            binary(
+                BinaryOp::Eq,
+                column_expr(&left_columns[2]),
+                literal(ScalarValue::UInt64(9), PhysicalType::UInt64),
+            ),
+        ];
+
+        for expression in expressions {
+            let joined = EvaluationValues::Joined {
+                left: &left,
+                right: &right,
+            };
+            assert_eq!(
+                evaluate(&expression, &contiguous, &fields).expect("contiguous evaluation"),
+                evaluate_values(&expression, joined, &fields).expect("joined evaluation")
+            );
+            assert_eq!(
+                evaluate_truth(&expression, &contiguous, &fields).expect("contiguous truth"),
+                evaluate_truth_values(&expression, joined, &fields).expect("joined truth")
             );
         }
     }

@@ -225,16 +225,28 @@ joins. A scan row retains one hidden `RowId` for Phase 3B DML; a joined row
 combines scalar values and intentionally drops mutation identity because
 multi-table UPDATE/DELETE are not supported.
 
-The executor materializes each right child, iterates left rows outside and
-right rows inside, concatenates values in that order, and emits only rows whose
-typed `ON` predicate evaluates to TRUE. FALSE and UNKNOWN do not match, so
-ordinary equality never joins NULL to NULL. The existing expression checker
+The executor materializes both child results, iterates left rows outside and
+right rows inside, and evaluates the typed `ON` predicate through a non-owning
+joined view:
+
+```text
+materialized left child + materialized right child
+    -> joined value view for predicate evaluation
+    -> TRUE only: materialize left values + right values with row_id None
+```
+
+FALSE and UNKNOWN pairs allocate no combined value vector and copy no full row;
+ordinary equality therefore still never joins NULL to NULL. TRUE pairs are
+materialized in left-then-right order. Column positions remain resolved by
+`RelationBindingId + ColumnId` during expression evaluation, and scalar column
+and literal results remain owned values. The existing expression checker
 requires BOOL while allowing nullable BOOL, and nominal compatibility prevents
 JOIN from comparing distinct semantic types with the same physical encoding.
-This algorithm preserves duplicates and deterministic left-major/right-minor
-order. Query operators are arranged as `Scan/Join -> Filter -> Sort -> Project
--> Limit`, allowing sorting by source columns that projection omits. `SELECT *`
-follows left-to-right relation and schema order.
+This remains a quadratic NestedLoopJoin and preserves duplicates plus
+deterministic left-major/right-minor order. Query operators are arranged as
+`Scan/Join -> Filter -> Sort -> Project -> Limit`, allowing sorting by source
+columns that projection omits. `SELECT *` follows left-to-right relation and
+schema order.
 
 Core multi-table catalogs compose one existing heap file per `TableId`. JOIN
 therefore introduces no transaction-layer changes: the current page format is

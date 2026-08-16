@@ -1,8 +1,11 @@
 # NetbaDB performance baseline
 
 Phase 7A established a transparent, dependency-free benchmark target for
-database and planner behavior. Phase 7B keeps that target and uses its measured
-plan gap to optimize bounded integer ranges. The target
+database and planner behavior. Phase 7B kept that target and used its measured
+plan gap to optimize bounded integer ranges. After Phase 7B, join execution was
+the highest read-path candidate: NestedLoopJoin materialized and copied a
+combined row for every candidate pair before testing its predicate. Phase 7C
+keeps the same benchmark target and removes that rejected-pair work. The target
 uses `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with
 the optimized bench profile.
 
@@ -91,7 +94,9 @@ The target currently covers:
 - a one-sided indexed-ID range retaining `SeqScan` because it is not costed;
 - `ORDER BY team_id LIMIT 20`, retaining explicit in-memory Sort and Limit;
 - low- and higher-cardinality `GROUP BY team_id` through in-memory Aggregate;
-- unique-like and duplicate-key NestedLoopJoin at two input scales;
+- unique-like, duplicate-key, and fully disjoint NestedLoopJoin at two input
+  scales; disjoint left keys are `[0, N)` and right keys are `[N, 2N)` and must
+  produce zero rows with checksum zero;
 - direct INSERT into tables with zero, one, and two registered indexes;
 - SQL UPDATE of an indexed key while locating distinct rows through an index;
 - `Database::inspect_statement` compile plus real physical-planning overhead.
@@ -105,12 +110,24 @@ No min/max, histogram, MCV, floating selectivity guess, or persistent statistics
 change is involved. One-sided and Text/Bool ranges remain SeqScan; index
 union/intersection, join alternatives, and sort avoidance remain deferred.
 
+Phase 7C evaluates each join predicate through a non-owning view over the
+already materialized left and right child rows. A rejected pair allocates no
+combined value vector and copies no row values; a matching pair is materialized
+normally in left-then-right order. Controlled before/after full-profile runs at
+500×500 and 1,000×1,000 show the strongest improvement for fully disjoint joins,
+while unique-like and duplicate-key joins also benefit from avoiding work on
+their rejected pairs. This is only a constant-factor executor optimization:
+candidate-pair growth remains quadratic, PhysicalPlan still contains only
+NestedLoopJoin for joins, and there is no join reordering, cost model, or new
+join algorithm.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
 the Rust 1.85 MSRV. The expensive workload is not a normal CI performance gate
 and has no pass/fail timing threshold.
 
-Phase 7B changes the current Inspection JSON contract from v1 to v2 to expose
-the new physical operator. It changes no NetbaDB Protocol v1 message, SDK Schema
-Spec v1 field, deployment manifest v4 field, or database persistent format.
+Phase 7B changed the current Inspection JSON contract from v1 to v2 to expose
+the new physical operator. Phase 7C keeps Inspection JSON v2 and changes no
+NetbaDB Protocol v1 message, SDK Schema Spec v1 field, deployment manifest v4
+field, or database persistent format.

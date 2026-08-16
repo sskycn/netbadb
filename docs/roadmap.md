@@ -470,8 +470,23 @@ reporting.
 - no BTree payload, IndexCatalog, statistics, protocol, schema-spec, manifest,
   or other database persistent-format change.
 
-Phase 7C must be selected from post-7B benchmark results. Candidate ranking is
-therefore a measured follow-up, not a preselected hash-join or rewrite project.
+### Phase 7C — Predicate-first NestedLoopJoin (complete)
+
+- the executor evaluates each typed join predicate through a private joined
+  view over the materialized left and right child rows;
+- rejected candidate pairs allocate no combined row and copy no scalar values;
+  matching pairs retain normal left-then-right materialization, `row_id: None`,
+  duplicate preservation, NULL semantics, and deterministic output order;
+- PhysicalPlan::NestedLoopJoin, planner selection, binding-aware column lookup,
+  and current Inspection JSON v2 remain unchanged;
+- controlled before/after benchmark runs cover unique-like, duplicate-key, and
+  fully disjoint joins at 500×500 and 1,000×1,000; the disjoint cases isolate
+  the eliminated rejected-pair materialization;
+- this is a measured constant-factor improvement to the existing quadratic
+  nested-loop algorithm, not a new join algorithm or cost model.
+
+Phase 7D must be selected from post-7C benchmark results. Candidate ranking
+remains a measured follow-up rather than a prewritten HashJoin project.
 
 ### Later Phase 7 work
 

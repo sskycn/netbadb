@@ -615,7 +615,9 @@ The implementation sequence is intentionally vertical:
 28. Shared SQL diagnostics and diagnostics-only LSP (Phase 6E1) — complete.
 29. MCP and additional tooling adapters (Phase 6E2) — future work.
 30. Costed bounded Int64/UInt64 RangeIndexScan (Phase 7B) — complete.
-31. Further advanced optimization — select from post-7B benchmark evidence.
+31. Predicate-first NestedLoopJoin rejected-pair materialization avoidance
+    (Phase 7C) — complete.
+32. Further advanced optimization — select from post-7C benchmark evidence.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

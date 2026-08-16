@@ -1497,6 +1497,40 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
             .expect("insert team");
     }
 
+    assert!(
+        database
+            .query("SELECT u.id FROM users u JOIN teams t ON u.id = t.id")
+            .expect("nonempty no-match join")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT u.name, t.name FROM users u JOIN teams t \
+                 ON u.team_id = t.id AND t.name != 'Core-2'",
+            )
+            .expect("complex join predicate")
+            .rows,
+        vec![
+            vec![
+                ScalarValue::Text("Ada".into()),
+                ScalarValue::Text("Core".into()),
+            ],
+            vec![
+                ScalarValue::Text("Lin".into()),
+                ScalarValue::Text("Tools".into()),
+            ],
+        ]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM users u JOIN teams t ON u.id < t.id")
+            .expect("comparison join predicate")
+            .rows,
+        vec![vec![ScalarValue::UInt64(9)]]
+    );
+
     let joined = database
         .query(
             "SELECT u.name, t.name FROM users AS u JOIN teams AS t \

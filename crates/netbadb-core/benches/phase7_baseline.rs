@@ -517,6 +517,7 @@ fn run_join_scenarios(
             &format!("join_unique_{scale_name}"),
             rows,
             rows,
+            0,
             settings,
             measurements,
         )?;
@@ -524,6 +525,15 @@ fn run_join_scenarios(
             &format!("join_duplicate_{scale_name}"),
             rows,
             (rows / 10).max(1),
+            0,
+            settings,
+            measurements,
+        )?;
+        run_join_query(
+            &format!("join_none_{scale_name}"),
+            rows,
+            rows,
+            rows,
             settings,
             measurements,
         )?;
@@ -535,6 +545,7 @@ fn run_join_query(
     scenario: &str,
     rows: u64,
     cardinality: u64,
+    right_key_offset: u64,
     settings: ProfileSettings,
     measurements: &mut Vec<Measurement>,
 ) -> BenchResult<()> {
@@ -550,8 +561,14 @@ fn run_join_query(
         ),
     ];
     let mut database = Database::create_tables(tables)?;
-    load_join_rows(&mut database, LEFT_TABLE_ID, rows, cardinality)?;
-    load_join_rows(&mut database, RIGHT_TABLE_ID, rows, cardinality)?;
+    load_join_rows(&mut database, LEFT_TABLE_ID, rows, cardinality, 0)?;
+    load_join_rows(
+        &mut database,
+        RIGHT_TABLE_ID,
+        rows,
+        cardinality,
+        right_key_offset,
+    )?;
     let sql = "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key";
     let plan = inspect_plan(
         &database,
@@ -560,7 +577,14 @@ fn run_join_query(
         &[Operator::NestedLoopJoin, Operator::SeqScan],
         &[Operator::IndexScan],
     )?;
-    let expected = expected_join(rows, cardinality);
+    let expected = if right_key_offset == 0 {
+        expected_join(rows, cardinality)
+    } else {
+        Observation {
+            rows: 0,
+            checksum: 0,
+        }
+    };
     let durations = measure_checked(
         scenario,
         settings.query_warmup,
@@ -872,12 +896,16 @@ fn load_join_rows(
     table_id: TableId,
     rows: u64,
     cardinality: u64,
+    key_offset: u64,
 ) -> BenchResult<()> {
     let mut transaction = database.begin_transaction_for(table_id)?;
     for id in 0..rows {
         let id_value = i64::try_from(id).map_err(|_| message_error("join ID exceeds i64"))?;
-        let key =
-            i64::try_from(id % cardinality).map_err(|_| message_error("join key exceeds i64"))?;
+        let key = id
+            .checked_rem(cardinality)
+            .and_then(|key| key.checked_add(key_offset))
+            .ok_or_else(|| message_error("join key overflow"))?;
+        let key = i64::try_from(key).map_err(|_| message_error("join key exceeds i64"))?;
         database.insert_into_in(
             table_id,
             &mut transaction,
