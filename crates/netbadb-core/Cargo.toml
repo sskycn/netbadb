@@ -15,5 +15,9 @@ netbadb-schema = { path = "../netbadb-schema" }
 netbadb-storage = { path = "../netbadb-storage" }
 netbadb-types = { path = "../netbadb-types" }
 
+[[bench]]
+name = "phase7_baseline"
+harness = false
+
 [lints]
 workspace = true

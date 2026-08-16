@@ -1158,3 +1158,26 @@ heap paths, and is not the server's deployment source of truth. Server startup
 still gates manifest `TableDef` against heap metadata, while generated `Dial`
 gates embedded fingerprints against authorized HelloAck tables. These two hard
 failures detect drift while the inputs remain separate.
+
+## Performance baseline boundary
+
+The Phase 7A benchmark is an optimized custom Cargo target attached to
+`netbadb-core`. It consumes only public database and inspection APIs and adds no
+runtime dependency or alternate execution path:
+
+```text
+deterministic temporary databases
+              ↓
+       public Database API
+          ↙          ↘
+real execution      StatementInspection
+          ↓                 ↓
+correctness checksum   chosen operator gate
+          ↘                 ↙
+         warm-cache timing samples
+```
+
+Fixture construction, index backfill, `ANALYZE`, plan inspection, correctness
+verification, reporting, close, and cleanup remain outside timed query loops.
+The benchmark records current behavior; it does not feed measurements back
+into planning, expose a new planner API, or change any persistent representation.

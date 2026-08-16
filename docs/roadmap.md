@@ -423,15 +423,42 @@ would create false contracts.
   conversion and advertises no completion, hover, definition, formatting,
   semantic-token, or physical-plan capability.
 
-Phase 6E2 next adds MCP schema-validation and optional offline-inspection tools
-by consuming tooling diagnostics and inspection DTOs directly. It will not
-spawn CLI processes or parse Inspection JSON. There is currently no Go
+### Phase 6E2 — MCP adapter (deferred)
+
+Direct compilation probes found that official Rust MCP SDK releases supporting
+the required MCP 2025-11-25 stdio tool surface require a Rust compiler newer
+than NetbaDB's Rust 1.85 MSRV. Phase 6's implemented SDK and tooling scope is
+complete, while this optional adapter remains deferred. Revisit it only when an
+official release simultaneously provides MCP 2025-11-25 or newer, stdio tools,
+and Rust 1.85 compatibility without a fork, patch, or NetbaDB MSRV increase.
+
+No MCP placeholder crate or dependency is retained. There is currently no Go
 `database/sql` driver, connection pool, ORM/query builder, prepared statement
 support, typed parameter protocol, Rust generated query layer, SQL EXPLAIN
 syntax, remote inspection protocol, cost explanation, or rejected-access-path
 reporting.
 
 ## Phase 7 — Advanced optimization
+
+### Phase 7A — Reproducible performance baseline (complete)
+
+- dependency-free custom benchmark target using optimized Cargo bench builds,
+  deterministic fixtures, warmup, and quick/full profiles;
+- min, median, and nearest-rank p95 measurements without timing thresholds or
+  committed machine-specific expected numbers;
+- real planner inspection and correctness checks for point SeqScan/IndexScan,
+  low-selectivity indexed equality, nullable point access, range predicates,
+  sort, aggregate, and nested-loop join scenarios;
+- direct INSERT maintenance scaling across zero, one, and two indexes, indexed
+  SQL UPDATE, and compile/physical-plan inspection overhead;
+- no optimizer, planner, executor, storage, protocol, or persistent-format
+  behavior changes.
+
+Phase 7B must use measured Phase 7A scenarios to choose its optimization work.
+The presence of a slow scenario alone does not select or justify a particular
+implementation.
+
+### Later Phase 7 work
 
 - histograms/MCVs and more sophisticated cost models;
 - predicate rewrites and property inference;

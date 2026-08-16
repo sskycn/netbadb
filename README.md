@@ -249,6 +249,11 @@ Run `netbadb-lsp --schema schema.json` as an LSP stdio process. It neither opens
 database files nor reports physical plans; it validates one SQL statement per
 document against the canonical schema decoded from SDK Schema Spec v1.
 
+The reproducible warm-cache performance baseline is documented in
+[`docs/performance.md`](docs/performance.md). It measures current public
+database behavior and real chosen plans without adding an optimizer or a CI
+wall-clock gate.
+
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
 the stable IndexCatalog root PageId; versions 1 and 2 are rejected rather than
