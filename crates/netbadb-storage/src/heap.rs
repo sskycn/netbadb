@@ -1305,15 +1305,16 @@ impl HeapStorage {
         for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
             let page_id = PageId(page_number);
             let page = self.buffer.read_page(page_id)?;
-            let header = page.page().header()?;
+            let validated = page.page().validated()?;
+            let header = validated.header();
             if header.page_type != PageType::Heap {
                 page.page().single_payload(header.page_type)?;
                 continue;
             }
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
-                if let SlotState::Live(slot_entry) = page.page().slot_state(slot)? {
-                    let values = decode_row(page.page().read_record(slot)?, &self.table)?;
+                if let Some((slot_entry, payload)) = validated.live_record(slot)? {
+                    let values = decode_row(payload, &self.table)?;
                     rows.push((
                         RowId {
                             page: page_id,
@@ -3334,6 +3335,55 @@ mod tests {
             Err(StorageError::StaleRowId { .. })
         ));
         assert_eq!(reopened.scan().expect("scan reopened")[0].0, new);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn scan_preserves_reuse_relocation_indexes_and_reopen_results() {
+        let path = test_path("heap-validated-scan-mixed-pages");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let source = storage
+            .insert(&text_row(1, 100, b'a'))
+            .expect("insert relocation source");
+        let deleted = storage
+            .insert(&text_row(2, 100, b'b'))
+            .expect("insert tombstone source");
+        storage.delete(deleted).expect("delete row");
+        let reused = storage
+            .insert(&text_row(3, 50, b'c'))
+            .expect("reuse deleted slot");
+        assert_eq!(
+            (reused.page, reused.slot, reused.generation),
+            (deleted.page, deleted.slot, deleted.generation + 1)
+        );
+        let filler = storage
+            .insert(&text_row(4, 3_600, b'd'))
+            .expect("fill source page");
+        let destination = storage
+            .insert(&text_row(5, 300, b'e'))
+            .expect("create destination page");
+        let relocated = storage
+            .update(source, &text_row(1, 1_000, b'f'))
+            .expect("relocate source row");
+        assert_ne!(relocated, source);
+
+        storage.create_index(ColumnId(1)).expect("register index");
+        storage.analyze().expect("analyze mixed-page heap");
+        let rows = storage.scan().expect("scan mixed page kinds");
+        assert_eq!(rows.len(), 4);
+        for expected in [reused, filler, destination, relocated] {
+            assert!(rows.iter().any(|(row_id, _)| *row_id == expected));
+        }
+        assert!(
+            !rows
+                .iter()
+                .any(|(row_id, _)| { *row_id == deleted || *row_id == source })
+        );
+        storage.close().expect("close mixed-page heap");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen mixed-page heap");
+        assert_eq!(reopened.scan().expect("scan reopened heap"), rows);
+        reopened.close().expect("close reopened heap");
         cleanup(&path);
     }
 

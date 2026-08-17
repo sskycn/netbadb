@@ -118,6 +118,55 @@ pub struct Page {
     bytes: [u8; PAGE_SIZE],
 }
 
+/// A short-lived immutable view whose page-wide structure and checksum were
+/// validated by [`Page::header`]. The borrow prevents mutation from invalidating
+/// the cached header while the view is live; this is not a persistent trust bit,
+/// an on-disk marker, or validation cached inside [`Page`].
+#[derive(Debug)]
+pub(crate) struct ValidatedPage<'a> {
+    page: &'a Page,
+    header: PageHeader,
+}
+
+impl ValidatedPage<'_> {
+    #[must_use]
+    pub(crate) const fn header(&self) -> PageHeader {
+        self.header
+    }
+
+    /// Returns one live slot and its payload after the page-wide validation
+    /// performed when this immutable view was created. Deleted slots are
+    /// represented as `None`; the payload remains borrowed from the page.
+    pub(crate) fn live_record(&self, slot: SlotId) -> Result<Option<(Slot, &[u8])>, StorageError> {
+        if slot.0 >= self.header.slot_count {
+            return Err(PageError::InvalidSlot { slot }.into());
+        }
+        let entry = self.page.slot_at(slot);
+        if is_deleted_slot(entry) {
+            return Ok(None);
+        }
+        let start = usize::from(entry.offset);
+        let end =
+            start
+                .checked_add(usize::from(entry.length))
+                .ok_or(PageError::RecordOutOfBounds {
+                    slot,
+                    offset: entry.offset,
+                    length: entry.length,
+                })?;
+        let payload = self
+            .page
+            .bytes
+            .get(start..end)
+            .ok_or(PageError::RecordOutOfBounds {
+                slot,
+                offset: entry.offset,
+                length: entry.length,
+            })?;
+        Ok(Some((entry, payload)))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ValidatedBeforeImage {
     Existing(Box<Page>),
@@ -302,6 +351,16 @@ impl Page {
             free_start,
             free_end,
             page_lsn,
+        })
+    }
+
+    /// Performs the authoritative full page validation once and returns an
+    /// immutable view that can reuse the resulting structural proof for the
+    /// lifetime of its borrow.
+    pub(crate) fn validated(&self) -> Result<ValidatedPage<'_>, StorageError> {
+        Ok(ValidatedPage {
+            page: self,
+            header: self.header()?,
         })
     }
 
@@ -922,6 +981,94 @@ mod tests {
             page.slot(SlotId(2)),
             Err(StorageError::Page(PageError::InvalidSlot {
                 slot: SlotId(2)
+            }))
+        ));
+    }
+
+    #[test]
+    fn validated_page_view_reads_live_deleted_and_invalid_slots() {
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        let live = page.insert_record(b"live").expect("insert live slot");
+        let deleted = page.insert_record(b"deleted").expect("insert deleted slot");
+        page.delete_record(deleted.slot).expect("delete slot");
+        let expected_header = page.header().expect("validate page normally");
+
+        let validated = page.validated().expect("create validated view");
+        assert_eq!(validated.header(), expected_header);
+        assert_eq!(
+            validated.live_record(live.slot).expect("read live slot"),
+            Some((
+                page.slot(live.slot).expect("read expected slot"),
+                b"live".as_slice()
+            ))
+        );
+        assert_eq!(
+            validated
+                .live_record(deleted.slot)
+                .expect("read deleted slot"),
+            None
+        );
+        assert!(matches!(
+            validated.live_record(SlotId(expected_header.slot_count)),
+            Err(StorageError::Page(PageError::InvalidSlot { slot }))
+                if slot == SlotId(expected_header.slot_count)
+        ));
+    }
+
+    #[test]
+    fn validated_page_creation_rejects_checksum_and_structural_corruption() {
+        let mut valid = Page::new(PageId(30), PageType::Heap);
+        valid.insert_record(b"first").expect("insert first");
+        valid.insert_record(b"other").expect("insert second");
+
+        let mut bad_checksum = valid.clone();
+        bad_checksum.bytes_mut()[PAGE_SIZE - 1] ^= 0x80;
+        assert!(matches!(
+            bad_checksum.validated(),
+            Err(StorageError::Page(PageError::ChecksumMismatch { .. }))
+        ));
+
+        let mut zero_generation = valid.clone();
+        zero_generation.bytes_mut()[super::PAGE_HEADER_SIZE + 4..super::PAGE_HEADER_SIZE + 8]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        zero_generation.refresh_checksum();
+        assert!(matches!(
+            zero_generation.validated(),
+            Err(StorageError::Page(PageError::InvalidSlotGeneration {
+                slot: SlotId(0),
+                generation: 0,
+            }))
+        ));
+
+        let mut bad_bounds = valid.clone();
+        bad_bounds.bytes_mut()[super::PAGE_HEADER_SIZE + 2..super::PAGE_HEADER_SIZE + 4]
+            .copy_from_slice(&(u16::MAX - 1).to_le_bytes());
+        bad_bounds.refresh_checksum();
+        assert!(matches!(
+            bad_bounds.validated(),
+            Err(StorageError::Page(PageError::RecordOutOfBounds { .. }))
+        ));
+
+        let mut bad_free_space = valid.clone();
+        bad_free_space.bytes_mut()[super::FREE_END_OFFSET..super::FREE_END_OFFSET + 2]
+            .copy_from_slice(&((super::PAGE_HEADER_SIZE - 1) as u16).to_le_bytes());
+        bad_free_space.refresh_checksum();
+        assert!(matches!(
+            bad_free_space.validated(),
+            Err(StorageError::Page(PageError::InvalidFreeSpace { .. }))
+        ));
+
+        let mut overlap = valid;
+        let first_offset = overlap.slot(SlotId(0)).expect("first slot").offset;
+        let second_entry = super::PAGE_HEADER_SIZE + super::SLOT_SIZE;
+        overlap.bytes_mut()[second_entry..second_entry + 2]
+            .copy_from_slice(&first_offset.to_le_bytes());
+        overlap.refresh_checksum();
+        assert!(matches!(
+            overlap.validated(),
+            Err(StorageError::Page(PageError::OverlappingRecords {
+                first: SlotId(0),
+                second: SlotId(1),
             }))
         ));
     }

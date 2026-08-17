@@ -251,8 +251,10 @@ document against the canonical schema decoded from SDK Schema Spec v1.
 
 The reproducible warm-cache performance baseline is documented in
 [`docs/performance.md`](docs/performance.md). It measures current public
-database behavior and real chosen plans without adding an optimizer or a CI
-wall-clock gate.
+database behavior and real chosen plans without adding a CI wall-clock gate.
+Phase 7E adds direct storage-scan attribution and validates each immutable Heap
+page once per sequential scan, while retaining the complete checksum and
+structural corruption boundary.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -619,8 +621,11 @@ The implementation sequence is intentionally vertical:
     (Phase 7C) — complete.
 32. Costed simple equi HashJoin for analyzed direct Scan × Scan INNER JOINs
     (Phase 7D) — complete; Inspection JSON v3 is current.
-33. SeqScan row decode and materialization throughput (Phase 7E) — selected
-    from post-7D benchmark evidence, not started.
+33. Validate-once Heap sequential scan (Phase 7E) — complete; one authoritative
+    full validation is reused through a crate-private immutable page borrow,
+    with checked record access and unchanged persistent formats.
+34. Predicate column-position prebinding (Phase 7F) — selected from post-7E
+    non-equi NestedLoopJoin evidence, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

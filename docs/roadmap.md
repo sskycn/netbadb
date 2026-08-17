@@ -507,16 +507,46 @@ reporting.
   duplicate, and equality no-match joins while a non-equi no-match join retains
   the measured NestedLoopJoin reference.
 
-### Phase 7E — SeqScan row decode and materialization throughput (selected, not started)
+### Phase 7E — Validate-once Heap scan (complete)
 
-Post-7D equality joins scale approximately with input rows rather than candidate
-pairs, and unique, duplicate, and no-match HashJoin timings remain close. Their
-shared work is materializing the two SeqScan children, so Phase 7E is selected
-to measure and improve that row-decode/materialization boundary before widening
-join planning. Predicate position prebinding or borrowed evaluation remains the
-next candidate for the retained non-equi NestedLoopJoin; chained/multi-way hash
-planning, cardinality/property propagation, and covering reads rank behind
-those measured paths. No Phase 7E implementation is part of Phase 7D.
+- source inspection found that Heap scan's slot-state and record-read paths
+  could repeat the complete `Page::header` checksum and structural validation
+  `1 + 2N` times for a page with `N` live slots;
+- a crate-private immutable `ValidatedPage<'_>` is created only by the existing
+  authoritative full validation, borrows its `Page`, and stores the validated
+  `PageHeader` without adding a trust bit or cache to mutable Page state;
+- one combined live-record operation reads a slot once, preserves its RowId
+  generation, represents tombstones as `None`, rejects invalid slots with a
+  typed error, and obtains payloads through checked slices;
+- `HeapStorage::scan` performs one full validation per Heap page per scan and
+  reuses it only inside that immutable borrow; non-Heap single-payload
+  validation is unchanged;
+- the row codec, Text ownership, full-row materialization, buffer pool,
+  PageManager, checksum algorithm, public Page APIs, planner, executor, and all
+  persistent formats remain unchanged;
+- direct two-column/1,000-row and six-column-with-Text/10,000-row storage scans
+  were added before the implementation, then controlled full-profile pre/post
+  runs were recorded three times each; query, range-plan, HashJoin, non-equi
+  reference, and result gates remained intact.
+
+### Phase 7F — Predicate column-position prebinding (selected, not started)
+
+Post-7E direct scans are no longer the dominant measured read cost. The
+non-equi 1,000×1,000 NestedLoopJoin still spends roughly two orders of
+magnitude more time than its two direct two-column child scans combined, and
+source inspection confirms that every candidate expression evaluation searches
+the output fields again for each referenced column. Phase 7F is therefore
+selected to measure and prebind typed expression column positions once at an
+execution boundary while preserving binding identity, NULL semantics, typed
+errors, and complete residual predicates. No Phase 7F implementation is part
+of Phase 7E.
+
+The remaining measured candidate order is: projection/required-column pruning
+and row-codec/Text ownership for the wider scan shape; BufferPool read-page
+snapshot copying and sequential PageManager traversal behind the now-small
+direct scan; covering/index-only reads; then broader HashJoin eligibility.
+Each requires its own attribution scenario before implementation, and
+multi-way join planning remains later work.
 
 ### Later Phase 7 work
 

@@ -502,6 +502,31 @@ Database file
   planner, or executor. `netbadb-storage::BTree` owns page traversal,
   allocation, transaction/WAL ordering, publication, and recovery integration.
 
+Heap sequential scan uses one immutable validation proof per buffered page:
+
+```text
+Disk / Buffer Page
+        ↓
+one authoritative Page::header full validation
+        ↓
+ValidatedPage<'_> borrowing the immutable Page
+        ↓
+checked slot lookup and borrowed live-record slices
+        ↓
+unchanged row codec and owned ScalarValue row
+```
+
+`ValidatedPage` is crate-private and can only be created through the existing
+full `Page::header` validation. Its lifetime prevents mutable access to the
+borrowed `Page` while the stored `PageHeader` and structural proof are reused.
+It is not a persistent trust bit, a validation cache in `Page`, or an on-disk
+marker. Live-record slicing still uses checked ranges; invalid slots return a
+typed error, and checksum, generation, record-bound, free-space, and overlap
+corruption fails before traversal begins. Public Page operations retain their
+existing validation semantics. Non-Heap pages encountered in a table file
+still pass their existing single-payload validation before Heap scan skips
+them.
+
 The experimental container retains the legacy `NBPG` file-root marker. Heap
 metadata has its own `NBD1` marker and version 3 little-endian layout inside
 the header page:
@@ -598,7 +623,9 @@ formats have no migration path and are rejected rather than reinterpreted.
 
 One table database file may interleave Heap and B+Tree pages. Heap scans and
 first-fit allocation validate every page, process only Heap pages, and skip
-valid index pages. RowId read/update/delete requires a Heap page, so a locator
+valid index pages. A Heap scan performs that complete page-wide validation once
+and reuses it only for the lifetime of the page's immutable borrow. RowId
+read/update/delete requires a Heap page, so a locator
 for an index page is rejected. B+Tree allocation uses the same PageManager,
 buffer pool, transaction manager, WAL generation, recovery, and checkpoint as
 heap mutation; there is no second file or durability domain.

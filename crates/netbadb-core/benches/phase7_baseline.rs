@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use netbadb_core::{Database, ExecutionResult, QueryResult};
 use netbadb_inspect::{PlanNodeInspection, StatementInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+use netbadb_storage::HeapStorage;
+use netbadb_types::{ColumnId, PhysicalType, RowId, ScalarValue, TableId};
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
@@ -245,6 +246,7 @@ fn main() -> BenchResult<()> {
     let settings = profile.settings();
     let mut measurements = Vec::new();
 
+    run_direct_heap_scan_scenarios(settings, &mut measurements)?;
     run_point_and_shape_scenarios(settings, &mut measurements)?;
     run_join_scenarios(settings, &mut measurements)?;
     run_insert_scenarios(settings, &mut measurements)?;
@@ -252,6 +254,74 @@ fn main() -> BenchResult<()> {
     run_planner_scenario(settings, &mut measurements)?;
 
     print_report(profile, settings, &measurements)?;
+    Ok(())
+}
+
+fn run_direct_heap_scan_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    run_direct_heap_scan(
+        "heap_scan_join_shape",
+        settings.join_large,
+        join_table(LEFT_TABLE_ID, "join_rows"),
+        2,
+        |id| {
+            let value = i64::try_from(id).map_err(|_| message_error("join ID exceeds i64"))?;
+            Ok(vec![ScalarValue::Int64(value), ScalarValue::Int64(value)])
+        },
+        settings,
+        measurements,
+    )?;
+    run_direct_heap_scan(
+        "heap_scan_item_shape",
+        settings.medium_rows,
+        items_table(),
+        6,
+        |id| item_row(id, 4, NullDistribution::Low),
+        settings,
+        measurements,
+    )
+}
+
+fn run_direct_heap_scan(
+    scenario: &str,
+    rows: u64,
+    table: TableDef,
+    expected_columns: usize,
+    mut row: impl FnMut(u64) -> BenchResult<Vec<ScalarValue>>,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let paths = FixturePaths::new(scenario, 1);
+    let mut storage = HeapStorage::create(paths.path(0), table)?;
+    let mut transaction = storage.begin_transaction()?;
+    for id in 0..rows {
+        storage.insert_in(&mut transaction, &row(id)?)?;
+    }
+    transaction.commit()?;
+
+    let expected = Observation {
+        rows,
+        checksum: arithmetic_sum(rows),
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || storage.scan().map_err(Into::into),
+        |result| heap_scan_observation(result, expected_columns),
+    )?;
+    storage.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: rows.to_string(),
+        plan: "DirectHeapScan".to_owned(),
+        operations_per_iteration: 1,
+        durations,
+    });
     Ok(())
 }
 
@@ -1081,6 +1151,34 @@ fn ids_observation(result: &QueryResult) -> BenchResult<Observation> {
     Ok(Observation {
         rows: u64::try_from(result.rows.len())
             .map_err(|_| message_error("result row count exceeds u64"))?,
+        checksum,
+    })
+}
+
+fn heap_scan_observation(
+    result: &[(RowId, Vec<ScalarValue>)],
+    expected_columns: usize,
+) -> BenchResult<Observation> {
+    let mut checksum = 0_u128;
+    for (_, values) in result {
+        if values.len() != expected_columns {
+            return Err(message_error(format!(
+                "heap scan returned {} columns; expected {expected_columns}",
+                values.len()
+            )));
+        }
+        let Some(ScalarValue::Int64(id)) = values.first() else {
+            return Err(message_error(
+                "heap scan row must begin with a non-NULL Int64 ID",
+            ));
+        };
+        checksum = checksum
+            .checked_add(u128::try_from(*id).map_err(|_| message_error("negative heap row ID"))?)
+            .ok_or_else(|| message_error("heap scan checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: u64::try_from(result.len())
+            .map_err(|_| message_error("heap scan row count exceeds u64"))?,
         checksum,
     })
 }

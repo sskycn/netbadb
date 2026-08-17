@@ -2,15 +2,14 @@
 
 Phase 7A established a transparent, dependency-free benchmark target for
 database and planner behavior. Phase 7B kept that target and used its measured
-plan gap to optimize bounded integer ranges. After Phase 7B, join execution was
-the highest read-path candidate: NestedLoopJoin materialized and copied a
-combined row for every candidate pair before testing its predicate. Phase 7C
-removed that rejected-pair work, but measured evidence still showed that a
-fully disjoint 1,000×1,000 join spent meaningful time enumerating and testing
-one million candidate pairs. Phase 7D therefore adds a narrowly costed simple
-equi HashJoin while retaining the same benchmark target. The target uses
-`std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
-optimized bench profile.
+plan gap to optimize bounded integer ranges. Phase 7C removed rejected-pair
+materialization from NestedLoopJoin, and Phase 7D added a narrowly costed
+simple equi HashJoin after measurements isolated the remaining quadratic
+candidate work. Post-7D source inspection then found that Heap sequential scan
+repeated the complete `Page::header` validation in its per-slot paths. Phase 7E
+retains the same benchmark target and validates each immutable Heap page once
+per scan. The target uses `std::time::Instant` and `std::hint::black_box`, and
+Cargo builds it with the optimized bench profile.
 
 Run the default quick profile for development confirmation:
 
@@ -49,6 +48,12 @@ database, and the timed operation includes the transaction begin, deterministic
 row inserts, registered-index maintenance, and commit. Index creation itself
 is setup and is not timed.
 
+The two direct Heap scan scenarios likewise create and load their fixtures and
+commit the load transaction outside the timed loop. They time
+`HeapStorage::scan` directly, without SQL compilation, planning, or executor
+dispatch, and validate the complete returned row width, row count, and a
+deterministic first-column checksum.
+
 Each measurement retains a `Vec<Duration>`. Durations are sorted to report:
 
 - minimum;
@@ -85,6 +90,11 @@ path. It never infers an IndexScan merely because an index exists.
 
 The target currently covers:
 
+- direct Heap scan of a two-Int64-column join-shaped table, using 1,000 rows in
+  the full profile and reporting `DirectHeapScan`;
+- direct Heap scan of the existing six-column item shape, including its Text
+  payload, using 10,000 rows in the full profile and reporting
+  `DirectHeapScan`;
 - point equality with no index: `Filter → SeqScan`;
 - the same point equality with an analyzed registered ID index:
   `Filter → IndexScan`;
@@ -148,9 +158,35 @@ remaining close despite different bucket-candidate counts. The retained
 non-equi no-match NestedLoopJoin remains slower and scales worse. This indicates
 that the eligible equality path no longer pays dominant quadratic candidate
 work and that shared child scanning, row decoding, and materialization are now
-the leading measured follow-up. Phase 7E therefore targets that common scan
-throughput boundary; it does not extend HashJoin eligibility or start a
-multi-way join optimizer.
+the leading measured follow-up.
+
+Phase 7E source inspection found the concrete storage cause. A Heap scan first
+called `Page::header`, then `slot_state` called it again for each slot, and a
+live slot's `read_record` path called it yet again. For a page with `N` live
+slots, one scan could therefore perform `1 + 2N` complete page validations.
+`Page::header` is not a field getter: it verifies magic and version, the
+PageId-bound CRC32C, reserved bytes, page type, free-space bounds, every slot
+generation and record range, and pairwise record non-overlap, allocating a
+record-range vector along the way.
+
+Controlled pre-feature and post-feature full-profile runs were recorded three
+times each, strictly serially, after adding the two direct attribution
+scenarios. The median of the three per-run medians showed an order-of-magnitude
+improvement for both direct shapes and for every scan-dominated query, while
+plan and result gates remained unchanged. The two-column direct scan improved
+more than the wider Text-bearing shape, which now exposes row width, decoding,
+and ownership as a smaller follow-up cost. HashJoin scenarios also improved
+substantially because both children are scans. The non-equi million-candidate
+NestedLoopJoin improved from cheaper children but remains the largest measured
+read-path case because candidate predicate evaluation now dominates.
+
+That post-7E evidence selects predicate column-position prebinding for Phase
+7F. The current expression evaluator resolves each column by scanning output
+fields for every candidate evaluation. Projection/required-column pruning and
+row-codec Text ownership rank next; buffer-page snapshot copying and sequential
+page traversal rank behind the now-small direct scan, while covering reads and
+broader HashJoin eligibility need their own representative evidence. Phase 7E
+does not implement any of those follow-ups.
 
 ## CI and compatibility
 
@@ -160,5 +196,6 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. It changes no NetbaDB Protocol v1 message, SDK Schema Spec
-v1 field, deployment manifest v4 field, or database persistent format.
+represent HashJoin. Phase 7E introduces no plan or inspection change, so v3
+remains current. It changes no NetbaDB Protocol v1 message, SDK Schema Spec v1
+field, deployment manifest v4 field, or database persistent format.
