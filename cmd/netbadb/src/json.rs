@@ -11,7 +11,7 @@ use netbadb_sdk::inspection::{
 use netbadb_sdk::{PhysicalType, ScalarValue, SemanticType};
 use serde::Serialize;
 
-pub(crate) const INSPECTION_JSON_VERSION: u32 = 2;
+pub(crate) const INSPECTION_JSON_VERSION: u32 = 3;
 const INSPECTION_JSON_FORMAT: &str = "netbadb-inspection";
 
 pub(crate) fn render_catalog(catalog: &CatalogInspection) -> Result<String, serde_json::Error> {
@@ -402,6 +402,14 @@ enum PlanJson<'a> {
         left: Box<PlanJson<'a>>,
         right: Box<PlanJson<'a>>,
     },
+    HashJoin {
+        kind: &'static str,
+        left_key: ColumnReferenceJson<'a>,
+        right_key: ColumnReferenceJson<'a>,
+        predicate: ExpressionJson<'a>,
+        left: Box<PlanJson<'a>>,
+        right: Box<PlanJson<'a>>,
+    },
     Filter {
         predicate: ExpressionJson<'a>,
         input: Box<PlanJson<'a>>,
@@ -477,6 +485,21 @@ impl<'a> From<&'a PlanNodeInspection> for PlanJson<'a> {
                 right,
             } => Self::NestedLoopJoin {
                 kind: join_kind(*kind),
+                predicate: ExpressionJson::from(predicate),
+                left: Box::new(PlanJson::from(left.as_ref())),
+                right: Box::new(PlanJson::from(right.as_ref())),
+            },
+            PlanNodeInspection::HashJoin {
+                kind,
+                left_key,
+                right_key,
+                predicate,
+                left,
+                right,
+            } => Self::HashJoin {
+                kind: join_kind(*kind),
+                left_key: ColumnReferenceJson::from(left_key),
+                right_key: ColumnReferenceJson::from(right_key),
                 predicate: ExpressionJson::from(predicate),
                 left: Box::new(PlanJson::from(left.as_ref())),
                 right: Box::new(PlanJson::from(right.as_ref())),
@@ -781,11 +804,22 @@ mod tests {
     use super::{render_catalog, render_statement};
 
     fn column(id: u32, name: &str, physical: PhysicalType) -> ColumnReferenceInspection {
+        bound_column(0, 1, "users", id, name, physical)
+    }
+
+    fn bound_column(
+        binding_id: u32,
+        table_id: u64,
+        relation_name: &str,
+        id: u32,
+        name: &str,
+        physical: PhysicalType,
+    ) -> ColumnReferenceInspection {
         ColumnReferenceInspection {
-            binding_id: RelationBindingId(0),
-            table_id: TableId(1),
+            binding_id: RelationBindingId(binding_id),
+            table_id: TableId(table_id),
             column_id: ColumnId(id),
-            relation_name: "users".into(),
+            relation_name: relation_name.into(),
             name: name.into(),
             data_type: SemanticType::physical(physical),
             nullable: false,
@@ -835,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_json_v2_matches_the_golden_contract() {
+    fn catalog_json_v3_matches_the_golden_contract() {
         let catalog = CatalogInspection {
             tables: vec![TableInspection {
                 table_id: TableId(1),
@@ -866,12 +900,12 @@ mod tests {
         };
         assert_eq!(
             render_catalog(&catalog).unwrap(),
-            include_str!("../tests/golden/catalog-v2.json")
+            include_str!("../tests/golden/catalog-v3.json")
         );
     }
 
     #[test]
-    fn seq_scan_statement_json_v2_matches_the_golden_contract() {
+    fn seq_scan_statement_json_v3_matches_the_golden_contract() {
         let id = column(1, "id", PhysicalType::UInt64);
         let inspection = statement(
             PlanNodeInspection::Project {
@@ -887,12 +921,77 @@ mod tests {
         );
         assert_eq!(
             render_statement(&inspection).unwrap(),
-            include_str!("../tests/golden/statement-seq-scan-v2.json")
+            include_str!("../tests/golden/statement-seq-scan-v3.json")
+        );
+    }
+
+    fn join_statement(hash: bool) -> StatementInspection {
+        let left = bound_column(0, 1, "e", 1, "id", PhysicalType::Int64);
+        let right = bound_column(1, 1, "m", 1, "id", PhysicalType::Int64);
+        let predicate = expression(
+            ExpressionKindInspection::Binary {
+                operator: BinaryOpInspection::Eq,
+                left: Box::new(expression(
+                    ExpressionKindInspection::Column(left.clone()),
+                    PhysicalType::Int64,
+                )),
+                right: Box::new(expression(
+                    ExpressionKindInspection::Column(right.clone()),
+                    PhysicalType::Int64,
+                )),
+            },
+            PhysicalType::Bool,
+        );
+        let left_scan = PlanNodeInspection::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            table_name: "employees".into(),
+            columns: vec![left.clone()],
+        };
+        let right_scan = PlanNodeInspection::SeqScan {
+            binding_id: RelationBindingId(1),
+            table_id: TableId(1),
+            table_name: "employees".into(),
+            columns: vec![right.clone()],
+        };
+        let root = if hash {
+            PlanNodeInspection::HashJoin {
+                kind: netbadb_sdk::inspection::JoinKindInspection::Inner,
+                left_key: left.clone(),
+                right_key: right,
+                predicate,
+                left: Box::new(left_scan),
+                right: Box::new(right_scan),
+            }
+        } else {
+            PlanNodeInspection::NestedLoopJoin {
+                kind: netbadb_sdk::inspection::JoinKindInspection::Inner,
+                predicate,
+                left: Box::new(left_scan),
+                right: Box::new(right_scan),
+            }
+        };
+        statement(root, vec![result(&left)])
+    }
+
+    #[test]
+    fn nested_loop_join_statement_json_v3_matches_the_golden_contract() {
+        assert_eq!(
+            render_statement(&join_statement(false)).unwrap(),
+            include_str!("../tests/golden/statement-nested-loop-join-v3.json")
         );
     }
 
     #[test]
-    fn index_filter_statement_json_v2_matches_the_golden_contract() {
+    fn hash_join_statement_json_v3_matches_the_golden_contract() {
+        assert_eq!(
+            render_statement(&join_statement(true)).unwrap(),
+            include_str!("../tests/golden/statement-hash-join-v3.json")
+        );
+    }
+
+    #[test]
+    fn index_filter_statement_json_v3_matches_the_golden_contract() {
         let id = column(1, "id", PhysicalType::UInt64);
         let predicate = expression(
             ExpressionKindInspection::Binary {
@@ -921,12 +1020,12 @@ mod tests {
         );
         assert_eq!(
             render_statement(&inspection).unwrap(),
-            include_str!("../tests/golden/statement-index-filter-v2.json")
+            include_str!("../tests/golden/statement-index-filter-v3.json")
         );
     }
 
     #[test]
-    fn range_index_statement_json_v2_matches_the_golden_contract() {
+    fn range_index_statement_json_v3_matches_the_golden_contract() {
         let id = column(1, "id", PhysicalType::Int64);
         let inspection = statement(
             PlanNodeInspection::RangeIndexScan {
@@ -944,12 +1043,12 @@ mod tests {
         );
         assert_eq!(
             render_statement(&inspection).unwrap(),
-            include_str!("../tests/golden/statement-range-index-v2.json")
+            include_str!("../tests/golden/statement-range-index-v3.json")
         );
     }
 
     #[test]
-    fn aggregate_statement_json_v2_matches_the_golden_contract() {
+    fn aggregate_statement_json_v3_matches_the_golden_contract() {
         let team_id = column(2, "team_id", PhysicalType::UInt64);
         let count = ResultFieldInspection {
             name: "count(*)".into(),
@@ -979,12 +1078,12 @@ mod tests {
         );
         assert_eq!(
             render_statement(&inspection).unwrap(),
-            include_str!("../tests/golden/statement-aggregate-v2.json")
+            include_str!("../tests/golden/statement-aggregate-v3.json")
         );
     }
 
     #[test]
-    fn dml_statement_json_v2_matches_the_golden_contract() {
+    fn dml_statement_json_v3_matches_the_golden_contract() {
         let inspection = StatementInspection {
             kind: StatementKind::Insert,
             access: StatementAccessInspection {
@@ -1006,7 +1105,7 @@ mod tests {
         };
         assert_eq!(
             render_statement(&inspection).unwrap(),
-            include_str!("../tests/golden/statement-dml-v2.json")
+            include_str!("../tests/golden/statement-dml-v3.json")
         );
     }
 }

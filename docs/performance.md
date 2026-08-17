@@ -5,9 +5,12 @@ database and planner behavior. Phase 7B kept that target and used its measured
 plan gap to optimize bounded integer ranges. After Phase 7B, join execution was
 the highest read-path candidate: NestedLoopJoin materialized and copied a
 combined row for every candidate pair before testing its predicate. Phase 7C
-keeps the same benchmark target and removes that rejected-pair work. The target
-uses `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with
-the optimized bench profile.
+removed that rejected-pair work, but measured evidence still showed that a
+fully disjoint 1,000×1,000 join spent meaningful time enumerating and testing
+one million candidate pairs. Phase 7D therefore adds a narrowly costed simple
+equi HashJoin while retaining the same benchmark target. The target uses
+`std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
+optimized bench profile.
 
 Run the default quick profile for development confirmation:
 
@@ -94,9 +97,11 @@ The target currently covers:
 - a one-sided indexed-ID range retaining `SeqScan` because it is not costed;
 - `ORDER BY team_id LIMIT 20`, retaining explicit in-memory Sort and Limit;
 - low- and higher-cardinality `GROUP BY team_id` through in-memory Aggregate;
-- unique-like, duplicate-key, and fully disjoint NestedLoopJoin at two input
-  scales; disjoint left keys are `[0, N)` and right keys are `[N, 2N)` and must
-  produce zero rows with checksum zero;
+- unique-like, duplicate-key, and fully disjoint analyzed equality joins at two
+  input scales, selecting HashJoin after Phase 7D;
+- a fully disjoint analyzed non-equality join at both scales, retaining
+  NestedLoopJoin; disjoint left keys are `[0, N)` and right keys are `[N, 2N)`
+  and both no-match shapes must produce zero rows with checksum zero;
 - direct INSERT into tables with zero, one, and two registered indexes;
 - SQL UPDATE of an indexed key while locating distinct rows through an index;
 - `Database::inspect_statement` compile plus real physical-planning overhead.
@@ -113,13 +118,39 @@ union/intersection, join alternatives, and sort avoidance remain deferred.
 Phase 7C evaluates each join predicate through a non-owning view over the
 already materialized left and right child rows. A rejected pair allocates no
 combined value vector and copies no row values; a matching pair is materialized
-normally in left-then-right order. Controlled before/after full-profile runs at
-500×500 and 1,000×1,000 show the strongest improvement for fully disjoint joins,
-while unique-like and duplicate-key joins also benefit from avoiding work on
-their rejected pairs. This is only a constant-factor executor optimization:
-candidate-pair growth remains quadratic, PhysicalPlan still contains only
-NestedLoopJoin for joins, and there is no join reordering, cost model, or new
-join algorithm.
+normally in left-then-right order. Controlled full-profile runs at 500×500 and
+1,000×1,000 showed that the fully disjoint million-pair case still spent
+material time in candidate enumeration and typed predicate evaluation even
+though it produced no rows. That qualitative result isolated the remaining
+quadratic work and selected Phase 7D's algorithm change.
+
+Phase 7D considers HashJoin only for an INNER JOIN whose current logical
+children are direct scans, whose predicate contains a necessary cross-side
+column equality in an AND tree, and whose two tables both have existing ANALYZE
+row counts. It compares transparent integer work units: `left_rows * right_rows`
+for NestedLoopJoin and `left_rows + right_rows` for HashJoin, using checked
+`u128` arithmetic and selecting hash only when it is strictly cheaper. Missing
+statistics, ties, non-equality predicates, unsupported boolean shapes, and
+non-scan children retain NestedLoopJoin.
+
+HashJoin materializes both children, builds the right child into buckets of
+right-row indices, probes in left input order, and evaluates the complete typed
+predicate for every bucket candidate before materializing TRUE rows. NULL keys
+are excluded from both build and probe. Right indices retain input order, so
+the current deterministic left-major/right-minor behavior is preserved without
+turning unordered SQL output into a language guarantee. There is no join
+reordering, dynamic build-side choice, composite key, index coupling, spilling,
+or global cost model.
+
+The post-7D full-profile comparison shows approximately input-linear scaling
+for unique, duplicate, and no-match HashJoin scenarios, with those three shapes
+remaining close despite different bucket-candidate counts. The retained
+non-equi no-match NestedLoopJoin remains slower and scales worse. This indicates
+that the eligible equality path no longer pays dominant quadratic candidate
+work and that shared child scanning, row decoding, and materialization are now
+the leading measured follow-up. Phase 7E therefore targets that common scan
+throughput boundary; it does not extend HashJoin eligibility or start a
+multi-way join optimizer.
 
 ## CI and compatibility
 
@@ -127,7 +158,7 @@ join algorithm.
 the Rust 1.85 MSRV. The expensive workload is not a normal CI performance gate
 and has no pass/fail timing threshold.
 
-Phase 7B changed the current Inspection JSON contract from v1 to v2 to expose
-the new physical operator. Phase 7C keeps Inspection JSON v2 and changes no
-NetbaDB Protocol v1 message, SDK Schema Spec v1 field, deployment manifest v4
-field, or database persistent format.
+Phase 7B changed the Inspection JSON contract from v1 to v2 for
+RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
+represent HashJoin. It changes no NetbaDB Protocol v1 message, SDK Schema Spec
+v1 field, deployment manifest v4 field, or database persistent format.

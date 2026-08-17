@@ -214,7 +214,7 @@ The current code genuinely supports:
   handles and never drives execution;
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
-  current versioned Inspection JSON v2 output (with v1 retained historically);
+  current versioned Inspection JSON v3 output (with v1/v2 retained historically);
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
@@ -610,14 +610,17 @@ The implementation sequence is intentionally vertical:
     complete.
 27. Structured inspection and offline local CLI (Phases 6D1 and 6D2) — stable
     DTOs, deterministic text, manifest-v4 bootstrap, and historical Inspection
-    JSON v1. Complete; the current CLI contract is v2 after Phase 7B.
+    JSON v1. Complete; the current CLI contract is v3 after Phase 7D.
     Complete.
 28. Shared SQL diagnostics and diagnostics-only LSP (Phase 6E1) — complete.
 29. MCP and additional tooling adapters (Phase 6E2) — future work.
 30. Costed bounded Int64/UInt64 RangeIndexScan (Phase 7B) — complete.
 31. Predicate-first NestedLoopJoin rejected-pair materialization avoidance
     (Phase 7C) — complete.
-32. Further advanced optimization — select from post-7C benchmark evidence.
+32. Costed simple equi HashJoin for analyzed direct Scan × Scan INNER JOINs
+    (Phase 7D) — complete; Inspection JSON v3 is current.
+33. SeqScan row decode and materialization throughput (Phase 7E) — selected
+    from post-7D benchmark evidence, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

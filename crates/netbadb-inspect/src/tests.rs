@@ -217,7 +217,7 @@ fn statement_renderer_covers_join_aggregate_and_dml() {
     };
     let join = PlanNodeInspection::NestedLoopJoin {
         kind: JoinKindInspection::Inner,
-        predicate,
+        predicate: predicate.clone(),
         left: Box::new(PlanNodeInspection::SeqScan {
             binding_id: RelationBindingId(0),
             table_id: TableId(1),
@@ -228,7 +228,7 @@ fn statement_renderer_covers_join_aggregate_and_dml() {
             binding_id: RelationBindingId(1),
             table_id: TableId(1),
             table_name: "employees".into(),
-            columns: vec![manager],
+            columns: vec![manager.clone()],
         }),
     };
     let join_text = render_statement(&query_statement(join));
@@ -247,6 +247,35 @@ fn statement_renderer_covers_join_aggregate_and_dml() {
             "        SeqScan table=employees#1 binding=#1 columns=[m#1.id#1@table#1]\n",
         )
     );
+
+    let hash_join = PlanNodeInspection::HashJoin {
+        kind: JoinKindInspection::Inner,
+        left_key: employee.clone(),
+        right_key: manager.clone(),
+        predicate,
+        left: Box::new(PlanNodeInspection::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            table_name: "employees".into(),
+            columns: vec![employee.clone()],
+        }),
+        right: Box::new(PlanNodeInspection::SeqScan {
+            binding_id: RelationBindingId(1),
+            table_id: TableId(1),
+            table_name: "employees".into(),
+            columns: vec![manager],
+        }),
+    };
+    let hash_text = render_statement(&query_statement(hash_join));
+    assert!(hash_text.contains(concat!(
+        "HashJoin kind=Inner ",
+        "left_key=e#0.id#1@table#1 right_key=m#1.id#1@table#1 ",
+        "predicate=Eq(e#0.id#1@table#1, m#1.id#1@table#1)\n",
+        "      left:\n",
+        "        SeqScan table=employees#1 binding=#0 columns=[e#0.id#1@table#1]\n",
+        "      right:\n",
+        "        SeqScan table=employees#1 binding=#1 columns=[m#1.id#1@table#1]\n",
+    )));
 
     let aggregate = PlanNodeInspection::Aggregate {
         group_keys: vec![employee.clone()],

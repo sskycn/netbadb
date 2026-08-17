@@ -263,6 +263,22 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
             left: Box::new(inspect_plan(left)),
             right: Box::new(inspect_plan(right)),
         },
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            right_key,
+            predicate,
+            columns: _,
+        } => PlanNodeInspection::HashJoin {
+            kind: join_kind(*kind),
+            left_key: column_reference(left_key),
+            right_key: column_reference(right_key),
+            predicate: expression(predicate),
+            left: Box::new(inspect_plan(left)),
+            right: Box::new(inspect_plan(right)),
+        },
         PhysicalPlan::Filter { input, predicate } => PlanNodeInspection::Filter {
             predicate: expression(predicate),
             input: Box::new(inspect_plan(input)),

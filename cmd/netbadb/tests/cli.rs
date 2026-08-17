@@ -278,7 +278,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
     assert_eq!(first.stdout, second.stdout);
     let json = json_stdout(&first);
     assert_eq!(json["format"], "netbadb-inspection");
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["kind"], "catalog");
     assert_eq!(json["catalog"]["tables"][0]["name"], "users");
     assert_eq!(json["catalog"]["tables"][1]["name"], "admin_data");
@@ -313,7 +313,7 @@ fn statement_commands_report_real_plans_sql_files_bindings_and_aggregate_provena
     operators.clear();
     collect_operators(&ranged, &mut operators);
     assert!(operators.contains(&"range_index_scan"));
-    assert_eq!(ranged["version"], 2);
+    assert_eq!(ranged["version"], 3);
     let range = &ranged["statement"]["plan"]["root"]["input"]["input"];
     assert_eq!(range["lower_bound"]["kind"], "included");
     assert_eq!(range["lower_bound"]["value"]["value"], 40);
@@ -345,9 +345,25 @@ fn statement_commands_report_real_plans_sql_files_bindings_and_aggregate_provena
         "SELECT e.id, m.id FROM users e JOIN users m ON e.team_id = m.team_id",
         "json",
     );
+    let self_join_json = json_stdout(&self_join);
     let mut scans = Vec::new();
-    collect_scans(&json_stdout(&self_join), &mut scans);
+    collect_scans(&self_join_json, &mut scans);
     assert_eq!(scans, vec![(1, 0), (1, 1)]);
+    let hash_join = &self_join_json["statement"]["plan"]["root"]["input"];
+    assert_eq!(hash_join["operator"], "hash_join");
+    assert_eq!(hash_join["left_key"]["binding_id"], 0);
+    assert_eq!(hash_join["right_key"]["binding_id"], 1);
+    assert!(hash_join.get("build_side").is_none());
+
+    let non_equi = json_stdout(&statement(
+        &fixture,
+        "SELECT e.id, m.id FROM users e JOIN users m ON e.id < m.id",
+        "json",
+    ));
+    assert_eq!(
+        non_equi["statement"]["plan"]["root"]["input"]["operator"],
+        "nested_loop_join"
+    );
 
     let aggregate = statement(
         &fixture,

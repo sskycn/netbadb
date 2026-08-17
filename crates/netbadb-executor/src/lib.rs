@@ -319,6 +319,70 @@ fn execute_rows(
                 rows,
             })
         }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+            ..
+        } => {
+            if !left_key.data_type.is_compatible_with(&right_key.data_type) {
+                return Err(ExecutionError::TypeMismatch);
+            }
+            let left = execute_rows(left, storages)?;
+            let right = execute_rows(right, storages)?;
+            let left_key_position = find_source_position(&left.fields, left_key)?;
+            let right_key_position = find_source_position(&right.fields, right_key)?;
+            let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
+            for (right_index, right_row) in right.rows.iter().enumerate() {
+                let key = hash_join_key(right_row, right_key_position, right_key)?;
+                if let Some(key) = key {
+                    buckets.entry(key.clone()).or_default().push(right_index);
+                }
+            }
+
+            let fields = columns
+                .iter()
+                .cloned()
+                .map(OutputField::Source)
+                .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for left_row in left.rows {
+                let Some(key) = hash_join_key(&left_row, left_key_position, left_key)? else {
+                    continue;
+                };
+                let Some(right_indices) = buckets.get(key) else {
+                    continue;
+                };
+                for right_index in right_indices {
+                    let Some(right_row) = right.rows.get(*right_index) else {
+                        return Err(ExecutionError::TypeMismatch);
+                    };
+                    if evaluate_truth_values(
+                        predicate,
+                        EvaluationValues::Joined {
+                            left: &left_row.values,
+                            right: &right_row.values,
+                        },
+                        &fields,
+                    )? == TruthValue::True
+                    {
+                        let mut values = Vec::with_capacity(
+                            left_row.values.len().saturating_add(right_row.values.len()),
+                        );
+                        values.extend(left_row.values.iter().cloned());
+                        values.extend(right_row.values.iter().cloned());
+                        rows.push(ExecutionRow {
+                            row_id: None,
+                            values,
+                        });
+                    }
+                }
+            }
+            Ok(ExecutionRows { fields, rows })
+        }
         PhysicalPlan::Filter { input, predicate } => {
             let mut result = execute_rows(input, storages)?;
             let fields = result.fields.clone();
@@ -398,6 +462,24 @@ fn execute_rows(
             Ok(result)
         }
     }
+}
+
+fn hash_join_key<'a>(
+    row: &'a ExecutionRow,
+    position: usize,
+    column: &ColumnRef,
+) -> Result<Option<&'a ScalarValue>, ExecutionError> {
+    let value = row
+        .values
+        .get(position)
+        .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+    if matches!(value, ScalarValue::Null) {
+        return Ok(None);
+    }
+    if !value.matches_type(&column.data_type) {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    Ok(Some(value))
 }
 
 fn resolve_sort_positions(
@@ -1013,12 +1095,13 @@ mod tests {
     use super::{
         EvaluationValues, ExecutionError, QueryResult, TruthValue, evaluate, evaluate_binary,
         evaluate_truth, evaluate_truth_values, evaluate_values, execute, execute_rows,
+        execute_with_storages,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
         AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
-        DerivedField, Expr, ExprKind, LogicalPlan, NullOrder, OutputField, SortDirection, SortKey,
-        UnaryOp,
+        DerivedField, Expr, ExprKind, JoinKind, LogicalPlan, NullOrder, OutputField, SortDirection,
+        SortKey, UnaryOp,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
@@ -1487,6 +1570,330 @@ mod tests {
                 evaluate_truth(&expression, &contiguous, &fields).expect("contiguous truth"),
                 evaluate_truth_values(&expression, joined, &fields).expect("joined truth")
             );
+        }
+    }
+
+    #[test]
+    fn hash_join_matches_nested_loop_for_all_key_types_nulls_duplicates_and_residuals() {
+        fn column(
+            binding_id: u32,
+            table_id: u64,
+            column_id: u32,
+            name: &str,
+            physical: PhysicalType,
+            nullable: bool,
+        ) -> ColumnRef {
+            ColumnRef {
+                binding_id: RelationBindingId(binding_id),
+                table_id: TableId(table_id),
+                column_id: ColumnId(column_id),
+                relation_name: format!("r{binding_id}"),
+                name: name.into(),
+                data_type: SemanticType::physical(physical),
+                nullable,
+            }
+        }
+
+        fn expression(column: &ColumnRef) -> Expr {
+            Expr {
+                kind: ExprKind::Column(column.clone()),
+                expr_type: ExprType {
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+            }
+        }
+
+        fn literal(value: ScalarValue, physical: PhysicalType) -> Expr {
+            Expr {
+                kind: ExprKind::Literal(value),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(physical),
+                    nullable: false,
+                },
+            }
+        }
+
+        fn binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+            Expr {
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+            }
+        }
+
+        fn key_values(physical: PhysicalType) -> (ScalarValue, ScalarValue) {
+            match physical {
+                PhysicalType::Bool => (ScalarValue::Bool(true), ScalarValue::Bool(false)),
+                PhysicalType::Int64 => (ScalarValue::Int64(-7), ScalarValue::Int64(9)),
+                PhysicalType::UInt64 => (ScalarValue::UInt64(7), ScalarValue::UInt64(9)),
+                PhysicalType::Text => (
+                    ScalarValue::Text("alpha".into()),
+                    ScalarValue::Text("omega".into()),
+                ),
+            }
+        }
+
+        for (case, physical) in [
+            PhysicalType::Bool,
+            PhysicalType::Int64,
+            PhysicalType::UInt64,
+            PhysicalType::Text,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let left_table_id = TableId(1_000 + u64::try_from(case).expect("case ID"));
+            let right_table_id = TableId(2_000 + u64::try_from(case).expect("case ID"));
+            let left_path = std::env::temp_dir().join(format!(
+                "netbadb-hash-left-{physical:?}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let right_path = std::env::temp_dir().join(format!(
+                "netbadb-hash-right-{physical:?}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let table = |table_id, name| {
+                TableDef::new(
+                    table_id,
+                    name,
+                    vec![
+                        ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                        ColumnDef::new(ColumnId(2), "key", TypeSpec::Physical(physical))
+                            .nullable(true),
+                        ColumnDef::new(
+                            ColumnId(3),
+                            "enabled",
+                            TypeSpec::Physical(PhysicalType::Bool),
+                        ),
+                        ColumnDef::new(
+                            ColumnId(4),
+                            "marker",
+                            TypeSpec::Physical(PhysicalType::Int64),
+                        )
+                        .nullable(true),
+                    ],
+                )
+            };
+            let mut left_storage =
+                HeapStorage::create(&left_path, table(left_table_id, "left_rows"))
+                    .expect("create left heap");
+            let mut right_storage =
+                HeapStorage::create(&right_path, table(right_table_id, "right_rows"))
+                    .expect("create right heap");
+            let (first_key, second_key) = key_values(physical);
+            for row in [
+                vec![
+                    ScalarValue::Int64(1),
+                    first_key.clone(),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(1),
+                ],
+                vec![
+                    ScalarValue::Int64(2),
+                    first_key.clone(),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(2),
+                ],
+                vec![
+                    ScalarValue::Int64(3),
+                    ScalarValue::Null,
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(3),
+                ],
+                vec![
+                    ScalarValue::Int64(4),
+                    second_key.clone(),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(4),
+                ],
+            ] {
+                left_storage.insert(&row).expect("insert left row");
+            }
+            for row in [
+                vec![
+                    ScalarValue::Int64(10),
+                    first_key.clone(),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(10),
+                ],
+                vec![
+                    ScalarValue::Int64(11),
+                    first_key,
+                    ScalarValue::Bool(false),
+                    ScalarValue::Null,
+                ],
+                vec![
+                    ScalarValue::Int64(12),
+                    ScalarValue::Null,
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(12),
+                ],
+                vec![
+                    ScalarValue::Int64(13),
+                    second_key,
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(13),
+                ],
+            ] {
+                right_storage.insert(&row).expect("insert right row");
+            }
+
+            let left_columns = vec![
+                column(10, left_table_id.0, 1, "id", PhysicalType::Int64, false),
+                column(10, left_table_id.0, 2, "key", physical, true),
+                column(10, left_table_id.0, 3, "enabled", PhysicalType::Bool, false),
+                column(10, left_table_id.0, 4, "marker", PhysicalType::Int64, true),
+            ];
+            let right_columns = vec![
+                column(20, right_table_id.0, 1, "id", PhysicalType::Int64, false),
+                column(20, right_table_id.0, 2, "key", physical, true),
+                column(
+                    20,
+                    right_table_id.0,
+                    3,
+                    "enabled",
+                    PhysicalType::Bool,
+                    false,
+                ),
+                column(20, right_table_id.0, 4, "marker", PhysicalType::Int64, true),
+            ];
+            let left_scan = PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(10),
+                table_id: left_table_id,
+                table_name: "left_rows".into(),
+                columns: left_columns.clone(),
+            };
+            let right_scan = PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(20),
+                table_id: right_table_id,
+                table_name: "right_rows".into(),
+                columns: right_columns.clone(),
+            };
+            let equality = binary(
+                BinaryOp::Eq,
+                expression(&left_columns[1]),
+                expression(&right_columns[1]),
+            );
+            let mut columns = left_columns.clone();
+            columns.extend(right_columns.clone());
+            let nested = PhysicalPlan::NestedLoopJoin {
+                left: Box::new(left_scan.clone()),
+                right: Box::new(right_scan.clone()),
+                kind: JoinKind::Inner,
+                predicate: equality.clone(),
+                columns: columns.clone(),
+            };
+            let hash = PhysicalPlan::HashJoin {
+                left: Box::new(left_scan.clone()),
+                right: Box::new(right_scan.clone()),
+                kind: JoinKind::Inner,
+                left_key: left_columns[1].clone(),
+                right_key: right_columns[1].clone(),
+                predicate: equality.clone(),
+                columns: columns.clone(),
+            };
+            let mut storages = [left_storage, right_storage];
+            let nested_result =
+                execute_with_storages(&nested, &mut storages).expect("nested-loop execution");
+            let hash_result = execute_with_storages(&hash, &mut storages).expect("hash execution");
+            assert_eq!(hash_result, nested_result);
+            assert_eq!(
+                hash_result
+                    .rows
+                    .iter()
+                    .map(|row| (row[0].clone(), row[4].clone()))
+                    .collect::<Vec<_>>(),
+                [(1, 10), (1, 11), (2, 10), (2, 11), (4, 13)]
+                    .map(|(left, right)| { (ScalarValue::Int64(left), ScalarValue::Int64(right)) })
+            );
+            for _ in 0..5 {
+                assert_eq!(
+                    execute_with_storages(&hash, &mut storages).expect("repeat hash execution"),
+                    hash_result
+                );
+            }
+
+            if physical == PhysicalType::Int64 {
+                let mut invalid_left_key = left_columns[1].clone();
+                invalid_left_key.data_type = SemanticType::physical(PhysicalType::UInt64);
+                let mut invalid_right_key = right_columns[1].clone();
+                invalid_right_key.data_type = SemanticType::physical(PhysicalType::UInt64);
+                let invalid_runtime_key = PhysicalPlan::HashJoin {
+                    left: Box::new(left_scan.clone()),
+                    right: Box::new(right_scan.clone()),
+                    kind: JoinKind::Inner,
+                    left_key: invalid_left_key,
+                    right_key: invalid_right_key,
+                    predicate: equality.clone(),
+                    columns: columns.clone(),
+                };
+                assert!(matches!(
+                    execute_with_storages(&invalid_runtime_key, &mut storages),
+                    Err(ExecutionError::TypeMismatch)
+                ));
+
+                let residual = binary(
+                    BinaryOp::And,
+                    equality,
+                    binary(
+                        BinaryOp::And,
+                        binary(
+                            BinaryOp::Eq,
+                            expression(&right_columns[2]),
+                            literal(ScalarValue::Bool(true), PhysicalType::Bool),
+                        ),
+                        Expr {
+                            kind: ExprKind::IsNull {
+                                expression: Box::new(expression(&right_columns[3])),
+                                negated: true,
+                            },
+                            expr_type: ExprType {
+                                data_type: SemanticType::physical(PhysicalType::Bool),
+                                nullable: false,
+                            },
+                        },
+                    ),
+                );
+                let nested_residual = PhysicalPlan::NestedLoopJoin {
+                    left: Box::new(left_scan.clone()),
+                    right: Box::new(right_scan.clone()),
+                    kind: JoinKind::Inner,
+                    predicate: residual.clone(),
+                    columns: columns.clone(),
+                };
+                let hash_residual = PhysicalPlan::HashJoin {
+                    left: Box::new(left_scan),
+                    right: Box::new(right_scan),
+                    kind: JoinKind::Inner,
+                    left_key: left_columns[1].clone(),
+                    right_key: right_columns[1].clone(),
+                    predicate: residual,
+                    columns,
+                };
+                assert_eq!(
+                    execute_with_storages(&hash_residual, &mut storages)
+                        .expect("hash residual execution"),
+                    execute_with_storages(&nested_residual, &mut storages)
+                        .expect("nested residual execution")
+                );
+            }
+
+            for storage in storages {
+                storage.close().expect("close hash fixture");
+            }
+            let _ = std::fs::remove_file(&left_path);
+            let _ = std::fs::remove_file(netbadb_storage::wal_path(&left_path));
+            let _ = std::fs::remove_file(&right_path);
+            let _ = std::fs::remove_file(netbadb_storage::wal_path(&right_path));
         }
     }
 

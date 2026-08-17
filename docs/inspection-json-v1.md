@@ -1,6 +1,6 @@
 # NetbaDB Inspection JSON v1
 
-> Historical contract: the current CLI emits Inspection JSON v2. This file
+> Historical contract: the current CLI emits Inspection JSON v3. This file
 > and the v1 goldens remain unchanged references for the former contract.
 
 Inspection JSON v1 was the explicit machine-readable contract emitted by the

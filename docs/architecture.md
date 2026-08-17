@@ -59,7 +59,7 @@ Canonical Schema + source SQL               netbadb-inspect DTOs
         ↓                                           ↓
 netbadb-compiler                             embedded SDK / offline CLI
         ↓                                           ↓
-ToolingDiagnostic                           text / Inspection JSON v2
+ToolingDiagnostic                           text / Inspection JSON v3
         ↓
 netbadb-lsp UTF-16 adapter
 ```
@@ -92,7 +92,7 @@ compiler / planner / storage internal state
                     ↓
              embedded SDK
                     ↓
-       offline CLI text / explicit JSON v1
+       offline CLI text / explicit JSON v3
 ```
 
 `netbadb-inspect` depends only on canonical schema and type domains. Its DTOs
@@ -120,14 +120,15 @@ netbadb-sdk embedded Database
           ↓
 netbadb-inspect DTOs
        ↙       ↘
-human text   Inspection JSON v2
+human text   Inspection JSON v3
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
 obtain table bootstrap paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
-filesystem access. JSON v1 is an explicit external CLI contract converted
-exhaustively from inspection DTOs; the DTOs themselves remain serde-free.
+filesystem access. JSON v3 is the current explicit external CLI contract,
+converted exhaustively from inspection DTOs; v1 and v2 remain historical
+contracts and the DTOs themselves remain serde-free.
 Future runtime-inspection tooling, including MCP, consumes those DTOs directly
 rather than spawning the CLI. The diagnostics-only LSP does not use this path.
 
@@ -215,8 +216,8 @@ left-associated tree:
 
 ```text
 LogicalPlan::Join(left plan, right plan, Inner, typed predicate)
-    ↓ planner (no join reordering or join cost model)
-PhysicalPlan::NestedLoopJoin(left plan, right plan, typed predicate)
+    ↓ planner (no join reordering)
+PhysicalPlan::NestedLoopJoin or eligible PhysicalPlan::HashJoin
 ```
 
 Every physical node has binding-aware output columns. Expression and projection
@@ -225,7 +226,31 @@ joins. A scan row retains one hidden `RowId` for Phase 3B DML; a joined row
 combines scalar values and intentionally drops mutation identity because
 multi-table UPDATE/DELETE are not supported.
 
-The executor materializes both child results, iterates left rows outside and
+The planner keeps NestedLoopJoin as the general implementation. At the current
+join node it considers HashJoin only for an INNER JOIN over two direct logical
+scans, with existing table statistics on both sides and a necessary cross-side
+typed column equality found by deterministic left-to-right traversal through
+AND nodes:
+
+```text
+Join
+ |
+ +-- no statistics, non-equi, or unsupported child/predicate
+ |      -> NestedLoopJoin
+ |
+ +-- analyzed direct Scan × Scan with cross-side equality
+        +-- left_rows + right_rows < left_rows * right_rows
+               -> HashJoin
+        +-- otherwise
+               -> NestedLoopJoin
+```
+
+Both costs use checked `u128` work units. Missing or stale statistics can affect
+only the algorithm choice; the complete predicate remains the semantic source
+of truth. There is no join reorder, selectivity estimate, or global optimizer
+cost model.
+
+NestedLoopJoin materializes both child results, iterates left rows outside and
 right rows inside, and evaluates the typed `ON` predicate through a non-owning
 joined view:
 
@@ -242,8 +267,28 @@ materialized in left-then-right order. Column positions remain resolved by
 and literal results remain owned values. The existing expression checker
 requires BOOL while allowing nullable BOOL, and nominal compatibility prevents
 JOIN from comparing distinct semantic types with the same physical encoding.
-This remains a quadratic NestedLoopJoin and preserves duplicates plus
-deterministic left-major/right-minor order. Query operators are arranged as
+HashJoin also materializes both children but fixes the right child as the build
+side:
+
+```text
+right rows
+   -> HashMap<ScalarValue, Vec<right-row index>>
+                 ^
+left key probes -+
+   -> complete typed residual predicate
+   -> TRUE only: materialize left + right with row_id None
+```
+
+Build and probe NULL keys are skipped because SQL `NULL = NULL` is UNKNOWN.
+Buckets store indices rather than cloned rows, and indices are appended in
+right input order. Probing in left input order therefore preserves duplicates
+and the current deterministic left-major/right-minor behavior. Hash iteration
+order never determines results. This is executor behavior, not an unordered SQL
+result-order guarantee. Bool, Int64, UInt64, and Text use exact ScalarValue
+identity, while semantic compatibility protects nominal types and self joins
+use binding plus column IDs to identify sides.
+
+Query operators are arranged as
 `Scan/Join -> Filter -> Sort -> Project -> Limit`, allowing sorting by source
 columns that projection omits. `SELECT *` follows left-to-right relation and
 schema order.

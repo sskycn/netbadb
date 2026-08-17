@@ -630,7 +630,8 @@ mod tests {
             | PhysicalPlan::Project { input, .. }
             | PhysicalPlan::Aggregate { input, .. }
             | PhysicalPlan::Limit { input, .. } => planned_index(input),
-            PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+            PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::HashJoin { left, right, .. } => {
                 planned_index(left).or_else(|| planned_index(right))
             }
             PhysicalPlan::SeqScan { .. } | PhysicalPlan::RangeIndexScan { .. } => None,
@@ -658,7 +659,8 @@ mod tests {
             PlanNodeInspection::IndexScan {
                 index_column, key, ..
             } => Some((index_column.column_id, key)),
-            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_index(left).or_else(|| inspected_index(right))
             }
             PlanNodeInspection::Filter { input, .. }
@@ -675,7 +677,8 @@ mod tests {
     ) -> Option<&netbadb_inspect::IndexRangeInspection> {
         match plan {
             PlanNodeInspection::RangeIndexScan { range, .. } => Some(range),
-            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_range(left).or_else(|| inspected_range(right))
             }
             PlanNodeInspection::Filter { input, .. }
@@ -713,7 +716,8 @@ mod tests {
                 binding_id,
                 ..
             } => bindings.push((*table_id, binding_id.0)),
-            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
                 scan_bindings(left, bindings);
                 scan_bindings(right, bindings);
             }
@@ -728,7 +732,8 @@ mod tests {
     fn inspected_filter(plan: &PlanNodeInspection) -> Option<&ExpressionInspection> {
         match plan {
             PlanNodeInspection::Filter { predicate, .. } => Some(predicate),
-            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_filter(left).or_else(|| inspected_filter(right))
             }
             PlanNodeInspection::Sort { input, .. }

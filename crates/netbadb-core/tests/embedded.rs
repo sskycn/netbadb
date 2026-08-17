@@ -1,8 +1,56 @@
 use netbadb_core::{Database, DatabaseError, ExecutionResult, TransactionState};
 use netbadb_executor::ExecutionError;
+use netbadb_inspect::{PlanNodeInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
 use netbadb_storage::{PageError, StorageError};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+
+fn inspected_query_root(plan: &StatementPlanInspection) -> &PlanNodeInspection {
+    match plan {
+        StatementPlanInspection::Query { root } => root,
+        StatementPlanInspection::Insert { .. }
+        | StatementPlanInspection::Update { .. }
+        | StatementPlanInspection::Delete { .. } => panic!("expected query inspection"),
+    }
+}
+
+fn inspected_hash_keys(plan: &PlanNodeInspection) -> Option<(u32, u32)> {
+    match plan {
+        PlanNodeInspection::HashJoin {
+            left_key,
+            right_key,
+            ..
+        } => Some((left_key.binding_id.0, right_key.binding_id.0)),
+        PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            inspected_hash_keys(left).or_else(|| inspected_hash_keys(right))
+        }
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => inspected_hash_keys(input),
+        PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. } => None,
+    }
+}
+
+fn contains_nested_loop_join(plan: &PlanNodeInspection) -> bool {
+    match plan {
+        PlanNodeInspection::NestedLoopJoin { .. } => true,
+        PlanNodeInspection::HashJoin { left, right, .. } => {
+            contains_nested_loop_join(left) || contains_nested_loop_join(right)
+        }
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => contains_nested_loop_join(input),
+        PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. } => false,
+    }
+}
 
 fn users() -> TableDef {
     TableDef::new(
@@ -1496,6 +1544,21 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
             .insert_into(TableId(12), &values)
             .expect("insert team");
     }
+    database.analyze(TableId(11)).expect("analyze users");
+    database.analyze(TableId(12)).expect("analyze teams");
+    let equality_inspection = database
+        .inspect_statement("SELECT u.id FROM users u JOIN teams t ON u.team_id = t.id")
+        .expect("inspect analyzed equality join");
+    assert_eq!(
+        inspected_hash_keys(inspected_query_root(&equality_inspection.plan)),
+        Some((0, 1))
+    );
+    let non_equi_inspection = database
+        .inspect_statement("SELECT u.id FROM users u JOIN teams t ON u.id < t.id")
+        .expect("inspect analyzed non-equality join");
+    assert!(contains_nested_loop_join(inspected_query_root(
+        &non_equi_inspection.plan
+    )));
 
     assert!(
         database
@@ -1836,6 +1899,17 @@ fn self_join_uses_independent_relation_bindings() {
     ] {
         database.insert(&row).expect("insert employee");
     }
+    database.analyze(TableId(21)).expect("analyze employees");
+    let inspection = database
+        .inspect_statement(
+            "SELECT e.name, m.name FROM employees e JOIN employees m \
+             ON e.manager_id = m.id",
+        )
+        .expect("inspect self hash join");
+    assert_eq!(
+        inspected_hash_keys(inspected_query_root(&inspection.plan)),
+        Some((0, 1))
+    );
     let result = database
         .query(
             "SELECT e.name, m.name FROM employees e JOIN employees m \

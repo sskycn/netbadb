@@ -215,6 +215,7 @@ enum Operator {
     IndexScan,
     RangeIndexScan,
     NestedLoopJoin,
+    HashJoin,
     Filter,
     Sort,
     Project,
@@ -229,6 +230,7 @@ impl Operator {
             Self::IndexScan => "IndexScan",
             Self::RangeIndexScan => "RangeIndexScan",
             Self::NestedLoopJoin => "NestedLoopJoin",
+            Self::HashJoin => "HashJoin",
             Self::Filter => "Filter",
             Self::Sort => "Sort",
             Self::Project => "Project",
@@ -514,26 +516,60 @@ fn run_join_scenarios(
         ("large", settings.join_large),
     ] {
         run_join_query(
-            &format!("join_unique_{scale_name}"),
-            rows,
-            rows,
-            0,
+            JoinScenario {
+                name: &format!("join_unique_{scale_name}"),
+                rows,
+                cardinality: rows,
+                right_key_offset: 0,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+                expected: expected_join(rows, rows),
+                operator: Operator::HashJoin,
+            },
             settings,
             measurements,
         )?;
         run_join_query(
-            &format!("join_duplicate_{scale_name}"),
-            rows,
-            (rows / 10).max(1),
-            0,
+            JoinScenario {
+                name: &format!("join_duplicate_{scale_name}"),
+                rows,
+                cardinality: (rows / 10).max(1),
+                right_key_offset: 0,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+                expected: expected_join(rows, (rows / 10).max(1)),
+                operator: Operator::HashJoin,
+            },
             settings,
             measurements,
         )?;
         run_join_query(
-            &format!("join_none_{scale_name}"),
-            rows,
-            rows,
-            rows,
+            JoinScenario {
+                name: &format!("join_none_{scale_name}"),
+                rows,
+                cardinality: rows,
+                right_key_offset: rows,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+                expected: Observation {
+                    rows: 0,
+                    checksum: 0,
+                },
+                operator: Operator::HashJoin,
+            },
+            settings,
+            measurements,
+        )?;
+        run_join_query(
+            JoinScenario {
+                name: &format!("join_non_equi_none_{scale_name}"),
+                rows,
+                cardinality: rows,
+                right_key_offset: rows,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key",
+                expected: Observation {
+                    rows: 0,
+                    checksum: 0,
+                },
+                operator: Operator::NestedLoopJoin,
+            },
             settings,
             measurements,
         )?;
@@ -541,15 +577,22 @@ fn run_join_scenarios(
     Ok(())
 }
 
-fn run_join_query(
-    scenario: &str,
+struct JoinScenario<'a> {
+    name: &'a str,
     rows: u64,
     cardinality: u64,
     right_key_offset: u64,
+    sql: &'static str,
+    expected: Observation,
+    operator: Operator,
+}
+
+fn run_join_query(
+    scenario: JoinScenario<'_>,
     settings: ProfileSettings,
     measurements: &mut Vec<Measurement>,
 ) -> BenchResult<()> {
-    let paths = FixturePaths::new(scenario, 2);
+    let paths = FixturePaths::new(scenario.name, 2);
     let tables = vec![
         (
             paths.path(0).to_path_buf(),
@@ -561,43 +604,42 @@ fn run_join_query(
         ),
     ];
     let mut database = Database::create_tables(tables)?;
-    load_join_rows(&mut database, LEFT_TABLE_ID, rows, cardinality, 0)?;
+    load_join_rows(
+        &mut database,
+        LEFT_TABLE_ID,
+        scenario.rows,
+        scenario.cardinality,
+        0,
+    )?;
     load_join_rows(
         &mut database,
         RIGHT_TABLE_ID,
-        rows,
-        cardinality,
-        right_key_offset,
+        scenario.rows,
+        scenario.cardinality,
+        scenario.right_key_offset,
     )?;
-    let sql = "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key";
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
     let plan = inspect_plan(
         &database,
-        scenario,
-        sql,
-        &[Operator::NestedLoopJoin, Operator::SeqScan],
+        scenario.name,
+        scenario.sql,
+        &[scenario.operator, Operator::SeqScan],
         &[Operator::IndexScan],
     )?;
-    let expected = if right_key_offset == 0 {
-        expected_join(rows, cardinality)
-    } else {
-        Observation {
-            rows: 0,
-            checksum: 0,
-        }
-    };
     let durations = measure_checked(
-        scenario,
+        scenario.name,
         settings.query_warmup,
         settings.join_iterations,
-        expected,
-        || database.query(sql).map_err(Into::into),
+        scenario.expected,
+        || database.query(scenario.sql).map_err(Into::into),
         ids_observation,
     )?;
     database.close()?;
     paths.cleanup()?;
     measurements.push(Measurement {
-        scenario: scenario.to_owned(),
-        rows: format!("{rows}x{rows}"),
+        scenario: scenario.name.to_owned(),
+        rows: format!("{}x{}", scenario.rows, scenario.rows),
         plan,
         operations_per_iteration: 1,
         durations,
@@ -971,7 +1013,8 @@ fn query_root(inspection: &StatementInspection) -> BenchResult<&PlanNodeInspecti
 fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
     operator(plan) == target
         || match plan {
-            PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
                 contains_operator(left, target) || contains_operator(right, target)
             }
             PlanNodeInspection::Filter { input, .. }
@@ -991,6 +1034,7 @@ const fn operator(plan: &PlanNodeInspection) -> Operator {
         PlanNodeInspection::IndexScan { .. } => Operator::IndexScan,
         PlanNodeInspection::RangeIndexScan { .. } => Operator::RangeIndexScan,
         PlanNodeInspection::NestedLoopJoin { .. } => Operator::NestedLoopJoin,
+        PlanNodeInspection::HashJoin { .. } => Operator::HashJoin,
         PlanNodeInspection::Filter { .. } => Operator::Filter,
         PlanNodeInspection::Sort { .. } => Operator::Sort,
         PlanNodeInspection::Project { .. } => Operator::Project,
@@ -1008,7 +1052,8 @@ fn plan_label(plan: &PlanNodeInspection) -> String {
 fn collect_operators(plan: &PlanNodeInspection, operators: &mut Vec<&'static str>) {
     operators.push(operator(plan).name());
     match plan {
-        PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+        PlanNodeInspection::NestedLoopJoin { left, right, .. }
+        | PlanNodeInspection::HashJoin { left, right, .. } => {
             collect_operators(left, operators);
             collect_operators(right, operators);
         }
@@ -1258,7 +1303,7 @@ fn print_report(
     println!("- costed bounded Int64/UInt64 RangeIndexScan;");
     println!("- one-sided and Text/Bool ranges remain SeqScan;");
     println!("- no index union/intersection;");
-    println!("- NestedLoopJoin only;");
+    println!("- costed direct Scan x Scan equi HashJoin, otherwise NestedLoopJoin;");
     println!("- explicit in-memory Sort;");
     println!("- in-memory Aggregate;");
     println!("- no join reorder.");

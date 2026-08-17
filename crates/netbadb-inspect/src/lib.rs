@@ -210,6 +210,14 @@ pub enum PlanNodeInspection {
         left: Box<PlanNodeInspection>,
         right: Box<PlanNodeInspection>,
     },
+    HashJoin {
+        kind: JoinKindInspection,
+        left_key: ColumnReferenceInspection,
+        right_key: ColumnReferenceInspection,
+        predicate: ExpressionInspection,
+        left: Box<PlanNodeInspection>,
+        right: Box<PlanNodeInspection>,
+    },
     Filter {
         predicate: ExpressionInspection,
         input: Box<PlanNodeInspection>,
@@ -579,6 +587,29 @@ impl Renderer {
                     format_args!(
                         "NestedLoopJoin kind={} predicate={}",
                         join_kind(*kind),
+                        expression_text(predicate)
+                    ),
+                );
+                self.line(depth + 1, format_args!("left:"));
+                self.plan(depth + 2, left);
+                self.line(depth + 1, format_args!("right:"));
+                self.plan(depth + 2, right);
+            }
+            PlanNodeInspection::HashJoin {
+                kind,
+                left_key,
+                right_key,
+                predicate,
+                left,
+                right,
+            } => {
+                self.line(
+                    depth,
+                    format_args!(
+                        "HashJoin kind={} left_key={} right_key={} predicate={}",
+                        join_kind(*kind),
+                        column_reference_text(left_key),
+                        column_reference_text(right_key),
                         expression_text(predicate)
                     ),
                 );

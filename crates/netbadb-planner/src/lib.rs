@@ -63,6 +63,15 @@ pub enum PhysicalPlan {
         predicate: Expr,
         columns: Vec<ColumnRef>,
     },
+    HashJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        kind: JoinKind,
+        left_key: ColumnRef,
+        right_key: ColumnRef,
+        predicate: Expr,
+        columns: Vec<ColumnRef>,
+    },
     Filter {
         input: Box<PhysicalPlan>,
         predicate: Expr,
@@ -113,6 +122,7 @@ impl PhysicalPlan {
             | Self::IndexScan { columns, .. }
             | Self::RangeIndexScan { columns, .. }
             | Self::NestedLoopJoin { columns, .. }
+            | Self::HashJoin { columns, .. }
             | Self::Project { columns, .. } => {
                 columns.iter().cloned().map(OutputField::Source).collect()
             }
@@ -167,13 +177,33 @@ pub fn plan_with_statistics(
             kind,
             predicate,
             columns,
-        } => PhysicalPlan::NestedLoopJoin {
-            left: Box::new(plan_with_statistics(left, table_statistics, access_paths)),
-            right: Box::new(plan_with_statistics(right, table_statistics, access_paths)),
-            kind: *kind,
-            predicate: predicate.clone(),
-            columns: columns.clone(),
-        },
+        } => {
+            let physical_left =
+                Box::new(plan_with_statistics(left, table_statistics, access_paths));
+            let physical_right =
+                Box::new(plan_with_statistics(right, table_statistics, access_paths));
+            if let Some((left_key, right_key)) =
+                eligible_simple_hash_join(*kind, left, right, predicate, table_statistics)
+            {
+                PhysicalPlan::HashJoin {
+                    left: physical_left,
+                    right: physical_right,
+                    kind: *kind,
+                    left_key,
+                    right_key,
+                    predicate: predicate.clone(),
+                    columns: columns.clone(),
+                }
+            } else {
+                PhysicalPlan::NestedLoopJoin {
+                    left: physical_left,
+                    right: physical_right,
+                    kind: *kind,
+                    predicate: predicate.clone(),
+                    columns: columns.clone(),
+                }
+            }
+        }
         LogicalPlan::Filter { input, predicate } => {
             let input = match input.as_ref() {
                 LogicalPlan::Scan {
@@ -220,6 +250,86 @@ pub fn plan_with_statistics(
             limit: *limit,
         },
     }
+}
+
+fn eligible_simple_hash_join(
+    kind: JoinKind,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    predicate: &Expr,
+    table_statistics: &[TableAccessStatistics],
+) -> Option<(ColumnRef, ColumnRef)> {
+    if !matches!(kind, JoinKind::Inner) {
+        return None;
+    }
+    let left_rows = direct_scan_row_count(left, table_statistics)?;
+    let right_rows = direct_scan_row_count(right, table_statistics)?;
+    let nested_loop_work = u128::from(left_rows).checked_mul(u128::from(right_rows))?;
+    let hash_join_work = u128::from(left_rows).checked_add(u128::from(right_rows))?;
+    if hash_join_work >= nested_loop_work {
+        return None;
+    }
+    find_hash_equality(predicate, left, right)
+}
+
+fn direct_scan_row_count(
+    plan: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+) -> Option<u64> {
+    let LogicalPlan::Scan { table_id, .. } = plan else {
+        return None;
+    };
+    table_statistics
+        .iter()
+        .find(|candidate| candidate.table_id == *table_id)?
+        .statistics
+        .as_ref()
+        .map(|statistics| statistics.row_count)
+}
+
+fn find_hash_equality(
+    predicate: &Expr,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+) -> Option<(ColumnRef, ColumnRef)> {
+    match &predicate.kind {
+        ExprKind::Binary {
+            operator: BinaryOp::And,
+            left: first,
+            right: second,
+        } => find_hash_equality(first, left, right)
+            .or_else(|| find_hash_equality(second, left, right)),
+        ExprKind::Binary {
+            operator: BinaryOp::Eq,
+            left: first,
+            right: second,
+        } => {
+            let (ExprKind::Column(first), ExprKind::Column(second)) = (&first.kind, &second.kind)
+            else {
+                return None;
+            };
+            if !first.data_type.is_compatible_with(&second.data_type) {
+                return None;
+            }
+            if scan_contains_column(left, first) && scan_contains_column(right, second) {
+                Some((first.clone(), second.clone()))
+            } else if scan_contains_column(left, second) && scan_contains_column(right, first) {
+                Some((second.clone(), first.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn scan_contains_column(plan: &LogicalPlan, column: &ColumnRef) -> bool {
+    let LogicalPlan::Scan { columns, .. } = plan else {
+        return false;
+    };
+    columns.iter().any(|candidate| {
+        candidate.binding_id == column.binding_id && candidate.column_id == column.column_id
+    })
 }
 
 #[derive(Debug)]
@@ -823,6 +933,365 @@ mod tests {
         assert!(matches!(
             plan(&logical),
             PhysicalPlan::NestedLoopJoin { .. }
+        ));
+    }
+
+    fn join_column_ref(
+        binding_id: u32,
+        table_id: u64,
+        column_id: u32,
+        name: &str,
+        data_type: SemanticType,
+        nullable: bool,
+    ) -> ColumnRef {
+        ColumnRef {
+            binding_id: RelationBindingId(binding_id),
+            table_id: TableId(table_id),
+            column_id: ColumnId(column_id),
+            relation_name: format!("r{binding_id}"),
+            name: name.into(),
+            data_type,
+            nullable,
+        }
+    }
+
+    fn join_scan(binding_id: u32, table_id: u64, columns: Vec<ColumnRef>) -> LogicalPlan {
+        LogicalPlan::Scan {
+            binding_id: RelationBindingId(binding_id),
+            table_id: TableId(table_id),
+            table_name: format!("table_{table_id}"),
+            columns,
+        }
+    }
+
+    fn join_expr(column: &ColumnRef) -> Expr {
+        Expr {
+            kind: ExprKind::Column(column.clone()),
+            expr_type: ExprType {
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            },
+        }
+    }
+
+    fn join_literal(value: ScalarValue, physical: PhysicalType) -> Expr {
+        Expr {
+            kind: ExprKind::Literal(value.clone()),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(physical),
+                nullable: matches!(value, ScalarValue::Null),
+            },
+        }
+    }
+
+    fn join_binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+        Expr {
+            kind: ExprKind::Binary {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: true,
+            },
+        }
+    }
+
+    fn logical_join(left: LogicalPlan, right: LogicalPlan, predicate: Expr) -> LogicalPlan {
+        let mut columns = left
+            .output_fields()
+            .into_iter()
+            .filter_map(|field| match field {
+                netbadb_rel::OutputField::Source(column) => Some(column),
+                netbadb_rel::OutputField::Derived(_) => None,
+            })
+            .collect::<Vec<_>>();
+        columns.extend(
+            right
+                .output_fields()
+                .into_iter()
+                .filter_map(|field| match field {
+                    netbadb_rel::OutputField::Source(column) => Some(column),
+                    netbadb_rel::OutputField::Derived(_) => None,
+                }),
+        );
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            kind: netbadb_rel::JoinKind::Inner,
+            predicate,
+            columns,
+        }
+    }
+
+    fn join_table_statistics(table_id: u64, row_count: u64) -> TableAccessStatistics {
+        TableAccessStatistics {
+            table_id: TableId(table_id),
+            statistics: Some(TableStatistics {
+                row_count,
+                managed_page_count: 1,
+            }),
+        }
+    }
+
+    fn simple_join_fixture(
+        left_type: SemanticType,
+        right_type: SemanticType,
+    ) -> (LogicalPlan, LogicalPlan, ColumnRef, ColumnRef) {
+        let left_key = join_column_ref(10, 1, 1, "key", left_type, true);
+        let right_key = join_column_ref(20, 2, 1, "key", right_type, true);
+        (
+            join_scan(10, 1, vec![left_key.clone()]),
+            join_scan(20, 2, vec![right_key.clone()]),
+            left_key,
+            right_key,
+        )
+    }
+
+    #[test]
+    fn analyzed_direct_equality_uses_hash_join_and_normalizes_orientation() {
+        let (left, right, left_key, right_key) = simple_join_fixture(
+            SemanticType::physical(PhysicalType::Int64),
+            SemanticType::physical(PhysicalType::Int64),
+        );
+        let statistics = [join_table_statistics(1, 500), join_table_statistics(2, 500)];
+        for predicate in [
+            join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key)),
+            join_binary(BinaryOp::Eq, join_expr(&right_key), join_expr(&left_key)),
+        ] {
+            assert!(matches!(
+                plan_with_statistics(
+                    &logical_join(left.clone(), right.clone(), predicate),
+                    &statistics,
+                    &[],
+                ),
+                PhysicalPlan::HashJoin {
+                    left_key: actual_left,
+                    right_key: actual_right,
+                    ..
+                } if actual_left == left_key && actual_right == right_key
+            ));
+        }
+    }
+
+    #[test]
+    fn hash_join_requires_both_statistics_and_strictly_cheaper_work() {
+        let (left, right, left_key, right_key) = simple_join_fixture(
+            SemanticType::physical(PhysicalType::Int64),
+            SemanticType::physical(PhysicalType::Int64),
+        );
+        let predicate = join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key));
+        let logical = logical_join(left, right, predicate);
+        for statistics in [
+            Vec::new(),
+            vec![join_table_statistics(1, 500)],
+            vec![join_table_statistics(2, 500)],
+        ] {
+            assert!(matches!(
+                plan_with_statistics(&logical, &statistics, &[]),
+                PhysicalPlan::NestedLoopJoin { .. }
+            ));
+        }
+        for (left_rows, right_rows, hash_expected) in [(1, 100, false), (2, 2, false), (2, 3, true)]
+        {
+            let statistics = [
+                join_table_statistics(1, left_rows),
+                join_table_statistics(2, right_rows),
+            ];
+            assert_eq!(
+                matches!(
+                    plan_with_statistics(&logical, &statistics, &[]),
+                    PhysicalPlan::HashJoin { .. }
+                ),
+                hash_expected
+            );
+        }
+    }
+
+    #[test]
+    fn hash_equality_extraction_is_necessary_typed_and_deterministic() {
+        let left_a = join_column_ref(
+            10,
+            1,
+            1,
+            "a",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let left_b = join_column_ref(
+            10,
+            1,
+            2,
+            "b",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let left_active = join_column_ref(
+            10,
+            1,
+            3,
+            "active",
+            SemanticType::physical(PhysicalType::Bool),
+            false,
+        );
+        let right_a = join_column_ref(
+            20,
+            2,
+            1,
+            "a",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let right_b = join_column_ref(
+            20,
+            2,
+            2,
+            "b",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let left = join_scan(
+            10,
+            1,
+            vec![left_a.clone(), left_b.clone(), left_active.clone()],
+        );
+        let right = join_scan(20, 2, vec![right_a.clone(), right_b.clone()]);
+        let statistics = [join_table_statistics(1, 500), join_table_statistics(2, 500)];
+        let first_equality = join_binary(BinaryOp::Eq, join_expr(&left_a), join_expr(&right_a));
+        let second_equality = join_binary(BinaryOp::Eq, join_expr(&left_b), join_expr(&right_b));
+        let nested = join_binary(
+            BinaryOp::And,
+            join_binary(
+                BinaryOp::Eq,
+                join_expr(&left_active),
+                join_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            ),
+            join_binary(
+                BinaryOp::And,
+                first_equality.clone(),
+                second_equality.clone(),
+            ),
+        );
+        assert!(matches!(
+            plan_with_statistics(
+                &logical_join(left.clone(), right.clone(), nested.clone()),
+                &statistics,
+                &[],
+            ),
+            PhysicalPlan::HashJoin {
+                left_key,
+                right_key,
+                predicate,
+                ..
+            } if left_key == left_a && right_key == right_a && predicate == nested
+        ));
+
+        let rejected = [
+            join_binary(
+                BinaryOp::Or,
+                first_equality.clone(),
+                join_expr(&left_active),
+            ),
+            Expr {
+                kind: ExprKind::Unary {
+                    operator: netbadb_rel::UnaryOp::Not,
+                    expression: Box::new(first_equality.clone()),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            },
+            join_binary(BinaryOp::NotEq, join_expr(&left_a), join_expr(&right_a)),
+            join_binary(BinaryOp::Lt, join_expr(&left_a), join_expr(&right_a)),
+            join_binary(BinaryOp::LtEq, join_expr(&left_a), join_expr(&right_a)),
+            join_binary(BinaryOp::Gt, join_expr(&left_a), join_expr(&right_a)),
+            join_binary(BinaryOp::GtEq, join_expr(&left_a), join_expr(&right_a)),
+            join_binary(BinaryOp::Eq, join_expr(&left_a), join_expr(&left_b)),
+            join_binary(
+                BinaryOp::Eq,
+                join_expr(&left_a),
+                join_literal(ScalarValue::Int64(42), PhysicalType::Int64),
+            ),
+        ];
+        for predicate in rejected {
+            assert!(matches!(
+                plan_with_statistics(
+                    &logical_join(left.clone(), right.clone(), predicate),
+                    &statistics,
+                    &[],
+                ),
+                PhysicalPlan::NestedLoopJoin { .. }
+            ));
+        }
+
+        let (nominal_left, nominal_right, nominal_left_key, nominal_right_key) =
+            simple_join_fixture(
+                SemanticType::named("UserId", PhysicalType::UInt64),
+                SemanticType::named("TeamId", PhysicalType::UInt64),
+            );
+        assert!(matches!(
+            plan_with_statistics(
+                &logical_join(
+                    nominal_left,
+                    nominal_right,
+                    join_binary(
+                        BinaryOp::Eq,
+                        join_expr(&nominal_left_key),
+                        join_expr(&nominal_right_key),
+                    ),
+                ),
+                &statistics,
+                &[],
+            ),
+            PhysicalPlan::NestedLoopJoin { .. }
+        ));
+    }
+
+    #[test]
+    fn only_the_current_direct_scan_join_is_hash_eligible() {
+        let (left, right, left_key, right_key) = simple_join_fixture(
+            SemanticType::physical(PhysicalType::Int64),
+            SemanticType::physical(PhysicalType::Int64),
+        );
+        let predicate = join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key));
+        let statistics = [
+            join_table_statistics(1, 500),
+            join_table_statistics(2, 500),
+            join_table_statistics(3, 500),
+        ];
+        let filtered_left = LogicalPlan::Filter {
+            input: Box::new(left.clone()),
+            predicate: join_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+        };
+        assert!(matches!(
+            plan_with_statistics(
+                &logical_join(filtered_left, right.clone(), predicate.clone()),
+                &statistics,
+                &[],
+            ),
+            PhysicalPlan::NestedLoopJoin { .. }
+        ));
+
+        let inner = logical_join(left, right, predicate);
+        let third_key = join_column_ref(
+            30,
+            3,
+            1,
+            "key",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let outer = logical_join(
+            inner,
+            join_scan(30, 3, vec![third_key.clone()]),
+            join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&third_key)),
+        );
+        assert!(matches!(
+            plan_with_statistics(&outer, &statistics, &[]),
+            PhysicalPlan::NestedLoopJoin { left, .. }
+                if matches!(*left, PhysicalPlan::HashJoin { .. })
         ));
     }
 

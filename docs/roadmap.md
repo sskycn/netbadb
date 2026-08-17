@@ -465,8 +465,8 @@ reporting.
   retaining SeqScan;
 - complete residual Filter and generation-safe Heap fetch for SELECT, UPDATE,
   and DELETE, with DML targets materialized before index maintenance;
-- deterministic inspection text and current Inspection JSON v2, while v1
-  remains a historical documented/golden contract;
+- deterministic inspection text and Inspection JSON v2, now retained with v1
+  as a historical documented/golden contract;
 - no BTree payload, IndexCatalog, statistics, protocol, schema-spec, manifest,
   or other database persistent-format change.
 
@@ -478,19 +478,49 @@ reporting.
   matching pairs retain normal left-then-right materialization, `row_id: None`,
   duplicate preservation, NULL semantics, and deterministic output order;
 - PhysicalPlan::NestedLoopJoin, planner selection, binding-aware column lookup,
-  and current Inspection JSON v2 remain unchanged;
+  and Inspection JSON v2 remain unchanged in this phase;
 - controlled before/after benchmark runs cover unique-like, duplicate-key, and
   fully disjoint joins at 500×500 and 1,000×1,000; the disjoint cases isolate
   the eliminated rejected-pair materialization;
 - this is a measured constant-factor improvement to the existing quadratic
   nested-loop algorithm, not a new join algorithm or cost model.
 
-Phase 7D must be selected from post-7C benchmark results. Candidate ranking
-remains a measured follow-up rather than a prewritten HashJoin project.
+### Phase 7D — Costed simple equi HashJoin (complete)
+
+- post-7C measurements showed that eliminating rejected-pair materialization
+  left quadratic candidate enumeration and predicate evaluation as the
+  dominant work in the fully disjoint million-pair join;
+- analyzed direct Scan × Scan INNER JOINs can extract the first necessary,
+  semantic-type-compatible cross-side column equality from an AND tree;
+- checked integer work compares `left_rows * right_rows` with
+  `left_rows + right_rows`, choosing HashJoin only when strictly cheaper and
+  retaining NestedLoopJoin for missing statistics, ties, non-equi predicates,
+  and unsupported child shapes;
+- deterministic right-build HashJoin stores ordered right-row indices, skips
+  NULL keys, probes in left order, and evaluates the complete typed residual
+  predicate before materializing TRUE rows;
+- duplicate multiplicity, self-join binding identity, nominal types, and the
+  current left-major/right-minor executor order remain intact;
+- deterministic inspection text and current Inspection JSON v3 expose the
+  selected HashJoin while v1 and v2 remain historical contracts;
+- controlled pre-feature and post-feature benchmark runs compare unique,
+  duplicate, and equality no-match joins while a non-equi no-match join retains
+  the measured NestedLoopJoin reference.
+
+### Phase 7E — SeqScan row decode and materialization throughput (selected, not started)
+
+Post-7D equality joins scale approximately with input rows rather than candidate
+pairs, and unique, duplicate, and no-match HashJoin timings remain close. Their
+shared work is materializing the two SeqScan children, so Phase 7E is selected
+to measure and improve that row-decode/materialization boundary before widening
+join planning. Predicate position prebinding or borrowed evaluation remains the
+next candidate for the retained non-equi NestedLoopJoin; chained/multi-way hash
+planning, cardinality/property propagation, and covering reads rank behind
+those measured paths. No Phase 7E implementation is part of Phase 7D.
 
 ### Later Phase 7 work
 
 - histograms/MCVs and more sophisticated cost models;
 - predicate rewrites and property inference;
-- join ordering and algorithms;
+- broader join ordering and algorithms;
 - benchmarks before introducing complexity.
