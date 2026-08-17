@@ -282,11 +282,25 @@ diagnostic column names from the original expression; a missing input field or
 short runtime row remains a typed `MissingColumn` error. Filter predicates and
 UPDATE assignments intentionally retain dynamic position resolution.
 
-Scalar column and literal results remain owned values. Binary operations reuse
-the same evaluator and three-valued `TruthValue`; AND/OR still evaluate both
-sides, and Text values are still cloned. The existing expression checker
-requires BOOL while allowing nullable BOOL, and nominal compatibility prevents
-JOIN from comparing distinct semantic types with the same physical encoding.
+Join-bound evaluation represents an intermediate scalar as either a borrowed
+row/literal value or an owned computed value:
+
+```text
+bound Column/Literal
+    -> borrow row/literal ScalarValue
+    -> evaluate binary semantics through ScalarValue references
+    -> own only Bool/NULL results produced by Binary, Unary, or IS NULL
+```
+
+The borrowed lifetime is limited to one candidate evaluation and cannot escape
+the materialized child rows or typed predicate. Binary comparison and
+three-valued truth semantics have one reference-based core; the existing owned
+evaluator is a thin caller of that core, so Filter and UPDATE remain owned and
+dynamically resolved. AND/OR still evaluate both sides without short-circuiting.
+The existing expression checker requires BOOL while allowing nullable BOOL,
+and nominal compatibility prevents JOIN from comparing distinct semantic types
+with the same physical encoding. Text still becomes owned once per decoded
+storage row; only repeated candidate-level Text cloning is removed.
 HashJoin also materializes both children but fixes the right child as the build
 side:
 

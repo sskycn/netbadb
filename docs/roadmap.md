@@ -553,22 +553,42 @@ reporting.
   million-pair wide/narrow ratio contracted from about 1.70 to about 1.03,
   directly isolating removal of field-width-sensitive repeated lookup.
 
-### Phase 7G — Borrowed Join predicate value evaluation (selected, not started)
+### Phase 7G — Borrowed Join predicate scalar evaluation (complete)
 
-Post-7F, the narrow million-pair non-equi comparison remains the largest
-measured read case even though its two scans are small and position lookup is
-prebound. The bound evaluator still clones each ScalarValue column operand and
-returns owned ScalarValue results for every candidate. Phase 7G is therefore
-selected to attribute and evaluate a Join-only borrowed-value path while
-preserving typed comparisons, NULL semantics, errors, and the existing
-materialization boundary. No Phase 7G implementation is part of Phase 7F.
+- an executor-private evaluated-scalar enum borrows bound Column and Literal
+  leaves from the current row or typed predicate and owns only computed Binary,
+  Unary, and IS NULL results;
+- binary operations and `TruthValue` conversion use one reference-based
+  semantic core, while the existing owned evaluator remains a thin wrapper;
+  comparisons, NULL/UNKNOWN behavior, checked access, and errors are unchanged;
+- NestedLoopJoin candidates and HashJoin residual candidates use the borrowed
+  path; final TRUE-row materialization, hash keys and maps, and FALSE/UNKNOWN
+  rejection remain unchanged;
+- structural tests prove Int64/Text Column and Text Literal borrowing, and
+  semantic tests cover all ScalarValue kinds, operators, three-valued logic,
+  self joins, chained joins, short rows, and complex HashJoin residuals;
+- a deterministic Text non-equi no-match pair was added at 500x500 and
+  1,000x1,000 before implementation. Three serial full pre/post runs reduced
+  the representative Text/narrow ratio from about 5.26 to 1.21 without a timing
+  gate;
+- AND/OR still has no short-circuit. Filter, UPDATE, Rel IR, PhysicalPlan,
+  planner, inspection, public APIs, dependencies, and persistent formats are
+  unchanged.
 
-AND/OR short-circuit ranks next only after a representative complex-boolean
-benchmark. Filter predicate prebinding follows because current point SeqScan
-cost is much smaller than the retained Join loop. Projection/required-column
-pruning and row-codec/Text ownership, BufferPool read snapshots, covering or
-index-only reads, and broader HashJoin eligibility remain later measured
-candidates.
+### Phase 7H — Non-equi Join algorithm alternatives (selected, not started)
+
+Post-7G, the representative million-pair narrow comparison remains about
+10.19 ms while the two direct 1,000-row Heap scans total about 0.10 ms. Borrowed
+evaluation removed the Text-specific allocation signal, but did not reduce the
+quadratic candidate count and produced no Int64 constant-factor win. Phase 7H
+therefore investigates typed non-equi join algorithm eligibility, ordering and
+costing before choosing an implementation. It does not begin in Phase 7G.
+
+AND/OR short-circuit still requires a representative complex-boolean benchmark.
+Filter predicate prebinding, projection/required-column pruning, row-codec Text
+ownership, BufferPool read snapshots, covering/index-only reads, and broader
+HashJoin eligibility remain measured candidates behind the retained quadratic
+loop.
 
 ### Later Phase 7 work
 

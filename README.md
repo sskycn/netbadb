@@ -627,8 +627,11 @@ The implementation sequence is intentionally vertical:
 34. Join predicate column-position prebinding (Phase 7F) — complete; NLJ and
     HashJoin residual predicates bind logical column identities to checked
     executor-layout positions once, with Inspection JSON v3 unchanged.
-35. Borrowed Join predicate value evaluation (Phase 7G) — selected from
-    post-7F million-candidate non-equi evidence, not started.
+35. Borrowed Join predicate scalar evaluation (Phase 7G) — complete; Join-bound
+    Column/Literal leaves borrow ScalarValues while computed results remain
+    owned, with shared reference-based binary and truth semantics.
+36. Non-equi Join algorithm alternatives (Phase 7H) — selected from post-7G
+    million-candidate evidence, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

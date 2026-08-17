@@ -213,14 +213,38 @@ Point/range controls retained their exact plans and results, although individual
 timings continued to show machine/code-layout variance. There is no timing
 gate.
 
-The narrow single-comparison million-pair loop remains the largest measured
-read case, while source inspection shows its bound evaluator still clones
-owned ScalarValue operands and constructs an owned result for every candidate.
-Phase 7G is therefore selected to measure borrowed ScalarValue Join predicate
-evaluation. AND/OR short-circuit needs a boolean-shape attribution scenario;
-Filter prebinding, projection/row-codec work, buffer snapshots, covering reads,
-and broader HashJoin eligibility rank behind the current measured loop. Phase
-7F does not implement any of those follow-ups.
+Phase 7G adds deterministic two-column Text no-match scenarios at 500x500 and
+1,000x1,000. Keys are fixed-width `L-{id:020}` and `R-{id:020}` values, so
+`l.join_key > r.join_key` is always FALSE, the plan is NestedLoopJoin, and no
+output row is materialized. Before the executor change, each candidate cloned
+both String operands. Three strictly serial full pre runs gave representative
+median-of-three million-pair medians of 9.426 ms narrow Int64, 9.686 ms wide
+Int64, and 49.603 ms Text: Text was 5.26 times narrow Int64.
+
+The Join-bound evaluator now borrows Column and Literal ScalarValues and owns
+only computed results. Binary and truth semantics operate through references;
+the normal Filter/UPDATE evaluator remains owned and AND/OR still evaluates
+both sides. Three serial full post runs gave representative medians of 10.194
+ms narrow Int64, 10.398 ms wide Int64, and 12.365 ms Text. Text improved about
+4.01 times and its ratio to narrow Int64 contracted to 1.21, directly
+attributing the removed candidate-level String clones. The Int64 cases did not
+improve in these runs (about 8.1% and 7.3% slower respectively), so no broader
+constant-factor optimization is claimed or added.
+
+HashJoin million-pair-scale controls remained sub-millisecond at representative
+medians of 0.236 ms unique, 0.677 ms duplicate, and 0.180 ms no-match. Point
+SeqScan, low/high-cardinality grouping, and 50% range SeqScan controls remained
+about 1.14, 1.59, 1.61, and 1.88 ms; direct 1,000-row join-shape and 10,000-row
+item-shape Heap scans were about 0.046 and 0.792 ms. Individual runs retain
+machine and code-layout variance, and there is no timing gate.
+
+The narrow million-candidate NestedLoopJoin remains the largest measured read
+case even though its two scans total only about 0.10 ms. Since leaf lookup and
+ownership signals are now isolated, Phase 7H is selected to investigate
+non-equi join algorithm alternatives that can reduce candidate work. AND/OR
+short-circuit, Filter prebinding, projection/row-codec work, buffer snapshots,
+covering reads, and broader HashJoin eligibility remain later measured
+candidates.
 
 ## CI and compatibility
 
@@ -230,6 +254,7 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E and 7F introduce no plan or inspection change, so
-v3 remains current. They change no NetbaDB Protocol v1 message, SDK Schema Spec
-v1 field, deployment manifest v4 field, or database persistent format.
+represent HashJoin. Phases 7E through 7G introduce no plan or inspection
+change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
+Schema Spec v1 field, deployment manifest v4 field, or database persistent
+format.

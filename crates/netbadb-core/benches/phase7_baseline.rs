@@ -664,6 +664,12 @@ fn run_join_scenarios(
             settings,
             measurements,
         )?;
+        run_text_join_query(
+            &format!("join_non_equi_text_none_{scale_name}"),
+            rows,
+            settings,
+            measurements,
+        )?;
     }
     Ok(())
 }
@@ -754,6 +760,60 @@ fn run_join_query(
     measurements.push(Measurement {
         scenario: scenario.name.to_owned(),
         rows: format!("{}x{}", scenario.rows, scenario.rows),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+fn run_text_join_query(
+    scenario: &str,
+    rows: u64,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let paths = FixturePaths::new(scenario, 2);
+    let tables = vec![
+        (
+            paths.path(0).to_path_buf(),
+            text_join_table(LEFT_TABLE_ID, "left_rows"),
+        ),
+        (
+            paths.path(1).to_path_buf(),
+            text_join_table(RIGHT_TABLE_ID, "right_rows"),
+        ),
+    ];
+    let mut database = Database::create_tables(tables)?;
+    load_text_join_rows(&mut database, LEFT_TABLE_ID, rows, 'L')?;
+    load_text_join_rows(&mut database, RIGHT_TABLE_ID, rows, 'R')?;
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    let sql = "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key";
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[Operator::NestedLoopJoin, Operator::SeqScan],
+        &[Operator::HashJoin, Operator::IndexScan],
+    )?;
+    let expected = Observation {
+        rows: 0,
+        checksum: 0,
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.join_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        ids_observation,
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: format!("{rows}x{rows}"),
         plan,
         operations_per_iteration: 1,
         durations,
@@ -1031,6 +1091,21 @@ fn wide_join_table(table_id: TableId, name: &str) -> TableDef {
     TableDef::new(table_id, name, columns)
 }
 
+fn text_join_table(table_id: TableId, name: &str) -> TableDef {
+    TableDef::new(
+        table_id,
+        name,
+        vec![
+            ColumnDef::new(ID_COLUMN_ID, "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                ColumnId(2),
+                "join_key",
+                TypeSpec::Physical(PhysicalType::Text),
+            ),
+        ],
+    )
+}
+
 fn load_item_rows(
     database: &mut Database,
     rows: u64,
@@ -1112,6 +1187,28 @@ fn load_wide_join_rows(
         let mut values = vec![ScalarValue::Int64(id_value); 7];
         values.push(ScalarValue::Int64(key));
         database.insert_into_in(table_id, &mut transaction, &values)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn load_text_join_rows(
+    database: &mut Database,
+    table_id: TableId,
+    rows: u64,
+    prefix: char,
+) -> BenchResult<()> {
+    let mut transaction = database.begin_transaction_for(table_id)?;
+    for id in 0..rows {
+        let id_value = i64::try_from(id).map_err(|_| message_error("join ID exceeds i64"))?;
+        database.insert_into_in(
+            table_id,
+            &mut transaction,
+            &[
+                ScalarValue::Int64(id_value),
+                ScalarValue::Text(format!("{prefix}-{id:020}")),
+            ],
+        )?;
     }
     transaction.commit()?;
     Ok(())

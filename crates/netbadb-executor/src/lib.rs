@@ -986,16 +986,30 @@ impl<'a> EvaluationValues<'a> {
     }
 }
 
-fn evaluate_bound_values(
-    expression: &BoundExpr<'_>,
-    values: EvaluationValues<'_>,
-) -> Result<ScalarValue, ExecutionError> {
+enum EvaluatedScalar<'a> {
+    Borrowed(&'a ScalarValue),
+    Owned(ScalarValue),
+}
+
+impl EvaluatedScalar<'_> {
+    fn as_ref(&self) -> &ScalarValue {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+fn evaluate_bound_values<'a>(
+    expression: &'a BoundExpr<'_>,
+    values: EvaluationValues<'a>,
+) -> Result<EvaluatedScalar<'a>, ExecutionError> {
     match &expression.kind {
         BoundExprKind::Column { position, name } => values
             .get(*position)
-            .cloned()
+            .map(EvaluatedScalar::Borrowed)
             .ok_or_else(|| ExecutionError::MissingColumn((*name).to_owned())),
-        BoundExprKind::Literal(value) => Ok((*value).clone()),
+        BoundExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(value)),
         BoundExprKind::Binary {
             operator,
             left,
@@ -1003,32 +1017,38 @@ fn evaluate_bound_values(
         } => {
             let left = evaluate_bound_values(left, values)?;
             let right = evaluate_bound_values(right, values)?;
-            evaluate_binary(*operator, left, right)
+            evaluate_binary_refs(*operator, left.as_ref(), right.as_ref())
+                .map(EvaluatedScalar::Owned)
         }
         BoundExprKind::Unary {
             operator: UnaryOp::Not,
             expression,
-        } => Ok(evaluate_bound_truth(expression, values)?
-            .not()
-            .into_scalar()),
+        } => Ok(EvaluatedScalar::Owned(
+            evaluate_bound_truth(expression, values)?
+                .not()
+                .into_scalar(),
+        )),
         BoundExprKind::IsNull {
             expression,
             negated,
         } => {
-            let is_null = matches!(
-                evaluate_bound_values(expression, values)?,
-                ScalarValue::Null
-            );
-            Ok(ScalarValue::Bool(if *negated { !is_null } else { is_null }))
+            let value = evaluate_bound_values(expression, values)?;
+            let is_null = matches!(value.as_ref(), ScalarValue::Null);
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(if *negated {
+                !is_null
+            } else {
+                is_null
+            })))
         }
     }
 }
 
-fn evaluate_bound_truth(
-    expression: &BoundExpr<'_>,
-    values: EvaluationValues<'_>,
+fn evaluate_bound_truth<'a>(
+    expression: &'a BoundExpr<'_>,
+    values: EvaluationValues<'a>,
 ) -> Result<TruthValue, ExecutionError> {
-    TruthValue::from_scalar(evaluate_bound_values(expression, values)?)
+    let value = evaluate_bound_values(expression, values)?;
+    TruthValue::from_scalar_ref(value.as_ref())
 }
 
 fn evaluate_values(
@@ -1106,6 +1126,10 @@ enum TruthValue {
 
 impl TruthValue {
     fn from_scalar(value: ScalarValue) -> Result<Self, ExecutionError> {
+        Self::from_scalar_ref(&value)
+    }
+
+    fn from_scalar_ref(value: &ScalarValue) -> Result<Self, ExecutionError> {
         match value {
             ScalarValue::Bool(true) => Ok(Self::True),
             ScalarValue::Bool(false) => Ok(Self::False),
@@ -1152,10 +1176,18 @@ fn evaluate_binary(
     left: ScalarValue,
     right: ScalarValue,
 ) -> Result<ScalarValue, ExecutionError> {
+    evaluate_binary_refs(operator, &left, &right)
+}
+
+fn evaluate_binary_refs(
+    operator: BinaryOp,
+    left: &ScalarValue,
+    right: &ScalarValue,
+) -> Result<ScalarValue, ExecutionError> {
     match operator {
         BinaryOp::And | BinaryOp::Or => {
-            let left = TruthValue::from_scalar(left)?;
-            let right = TruthValue::from_scalar(right)?;
+            let left = TruthValue::from_scalar_ref(left)?;
+            let right = TruthValue::from_scalar_ref(right)?;
             let value = if operator == BinaryOp::And {
                 left.and(right)
             } else {
@@ -1172,7 +1204,7 @@ fn evaluate_binary(
             if matches!(left, ScalarValue::Null) || matches!(right, ScalarValue::Null) {
                 return Ok(ScalarValue::Null);
             }
-            let ordering = compare_values(&left, &right)?;
+            let ordering = compare_values(left, right)?;
             let result = match operator {
                 BinaryOp::Eq => ordering == Ordering::Equal,
                 BinaryOp::NotEq => ordering != Ordering::Equal,
@@ -1200,9 +1232,10 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundExprKind, EvaluationValues, ExecutionError, QueryResult, TruthValue, bind_expression,
-        evaluate, evaluate_binary, evaluate_bound_truth, evaluate_bound_values, evaluate_truth,
-        evaluate_truth_values, evaluate_values, execute, execute_rows, execute_with_storages,
+        BoundExpr, BoundExprKind, EvaluatedScalar, EvaluationValues, ExecutionError, QueryResult,
+        TruthValue, bind_expression, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_bound_truth, evaluate_bound_values, evaluate_truth, evaluate_truth_values,
+        evaluate_values, execute, execute_rows, execute_with_storages,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
@@ -1484,6 +1517,75 @@ mod tests {
     }
 
     #[test]
+    fn owned_and_reference_scalar_semantics_are_equivalent() {
+        let comparison_pairs = [
+            (ScalarValue::Bool(false), ScalarValue::Bool(true)),
+            (ScalarValue::Int64(-1), ScalarValue::Int64(2)),
+            (ScalarValue::UInt64(1), ScalarValue::UInt64(2)),
+            (
+                ScalarValue::Text("alpha".into()),
+                ScalarValue::Text("beta".into()),
+            ),
+            (ScalarValue::Null, ScalarValue::Null),
+            (ScalarValue::Null, ScalarValue::Text("value".into())),
+        ];
+        for operator in [
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ] {
+            for (left, right) in &comparison_pairs {
+                assert_eq!(
+                    evaluate_binary(operator, left.clone(), right.clone())
+                        .expect("owned comparison"),
+                    evaluate_binary_refs(operator, left, right).expect("reference comparison")
+                );
+            }
+        }
+
+        let truth_scalars = [
+            ScalarValue::Bool(true),
+            ScalarValue::Bool(false),
+            ScalarValue::Null,
+        ];
+        for operator in [BinaryOp::And, BinaryOp::Or] {
+            for left in &truth_scalars {
+                for right in &truth_scalars {
+                    assert_eq!(
+                        evaluate_binary(operator, left.clone(), right.clone())
+                            .expect("owned truth operation"),
+                        evaluate_binary_refs(operator, left, right)
+                            .expect("reference truth operation")
+                    );
+                }
+            }
+        }
+        for value in &truth_scalars {
+            assert_eq!(
+                TruthValue::from_scalar(value.clone()).expect("owned truth conversion"),
+                TruthValue::from_scalar_ref(value).expect("reference truth conversion")
+            );
+        }
+        for invalid in [
+            ScalarValue::Int64(1),
+            ScalarValue::UInt64(1),
+            ScalarValue::Text("true".into()),
+        ] {
+            assert!(matches!(
+                TruthValue::from_scalar(invalid.clone()),
+                Err(ExecutionError::ExpectedBoolean)
+            ));
+            assert!(matches!(
+                TruthValue::from_scalar_ref(&invalid),
+                Err(ExecutionError::ExpectedBoolean)
+            ));
+        }
+    }
+
+    #[test]
     fn joined_and_contiguous_evaluation_are_equivalent() {
         fn column_expr(column: &ColumnRef) -> Expr {
             Expr {
@@ -1697,10 +1799,10 @@ mod tests {
                 evaluate(&expression, &contiguous, &fields).expect("contiguous evaluation"),
                 evaluate_values(&expression, joined, &fields).expect("joined evaluation")
             );
-            assert_eq!(
-                evaluate_values(&expression, joined, &fields).expect("dynamic evaluation"),
-                evaluate_bound_values(&bound, joined).expect("bound evaluation")
-            );
+            let dynamic =
+                evaluate_values(&expression, joined, &fields).expect("dynamic evaluation");
+            let evaluated = evaluate_bound_values(&bound, joined).expect("bound evaluation");
+            assert_eq!(&dynamic, evaluated.as_ref());
             assert_eq!(
                 evaluate_truth(&expression, &contiguous, &fields).expect("contiguous truth"),
                 evaluate_truth_values(&expression, joined, &fields).expect("joined truth")
@@ -1738,6 +1840,125 @@ mod tests {
                 EvaluationValues::Contiguous(&left[..1])
             ),
             Err(ExecutionError::MissingColumn(name)) if name == "signed"
+        ));
+    }
+
+    #[test]
+    fn bound_leaf_values_borrow_and_computed_values_are_owned() {
+        let values = vec![
+            ScalarValue::Int64(7),
+            ScalarValue::Text("alpha".into()),
+            ScalarValue::Text("beta".into()),
+            ScalarValue::Null,
+            ScalarValue::Bool(true),
+        ];
+        let evaluation_values = EvaluationValues::Contiguous(&values);
+
+        for (position, name) in [(0, "number"), (1, "text")] {
+            let expression = BoundExpr {
+                kind: BoundExprKind::Column { position, name },
+            };
+            let evaluated =
+                evaluate_bound_values(&expression, evaluation_values).expect("evaluate column");
+            match evaluated {
+                EvaluatedScalar::Borrowed(value) => {
+                    assert!(std::ptr::eq(value, &values[position]));
+                }
+                EvaluatedScalar::Owned(_) => panic!("bound column must remain borrowed"),
+            }
+        }
+
+        let literal_value = ScalarValue::Text("constant-value".into());
+        let literal = BoundExpr {
+            kind: BoundExprKind::Literal(&literal_value),
+        };
+        let evaluated =
+            evaluate_bound_values(&literal, evaluation_values).expect("evaluate literal");
+        match evaluated {
+            EvaluatedScalar::Borrowed(value) => assert!(std::ptr::eq(value, &literal_value)),
+            EvaluatedScalar::Owned(_) => panic!("bound literal must remain borrowed"),
+        }
+
+        let text_comparison = BoundExpr {
+            kind: BoundExprKind::Binary {
+                operator: BinaryOp::Lt,
+                left: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 1,
+                        name: "left_text",
+                    },
+                }),
+                right: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 2,
+                        name: "right_text",
+                    },
+                }),
+            },
+        };
+        assert!(matches!(
+            evaluate_bound_values(&text_comparison, evaluation_values),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(true)))
+        ));
+
+        let null_comparison = BoundExpr {
+            kind: BoundExprKind::Binary {
+                operator: BinaryOp::Eq,
+                left: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 3,
+                        name: "nullable",
+                    },
+                }),
+                right: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 3,
+                        name: "nullable",
+                    },
+                }),
+            },
+        };
+        assert!(matches!(
+            evaluate_bound_values(&null_comparison, evaluation_values),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Null))
+        ));
+
+        let is_null = BoundExpr {
+            kind: BoundExprKind::IsNull {
+                expression: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 3,
+                        name: "nullable",
+                    },
+                }),
+                negated: false,
+            },
+        };
+        assert!(matches!(
+            evaluate_bound_values(&is_null, evaluation_values),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(true)))
+        ));
+
+        let and = BoundExpr {
+            kind: BoundExprKind::Binary {
+                operator: BinaryOp::And,
+                left: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 4,
+                        name: "flag",
+                    },
+                }),
+                right: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 3,
+                        name: "nullable_bool",
+                    },
+                }),
+            },
+        };
+        assert!(matches!(
+            evaluate_bound_values(&and, evaluation_values),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Null))
         ));
     }
 
