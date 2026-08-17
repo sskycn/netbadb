@@ -262,9 +262,29 @@ materialized left child + materialized right child
 
 FALSE and UNKNOWN pairs allocate no combined value vector and copy no full row;
 ordinary equality therefore still never joins NULL to NULL. TRUE pairs are
-materialized in left-then-right order. Column positions remain resolved by
-`RelationBindingId + ColumnId` during expression evaluation, and scalar column
-and literal results remain owned values. The existing expression checker
+materialized in left-then-right order. Join predicate positions are execution
+layout properties and are bound only after both child outputs are known:
+
+```text
+typed Join predicate Expr with ColumnRef identity
+        ↓ executor bind once through RelationBindingId + ColumnId
+private position-bound expression borrowing the original Expr
+        ↓
+candidate-pair evaluation through checked positions
+```
+
+NestedLoopJoin binds its complete `ON` expression once before the candidate
+loop. HashJoin retains its separately prebound hash-key positions and binds the
+complete residual predicate once before probing buckets. The private bound
+tree is not Rel IR or planner IR, exposes no public API, and does not replace
+logical column identity with `usize` positions. It borrows literal values and
+diagnostic column names from the original expression; a missing input field or
+short runtime row remains a typed `MissingColumn` error. Filter predicates and
+UPDATE assignments intentionally retain dynamic position resolution.
+
+Scalar column and literal results remain owned values. Binary operations reuse
+the same evaluator and three-valued `TruthValue`; AND/OR still evaluate both
+sides, and Text values are still cloned. The existing expression checker
 requires BOOL while allowing nullable BOOL, and nominal compatibility prevents
 JOIN from comparing distinct semantic types with the same physical encoding.
 HashJoin also materializes both children but fixes the right child as the build

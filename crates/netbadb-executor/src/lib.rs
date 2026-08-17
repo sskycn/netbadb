@@ -290,16 +290,16 @@ fn execute_rows(
                 .cloned()
                 .map(OutputField::Source)
                 .collect::<Vec<_>>();
+            let bound_predicate = bind_expression(predicate, &fields)?;
             let mut rows = Vec::new();
             for left_row in left.rows {
                 for right_row in &right.rows {
-                    if evaluate_truth_values(
-                        predicate,
+                    if evaluate_bound_truth(
+                        &bound_predicate,
                         EvaluationValues::Joined {
                             left: &left_row.values,
                             right: &right_row.values,
                         },
-                        &fields,
                     )? == TruthValue::True
                     {
                         let mut values = Vec::with_capacity(
@@ -348,6 +348,7 @@ fn execute_rows(
                 .cloned()
                 .map(OutputField::Source)
                 .collect::<Vec<_>>();
+            let bound_predicate = bind_expression(predicate, &fields)?;
             let mut rows = Vec::new();
             for left_row in left.rows {
                 let Some(key) = hash_join_key(&left_row, left_key_position, left_key)? else {
@@ -360,13 +361,12 @@ fn execute_rows(
                     let Some(right_row) = right.rows.get(*right_index) else {
                         return Err(ExecutionError::TypeMismatch);
                     };
-                    if evaluate_truth_values(
-                        predicate,
+                    if evaluate_bound_truth(
+                        &bound_predicate,
                         EvaluationValues::Joined {
                             left: &left_row.values,
                             right: &right_row.values,
                         },
-                        &fields,
                     )? == TruthValue::True
                     {
                         let mut values = Vec::with_capacity(
@@ -902,6 +902,68 @@ fn build_replacements(
         .collect()
 }
 
+struct BoundExpr<'a> {
+    kind: BoundExprKind<'a>,
+}
+
+enum BoundExprKind<'a> {
+    Column {
+        position: usize,
+        name: &'a str,
+    },
+    Literal(&'a ScalarValue),
+    Binary {
+        operator: BinaryOp,
+        left: Box<BoundExpr<'a>>,
+        right: Box<BoundExpr<'a>>,
+    },
+    Unary {
+        operator: UnaryOp,
+        expression: Box<BoundExpr<'a>>,
+    },
+    IsNull {
+        expression: Box<BoundExpr<'a>>,
+        negated: bool,
+    },
+}
+
+fn bind_expression<'a>(
+    expression: &'a Expr,
+    fields: &[OutputField],
+) -> Result<BoundExpr<'a>, ExecutionError> {
+    let kind = match &expression.kind {
+        ExprKind::Column(column) => BoundExprKind::Column {
+            position: find_source_position(fields, column)?,
+            name: &column.name,
+        },
+        ExprKind::Literal(value) => BoundExprKind::Literal(value),
+        ExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => BoundExprKind::Binary {
+            operator: *operator,
+            left: Box::new(bind_expression(left, fields)?),
+            right: Box::new(bind_expression(right, fields)?),
+        },
+        ExprKind::Unary {
+            operator,
+            expression,
+        } => BoundExprKind::Unary {
+            operator: *operator,
+            expression: Box::new(bind_expression(expression, fields)?),
+        },
+        ExprKind::IsNull {
+            expression,
+            negated,
+        } => BoundExprKind::IsNull {
+            expression: Box::new(bind_expression(expression, fields)?),
+            negated: *negated,
+        },
+    };
+    Ok(BoundExpr { kind })
+}
+
 #[derive(Clone, Copy)]
 enum EvaluationValues<'a> {
     Contiguous(&'a [ScalarValue]),
@@ -922,6 +984,51 @@ impl<'a> EvaluationValues<'a> {
             }),
         }
     }
+}
+
+fn evaluate_bound_values(
+    expression: &BoundExpr<'_>,
+    values: EvaluationValues<'_>,
+) -> Result<ScalarValue, ExecutionError> {
+    match &expression.kind {
+        BoundExprKind::Column { position, name } => values
+            .get(*position)
+            .cloned()
+            .ok_or_else(|| ExecutionError::MissingColumn((*name).to_owned())),
+        BoundExprKind::Literal(value) => Ok((*value).clone()),
+        BoundExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = evaluate_bound_values(left, values)?;
+            let right = evaluate_bound_values(right, values)?;
+            evaluate_binary(*operator, left, right)
+        }
+        BoundExprKind::Unary {
+            operator: UnaryOp::Not,
+            expression,
+        } => Ok(evaluate_bound_truth(expression, values)?
+            .not()
+            .into_scalar()),
+        BoundExprKind::IsNull {
+            expression,
+            negated,
+        } => {
+            let is_null = matches!(
+                evaluate_bound_values(expression, values)?,
+                ScalarValue::Null
+            );
+            Ok(ScalarValue::Bool(if *negated { !is_null } else { is_null }))
+        }
+    }
+}
+
+fn evaluate_bound_truth(
+    expression: &BoundExpr<'_>,
+    values: EvaluationValues<'_>,
+) -> Result<TruthValue, ExecutionError> {
+    TruthValue::from_scalar(evaluate_bound_values(expression, values)?)
 }
 
 fn evaluate_values(
@@ -1093,9 +1200,9 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 #[cfg(test)]
 mod tests {
     use super::{
-        EvaluationValues, ExecutionError, QueryResult, TruthValue, evaluate, evaluate_binary,
-        evaluate_truth, evaluate_truth_values, evaluate_values, execute, execute_rows,
-        execute_with_storages,
+        BoundExprKind, EvaluationValues, ExecutionError, QueryResult, TruthValue, bind_expression,
+        evaluate, evaluate_binary, evaluate_bound_truth, evaluate_bound_values, evaluate_truth,
+        evaluate_truth_values, evaluate_values, execute, execute_rows, execute_with_storages,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
@@ -1495,6 +1602,11 @@ mod tests {
                 column_expr(&right_columns[1]),
             ),
             binary(
+                BinaryOp::NotEq,
+                column_expr(&left_columns[1]),
+                column_expr(&right_columns[1]),
+            ),
+            binary(
                 BinaryOp::Eq,
                 column_expr(&right_columns[3]),
                 column_expr(&left_columns[3]),
@@ -1555,6 +1667,24 @@ mod tests {
                 column_expr(&left_columns[2]),
                 literal(ScalarValue::UInt64(9), PhysicalType::UInt64),
             ),
+            binary(
+                BinaryOp::Eq,
+                column_expr(&left_columns[1]),
+                column_expr(&left_columns[1]),
+            ),
+            binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::Lt,
+                    column_expr(&left_columns[1]),
+                    column_expr(&right_columns[1]),
+                ),
+                binary(
+                    BinaryOp::And,
+                    not(column_expr(&right_columns[0])),
+                    is_null(column_expr(&left_columns[4]), true),
+                ),
+            ),
         ];
 
         for expression in expressions {
@@ -1562,15 +1692,53 @@ mod tests {
                 left: &left,
                 right: &right,
             };
+            let bound = bind_expression(&expression, &fields).expect("bind expression");
             assert_eq!(
                 evaluate(&expression, &contiguous, &fields).expect("contiguous evaluation"),
                 evaluate_values(&expression, joined, &fields).expect("joined evaluation")
             );
             assert_eq!(
+                evaluate_values(&expression, joined, &fields).expect("dynamic evaluation"),
+                evaluate_bound_values(&bound, joined).expect("bound evaluation")
+            );
+            assert_eq!(
                 evaluate_truth(&expression, &contiguous, &fields).expect("contiguous truth"),
                 evaluate_truth_values(&expression, joined, &fields).expect("joined truth")
             );
+            assert_eq!(
+                evaluate_truth_values(&expression, joined, &fields).expect("dynamic truth"),
+                evaluate_bound_truth(&bound, joined).expect("bound truth")
+            );
         }
+
+        let left_signed = column_expr(&left_columns[1]);
+        let right_signed = column_expr(&right_columns[1]);
+        let bound_left = bind_expression(&left_signed, &fields).expect("bind left identity");
+        let bound_right = bind_expression(&right_signed, &fields).expect("bind right identity");
+        assert!(matches!(
+            bound_left.kind,
+            BoundExprKind::Column { position: 1, .. }
+        ));
+        assert!(matches!(
+            bound_right.kind,
+            BoundExprKind::Column { position: 6, .. }
+        ));
+
+        let missing = column(3, 99, "missing", PhysicalType::Int64, false);
+        assert!(matches!(
+            bind_expression(&column_expr(&missing), &fields),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
+
+        let bound_right_signed =
+            bind_expression(&right_signed, &fields).expect("bind right signed column");
+        assert!(matches!(
+            evaluate_bound_values(
+                &bound_right_signed,
+                EvaluationValues::Contiguous(&left[..1])
+            ),
+            Err(ExecutionError::MissingColumn(name)) if name == "signed"
+        ));
     }
 
     #[test]

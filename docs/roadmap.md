@@ -529,24 +529,46 @@ reporting.
   runs were recorded three times each; query, range-plan, HashJoin, non-equi
   reference, and result gates remained intact.
 
-### Phase 7F — Predicate column-position prebinding (selected, not started)
+### Phase 7F — Join predicate column-position prebinding (complete)
 
-Post-7E direct scans are no longer the dominant measured read cost. The
-non-equi 1,000×1,000 NestedLoopJoin still spends roughly two orders of
-magnitude more time than its two direct two-column child scans combined, and
-source inspection confirms that every candidate expression evaluation searches
-the output fields again for each referenced column. Phase 7F is therefore
-selected to measure and prebind typed expression column positions once at an
-execution boundary while preserving binding identity, NULL semantics, typed
-errors, and complete residual predicates. No Phase 7F implementation is part
-of Phase 7E.
+- a private executor-only bound expression borrows the original typed Expr and
+  resolves every ColumnRef once through the existing
+  `RelationBindingId + ColumnId` identity rule after concrete child output
+  fields are known;
+- NestedLoopJoin binds the complete `ON` expression before its candidate loop,
+  and HashJoin binds the complete residual predicate before bucket probing;
+  existing hash-key positions and right-build behavior are unchanged;
+- bound evaluation accepts no OutputField slice, performs checked position
+  access, and reuses the existing binary operations and three-valued truth
+  semantics without changing owned ScalarValue/Text behavior or AND/OR
+  evaluation order;
+- semantic-equivalence tests cover every ExprKind, BinaryOp, ScalarValue kind,
+  TRUE/FALSE/UNKNOWN, repeated columns, distinct self-join bindings, missing
+  fields, and short rows; existing non-equi, complex residual, NULL, self-join,
+  and chained-join integration tests remain green;
+- Filter predicates, UPDATE assignments, Rel IR, PhysicalPlan, planner,
+  inspection, and every public contract intentionally remain unchanged;
+- narrow two-column and wide eight-Int64-column no-match non-equi scenarios
+  were measured before and after in three serial full runs. The representative
+  million-pair wide/narrow ratio contracted from about 1.70 to about 1.03,
+  directly isolating removal of field-width-sensitive repeated lookup.
 
-The remaining measured candidate order is: projection/required-column pruning
-and row-codec/Text ownership for the wider scan shape; BufferPool read-page
-snapshot copying and sequential PageManager traversal behind the now-small
-direct scan; covering/index-only reads; then broader HashJoin eligibility.
-Each requires its own attribution scenario before implementation, and
-multi-way join planning remains later work.
+### Phase 7G — Borrowed Join predicate value evaluation (selected, not started)
+
+Post-7F, the narrow million-pair non-equi comparison remains the largest
+measured read case even though its two scans are small and position lookup is
+prebound. The bound evaluator still clones each ScalarValue column operand and
+returns owned ScalarValue results for every candidate. Phase 7G is therefore
+selected to attribute and evaluate a Join-only borrowed-value path while
+preserving typed comparisons, NULL semantics, errors, and the existing
+materialization boundary. No Phase 7G implementation is part of Phase 7F.
+
+AND/OR short-circuit ranks next only after a representative complex-boolean
+benchmark. Filter predicate prebinding follows because current point SeqScan
+cost is much smaller than the retained Join loop. Projection/required-column
+pruning and row-codec/Text ownership, BufferPool read snapshots, covering or
+index-only reads, and broader HashJoin eligibility remain later measured
+candidates.
 
 ### Later Phase 7 work
 

@@ -180,13 +180,47 @@ substantially because both children are scans. The non-equi million-candidate
 NestedLoopJoin improved from cheaper children but remains the largest measured
 read-path case because candidate predicate evaluation now dominates.
 
-That post-7E evidence selects predicate column-position prebinding for Phase
-7F. The current expression evaluator resolves each column by scanning output
-fields for every candidate evaluation. Projection/required-column pruning and
-row-codec Text ownership rank next; buffer-page snapshot copying and sequential
-page traversal rank behind the now-small direct scan, while covering reads and
-broader HashJoin eligibility need their own representative evidence. Phase 7E
-does not implement any of those follow-ups.
+That post-7E evidence selected predicate column-position prebinding for Phase
+7F. The expression evaluator resolved each column by scanning output fields for
+every candidate evaluation. A 1,000×1,000 non-equi NestedLoopJoin therefore
+performed at least two million repeated identity lookups despite producing no
+rows.
+
+Phase 7F adds narrow and wide no-match non-equi attribution pairs at both join
+scales. The narrow schema retains two Int64 columns per side. The wide schema
+uses eight Int64 columns per side and places `join_key` last, at combined
+positions 7 and 15. Both use disjoint key ranges and compare left `join_key`
+greater than right `join_key`, so every candidate is FALSE and output
+materialization remains absent. The wide shape deliberately contains no Text
+column.
+
+The executor now binds the complete Join `ON` expression once after child
+output fields are known. NestedLoopJoin candidate pairs and HashJoin residual
+bucket candidates evaluate the private position-bound tree without an output
+field slice or repeated identity lookup. Binding still uses the authoritative
+`RelationBindingId + ColumnId` rule, and evaluation retains checked access,
+owned ScalarValue results, the existing binary/NULL semantics, and AND/OR
+without short-circuiting. Filter and UPDATE expression evaluation remain
+dynamic.
+
+Controlled full-profile pre/post runs were recorded three times each,
+strictly serially. Before binding, the representative wide million-pair case
+was about 1.70 times the narrow case. Afterwards that ratio was about 1.03,
+with the wide case improving materially and the narrow case improving by a
+smaller constant factor. HashJoin controls remained in the same sub-millisecond
+range; direct scans and grouped queries also stayed at the post-7E scale.
+Point/range controls retained their exact plans and results, although individual
+timings continued to show machine/code-layout variance. There is no timing
+gate.
+
+The narrow single-comparison million-pair loop remains the largest measured
+read case, while source inspection shows its bound evaluator still clones
+owned ScalarValue operands and constructs an owned result for every candidate.
+Phase 7G is therefore selected to measure borrowed ScalarValue Join predicate
+evaluation. AND/OR short-circuit needs a boolean-shape attribution scenario;
+Filter prebinding, projection/row-codec work, buffer snapshots, covering reads,
+and broader HashJoin eligibility rank behind the current measured loop. Phase
+7F does not implement any of those follow-ups.
 
 ## CI and compatibility
 
@@ -196,6 +230,6 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phase 7E introduces no plan or inspection change, so v3
-remains current. It changes no NetbaDB Protocol v1 message, SDK Schema Spec v1
-field, deployment manifest v4 field, or database persistent format.
+represent HashJoin. Phases 7E and 7F introduce no plan or inspection change, so
+v3 remains current. They change no NetbaDB Protocol v1 message, SDK Schema Spec
+v1 field, deployment manifest v4 field, or database persistent format.

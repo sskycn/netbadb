@@ -624,8 +624,11 @@ The implementation sequence is intentionally vertical:
 33. Validate-once Heap sequential scan (Phase 7E) — complete; one authoritative
     full validation is reused through a crate-private immutable page borrow,
     with checked record access and unchanged persistent formats.
-34. Predicate column-position prebinding (Phase 7F) — selected from post-7E
-    non-equi NestedLoopJoin evidence, not started.
+34. Join predicate column-position prebinding (Phase 7F) — complete; NLJ and
+    HashJoin residual predicates bind logical column identities to checked
+    executor-layout positions once, with Inspection JSON v3 unchanged.
+35. Borrowed Join predicate value evaluation (Phase 7G) — selected from
+    post-7F million-candidate non-equi evidence, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

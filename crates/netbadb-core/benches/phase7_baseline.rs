@@ -594,6 +594,7 @@ fn run_join_scenarios(
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
                 expected: expected_join(rows, rows),
                 operator: Operator::HashJoin,
+                wide: false,
             },
             settings,
             measurements,
@@ -607,6 +608,7 @@ fn run_join_scenarios(
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
                 expected: expected_join(rows, (rows / 10).max(1)),
                 operator: Operator::HashJoin,
+                wide: false,
             },
             settings,
             measurements,
@@ -623,6 +625,7 @@ fn run_join_scenarios(
                     checksum: 0,
                 },
                 operator: Operator::HashJoin,
+                wide: false,
             },
             settings,
             measurements,
@@ -639,6 +642,24 @@ fn run_join_scenarios(
                     checksum: 0,
                 },
                 operator: Operator::NestedLoopJoin,
+                wide: false,
+            },
+            settings,
+            measurements,
+        )?;
+        run_join_query(
+            JoinScenario {
+                name: &format!("join_non_equi_wide_none_{scale_name}"),
+                rows,
+                cardinality: rows,
+                right_key_offset: rows,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key",
+                expected: Observation {
+                    rows: 0,
+                    checksum: 0,
+                },
+                operator: Operator::NestedLoopJoin,
+                wide: true,
             },
             settings,
             measurements,
@@ -655,6 +676,7 @@ struct JoinScenario<'a> {
     sql: &'static str,
     expected: Observation,
     operator: Operator,
+    wide: bool,
 }
 
 fn run_join_query(
@@ -663,31 +685,53 @@ fn run_join_query(
     measurements: &mut Vec<Measurement>,
 ) -> BenchResult<()> {
     let paths = FixturePaths::new(scenario.name, 2);
+    let table = if scenario.wide {
+        wide_join_table
+    } else {
+        join_table
+    };
     let tables = vec![
         (
             paths.path(0).to_path_buf(),
-            join_table(LEFT_TABLE_ID, "left_rows"),
+            table(LEFT_TABLE_ID, "left_rows"),
         ),
         (
             paths.path(1).to_path_buf(),
-            join_table(RIGHT_TABLE_ID, "right_rows"),
+            table(RIGHT_TABLE_ID, "right_rows"),
         ),
     ];
     let mut database = Database::create_tables(tables)?;
-    load_join_rows(
-        &mut database,
-        LEFT_TABLE_ID,
-        scenario.rows,
-        scenario.cardinality,
-        0,
-    )?;
-    load_join_rows(
-        &mut database,
-        RIGHT_TABLE_ID,
-        scenario.rows,
-        scenario.cardinality,
-        scenario.right_key_offset,
-    )?;
+    if scenario.wide {
+        load_wide_join_rows(
+            &mut database,
+            LEFT_TABLE_ID,
+            scenario.rows,
+            scenario.cardinality,
+            0,
+        )?;
+        load_wide_join_rows(
+            &mut database,
+            RIGHT_TABLE_ID,
+            scenario.rows,
+            scenario.cardinality,
+            scenario.right_key_offset,
+        )?;
+    } else {
+        load_join_rows(
+            &mut database,
+            LEFT_TABLE_ID,
+            scenario.rows,
+            scenario.cardinality,
+            0,
+        )?;
+        load_join_rows(
+            &mut database,
+            RIGHT_TABLE_ID,
+            scenario.rows,
+            scenario.cardinality,
+            scenario.right_key_offset,
+        )?;
+    }
     database.analyze(LEFT_TABLE_ID)?;
     database.analyze(RIGHT_TABLE_ID)?;
     let plan = inspect_plan(
@@ -965,6 +1009,28 @@ fn join_table(table_id: TableId, name: &str) -> TableDef {
     )
 }
 
+fn wide_join_table(table_id: TableId, name: &str) -> TableDef {
+    let mut columns = Vec::with_capacity(8);
+    columns.push(ColumnDef::new(
+        ID_COLUMN_ID,
+        "id",
+        TypeSpec::Physical(PhysicalType::Int64),
+    ));
+    for column in 1_u32..=6 {
+        columns.push(ColumnDef::new(
+            ColumnId(column + 1),
+            format!("pad{column}"),
+            TypeSpec::Physical(PhysicalType::Int64),
+        ));
+    }
+    columns.push(ColumnDef::new(
+        ColumnId(8),
+        "join_key",
+        TypeSpec::Physical(PhysicalType::Int64),
+    ));
+    TableDef::new(table_id, name, columns)
+}
+
 fn load_item_rows(
     database: &mut Database,
     rows: u64,
@@ -1023,6 +1089,29 @@ fn load_join_rows(
             &mut transaction,
             &[ScalarValue::Int64(id_value), ScalarValue::Int64(key)],
         )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn load_wide_join_rows(
+    database: &mut Database,
+    table_id: TableId,
+    rows: u64,
+    cardinality: u64,
+    key_offset: u64,
+) -> BenchResult<()> {
+    let mut transaction = database.begin_transaction_for(table_id)?;
+    for id in 0..rows {
+        let id_value = i64::try_from(id).map_err(|_| message_error("join ID exceeds i64"))?;
+        let key = id
+            .checked_rem(cardinality)
+            .and_then(|key| key.checked_add(key_offset))
+            .ok_or_else(|| message_error("join key overflow"))?;
+        let key = i64::try_from(key).map_err(|_| message_error("join key exceeds i64"))?;
+        let mut values = vec![ScalarValue::Int64(id_value); 7];
+        values.push(ScalarValue::Int64(key));
+        database.insert_into_in(table_id, &mut transaction, &values)?;
     }
     transaction.commit()?;
     Ok(())
