@@ -633,8 +633,11 @@ The implementation sequence is intentionally vertical:
 36. Exact inequality bound rejection (Phase 7H) — complete; NestedLoopJoin uses
     a necessary bound conjunct and borrowed real-data right min/max to skip
     left probes that cannot match any right row, without changing its plan.
-37. Inequality candidate-range algorithm (Phase 7I) — selected from post-7H
-    partial/no-prune evidence, not started.
+37. Adaptive exact inequality candidate sweep (Phase 7I) — complete; execution
+    sorts borrowed row-index auxiliaries, counts exact candidates, and uses a
+    checked integer work choice before an original-order-preserving sweep.
+38. Required-column propagation and projection pruning (Phase 7J) — selected
+    from post-7I narrow/wide scan and zero-candidate Join evidence, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

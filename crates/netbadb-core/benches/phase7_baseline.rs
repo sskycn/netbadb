@@ -705,6 +705,24 @@ fn run_join_scenarios(
             settings,
             measurements,
         )?;
+        run_join_query(
+            JoinScenario {
+                name: &format!("join_non_equi_dense_none_{scale_name}"),
+                rows,
+                cardinality: rows,
+                left_key_offset: rows * 3 / 4,
+                right_key_offset: 0,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key AND l.id < 0",
+                expected: Observation {
+                    rows: 0,
+                    checksum: 0,
+                },
+                operator: Operator::NestedLoopJoin,
+                wide: false,
+            },
+            settings,
+            measurements,
+        )?;
         run_text_join_query(
             &format!("join_non_equi_text_none_{scale_name}"),
             rows,

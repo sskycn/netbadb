@@ -284,6 +284,42 @@ sweep/range execution, or new operator is implemented in Phase 7H. AND/OR
 short-circuit, Filter prebinding, projection/row-codec work, buffer snapshots,
 covering reads, and broader HashJoin eligibility remain separate candidates.
 
+Phase 7I adds a near-full dense control with left keys `[3N/4, 7N/4)` and right
+keys `[0, N)`. About 96.9% of its million pairs satisfy `l.join_key >
+r.join_key`; like the partial and no-prune controls it adds the always-false
+`l.id < 0` residual, so result materialization remains zero. Before
+implementation, three serial full runs gave median-of-three large medians of
+0.125 ms for 100% rejection, 11.697 ms partial, 23.593 ms dense, and 23.573 ms
+no-prune.
+
+After the retained Phase 7H extreme check, Phase 7I sorts only borrowed key row
+indices, counts exact inequality candidates with a two-pointer pass, and uses a
+checked integer work model. Sweep is selected only when exact candidates plus
+left/right sort and ordered-set work are strictly cheaper than the current
+potential-left-by-total-right loop. Ties and arithmetic overflow fall back;
+there is no selectivity percentage, planner statistic, or timing threshold.
+The selected sweep keeps candidate right indices in original-index order and
+buckets output per original left index, preserving the existing deterministic
+left-major/right-minor result order without materializing candidate pairs.
+
+Three serial full post runs gave median-of-three large medians of 0.123 ms for
+100% rejection, 3.266 ms partial, 24.669 ms dense, and 24.335 ms no-prune. The
+partial case improved 3.58 times while evaluating only its 124,750 exact
+inequality candidates instead of about 499,000 Phase 7H pairs. The zero-candidate
+fast path remained effectively unchanged; dense and no-prune stayed in the same
+approximately 24 ms fallback regime rather than paying candidate evaluation
+through the sweep. The narrow/wide/Text 100%-reject medians were
+0.123/0.474/0.297 ms.
+
+HashJoin unique/duplicate/no-match controls remained about
+0.235/0.607/0.182 ms. Point SeqScan, 50% range SeqScan, low/high-cardinality
+grouping, and direct narrow/wide Heap scans were about
+1.046/2.077/1.472/1.507 ms and 0.045/0.737 ms. The persistent wide-vs-narrow
+scan and 100%-reject gaps now provide the clearest next measured target, so
+Phase 7J is selected to design required-column propagation and projection
+pruning. It is not implemented in Phase 7I; its cross-layer identity, DML,
+inspection, and storage-read boundaries remain to be specified first.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -292,7 +328,7 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E through 7H introduce no plan or inspection
+represent HashJoin. Phases 7E through 7I introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format.

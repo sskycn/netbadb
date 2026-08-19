@@ -304,10 +304,48 @@ eligible conjuncts use the first left-to-right match, and `compare_values`
 remains the ordering authority. The extreme is borrowed from the current right
 rows and is neither a planner estimate nor persistent statistics.
 
-This is still NestedLoopJoin. A left row that can match scans every right row in
-its original order and evaluates the full predicate, so result order and SQL
-truth are unchanged. There is no child sorting, candidate-range narrowing,
-sort-merge operator, new physical plan, or inspection change.
+In Phase 7H alone, a left row that can match scans every right row in its
+original order and evaluates the full predicate. That zero-candidate step does
+no child sorting or candidate-range narrowing and changes no physical plan or
+inspection contract.
+
+Phase 7I retains that zero-candidate fast path, then adaptively narrows possible
+probes when the first necessary inequality has a useful exact range:
+
+```text
+bound necessary inequality
+    -> Phase 7H exact extreme rejection
+    -> potential left row indices in original order
+    -> borrowed-key sorted left/right index auxiliaries
+    -> exact candidate count with a two-pointer sweep
+    -> checked integer runtime work comparison
+         nested work <= sweep work -> Phase 7H NestedLoop fallback
+         sweep work < nested work  -> ordered candidate sweep
+    -> complete bound predicate for every selected pair
+    -> per-left output buckets
+    -> flatten in original left order
+```
+
+The runtime choice is execution-local and uses no ANALYZE statistics or magic
+selectivity ratio. Nested work is potential-left count times total right rows.
+Sweep work adds the exact candidate pairs, checked `n * ceil_log2(n)` index-sort
+proxies, and a checked ordered-set proxy; overflow and ties conservatively use
+the nested loop. The 100%-reject case returns before sorting, and an all-pairs
+boundary proof also avoids building auxiliaries for fully dense candidates.
+
+Sorted auxiliaries contain only original row indices and borrow scalar keys.
+Right NULL keys are excluded, left NULL keys are not potential probes, and all
+ordering uses the same fallible `compare_values` implementation. For `>`/`>=`,
+an original-right-index `BTreeSet` grows with keys `<`/`<=` each ascending left
+key; for `<`/`<=`, it starts with every non-NULL right and removes keys `<=`/`<`
+the left key. Each right index changes set membership at most once. Iterating
+the set preserves original right order, while per-left buckets restore original
+left order after key-ordered processing.
+
+The auxiliary memory bound is O(left rows + right rows + output rows): candidate
+pairs are never materialized. Only a complete predicate result of TRUE creates
+an owned output row. This remains an internal NestedLoopJoin strategy, not a new
+physical operator, planner cost, persistent statistic, or inspection contract.
 
 Join-bound evaluation represents an intermediate scalar as either a borrowed
 row/literal value or an owned computed value:

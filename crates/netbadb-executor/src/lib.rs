@@ -1,7 +1,7 @@
 //! Synchronous execution of typed query and DML physical statements.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -291,7 +291,7 @@ fn execute_rows(
                 .map(OutputField::Source)
                 .collect::<Vec<_>>();
             let bound_predicate = bind_expression(predicate, &fields)?;
-            let rejection = match find_required_inequality(&bound_predicate, left.fields.len()) {
+            let rows = match find_required_inequality(&bound_predicate, left.fields.len()) {
                 Some(inequality) => {
                     let Some(extreme) = required_right_extreme(&inequality, &right.rows)? else {
                         return Ok(ExecutionRows {
@@ -299,38 +299,81 @@ fn execute_rows(
                             rows: Vec::new(),
                         });
                     };
-                    Some((inequality, extreme))
-                }
-                None => None,
-            };
-            let mut rows = Vec::new();
-            for left_row in left.rows {
-                if let Some((inequality, extreme)) = &rejection {
-                    if !inequality_can_match(inequality, &left_row, extreme)? {
-                        continue;
-                    }
-                }
-                for right_row in &right.rows {
-                    if evaluate_bound_truth(
-                        &bound_predicate,
-                        EvaluationValues::Joined {
-                            left: &left_row.values,
-                            right: &right_row.values,
-                        },
-                    )? == TruthValue::True
-                    {
-                        let mut values = Vec::with_capacity(
-                            left_row.values.len().saturating_add(right_row.values.len()),
-                        );
-                        values.extend(left_row.values.iter().cloned());
-                        values.extend(right_row.values.iter().cloned());
-                        rows.push(ExecutionRow {
-                            row_id: None,
-                            values,
+                    let potential_left = potential_left_indices(&inequality, &left.rows, extreme)?;
+                    if potential_left.is_empty() {
+                        return Ok(ExecutionRows {
+                            fields,
+                            rows: Vec::new(),
                         });
                     }
+                    if all_candidate_pairs_match(
+                        &inequality,
+                        &left.rows,
+                        &potential_left,
+                        &right.rows,
+                    )? {
+                        execute_nested_loop_join(
+                            &bound_predicate,
+                            &left.rows,
+                            &right.rows,
+                            potential_left.iter().copied(),
+                        )?
+                    } else {
+                        let sorted_left = sorted_non_null_indices(
+                            &left.rows,
+                            potential_left.iter().copied(),
+                            inequality.left_position,
+                            inequality.left_name,
+                        )?;
+                        let sorted_right = sorted_non_null_indices(
+                            &right.rows,
+                            0..right.rows.len(),
+                            inequality.right_position,
+                            inequality.right_name,
+                        )?;
+                        let candidate_pairs = exact_candidate_pair_count(
+                            &inequality,
+                            &left.rows,
+                            &sorted_left,
+                            &right.rows,
+                            &sorted_right,
+                        )?;
+                        let strategy = candidate_pairs.map_or(
+                            InequalityExecutionStrategy::NestedLoop,
+                            |candidate_pairs| {
+                                choose_inequality_strategy(
+                                    potential_left.len(),
+                                    right.rows.len(),
+                                    sorted_right.len(),
+                                    candidate_pairs,
+                                )
+                            },
+                        );
+                        match strategy {
+                            InequalityExecutionStrategy::NestedLoop => execute_nested_loop_join(
+                                &bound_predicate,
+                                &left.rows,
+                                &right.rows,
+                                potential_left.iter().copied(),
+                            )?,
+                            InequalityExecutionStrategy::Sweep => execute_inequality_sweep(
+                                &bound_predicate,
+                                &inequality,
+                                &left.rows,
+                                &sorted_left,
+                                &right.rows,
+                                &sorted_right,
+                            )?,
+                        }
+                    }
                 }
-            }
+                None => execute_nested_loop_join(
+                    &bound_predicate,
+                    &left.rows,
+                    &right.rows,
+                    0..left.rows.len(),
+                )?,
+            };
             Ok(ExecutionRows { fields, rows })
         }
         PhysicalPlan::HashJoin {
@@ -1060,24 +1103,48 @@ fn required_right_extreme<'a>(
     inequality: &BoundInequality<'_>,
     right_rows: &'a [ExecutionRow],
 ) -> Result<Option<&'a ScalarValue>, ExecutionError> {
+    let kind = match inequality.operator {
+        BinaryOp::Gt | BinaryOp::GtEq => ExtremeKind::Minimum,
+        BinaryOp::Lt | BinaryOp::LtEq => ExtremeKind::Maximum,
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+            return Err(ExecutionError::TypeMismatch);
+        }
+    };
+    right_extreme(
+        right_rows,
+        inequality.right_position,
+        inequality.right_name,
+        kind,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ExtremeKind {
+    Minimum,
+    Maximum,
+}
+
+fn right_extreme<'a>(
+    right_rows: &'a [ExecutionRow],
+    position: usize,
+    name: &str,
+    kind: ExtremeKind,
+) -> Result<Option<&'a ScalarValue>, ExecutionError> {
     let mut extreme = None;
     for row in right_rows {
         let value = row
             .values
-            .get(inequality.right_position)
-            .ok_or_else(|| ExecutionError::MissingColumn(inequality.right_name.to_owned()))?;
+            .get(position)
+            .ok_or_else(|| ExecutionError::MissingColumn(name.to_owned()))?;
         if matches!(value, ScalarValue::Null) {
             continue;
         }
         extreme = match extreme {
             Some(current) => {
                 let ordering = compare_values(value, current)?;
-                let replace = match inequality.operator {
-                    BinaryOp::Gt | BinaryOp::GtEq => ordering == Ordering::Less,
-                    BinaryOp::Lt | BinaryOp::LtEq => ordering == Ordering::Greater,
-                    BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
-                        return Err(ExecutionError::TypeMismatch);
-                    }
+                let replace = match kind {
+                    ExtremeKind::Minimum => ordering == Ordering::Less,
+                    ExtremeKind::Maximum => ordering == Ordering::Greater,
                 };
                 Some(if replace { value } else { current })
             }
@@ -1109,6 +1176,369 @@ fn inequality_can_match(
             Err(ExecutionError::TypeMismatch)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InequalityExecutionStrategy {
+    NestedLoop,
+    Sweep,
+}
+
+fn potential_left_indices(
+    inequality: &BoundInequality<'_>,
+    left_rows: &[ExecutionRow],
+    required_right_extreme: &ScalarValue,
+) -> Result<Vec<usize>, ExecutionError> {
+    left_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            match inequality_can_match(inequality, row, required_right_extreme) {
+                Ok(true) => Some(Ok(index)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn all_candidate_pairs_match(
+    inequality: &BoundInequality<'_>,
+    left_rows: &[ExecutionRow],
+    potential_left: &[usize],
+    right_rows: &[ExecutionRow],
+) -> Result<bool, ExecutionError> {
+    let right_kind = match inequality.operator {
+        BinaryOp::Gt | BinaryOp::GtEq => ExtremeKind::Maximum,
+        BinaryOp::Lt | BinaryOp::LtEq => ExtremeKind::Minimum,
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+            return Err(ExecutionError::TypeMismatch);
+        }
+    };
+    let Some(right_boundary) = right_extreme(
+        right_rows,
+        inequality.right_position,
+        inequality.right_name,
+        right_kind,
+    )?
+    else {
+        return Ok(false);
+    };
+    let left_kind = match inequality.operator {
+        BinaryOp::Gt | BinaryOp::GtEq => ExtremeKind::Minimum,
+        BinaryOp::Lt | BinaryOp::LtEq => ExtremeKind::Maximum,
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+            return Err(ExecutionError::TypeMismatch);
+        }
+    };
+    let mut limiting_left = None;
+    for left_index in potential_left {
+        let row = left_rows
+            .get(*left_index)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        let value = row
+            .values
+            .get(inequality.left_position)
+            .ok_or_else(|| ExecutionError::MissingColumn(inequality.left_name.to_owned()))?;
+        if matches!(value, ScalarValue::Null) {
+            return Ok(false);
+        }
+        limiting_left = match limiting_left {
+            Some(current) => {
+                let ordering = compare_values(value, current)?;
+                let replace = match left_kind {
+                    ExtremeKind::Minimum => ordering == Ordering::Less,
+                    ExtremeKind::Maximum => ordering == Ordering::Greater,
+                };
+                Some(if replace { value } else { current })
+            }
+            None => Some(value),
+        };
+    }
+    let Some(limiting_left) = limiting_left else {
+        return Ok(false);
+    };
+    let ordering = compare_values(limiting_left, right_boundary)?;
+    match inequality.operator {
+        BinaryOp::Gt => Ok(ordering == Ordering::Greater),
+        BinaryOp::GtEq => Ok(ordering != Ordering::Less),
+        BinaryOp::Lt => Ok(ordering == Ordering::Less),
+        BinaryOp::LtEq => Ok(ordering != Ordering::Greater),
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+            Err(ExecutionError::TypeMismatch)
+        }
+    }
+}
+
+fn sorted_non_null_indices<I>(
+    rows: &[ExecutionRow],
+    indices: I,
+    position: usize,
+    name: &str,
+) -> Result<Vec<usize>, ExecutionError>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut indices = indices
+        .into_iter()
+        .filter_map(|index| {
+            let value = match rows.get(index).and_then(|row| row.values.get(position)) {
+                Some(value) => value,
+                None => return Some(Err(ExecutionError::MissingColumn(name.to_owned()))),
+            };
+            if matches!(value, ScalarValue::Null) {
+                None
+            } else {
+                Some(Ok(index))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut comparison_error = None;
+    indices.sort_by(|left_index, right_index| {
+        if comparison_error.is_some() {
+            return Ordering::Equal;
+        }
+        let ordering = rows
+            .get(*left_index)
+            .and_then(|row| row.values.get(position))
+            .zip(
+                rows.get(*right_index)
+                    .and_then(|row| row.values.get(position)),
+            )
+            .ok_or_else(|| ExecutionError::MissingColumn(name.to_owned()))
+            .and_then(|(left, right)| compare_values(left, right));
+        match ordering {
+            Ok(Ordering::Equal) => left_index.cmp(right_index),
+            Ok(ordering) => ordering,
+            Err(error) => {
+                comparison_error = Some(error);
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = comparison_error {
+        return Err(error);
+    }
+    Ok(indices)
+}
+
+fn row_key<'a>(
+    rows: &'a [ExecutionRow],
+    index: usize,
+    position: usize,
+    name: &str,
+) -> Result<&'a ScalarValue, ExecutionError> {
+    rows.get(index)
+        .and_then(|row| row.values.get(position))
+        .ok_or_else(|| ExecutionError::MissingColumn(name.to_owned()))
+}
+
+fn right_precedes_left_boundary(
+    operator: BinaryOp,
+    right_to_left: Ordering,
+) -> Result<bool, ExecutionError> {
+    match operator {
+        BinaryOp::Gt => Ok(right_to_left == Ordering::Less),
+        BinaryOp::GtEq => Ok(right_to_left != Ordering::Greater),
+        BinaryOp::Lt => Ok(right_to_left != Ordering::Greater),
+        BinaryOp::LtEq => Ok(right_to_left == Ordering::Less),
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+            Err(ExecutionError::TypeMismatch)
+        }
+    }
+}
+
+fn exact_candidate_pair_count(
+    inequality: &BoundInequality<'_>,
+    left_rows: &[ExecutionRow],
+    sorted_left: &[usize],
+    right_rows: &[ExecutionRow],
+    sorted_right: &[usize],
+) -> Result<Option<u128>, ExecutionError> {
+    let mut right_cursor = 0usize;
+    let mut total = 0u128;
+    for left_index in sorted_left {
+        let left_key = row_key(
+            left_rows,
+            *left_index,
+            inequality.left_position,
+            inequality.left_name,
+        )?;
+        while let Some(right_index) = sorted_right.get(right_cursor) {
+            let right_key = row_key(
+                right_rows,
+                *right_index,
+                inequality.right_position,
+                inequality.right_name,
+            )?;
+            let ordering = compare_values(right_key, left_key)?;
+            if !right_precedes_left_boundary(inequality.operator, ordering)? {
+                break;
+            }
+            right_cursor = right_cursor.saturating_add(1);
+        }
+        let candidate_count = match inequality.operator {
+            BinaryOp::Gt | BinaryOp::GtEq => right_cursor,
+            BinaryOp::Lt | BinaryOp::LtEq => sorted_right.len().saturating_sub(right_cursor),
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+                return Err(ExecutionError::TypeMismatch);
+            }
+        };
+        let Some(candidate_count) = u128::try_from(candidate_count).ok() else {
+            return Ok(None);
+        };
+        let Some(next_total) = total.checked_add(candidate_count) else {
+            return Ok(None);
+        };
+        total = next_total;
+    }
+    Ok(Some(total))
+}
+
+fn ceil_log2(value: usize) -> u128 {
+    if value <= 1 {
+        0
+    } else {
+        u128::from(usize::BITS - (value - 1).leading_zeros())
+    }
+}
+
+fn sort_work(value: usize) -> Option<u128> {
+    u128::try_from(value).ok()?.checked_mul(ceil_log2(value))
+}
+
+fn choose_inequality_strategy(
+    potential_left_count: usize,
+    right_total_count: usize,
+    right_non_null_count: usize,
+    candidate_pairs: u128,
+) -> InequalityExecutionStrategy {
+    let work = || {
+        let left = u128::try_from(potential_left_count).ok()?;
+        let right_total = u128::try_from(right_total_count).ok()?;
+        let right_non_null = u128::try_from(right_non_null_count).ok()?;
+        let nested_work = left.checked_mul(right_total)?;
+        let left_sort_work = sort_work(potential_left_count)?;
+        let right_sort_work = sort_work(right_non_null_count)?;
+        let set_log = ceil_log2(right_non_null_count.checked_add(1)?);
+        let ordered_set_work = right_non_null.checked_mul(set_log)?.checked_mul(2)?;
+        let sweep_work = candidate_pairs
+            .checked_add(left_sort_work)?
+            .checked_add(right_sort_work)?
+            .checked_add(ordered_set_work)?;
+        Some((nested_work, sweep_work))
+    };
+    match work() {
+        Some((nested_work, sweep_work)) if sweep_work < nested_work => {
+            InequalityExecutionStrategy::Sweep
+        }
+        Some(_) | None => InequalityExecutionStrategy::NestedLoop,
+    }
+}
+
+fn materialize_join_candidate(
+    predicate: &BoundExpr<'_>,
+    left_row: &ExecutionRow,
+    right_row: &ExecutionRow,
+) -> Result<Option<ExecutionRow>, ExecutionError> {
+    if evaluate_bound_truth(
+        predicate,
+        EvaluationValues::Joined {
+            left: &left_row.values,
+            right: &right_row.values,
+        },
+    )? != TruthValue::True
+    {
+        return Ok(None);
+    }
+    let mut values =
+        Vec::with_capacity(left_row.values.len().saturating_add(right_row.values.len()));
+    values.extend(left_row.values.iter().cloned());
+    values.extend(right_row.values.iter().cloned());
+    Ok(Some(ExecutionRow {
+        row_id: None,
+        values,
+    }))
+}
+
+fn execute_nested_loop_join<I>(
+    predicate: &BoundExpr<'_>,
+    left_rows: &[ExecutionRow],
+    right_rows: &[ExecutionRow],
+    left_indices: I,
+) -> Result<Vec<ExecutionRow>, ExecutionError>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut output = Vec::new();
+    for left_index in left_indices {
+        let left_row = left_rows
+            .get(left_index)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        for right_row in right_rows {
+            if let Some(row) = materialize_join_candidate(predicate, left_row, right_row)? {
+                output.push(row);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn execute_inequality_sweep(
+    predicate: &BoundExpr<'_>,
+    inequality: &BoundInequality<'_>,
+    left_rows: &[ExecutionRow],
+    sorted_left: &[usize],
+    right_rows: &[ExecutionRow],
+    sorted_right: &[usize],
+) -> Result<Vec<ExecutionRow>, ExecutionError> {
+    let growing_candidates = matches!(inequality.operator, BinaryOp::Gt | BinaryOp::GtEq);
+    let mut candidate_rights = if growing_candidates {
+        BTreeSet::new()
+    } else {
+        sorted_right.iter().copied().collect()
+    };
+    let mut right_cursor = 0usize;
+    let mut outputs_by_left = (0..left_rows.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for left_index in sorted_left {
+        let left_row = left_rows
+            .get(*left_index)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        let left_key = left_row
+            .values
+            .get(inequality.left_position)
+            .ok_or_else(|| ExecutionError::MissingColumn(inequality.left_name.to_owned()))?;
+        while let Some(right_index) = sorted_right.get(right_cursor) {
+            let right_key = row_key(
+                right_rows,
+                *right_index,
+                inequality.right_position,
+                inequality.right_name,
+            )?;
+            let ordering = compare_values(right_key, left_key)?;
+            if !right_precedes_left_boundary(inequality.operator, ordering)? {
+                break;
+            }
+            if growing_candidates {
+                candidate_rights.insert(*right_index);
+            } else {
+                candidate_rights.remove(right_index);
+            }
+            right_cursor = right_cursor.saturating_add(1);
+        }
+        let output = outputs_by_left
+            .get_mut(*left_index)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        for right_index in &candidate_rights {
+            let right_row = right_rows
+                .get(*right_index)
+                .ok_or(ExecutionError::TypeMismatch)?;
+            if let Some(row) = materialize_join_candidate(predicate, left_row, right_row)? {
+                output.push(row);
+            }
+        }
+    }
+    Ok(outputs_by_left.into_iter().flatten().collect())
 }
 
 #[derive(Clone, Copy)]
@@ -1380,11 +1810,13 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 mod tests {
     use super::{
         BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
-        ExecutionError, ExecutionRow, QueryResult, TruthValue, bind_expression, evaluate,
-        evaluate_binary, evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_truth, evaluate_truth_values, evaluate_values, execute, execute_rows,
-        execute_with_storages, find_required_inequality, inequality_can_match,
-        required_right_extreme,
+        ExecutionError, ExecutionRow, InequalityExecutionStrategy, QueryResult, TruthValue,
+        bind_expression, choose_inequality_strategy, evaluate, evaluate_binary,
+        evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_with_storages,
+        find_required_inequality, inequality_can_match, potential_left_indices,
+        required_right_extreme, sorted_non_null_indices,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
@@ -2009,6 +2441,455 @@ mod tests {
             ),
             Err(ExecutionError::TypeMismatch)
         ));
+    }
+
+    #[test]
+    fn exact_candidate_counts_cover_all_operators_types_and_duplicate_boundaries() {
+        fn rows(values: Vec<ScalarValue>) -> Vec<ExecutionRow> {
+            values
+                .into_iter()
+                .map(|value| ExecutionRow {
+                    row_id: None,
+                    values: vec![value],
+                })
+                .collect()
+        }
+
+        fn inequality(operator: BinaryOp) -> BoundInequality<'static> {
+            BoundInequality {
+                operator,
+                left_position: 0,
+                left_name: "left_key",
+                right_position: 0,
+                right_name: "right_key",
+            }
+        }
+
+        let ordered_cases = [
+            (
+                rows(vec![ScalarValue::UInt64(1), ScalarValue::UInt64(2)]),
+                rows(vec![
+                    ScalarValue::UInt64(0),
+                    ScalarValue::UInt64(1),
+                    ScalarValue::UInt64(2),
+                ]),
+                [3, 5, 1, 3],
+            ),
+            (
+                rows(vec![ScalarValue::Bool(false), ScalarValue::Bool(true)]),
+                rows(vec![ScalarValue::Bool(false), ScalarValue::Bool(true)]),
+                [1, 3, 1, 3],
+            ),
+            (
+                rows(vec![
+                    ScalarValue::Text("b".into()),
+                    ScalarValue::Text("c".into()),
+                ]),
+                rows(vec![
+                    ScalarValue::Text("a".into()),
+                    ScalarValue::Text("b".into()),
+                    ScalarValue::Text("c".into()),
+                ]),
+                [3, 5, 1, 3],
+            ),
+        ];
+        for (left, right, expected) in ordered_cases {
+            for (index, operator) in [BinaryOp::Gt, BinaryOp::GtEq, BinaryOp::Lt, BinaryOp::LtEq]
+                .into_iter()
+                .enumerate()
+            {
+                let inequality = inequality(operator);
+                let sorted_left = sorted_non_null_indices(
+                    &left,
+                    0..left.len(),
+                    inequality.left_position,
+                    inequality.left_name,
+                )
+                .expect("sort typed left keys");
+                let sorted_right = sorted_non_null_indices(
+                    &right,
+                    0..right.len(),
+                    inequality.right_position,
+                    inequality.right_name,
+                )
+                .expect("sort typed right keys");
+                assert_eq!(
+                    exact_candidate_pair_count(
+                        &inequality,
+                        &left,
+                        &sorted_left,
+                        &right,
+                        &sorted_right,
+                    )
+                    .expect("count typed candidates"),
+                    Some(expected[index])
+                );
+            }
+        }
+
+        let left = rows(vec![ScalarValue::Int64(5)]);
+        let right = rows(vec![
+            ScalarValue::Int64(5),
+            ScalarValue::Int64(4),
+            ScalarValue::Int64(5),
+            ScalarValue::Int64(6),
+            ScalarValue::Null,
+        ]);
+        for (operator, expected) in [
+            (BinaryOp::Gt, 1),
+            (BinaryOp::GtEq, 3),
+            (BinaryOp::Lt, 1),
+            (BinaryOp::LtEq, 3),
+        ] {
+            let inequality = inequality(operator);
+            let sorted_left = sorted_non_null_indices(
+                &left,
+                0..left.len(),
+                inequality.left_position,
+                inequality.left_name,
+            )
+            .expect("sort duplicate left keys");
+            let sorted_right = sorted_non_null_indices(
+                &right,
+                0..right.len(),
+                inequality.right_position,
+                inequality.right_name,
+            )
+            .expect("sort duplicate right keys");
+            assert_eq!(
+                exact_candidate_pair_count(
+                    &inequality,
+                    &left,
+                    &sorted_left,
+                    &right,
+                    &sorted_right,
+                )
+                .expect("count duplicate candidates"),
+                Some(expected)
+            );
+        }
+
+        assert!(matches!(
+            sorted_non_null_indices(
+                &[ExecutionRow {
+                    row_id: None,
+                    values: Vec::new(),
+                }],
+                0..1,
+                0,
+                "missing",
+            ),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
+        assert!(matches!(
+            sorted_non_null_indices(
+                &rows(vec![ScalarValue::Int64(1), ScalarValue::Text("one".into()),]),
+                0..2,
+                0,
+                "mixed",
+            ),
+            Err(ExecutionError::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn exact_integer_work_model_selects_partial_and_rejects_dense_or_full_sweeps() {
+        assert_eq!(
+            choose_inequality_strategy(499, 1_000, 1_000, 124_750),
+            InequalityExecutionStrategy::Sweep
+        );
+        assert_eq!(
+            choose_inequality_strategy(1_000, 1_000, 1_000, 968_625),
+            InequalityExecutionStrategy::NestedLoop
+        );
+        assert_eq!(
+            choose_inequality_strategy(1_000, 1_000, 1_000, 1_000_000),
+            InequalityExecutionStrategy::NestedLoop
+        );
+        assert_eq!(
+            choose_inequality_strategy(0, 0, 0, 0),
+            InequalityExecutionStrategy::NestedLoop
+        );
+        assert_eq!(
+            choose_inequality_strategy(1, 1, 1, u128::MAX),
+            InequalityExecutionStrategy::NestedLoop
+        );
+    }
+
+    #[test]
+    fn sweep_preserves_nested_order_duplicate_identity_and_nullable_residual_truth() {
+        fn column(position: usize, name: &'static str) -> BoundExpr<'static> {
+            BoundExpr {
+                kind: BoundExprKind::Column { position, name },
+            }
+        }
+
+        fn binary(
+            operator: BinaryOp,
+            left: BoundExpr<'static>,
+            right: BoundExpr<'static>,
+        ) -> BoundExpr<'static> {
+            BoundExpr {
+                kind: BoundExprKind::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            }
+        }
+
+        let inequality = BoundInequality {
+            operator: BinaryOp::Gt,
+            left_position: 0,
+            left_name: "left_key",
+            right_position: 0,
+            right_name: "right_key",
+        };
+        let predicate = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Gt, column(0, "left_key"), column(2, "right_key")),
+            binary(
+                BinaryOp::Eq,
+                column(1, "left_flag"),
+                column(3, "right_flag"),
+            ),
+        );
+        let left = vec![
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(7), ScalarValue::Bool(true)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(1), ScalarValue::Bool(false)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(5), ScalarValue::Bool(true)],
+            },
+        ];
+        let right = vec![
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(4), ScalarValue::Bool(true)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(0), ScalarValue::Bool(false)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(6), ScalarValue::Bool(true)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(2), ScalarValue::Null],
+            },
+        ];
+        let sorted_left = sorted_non_null_indices(&left, 0..left.len(), 0, "left_key")
+            .expect("sort unsorted left input");
+        let sorted_right = sorted_non_null_indices(&right, 0..right.len(), 0, "right_key")
+            .expect("sort unsorted right input");
+        let swept = execute_inequality_sweep(
+            &predicate,
+            &inequality,
+            &left,
+            &sorted_left,
+            &right,
+            &sorted_right,
+        )
+        .expect("sweep residual candidates");
+        let nested = execute_nested_loop_join(&predicate, &left, &right, 0..left.len())
+            .expect("reference nested loop");
+        assert_eq!(
+            swept
+                .iter()
+                .map(|row| (&row.row_id, &row.values))
+                .collect::<Vec<_>>(),
+            nested
+                .iter()
+                .map(|row| (&row.row_id, &row.values))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            swept
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    ScalarValue::Int64(7),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(4),
+                    ScalarValue::Bool(true),
+                ],
+                vec![
+                    ScalarValue::Int64(7),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(6),
+                    ScalarValue::Bool(true),
+                ],
+                vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Bool(false),
+                    ScalarValue::Int64(0),
+                    ScalarValue::Bool(false),
+                ],
+                vec![
+                    ScalarValue::Int64(5),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Int64(4),
+                    ScalarValue::Bool(true),
+                ],
+            ]
+        );
+
+        let duplicate_right = [5, 4, 5, 6]
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(key), ScalarValue::UInt64(index as u64)],
+            })
+            .collect::<Vec<_>>();
+        let duplicate_left = vec![ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Int64(5)],
+        }];
+        for (operator, expected_right_ids) in [
+            (BinaryOp::Gt, vec![1]),
+            (BinaryOp::GtEq, vec![0, 1, 2]),
+            (BinaryOp::Lt, vec![3]),
+            (BinaryOp::LtEq, vec![0, 2, 3]),
+        ] {
+            let inequality = BoundInequality {
+                operator,
+                left_position: 0,
+                left_name: "left_key",
+                right_position: 0,
+                right_name: "right_key",
+            };
+            let predicate = binary(operator, column(0, "left_key"), column(1, "right_key"));
+            let sorted_left = vec![0];
+            let sorted_right =
+                sorted_non_null_indices(&duplicate_right, 0..duplicate_right.len(), 0, "right_key")
+                    .expect("sort duplicate right input");
+            let output = execute_inequality_sweep(
+                &predicate,
+                &inequality,
+                &duplicate_left,
+                &sorted_left,
+                &duplicate_right,
+                &sorted_right,
+            )
+            .expect("sweep duplicate boundary");
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|row| match row.values.get(2) {
+                        Some(ScalarValue::UInt64(value)) => *value,
+                        _ => panic!("right identity must be UInt64"),
+                    })
+                    .collect::<Vec<_>>(),
+                expected_right_ids
+            );
+        }
+    }
+
+    #[test]
+    fn text_partial_range_chooses_sweep_and_matches_nested_loop_exactly() {
+        fn text_row(value: usize) -> ExecutionRow {
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Text(format!("K-{value:03}"))],
+            }
+        }
+
+        let left = (0..128).rev().map(text_row).collect::<Vec<_>>();
+        let right = (64..192).rev().map(text_row).collect::<Vec<_>>();
+        let inequality = BoundInequality {
+            operator: BinaryOp::Gt,
+            left_position: 0,
+            left_name: "left_key",
+            right_position: 0,
+            right_name: "right_key",
+        };
+        let predicate = BoundExpr {
+            kind: BoundExprKind::Binary {
+                operator: BinaryOp::Gt,
+                left: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 0,
+                        name: "left_key",
+                    },
+                }),
+                right: Box::new(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        position: 1,
+                        name: "right_key",
+                    },
+                }),
+            },
+        };
+        let extreme = required_right_extreme(&inequality, &right)
+            .expect("Text right minimum")
+            .expect("non-empty Text right");
+        let potential =
+            potential_left_indices(&inequality, &left, extreme).expect("Text potential probes");
+        let sorted_left = sorted_non_null_indices(&left, potential.iter().copied(), 0, "left_key")
+            .expect("sort Text left keys");
+        let sorted_right = sorted_non_null_indices(&right, 0..right.len(), 0, "right_key")
+            .expect("sort Text right keys");
+        let candidates =
+            exact_candidate_pair_count(&inequality, &left, &sorted_left, &right, &sorted_right)
+                .expect("count Text candidates")
+                .expect("Text candidate count fits u128");
+        assert_eq!(candidates, 2_016);
+        assert_eq!(
+            choose_inequality_strategy(
+                potential.len(),
+                right.len(),
+                sorted_right.len(),
+                candidates,
+            ),
+            InequalityExecutionStrategy::Sweep
+        );
+        let swept = execute_inequality_sweep(
+            &predicate,
+            &inequality,
+            &left,
+            &sorted_left,
+            &right,
+            &sorted_right,
+        )
+        .expect("execute Text sweep");
+        let nested = execute_nested_loop_join(&predicate, &left, &right, potential.iter().copied())
+            .expect("execute Text nested reference");
+        assert_eq!(
+            swept
+                .iter()
+                .map(|row| (&row.row_id, &row.values))
+                .collect::<Vec<_>>(),
+            nested
+                .iter()
+                .map(|row| (&row.row_id, &row.values))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(swept.len(), 2_016);
+        assert_eq!(
+            swept.first().map(|row| &row.values),
+            Some(&vec![
+                ScalarValue::Text("K-127".into()),
+                ScalarValue::Text("K-126".into()),
+            ])
+        );
+        assert_eq!(
+            swept.last().map(|row| &row.values),
+            Some(&vec![
+                ScalarValue::Text("K-065".into()),
+                ScalarValue::Text("K-064".into()),
+            ])
+        );
     }
 
     #[test]

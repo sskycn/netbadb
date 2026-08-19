@@ -597,18 +597,44 @@ reporting.
 - PhysicalPlan and inspection remain NestedLoopJoin/v3. HashJoin, planner,
   storage, public APIs, dependencies, and persistent formats are unchanged.
 
-### Phase 7I — Inequality candidate-range algorithm (selected, not started)
+### Phase 7I — Adaptive exact inequality candidate sweep (complete)
 
-Post-7H, partial and no-prune million-pair scenarios remain about 12.12 and
-24.29 ms, materially above scan and HashJoin controls. Phase 7I therefore
-investigates a true sorted/range/sweep candidate algorithm, but must first make
-output-order preservation, high-output worst cases, intermediate memory, and
-cost eligibility explicit. No Phase 7I implementation is part of Phase 7H.
+- the Phase 7H exact zero-candidate extreme check remains first, so fully
+  impossible Int64, wide, and Text probes return before sorting;
+- potential left probes and non-NULL right keys become deterministic
+  key/index-sorted row-index auxiliaries that borrow current materialized row
+  values; fallible ordering errors propagate as typed execution errors;
+- a two-pointer pass counts exact `<`, `<=`, `>`, or `>=` candidate pairs,
+  including strict duplicate boundaries. Checked `u128` arithmetic compares
+  exact candidates plus integer sort/ordered-set work with the Phase 7H loop;
+  only a strict win selects sweep, while ties and overflow fall back;
+- an original-right-index `BTreeSet` grows or shrinks once per right row as left
+  keys advance. The complete bound predicate still decides every candidate,
+  and per-left buckets restore exact left-major/right-minor output order;
+- auxiliary memory is O(left rows + right rows + output rows), never
+  O(candidate pairs). NULL, duplicates, residual FALSE/UNKNOWN, self joins,
+  chained joins, and borrowed scalar evaluation retain their semantics;
+- three serial full pre/post runs kept 100%-reject near 0.125/0.123 ms, improved
+  partial rejection from 11.697 to 3.266 ms (3.58x), and retained dense and
+  no-prune fallback near 24 ms. All plan gates remain NestedLoopJoin;
+- PhysicalPlan, planner, storage, inspection v3, public APIs, dependencies, and
+  persistent formats are unchanged.
+
+### Phase 7J — Required-column propagation and projection pruning (selected, not started)
+
+Post-7I, the representative direct narrow/wide Heap scans remain about 0.045
+and 0.737 ms, while narrow/wide 100%-reject joins remain about 0.123 and 0.474
+ms even though neither produces candidate pairs. This payload-width signal is
+clearer than the now-reduced partial candidate loop. Phase 7J is therefore
+selected to design typed required-column propagation and narrower storage reads,
+with explicit field-identity, DML, inspection, and row reconstruction
+boundaries. No Phase 7J implementation is part of Phase 7I.
 
 AND/OR short-circuit still requires a representative complex-boolean benchmark.
-Filter predicate prebinding, projection/required-column pruning, row-codec Text
-ownership, BufferPool read snapshots, covering/index-only reads, and broader
-HashJoin eligibility remain separate measured candidates.
+Filter predicate prebinding, row-codec Text ownership, BufferPool read
+snapshots, covering/index-only reads, broader HashJoin eligibility,
+multi-inequality intersection, and new physical join operators remain separate
+measured candidates.
 
 ### Later Phase 7 work
 
