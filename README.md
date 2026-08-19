@@ -630,8 +630,11 @@ The implementation sequence is intentionally vertical:
 35. Borrowed Join predicate scalar evaluation (Phase 7G) — complete; Join-bound
     Column/Literal leaves borrow ScalarValues while computed results remain
     owned, with shared reference-based binary and truth semantics.
-36. Non-equi Join algorithm alternatives (Phase 7H) — selected from post-7G
-    million-candidate evidence, not started.
+36. Exact inequality bound rejection (Phase 7H) — complete; NestedLoopJoin uses
+    a necessary bound conjunct and borrowed real-data right min/max to skip
+    left probes that cannot match any right row, without changing its plan.
+37. Inequality candidate-range algorithm (Phase 7I) — selected from post-7H
+    partial/no-prune evidence, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

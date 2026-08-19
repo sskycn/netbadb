@@ -282,6 +282,33 @@ diagnostic column names from the original expression; a missing input field or
 short runtime row remains a typed `MissingColumn` error. Filter predicates and
 UPDATE assignments intentionally retain dynamic position resolution.
 
+NestedLoopJoin also uses the bound tree for exact runtime rejection before its
+inner loop:
+
+```text
+bound Join predicate
+    -> first necessary direct cross-side inequality under AND
+    -> normalize operands to left <op> right child positions
+    -> borrow exact non-NULL min/max from materialized right rows
+    -> can this left row match any right row?
+         no  -> skip the complete right loop
+         yes -> existing right-order loop + complete bound predicate
+```
+
+`>` and `>=` use the minimum right value; `<` and `<=` use the maximum.
+Right NULLs are ignored because their comparison is UNKNOWN, an all-NULL right
+key makes the join empty, and a NULL left key skips that left row. Extraction
+descends only through AND because each conjunct is necessary for a TRUE result;
+it never descends through OR or NOT. Reversed operands are normalized, multiple
+eligible conjuncts use the first left-to-right match, and `compare_values`
+remains the ordering authority. The extreme is borrowed from the current right
+rows and is neither a planner estimate nor persistent statistics.
+
+This is still NestedLoopJoin. A left row that can match scans every right row in
+its original order and evaluates the full predicate, so result order and SQL
+truth are unchanged. There is no child sorting, candidate-range narrowing,
+sort-merge operator, new physical plan, or inspection change.
+
 Join-bound evaluation represents an intermediate scalar as either a borrowed
 row/literal value or an owned computed value:
 

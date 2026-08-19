@@ -1593,6 +1593,13 @@ fn typed_inner_join_runs_across_heaps_with_null_where_star_limit_and_duplicates(
             .rows,
         vec![vec![ScalarValue::UInt64(9)]]
     );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM users u JOIN teams t ON u.name < t.name")
+            .expect("Text comparison join predicate")
+            .rows,
+        vec![vec![ScalarValue::UInt64(10)]]
+    );
 
     let joined = database
         .query(
@@ -1852,6 +1859,19 @@ fn chained_join_executes_left_associatively_and_handles_an_empty_left_side() {
             ScalarValue::Text("match".into()),
         ]]
     );
+    assert_eq!(
+        database
+            .query(
+                "SELECT a.id, c.name FROM a JOIN b ON a.id = b.a_id \
+                 JOIN c ON b.id <= c.b_id",
+            )
+            .expect("outer inequality multi join")
+            .rows,
+        vec![vec![
+            ScalarValue::Int64(10),
+            ScalarValue::Text("match".into()),
+        ]]
+    );
     database.close().expect("close three-table catalog");
     cleanup(&a_path);
     cleanup(&b_path);
@@ -1927,6 +1947,17 @@ fn self_join_uses_independent_relation_bindings() {
                 ScalarValue::Text("Lin".into()),
                 ScalarValue::Text("CEO".into())
             ],
+        ]
+    );
+    assert_eq!(
+        database
+            .query("SELECT e.id, m.id FROM employees e JOIN employees m ON e.id < m.id")
+            .expect("inequality self join")
+            .rows,
+        vec![
+            vec![ScalarValue::Int64(1), ScalarValue::Int64(2)],
+            vec![ScalarValue::Int64(1), ScalarValue::Int64(3)],
+            vec![ScalarValue::Int64(2), ScalarValue::Int64(3)],
         ]
     );
     database.close().expect("close employees");

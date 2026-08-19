@@ -291,8 +291,25 @@ fn execute_rows(
                 .map(OutputField::Source)
                 .collect::<Vec<_>>();
             let bound_predicate = bind_expression(predicate, &fields)?;
+            let rejection = match find_required_inequality(&bound_predicate, left.fields.len()) {
+                Some(inequality) => {
+                    let Some(extreme) = required_right_extreme(&inequality, &right.rows)? else {
+                        return Ok(ExecutionRows {
+                            fields,
+                            rows: Vec::new(),
+                        });
+                    };
+                    Some((inequality, extreme))
+                }
+                None => None,
+            };
             let mut rows = Vec::new();
             for left_row in left.rows {
+                if let Some((inequality, extreme)) = &rejection {
+                    if !inequality_can_match(inequality, &left_row, extreme)? {
+                        continue;
+                    }
+                }
                 for right_row in &right.rows {
                     if evaluate_bound_truth(
                         &bound_predicate,
@@ -314,10 +331,7 @@ fn execute_rows(
                     }
                 }
             }
-            Ok(ExecutionRows {
-                fields: columns.iter().cloned().map(OutputField::Source).collect(),
-                rows,
-            })
+            Ok(ExecutionRows { fields, rows })
         }
         PhysicalPlan::HashJoin {
             left,
@@ -965,6 +979,139 @@ fn bind_expression<'a>(
 }
 
 #[derive(Clone, Copy)]
+struct BoundInequality<'a> {
+    operator: BinaryOp,
+    left_position: usize,
+    left_name: &'a str,
+    right_position: usize,
+    right_name: &'a str,
+}
+
+fn find_required_inequality<'a>(
+    expression: &'a BoundExpr<'_>,
+    left_width: usize,
+) -> Option<BoundInequality<'a>> {
+    let BoundExprKind::Binary {
+        operator,
+        left,
+        right,
+    } = &expression.kind
+    else {
+        return None;
+    };
+    if *operator == BinaryOp::And {
+        return find_required_inequality(left, left_width)
+            .or_else(|| find_required_inequality(right, left_width));
+    }
+    if !matches!(
+        operator,
+        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+    ) {
+        return None;
+    }
+    let BoundExprKind::Column {
+        position: first_position,
+        name: first_name,
+    } = &left.kind
+    else {
+        return None;
+    };
+    let BoundExprKind::Column {
+        position: second_position,
+        name: second_name,
+    } = &right.kind
+    else {
+        return None;
+    };
+
+    match (
+        first_position.checked_sub(left_width),
+        second_position.checked_sub(left_width),
+    ) {
+        (None, Some(right_position)) => Some(BoundInequality {
+            operator: *operator,
+            left_position: *first_position,
+            left_name: first_name,
+            right_position,
+            right_name: second_name,
+        }),
+        (Some(right_position), None) => Some(BoundInequality {
+            operator: reverse_inequality(*operator),
+            left_position: *second_position,
+            left_name: second_name,
+            right_position,
+            right_name: first_name,
+        }),
+        (None, None) | (Some(_), Some(_)) => None,
+    }
+}
+
+const fn reverse_inequality(operator: BinaryOp) -> BinaryOp {
+    match operator {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => operator,
+    }
+}
+
+fn required_right_extreme<'a>(
+    inequality: &BoundInequality<'_>,
+    right_rows: &'a [ExecutionRow],
+) -> Result<Option<&'a ScalarValue>, ExecutionError> {
+    let mut extreme = None;
+    for row in right_rows {
+        let value = row
+            .values
+            .get(inequality.right_position)
+            .ok_or_else(|| ExecutionError::MissingColumn(inequality.right_name.to_owned()))?;
+        if matches!(value, ScalarValue::Null) {
+            continue;
+        }
+        extreme = match extreme {
+            Some(current) => {
+                let ordering = compare_values(value, current)?;
+                let replace = match inequality.operator {
+                    BinaryOp::Gt | BinaryOp::GtEq => ordering == Ordering::Less,
+                    BinaryOp::Lt | BinaryOp::LtEq => ordering == Ordering::Greater,
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+                        return Err(ExecutionError::TypeMismatch);
+                    }
+                };
+                Some(if replace { value } else { current })
+            }
+            None => Some(value),
+        };
+    }
+    Ok(extreme)
+}
+
+fn inequality_can_match(
+    inequality: &BoundInequality<'_>,
+    left_row: &ExecutionRow,
+    extreme: &ScalarValue,
+) -> Result<bool, ExecutionError> {
+    let left = left_row
+        .values
+        .get(inequality.left_position)
+        .ok_or_else(|| ExecutionError::MissingColumn(inequality.left_name.to_owned()))?;
+    if matches!(left, ScalarValue::Null) {
+        return Ok(false);
+    }
+    let ordering = compare_values(left, extreme)?;
+    match inequality.operator {
+        BinaryOp::Gt => Ok(ordering == Ordering::Greater),
+        BinaryOp::GtEq => Ok(ordering != Ordering::Less),
+        BinaryOp::Lt => Ok(ordering == Ordering::Less),
+        BinaryOp::LtEq => Ok(ordering != Ordering::Greater),
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::NotEq => {
+            Err(ExecutionError::TypeMismatch)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum EvaluationValues<'a> {
     Contiguous(&'a [ScalarValue]),
     Joined {
@@ -1232,10 +1379,12 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundExpr, BoundExprKind, EvaluatedScalar, EvaluationValues, ExecutionError, QueryResult,
-        TruthValue, bind_expression, evaluate, evaluate_binary, evaluate_binary_refs,
-        evaluate_bound_truth, evaluate_bound_values, evaluate_truth, evaluate_truth_values,
-        evaluate_values, execute, execute_rows, execute_with_storages,
+        BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
+        ExecutionError, ExecutionRow, QueryResult, TruthValue, bind_expression, evaluate,
+        evaluate_binary, evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values,
+        evaluate_truth, evaluate_truth_values, evaluate_values, execute, execute_rows,
+        execute_with_storages, find_required_inequality, inequality_can_match,
+        required_right_extreme,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
@@ -1583,6 +1732,283 @@ mod tests {
                 Err(ExecutionError::ExpectedBoolean)
             ));
         }
+    }
+
+    #[test]
+    fn required_inequality_extraction_is_normalized_necessary_and_deterministic() {
+        fn column(position: usize, name: &'static str) -> BoundExpr<'static> {
+            BoundExpr {
+                kind: BoundExprKind::Column { position, name },
+            }
+        }
+
+        fn binary<'a>(
+            operator: BinaryOp,
+            left: BoundExpr<'a>,
+            right: BoundExpr<'a>,
+        ) -> BoundExpr<'a> {
+            BoundExpr {
+                kind: BoundExprKind::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            }
+        }
+
+        let cases = [
+            (BinaryOp::Gt, 0, "left", 2, "right", BinaryOp::Gt),
+            (BinaryOp::Lt, 2, "right", 0, "left", BinaryOp::Gt),
+            (BinaryOp::GtEq, 0, "left", 2, "right", BinaryOp::GtEq),
+            (BinaryOp::LtEq, 2, "right", 0, "left", BinaryOp::GtEq),
+            (BinaryOp::Lt, 0, "left", 2, "right", BinaryOp::Lt),
+            (BinaryOp::Gt, 2, "right", 0, "left", BinaryOp::Lt),
+            (BinaryOp::LtEq, 0, "left", 2, "right", BinaryOp::LtEq),
+            (BinaryOp::GtEq, 2, "right", 0, "left", BinaryOp::LtEq),
+        ];
+        for (operator, first, first_name, second, second_name, normalized) in cases {
+            let expression = binary(
+                operator,
+                column(first, first_name),
+                column(second, second_name),
+            );
+            let inequality = find_required_inequality(&expression, 2).expect("extract inequality");
+            assert_eq!(inequality.operator, normalized);
+            assert_eq!(inequality.left_position, 0);
+            assert_eq!(inequality.left_name, "left");
+            assert_eq!(inequality.right_position, 0);
+            assert_eq!(inequality.right_name, "right");
+        }
+
+        let invalid = || binary(BinaryOp::Eq, column(0, "left"), column(2, "right"));
+        let eligible = || binary(BinaryOp::Gt, column(0, "first"), column(2, "right_first"));
+        for expression in [
+            binary(BinaryOp::And, eligible(), invalid()),
+            binary(BinaryOp::And, invalid(), eligible()),
+            binary(
+                BinaryOp::And,
+                invalid(),
+                binary(BinaryOp::And, invalid(), eligible()),
+            ),
+        ] {
+            assert_eq!(
+                find_required_inequality(&expression, 2)
+                    .expect("extract nested inequality")
+                    .operator,
+                BinaryOp::Gt
+            );
+        }
+
+        let first = binary(BinaryOp::Lt, column(1, "first"), column(3, "right_first"));
+        let second = eligible();
+        let multiple = binary(BinaryOp::And, first, second);
+        let extracted = find_required_inequality(&multiple, 2).expect("extract first inequality");
+        assert_eq!(extracted.operator, BinaryOp::Lt);
+        assert_eq!(extracted.left_position, 1);
+        assert_eq!(extracted.right_position, 1);
+
+        let literal = ScalarValue::Int64(1);
+        for expression in [
+            binary(BinaryOp::Or, eligible(), invalid()),
+            BoundExpr {
+                kind: BoundExprKind::Unary {
+                    operator: UnaryOp::Not,
+                    expression: Box::new(eligible()),
+                },
+            },
+            binary(BinaryOp::Gt, column(0, "left_a"), column(1, "left_b")),
+            binary(BinaryOp::Lt, column(2, "right_a"), column(3, "right_b")),
+            binary(BinaryOp::Eq, column(0, "left"), column(2, "right")),
+            binary(BinaryOp::NotEq, column(0, "left"), column(2, "right")),
+            binary(
+                BinaryOp::Gt,
+                column(0, "left"),
+                BoundExpr {
+                    kind: BoundExprKind::Literal(&literal),
+                },
+            ),
+        ] {
+            assert!(find_required_inequality(&expression, 2).is_none());
+        }
+    }
+
+    #[test]
+    fn right_extremes_are_borrowed_typed_and_null_safe() {
+        fn inequality(operator: BinaryOp) -> BoundInequality<'static> {
+            BoundInequality {
+                operator,
+                left_position: 0,
+                left_name: "left_key",
+                right_position: 0,
+                right_name: "right_key",
+            }
+        }
+
+        let cases = [
+            (
+                vec![
+                    ScalarValue::Null,
+                    ScalarValue::Int64(5),
+                    ScalarValue::Int64(1),
+                    ScalarValue::Int64(1),
+                ],
+                2,
+                1,
+            ),
+            (
+                vec![
+                    ScalarValue::Null,
+                    ScalarValue::UInt64(5),
+                    ScalarValue::UInt64(1),
+                ],
+                2,
+                1,
+            ),
+            (
+                vec![
+                    ScalarValue::Null,
+                    ScalarValue::Bool(true),
+                    ScalarValue::Bool(false),
+                ],
+                2,
+                1,
+            ),
+            (
+                vec![
+                    ScalarValue::Null,
+                    ScalarValue::Text("zulu".into()),
+                    ScalarValue::Text("alpha".into()),
+                ],
+                2,
+                1,
+            ),
+        ];
+        for (values, minimum, maximum) in cases {
+            let rows = values
+                .into_iter()
+                .map(|value| ExecutionRow {
+                    row_id: None,
+                    values: vec![value],
+                })
+                .collect::<Vec<_>>();
+            let min = required_right_extreme(&inequality(BinaryOp::Gt), &rows)
+                .expect("minimum")
+                .expect("non-null minimum");
+            let max = required_right_extreme(&inequality(BinaryOp::Lt), &rows)
+                .expect("maximum")
+                .expect("non-null maximum");
+            assert!(std::ptr::eq(min, &rows[minimum].values[0]));
+            assert!(std::ptr::eq(max, &rows[maximum].values[0]));
+        }
+
+        let all_null = [ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Null],
+        }];
+        assert!(
+            required_right_extreme(&inequality(BinaryOp::Gt), &all_null)
+                .expect("all-null extreme")
+                .is_none()
+        );
+        assert!(
+            required_right_extreme(&inequality(BinaryOp::Lt), &[])
+                .expect("empty extreme")
+                .is_none()
+        );
+        assert!(matches!(
+            required_right_extreme(
+                &inequality(BinaryOp::Gt),
+                &[ExecutionRow {
+                    row_id: None,
+                    values: Vec::new(),
+                }]
+            ),
+            Err(ExecutionError::MissingColumn(name)) if name == "right_key"
+        ));
+        assert!(matches!(
+            required_right_extreme(
+                &inequality(BinaryOp::Gt),
+                &[
+                    ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Int64(1)],
+                    },
+                    ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Text("one".into())],
+                    },
+                ]
+            ),
+            Err(ExecutionError::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn inequality_existence_checks_strict_boundaries_nulls_and_errors() {
+        fn inequality(operator: BinaryOp) -> BoundInequality<'static> {
+            BoundInequality {
+                operator,
+                left_position: 0,
+                left_name: "left_key",
+                right_position: 0,
+                right_name: "right_key",
+            }
+        }
+
+        let equal = ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Int64(5)],
+        };
+        for (operator, expected) in [
+            (BinaryOp::Gt, false),
+            (BinaryOp::GtEq, true),
+            (BinaryOp::Lt, false),
+            (BinaryOp::LtEq, true),
+        ] {
+            assert_eq!(
+                inequality_can_match(&inequality(operator), &equal, &ScalarValue::Int64(5))
+                    .expect("boundary check"),
+                expected
+            );
+        }
+        assert!(
+            inequality_can_match(&inequality(BinaryOp::Gt), &equal, &ScalarValue::Int64(4))
+                .expect("greater check")
+        );
+        assert!(
+            inequality_can_match(&inequality(BinaryOp::Lt), &equal, &ScalarValue::Int64(6))
+                .expect("less check")
+        );
+        assert!(
+            !inequality_can_match(
+                &inequality(BinaryOp::Gt),
+                &ExecutionRow {
+                    row_id: None,
+                    values: vec![ScalarValue::Null],
+                },
+                &ScalarValue::Int64(1)
+            )
+            .expect("null check")
+        );
+        assert!(matches!(
+            inequality_can_match(
+                &inequality(BinaryOp::Gt),
+                &ExecutionRow {
+                    row_id: None,
+                    values: Vec::new(),
+                },
+                &ScalarValue::Int64(1)
+            ),
+            Err(ExecutionError::MissingColumn(name)) if name == "left_key"
+        ));
+        assert!(matches!(
+            inequality_can_match(
+                &inequality(BinaryOp::Gt),
+                &equal,
+                &ScalarValue::Text("five".into())
+            ),
+            Err(ExecutionError::TypeMismatch)
+        ));
     }
 
     #[test]

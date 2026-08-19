@@ -590,6 +590,7 @@ fn run_join_scenarios(
                 name: &format!("join_unique_{scale_name}"),
                 rows,
                 cardinality: rows,
+                left_key_offset: 0,
                 right_key_offset: 0,
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
                 expected: expected_join(rows, rows),
@@ -604,6 +605,7 @@ fn run_join_scenarios(
                 name: &format!("join_duplicate_{scale_name}"),
                 rows,
                 cardinality: (rows / 10).max(1),
+                left_key_offset: 0,
                 right_key_offset: 0,
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
                 expected: expected_join(rows, (rows / 10).max(1)),
@@ -618,6 +620,7 @@ fn run_join_scenarios(
                 name: &format!("join_none_{scale_name}"),
                 rows,
                 cardinality: rows,
+                left_key_offset: 0,
                 right_key_offset: rows,
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
                 expected: Observation {
@@ -635,6 +638,7 @@ fn run_join_scenarios(
                 name: &format!("join_non_equi_none_{scale_name}"),
                 rows,
                 cardinality: rows,
+                left_key_offset: 0,
                 right_key_offset: rows,
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key",
                 expected: Observation {
@@ -652,6 +656,7 @@ fn run_join_scenarios(
                 name: &format!("join_non_equi_wide_none_{scale_name}"),
                 rows,
                 cardinality: rows,
+                left_key_offset: 0,
                 right_key_offset: rows,
                 sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key",
                 expected: Observation {
@@ -660,6 +665,42 @@ fn run_join_scenarios(
                 },
                 operator: Operator::NestedLoopJoin,
                 wide: true,
+            },
+            settings,
+            measurements,
+        )?;
+        run_join_query(
+            JoinScenario {
+                name: &format!("join_non_equi_partial_none_{scale_name}"),
+                rows,
+                cardinality: rows,
+                left_key_offset: 0,
+                right_key_offset: rows / 2,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key AND l.id < 0",
+                expected: Observation {
+                    rows: 0,
+                    checksum: 0,
+                },
+                operator: Operator::NestedLoopJoin,
+                wide: false,
+            },
+            settings,
+            measurements,
+        )?;
+        run_join_query(
+            JoinScenario {
+                name: &format!("join_non_equi_no_prune_none_{scale_name}"),
+                rows,
+                cardinality: rows,
+                left_key_offset: rows,
+                right_key_offset: 0,
+                sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key > r.join_key AND l.id < 0",
+                expected: Observation {
+                    rows: 0,
+                    checksum: 0,
+                },
+                operator: Operator::NestedLoopJoin,
+                wide: false,
             },
             settings,
             measurements,
@@ -678,6 +719,7 @@ struct JoinScenario<'a> {
     name: &'a str,
     rows: u64,
     cardinality: u64,
+    left_key_offset: u64,
     right_key_offset: u64,
     sql: &'static str,
     expected: Observation,
@@ -713,7 +755,7 @@ fn run_join_query(
             LEFT_TABLE_ID,
             scenario.rows,
             scenario.cardinality,
-            0,
+            scenario.left_key_offset,
         )?;
         load_wide_join_rows(
             &mut database,
@@ -728,7 +770,7 @@ fn run_join_query(
             LEFT_TABLE_ID,
             scenario.rows,
             scenario.cardinality,
-            0,
+            scenario.left_key_offset,
         )?;
         load_join_rows(
             &mut database,

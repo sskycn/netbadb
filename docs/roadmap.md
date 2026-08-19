@@ -575,20 +575,40 @@ reporting.
   planner, inspection, public APIs, dependencies, and persistent formats are
   unchanged.
 
-### Phase 7H — Non-equi Join algorithm alternatives (selected, not started)
+### Phase 7H — Exact inequality bound rejection (complete)
 
-Post-7G, the representative million-pair narrow comparison remains about
-10.19 ms while the two direct 1,000-row Heap scans total about 0.10 ms. Borrowed
-evaluation removed the Text-specific allocation signal, but did not reduce the
-quadratic candidate count and produced no Int64 constant-factor win. Phase 7H
-therefore investigates typed non-equi join algorithm eligibility, ordering and
-costing before choosing an implementation. It does not begin in Phase 7G.
+- NestedLoopJoin extracts the first left-to-right direct cross-side `<`, `<=`,
+  `>`, or `>=` conjunct that is necessary under AND; reversed operands are
+  normalized to child-relative positions, while OR, NOT, equality, literals,
+  and same-side comparisons are ineligible;
+- the materialized right rows provide a borrowed exact non-NULL minimum for
+  `>`/`>=` or maximum for `<`/`<=`; no ScalarValue summary is cloned and no
+  statistics or persistent metadata is involved;
+- NULL right keys are ignored, all-NULL/empty right inputs return empty, and a
+  NULL left key skips its right loop. Checked access, typed errors, and the
+  authoritative scalar comparison semantics are retained;
+- only a mathematically impossible left probe skips the inner loop. Possible
+  probes preserve the original right order and evaluate the complete bound
+  predicate, so output ordering, residual truth, duplicates, and UNKNOWN
+  behavior are unchanged;
+- 100%-reject narrow/wide/Text, approximately 50%-reject, and 0%-reject control
+  scenarios were measured in three serial full pre/post runs. Representative
+  large medians improved by about 76.4x, 21.4x, 38.8x, 2.01x, and 1.01x;
+- PhysicalPlan and inspection remain NestedLoopJoin/v3. HashJoin, planner,
+  storage, public APIs, dependencies, and persistent formats are unchanged.
+
+### Phase 7I — Inequality candidate-range algorithm (selected, not started)
+
+Post-7H, partial and no-prune million-pair scenarios remain about 12.12 and
+24.29 ms, materially above scan and HashJoin controls. Phase 7I therefore
+investigates a true sorted/range/sweep candidate algorithm, but must first make
+output-order preservation, high-output worst cases, intermediate memory, and
+cost eligibility explicit. No Phase 7I implementation is part of Phase 7H.
 
 AND/OR short-circuit still requires a representative complex-boolean benchmark.
 Filter predicate prebinding, projection/required-column pruning, row-codec Text
 ownership, BufferPool read snapshots, covering/index-only reads, and broader
-HashJoin eligibility remain measured candidates behind the retained quadratic
-loop.
+HashJoin eligibility remain separate measured candidates.
 
 ### Later Phase 7 work
 

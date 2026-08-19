@@ -246,6 +246,44 @@ short-circuit, Filter prebinding, projection/row-codec work, buffer snapshots,
 covering reads, and broader HashJoin eligibility remain later measured
 candidates.
 
+Phase 7H isolates exact inequality existence rejection with three NestedLoopJoin
+shapes. The existing disjoint no-match scenarios reject 100% of left probes. A
+partial scenario uses left keys `[0, N)`, right keys `[N/2, N/2 + N)`, and the
+necessary conjunct `l.join_key > r.join_key`, so about half of left probes can
+be rejected. A no-prune control reverses the disjoint ranges so every left has
+at least one possible right. Both new scenarios add `l.id < 0` to keep output
+at zero and remove materialization from the measurement.
+
+Before implementation, three serial full runs gave representative
+median-of-three million-pair medians of 9.532 ms narrow 100%-reject, 10.289 ms
+wide 100%-reject, 11.774 ms Text 100%-reject, 24.348 ms partial, and 24.473 ms
+no-prune. All three shapes still enumerated the complete right side.
+
+NestedLoopJoin now extracts the first necessary direct cross-side inequality
+under AND from its bound predicate, normalizes reversed operands, and borrows
+the exact non-NULL right min or max from the materialized rows. Each left row
+is rejected only when that necessary condition cannot be TRUE for any right.
+This is exact current-data reasoning, not selectivity estimation, statistics,
+or a sort-merge/range join. A possible left probe still runs the unchanged full
+right loop and complete predicate.
+
+Three serial full post runs gave representative medians of 0.125 ms narrow,
+0.482 ms wide, and 0.303 ms Text for 100% rejection: improvements of about
+76.4, 21.4, and 38.8 times. Partial rejection improved from 24.348 to 12.118 ms
+(2.01 times), while the no-prune control stayed effectively unchanged at
+24.291 ms. HashJoin unique/duplicate/no-match controls remained about
+0.249/0.663/0.190 ms. Point SeqScan, low/high-cardinality grouping, 50% range
+SeqScan, and the direct join/item Heap scans were about 1.09/1.63/1.67/1.82 ms
+and 0.051/0.817 ms. One run had broad system variance; the median-of-three and
+the 100%/partial/0% gradient remain consistent, with no timing gate.
+
+Partial and no-prune inequality joins remain the largest measured read cases.
+Phase 7I is therefore selected to investigate a true inequality candidate-range
+algorithm with explicit costing and output-order boundaries. No sorting,
+sweep/range execution, or new operator is implemented in Phase 7H. AND/OR
+short-circuit, Filter prebinding, projection/row-codec work, buffer snapshots,
+covering reads, and broader HashJoin eligibility remain separate candidates.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -254,7 +292,7 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E through 7G introduce no plan or inspection
+represent HashJoin. Phases 7E through 7H introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format.
