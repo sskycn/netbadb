@@ -208,6 +208,44 @@ struct ExecutionRows {
     rows: Vec<ExecutionRow>,
 }
 
+fn project_execution_row(
+    row: ExecutionRow,
+    positions: &[usize],
+) -> Result<ExecutionRow, ExecutionError> {
+    let values = positions
+        .iter()
+        .map(|position| {
+            row.values
+                .get(*position)
+                .cloned()
+                .ok_or(ExecutionError::TypeMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ExecutionRow {
+        row_id: row.row_id,
+        values,
+    })
+}
+
+fn project_join_values(
+    left: &[ScalarValue],
+    right: &[ScalarValue],
+    positions: &[usize],
+) -> Result<Vec<ScalarValue>, ExecutionError> {
+    positions
+        .iter()
+        .map(|position| {
+            if *position < left.len() {
+                left.get(*position)
+            } else {
+                right.get(position - left.len())
+            }
+            .cloned()
+            .ok_or(ExecutionError::TypeMismatch)
+        })
+        .collect()
+}
+
 fn execute_rows(
     plan: &PhysicalPlan,
     storages: &mut [HeapStorage],
@@ -217,8 +255,12 @@ fn execute_rows(
             table_id, columns, ..
         } => {
             let storage = storage_for_table(storages, *table_id)?;
+            let column_ids = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
             let rows = storage
-                .scan()?
+                .scan_columns(&column_ids)?
                 .into_iter()
                 .map(|(row_id, values)| ExecutionRow {
                     row_id: Some(row_id),
@@ -238,13 +280,17 @@ fn execute_rows(
             ..
         } => {
             let storage = storage_for_table(storages, *table_id)?;
+            let column_ids = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
             let row_ids = storage.btree().lookup(*handle, key)?;
             let rows = row_ids
                 .into_iter()
                 .map(|row_id| {
                     Ok(ExecutionRow {
                         row_id: Some(row_id),
-                        values: storage.read_row(row_id)?,
+                        values: storage.read_row_columns(row_id, &column_ids)?,
                     })
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
@@ -261,13 +307,17 @@ fn execute_rows(
             ..
         } => {
             let storage = storage_for_table(storages, *table_id)?;
+            let column_ids = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
             let row_ids = storage.btree().lookup_range(*handle, range)?;
             let rows = row_ids
                 .into_iter()
                 .map(|row_id| {
                     Ok(ExecutionRow {
                         row_id: Some(row_id),
-                        values: storage.read_row(row_id)?,
+                        values: storage.read_row_columns(row_id, &column_ids)?,
                     })
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
@@ -285,12 +335,18 @@ fn execute_rows(
         } => {
             let left = execute_rows(left, storages)?;
             let right = execute_rows(right, storages)?;
+            let mut joined_fields = left.fields.clone();
+            joined_fields.extend(right.fields.clone());
+            let output_positions = columns
+                .iter()
+                .map(|column| find_source_position(&joined_fields, column))
+                .collect::<Result<Vec<_>, _>>()?;
             let fields = columns
                 .iter()
                 .cloned()
                 .map(OutputField::Source)
                 .collect::<Vec<_>>();
-            let bound_predicate = bind_expression(predicate, &fields)?;
+            let bound_predicate = bind_expression(predicate, &joined_fields)?;
             let rows = match find_required_inequality(&bound_predicate, left.fields.len()) {
                 Some(inequality) => {
                     let Some(extreme) = required_right_extreme(&inequality, &right.rows)? else {
@@ -373,7 +429,10 @@ fn execute_rows(
                     &right.rows,
                     0..left.rows.len(),
                 )?,
-            };
+            }
+            .into_iter()
+            .map(|row| project_execution_row(row, &output_positions))
+            .collect::<Result<Vec<_>, _>>()?;
             Ok(ExecutionRows { fields, rows })
         }
         PhysicalPlan::HashJoin {
@@ -400,12 +459,18 @@ fn execute_rows(
                 }
             }
 
+            let mut joined_fields = left.fields.clone();
+            joined_fields.extend(right.fields.clone());
+            let output_positions = columns
+                .iter()
+                .map(|column| find_source_position(&joined_fields, column))
+                .collect::<Result<Vec<_>, _>>()?;
             let fields = columns
                 .iter()
                 .cloned()
                 .map(OutputField::Source)
                 .collect::<Vec<_>>();
-            let bound_predicate = bind_expression(predicate, &fields)?;
+            let bound_predicate = bind_expression(predicate, &joined_fields)?;
             let mut rows = Vec::new();
             for left_row in left.rows {
                 let Some(key) = hash_join_key(&left_row, left_key_position, left_key)? else {
@@ -426,11 +491,11 @@ fn execute_rows(
                         },
                     )? == TruthValue::True
                     {
-                        let mut values = Vec::with_capacity(
-                            left_row.values.len().saturating_add(right_row.values.len()),
-                        );
-                        values.extend(left_row.values.iter().cloned());
-                        values.extend(right_row.values.iter().cloned());
+                        let values = project_join_values(
+                            &left_row.values,
+                            &right_row.values,
+                            &output_positions,
+                        )?;
                         rows.push(ExecutionRow {
                             row_id: None,
                             values,

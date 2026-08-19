@@ -729,6 +729,25 @@ mod tests {
         }
     }
 
+    fn inspected_scan_columns(plan: &PlanNodeInspection) -> Option<Vec<ColumnId>> {
+        match plan {
+            PlanNodeInspection::SeqScan { columns, .. }
+            | PlanNodeInspection::IndexScan { columns, .. }
+            | PlanNodeInspection::RangeIndexScan { columns, .. } => {
+                Some(columns.iter().map(|column| column.column_id).collect())
+            }
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
+                inspected_scan_columns(left).or_else(|| inspected_scan_columns(right))
+            }
+            PlanNodeInspection::Filter { input, .. }
+            | PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => inspected_scan_columns(input),
+        }
+    }
+
     fn inspected_filter(plan: &PlanNodeInspection) -> Option<&ExpressionInspection> {
         match plan {
             PlanNodeInspection::Filter { predicate, .. } => Some(predicate),
@@ -1396,6 +1415,10 @@ mod tests {
             .inspect_statement(range_sql)
             .expect("inspect costed range");
         let range = inspected_range(inspected_root(&inspected.plan)).expect("range scan");
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&inspected.plan)),
+            Some(vec![ColumnId(1), ColumnId(4)])
+        );
         assert!(matches!(
             range.lower,
             netbadb_inspect::RangeBoundInspection::Included(ScalarValue::Int64(100))
@@ -1602,6 +1625,10 @@ mod tests {
             inspected_index(inspected_root(&fallback.plan)),
             Some((ColumnId(2), &ScalarValue::Int64(0)))
         );
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&fallback.plan)),
+            Some(vec![ColumnId(1), ColumnId(2), ColumnId(3)])
+        );
 
         database.analyze(TableId(9)).unwrap();
         let selective = database
@@ -1611,10 +1638,18 @@ mod tests {
             inspected_index(inspected_root(&selective.plan)),
             Some((ColumnId(1), &ScalarValue::Int64(42)))
         );
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&selective.plan)),
+            Some(vec![ColumnId(1), ColumnId(2), ColumnId(3)])
+        );
         let duplicate_heavy = database
             .inspect_statement("SELECT name FROM members WHERE team_id = 0")
             .unwrap();
         assert!(inspected_index(inspected_root(&duplicate_heavy.plan)).is_none());
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&duplicate_heavy.plan)),
+            Some(vec![ColumnId(2), ColumnId(3)])
+        );
 
         let sorted = database
             .inspect_statement("SELECT id FROM members ORDER BY team_id DESC NULLS LAST LIMIT 3")
@@ -1632,6 +1667,10 @@ mod tests {
         assert_eq!(keys[0].column.column_id, ColumnId(2));
         assert_eq!(keys[0].direction, SortDirectionInspection::Desc);
         assert_eq!(keys[0].null_order, NullOrderInspection::Last);
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&sorted.plan)),
+            Some(vec![ColumnId(1), ColumnId(2)])
+        );
 
         let self_join = database
             .inspect_statement(
@@ -1660,6 +1699,10 @@ mod tests {
                 AggregateOutputInspection::Aggregate { .. }
             ]
         ));
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&aggregate.plan)),
+            Some(vec![ColumnId(2)])
+        );
 
         let expression = database
             .inspect_statement(
@@ -1686,6 +1729,10 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&expression.plan)),
+            Some(vec![ColumnId(1), ColumnId(2), ColumnId(4)])
+        );
 
         let before = database
             .query("SELECT id FROM members ORDER BY id")
@@ -1708,12 +1755,20 @@ mod tests {
             inspected_index(inspected_root(&update.plan)),
             Some((ColumnId(1), &ScalarValue::Int64(42)))
         );
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&update.plan)),
+            Some(vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)])
+        );
         let delete = database
             .inspect_statement("DELETE FROM members WHERE id = 42")
             .unwrap();
         assert_eq!(
             inspected_index(inspected_root(&delete.plan)),
             Some((ColumnId(1), &ScalarValue::Int64(42)))
+        );
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&delete.plan)),
+            Some(vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)])
         );
         assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_length);
         assert_eq!(

@@ -6,8 +6,8 @@ use netbadb_index::{
     BTreeHandle, IndexBound, IndexRange, IndexStatistics, TableStatistics, compare_values,
 };
 use netbadb_rel::{
-    AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind, LogicalPlan,
-    LogicalStatement, OutputField, SortKey,
+    AggregateInput, AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind,
+    LogicalPlan, LogicalStatement, OutputField, SortKey,
 };
 use netbadb_types::{ColumnId, RelationBindingId, ScalarValue, TableId};
 
@@ -159,6 +159,20 @@ pub fn plan_with_statistics(
     table_statistics: &[TableAccessStatistics],
     access_paths: &[IndexAccessPath],
 ) -> PhysicalPlan {
+    let raw = plan_raw_with_statistics(logical, table_statistics, access_paths);
+    let required = raw
+        .output_fields()
+        .into_iter()
+        .filter_map(|field| field.source_column().map(SourceIdentity::from))
+        .collect::<Vec<_>>();
+    prune_required_columns(raw, &required)
+}
+
+fn plan_raw_with_statistics(
+    logical: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[IndexAccessPath],
+) -> PhysicalPlan {
     match logical {
         LogicalPlan::Scan {
             binding_id,
@@ -178,10 +192,16 @@ pub fn plan_with_statistics(
             predicate,
             columns,
         } => {
-            let physical_left =
-                Box::new(plan_with_statistics(left, table_statistics, access_paths));
-            let physical_right =
-                Box::new(plan_with_statistics(right, table_statistics, access_paths));
+            let physical_left = Box::new(plan_raw_with_statistics(
+                left,
+                table_statistics,
+                access_paths,
+            ));
+            let physical_right = Box::new(plan_raw_with_statistics(
+                right,
+                table_statistics,
+                access_paths,
+            ));
             if let Some((left_key, right_key)) =
                 eligible_simple_hash_join(*kind, left, right, predicate, table_statistics)
             {
@@ -220,8 +240,8 @@ pub fn plan_with_statistics(
                     table_statistics,
                     access_paths,
                 )
-                .unwrap_or_else(|| plan_with_statistics(input, table_statistics, access_paths)),
-                _ => plan_with_statistics(input, table_statistics, access_paths),
+                .unwrap_or_else(|| plan_raw_with_statistics(input, table_statistics, access_paths)),
+                _ => plan_raw_with_statistics(input, table_statistics, access_paths),
             };
             PhysicalPlan::Filter {
                 input: Box::new(input),
@@ -229,11 +249,19 @@ pub fn plan_with_statistics(
             }
         }
         LogicalPlan::Sort { input, keys } => PhysicalPlan::Sort {
-            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
+            input: Box::new(plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+            )),
             keys: keys.clone(),
         },
         LogicalPlan::Project { input, columns } => PhysicalPlan::Project {
-            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
+            input: Box::new(plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+            )),
             columns: columns.clone(),
         },
         LogicalPlan::Aggregate {
@@ -241,15 +269,263 @@ pub fn plan_with_statistics(
             group_keys,
             outputs,
         } => PhysicalPlan::Aggregate {
-            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
+            input: Box::new(plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+            )),
             group_keys: group_keys.clone(),
             outputs: outputs.clone(),
         },
         LogicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
-            input: Box::new(plan_with_statistics(input, table_statistics, access_paths)),
+            input: Box::new(plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+            )),
             limit: *limit,
         },
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceIdentity {
+    binding_id: RelationBindingId,
+    column_id: ColumnId,
+}
+
+impl From<&ColumnRef> for SourceIdentity {
+    fn from(column: &ColumnRef) -> Self {
+        Self {
+            binding_id: column.binding_id,
+            column_id: column.column_id,
+        }
+    }
+}
+
+fn add_required(required: &mut Vec<SourceIdentity>, column: &ColumnRef) {
+    let identity = SourceIdentity::from(column);
+    if !required.contains(&identity) {
+        required.push(identity);
+    }
+}
+
+fn collect_expression_columns(expression: &Expr, required: &mut Vec<SourceIdentity>) {
+    match &expression.kind {
+        ExprKind::Column(column) => add_required(required, column),
+        ExprKind::Literal(_) => {}
+        ExprKind::Binary { left, right, .. } => {
+            collect_expression_columns(left, required);
+            collect_expression_columns(right, required);
+        }
+        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+            collect_expression_columns(expression, required);
+        }
+    }
+}
+
+fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+        } => PhysicalPlan::SeqScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns: prune_columns(columns, parent_required),
+        },
+        PhysicalPlan::IndexScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            index_column,
+            handle,
+            key,
+        } => PhysicalPlan::IndexScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns: prune_columns(columns, parent_required),
+            index_column,
+            handle,
+            key,
+        },
+        PhysicalPlan::RangeIndexScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            index_column,
+            handle,
+            range,
+        } => PhysicalPlan::RangeIndexScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns: prune_columns(columns, parent_required),
+            index_column,
+            handle,
+            range,
+        },
+        PhysicalPlan::Filter { input, predicate } => {
+            let mut required = parent_required.to_vec();
+            collect_expression_columns(&predicate, &mut required);
+            PhysicalPlan::Filter {
+                input: Box::new(prune_required_columns(*input, &required)),
+                predicate,
+            }
+        }
+        PhysicalPlan::Sort { input, keys } => {
+            let mut required = parent_required.to_vec();
+            for key in &keys {
+                add_required(&mut required, &key.column);
+            }
+            PhysicalPlan::Sort {
+                input: Box::new(prune_required_columns(*input, &required)),
+                keys,
+            }
+        }
+        PhysicalPlan::Project { input, columns } => {
+            let mut required = Vec::new();
+            for column in &columns {
+                add_required(&mut required, column);
+            }
+            PhysicalPlan::Project {
+                input: Box::new(prune_required_columns(*input, &required)),
+                columns,
+            }
+        }
+        PhysicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } => {
+            let mut required = Vec::new();
+            for column in &group_keys {
+                add_required(&mut required, column);
+            }
+            for output in &outputs {
+                if let AggregateOutput::Aggregate(aggregate) = output {
+                    if let AggregateInput::Column(column) = &aggregate.input {
+                        add_required(&mut required, column);
+                    }
+                }
+            }
+            PhysicalPlan::Aggregate {
+                input: Box::new(prune_required_columns(*input, &required)),
+                group_keys,
+                outputs,
+            }
+        }
+        PhysicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
+            input: Box::new(prune_required_columns(*input, parent_required)),
+            limit,
+        },
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            kind,
+            predicate,
+            columns,
+        } => prune_join(
+            *left,
+            *right,
+            kind,
+            predicate,
+            columns,
+            None,
+            parent_required,
+        ),
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+        } => prune_join(
+            *left,
+            *right,
+            kind,
+            predicate,
+            columns,
+            Some((left_key, right_key)),
+            parent_required,
+        ),
+    }
+}
+
+fn prune_columns(columns: Vec<ColumnRef>, required: &[SourceIdentity]) -> Vec<ColumnRef> {
+    columns
+        .into_iter()
+        .filter(|column| required.contains(&SourceIdentity::from(column)))
+        .collect()
+}
+
+fn prune_join(
+    left: PhysicalPlan,
+    right: PhysicalPlan,
+    kind: JoinKind,
+    predicate: Expr,
+    columns: Vec<ColumnRef>,
+    hash_keys: Option<(ColumnRef, ColumnRef)>,
+    parent_required: &[SourceIdentity],
+) -> PhysicalPlan {
+    let mut required = parent_required.to_vec();
+    collect_expression_columns(&predicate, &mut required);
+    if let Some((left_key, right_key)) = &hash_keys {
+        add_required(&mut required, left_key);
+        add_required(&mut required, right_key);
+    }
+    let left_outputs = left.output_fields();
+    let right_outputs = right.output_fields();
+    let left_required = required
+        .iter()
+        .copied()
+        .filter(|identity| output_contains(&left_outputs, *identity))
+        .collect::<Vec<_>>();
+    let right_required = required
+        .iter()
+        .copied()
+        .filter(|identity| output_contains(&right_outputs, *identity))
+        .collect::<Vec<_>>();
+    let columns = columns
+        .into_iter()
+        .filter(|column| required.contains(&SourceIdentity::from(column)))
+        .collect();
+    let left = Box::new(prune_required_columns(left, &left_required));
+    let right = Box::new(prune_required_columns(right, &right_required));
+    match hash_keys {
+        None => PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            kind,
+            predicate,
+            columns,
+        },
+        Some((left_key, right_key)) => PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+        },
+    }
+}
+
+fn output_contains(fields: &[OutputField], identity: SourceIdentity) -> bool {
+    fields.iter().any(|field| {
+        field
+            .source_column()
+            .is_some_and(|column| SourceIdentity::from(column) == identity)
+    })
 }
 
 fn eligible_simple_hash_join(
@@ -840,12 +1116,12 @@ pub fn plan_statement_with_statistics(
             table_id,
             assignments,
         } => PhysicalStatement::Update {
-            input: plan_with_statistics(input, table_statistics, access_paths),
+            input: plan_raw_with_statistics(input, table_statistics, access_paths),
             table_id: *table_id,
             assignments: assignments.clone(),
         },
         LogicalStatement::Delete { input, table_id } => PhysicalStatement::Delete {
-            input: plan_with_statistics(input, table_statistics, access_paths),
+            input: plan_raw_with_statistics(input, table_statistics, access_paths),
             table_id: *table_id,
         },
     }
@@ -2277,5 +2553,397 @@ mod tests {
             index_scan_input(&input),
             Some(PhysicalPlan::IndexScan { .. })
         ));
+    }
+
+    fn base_columns(plan: &PhysicalPlan) -> &[ColumnRef] {
+        match plan {
+            PhysicalPlan::SeqScan { columns, .. }
+            | PhysicalPlan::IndexScan { columns, .. }
+            | PhysicalPlan::RangeIndexScan { columns, .. } => columns,
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Aggregate { input, .. }
+            | PhysicalPlan::Limit { input, .. } => base_columns(input),
+            PhysicalPlan::NestedLoopJoin { .. } | PhysicalPlan::HashJoin { .. } => {
+                panic!("expected one base scan")
+            }
+        }
+    }
+
+    fn base_plan(plan: &PhysicalPlan) -> &PhysicalPlan {
+        match plan {
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Aggregate { input, .. }
+            | PhysicalPlan::Limit { input, .. } => base_plan(input),
+            _ => plan,
+        }
+    }
+
+    fn column_ids(columns: &[ColumnRef]) -> Vec<ColumnId> {
+        columns.iter().map(|column| column.column_id).collect()
+    }
+
+    #[test]
+    fn query_pruning_preserves_projection_filter_sort_and_aggregate_requirements() {
+        let id = test_column(1, "id", false);
+        let active = test_column(2, "active", false);
+        let payload = test_column(3, "payload", false);
+        let scan = || LogicalPlan::Scan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            table_name: "items".into(),
+            columns: vec![id.clone(), active.clone(), payload.clone()],
+        };
+
+        let duplicate_project = LogicalPlan::Project {
+            input: Box::new(scan()),
+            columns: vec![id.clone(), id.clone()],
+        };
+        let physical = plan(&duplicate_project);
+        assert_eq!(column_ids(base_columns(&physical)), vec![ColumnId(1)]);
+        assert_eq!(physical.output_fields().len(), 2);
+
+        let filtered = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan()),
+                predicate: binary(
+                    BinaryOp::Eq,
+                    column_expr(&active),
+                    literal(ScalarValue::Int64(1)),
+                ),
+            }),
+            columns: vec![id.clone()],
+        };
+        assert_eq!(
+            column_ids(base_columns(&plan(&filtered))),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+
+        let sorted = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(scan()),
+                keys: vec![netbadb_rel::SortKey {
+                    column: payload.clone(),
+                    direction: netbadb_rel::SortDirection::Asc,
+                    null_order: netbadb_rel::NullOrder::First,
+                }],
+            }),
+            columns: vec![id.clone()],
+        };
+        assert_eq!(
+            column_ids(base_columns(&plan(&sorted))),
+            vec![ColumnId(1), ColumnId(3)]
+        );
+
+        let count = |input| {
+            netbadb_rel::AggregateOutput::Aggregate(netbadb_rel::AggregateExpr {
+                function: netbadb_rel::AggregateFunction::Count,
+                input,
+                output: netbadb_rel::DerivedField {
+                    name: "count".into(),
+                    data_type: SemanticType::physical(PhysicalType::UInt64),
+                    nullable: false,
+                },
+            })
+        };
+        let count_star = LogicalPlan::Aggregate {
+            input: Box::new(scan()),
+            group_keys: Vec::new(),
+            outputs: vec![count(netbadb_rel::AggregateInput::All)],
+        };
+        assert!(base_columns(&plan(&count_star)).is_empty());
+        let count_payload = LogicalPlan::Aggregate {
+            input: Box::new(scan()),
+            group_keys: vec![active.clone()],
+            outputs: vec![
+                netbadb_rel::AggregateOutput::GroupKey(active),
+                count(netbadb_rel::AggregateInput::Column(payload)),
+            ],
+        };
+        assert_eq!(
+            column_ids(base_columns(&plan(&count_payload))),
+            vec![ColumnId(2), ColumnId(3)]
+        );
+    }
+
+    #[test]
+    fn point_range_reads_prune_columns_but_dml_inputs_remain_complete() {
+        let id = test_column(1, "id", false);
+        let payload = test_column(2, "payload", false);
+        let extra = test_column(3, "extra", false);
+        let columns = vec![id.clone(), payload.clone(), extra.clone()];
+        let point_input = filtered_scan(
+            binary(
+                BinaryOp::Eq,
+                column_expr(&id),
+                literal(ScalarValue::Int64(42)),
+            ),
+            columns.clone(),
+        );
+        let point = LogicalPlan::Project {
+            input: Box::new(point_input.clone()),
+            columns: vec![payload.clone()],
+        };
+        let point = plan_with_access_paths(&point, &[access_path(1, 40)]);
+        assert_eq!(
+            column_ids(base_columns(&point)),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        assert!(matches!(base_plan(&point), PhysicalPlan::IndexScan { .. }));
+
+        let range_input = filtered_scan(
+            binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::GtEq,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(10)),
+                ),
+                binary(
+                    BinaryOp::Lt,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(20)),
+                ),
+            ),
+            columns.clone(),
+        );
+        let range = LogicalPlan::Project {
+            input: Box::new(range_input),
+            columns: vec![payload],
+        };
+        let range = plan_with_statistics(
+            &range,
+            &[analyzed_table(1_000, 100)],
+            &[analyzed_path(1, 40, 1_000, 0, 1)],
+        );
+        assert_eq!(
+            column_ids(base_columns(&range)),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        assert!(matches!(
+            base_plan(&range),
+            PhysicalPlan::RangeIndexScan { .. }
+        ));
+
+        let delete = plan_statement_with_access_paths(
+            &LogicalStatement::Delete {
+                input: point_input,
+                table_id: TableId(1),
+            },
+            &[access_path(1, 40)],
+        );
+        let PhysicalStatement::Delete { input, .. } = delete else {
+            panic!("expected delete")
+        };
+        assert_eq!(
+            column_ids(base_columns(&input)),
+            vec![ColumnId(1), ColumnId(2), ColumnId(3)]
+        );
+    }
+
+    #[test]
+    fn join_pruning_splits_self_join_bindings_and_keeps_hash_residual_columns() {
+        let left_id = join_column_ref(
+            10,
+            1,
+            1,
+            "id",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let left_key = join_column_ref(
+            10,
+            1,
+            2,
+            "key",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let left_extra = join_column_ref(
+            10,
+            1,
+            3,
+            "extra",
+            SemanticType::physical(PhysicalType::Bool),
+            false,
+        );
+        let right_id = join_column_ref(
+            20,
+            1,
+            1,
+            "id",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let right_key = join_column_ref(
+            20,
+            1,
+            2,
+            "key",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let right_active = join_column_ref(
+            20,
+            1,
+            3,
+            "active",
+            SemanticType::physical(PhysicalType::Bool),
+            false,
+        );
+        let predicate = join_binary(
+            BinaryOp::And,
+            join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key)),
+            join_binary(
+                BinaryOp::Eq,
+                join_expr(&right_active),
+                join_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            ),
+        );
+        let joined = logical_join(
+            join_scan(10, 1, vec![left_id.clone(), left_key.clone(), left_extra]),
+            join_scan(
+                20,
+                1,
+                vec![right_id, right_key.clone(), right_active.clone()],
+            ),
+            predicate,
+        );
+        let physical = plan_with_statistics(
+            &LogicalPlan::Project {
+                input: Box::new(joined),
+                columns: vec![left_id.clone()],
+            },
+            &[join_table_statistics(1, 500)],
+            &[],
+        );
+        let PhysicalPlan::Project { input, .. } = physical else {
+            panic!("expected project")
+        };
+        let PhysicalPlan::HashJoin {
+            left,
+            right,
+            columns,
+            ..
+        } = *input
+        else {
+            panic!("expected hash join")
+        };
+        assert_eq!(
+            column_ids(base_columns(&left)),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        assert_eq!(
+            column_ids(base_columns(&right)),
+            vec![ColumnId(2), ColumnId(3)]
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| (column.binding_id, column.column_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (RelationBindingId(10), ColumnId(1)),
+                (RelationBindingId(10), ColumnId(2)),
+                (RelationBindingId(20), ColumnId(2)),
+                (RelationBindingId(20), ColumnId(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn chained_join_propagates_outer_predicate_columns_through_the_inner_join() {
+        let a_id = join_column_ref(
+            10,
+            1,
+            1,
+            "id",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let b_id = join_column_ref(
+            20,
+            2,
+            1,
+            "id",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let b_a_id = join_column_ref(
+            20,
+            2,
+            2,
+            "a_id",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let c_b_id = join_column_ref(
+            30,
+            3,
+            1,
+            "b_id",
+            SemanticType::physical(PhysicalType::Int64),
+            false,
+        );
+        let c_name = join_column_ref(
+            30,
+            3,
+            2,
+            "name",
+            SemanticType::physical(PhysicalType::Text),
+            false,
+        );
+        let inner = logical_join(
+            join_scan(10, 1, vec![a_id.clone()]),
+            join_scan(20, 2, vec![b_id.clone(), b_a_id.clone()]),
+            join_binary(BinaryOp::Eq, join_expr(&a_id), join_expr(&b_a_id)),
+        );
+        let outer = logical_join(
+            inner,
+            join_scan(30, 3, vec![c_b_id.clone(), c_name.clone()]),
+            join_binary(BinaryOp::Eq, join_expr(&b_id), join_expr(&c_b_id)),
+        );
+        let physical = plan(&LogicalPlan::Project {
+            input: Box::new(outer),
+            columns: vec![a_id, c_name],
+        });
+        let PhysicalPlan::Project { input, .. } = physical else {
+            panic!("expected project")
+        };
+        let PhysicalPlan::NestedLoopJoin { left, right, .. } = *input else {
+            panic!("expected outer join")
+        };
+        assert_eq!(
+            column_ids(base_columns(&right)),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        let PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            columns,
+            ..
+        } = *left
+        else {
+            panic!("expected inner join")
+        };
+        assert_eq!(column_ids(base_columns(&left)), vec![ColumnId(1)]);
+        assert_eq!(
+            column_ids(base_columns(&right)),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| (column.binding_id, column.column_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (RelationBindingId(10), ColumnId(1)),
+                (RelationBindingId(20), ColumnId(1)),
+                (RelationBindingId(20), ColumnId(2)),
+            ]
+        );
     }
 }

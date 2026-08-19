@@ -620,21 +620,46 @@ reporting.
 - PhysicalPlan, planner, storage, inspection v3, public APIs, dependencies, and
   persistent formats are unchanged.
 
-### Phase 7J — Required-column propagation and projection pruning (selected, not started)
+### Phase 7J — Required-column propagation and selective base-row decode (complete)
 
-Post-7I, the representative direct narrow/wide Heap scans remain about 0.045
-and 0.737 ms, while narrow/wide 100%-reject joins remain about 0.123 and 0.474
-ms even though neither produces candidate pairs. This payload-width signal is
-clearer than the now-reduced partial candidate loop. Phase 7J is therefore
-selected to design typed required-column propagation and narrower storage reads,
-with explicit field-identity, DML, inspection, and row reconstruction
-boundaries. No Phase 7J implementation is part of Phase 7I.
+- raw physical planning remains responsible for access paths and join choices;
+  one query-only top-down pass propagates binding-aware source requirements;
+- Project, Filter, Sort, Aggregate, Limit, NestedLoopJoin, and HashJoin preserve
+  every hidden semantic input while base Seq/point/range reads retain required
+  columns in source order;
+- join requirements split through `RelationBindingId + ColumnId`, including
+  self joins, residual predicates, hash keys, and outer ON columns crossing a
+  chained inner join;
+- UPDATE and DELETE deliberately use raw full-row plans, preserving replacement
+  and transaction behavior;
+- typed Heap projected scan/point APIs preserve request order and duplicates;
+  zero-column scans retain one RowId-bearing row per live tuple for COUNT(*);
+- one borrowed decoder validates every persisted tag, length, bound, UTF-8
+  string, physical type, NULL constraint, truncation, and trailing value, while
+  only requested values become owned ScalarValues;
+- sequential scans retain Phase 7E's once-per-page full validation and indexed
+  reads retain generation-safe RowId fetches;
+- attribution scenarios cover ID-only versus ID+Text, COUNT(*) versus
+  COUNT(Text), hidden Text filtering, ORDER BY, GROUP BY, and narrow/wide joins;
+  plans, rows, shapes, and checksums are hard gates without timing thresholds;
+- PhysicalPlan operator variants, Inspection JSON v3, Protocol v1, SDK Schema
+  Spec v1, Manifest v4, row encoding, dependencies, and persistent formats are
+  unchanged.
 
-AND/OR short-circuit still requires a representative complex-boolean benchmark.
-Filter predicate prebinding, row-codec Text ownership, BufferPool read
-snapshots, covering/index-only reads, broader HashJoin eligibility,
-multi-inequality intersection, and new physical join operators remain separate
-measured candidates.
+### Phase 7K — Remaining row-codec/scalar-consumer ownership (selected, not started)
+
+Post-7J median-of-three full runs reduced ID-only by about 24.3% and COUNT(*)
+by about 40.3%, while ID+payload improved about 2.0% and COUNT(payload) about
+6.8%. The payload/ID ratio grew from about 1.10 to 1.42 and the
+COUNT(payload)/COUNT(*) ratio from about 1.05 to 1.64. Remaining Text ownership
+is therefore the clearest newly isolated cost and is selected for Phase 7K
+investigation. Phase 7K must benchmark a concrete consumer boundary and retain
+full persisted validation; it is not implemented in Phase 7J.
+
+Filter predicate prebinding, AND/OR short-circuiting, BufferPool page snapshot
+cloning, covering/index-only reads, broader HashJoin eligibility,
+multi-inequality intersection, and sequential PageManager traversal remain
+separate candidates.
 
 ### Later Phase 7 work
 

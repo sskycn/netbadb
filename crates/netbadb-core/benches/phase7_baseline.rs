@@ -21,6 +21,7 @@ const ID_COLUMN_ID: ColumnId = ColumnId(1);
 const TEAM_COLUMN_ID: ColumnId = ColumnId(2);
 const BUCKET_COLUMN_ID: ColumnId = ColumnId(3);
 const NULLABLE_COLUMN_ID: ColumnId = ColumnId(4);
+const PAYLOAD_COLUMN_ID: ColumnId = ColumnId(6);
 const LEFT_TABLE_ID: TableId = TableId(11);
 const RIGHT_TABLE_ID: TableId = TableId(12);
 const CHECKSUM_FACTOR: u128 = 1_000_003;
@@ -247,6 +248,7 @@ fn main() -> BenchResult<()> {
     let mut measurements = Vec::new();
 
     run_direct_heap_scan_scenarios(settings, &mut measurements)?;
+    run_projection_attribution_scenarios(settings, &mut measurements)?;
     run_point_and_shape_scenarios(settings, &mut measurements)?;
     run_join_scenarios(settings, &mut measurements)?;
     run_insert_scenarios(settings, &mut measurements)?;
@@ -254,6 +256,119 @@ fn main() -> BenchResult<()> {
     run_planner_scenario(settings, &mut measurements)?;
 
     print_report(profile, settings, &measurements)?;
+    Ok(())
+}
+
+fn run_projection_attribution_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let rows = settings.medium_rows;
+    run_attribution_query(
+        "projection_id_only",
+        rows,
+        "SELECT id FROM items",
+        &[Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "projection_id_payload",
+        rows,
+        "SELECT id, payload FROM items",
+        &[Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        id_payload_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_star",
+        rows,
+        "SELECT COUNT(*) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_payload",
+        rows,
+        "SELECT COUNT(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    let middle = rows / 2;
+    run_attribution_query(
+        "hidden_filter_payload",
+        rows,
+        &format!("SELECT id FROM items WHERE payload = 'payload-{middle:016}'"),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_attribution_query(
+    scenario: &str,
+    rows: u64,
+    sql: &str,
+    required: &[Operator],
+    expected_base_columns: &[ColumnId],
+    expected: Observation,
+    settings: ProfileSettings,
+    observe: impl Fn(&QueryResult) -> BenchResult<Observation>,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let (mut database, paths) = items_fixture(scenario, rows, &[], NullDistribution::Low, 4)?;
+    let plan = inspect_plan(&database, scenario, sql, required, &[])?;
+    inspect_base_scan_columns(&database, scenario, sql, expected_base_columns)?;
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        observe,
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
     Ok(())
 }
 
@@ -1304,6 +1419,50 @@ fn inspect_plan(
     Ok(plan_label(root))
 }
 
+fn inspect_base_scan_columns(
+    database: &Database,
+    scenario: &str,
+    sql: &str,
+    expected: &[ColumnId],
+) -> BenchResult<()> {
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    let mut scans = Vec::new();
+    collect_base_scan_columns(root, &mut scans);
+    let [actual] = scans.as_slice() else {
+        return Err(message_error(format!(
+            "scenario `{scenario}` expected exactly one base scan, found {}",
+            scans.len()
+        )));
+    };
+    if actual.as_slice() != expected {
+        return Err(message_error(format!(
+            "scenario `{scenario}` base scan columns were {actual:?}; expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn collect_base_scan_columns(plan: &PlanNodeInspection, scans: &mut Vec<Vec<ColumnId>>) {
+    match plan {
+        PlanNodeInspection::SeqScan { columns, .. }
+        | PlanNodeInspection::IndexScan { columns, .. }
+        | PlanNodeInspection::RangeIndexScan { columns, .. } => {
+            scans.push(columns.iter().map(|column| column.column_id).collect());
+        }
+        PlanNodeInspection::NestedLoopJoin { left, right, .. }
+        | PlanNodeInspection::HashJoin { left, right, .. } => {
+            collect_base_scan_columns(left, scans);
+            collect_base_scan_columns(right, scans);
+        }
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => collect_base_scan_columns(input, scans),
+    }
+}
+
 fn statement_root(inspection: &StatementInspection) -> BenchResult<&PlanNodeInspection> {
     match &inspection.plan {
         StatementPlanInspection::Query { root } => Ok(root),
@@ -1392,6 +1551,31 @@ fn ids_observation(result: &QueryResult) -> BenchResult<Observation> {
         };
         checksum = checksum
             .checked_add(u128::try_from(*value).map_err(|_| message_error("negative result ID"))?)
+            .ok_or_else(|| message_error("ID checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: u64::try_from(result.rows.len())
+            .map_err(|_| message_error("result row count exceeds u64"))?,
+        checksum,
+    })
+}
+
+fn id_payload_observation(result: &QueryResult) -> BenchResult<Observation> {
+    let mut checksum = 0_u128;
+    for row in &result.rows {
+        let [ScalarValue::Int64(id), ScalarValue::Text(payload)] = row.as_slice() else {
+            return Err(message_error(
+                "id/payload query must return non-NULL Int64 and Text columns",
+            ));
+        };
+        let id = u64::try_from(*id).map_err(|_| message_error("negative result ID"))?;
+        if payload != &format!("payload-{id:016}") {
+            return Err(message_error(format!(
+                "id/payload query returned unexpected payload shape for ID {id}"
+            )));
+        }
+        checksum = checksum
+            .checked_add(u128::from(id))
             .ok_or_else(|| message_error("ID checksum overflow"))?;
     }
     Ok(Observation {

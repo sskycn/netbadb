@@ -347,6 +347,47 @@ pairs are never materialized. Only a complete predicate result of TRUE creates
 an owned output row. This remains an internal NestedLoopJoin strategy, not a new
 physical operator, planner cost, persistent statistic, or inspection contract.
 
+Phase 7J applies required-column propagation only after the complete physical
+query tree has been selected. Logical scans retain the full resolved relation,
+and UPDATE/DELETE keep full base rows. The public query planner performs one
+top-down pass over the raw physical tree:
+
+```text
+typed physical query
+    -> required source columns (RelationBindingId + ColumnId)
+    -> preserve Filter predicate and Sort key columns
+    -> preserve group keys and aggregate column inputs
+    -> preserve Join predicate columns and defensive HashJoin keys
+    -> split Join requirements by binding-aware child output identity
+    -> prune SeqScan / IndexScan / RangeIndexScan columns in source order
+    -> executor passes ordered ColumnId projections to Heap
+    -> Heap validates every encoded scalar
+    -> own only requested ScalarValues
+```
+
+Membership is deduplicated, but operators never reorder source columns by
+discovery order. A repeated result projection remains repeated while its base
+scan reads the source once. `COUNT(*)` can drive a zero-column scan; every live
+row still produces an execution row with its RowId and an empty value vector,
+so row-count semantics are unchanged.
+
+Join children may retain columns needed only by their own predicates. The join
+executor therefore binds the current predicate against the concrete
+left-then-right child layout, then projects matching rows to the current join's
+declared columns. This lets an inner join consume its private predicate columns
+without leaking them into an outer join, while outer ON columns still propagate
+through a chained left subtree. Self joins remain distinct because TableId or
+ColumnId alone never determines membership.
+
+The Heap projected-read APIs resolve typed ColumnIds to schema positions once
+per read or scan. Their decoder borrows Text as `&str` while parsing, validates
+tag, length, bounds, UTF-8, physical type, nullability, truncation, and trailing
+values for every schema column, then allocates owned Text only for selected
+values. Request order and duplicates are preserved. Full reads use the same
+borrowed decoder core, page validation remains once per immutable Heap page per
+scan, and point/range reads retain page bounds, tombstone, and RowId generation
+checks. Row encoding and every persistent format are unchanged.
+
 Join-bound evaluation represents an intermediate scalar as either a borrowed
 row/literal value or an owned computed value:
 

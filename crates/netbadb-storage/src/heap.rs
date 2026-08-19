@@ -9,7 +9,7 @@ use netbadb_index::{
     validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
-use netbadb_types::{ColumnId, PageId, RowId, ScalarValue, SlotId};
+use netbadb_types::{ColumnId, PageId, PhysicalType, RowId, ScalarValue, SlotId};
 
 use crate::recovery::RecoveryManager;
 use crate::transaction::TransactionManager;
@@ -891,6 +891,26 @@ impl HeapStorage {
         )
     }
 
+    /// Reads requested columns in caller-provided order while validating the
+    /// complete persisted row. Duplicate column IDs produce duplicate values.
+    pub fn read_row_columns(
+        &self,
+        row_id: RowId,
+        columns: &[ColumnId],
+    ) -> Result<Vec<ScalarValue>, StorageError> {
+        let positions = resolve_projection(&self.table, columns)?;
+        self.ensure_row_page(row_id)?;
+        let page = self.buffer.read_page(row_id.page)?;
+        let slot = validate_row_slot(page.page(), row_id)?;
+        decode_row_columns(
+            page.page()
+                .read_record(slot)
+                .map_err(|error| map_row_error(error, row_id))?,
+            &self.table,
+            &positions,
+        )
+    }
+
     /// Transactional form of [`Self::update`]. A failure after relocation has
     /// appended partial physical history leaves the transaction requiring
     /// rollback, so it cannot commit or perform another write.
@@ -1301,6 +1321,23 @@ impl HeapStorage {
     }
 
     pub fn scan(&mut self) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
+        let columns = self
+            .table
+            .columns
+            .iter()
+            .map(|column| column.id)
+            .collect::<Vec<_>>();
+        self.scan_columns(&columns)
+    }
+
+    /// Scans requested columns in caller-provided order while validating every
+    /// encoded value in every live row. An empty projection still returns one
+    /// `(RowId, Vec::new())` entry per live row.
+    pub fn scan_columns(
+        &mut self,
+        columns: &[ColumnId],
+    ) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
+        let positions = resolve_projection(&self.table, columns)?;
         let mut rows = Vec::new();
         for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
             let page_id = PageId(page_number);
@@ -1314,7 +1351,7 @@ impl HeapStorage {
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
                 if let Some((slot_entry, payload)) = validated.live_record(slot)? {
-                    let values = decode_row(payload, &self.table)?;
+                    let values = decode_row_columns(payload, &self.table, &positions)?;
                     rows.push((
                         RowId {
                             page: page_id,
@@ -1658,43 +1695,153 @@ fn decode_row(payload: &[u8], table: &TableDef) -> Result<Vec<ScalarValue>, Stor
     let mut values = Vec::with_capacity(table.columns.len());
     for column in &table.columns {
         let value = decode_value(payload, &mut offset)?;
-        if matches!(value, ScalarValue::Null) {
-            if !column.nullable {
-                return Err(StorageError::NullNotAllowed {
-                    column: column.name.clone(),
-                });
-            }
-        } else if !value.matches_type(&column.semantic_type()) {
-            return Err(StorageError::TypeMismatch {
-                column: column.name.clone(),
-                expected: column.semantic_type().physical,
-                actual: value.physical_type(),
-            });
-        }
-        values.push(value);
+        validate_decoded_scalar(value, column)?;
+        values.push(value.into_owned());
     }
-    if offset != payload.len() {
-        return Err(CodecError::ExtraValues.into());
-    }
+    ensure_row_consumed(offset, payload.len())?;
     Ok(values)
 }
 
-fn decode_value(payload: &[u8], offset: &mut usize) -> Result<ScalarValue, StorageError> {
+fn decode_row_columns(
+    payload: &[u8],
+    table: &TableDef,
+    positions: &[usize],
+) -> Result<Vec<ScalarValue>, StorageError> {
+    if positions.is_empty() {
+        let mut offset = 0;
+        for column in &table.columns {
+            let value = decode_value(payload, &mut offset)?;
+            validate_decoded_scalar(value, column)?;
+        }
+        ensure_row_consumed(offset, payload.len())?;
+        return Ok(Vec::new());
+    }
+    if positions.len() == table.columns.len()
+        && positions.iter().copied().eq(0..table.columns.len())
+    {
+        return decode_row(payload, table);
+    }
+    if positions.windows(2).all(|pair| pair[0] < pair[1]) {
+        let mut offset = 0;
+        let mut selected = Vec::with_capacity(positions.len());
+        let mut next_position = 0;
+        for (schema_position, column) in table.columns.iter().enumerate() {
+            let value = decode_value(payload, &mut offset)?;
+            validate_decoded_scalar(value, column)?;
+            if positions.get(next_position) == Some(&schema_position) {
+                selected.push(value.into_owned());
+                next_position += 1;
+            }
+        }
+        ensure_row_consumed(offset, payload.len())?;
+        return Ok(selected);
+    }
+    let mut offset = 0;
+    let mut decoded = Vec::with_capacity(table.columns.len());
+    for column in &table.columns {
+        let value = decode_value(payload, &mut offset)?;
+        validate_decoded_scalar(value, column)?;
+        decoded.push(value);
+    }
+    ensure_row_consumed(offset, payload.len())?;
+    Ok(positions
+        .iter()
+        .map(|position| decoded[*position].into_owned())
+        .collect())
+}
+
+fn ensure_row_consumed(offset: usize, payload_length: usize) -> Result<(), StorageError> {
+    if offset != payload_length {
+        return Err(CodecError::ExtraValues.into());
+    }
+    Ok(())
+}
+
+fn resolve_projection(table: &TableDef, columns: &[ColumnId]) -> Result<Vec<usize>, StorageError> {
+    columns
+        .iter()
+        .map(|column_id| {
+            table
+                .columns
+                .iter()
+                .position(|column| column.id == *column_id)
+                .ok_or(StorageError::UnknownColumn {
+                    column_id: *column_id,
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedScalar<'a> {
+    Bool(bool),
+    Int64(i64),
+    UInt64(u64),
+    Text(&'a str),
+    Null,
+}
+
+impl DecodedScalar<'_> {
+    const fn physical_type(self) -> Option<PhysicalType> {
+        match self {
+            Self::Bool(_) => Some(PhysicalType::Bool),
+            Self::Int64(_) => Some(PhysicalType::Int64),
+            Self::UInt64(_) => Some(PhysicalType::UInt64),
+            Self::Text(_) => Some(PhysicalType::Text),
+            Self::Null => None,
+        }
+    }
+
+    fn into_owned(self) -> ScalarValue {
+        match self {
+            Self::Bool(value) => ScalarValue::Bool(value),
+            Self::Int64(value) => ScalarValue::Int64(value),
+            Self::UInt64(value) => ScalarValue::UInt64(value),
+            Self::Text(value) => ScalarValue::Text(value.to_owned()),
+            Self::Null => ScalarValue::Null,
+        }
+    }
+}
+
+fn validate_decoded_scalar(
+    value: DecodedScalar<'_>,
+    column: &netbadb_schema::ColumnDef,
+) -> Result<(), StorageError> {
+    if matches!(value, DecodedScalar::Null) {
+        if !column.nullable {
+            return Err(StorageError::NullNotAllowed {
+                column: column.name.clone(),
+            });
+        }
+    } else if value.physical_type() != Some(column.semantic_type().physical) {
+        return Err(StorageError::TypeMismatch {
+            column: column.name.clone(),
+            expected: column.semantic_type().physical,
+            actual: value.physical_type(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_value<'a>(
+    payload: &'a [u8],
+    offset: &mut usize,
+) -> Result<DecodedScalar<'a>, StorageError> {
     let tag = *payload.get(*offset).ok_or(CodecError::MissingScalarTag)?;
     *offset += 1;
     match tag {
         0 => {
             let value = read_byte(payload, offset)?;
             match value {
-                0 => Ok(ScalarValue::Bool(false)),
-                1 => Ok(ScalarValue::Bool(true)),
+                0 => Ok(DecodedScalar::Bool(false)),
+                1 => Ok(DecodedScalar::Bool(true)),
                 other => Err(CodecError::InvalidBoolean(other).into()),
             }
         }
-        1 => Ok(ScalarValue::Int64(i64::from_le_bytes(read_array(
+        1 => Ok(DecodedScalar::Int64(i64::from_le_bytes(read_array(
             payload, offset,
         )?))),
-        2 => Ok(ScalarValue::UInt64(u64::from_le_bytes(read_array(
+        2 => Ok(DecodedScalar::UInt64(u64::from_le_bytes(read_array(
             payload, offset,
         )?))),
         3 => {
@@ -1705,13 +1852,11 @@ fn decode_value(payload: &[u8], offset: &mut usize) -> Result<ScalarValue, Stora
             let text_bytes = payload
                 .get(*offset..end)
                 .ok_or(CodecError::ScalarTruncated)?;
-            let text = std::str::from_utf8(text_bytes)
-                .map_err(|_| CodecError::TextNotUtf8)?
-                .to_owned();
+            let text = std::str::from_utf8(text_bytes).map_err(|_| CodecError::TextNotUtf8)?;
             *offset = end;
-            Ok(ScalarValue::Text(text))
+            Ok(DecodedScalar::Text(text))
         }
-        4 => Ok(ScalarValue::Null),
+        4 => Ok(DecodedScalar::Null),
         other => Err(CodecError::UnknownScalarTag(other).into()),
     }
 }
@@ -1753,7 +1898,10 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 
 #[cfg(test)]
 mod tests {
-    use super::{HeapStorage, decode_row, encode_row};
+    use super::{
+        DecodedScalar, HeapStorage, decode_row, decode_row_columns, decode_value, encode_row,
+        resolve_projection,
+    };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
         BufferError, CheckpointError, PageError, PageManager, PageType, SlotId, StorageError,
@@ -2979,6 +3127,120 @@ mod tests {
             vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
         );
         cleanup(&path);
+    }
+
+    #[test]
+    fn projected_reads_preserve_request_order_duplicates_and_zero_columns() {
+        let path = test_path("heap-projected-read");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let first = storage
+            .insert(&[ScalarValue::Int64(7), ScalarValue::Text("Ada".into())])
+            .expect("insert first");
+        storage
+            .insert(&[ScalarValue::Int64(8), ScalarValue::Text("Grace".into())])
+            .expect("insert second");
+
+        assert_eq!(
+            storage
+                .read_row_columns(first, &[ColumnId(2), ColumnId(1), ColumnId(2)])
+                .expect("project point read"),
+            vec![
+                ScalarValue::Text("Ada".into()),
+                ScalarValue::Int64(7),
+                ScalarValue::Text("Ada".into()),
+            ]
+        );
+        let projected = storage.scan_columns(&[ColumnId(1)]).expect("project scan");
+        assert_eq!(
+            projected
+                .iter()
+                .map(|(_, values)| values.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![ScalarValue::Int64(7)], vec![ScalarValue::Int64(8)]]
+        );
+        assert!(
+            storage
+                .scan_columns(&[])
+                .expect("zero-column scan")
+                .iter()
+                .all(|(_, values)| values.is_empty())
+        );
+        assert!(matches!(
+            storage.scan_columns(&[ColumnId(99)]),
+            Err(StorageError::UnknownColumn {
+                column_id: ColumnId(99)
+            })
+        ));
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn selective_decode_validates_every_unselected_scalar_without_owning_text() {
+        let schema = TableDef::new(
+            TableId(40),
+            "items",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "payload",
+                    TypeSpec::Physical(PhysicalType::Text),
+                ),
+            ],
+        );
+        let encoded = encode_row(&[
+            ScalarValue::Int64(7),
+            ScalarValue::Bool(true),
+            ScalarValue::Text("payload".into()),
+        ])
+        .expect("encode row");
+        let positions = resolve_projection(&schema, &[ColumnId(1)]).expect("resolve ID");
+        assert_eq!(
+            decode_row_columns(&encoded, &schema, &positions).expect("project ID"),
+            vec![ScalarValue::Int64(7)]
+        );
+        let mut offset = 0;
+        let _id = decode_value(&encoded, &mut offset).expect("borrow ID");
+        let _active = decode_value(&encoded, &mut offset).expect("borrow active");
+        assert!(matches!(
+            decode_value(&encoded, &mut offset).expect("borrow Text"),
+            DecodedScalar::Text("payload")
+        ));
+
+        let mut invalid_bool = encoded.clone();
+        invalid_bool[10] = 2;
+        assert!(matches!(
+            decode_row_columns(&invalid_bool, &schema, &positions),
+            Err(StorageError::Codec(crate::CodecError::InvalidBoolean(2)))
+        ));
+        let mut invalid_utf8 = encoded.clone();
+        invalid_utf8[16] = 0xff;
+        assert!(matches!(
+            decode_row_columns(&invalid_utf8, &schema, &positions),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
+        let mut invalid_null = encoded.clone();
+        invalid_null[9] = 4;
+        assert!(matches!(
+            decode_row_columns(&invalid_null, &schema, &positions),
+            Err(StorageError::NullNotAllowed { column }) if column == "active"
+        ));
+        assert!(matches!(
+            decode_row_columns(&encoded[..encoded.len() - 1], &schema, &positions),
+            Err(StorageError::Codec(crate::CodecError::ScalarTruncated))
+        ));
+        let mut extra = encoded;
+        extra.push(4);
+        assert!(matches!(
+            decode_row_columns(&extra, &schema, &positions),
+            Err(StorageError::Codec(crate::CodecError::ExtraValues))
+        ));
     }
 
     #[test]
@@ -4228,6 +4490,33 @@ mod tests {
         assert!(matches!(
             reopened.scan(),
             Err(StorageError::Codec(crate::CodecError::UnknownScalarTag(99)))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn projected_scan_rejects_invalid_utf8_in_an_unselected_persisted_column() {
+        let path = test_path("heap-corrupt-unselected-text");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        storage
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert row");
+        storage.close().expect("close heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut page = pages.read_page(FIRST_HEAP_PAGE).expect("read data page");
+        let slot = page.slot(SlotId(0)).expect("read row slot");
+        let text_payload = usize::from(slot.offset) + 9 + 1 + 4;
+        page.bytes_mut()[text_payload] = 0xff;
+        page.refresh_checksum();
+        pages.write_page(&page).expect("write corrupt row");
+        pages.sync().expect("sync corrupt row");
+        drop(pages);
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
+        assert!(matches!(
+            reopened.scan_columns(&[ColumnId(1)]),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
         cleanup(&path);
     }

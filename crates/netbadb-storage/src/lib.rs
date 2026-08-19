@@ -467,6 +467,9 @@ pub enum StorageError {
     NullNotAllowed {
         column: String,
     },
+    UnknownColumn {
+        column_id: netbadb_types::ColumnId,
+    },
     RowNotFound {
         row_id: netbadb_types::RowId,
     },
@@ -523,6 +526,9 @@ impl fmt::Display for StorageError {
             ),
             Self::NullNotAllowed { column } => {
                 write!(formatter, "column `{column}` is not nullable")
+            }
+            Self::UnknownColumn { column_id } => {
+                write!(formatter, "table has no column with ID {}", column_id.0)
             }
             Self::RowNotFound { row_id } => write!(
                 formatter,

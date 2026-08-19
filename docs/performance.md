@@ -8,8 +8,10 @@ simple equi HashJoin after measurements isolated the remaining quadratic
 candidate work. Post-7D source inspection then found that Heap sequential scan
 repeated the complete `Page::header` validation in its per-slot paths. Phase 7E
 retains the same benchmark target and validates each immutable Heap page once
-per scan. The target uses `std::time::Instant` and `std::hint::black_box`, and
-Cargo builds it with the optimized bench profile.
+per scan. Phase 7J adds required-column attribution and makes base-row ownership
+match the physical query's actual needs without weakening persisted-row
+validation. The target uses `std::time::Instant` and
+`std::hint::black_box`, and Cargo builds it with the optimized bench profile.
 
 Run the default quick profile for development confirmation:
 
@@ -95,6 +97,10 @@ The target currently covers:
 - direct Heap scan of the existing six-column item shape, including its Text
   payload, using 10,000 rows in the full profile and reporting
   `DirectHeapScan`;
+- ID-only and ID+Text projection over the same six-column/10,000-row fixture,
+  with exact base-scan ColumnId gates and Text-shape validation;
+- COUNT(*) and COUNT(Text) over that fixture, including a zero-column base scan
+  gate for COUNT(*), plus an ID projection with a hidden Text predicate;
 - point equality with no index: `Filter → SeqScan`;
 - the same point equality with an analyzed registered ID index:
   `Filter → IndexScan`;
@@ -315,10 +321,66 @@ HashJoin unique/duplicate/no-match controls remained about
 0.235/0.607/0.182 ms. Point SeqScan, 50% range SeqScan, low/high-cardinality
 grouping, and direct narrow/wide Heap scans were about
 1.046/2.077/1.472/1.507 ms and 0.045/0.737 ms. The persistent wide-vs-narrow
-scan and 100%-reject gaps now provide the clearest next measured target, so
-Phase 7J is selected to design required-column propagation and projection
-pruning. It is not implemented in Phase 7I; its cross-layer identity, DML,
-inspection, and storage-read boundaries remain to be specified first.
+scan and 100%-reject gaps provided the clearest next measured target, so Phase
+7I selected required-column propagation and projection pruning for Phase 7J.
+That implementation was deliberately absent from the Phase 7I result;
+cross-layer identity, DML, inspection, and storage-read boundaries were its
+entry criteria.
+
+Phase 7J first added five same-schema attribution scenarios without changing
+the read path, then recorded three strictly serial full pre runs. The
+median-of-three per-run medians were 1.139 ms for ID-only, 1.250 ms for
+ID+payload, 1.164 ms for COUNT(*), and 1.224 ms for COUNT(payload). ORDER BY was
+1.461 ms, low-cardinality GROUP BY was 1.622 ms, and the 1,000x1,000
+100%-reject non-equi join medians were 0.135 ms narrow versus 0.467 ms wide, a
+3.47x width ratio despite zero predicate candidates. Every pre attribution
+plan still exposed all six item columns.
+
+The planner now selects the complete physical tree first and runs one
+query-only top-down requirement pass. Source membership is
+`RelationBindingId + ColumnId`; operators retain projection inputs, hidden
+Filter/Sort columns, group keys, aggregate column inputs, complete join
+predicates, and HashJoin keys. Join requirements split by child provenance,
+and base operator order remains source order. UPDATE and DELETE bypass pruning
+and keep complete rows.
+
+The executor passes ordered ColumnIds to Heap projected scan and point-read
+APIs. Their shared decoder parses and validates every encoded value—including
+unselected Bool encodings, Text length/bounds/UTF-8, physical types, NULL
+constraints, truncation, and trailing values—but turns only selected values
+into owned ScalarValues. Text is a borrowed `&str` inside the decoder and stays
+owned at the selected query-result boundary. An empty projection still emits
+one RowId-bearing empty execution row per live tuple, preserving COUNT(*) row
+semantics. Phase 7E once-per-page validation and generation-safe indexed fetch
+remain unchanged.
+
+Post-7J quick ran every scenario with plan, row, shape, and checksum gates. The
+full post comparison below was recorded three times strictly serially; timing
+remains observational rather than a CI threshold.
+
+The post median-of-three medians were 0.863 ms for ID-only, 1.225 ms for
+ID+payload, 0.694 ms for COUNT(*), 1.141 ms for COUNT(payload), 1.121 ms for
+ORDER BY, and 1.277 ms for low-cardinality GROUP BY. Relative to pre, those
+changed by approximately -24.3%, -2.0%, -40.3%, -6.8%, -23.3%, and -21.3%.
+The hidden payload Filter improved from 1.555 to 1.493 ms, about 4.0%.
+
+The representative 1,000x1,000 100%-reject non-equi join changed from 0.467
+to 0.408 ms wide and from 0.135 to 0.127 ms narrow. The wide/narrow ratio
+contracted from about 3.47 to 3.22; complete validation of all eight encoded
+Int64 values intentionally remains, so column pruning removes output ownership
+but not width-dependent parse and type checks. Direct full Heap controls did
+not improve: the two-column shape changed from about 0.044 to 0.048 ms and the
+six-column Text shape from about 0.778 to 0.791 ms. Phase 7J therefore claims
+selective-query ownership benefits, not a faster full-row decoder.
+
+The sensitivity ratios make the remaining ownership boundary explicit.
+ID+payload divided by ID-only grew from about 1.10 to 1.42, and COUNT(payload)
+divided by COUNT(*) grew from about 1.05 to 1.64. Once unused ownership is
+removed, selecting Text or feeding it to an aggregate becomes a much clearer
+incremental cost. This selects remaining row-codec/scalar-consumer ownership as
+the first Phase 7K investigation target. Any aggregate-aware or borrowed
+consumption design must receive its own benchmark and preserve complete
+persisted-row validation; no Phase 7K implementation is included here.
 
 ## CI and compatibility
 

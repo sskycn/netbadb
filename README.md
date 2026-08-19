@@ -254,7 +254,9 @@ The reproducible warm-cache performance baseline is documented in
 database behavior and real chosen plans without adding a CI wall-clock gate.
 Phase 7E adds direct storage-scan attribution and validates each immutable Heap
 page once per sequential scan, while retaining the complete checksum and
-structural corruption boundary.
+structural corruption boundary. Phase 7J propagates binding-aware required
+columns through physical queries and uses selective Heap reads that validate
+every persisted scalar while owning only requested values.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -636,8 +638,11 @@ The implementation sequence is intentionally vertical:
 37. Adaptive exact inequality candidate sweep (Phase 7I) — complete; execution
     sorts borrowed row-index auxiliaries, counts exact candidates, and uses a
     checked integer work choice before an original-order-preserving sweep.
-38. Required-column propagation and projection pruning (Phase 7J) — selected
-    from post-7I narrow/wide scan and zero-candidate Join evidence, not started.
+38. Required-column propagation and selective base-row decode (Phase 7J) —
+    complete; query-only physical pruning preserves hidden semantic columns,
+    Heap validates every encoded value, and only requested values become owned.
+39. Remaining row-codec/scalar-consumer ownership (Phase 7K) — selected from
+    post-7J Text projection and COUNT(Text) sensitivity, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.
