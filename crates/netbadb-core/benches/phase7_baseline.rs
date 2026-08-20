@@ -293,6 +293,48 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "projection_payload_only",
+        rows,
+        "SELECT payload FROM items",
+        &[Operator::Project, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        payload_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "projection_payload_id_reordered",
+        rows,
+        "SELECT payload, id FROM items",
+        &[Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        payload_id_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "projection_payload_twice",
+        rows,
+        "SELECT payload, payload FROM items",
+        &[Operator::Project, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        duplicate_payload_observation,
+        measurements,
+    )?;
+    run_attribution_query(
         "aggregate_count_star",
         rows,
         "SELECT COUNT(*) FROM items",
@@ -396,7 +438,50 @@ fn run_direct_heap_scan_scenarios(
         |id| item_row(id, 4, NullDistribution::Low),
         settings,
         measurements,
-    )
+    )?;
+    run_direct_heap_payload_scan(settings, measurements)
+}
+
+fn run_direct_heap_payload_scan(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let scenario = "heap_scan_payload_only";
+    let rows = settings.medium_rows;
+    let paths = FixturePaths::new(scenario, 1);
+    let mut storage = HeapStorage::create(paths.path(0), items_table())?;
+    let mut transaction = storage.begin_transaction()?;
+    for id in 0..rows {
+        storage.insert_in(&mut transaction, &item_row(id, 4, NullDistribution::Low)?)?;
+    }
+    transaction.commit()?;
+
+    let expected = Observation {
+        rows,
+        checksum: arithmetic_sum(rows),
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || {
+            storage
+                .scan_columns(&[PAYLOAD_COLUMN_ID])
+                .map_err(Into::into)
+        },
+        |result| heap_payload_observation(result),
+    )?;
+    storage.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: rows.to_string(),
+        plan: "DirectProjectedHeapScan".to_owned(),
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
 }
 
 fn run_direct_heap_scan(
@@ -1581,6 +1666,99 @@ fn id_payload_observation(result: &QueryResult) -> BenchResult<Observation> {
     Ok(Observation {
         rows: u64::try_from(result.rows.len())
             .map_err(|_| message_error("result row count exceeds u64"))?,
+        checksum,
+    })
+}
+
+fn payload_observation(result: &QueryResult) -> BenchResult<Observation> {
+    let mut checksum = 0_u128;
+    for (id, row) in result.rows.iter().enumerate() {
+        let [ScalarValue::Text(payload)] = row.as_slice() else {
+            return Err(message_error(
+                "payload query must return one non-NULL Text column",
+            ));
+        };
+        validate_payload(id, payload)?;
+        checksum = checksum
+            .checked_add(id as u128)
+            .ok_or_else(|| message_error("payload checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: u64::try_from(result.rows.len())
+            .map_err(|_| message_error("result row count exceeds u64"))?,
+        checksum,
+    })
+}
+
+fn payload_id_observation(result: &QueryResult) -> BenchResult<Observation> {
+    let mut checksum = 0_u128;
+    for row in &result.rows {
+        let [ScalarValue::Text(payload), ScalarValue::Int64(id)] = row.as_slice() else {
+            return Err(message_error(
+                "reordered projection must return non-NULL Text and Int64 columns",
+            ));
+        };
+        let id = usize::try_from(*id).map_err(|_| message_error("invalid result ID"))?;
+        validate_payload(id, payload)?;
+        checksum = checksum
+            .checked_add(id as u128)
+            .ok_or_else(|| message_error("reordered projection checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: u64::try_from(result.rows.len())
+            .map_err(|_| message_error("result row count exceeds u64"))?,
+        checksum,
+    })
+}
+
+fn duplicate_payload_observation(result: &QueryResult) -> BenchResult<Observation> {
+    let mut checksum = 0_u128;
+    for (id, row) in result.rows.iter().enumerate() {
+        let [ScalarValue::Text(first), ScalarValue::Text(second)] = row.as_slice() else {
+            return Err(message_error(
+                "duplicate projection must return two non-NULL Text columns",
+            ));
+        };
+        validate_payload(id, first)?;
+        validate_payload(id, second)?;
+        if first != second {
+            return Err(message_error("duplicate projection values differ"));
+        }
+        checksum = checksum
+            .checked_add(id as u128)
+            .ok_or_else(|| message_error("duplicate projection checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: u64::try_from(result.rows.len())
+            .map_err(|_| message_error("result row count exceeds u64"))?,
+        checksum,
+    })
+}
+
+fn validate_payload(id: usize, payload: &str) -> BenchResult<()> {
+    if payload == format!("payload-{id:016}") {
+        Ok(())
+    } else {
+        Err(message_error(format!("unexpected payload for row ID {id}")))
+    }
+}
+
+fn heap_payload_observation(result: &[(RowId, Vec<ScalarValue>)]) -> BenchResult<Observation> {
+    let mut checksum = 0_u128;
+    for (id, (_, values)) in result.iter().enumerate() {
+        let [ScalarValue::Text(payload)] = values.as_slice() else {
+            return Err(message_error(
+                "projected Heap scan must return one non-NULL Text column",
+            ));
+        };
+        validate_payload(id, payload)?;
+        checksum = checksum
+            .checked_add(id as u128)
+            .ok_or_else(|| message_error("projected Heap checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: u64::try_from(result.len())
+            .map_err(|_| message_error("heap scan row count exceeds u64"))?,
         checksum,
     })
 }

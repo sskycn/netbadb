@@ -256,7 +256,9 @@ Phase 7E adds direct storage-scan attribution and validates each immutable Heap
 page once per sequential scan, while retaining the complete checksum and
 structural corruption boundary. Phase 7J propagates binding-aware required
 columns through physical queries and uses selective Heap reads that validate
-every persisted scalar while owning only requested values.
+every persisted scalar while owning only requested values. Phase 7K lets
+Project move already-owned values into results, cloning only the additional
+owners required by duplicate output columns.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
 Heap metadata version 3 retains the canonical table-schema fingerprint and adds
@@ -641,8 +643,11 @@ The implementation sequence is intentionally vertical:
 38. Required-column propagation and selective base-row decode (Phase 7J) —
     complete; query-only physical pruning preserves hidden semantic columns,
     Heap validates every encoded value, and only requested values become owned.
-39. Remaining row-codec/scalar-consumer ownership (Phase 7K) — selected from
-    post-7J Text projection and COUNT(Text) sensitivity, not started.
+39. Move-aware projection materialization (Phase 7K) — complete; identity
+    projections move rows directly, unique subset/reorder projections move
+    values, and duplicate sources clone only before their final use.
+40. Aggregate consumer-aware scalar ownership (Phase 7L) — selected from the
+    post-7K COUNT(payload)/COUNT(*) sensitivity, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

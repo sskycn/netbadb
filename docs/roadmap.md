@@ -646,20 +646,41 @@ reporting.
   Spec v1, Manifest v4, row encoding, dependencies, and persistent formats are
   unchanged.
 
-### Phase 7K — Remaining row-codec/scalar-consumer ownership (selected, not started)
+### Phase 7K — Move-aware projection materialization (complete)
 
-Post-7J median-of-three full runs reduced ID-only by about 24.3% and COUNT(*)
-by about 40.3%, while ID+payload improved about 2.0% and COUNT(payload) about
-6.8%. The payload/ID ratio grew from about 1.10 to 1.42 and the
-COUNT(payload)/COUNT(*) ratio from about 1.05 to 1.64. Remaining Text ownership
-is therefore the clearest newly isolated cost and is selected for Phase 7K
-investigation. Phase 7K must benchmark a concrete consumer boundary and retain
-full persisted validation; it is not implemented in Phase 7J.
+- one executor-private `ProjectionPlan` resolves binding-aware positions,
+  identity shape, and per-input last use once per Project operator;
+- identity projection moves complete input rows without rebuilding value Vecs;
+- unique subset and reorder projections move selected owned ScalarValues;
+- a source projected N times clones N - 1 times and moves its original value at
+  last use, preserving independent owned duplicate outputs;
+- every access remains checked, and RowId, output order, duplicates, types,
+  nullability metadata, and fully owned QueryResult semantics are unchanged;
+- join child candidate ownership, planner decisions, Phase 7J base columns,
+  storage decode, and every public/machine/persistent contract are unchanged;
+- allocation-pointer unit tests prove identity/reorder/subset moves and the
+  duplicate minimum-clone invariant; SQL tests cover Text-only, reordered, and
+  duplicate projections;
+- full median-of-three Text-only and ID+Text improved about 34.2% and 36.0%,
+  while direct projected Heap stayed within 0.5%; Text-only/direct contracted
+  from 1.63x to 1.07x;
+- duplicate Text improved about 16.0%, but duplicate/Text-only grew from 1.10x
+  to 1.41x because its second String owner remains semantically required;
+- all benchmark timing is observational; plan, base columns, rows, shapes,
+  exact Text values, and checksums remain the hard gates.
 
-Filter predicate prebinding, AND/OR short-circuiting, BufferPool page snapshot
-cloning, covering/index-only reads, broader HashJoin eligibility,
-multi-inequality intersection, and sequential PageManager traversal remain
-separate candidates.
+### Phase 7L — Aggregate consumer-aware scalar ownership (selected, not started)
+
+COUNT(payload) remained about 1.173 ms after Phase 7K while COUNT(*) was about
+0.698 ms, a 1.68x ratio. These controls bypass Project, so the remaining gap is
+the clearest independent ownership signal. Phase 7L must first benchmark a
+concrete aggregate consumer/storage boundary and retain complete persisted-row
+validation; no Phase 7L implementation is included here.
+
+Filter predicate prebinding, Filter Text borrowed consumption, AND/OR
+short-circuiting, BufferPool page snapshot cloning, covering/index-only reads,
+broader HashJoin eligibility, multi-inequality intersection, and sequential
+PageManager traversal remain separate candidates.
 
 ### Later Phase 7 work
 

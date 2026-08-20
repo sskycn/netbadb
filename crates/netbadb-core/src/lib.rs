@@ -828,6 +828,90 @@ mod tests {
     }
 
     #[test]
+    fn sql_projection_preserves_text_values_order_duplicates_and_scan_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-move-projection-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal = netbadb_storage::wal_path(&path);
+        let alternate_wal = netbadb_storage::wal_alternate_path(&wal);
+        for target in [&path, &wal, &alternate_wal] {
+            let _ = std::fs::remove_file(target);
+        }
+        let mut database = Database::create(&path, table()).expect("create database");
+        database
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert Ada");
+        database
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())])
+            .expect("insert Lin");
+
+        let payload = database.query("SELECT name FROM users").expect("payload");
+        assert_eq!(
+            payload.rows,
+            vec![
+                vec![ScalarValue::Text("Ada".into())],
+                vec![ScalarValue::Text("Lin".into())]
+            ]
+        );
+        let inspected = database
+            .inspect_statement("SELECT name FROM users")
+            .expect("inspect payload");
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&inspected.plan)),
+            Some(vec![ColumnId(2)])
+        );
+
+        let reordered = database
+            .query("SELECT name, id FROM users")
+            .expect("reordered");
+        assert_eq!(
+            reordered.rows,
+            vec![
+                vec![ScalarValue::Text("Ada".into()), ScalarValue::Int64(1)],
+                vec![ScalarValue::Text("Lin".into()), ScalarValue::Int64(2)]
+            ]
+        );
+        let inspected = database
+            .inspect_statement("SELECT name, id FROM users")
+            .expect("inspect reordered");
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&inspected.plan)),
+            Some(vec![ColumnId(1), ColumnId(2)])
+        );
+
+        let duplicate = database
+            .query("SELECT name, name FROM users")
+            .expect("duplicate");
+        assert_eq!(
+            duplicate.rows,
+            vec![
+                vec![
+                    ScalarValue::Text("Ada".into()),
+                    ScalarValue::Text("Ada".into())
+                ],
+                vec![
+                    ScalarValue::Text("Lin".into()),
+                    ScalarValue::Text("Lin".into())
+                ]
+            ]
+        );
+        let inspected = database
+            .inspect_statement("SELECT name, name FROM users")
+            .expect("inspect duplicate");
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&inspected.plan)),
+            Some(vec![ColumnId(2)])
+        );
+
+        database.close().expect("close database");
+        for target in [&path, &wal, &alternate_wal] {
+            let _ = std::fs::remove_file(target);
+        }
+    }
+
+    #[test]
     fn embedded_database_runs_a_query_after_reopen() {
         let path = std::env::temp_dir().join(format!("netbadb-core-{}", std::process::id()));
         let mut database = Database::create(&path, table()).expect("create database");

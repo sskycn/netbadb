@@ -10,8 +10,10 @@ repeated the complete `Page::header` validation in its per-slot paths. Phase 7E
 retains the same benchmark target and validates each immutable Heap page once
 per scan. Phase 7J adds required-column attribution and makes base-row ownership
 match the physical query's actual needs without weakening persisted-row
-validation. The target uses `std::time::Instant` and
-`std::hint::black_box`, and Cargo builds it with the optimized bench profile.
+validation. Phase 7K attributes and removes redundant Project clones after
+storage has created the selected owned values. The target uses
+`std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
+optimized bench profile.
 
 Run the default quick profile for development confirmation:
 
@@ -99,6 +101,8 @@ The target currently covers:
   `DirectHeapScan`;
 - ID-only and ID+Text projection over the same six-column/10,000-row fixture,
   with exact base-scan ColumnId gates and Text-shape validation;
+- Text-only, Text+ID reordered, and duplicate Text projections, plus a direct
+  projected Heap Text scan control; every observer validates exact Text values;
 - COUNT(*) and COUNT(Text) over that fixture, including a zero-column base scan
   gate for COUNT(*), plus an ID projection with a hidden Text predicate;
 - point equality with no index: `Filter → SeqScan`;
@@ -380,7 +384,44 @@ removed, selecting Text or feeding it to an aggregate becomes a much clearer
 incremental cost. This selects remaining row-codec/scalar-consumer ownership as
 the first Phase 7K investigation target. Any aggregate-aware or borrowed
 consumption design must receive its own benchmark and preserve complete
-persisted-row validation; no Phase 7K implementation is included here.
+persisted-row validation. No Phase 7K implementation was included in the Phase
+7J result.
+
+Phase 7K first added Text-only, Text+ID reordered, duplicate Text, and direct
+projected Heap attribution without changing executor production code. Three
+strictly serial full pre runs produced median-of-three medians of 1.306 ms for
+Text-only, 1.353 ms for ID+Text, 1.320 ms for reordered Text+ID, and 1.439 ms
+for duplicate Text. The direct projected Heap Text control was 0.803 ms;
+COUNT(*) and COUNT(payload) controls were 0.753 and 1.179 ms. Plans, exact base
+ColumnIds, rows, output shapes, Text values, and checksums were hard gates.
+
+Project now builds one private projection plan per operator. Identity
+projections move input rows directly, unique subset/reorder projections move
+values out of checked owned slots, and a source used N times is cloned exactly
+N - 1 times before its original value moves at the precomputed last use.
+Project output fields and RowIds remain unchanged. HashJoin and nested-loop
+candidate inputs remain borrowed/reusable and retain their existing clone
+boundary.
+
+Post quick passed every correctness gate. Three strictly serial full post runs
+gave median-of-three medians of 0.859 ms for Text-only, 0.866 ms for ID+Text,
+1.101 ms for reordered Text+ID, and 1.208 ms for duplicate Text: changes of
+about -34.2%, -36.0%, -16.6%, and -16.0%. ID-only changed from 0.946 to 0.694
+ms, about -26.6%. The direct projected Heap control was effectively unchanged
+at 0.807 ms (+0.5%).
+
+Text-only/direct projected Heap contracted from about 1.63x to 1.07x, directly
+isolating the removed Project owner. Duplicate Text/Text-only grew from about
+1.10x to 1.41x because duplicate output still requires a second independent
+String. This is the intended minimum-clone control, not a regression in output
+ownership.
+
+Aggregate controls do not traverse Project. COUNT(payload) stayed effectively
+flat at 1.173 ms (-0.5%), while COUNT(*) shifted from 0.753 to 0.698 ms (-7.3%),
+which is treated as observational code-layout/machine variation rather than a
+Phase 7K claim. Their ratio grew from about 1.57x to 1.68x. With Project's
+temporary Text owner removed, aggregate consumer-aware scalar ownership is the
+first Phase 7L investigation target; Phase 7L is not implemented here.
 
 ## CI and compatibility
 

@@ -388,6 +388,33 @@ borrowed decoder core, page validation remains once per immutable Heap page per
 scan, and point/range reads retain page bounds, tombstone, and RowId generation
 checks. Row encoding and every persistent format are unchanged.
 
+Phase 7K removes the next temporary owner at the executor Project boundary.
+Project consumes its `ExecutionRows`, so one operator-level `ProjectionPlan`
+resolves binding-aware positions and their last uses before processing rows:
+
+```text
+owned input ExecutionRows
+    -> identity positions: move rows and values Vec directly
+    -> unique subset/reorder: move selected ScalarValues from owned slots
+    -> duplicate source used N times: clone N - 1, move at last use
+    -> fully owned QueryResult
+```
+
+The identity path neither rebuilds each row's values Vec nor clones a
+ScalarValue. Generic projection preserves checked indexing, output order,
+duplicates, nullable/type metadata, and RowId. A repeated Text output still
+requires independent String owners, so the last-use rule only removes clones
+that are not semantically necessary. Join candidate materialization is
+unchanged because child rows may produce several matches; only a temporary
+joined row that is already exclusively owned can use the same projection
+helper.
+
+This is not a zero-copy result path. Selective Heap decode still creates one
+owned String for each selected Text value because QueryResult owns its rows;
+Phase 7K moves that owner through Project instead of allocating a second,
+short-lived String. PhysicalPlan, planner decisions, storage APIs, Inspection
+JSON v3, and persistent formats are unchanged.
+
 Join-bound evaluation represents an intermediate scalar as either a borrowed
 row/literal value or an owned computed value:
 

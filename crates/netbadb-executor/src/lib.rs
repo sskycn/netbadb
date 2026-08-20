@@ -208,22 +208,76 @@ struct ExecutionRows {
     rows: Vec<ExecutionRow>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProjectionPlan {
+    positions: Vec<usize>,
+    last_use: Vec<Option<usize>>,
+    identity: bool,
+}
+
+impl ProjectionPlan {
+    fn from_positions(input_width: usize, positions: Vec<usize>) -> Result<Self, ExecutionError> {
+        let mut last_use = vec![None; input_width];
+        for (output_position, input_position) in positions.iter().copied().enumerate() {
+            let slot = last_use
+                .get_mut(input_position)
+                .ok_or(ExecutionError::TypeMismatch)?;
+            *slot = Some(output_position);
+        }
+        let identity =
+            positions.len() == input_width && positions.iter().copied().eq(0..input_width);
+        Ok(Self {
+            positions,
+            last_use,
+            identity,
+        })
+    }
+}
+
+fn build_projection_plan(
+    fields: &[OutputField],
+    columns: &[ColumnRef],
+) -> Result<ProjectionPlan, ExecutionError> {
+    let positions = columns
+        .iter()
+        .map(|column| find_source_position(fields, column))
+        .collect::<Result<Vec<_>, _>>()?;
+    ProjectionPlan::from_positions(fields.len(), positions)
+}
+
 fn project_execution_row(
     row: ExecutionRow,
-    positions: &[usize],
+    projection: &ProjectionPlan,
 ) -> Result<ExecutionRow, ExecutionError> {
-    let values = positions
-        .iter()
-        .map(|position| {
-            row.values
-                .get(*position)
-                .cloned()
-                .ok_or(ExecutionError::TypeMismatch)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    if projection.identity {
+        return Ok(row);
+    }
+    if row.values.len() != projection.last_use.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    let ExecutionRow { row_id, values } = row;
+    let mut slots = values.into_iter().map(Some).collect::<Vec<_>>();
+    let mut projected = Vec::with_capacity(projection.positions.len());
+    for (output_position, input_position) in projection.positions.iter().copied().enumerate() {
+        let last_use = projection
+            .last_use
+            .get(input_position)
+            .copied()
+            .flatten()
+            .ok_or(ExecutionError::TypeMismatch)?;
+        let slot = slots
+            .get_mut(input_position)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        let value = if output_position == last_use {
+            slot.take().ok_or(ExecutionError::TypeMismatch)?
+        } else {
+            slot.as_ref().cloned().ok_or(ExecutionError::TypeMismatch)?
+        };
+        projected.push(value);
+    }
     Ok(ExecutionRow {
-        row_id: row.row_id,
-        values,
+        row_id,
+        values: projected,
     })
 }
 
@@ -341,6 +395,7 @@ fn execute_rows(
                 .iter()
                 .map(|column| find_source_position(&joined_fields, column))
                 .collect::<Result<Vec<_>, _>>()?;
+            let projection = ProjectionPlan::from_positions(joined_fields.len(), output_positions)?;
             let fields = columns
                 .iter()
                 .cloned()
@@ -431,7 +486,7 @@ fn execute_rows(
                 )?,
             }
             .into_iter()
-            .map(|row| project_execution_row(row, &output_positions))
+            .map(|row| project_execution_row(row, &projection))
             .collect::<Result<Vec<_>, _>>()?;
             Ok(ExecutionRows { fields, rows })
         }
@@ -546,24 +601,16 @@ fn execute_rows(
         }
         PhysicalPlan::Project { input, columns } => {
             let input_result = execute_rows(input, storages)?;
-            let positions = columns
-                .iter()
-                .map(|column| find_source_position(&input_result.fields, column))
-                .collect::<Result<Vec<_>, _>>()?;
-            let rows = input_result
-                .rows
-                .into_iter()
-                .map(|row| {
-                    let values = positions
-                        .iter()
-                        .map(|position| row.values[*position].clone())
-                        .collect();
-                    ExecutionRow {
-                        row_id: row.row_id,
-                        values,
-                    }
-                })
-                .collect();
+            let projection = build_projection_plan(&input_result.fields, columns)?;
+            let rows = if projection.identity {
+                input_result.rows
+            } else {
+                input_result
+                    .rows
+                    .into_iter()
+                    .map(|row| project_execution_row(row, &projection))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
@@ -1875,13 +1922,13 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 mod tests {
     use super::{
         BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
-        ExecutionError, ExecutionRow, InequalityExecutionStrategy, QueryResult, TruthValue,
-        bind_expression, choose_inequality_strategy, evaluate, evaluate_binary,
+        ExecutionError, ExecutionRow, InequalityExecutionStrategy, ProjectionPlan, QueryResult,
+        TruthValue, bind_expression, choose_inequality_strategy, evaluate, evaluate_binary,
         evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values, evaluate_truth,
         evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
         execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_with_storages,
         find_required_inequality, inequality_can_match, potential_left_indices,
-        required_right_extreme, sorted_non_null_indices,
+        project_execution_row, required_right_extreme, sorted_non_null_indices,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
@@ -1892,8 +1939,152 @@ mod tests {
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::HeapStorage;
     use netbadb_types::{
-        ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+        ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, RowId, ScalarValue,
+        SemanticType, TableId,
     };
+
+    fn text_pointer(value: &ScalarValue) -> *const u8 {
+        match value {
+            ScalarValue::Text(value) => value.as_ptr(),
+            _ => panic!("expected Text value"),
+        }
+    }
+
+    #[test]
+    fn projection_identity_moves_the_complete_row_without_rebuilding_values() {
+        let text = String::from("payload");
+        let pointer = text.as_ptr();
+        let row_id = RowId {
+            page: PageId(7),
+            slot: 2,
+            generation: 3,
+        };
+        let row = ExecutionRow {
+            row_id: Some(row_id),
+            values: vec![ScalarValue::Text(text)],
+        };
+        let projection = ProjectionPlan::from_positions(1, vec![0]).expect("identity plan");
+        assert!(projection.identity);
+
+        let projected = project_execution_row(row, &projection).expect("project identity");
+        assert_eq!(projected.row_id, Some(row_id));
+        assert_eq!(projected.values, vec![ScalarValue::Text("payload".into())]);
+        assert_eq!(text_pointer(&projected.values[0]), pointer);
+    }
+
+    #[test]
+    fn projection_moves_unique_reordered_and_subset_text_values() {
+        let first = String::from("first");
+        let second = String::from("second");
+        let first_pointer = first.as_ptr();
+        let second_pointer = second.as_ptr();
+        let row = ExecutionRow {
+            row_id: None,
+            values: vec![
+                ScalarValue::Int64(9),
+                ScalarValue::Text(first),
+                ScalarValue::Text(second),
+            ],
+        };
+        let reorder = ProjectionPlan::from_positions(3, vec![2, 1]).expect("reorder plan");
+        let projected = project_execution_row(row, &reorder).expect("project reorder");
+        assert_eq!(text_pointer(&projected.values[0]), second_pointer);
+        assert_eq!(text_pointer(&projected.values[1]), first_pointer);
+
+        let retained = String::from("retained");
+        let retained_pointer = retained.as_ptr();
+        let subset = ProjectionPlan::from_positions(3, vec![2]).expect("subset plan");
+        let projected = project_execution_row(
+            ExecutionRow {
+                row_id: None,
+                values: vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("dropped".into()),
+                    ScalarValue::Text(retained),
+                ],
+            },
+            &subset,
+        )
+        .expect("project subset");
+        assert_eq!(text_pointer(&projected.values[0]), retained_pointer);
+    }
+
+    #[test]
+    fn projection_duplicates_clone_only_before_the_original_last_use() {
+        let text = String::from("payload");
+        let original_pointer = text.as_ptr();
+        let projection = ProjectionPlan::from_positions(1, vec![0, 0]).expect("duplicate plan");
+        let projected = project_execution_row(
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Text(text)],
+            },
+            &projection,
+        )
+        .expect("project duplicate");
+        assert_eq!(
+            projected.values,
+            vec![
+                ScalarValue::Text("payload".into()),
+                ScalarValue::Text("payload".into())
+            ]
+        );
+        assert_ne!(text_pointer(&projected.values[0]), original_pointer);
+        assert_eq!(text_pointer(&projected.values[1]), original_pointer);
+        assert_ne!(
+            text_pointer(&projected.values[0]),
+            text_pointer(&projected.values[1])
+        );
+    }
+
+    #[test]
+    fn projection_handles_duplicates_empty_output_and_invalid_shapes() {
+        let duplicate = ProjectionPlan::from_positions(1, vec![0, 0]).expect("duplicate plan");
+        let projected = project_execution_row(
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(7)],
+            },
+            &duplicate,
+        )
+        .expect("duplicate integer");
+        assert_eq!(
+            projected.values,
+            vec![ScalarValue::Int64(7), ScalarValue::Int64(7)]
+        );
+
+        let row_id = RowId {
+            page: PageId(8),
+            slot: 1,
+            generation: 4,
+        };
+        let empty = ProjectionPlan::from_positions(1, Vec::new()).expect("empty plan");
+        let projected = project_execution_row(
+            ExecutionRow {
+                row_id: Some(row_id),
+                values: vec![ScalarValue::Int64(7)],
+            },
+            &empty,
+        )
+        .expect("empty projection");
+        assert_eq!(projected.row_id, Some(row_id));
+        assert!(projected.values.is_empty());
+
+        assert!(matches!(
+            ProjectionPlan::from_positions(1, vec![1]),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert!(matches!(
+            project_execution_row(
+                ExecutionRow {
+                    row_id: None,
+                    values: Vec::new(),
+                },
+                &empty,
+            ),
+            Err(ExecutionError::TypeMismatch)
+        ));
+    }
 
     #[test]
     fn executes_filter_projection_and_limit() {
