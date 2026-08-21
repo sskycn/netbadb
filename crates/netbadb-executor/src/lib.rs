@@ -621,8 +621,14 @@ fn execute_rows(
             group_keys,
             outputs,
         } => {
-            let input = execute_rows(input, storages)?;
-            execute_aggregate(input, group_keys, outputs)
+            if let Some(result) =
+                try_execute_direct_count_column(input, group_keys, outputs, storages)?
+            {
+                Ok(result)
+            } else {
+                let input = execute_rows(input, storages)?;
+                execute_aggregate(input, group_keys, outputs)
+            }
         }
         PhysicalPlan::Limit { input, limit } => {
             let mut result = execute_rows(input, storages)?;
@@ -760,6 +766,82 @@ struct GroupState {
 enum AggregateOutputPosition {
     GroupKey(usize),
     Aggregate(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectCountColumn<'a> {
+    table_id: TableId,
+    column: &'a ColumnRef,
+    aggregate: &'a AggregateExpr,
+}
+
+fn direct_count_column_eligibility<'a>(
+    input: &'a PhysicalPlan,
+    group_keys: &[ColumnRef],
+    outputs: &'a [AggregateOutput],
+) -> Option<DirectCountColumn<'a>> {
+    if !group_keys.is_empty() {
+        return None;
+    }
+    let [AggregateOutput::Aggregate(aggregate)] = outputs else {
+        return None;
+    };
+    if aggregate.function != AggregateFunction::Count {
+        return None;
+    }
+    let AggregateInput::Column(column) = &aggregate.input else {
+        return None;
+    };
+    let PhysicalPlan::SeqScan {
+        binding_id,
+        table_id,
+        columns,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    let [scan_column] = columns.as_slice() else {
+        return None;
+    };
+    if *binding_id != column.binding_id
+        || *binding_id != scan_column.binding_id
+        || *table_id != column.table_id
+        || *table_id != scan_column.table_id
+        || !same_source_column(scan_column, column)
+    {
+        return None;
+    }
+    Some(DirectCountColumn {
+        table_id: *table_id,
+        column,
+        aggregate,
+    })
+}
+
+fn try_execute_direct_count_column(
+    input: &PhysicalPlan,
+    group_keys: &[ColumnRef],
+    outputs: &[AggregateOutput],
+    storages: &mut [HeapStorage],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let Some(eligible) = direct_count_column_eligibility(input, group_keys, outputs) else {
+        return Ok(None);
+    };
+    let count = storage_for_table(storages, eligible.table_id)?
+        .scan_column_presence_count(eligible.column.column_id)?;
+    let count = count_to_sql_u64(count, eligible.aggregate)?;
+    Ok(Some(ExecutionRows {
+        fields: outputs.iter().map(AggregateOutput::output_field).collect(),
+        rows: vec![ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::UInt64(count)],
+        }],
+    }))
+}
+
+fn count_to_sql_u64(count: u128, aggregate: &AggregateExpr) -> Result<u64, ExecutionError> {
+    u64::try_from(count).map_err(|_| aggregate_overflow(aggregate))
 }
 
 fn execute_aggregate(
@@ -1923,12 +2005,13 @@ mod tests {
     use super::{
         BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
         ExecutionError, ExecutionRow, InequalityExecutionStrategy, ProjectionPlan, QueryResult,
-        TruthValue, bind_expression, choose_inequality_strategy, evaluate, evaluate_binary,
-        evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values, evaluate_truth,
-        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
-        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_with_storages,
-        find_required_inequality, inequality_can_match, potential_left_indices,
-        project_execution_row, required_right_extreme, sorted_non_null_indices,
+        TruthValue, bind_expression, choose_inequality_strategy, count_to_sql_u64,
+        direct_count_column_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_bound_truth, evaluate_bound_values, evaluate_truth, evaluate_truth_values,
+        evaluate_values, exact_candidate_pair_count, execute, execute_inequality_sweep,
+        execute_nested_loop_join, execute_rows, execute_with_storages, find_required_inequality,
+        inequality_can_match, potential_left_indices, project_execution_row,
+        required_right_extreme, sorted_non_null_indices,
     };
     use netbadb_planner::{PhysicalPlan, plan};
     use netbadb_rel::{
@@ -4132,6 +4215,158 @@ mod tests {
         storage.close().expect("close grouped heap");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn direct_count_column_eligibility_is_exact_and_conservative() {
+        let column = |binding_id: u32, table_id: u64, column_id: u32, name: &str| ColumnRef {
+            binding_id: RelationBindingId(binding_id),
+            table_id: TableId(table_id),
+            column_id: ColumnId(column_id),
+            relation_name: format!("t{table_id}"),
+            name: name.into(),
+            data_type: SemanticType::physical(PhysicalType::Int64),
+            nullable: false,
+        };
+        let value = column(0, 7, 1, "value");
+        let other = column(0, 7, 2, "other");
+        let scan = PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns: vec![value.clone()],
+        };
+        let aggregate = |function, input| {
+            AggregateOutput::Aggregate(AggregateExpr {
+                function,
+                input,
+                output: DerivedField {
+                    name: format!("{}(value)", function.as_str()),
+                    data_type: SemanticType::physical(PhysicalType::UInt64),
+                    nullable: false,
+                },
+            })
+        };
+        let count = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(value.clone()),
+        );
+        let AggregateOutput::Aggregate(count_expression) = &count else {
+            panic!("expected aggregate output");
+        };
+        assert!(matches!(
+            count_to_sql_u64(u128::from(u64::MAX) + 1, count_expression),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Count,
+                output
+            }) if output == "COUNT(value)"
+        ));
+        assert!(
+            direct_count_column_eligibility(&scan, &[], std::slice::from_ref(&count)).is_some()
+        );
+        assert!(
+            direct_count_column_eligibility(
+                &scan,
+                &[],
+                &[aggregate(AggregateFunction::Count, AggregateInput::All)]
+            )
+            .is_none()
+        );
+        for function in [
+            AggregateFunction::Sum,
+            AggregateFunction::Min,
+            AggregateFunction::Max,
+        ] {
+            assert!(
+                direct_count_column_eligibility(
+                    &scan,
+                    &[],
+                    &[aggregate(function, AggregateInput::Column(value.clone()))]
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            direct_count_column_eligibility(
+                &scan,
+                std::slice::from_ref(&value),
+                std::slice::from_ref(&count)
+            )
+            .is_none()
+        );
+        assert!(
+            direct_count_column_eligibility(&scan, &[], &[count.clone(), count.clone()]).is_none()
+        );
+
+        let mismatched_scan = PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns: vec![other.clone()],
+        };
+        assert!(
+            direct_count_column_eligibility(&mismatched_scan, &[], std::slice::from_ref(&count))
+                .is_none()
+        );
+        let mismatched_table = PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(8),
+            table_name: "t8".into(),
+            columns: vec![value.clone()],
+        };
+        assert!(
+            direct_count_column_eligibility(&mismatched_table, &[], std::slice::from_ref(&count))
+                .is_none()
+        );
+        let mismatched_binding = PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(1),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns: vec![value.clone()],
+        };
+        assert!(
+            direct_count_column_eligibility(&mismatched_binding, &[], std::slice::from_ref(&count))
+                .is_none()
+        );
+
+        let true_predicate = Expr {
+            kind: ExprKind::Literal(ScalarValue::Bool(true)),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let filtered = PhysicalPlan::Filter {
+            input: Box::new(scan.clone()),
+            predicate: true_predicate.clone(),
+        };
+        assert!(
+            direct_count_column_eligibility(&filtered, &[], std::slice::from_ref(&count)).is_none()
+        );
+        let joined = PhysicalPlan::NestedLoopJoin {
+            left: Box::new(scan.clone()),
+            right: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(1),
+                table_id: TableId(8),
+                table_name: "t8".into(),
+                columns: vec![column(1, 8, 1, "value")],
+            }),
+            kind: JoinKind::Inner,
+            predicate: true_predicate,
+            columns: vec![value.clone()],
+        };
+        assert!(
+            direct_count_column_eligibility(&joined, &[], std::slice::from_ref(&count)).is_none()
+        );
+        let sorted = PhysicalPlan::Sort {
+            input: Box::new(scan),
+            keys: vec![SortKey {
+                column: value,
+                direction: SortDirection::Asc,
+                null_order: NullOrder::First,
+            }],
+        };
+        assert!(direct_count_column_eligibility(&sorted, &[], &[count]).is_none());
     }
 
     #[test]

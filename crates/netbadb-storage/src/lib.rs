@@ -470,6 +470,7 @@ pub enum StorageError {
     UnknownColumn {
         column_id: netbadb_types::ColumnId,
     },
+    CountOverflow,
     RowNotFound {
         row_id: netbadb_types::RowId,
     },
@@ -529,6 +530,9 @@ impl fmt::Display for StorageError {
             }
             Self::UnknownColumn { column_id } => {
                 write!(formatter, "table has no column with ID {}", column_id.0)
+            }
+            Self::CountOverflow => {
+                formatter.write_str("exact column presence count overflowed u128")
             }
             Self::RowNotFound { row_id } => write!(
                 formatter,

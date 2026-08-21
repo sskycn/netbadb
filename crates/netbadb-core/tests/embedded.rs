@@ -449,6 +449,85 @@ fn typed_global_aggregates_cover_null_empty_types_limit_and_reopen() {
 }
 
 #[test]
+fn direct_count_column_preserves_nullable_sql_semantics_and_fallbacks() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-direct-count-column-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let table = TableDef::new(
+        TableId(96),
+        "items",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "note", TypeSpec::Physical(PhysicalType::Text))
+                .nullable(true),
+            ColumnDef::new(
+                ColumnId(3),
+                "score",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+        ],
+    );
+    let mut database = Database::create(&path, table.clone()).expect("create count database");
+    for row in [
+        vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Text("a".into()),
+            ScalarValue::Int64(10),
+        ],
+        vec![ScalarValue::Int64(2), ScalarValue::Null, ScalarValue::Null],
+        vec![
+            ScalarValue::Int64(3),
+            ScalarValue::Text("b".into()),
+            ScalarValue::Int64(30),
+        ],
+        vec![ScalarValue::Int64(4), ScalarValue::Null, ScalarValue::Null],
+    ] {
+        database.insert(&row).expect("insert count row");
+    }
+
+    for (sql, expected) in [
+        ("SELECT COUNT(id) FROM items", 4),
+        ("SELECT COUNT(note) FROM items", 2),
+        ("SELECT COUNT(score) FROM items", 2),
+        ("SELECT COUNT(*) FROM items", 4),
+    ] {
+        assert_eq!(
+            database.query(sql).expect("execute single count").rows,
+            vec![vec![ScalarValue::UInt64(expected)]]
+        );
+    }
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*), COUNT(note) FROM items")
+            .expect("execute multiple count fallback")
+            .rows,
+        vec![vec![ScalarValue::UInt64(4), ScalarValue::UInt64(2)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE id >= 2")
+            .expect("execute filtered count fallback")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    database.close().expect("close count database");
+
+    let mut reopened = Database::open(&path, table).expect("reopen count database");
+    assert_eq!(
+        reopened
+            .query("SELECT COUNT(note) FROM items")
+            .expect("count after reopen")
+            .rows,
+        vec![vec![ScalarValue::UInt64(2)]]
+    );
+    reopened.close().expect("close reopened count database");
+    cleanup(&path);
+}
+
+#[test]
 fn typed_grouped_aggregates_preserve_null_groups_projection_and_reopen() {
     let path = std::env::temp_dir().join(format!(
         "netbadb-grouped-{}-{:?}.db",

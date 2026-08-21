@@ -11,7 +11,9 @@ retains the same benchmark target and validates each immutable Heap page once
 per scan. Phase 7J adds required-column attribution and makes base-row ownership
 match the physical query's actual needs without weakening persisted-row
 validation. Phase 7K attributes and removes redundant Project clones after
-storage has created the selected owned values. The target uses
+storage has created the selected owned values. Phase 7L removes scalar and row
+materialization from one measured direct global COUNT(column) shape while
+retaining complete current-Heap validation. The target uses
 `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
 optimized bench profile.
 
@@ -103,8 +105,10 @@ The target currently covers:
   with exact base-scan ColumnId gates and Text-shape validation;
 - Text-only, Text+ID reordered, and duplicate Text projections, plus a direct
   projected Heap Text scan control; every observer validates exact Text values;
-- COUNT(*) and COUNT(Text) over that fixture, including a zero-column base scan
-  gate for COUNT(*), plus an ID projection with a hidden Text predicate;
+- COUNT(*), COUNT(Int64), COUNT(nullable Int64), and COUNT(Text) over that
+  fixture, including exact base-scan column gates and nullable semantics;
+- multi-COUNT and filtered COUNT(Text) fallback controls, plus an ID projection
+  with a hidden Text predicate;
 - point equality with no index: `Filter → SeqScan`;
 - the same point equality with an analyzed registered ID index:
   `Filter → IndexScan`;
@@ -423,6 +427,80 @@ Phase 7K claim. Their ratio grew from about 1.57x to 1.68x. With Project's
 temporary Text owner removed, aggregate consumer-aware scalar ownership is the
 first Phase 7L investigation target; Phase 7L is not implemented here.
 
+Phase 7L first added COUNT(id), COUNT(nullable_key), a two-output COUNT control,
+and a filtered COUNT(payload) control without changing production execution.
+All queries use the existing item fixture and hard-gate the exact Aggregate,
+Filter where applicable, direct SeqScan, required base ColumnIds, output shape,
+and exact count. Three strictly serial full pre runs gave median-of-three
+medians of 0.712 ms for COUNT(*), 0.927 ms for COUNT(id), 0.925 ms for
+COUNT(nullable_key), and 1.157 ms for COUNT(payload). The multi-COUNT and
+filtered controls were 1.188 and 1.241 ms; direct projected Heap payload and
+SQL payload projection were 0.805 and 0.833 ms.
+
+The executor now recognizes only this shape before executing the Aggregate
+child:
+
+```text
+Aggregate COUNT(column)
+        ↓
+single output + no group + direct SeqScan of the same source column?
+       / \
+     no   yes
+     |     |
+existing   exact Heap presence scan
+executor       ↓
+          validate every persisted value
+               ↓
+          count target non-NULL as u128
+               ↓
+          checked UInt64 aggregate result
+```
+
+COUNT(*), grouped or multiple aggregates, Filter, Join, Sort, IndexScan,
+RangeIndexScan, mismatched scan columns, and every non-COUNT function retain the
+generic Aggregate executor. The physical plan and Inspection JSON remain
+unchanged; this is an executor-private runtime specialization, not a new
+operator or general aggregate pushdown.
+
+`HeapStorage::scan_column_presence_count` is an exact read of current live Heap
+tuples. It resolves the requested ColumnId once, validates each immutable page
+once, validates non-Heap single payloads, skips tombstones, and decodes every
+column of every live row. Bool encodings, Text lengths/bounds/UTF-8, physical
+types, NULL constraints, truncation, and trailing values all remain checked.
+The target value stays a borrowed `DecodedScalar` long enough to record only
+NULL presence; it never becomes an owned `ScalarValue`, and scanned tuples
+never become `ExecutionRow`s. The scan neither reads cached ANALYZE statistics
+nor persists a count, writes WAL, or acquires a transaction writer. It returns
+a checked exact `u128`; the executor's checked conversion retains the existing
+typed COUNT overflow error at the SQL `u64` boundary.
+
+Post quick passed every benchmark correctness and plan gate. Three strictly
+serial full post runs gave median-of-three medians of 0.674 ms for COUNT(*),
+0.517 ms for COUNT(id), 0.514 ms for COUNT(nullable_key), and 0.518 ms for
+COUNT(payload). The eligible column counts improved by approximately 44.3%,
+44.5%, and 55.2%, respectively; COUNT(payload) improved 2.23 times. Its ratio
+to COUNT(*) contracted from 1.626x to 0.769x, and its ratio to COUNT(id)
+contracted from 1.248x to 1.003x. This removes the Text ownership distinction
+without reducing row validation.
+
+The non-eligible controls stayed on the generic path: multi-COUNT measured
+1.112 ms and filtered COUNT(payload) measured 1.128 ms. Direct projected Heap
+payload and SQL payload projection measured 0.752 and 0.800 ms. COUNT(*) and
+these controls moved by approximately -5.2%, -6.3%, -9.0%, -6.6%, and -3.9%
+relative to pre; those changes are observational machine/code-layout variance,
+not Phase 7L claims. Point/range, Phase 7I 100%/partial/dense/no-prune,
+HashJoin, grouping, projection, and DML plan/result gates all remained intact.
+
+The closest remaining measured aggregate gaps are the 1.112 ms direct
+multi-COUNT control and the 1.128 ms filtered COUNT control. The multi-COUNT
+shape has the narrower next design boundary because it can retain one exact
+current-Heap validation pass without introducing Filter evaluation semantics.
+It is therefore the first Phase 7M investigation target; no Phase 7M
+implementation is included here. Filter predicate prebinding/borrowed Text,
+MIN/MAX and group-key ownership, buffer snapshots, covering reads, broader
+HashJoin eligibility, multi-inequality intersection, AND/OR short-circuiting,
+and sequential PageManager traversal remain separate candidates.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -431,7 +509,7 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E through 7I introduce no plan or inspection
+represent HashJoin. Phases 7E through 7L introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format.

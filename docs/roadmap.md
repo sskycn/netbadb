@@ -669,15 +669,50 @@ reporting.
 - all benchmark timing is observational; plan, base columns, rows, shapes,
   exact Text values, and checksums remain the hard gates.
 
-### Phase 7L — Aggregate consumer-aware scalar ownership (selected, not started)
+### Phase 7L — Direct global COUNT(column) presence scan (complete)
 
-COUNT(payload) remained about 1.173 ms after Phase 7K while COUNT(*) was about
-0.698 ms, a 1.68x ratio. These controls bypass Project, so the remaining gap is
-the clearest independent ownership signal. Phase 7L must first benchmark a
-concrete aggregate consumer/storage boundary and retain complete persisted-row
-validation; no Phase 7L implementation is included here.
+- the only eligible runtime shape is one global COUNT(column), no GROUP BY,
+  over a direct SeqScan whose single binding/column/table identity matches the
+  aggregate input;
+- the exact current Heap scan uses no catalog or index statistics, cache,
+  persistence, WAL mutation, or transaction writer;
+- each Heap page is authoritatively validated once, non-Heap single payloads
+  remain validated, and only current live tuples participate across deletion,
+  slot reuse, relocation, index creation, ANALYZE, and reopen;
+- every persisted scalar still receives tag, bounds, UTF-8, physical-type,
+  NULL-constraint, truncation, and trailing-value validation. The selected
+  scalar is never owned; only its NULL presence is observed;
+- storage accumulates an exact checked `u128`, and the executor retains the
+  typed aggregate overflow error when converting the one final result to SQL
+  COUNT's `u64`;
+- no scanned row becomes a `ScalarValue` or `ExecutionRow`. COUNT(*), multiple
+  outputs, grouping, Filter, Join, Sort, index scans, mismatched identities,
+  and SUM/MIN/MAX retain the complete generic Aggregate executor;
+- the physical plan stays `Aggregate → SeqScan[column]`; PhysicalPlan,
+  Inspection JSON v3, Protocol v1, SDK Schema Spec v1, Manifest v4, row
+  encoding, persistent formats, dependencies, and unsafe-code count are
+  unchanged;
+- three serial full pre/post runs improved median-of-three COUNT(id),
+  COUNT(nullable_key), and COUNT(payload) from 0.927/0.925/1.157 ms to
+  0.517/0.514/0.518 ms. COUNT(payload) improved 2.23x, payload/COUNT(*)
+  contracted from 1.626x to 0.769x, and payload/ID contracted from 1.248x to
+  1.003x;
+- COUNT(*), multi-COUNT, filtered COUNT, direct projected Heap payload, and SQL
+  payload projection remain controls with exact plan/result gates and no timing
+  threshold.
 
-Filter predicate prebinding, Filter Text borrowed consumption, AND/OR
+### Phase 7M — Direct multi-COUNT presence scan (selected, not started)
+
+Post-7L direct multi-COUNT remained about 1.112 ms versus approximately
+0.514–0.518 ms for individual direct column counts; filtered COUNT(payload)
+was similarly 1.128 ms. Multi-COUNT is the narrower next investigation because
+it can potentially share one exact current-Heap validation pass without adding
+Filter predicate semantics. Phase 7M must first add attribution for duplicate
+and mixed-null direct COUNT outputs and define checked reuse/order behavior; no
+Phase 7M implementation is included here.
+
+Filtered COUNT consumer ownership, MIN/MAX ownership, group-key ownership,
+Filter predicate prebinding, Filter borrowed Text evaluation, AND/OR
 short-circuiting, BufferPool page snapshot cloning, covering/index-only reads,
 broader HashJoin eligibility, multi-inequality intersection, and sequential
 PageManager traversal remain separate candidates.

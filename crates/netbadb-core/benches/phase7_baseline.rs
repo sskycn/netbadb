@@ -21,6 +21,7 @@ const ID_COLUMN_ID: ColumnId = ColumnId(1);
 const TEAM_COLUMN_ID: ColumnId = ColumnId(2);
 const BUCKET_COLUMN_ID: ColumnId = ColumnId(3);
 const NULLABLE_COLUMN_ID: ColumnId = ColumnId(4);
+const ACTIVE_COLUMN_ID: ColumnId = ColumnId(5);
 const PAYLOAD_COLUMN_ID: ColumnId = ColumnId(6);
 const LEFT_TABLE_ID: TableId = TableId(11);
 const RIGHT_TABLE_ID: TableId = TableId(12);
@@ -349,6 +350,34 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "aggregate_count_id",
+        rows,
+        "SELECT COUNT(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_nullable",
+        rows,
+        "SELECT COUNT(nullable_key) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[NULLABLE_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(low_non_null_count(rows)),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
         "aggregate_count_payload",
         rows,
         "SELECT COUNT(payload) FROM items",
@@ -357,6 +386,34 @@ fn run_projection_attribution_scenarios(
         Observation {
             rows: 1,
             checksum: u128::from(rows),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_pair_control",
+        rows,
+        "SELECT COUNT(id), COUNT(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 2,
+        },
+        settings,
+        count_pair_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_payload_filter_control",
+        rows,
+        "SELECT COUNT(payload) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ACTIVE_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(active_count(rows)),
         },
         settings,
         count_observation,
@@ -1837,6 +1894,29 @@ fn count_observation(result: &QueryResult) -> BenchResult<Observation> {
         rows: 1,
         checksum: u128::from(*count),
     })
+}
+
+fn count_pair_observation(result: &QueryResult) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("COUNT pair query must return one row"));
+    };
+    let [ScalarValue::UInt64(left), ScalarValue::UInt64(right)] = row.as_slice() else {
+        return Err(message_error(
+            "COUNT pair query must return two UInt64 columns",
+        ));
+    };
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::from(*left) + u128::from(*right),
+    })
+}
+
+const fn low_non_null_count(rows: u64) -> u64 {
+    rows.saturating_sub(rows.saturating_add(99) / 100)
+}
+
+const fn active_count(rows: u64) -> u64 {
+    rows.saturating_add(2) / 3
 }
 
 fn group_observation(result: &QueryResult) -> BenchResult<Observation> {
