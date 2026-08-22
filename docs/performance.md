@@ -555,22 +555,22 @@ and mixed COUNT with SUM/MIN/MAX also retain the complete generic executor.
 The planner, PhysicalPlan, and Inspection JSON are unchanged.
 
 Post quick passed every plan/result/column gate. Three strictly serial full
-post runs reduced the median-of-three medians to 0.584 ms for the pair, 0.553
-ms for duplicate payload, 0.623 ms for mixed nullable, 0.551 ms for
-star+payload, and 0.617 ms for output order: improvements of approximately
-50.0%, 51.3%, 47.3%, 51.8%, and 47.7%, respectively. They now share one exact
+post runs reduced the median-of-three medians to 0.657 ms for the pair, 0.646
+ms for duplicate payload, 0.685 ms for mixed nullable, 0.622 ms for
+star+payload, and 0.686 ms for output order: improvements of approximately
+43.9%, 43.2%, 42.1%, 45.6%, and 41.8%, respectively. They now share one exact
 validation scan rather than materializing 10,000 owned rows and values.
 
 Phase 7L single-column controls changed from 0.530/0.543/0.531 ms for
-COUNT(id)/COUNT(nullable_key)/COUNT(payload) to 0.569/0.573/0.557 ms
-(approximately +7.4%/+5.6%/+4.8%). COUNT(*) changed from 0.678 to 0.708 ms,
-the all-star pair from 0.712 to 0.718 ms, filtered single from 1.163 to 1.199
-ms, and filtered pair from 1.197 to 1.185 ms. These non-target shifts are
+COUNT(id)/COUNT(nullable_key)/COUNT(payload) to 0.630/0.617/0.625 ms
+(approximately +18.8%/+13.8%/+17.8%). COUNT(*) changed from 0.678 to 0.778 ms,
+the all-star pair from 0.712 to 0.784 ms, filtered single from 1.163 to 1.299
+ms, and filtered pair from 1.197 to 1.279 ms. These non-target shifts are
 observational code-layout/machine variance; they have unchanged plan/result
 gates and no timing threshold.
 
 The remaining measured aggregate gap is now filtered COUNT at approximately
-1.19–1.20 ms versus 0.55–0.62 ms for direct presence summaries. A filtered
+1.28–1.30 ms versus 0.62–0.69 ms for direct presence summaries. A filtered
 COUNT consumer path is therefore the selected Phase 7N investigation. Direct
 COUNT(*) live-row specialization, MIN/MAX ownership, group-key ownership,
 Filter predicate prebinding and borrowed Text evaluation, AND/OR

@@ -724,13 +724,13 @@ reporting.
 - three serial full pre/post runs improved median-of-three pair, duplicate,
   mixed-nullable, star+column, and output-order cases from
   1.170/1.137/1.182/1.143/1.179 ms to
-  0.584/0.553/0.623/0.551/0.617 ms, approximately 47–52%, with exact plan,
+  0.657/0.646/0.685/0.622/0.686 ms, approximately 42–46%, with exact plan,
   source-column, result, and metadata gates and no timing threshold.
 
 ### Phase 7N — Filtered COUNT consumer path (selected, not started)
 
-Post-7M filtered single/pair COUNT controls remain approximately 1.199/1.185
-ms versus 0.557–0.623 ms for direct presence-summary cases. The next
+Post-7M filtered single/pair COUNT controls remain approximately 1.299/1.279
+ms versus 0.617–0.686 ms for direct presence-summary cases. The next
 investigation should define a correctness-preserving filtered COUNT consumer
 boundary without weakening three-valued predicate semantics or persisted-row
 validation. No Phase 7N implementation is included here.
