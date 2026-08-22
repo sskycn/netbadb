@@ -621,9 +621,7 @@ fn execute_rows(
             group_keys,
             outputs,
         } => {
-            if let Some(result) =
-                try_execute_direct_count_column(input, group_keys, outputs, storages)?
-            {
+            if let Some(result) = try_execute_direct_counts(input, group_keys, outputs, storages)? {
                 Ok(result)
             } else {
                 let input = execute_rows(input, storages)?;
@@ -768,30 +766,33 @@ enum AggregateOutputPosition {
     Aggregate(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectCountSource {
+    All,
+    Column(usize),
+}
+
 #[derive(Debug, Clone, Copy)]
-struct DirectCountColumn<'a> {
-    table_id: TableId,
-    column: &'a ColumnRef,
+struct DirectCountOutput<'a> {
+    source: DirectCountSource,
     aggregate: &'a AggregateExpr,
 }
 
-fn direct_count_column_eligibility<'a>(
+#[derive(Debug)]
+struct DirectCountPlan<'a> {
+    table_id: TableId,
+    scan_columns: &'a [ColumnRef],
+    outputs: Vec<DirectCountOutput<'a>>,
+}
+
+fn direct_count_eligibility<'a>(
     input: &'a PhysicalPlan,
     group_keys: &[ColumnRef],
     outputs: &'a [AggregateOutput],
-) -> Option<DirectCountColumn<'a>> {
-    if !group_keys.is_empty() {
+) -> Option<DirectCountPlan<'a>> {
+    if !group_keys.is_empty() || outputs.is_empty() {
         return None;
     }
-    let [AggregateOutput::Aggregate(aggregate)] = outputs else {
-        return None;
-    };
-    if aggregate.function != AggregateFunction::Count {
-        return None;
-    }
-    let AggregateInput::Column(column) = &aggregate.input else {
-        return None;
-    };
     let PhysicalPlan::SeqScan {
         binding_id,
         table_id,
@@ -801,41 +802,91 @@ fn direct_count_column_eligibility<'a>(
     else {
         return None;
     };
-    let [scan_column] = columns.as_slice() else {
-        return None;
-    };
-    if *binding_id != column.binding_id
-        || *binding_id != scan_column.binding_id
-        || *table_id != column.table_id
-        || *table_id != scan_column.table_id
-        || !same_source_column(scan_column, column)
+    if columns
+        .iter()
+        .any(|column| column.binding_id != *binding_id || column.table_id != *table_id)
     {
         return None;
     }
-    Some(DirectCountColumn {
+
+    let mut used_scan_columns = vec![false; columns.len()];
+    let mut has_column_count = false;
+    let mut direct_outputs = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let AggregateOutput::Aggregate(aggregate) = output else {
+            return None;
+        };
+        if aggregate.function != AggregateFunction::Count {
+            return None;
+        }
+        let source = match &aggregate.input {
+            AggregateInput::All => DirectCountSource::All,
+            AggregateInput::Column(column) => {
+                if column.binding_id != *binding_id || column.table_id != *table_id {
+                    return None;
+                }
+                let position = columns.iter().position(|scan_column| {
+                    scan_column.binding_id == column.binding_id
+                        && scan_column.table_id == column.table_id
+                        && scan_column.column_id == column.column_id
+                })?;
+                used_scan_columns[position] = true;
+                has_column_count = true;
+                DirectCountSource::Column(position)
+            }
+        };
+        direct_outputs.push(DirectCountOutput { source, aggregate });
+    }
+    if !has_column_count || used_scan_columns.iter().any(|used| !used) {
+        return None;
+    }
+    Some(DirectCountPlan {
         table_id: *table_id,
-        column,
-        aggregate,
+        scan_columns: columns,
+        outputs: direct_outputs,
     })
 }
 
-fn try_execute_direct_count_column(
+fn try_execute_direct_counts(
     input: &PhysicalPlan,
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
     storages: &mut [HeapStorage],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
-    let Some(eligible) = direct_count_column_eligibility(input, group_keys, outputs) else {
+    let Some(plan) = direct_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
     };
-    let count = storage_for_table(storages, eligible.table_id)?
-        .scan_column_presence_count(eligible.column.column_id)?;
-    let count = count_to_sql_u64(count, eligible.aggregate)?;
+    let column_ids = plan
+        .scan_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<Vec<_>>();
+    let summary = storage_for_table(storages, plan.table_id)?.scan_presence_counts(&column_ids)?;
+    if summary.non_null_counts.len() != plan.scan_columns.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    let values = plan
+        .outputs
+        .iter()
+        .map(|output| {
+            let count = match output.source {
+                DirectCountSource::All => summary.live_rows,
+                DirectCountSource::Column(position) => *summary
+                    .non_null_counts
+                    .get(position)
+                    .ok_or(ExecutionError::TypeMismatch)?,
+            };
+            Ok(ScalarValue::UInt64(count_to_sql_u64(
+                count,
+                output.aggregate,
+            )?))
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
     Ok(Some(ExecutionRows {
         fields: outputs.iter().map(AggregateOutput::output_field).collect(),
         rows: vec![ExecutionRow {
             row_id: None,
-            values: vec![ScalarValue::UInt64(count)],
+            values,
         }],
     }))
 }
@@ -2006,21 +2057,23 @@ mod tests {
         BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
         ExecutionError, ExecutionRow, InequalityExecutionStrategy, ProjectionPlan, QueryResult,
         TruthValue, bind_expression, choose_inequality_strategy, count_to_sql_u64,
-        direct_count_column_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
         evaluate_bound_truth, evaluate_bound_values, evaluate_truth, evaluate_truth_values,
         evaluate_values, exact_candidate_pair_count, execute, execute_inequality_sweep,
         execute_nested_loop_join, execute_rows, execute_with_storages, find_required_inequality,
         inequality_can_match, potential_left_indices, project_execution_row,
         required_right_extreme, sorted_non_null_indices,
     };
-    use netbadb_planner::{PhysicalPlan, plan};
+    use netbadb_planner::{
+        IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
+    };
     use netbadb_rel::{
         AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
         DerivedField, Expr, ExprKind, JoinKind, LogicalPlan, NullOrder, OutputField, SortDirection,
         SortKey, UnaryOp,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_storage::HeapStorage;
+    use netbadb_storage::{HeapStorage, IndexStatistics, TableStatistics};
     use netbadb_types::{
         ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, RowId, ScalarValue,
         SemanticType, TableId,
@@ -2323,6 +2376,89 @@ mod tests {
             handle: definition.handle,
             key: ScalarValue::UInt64(10),
         };
+
+        let count_id = AggregateOutput::Aggregate(AggregateExpr {
+            function: AggregateFunction::Count,
+            input: AggregateInput::Column(columns[0].clone()),
+            output: DerivedField {
+                name: "COUNT(id)".into(),
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            },
+        });
+        assert!(direct_count_eligibility(&scan, &[], std::slice::from_ref(&count_id)).is_none());
+
+        let team_expression = || Expr {
+            kind: ExprKind::Column(columns[1].clone()),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::UInt64),
+                nullable: false,
+            },
+        };
+        let bound = |operator, value| Expr {
+            kind: ExprKind::Binary {
+                operator,
+                left: Box::new(team_expression()),
+                right: Box::new(Expr {
+                    kind: ExprKind::Literal(ScalarValue::UInt64(value)),
+                    expr_type: ExprType {
+                        data_type: SemanticType::physical(PhysicalType::UInt64),
+                        nullable: false,
+                    },
+                }),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let range_logical = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(101),
+                table_name: "users".into(),
+                columns: columns.clone(),
+            }),
+            predicate: Expr {
+                kind: ExprKind::Binary {
+                    operator: BinaryOp::And,
+                    left: Box::new(bound(BinaryOp::GtEq, 10)),
+                    right: Box::new(bound(BinaryOp::Lt, 11)),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            },
+        };
+        let range_plan = plan_with_statistics(
+            &range_logical,
+            &[TableAccessStatistics {
+                table_id: TableId(101),
+                statistics: Some(TableStatistics {
+                    row_count: 10_000,
+                    managed_page_count: 100,
+                }),
+            }],
+            &[IndexAccessPath {
+                table_id: TableId(101),
+                column_id: ColumnId(2),
+                handle: definition.handle,
+                statistics: Some(IndexStatistics {
+                    distinct_non_null_keys: 10_000,
+                    null_count: 0,
+                    tree_height: 2,
+                }),
+            }],
+        );
+        let PhysicalPlan::Filter { input, .. } = &range_plan else {
+            panic!("bounded range must retain its residual filter");
+        };
+        assert!(matches!(
+            input.as_ref(),
+            PhysicalPlan::RangeIndexScan { .. }
+        ));
+        assert!(direct_count_eligibility(input, &[], std::slice::from_ref(&count_id)).is_none());
 
         let candidates =
             execute_rows(&scan, std::slice::from_mut(&mut storage)).expect("execute point lookup");
@@ -4218,7 +4354,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_count_column_eligibility_is_exact_and_conservative() {
+    fn direct_count_eligibility_maps_outputs_and_is_conservative() {
         let column = |binding_id: u32, table_id: u64, column_id: u32, name: &str| ColumnRef {
             binding_id: RelationBindingId(binding_id),
             table_id: TableId(table_id),
@@ -4230,7 +4366,7 @@ mod tests {
         };
         let value = column(0, 7, 1, "value");
         let other = column(0, 7, 2, "other");
-        let scan = PhysicalPlan::SeqScan {
+        let single_scan = PhysicalPlan::SeqScan {
             binding_id: RelationBindingId(0),
             table_id: TableId(7),
             table_name: "t7".into(),
@@ -4261,16 +4397,75 @@ mod tests {
                 output
             }) if output == "COUNT(value)"
         ));
-        assert!(
-            direct_count_column_eligibility(&scan, &[], std::slice::from_ref(&count)).is_some()
+        let single = direct_count_eligibility(&single_scan, &[], std::slice::from_ref(&count))
+            .expect("single column COUNT is eligible");
+        assert_eq!(single.table_id, TableId(7));
+        assert_eq!(single.scan_columns, std::slice::from_ref(&value));
+        assert_eq!(single.outputs.len(), 1);
+        assert_eq!(
+            single.outputs[0].source,
+            super::DirectCountSource::Column(0)
+        );
+
+        let count_other = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(other.clone()),
+        );
+        let pair_scan = PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns: vec![value.clone(), other.clone()],
+        };
+        let pair_outputs = [count.clone(), count_other.clone()];
+        let pair = direct_count_eligibility(&pair_scan, &[], &pair_outputs)
+            .expect("pair column COUNT is eligible");
+        assert_eq!(
+            pair.outputs
+                .iter()
+                .map(|output| output.source)
+                .collect::<Vec<_>>(),
+            [
+                super::DirectCountSource::Column(0),
+                super::DirectCountSource::Column(1)
+            ]
+        );
+        let duplicate_outputs = [count.clone(), count.clone()];
+        let duplicate = direct_count_eligibility(&single_scan, &[], &duplicate_outputs)
+            .expect("duplicate column COUNT is eligible");
+        assert_eq!(
+            duplicate
+                .outputs
+                .iter()
+                .map(|output| output.source)
+                .collect::<Vec<_>>(),
+            [
+                super::DirectCountSource::Column(0),
+                super::DirectCountSource::Column(0)
+            ]
+        );
+        let count_all = aggregate(AggregateFunction::Count, AggregateInput::All);
+        let mixed_outputs = [count_all.clone(), count.clone(), count_all.clone()];
+        let mixed = direct_count_eligibility(&single_scan, &[], &mixed_outputs)
+            .expect("star mixed with column COUNT is eligible");
+        assert_eq!(
+            mixed
+                .outputs
+                .iter()
+                .map(|output| output.source)
+                .collect::<Vec<_>>(),
+            [
+                super::DirectCountSource::All,
+                super::DirectCountSource::Column(0),
+                super::DirectCountSource::All
+            ]
         );
         assert!(
-            direct_count_column_eligibility(
-                &scan,
-                &[],
-                &[aggregate(AggregateFunction::Count, AggregateInput::All)]
-            )
-            .is_none()
+            direct_count_eligibility(&single_scan, &[], std::slice::from_ref(&count_all)).is_none()
+        );
+        assert!(
+            direct_count_eligibility(&single_scan, &[], &[count_all.clone(), count_all.clone()])
+                .is_none()
         );
         for function in [
             AggregateFunction::Sum,
@@ -4278,8 +4473,8 @@ mod tests {
             AggregateFunction::Max,
         ] {
             assert!(
-                direct_count_column_eligibility(
-                    &scan,
+                direct_count_eligibility(
+                    &single_scan,
                     &[],
                     &[aggregate(function, AggregateInput::Column(value.clone()))]
                 )
@@ -4287,27 +4482,39 @@ mod tests {
             );
         }
         assert!(
-            direct_count_column_eligibility(
-                &scan,
+            direct_count_eligibility(
+                &single_scan,
                 std::slice::from_ref(&value),
                 std::slice::from_ref(&count)
             )
             .is_none()
         );
         assert!(
-            direct_count_column_eligibility(&scan, &[], &[count.clone(), count.clone()]).is_none()
+            direct_count_eligibility(
+                &single_scan,
+                &[],
+                &[
+                    count.clone(),
+                    aggregate(
+                        AggregateFunction::Sum,
+                        AggregateInput::Column(value.clone())
+                    )
+                ]
+            )
+            .is_none()
         );
 
-        let mismatched_scan = PhysicalPlan::SeqScan {
+        let missing_count_column = PhysicalPlan::SeqScan {
             binding_id: RelationBindingId(0),
             table_id: TableId(7),
             table_name: "t7".into(),
             columns: vec![other.clone()],
         };
         assert!(
-            direct_count_column_eligibility(&mismatched_scan, &[], std::slice::from_ref(&count))
+            direct_count_eligibility(&missing_count_column, &[], std::slice::from_ref(&count))
                 .is_none()
         );
+        assert!(direct_count_eligibility(&pair_scan, &[], std::slice::from_ref(&count)).is_none());
         let mismatched_table = PhysicalPlan::SeqScan {
             binding_id: RelationBindingId(0),
             table_id: TableId(8),
@@ -4315,7 +4522,7 @@ mod tests {
             columns: vec![value.clone()],
         };
         assert!(
-            direct_count_column_eligibility(&mismatched_table, &[], std::slice::from_ref(&count))
+            direct_count_eligibility(&mismatched_table, &[], std::slice::from_ref(&count))
                 .is_none()
         );
         let mismatched_binding = PhysicalPlan::SeqScan {
@@ -4325,8 +4532,33 @@ mod tests {
             columns: vec![value.clone()],
         };
         assert!(
-            direct_count_column_eligibility(&mismatched_binding, &[], std::slice::from_ref(&count))
+            direct_count_eligibility(&mismatched_binding, &[], std::slice::from_ref(&count))
                 .is_none()
+        );
+
+        let mismatched_count_table = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(column(0, 8, 1, "value")),
+        );
+        let mismatched_count_binding = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(column(1, 7, 1, "value")),
+        );
+        assert!(
+            direct_count_eligibility(
+                &single_scan,
+                &[],
+                std::slice::from_ref(&mismatched_count_table)
+            )
+            .is_none()
+        );
+        assert!(
+            direct_count_eligibility(
+                &single_scan,
+                &[],
+                std::slice::from_ref(&mismatched_count_binding)
+            )
+            .is_none()
         );
 
         let true_predicate = Expr {
@@ -4337,14 +4569,12 @@ mod tests {
             },
         };
         let filtered = PhysicalPlan::Filter {
-            input: Box::new(scan.clone()),
+            input: Box::new(single_scan.clone()),
             predicate: true_predicate.clone(),
         };
-        assert!(
-            direct_count_column_eligibility(&filtered, &[], std::slice::from_ref(&count)).is_none()
-        );
+        assert!(direct_count_eligibility(&filtered, &[], std::slice::from_ref(&count)).is_none());
         let joined = PhysicalPlan::NestedLoopJoin {
-            left: Box::new(scan.clone()),
+            left: Box::new(single_scan.clone()),
             right: Box::new(PhysicalPlan::SeqScan {
                 binding_id: RelationBindingId(1),
                 table_id: TableId(8),
@@ -4355,18 +4585,16 @@ mod tests {
             predicate: true_predicate,
             columns: vec![value.clone()],
         };
-        assert!(
-            direct_count_column_eligibility(&joined, &[], std::slice::from_ref(&count)).is_none()
-        );
+        assert!(direct_count_eligibility(&joined, &[], std::slice::from_ref(&count)).is_none());
         let sorted = PhysicalPlan::Sort {
-            input: Box::new(scan),
+            input: Box::new(single_scan),
             keys: vec![SortKey {
                 column: value,
                 direction: SortDirection::Asc,
                 null_order: NullOrder::First,
             }],
         };
-        assert!(direct_count_column_eligibility(&sorted, &[], &[count]).is_none());
+        assert!(direct_count_eligibility(&sorted, &[], &[count]).is_none());
     }
 
     #[test]

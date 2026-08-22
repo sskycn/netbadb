@@ -62,6 +62,37 @@ pub struct HeapStorage {
     fail_analyze_after_catalog_updates: Option<usize>,
 }
 
+/// Exact counts collected by one current live Heap scan.
+///
+/// `non_null_counts` follows the caller-provided column request order and
+/// retains duplicate requests. Both the live-row count and column counts use
+/// checked `u128` arithmetic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceCountSummary {
+    pub live_rows: u128,
+    pub non_null_counts: Vec<u128>,
+}
+
+#[derive(Debug)]
+struct PresenceProjection {
+    output_slots_by_schema_position: Vec<Vec<usize>>,
+    requested_count: usize,
+}
+
+impl PresenceProjection {
+    fn resolve(table: &TableDef, columns: &[ColumnId]) -> Result<Self, StorageError> {
+        let mut output_slots_by_schema_position = vec![Vec::new(); table.columns.len()];
+        for (output_slot, column_id) in columns.iter().enumerate() {
+            let schema_position = resolve_column_position(table, *column_id)?;
+            output_slots_by_schema_position[schema_position].push(output_slot);
+        }
+        Ok(Self {
+            output_slots_by_schema_position,
+            requested_count: columns.len(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RegisteredIndexPlan {
     definition: IndexDefinition,
@@ -1366,19 +1397,23 @@ impl HeapStorage {
         Ok(rows)
     }
 
-    /// Returns the exact number of current live rows whose requested column is
-    /// non-NULL.
+    /// Returns exact current live-row and requested-column non-NULL counts.
     ///
     /// This is a read-only Heap scan, not a catalog statistic: it validates
     /// every managed page and every encoded value in each live row, performs
     /// no persistent or WAL mutation, and does not acquire a transaction
-    /// writer.
-    pub fn scan_column_presence_count(
+    /// writer. Column counts retain request order and duplicates. An empty
+    /// request still returns the exact live-row count.
+    pub fn scan_presence_counts(
         &mut self,
-        column_id: ColumnId,
-    ) -> Result<u128, StorageError> {
-        let target_position = resolve_column_position(&self.table, column_id)?;
-        let mut count = 0_u128;
+        columns: &[ColumnId],
+    ) -> Result<PresenceCountSummary, StorageError> {
+        let projection = PresenceProjection::resolve(&self.table, columns)?;
+        let mut summary = PresenceCountSummary {
+            live_rows: 0,
+            non_null_counts: vec![0; projection.requested_count],
+        };
+        let mut row_presence = vec![false; projection.requested_count];
         for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
             let page_id = PageId(page_number);
             let page = self.buffer.read_page(page_id)?;
@@ -1391,13 +1426,40 @@ impl HeapStorage {
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
                 if let Some((_slot_entry, payload)) = validated.live_record(slot)? {
-                    if decode_row_column_presence(payload, &self.table, target_position)? {
-                        count = count.checked_add(1).ok_or(StorageError::CountOverflow)?;
+                    row_presence.fill(false);
+                    decode_row_presence(payload, &self.table, &projection, &mut row_presence)?;
+                    summary.live_rows = summary
+                        .live_rows
+                        .checked_add(1)
+                        .ok_or(StorageError::CountOverflow)?;
+                    for (count, present) in summary
+                        .non_null_counts
+                        .iter_mut()
+                        .zip(row_presence.iter().copied())
+                    {
+                        if present {
+                            *count = count.checked_add(1).ok_or(StorageError::CountOverflow)?;
+                        }
                     }
                 }
             }
         }
-        Ok(count)
+        Ok(summary)
+    }
+
+    /// Returns the exact number of current live rows whose requested column is
+    /// non-NULL.
+    ///
+    /// This convenience API delegates to [`Self::scan_presence_counts`].
+    pub fn scan_column_presence_count(
+        &mut self,
+        column_id: ColumnId,
+    ) -> Result<u128, StorageError> {
+        self.scan_presence_counts(&[column_id])?
+            .non_null_counts
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::invalid_format("presence summary omitted requested column"))
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
@@ -1791,22 +1853,29 @@ fn ensure_row_consumed(offset: usize, payload_length: usize) -> Result<(), Stora
     Ok(())
 }
 
-fn decode_row_column_presence(
+fn decode_row_presence(
     payload: &[u8],
     table: &TableDef,
-    target_position: usize,
-) -> Result<bool, StorageError> {
+    projection: &PresenceProjection,
+    row_presence: &mut [bool],
+) -> Result<(), StorageError> {
+    if row_presence.len() != projection.requested_count {
+        return Err(crate::invalid_format(
+            "presence row scratch length does not match projection",
+        ));
+    }
     let mut offset = 0;
-    let mut target_present = None;
     for (schema_position, column) in table.columns.iter().enumerate() {
         let value = decode_value(payload, &mut offset)?;
         validate_decoded_scalar(value, column)?;
-        if schema_position == target_position {
-            target_present = Some(!matches!(value, DecodedScalar::Null));
+        if !matches!(value, DecodedScalar::Null) {
+            for output_slot in &projection.output_slots_by_schema_position[schema_position] {
+                row_presence[*output_slot] = true;
+            }
         }
     }
     ensure_row_consumed(offset, payload.len())?;
-    target_present.ok_or_else(|| crate::invalid_format("resolved column position is out of bounds"))
+    Ok(())
 }
 
 fn resolve_column_position(table: &TableDef, column_id: ColumnId) -> Result<usize, StorageError> {
@@ -1951,8 +2020,8 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedScalar, HeapStorage, decode_row, decode_row_column_presence, decode_row_columns,
-        decode_value, encode_row, resolve_projection,
+        DecodedScalar, HeapStorage, PresenceProjection, decode_row, decode_row_columns,
+        decode_row_presence, decode_value, encode_row, resolve_projection,
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
@@ -3296,7 +3365,18 @@ mod tests {
     }
 
     #[test]
-    fn presence_decode_validates_every_scalar_and_returns_only_target_presence() {
+    fn presence_decode_validates_every_scalar_and_returns_ordered_presence() {
+        fn decode(
+            payload: &[u8],
+            table: &TableDef,
+            columns: &[ColumnId],
+        ) -> Result<Vec<bool>, StorageError> {
+            let projection = PresenceProjection::resolve(table, columns)?;
+            let mut presence = vec![false; columns.len()];
+            decode_row_presence(payload, table, &projection, &mut presence)?;
+            Ok(presence)
+        }
+
         let schema = TableDef::new(
             TableId(41),
             "presence_items",
@@ -3319,7 +3399,19 @@ mod tests {
             ScalarValue::Text("extra".into()),
         ])
         .expect("encode presence row");
-        assert!(decode_row_column_presence(&encoded, &schema, 1).expect("present note"));
+        assert_eq!(
+            decode(
+                &encoded,
+                &schema,
+                &[ColumnId(4), ColumnId(2), ColumnId(2), ColumnId(1)]
+            )
+            .expect("decode ordered presence"),
+            vec![true, true, true, true]
+        );
+        assert_eq!(
+            decode(&encoded, &schema, &[]).expect("decode empty presence"),
+            Vec::<bool>::new()
+        );
 
         let null_note = encode_row(&[
             ScalarValue::Int64(7),
@@ -3328,40 +3420,48 @@ mod tests {
             ScalarValue::Text("extra".into()),
         ])
         .expect("encode NULL note");
-        assert!(!decode_row_column_presence(&null_note, &schema, 1).expect("NULL note"));
+        assert_eq!(
+            decode(
+                &null_note,
+                &schema,
+                &[ColumnId(2), ColumnId(1), ColumnId(2)]
+            )
+            .expect("decode NULL note"),
+            vec![false, true, false]
+        );
 
         let mut invalid_selected_utf8 = encoded.clone();
         invalid_selected_utf8[14] = 0xff;
         assert!(matches!(
-            decode_row_column_presence(&invalid_selected_utf8, &schema, 1),
+            decode(&invalid_selected_utf8, &schema, &[ColumnId(2)]),
             Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
         let mut invalid_unselected_utf8 = encoded.clone();
         invalid_unselected_utf8[25] = 0xff;
         assert!(matches!(
-            decode_row_column_presence(&invalid_unselected_utf8, &schema, 0),
+            decode(&invalid_unselected_utf8, &schema, &[ColumnId(1)]),
             Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
         let mut invalid_unselected_bool = encoded.clone();
         invalid_unselected_bool[19] = 2;
         assert!(matches!(
-            decode_row_column_presence(&invalid_unselected_bool, &schema, 0),
+            decode(&invalid_unselected_bool, &schema, &[ColumnId(1)]),
             Err(StorageError::Codec(crate::CodecError::InvalidBoolean(2)))
         ));
         let mut invalid_unselected_null = encoded.clone();
         invalid_unselected_null[18] = 4;
         assert!(matches!(
-            decode_row_column_presence(&invalid_unselected_null, &schema, 0),
+            decode(&invalid_unselected_null, &schema, &[ColumnId(1)]),
             Err(StorageError::NullNotAllowed { column }) if column == "active"
         ));
         assert!(matches!(
-            decode_row_column_presence(&encoded[..encoded.len() - 1], &schema, 1),
+            decode(&encoded[..encoded.len() - 1], &schema, &[ColumnId(2)]),
             Err(StorageError::Codec(crate::CodecError::ScalarTruncated))
         ));
         let mut extra = encoded;
         extra.push(4);
         assert!(matches!(
-            decode_row_column_presence(&extra, &schema, 1),
+            decode(&extra, &schema, &[ColumnId(2)]),
             Err(StorageError::Codec(crate::CodecError::ExtraValues))
         ));
     }
@@ -3386,6 +3486,15 @@ mod tests {
             ],
         );
         let mut storage = HeapStorage::create(&path, schema.clone()).expect("create heap");
+        assert_eq!(
+            storage
+                .scan_presence_counts(&[])
+                .expect("summarize empty heap without columns"),
+            super::PresenceCountSummary {
+                live_rows: 0,
+                non_null_counts: vec![],
+            }
+        );
         assert_eq!(
             storage
                 .scan_column_presence_count(ColumnId(1))
@@ -3416,8 +3525,26 @@ mod tests {
         assert_eq!(storage.scan_column_presence_count(ColumnId(1)).unwrap(), 4);
         assert_eq!(storage.scan_column_presence_count(ColumnId(2)).unwrap(), 2);
         assert_eq!(storage.scan_column_presence_count(ColumnId(3)).unwrap(), 3);
+        assert_eq!(
+            storage
+                .scan_presence_counts(&[ColumnId(2), ColumnId(1), ColumnId(3), ColumnId(2),])
+                .expect("summarize ordered duplicate requests"),
+            super::PresenceCountSummary {
+                live_rows: 4,
+                non_null_counts: vec![2, 4, 3, 2],
+            }
+        );
+        assert_eq!(
+            storage
+                .scan_presence_counts(&[])
+                .expect("summarize live rows without columns"),
+            super::PresenceCountSummary {
+                live_rows: 4,
+                non_null_counts: vec![],
+            }
+        );
         assert!(matches!(
-            storage.scan_column_presence_count(ColumnId(99)),
+            storage.scan_presence_counts(&[ColumnId(1), ColumnId(99)]),
             Err(StorageError::UnknownColumn {
                 column_id: ColumnId(99)
             })
@@ -3436,12 +3563,26 @@ mod tests {
         assert_eq!(storage.scan_column_presence_count(ColumnId(1)).unwrap(), 4);
         assert_eq!(storage.scan_column_presence_count(ColumnId(2)).unwrap(), 3);
         assert_eq!(storage.scan_column_presence_count(ColumnId(3)).unwrap(), 3);
+        assert_eq!(
+            storage
+                .scan_presence_counts(&[ColumnId(3), ColumnId(2), ColumnId(1)])
+                .expect("summarize after slot reuse")
+                .non_null_counts,
+            vec![3, 3, 4]
+        );
         storage.close().expect("close presence heap");
 
         let mut reopened = HeapStorage::open(&path, schema).expect("reopen presence heap");
-        assert_eq!(reopened.scan_column_presence_count(ColumnId(1)).unwrap(), 4);
+        assert_eq!(
+            reopened
+                .scan_presence_counts(&[ColumnId(1), ColumnId(2), ColumnId(3)])
+                .expect("summarize reopened heap"),
+            super::PresenceCountSummary {
+                live_rows: 4,
+                non_null_counts: vec![4, 3, 3],
+            }
+        );
         assert_eq!(reopened.scan_column_presence_count(ColumnId(2)).unwrap(), 3);
-        assert_eq!(reopened.scan_column_presence_count(ColumnId(3)).unwrap(), 3);
         reopened.close().expect("close reopened presence heap");
         cleanup(&path);
     }
@@ -3834,8 +3975,15 @@ mod tests {
 
         storage.create_index(ColumnId(1)).expect("register index");
         storage.analyze().expect("analyze mixed-page heap");
-        assert_eq!(storage.scan_column_presence_count(ColumnId(1)).unwrap(), 4);
-        assert_eq!(storage.scan_column_presence_count(ColumnId(2)).unwrap(), 4);
+        assert_eq!(
+            storage
+                .scan_presence_counts(&[ColumnId(2), ColumnId(1)])
+                .expect("summarize mixed page kinds"),
+            super::PresenceCountSummary {
+                live_rows: 4,
+                non_null_counts: vec![4, 4],
+            }
+        );
         let rows = storage.scan().expect("scan mixed page kinds");
         assert_eq!(rows.len(), 4);
         for expected in [reused, filler, destination, relocated] {
@@ -3849,8 +3997,15 @@ mod tests {
         storage.close().expect("close mixed-page heap");
 
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen mixed-page heap");
-        assert_eq!(reopened.scan_column_presence_count(ColumnId(1)).unwrap(), 4);
-        assert_eq!(reopened.scan_column_presence_count(ColumnId(2)).unwrap(), 4);
+        assert_eq!(
+            reopened
+                .scan_presence_counts(&[ColumnId(1), ColumnId(2)])
+                .expect("summarize reopened mixed page kinds"),
+            super::PresenceCountSummary {
+                live_rows: 4,
+                non_null_counts: vec![4, 4],
+            }
+        );
         assert_eq!(reopened.scan().expect("scan reopened heap"), rows);
         reopened.close().expect("close reopened heap");
         cleanup(&path);
@@ -4731,6 +4886,10 @@ mod tests {
         ));
         assert!(matches!(
             reopened.scan_column_presence_count(ColumnId(2)),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
+        assert!(matches!(
+            reopened.scan_presence_counts(&[ColumnId(1)]),
             Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
         cleanup(&path);

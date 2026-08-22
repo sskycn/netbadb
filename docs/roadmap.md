@@ -701,21 +701,45 @@ reporting.
   payload projection remain controls with exact plan/result gates and no timing
   threshold.
 
-### Phase 7M — Direct multi-COUNT presence scan (selected, not started)
+### Phase 7M — Direct multi-COUNT presence summary (complete)
 
-Post-7L direct multi-COUNT remained about 1.112 ms versus approximately
-0.514–0.518 ms for individual direct column counts; filtered COUNT(payload)
-was similarly 1.128 ms. Multi-COUNT is the narrower next investigation because
-it can potentially share one exact current-Heap validation pass without adding
-Filter predicate semantics. Phase 7M must first add attribution for duplicate
-and mixed-null direct COUNT outputs and define checked reuse/order behavior; no
-Phase 7M implementation is included here.
+- one exact current Heap traversal produces checked `u128` live-row and
+  source-order per-column non-NULL counts for multiple direct COUNT outputs;
+- duplicate column counts reuse one summary slot, nullable counts remain exact,
+  and mixed COUNT(*) outputs reuse the summary's live-row count;
+- aggregate results are reconstructed in SQL output order and each checked
+  `u64` conversion retains its own aggregate overflow metadata;
+- the Phase 7L single-column API delegates to the generalized public low-level
+  summary; zero and duplicate requests retain explicit ordered semantics;
+- every page and persisted scalar remains fully validated, including
+  unrequested Text/Bool/NULL/truncation/trailing-value corruption, without
+  per-row presence allocation, ScalarValue ownership, or ExecutionRow
+  materialization;
+- single/all-star COUNT(*), grouping, Filter, Join, Sort, index scans,
+  mismatched/unused scan columns, and mixed aggregate functions retain the
+  generic executor;
+- physical planning and Inspection JSON v3 remain unchanged; all persistent,
+  protocol, schema-spec, manifest, dependency, and unsafe-code boundaries are
+  unchanged;
+- three serial full pre/post runs improved median-of-three pair, duplicate,
+  mixed-nullable, star+column, and output-order cases from
+  1.170/1.137/1.182/1.143/1.179 ms to
+  0.584/0.553/0.623/0.551/0.617 ms, approximately 47–52%, with exact plan,
+  source-column, result, and metadata gates and no timing threshold.
 
-Filtered COUNT consumer ownership, MIN/MAX ownership, group-key ownership,
-Filter predicate prebinding, Filter borrowed Text evaluation, AND/OR
-short-circuiting, BufferPool page snapshot cloning, covering/index-only reads,
-broader HashJoin eligibility, multi-inequality intersection, and sequential
-PageManager traversal remain separate candidates.
+### Phase 7N — Filtered COUNT consumer path (selected, not started)
+
+Post-7M filtered single/pair COUNT controls remain approximately 1.199/1.185
+ms versus 0.557–0.623 ms for direct presence-summary cases. The next
+investigation should define a correctness-preserving filtered COUNT consumer
+boundary without weakening three-valued predicate semantics or persisted-row
+validation. No Phase 7N implementation is included here.
+
+Direct COUNT(*) live-row specialization, MIN/MAX ownership, group-key
+ownership, Filter predicate prebinding, Filter borrowed Text evaluation,
+AND/OR short-circuiting, BufferPool page snapshot cloning, covering/index-only
+reads, broader HashJoin eligibility, multi-inequality intersection, and
+sequential PageManager traversal remain separate candidates.
 
 ### Later Phase 7 work
 

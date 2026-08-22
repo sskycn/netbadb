@@ -12,7 +12,7 @@ mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
-pub use heap::HeapStorage;
+pub use heap::{HeapStorage, PresenceCountSummary};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
 pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
@@ -531,9 +531,7 @@ impl fmt::Display for StorageError {
             Self::UnknownColumn { column_id } => {
                 write!(formatter, "table has no column with ID {}", column_id.0)
             }
-            Self::CountOverflow => {
-                formatter.write_str("exact column presence count overflowed u128")
-            }
+            Self::CountOverflow => formatter.write_str("exact presence count overflowed u128"),
             Self::RowNotFound { row_id } => write!(
                 formatter,
                 "row at page {}, slot {}, generation {} does not exist",

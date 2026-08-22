@@ -501,6 +501,84 @@ MIN/MAX and group-key ownership, buffer snapshots, covering reads, broader
 HashJoin eligibility, multi-inequality intersection, AND/OR short-circuiting,
 and sequential PageManager traversal remain separate candidates.
 
+Phase 7M retained the existing pair scenario and added duplicate-column,
+mixed-nullable, mixed star/column, aggregate-output-order, all-star, and
+filtered-pair attribution. Every scenario hard-gates its exact result,
+Aggregate/Filter/SeqScan shape, and Phase 7J source-order base ColumnIds. Three
+strictly serial full pre runs gave median-of-three medians of 1.170 ms for
+COUNT(id)+COUNT(payload), 1.137 ms for duplicate COUNT(payload), 1.182 ms for
+three mixed-nullability column counts, 1.143 ms for COUNT(*)+COUNT(payload),
+and 1.179 ms for the five-output order/reuse case.
+
+The executor-private direct-count specialization now recognizes a global
+Aggregate whose nonempty outputs are all COUNT, whose child is a direct
+SeqScan, and which contains at least one COUNT(column):
+
+```text
+Global Aggregate
+      ↓
+all outputs COUNT + direct SeqScan + at least one COUNT(column)?
+     / \
+   no   yes
+   |     |
+generic  map aggregate outputs to live rows or source-order scan columns
+         ↓
+   one exact Heap presence summary
+         ↓
+   live_rows + ordered per-column non-NULL counts
+         ↓
+   reconstruct aggregate output order with checked SQL u64 conversion
+```
+
+`HeapStorage::scan_presence_counts` returns a typed `PresenceCountSummary`
+containing checked `u128` live-row and ordered non-NULL counts. It accepts zero
+or duplicate column requests and preserves request order. The Phase 7L
+single-column API delegates to this one authoritative traversal. Presence
+scratch is allocated once per scan and reset per row; no live row allocates a
+presence vector, owns a `ScalarValue`, or becomes an `ExecutionRow`.
+
+The summary is an exact current-Heap read, not statistics or generic aggregate
+pushdown. Every managed page is fully validated once, non-Heap single payloads
+remain validated, and every live tuple fully decodes all selected and
+unselected scalars. Bool encodings, Text bounds and UTF-8, physical types,
+NULL constraints, truncation, and trailing values remain checked without
+calling `DecodedScalar::into_owned`. Tombstones are excluded and slot reuse,
+relocation, index/ANALYZE mixed pages, and reopen count only current live
+tuples.
+
+Duplicate COUNT(column) outputs reuse one source-order summary slot. Mixed
+COUNT(*) reads the same summary's live-row count, while each final output uses
+its own `AggregateExpr` for typed overflow attribution. A single COUNT(*) and
+all-star multi-output aggregates deliberately remain generic. Grouping,
+Filter, Join, Sort, IndexScan, RangeIndexScan, unused/mismatched scan columns,
+and mixed COUNT with SUM/MIN/MAX also retain the complete generic executor.
+The planner, PhysicalPlan, and Inspection JSON are unchanged.
+
+Post quick passed every plan/result/column gate. Three strictly serial full
+post runs reduced the median-of-three medians to 0.584 ms for the pair, 0.553
+ms for duplicate payload, 0.623 ms for mixed nullable, 0.551 ms for
+star+payload, and 0.617 ms for output order: improvements of approximately
+50.0%, 51.3%, 47.3%, 51.8%, and 47.7%, respectively. They now share one exact
+validation scan rather than materializing 10,000 owned rows and values.
+
+Phase 7L single-column controls changed from 0.530/0.543/0.531 ms for
+COUNT(id)/COUNT(nullable_key)/COUNT(payload) to 0.569/0.573/0.557 ms
+(approximately +7.4%/+5.6%/+4.8%). COUNT(*) changed from 0.678 to 0.708 ms,
+the all-star pair from 0.712 to 0.718 ms, filtered single from 1.163 to 1.199
+ms, and filtered pair from 1.197 to 1.185 ms. These non-target shifts are
+observational code-layout/machine variance; they have unchanged plan/result
+gates and no timing threshold.
+
+The remaining measured aggregate gap is now filtered COUNT at approximately
+1.19–1.20 ms versus 0.55–0.62 ms for direct presence summaries. A filtered
+COUNT consumer path is therefore the selected Phase 7N investigation. Direct
+COUNT(*) live-row specialization, MIN/MAX ownership, group-key ownership,
+Filter predicate prebinding and borrowed Text evaluation, AND/OR
+short-circuiting, BufferPool page snapshot cloning, covering/index-only reads,
+broader HashJoin eligibility, multi-inequality intersection, and sequential
+PageManager traversal remain separate candidates; Phase 7N is not implemented
+here.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -509,7 +587,7 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E through 7L introduce no plan or inspection
+represent HashJoin. Phases 7E through 7M introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format.

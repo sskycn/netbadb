@@ -449,7 +449,7 @@ fn typed_global_aggregates_cover_null_empty_types_limit_and_reopen() {
 }
 
 #[test]
-fn direct_count_column_preserves_nullable_sql_semantics_and_fallbacks() {
+fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
     let path = std::env::temp_dir().join(format!(
         "netbadb-direct-count-column-{}-{:?}.db",
         std::process::id(),
@@ -499,19 +499,59 @@ fn direct_count_column_preserves_nullable_sql_semantics_and_fallbacks() {
             vec![vec![ScalarValue::UInt64(expected)]]
         );
     }
+    let ordered = database
+        .query("SELECT COUNT(*), COUNT(note), COUNT(score), COUNT(note) FROM items")
+        .expect("execute ordered direct counts");
     assert_eq!(
-        database
-            .query("SELECT COUNT(*), COUNT(note) FROM items")
-            .expect("execute multiple count fallback")
-            .rows,
-        vec![vec![ScalarValue::UInt64(4), ScalarValue::UInt64(2)]]
+        ordered.rows,
+        vec![vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(2),
+        ]]
+    );
+    assert_eq!(
+        ordered
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.data_type.physical,
+                column.nullable
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("COUNT(*)", PhysicalType::UInt64, false),
+            ("COUNT(note)", PhysicalType::UInt64, false),
+            ("COUNT(score)", PhysicalType::UInt64, false),
+            ("COUNT(note)", PhysicalType::UInt64, false),
+        ]
     );
     assert_eq!(
         database
-            .query("SELECT COUNT(note) FROM items WHERE id >= 2")
-            .expect("execute filtered count fallback")
+            .query("SELECT COUNT(note), COUNT(*), COUNT(id) FROM items")
+            .expect("execute reordered direct counts")
             .rows,
-        vec![vec![ScalarValue::UInt64(1)]]
+        vec![vec![
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+        ]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*), COUNT(*) FROM items")
+            .expect("execute all-star generic fallback")
+            .rows,
+        vec![vec![ScalarValue::UInt64(4), ScalarValue::UInt64(4)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note), COUNT(score) FROM items WHERE id >= 2")
+            .expect("execute filtered multi-count fallback")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1), ScalarValue::UInt64(1)]]
     );
     database.close().expect("close count database");
 

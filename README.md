@@ -646,8 +646,14 @@ The implementation sequence is intentionally vertical:
 39. Move-aware projection materialization (Phase 7K) — complete; identity
     projections move rows directly, unique subset/reorder projections move
     values, and duplicate sources clone only before their final use.
-40. Aggregate consumer-aware scalar ownership (Phase 7L) — selected from the
-    post-7K COUNT(payload)/COUNT(*) sensitivity, not started.
+40. Direct global COUNT(column) presence scan (Phase 7L) — complete; exact
+    live Heap validation counts target non-NULL presence without row/scalar
+    ownership.
+41. Direct multi-COUNT presence summary (Phase 7M) — complete; one exact Heap
+    scan shares live-row and source-order non-NULL counts across duplicate,
+    nullable, mixed-star, and reordered COUNT outputs.
+42. Filtered COUNT consumer path (Phase 7N) — selected from post-7M controls,
+    not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.
