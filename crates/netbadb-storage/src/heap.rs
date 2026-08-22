@@ -3525,6 +3525,13 @@ mod tests {
         assert_eq!(storage.scan_column_presence_count(ColumnId(1)).unwrap(), 4);
         assert_eq!(storage.scan_column_presence_count(ColumnId(2)).unwrap(), 2);
         assert_eq!(storage.scan_column_presence_count(ColumnId(3)).unwrap(), 3);
+        let delegated_count = storage
+            .scan_column_presence_count(ColumnId(2))
+            .expect("count through the single-column API");
+        let summarized_count = storage
+            .scan_presence_counts(&[ColumnId(2)])
+            .expect("count through the summary API");
+        assert_eq!(summarized_count.non_null_counts, vec![delegated_count]);
         assert_eq!(
             storage
                 .scan_presence_counts(&[ColumnId(2), ColumnId(1), ColumnId(3), ColumnId(2),])
@@ -3545,6 +3552,12 @@ mod tests {
         );
         assert!(matches!(
             storage.scan_presence_counts(&[ColumnId(1), ColumnId(99)]),
+            Err(StorageError::UnknownColumn {
+                column_id: ColumnId(99)
+            })
+        ));
+        assert!(matches!(
+            storage.scan_column_presence_count(ColumnId(99)),
             Err(StorageError::UnknownColumn {
                 column_id: ColumnId(99)
             })

@@ -10,7 +10,7 @@ use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
-use netbadb_storage::{HeapStorage, StorageError, Transaction};
+use netbadb_storage::{HeapStorage, PresenceCountSummary, StorageError, Transaction};
 use netbadb_types::{RowId, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -862,11 +862,24 @@ fn try_execute_direct_counts(
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
     let summary = storage_for_table(storages, plan.table_id)?.scan_presence_counts(&column_ids)?;
+    let values = materialize_direct_count_values(&plan, &summary)?;
+    Ok(Some(ExecutionRows {
+        fields: outputs.iter().map(AggregateOutput::output_field).collect(),
+        rows: vec![ExecutionRow {
+            row_id: None,
+            values,
+        }],
+    }))
+}
+
+fn materialize_direct_count_values(
+    plan: &DirectCountPlan<'_>,
+    summary: &PresenceCountSummary,
+) -> Result<Vec<ScalarValue>, ExecutionError> {
     if summary.non_null_counts.len() != plan.scan_columns.len() {
         return Err(ExecutionError::TypeMismatch);
     }
-    let values = plan
-        .outputs
+    plan.outputs
         .iter()
         .map(|output| {
             let count = match output.source {
@@ -881,14 +894,7 @@ fn try_execute_direct_counts(
                 output.aggregate,
             )?))
         })
-        .collect::<Result<Vec<_>, ExecutionError>>()?;
-    Ok(Some(ExecutionRows {
-        fields: outputs.iter().map(AggregateOutput::output_field).collect(),
-        rows: vec![ExecutionRow {
-            row_id: None,
-            values,
-        }],
-    }))
+        .collect()
 }
 
 fn count_to_sql_u64(count: u128, aggregate: &AggregateExpr) -> Result<u64, ExecutionError> {
@@ -2061,8 +2067,8 @@ mod tests {
         evaluate_bound_truth, evaluate_bound_values, evaluate_truth, evaluate_truth_values,
         evaluate_values, exact_candidate_pair_count, execute, execute_inequality_sweep,
         execute_nested_loop_join, execute_rows, execute_with_storages, find_required_inequality,
-        inequality_can_match, potential_left_indices, project_execution_row,
-        required_right_extreme, sorted_non_null_indices,
+        inequality_can_match, materialize_direct_count_values, potential_left_indices,
+        project_execution_row, required_right_extreme, sorted_non_null_indices,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -2073,7 +2079,7 @@ mod tests {
         SortKey, UnaryOp,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_storage::{HeapStorage, IndexStatistics, TableStatistics};
+    use netbadb_storage::{HeapStorage, IndexStatistics, PresenceCountSummary, TableStatistics};
     use netbadb_types::{
         ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, RowId, ScalarValue,
         SemanticType, TableId,
@@ -4387,6 +4393,15 @@ mod tests {
             AggregateFunction::Count,
             AggregateInput::Column(value.clone()),
         );
+        assert!(direct_count_eligibility(&single_scan, &[], &[]).is_none());
+        assert!(
+            direct_count_eligibility(
+                &single_scan,
+                &[],
+                &[AggregateOutput::GroupKey(value.clone())]
+            )
+            .is_none()
+        );
         let AggregateOutput::Aggregate(count_expression) = &count else {
             panic!("expected aggregate output");
         };
@@ -4460,6 +4475,63 @@ mod tests {
                 super::DirectCountSource::All
             ]
         );
+
+        let named_count = |name: &str, input| {
+            AggregateOutput::Aggregate(AggregateExpr {
+                function: AggregateFunction::Count,
+                input,
+                output: DerivedField {
+                    name: name.into(),
+                    data_type: SemanticType::physical(PhysicalType::UInt64),
+                    nullable: false,
+                },
+            })
+        };
+        let named_outputs = [
+            named_count("first_count", AggregateInput::Column(value.clone())),
+            named_count("row_count", AggregateInput::All),
+            named_count("second_count", AggregateInput::Column(other.clone())),
+        ];
+        let named_plan = direct_count_eligibility(&pair_scan, &[], &named_outputs)
+            .expect("named mixed counts are eligible");
+        assert_eq!(
+            materialize_direct_count_values(
+                &named_plan,
+                &PresenceCountSummary {
+                    live_rows: 9,
+                    non_null_counts: vec![3, 4],
+                }
+            )
+            .expect("materialize direct counts"),
+            vec![
+                ScalarValue::UInt64(3),
+                ScalarValue::UInt64(9),
+                ScalarValue::UInt64(4),
+            ]
+        );
+        assert!(matches!(
+            materialize_direct_count_values(
+                &named_plan,
+                &PresenceCountSummary {
+                    live_rows: 9,
+                    non_null_counts: vec![3, u128::from(u64::MAX) + 1],
+                }
+            ),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Count,
+                output,
+            }) if output == "second_count"
+        ));
+        assert!(matches!(
+            materialize_direct_count_values(
+                &named_plan,
+                &PresenceCountSummary {
+                    live_rows: 9,
+                    non_null_counts: vec![3],
+                }
+            ),
+            Err(ExecutionError::TypeMismatch)
+        ));
         assert!(
             direct_count_eligibility(&single_scan, &[], std::slice::from_ref(&count_all)).is_none()
         );
@@ -4573,19 +4645,37 @@ mod tests {
             predicate: true_predicate.clone(),
         };
         assert!(direct_count_eligibility(&filtered, &[], std::slice::from_ref(&count)).is_none());
+        let right_value = column(1, 8, 1, "value");
         let joined = PhysicalPlan::NestedLoopJoin {
             left: Box::new(single_scan.clone()),
             right: Box::new(PhysicalPlan::SeqScan {
                 binding_id: RelationBindingId(1),
                 table_id: TableId(8),
                 table_name: "t8".into(),
-                columns: vec![column(1, 8, 1, "value")],
+                columns: vec![right_value.clone()],
             }),
             kind: JoinKind::Inner,
-            predicate: true_predicate,
+            predicate: true_predicate.clone(),
             columns: vec![value.clone()],
         };
         assert!(direct_count_eligibility(&joined, &[], std::slice::from_ref(&count)).is_none());
+        let hash_joined = PhysicalPlan::HashJoin {
+            left: Box::new(single_scan.clone()),
+            right: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(1),
+                table_id: TableId(8),
+                table_name: "t8".into(),
+                columns: vec![right_value.clone()],
+            }),
+            kind: JoinKind::Inner,
+            left_key: value.clone(),
+            right_key: right_value.clone(),
+            predicate: true_predicate,
+            columns: vec![value.clone(), right_value],
+        };
+        assert!(
+            direct_count_eligibility(&hash_joined, &[], std::slice::from_ref(&count)).is_none()
+        );
         let sorted = PhysicalPlan::Sort {
             input: Box::new(single_scan),
             keys: vec![SortKey {
