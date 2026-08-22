@@ -523,6 +523,41 @@ above Aggregate and therefore limits complete result groups, never input rows.
 Runtime key and aggregate values are checked against typed physical inputs and
 SUM uses checked signed or unsigned addition.
 
+Two executor-private global COUNT specializations avoid that generic row
+materialization without changing physical plans. A direct `Aggregate →
+SeqScan` can request an exact Heap presence summary. Phase 7N additionally
+recognizes only `Aggregate → Filter → SeqScan`, with all outputs COUNT and at
+least one COUNT(column). It splits the scan's source-order columns into values
+needed by the predicate and NULL-presence bits needed by COUNT, then consumes
+each completely validated live tuple synchronously:
+
+```text
+Aggregate COUNT outputs
+        ↓
+direct Filter → SeqScan eligible?
+       / \
+     no   yes
+     |     |
+ generic  predicate values + COUNT presence
+                 ↓
+        one validated Heap visitor scan
+                 ↓
+       existing dynamic predicate evaluation
+                 ↓
+        TRUE updates checked counts
+                 ↓
+          one materialized result row
+```
+
+The Heap visitor knows only ColumnIds, owned `ScalarValue` requests, and
+presence requests; storage never receives relational `Expr` or SQL truth
+semantics. It invokes the callback only after full row-codec validation.
+Executor still applies three-valued logic, so only TRUE qualifies and FALSE or
+UNKNOWN is discarded. Count-only Text never becomes an owned String, but Text
+used by the predicate remains owned because the current dynamic Filter
+evaluator is deliberately unchanged. Grouped, mixed-function, all-star-only,
+nested, join, sort, and index-backed shapes retain the generic aggregate path.
+
 `ScalarValue` equality and hashing are used only for current-process group
 lookup. NULL equals NULL for grouping, so all NULLs at the same key position
 share a group; this is deliberately different from SQL expression equality,

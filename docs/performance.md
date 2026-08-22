@@ -13,7 +13,10 @@ match the physical query's actual needs without weakening persisted-row
 validation. Phase 7K attributes and removes redundant Project clones after
 storage has created the selected owned values. Phase 7L removes scalar and row
 materialization from one measured direct global COUNT(column) shape while
-retaining complete current-Heap validation. The target uses
+retaining complete current-Heap validation. Phase 7M shares one presence scan
+across direct multi-COUNT outputs. Phase 7N streams Filter-qualified COUNT
+consumption without owning count-only scalars or materializing intermediate
+rows. The target uses
 `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
 optimized bench profile.
 
@@ -107,8 +110,10 @@ The target currently covers:
   projected Heap Text scan control; every observer validates exact Text values;
 - COUNT(*), COUNT(Int64), COUNT(nullable Int64), and COUNT(Text) over that
   fixture, including exact base-scan column gates and nullable semantics;
-- multi-COUNT and filtered COUNT(Text) fallback controls, plus an ID projection
-  with a hidden Text predicate;
+- direct multi-COUNT controls; filtered COUNT(Int64), COUNT(nullable Int64),
+  COUNT(Text), multi/mixed-star/output-order cases, an all-star fallback, and a
+  Text-predicate overlap control; plus an ID projection with a hidden Text
+  predicate;
 - point equality with no index: `Filter → SeqScan`;
 - the same point equality with an analyzed registered ID index:
   `Filter → IndexScan`;
@@ -569,15 +574,102 @@ ms, and filtered pair from 1.197 to 1.279 ms. These non-target shifts are
 observational code-layout/machine variance; they have unchanged plan/result
 gates and no timing threshold.
 
-The remaining measured aggregate gap is now filtered COUNT at approximately
-1.28–1.30 ms versus 0.62–0.69 ms for direct presence summaries. A filtered
-COUNT consumer path is therefore the selected Phase 7N investigation. Direct
-COUNT(*) live-row specialization, MIN/MAX ownership, group-key ownership,
-Filter predicate prebinding and borrowed Text evaluation, AND/OR
-short-circuiting, BufferPool page snapshot cloning, covering/index-only reads,
-broader HashJoin eligibility, multi-inequality intersection, and sequential
-PageManager traversal remain separate candidates; Phase 7N is not implemented
-here.
+The remaining measured aggregate gap was filtered COUNT at approximately
+1.28–1.30 ms versus 0.62–0.69 ms for direct presence summaries. That evidence
+selected Phase 7N.
+
+Phase 7N added filtered ID, nullable, star+payload, output-order/reuse,
+all-star-fallback, and Text-predicate attribution cases before changing
+production code. The executor-private specialization recognizes only this
+physical shape:
+
+```text
+Global Aggregate COUNT outputs
+             ↓
+        direct Filter
+             ↓
+        direct SeqScan
+             ↓
+split source-order requirements
+      /                    \
+predicate ScalarValues   COUNT presence bits
+      \                    /
+ one completely validated Heap visitor traversal
+             ↓
+ existing dynamic Filter evaluator
+     TRUE / FALSE / UNKNOWN
+             ↓
+ checked count summary + one result row
+```
+
+Every output must be COUNT, grouping must be empty, and at least one output
+must be COUNT(column). COUNT(*), duplicate columns, multiple columns, nullable
+columns, and SQL output reordering are supported inside that boundary. A
+filtered all-star aggregate, grouped/mixed-function aggregate, nested Filter,
+Sort, Join, IndexScan, RangeIndexScan, mismatched identity, missing requirement,
+or unused SeqScan column retains the complete generic executor. The physical
+plan remains `Aggregate → Filter → SeqScan`; this is not a planner rewrite or a
+new operator.
+
+`HeapStorage::visit_columns_with_presence` is a synchronous low-level read
+primitive. It resolves separate value and presence projections once, preserves
+request order and duplicates, supports overlap, and allocates value-slot,
+visitor-value, and presence scratch once before traversal. A selected scalar
+is decoded once: presence is recorded before an owned `ScalarValue` is created,
+and ownership occurs only if the value projection requests it. Thus a Text
+column used only by COUNT never creates a String, while a Text column genuinely
+used by the predicate still does in this phase.
+
+Storage does not receive or evaluate SQL `Expr`. It validates every managed
+page once, validates non-Heap single payloads, and fully decodes every scalar
+of every live tuple before invoking the callback. Tag, Bool, integer width,
+Text length/bounds/UTF-8, physical type, NULL constraint, truncation, and
+trailing-value checks are unchanged. Tombstones are skipped; slot reuse,
+relocation, mixed index/ANALYZE pages, and reopen expose each current live tuple
+once. The first callback error stops traversal and is returned unchanged; the
+read writes no WAL, performs no persistent mutation, and acquires no writer.
+
+The executor continues to call the existing dynamic `evaluate_truth` with
+source-order predicate fields. TRUE updates checked `u128` qualified-row and
+per-source non-NULL counts; FALSE and UNKNOWN update nothing. Each unique
+presence source attributes intermediate overflow to its first `AggregateExpr`,
+while every final SQL output independently performs the existing checked
+`u64` conversion with its exact metadata. No scanned or filtered
+`ExecutionRow` collection is constructed. This phase does not prebind Filter
+positions, add a borrowed Filter evaluator, or claim that Filter is zero-copy.
+
+Three strictly serial full pre/post runs used distinct
+`/private/tmp/netbadb-phase7n-pre-target` and
+`/private/tmp/netbadb-phase7n-post-target` build directories. Median-of-three
+medians in milliseconds were:
+
+| scenario | pre | post | change |
+| --- | ---: | ---: | ---: |
+| filtered COUNT(id) | 0.969 | 0.725 | -25.3% |
+| filtered COUNT(nullable_key) | 0.979 | 0.715 | -26.9% |
+| filtered COUNT(payload) | 1.253 | 0.719 | -42.6% |
+| filtered COUNT(id), COUNT(payload) | 1.267 | 0.738 | -41.8% |
+| filtered COUNT(*), COUNT(payload) | 1.263 | 0.735 | -41.8% |
+| filtered output order/reuse | 1.305 | 0.775 | -40.6% |
+| filtered Text-predicate COUNT(payload) | 1.536 | 1.344 | -12.5% |
+| filtered COUNT(*), COUNT(*) fallback | 0.976 | 0.889 | observational |
+
+Direct Phase 7M controls changed from 0.622/0.600/0.612/0.628 ms for
+COUNT(id), COUNT(nullable_key), COUNT(payload), and the ID+payload pair to
+0.551/0.544/0.545/0.583 ms. They retain their dedicated presence-summary path;
+these non-target changes are observational machine/code-layout variance.
+
+Filtered payload/direct payload contracted from 2.046x to 1.321x, and filtered
+payload/filtered ID contracted from 1.292x to 0.992x. Count-only Text ownership
+is therefore no longer visible as the filtered payload penalty. The post Text
+predicate/Bool predicate ratio remains 1.868x because Text needed by the
+predicate still becomes an owned String. That isolated gap selects borrowed
+Text Filter evaluation as the first Phase 7O investigation; Filter position
+prebinding remains a separate measured candidate. Direct COUNT(*) live-row
+specialization, AND/OR short-circuiting, MIN/MAX and group-key ownership,
+BufferPool page snapshot cloning, covering/index-only reads, broader HashJoin
+eligibility, multi-inequality intersection, and sequential PageManager
+traversal remain separate candidates. There is no timing threshold.
 
 ## CI and compatibility
 
@@ -587,7 +679,9 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E through 7M introduce no plan or inspection
+represent HashJoin. Phases 7E through 7N introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
-format.
+format. Phase 7N specifically leaves Canonical Schema v1, Heap metadata v3,
+Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
+encoding unchanged. It adds no dependency and no unsafe code.

@@ -74,6 +74,39 @@ pub struct PresenceCountSummary {
 }
 
 #[derive(Debug)]
+struct ConsumerProjection {
+    value_output_slots_by_schema_position: Vec<Vec<usize>>,
+    presence_output_slots_by_schema_position: Vec<Vec<usize>>,
+    value_count: usize,
+    presence_count: usize,
+}
+
+impl ConsumerProjection {
+    fn resolve(
+        table: &TableDef,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+    ) -> Result<Self, StorageError> {
+        let mut value_output_slots_by_schema_position = vec![Vec::new(); table.columns.len()];
+        for (output_slot, column_id) in value_columns.iter().enumerate() {
+            let schema_position = resolve_column_position(table, *column_id)?;
+            value_output_slots_by_schema_position[schema_position].push(output_slot);
+        }
+        let mut presence_output_slots_by_schema_position = vec![Vec::new(); table.columns.len()];
+        for (output_slot, column_id) in presence_columns.iter().enumerate() {
+            let schema_position = resolve_column_position(table, *column_id)?;
+            presence_output_slots_by_schema_position[schema_position].push(output_slot);
+        }
+        Ok(Self {
+            value_output_slots_by_schema_position,
+            presence_output_slots_by_schema_position,
+            value_count: value_columns.len(),
+            presence_count: presence_columns.len(),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct PresenceProjection {
     output_slots_by_schema_position: Vec<Vec<usize>>,
     requested_count: usize,
@@ -1447,6 +1480,66 @@ impl HeapStorage {
         Ok(summary)
     }
 
+    /// Visits each current live Heap row after complete persisted-row
+    /// validation, owning only requested values and reporting only NULL
+    /// presence for the other requested columns.
+    ///
+    /// Both projections preserve request order and duplicates, and a column
+    /// may appear in both. Projection resolution and scratch allocation happen
+    /// once before traversal. The callback runs synchronously only after the
+    /// complete row has been decoded and validated; its first error stops the
+    /// scan immediately and is returned unchanged. This read-only primitive
+    /// performs no WAL or persistent mutation and does not acquire a writer.
+    pub fn visit_columns_with_presence<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        mut visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+        F: FnMut(&[ScalarValue], &[bool]) -> Result<(), E>,
+    {
+        let projection = ConsumerProjection::resolve(&self.table, value_columns, presence_columns)
+            .map_err(E::from)?;
+        let mut value_slots = vec![None; projection.value_count];
+        let mut values = Vec::with_capacity(projection.value_count);
+        let mut presence = vec![false; projection.presence_count];
+        for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
+            let page_id = PageId(page_number);
+            let page = self.buffer.read_page(page_id).map_err(E::from)?;
+            let validated = page.page().validated().map_err(E::from)?;
+            let header = validated.header();
+            if header.page_type != PageType::Heap {
+                page.page()
+                    .single_payload(header.page_type)
+                    .map_err(E::from)?;
+                continue;
+            }
+            for slot_number in 0..header.slot_count {
+                let slot = SlotId(slot_number);
+                if let Some((_slot_entry, payload)) =
+                    validated.live_record(slot).map_err(E::from)?
+                {
+                    value_slots.fill(None);
+                    values.clear();
+                    presence.fill(false);
+                    decode_row_for_consumer(
+                        payload,
+                        &self.table,
+                        &projection,
+                        &mut value_slots,
+                        &mut values,
+                        &mut presence,
+                    )
+                    .map_err(E::from)?;
+                    visitor(&values, &presence)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the exact number of current live rows whose requested column is
     /// non-NULL.
     ///
@@ -1853,6 +1946,40 @@ fn ensure_row_consumed(offset: usize, payload_length: usize) -> Result<(), Stora
     Ok(())
 }
 
+fn decode_row_for_consumer(
+    payload: &[u8],
+    table: &TableDef,
+    projection: &ConsumerProjection,
+    value_slots: &mut [Option<ScalarValue>],
+    values: &mut Vec<ScalarValue>,
+    presence: &mut [bool],
+) -> Result<(), StorageError> {
+    if value_slots.len() != projection.value_count || presence.len() != projection.presence_count {
+        return Err(crate::invalid_format(
+            "consumer row scratch length does not match projection",
+        ));
+    }
+    let mut offset = 0;
+    for (schema_position, column) in table.columns.iter().enumerate() {
+        let value = decode_value(payload, &mut offset)?;
+        validate_decoded_scalar(value, column)?;
+        let present = !matches!(value, DecodedScalar::Null);
+        for output_slot in &projection.presence_output_slots_by_schema_position[schema_position] {
+            presence[*output_slot] = present;
+        }
+        for output_slot in &projection.value_output_slots_by_schema_position[schema_position] {
+            value_slots[*output_slot] = Some(value.into_owned());
+        }
+    }
+    ensure_row_consumed(offset, payload.len())?;
+    for value in value_slots.iter_mut() {
+        values.push(value.take().ok_or_else(|| {
+            crate::invalid_format("consumer value projection did not populate every output slot")
+        })?);
+    }
+    Ok(())
+}
+
 fn decode_row_presence(
     payload: &[u8],
     table: &TableDef,
@@ -2020,8 +2147,8 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedScalar, HeapStorage, PresenceProjection, decode_row, decode_row_columns,
-        decode_row_presence, decode_value, encode_row, resolve_projection,
+        ConsumerProjection, DecodedScalar, HeapStorage, decode_row, decode_row_columns,
+        decode_row_for_consumer, decode_value, encode_row, resolve_projection,
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
@@ -3297,6 +3424,173 @@ mod tests {
     }
 
     #[test]
+    fn consumer_visitor_preserves_order_duplicates_overlap_and_empty_projections() {
+        let path = test_path("heap-consumer-visitor");
+        let schema = TableDef::new(
+            TableId(39),
+            "consumer_items",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "note", TypeSpec::Physical(PhysicalType::Text))
+                    .nullable(true),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+            ],
+        );
+        let mut storage = HeapStorage::create(&path, schema.clone()).expect("create heap");
+        let mut empty_visits = 0;
+        storage
+            .visit_columns_with_presence::<StorageError, _>(
+                &[ColumnId(1)],
+                &[ColumnId(2)],
+                |_, _| {
+                    empty_visits += 1;
+                    Ok(())
+                },
+            )
+            .expect("visit empty heap");
+        assert_eq!(empty_visits, 0);
+
+        for row in [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("a".into()),
+                ScalarValue::Bool(true),
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::Null,
+                ScalarValue::Bool(false),
+            ],
+        ] {
+            storage.insert(&row).expect("insert consumer row");
+        }
+
+        let mut observed = Vec::new();
+        storage
+            .visit_columns_with_presence::<StorageError, _>(
+                &[ColumnId(2), ColumnId(1), ColumnId(2)],
+                &[ColumnId(2), ColumnId(3), ColumnId(2)],
+                |values, presence| {
+                    observed.push((values.to_vec(), presence.to_vec()));
+                    Ok(())
+                },
+            )
+            .expect("visit ordered duplicate overlap projections");
+        assert_eq!(
+            observed,
+            vec![
+                (
+                    vec![
+                        ScalarValue::Text("a".into()),
+                        ScalarValue::Int64(1),
+                        ScalarValue::Text("a".into()),
+                    ],
+                    vec![true, true, true],
+                ),
+                (
+                    vec![ScalarValue::Null, ScalarValue::Int64(2), ScalarValue::Null],
+                    vec![false, true, false],
+                ),
+            ]
+        );
+
+        let mut presence_only = Vec::new();
+        storage
+            .visit_columns_with_presence::<StorageError, _>(&[], &[ColumnId(2)], |values, p| {
+                assert!(values.is_empty());
+                presence_only.push(p[0]);
+                Ok(())
+            })
+            .expect("visit presence-only projection");
+        assert_eq!(presence_only, [true, false]);
+
+        let mut value_only = Vec::new();
+        storage
+            .visit_columns_with_presence::<StorageError, _>(&[ColumnId(1)], &[], |values, p| {
+                assert!(p.is_empty());
+                value_only.push(values[0].clone());
+                Ok(())
+            })
+            .expect("visit value-only projection");
+        assert_eq!(value_only, [ScalarValue::Int64(1), ScalarValue::Int64(2)]);
+
+        let mut zero_width_visits = 0;
+        storage
+            .visit_columns_with_presence::<StorageError, _>(&[], &[], |values, presence| {
+                assert!(values.is_empty());
+                assert!(presence.is_empty());
+                zero_width_visits += 1;
+                Ok(())
+            })
+            .expect("visit zero-width projection");
+        assert_eq!(zero_width_visits, 2);
+
+        for (values, presence) in [
+            (&[ColumnId(99)][..], &[][..]),
+            (&[][..], &[ColumnId(99)][..]),
+        ] {
+            assert!(matches!(
+                storage.visit_columns_with_presence::<StorageError, _>(
+                    values,
+                    presence,
+                    |_, _| Ok(())
+                ),
+                Err(StorageError::UnknownColumn {
+                    column_id: ColumnId(99)
+                })
+            ));
+        }
+        storage.close().expect("close consumer heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn consumer_visitor_stops_at_the_first_callback_error_without_mutation() {
+        #[derive(Debug)]
+        enum VisitError {
+            Storage,
+            Stop,
+        }
+
+        impl From<StorageError> for VisitError {
+            fn from(_error: StorageError) -> Self {
+                Self::Storage
+            }
+        }
+
+        let path = test_path("heap-consumer-callback-error");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        for id in 1..=3 {
+            storage
+                .insert(&[
+                    ScalarValue::Int64(id),
+                    ScalarValue::Text(format!("name-{id}")),
+                ])
+                .expect("insert row");
+        }
+        let mut visits = 0;
+        let error = storage
+            .visit_columns_with_presence::<VisitError, _>(&[ColumnId(1)], &[ColumnId(2)], |_, _| {
+                visits += 1;
+                if visits == 2 {
+                    Err(VisitError::Stop)
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("callback error must stop the scan");
+        assert!(matches!(error, VisitError::Stop));
+        assert_eq!(visits, 2);
+        assert_eq!(storage.scan().expect("scan unchanged heap").len(), 3);
+        storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
     fn selective_decode_validates_every_unselected_scalar_without_owning_text() {
         let schema = TableDef::new(
             TableId(40),
@@ -3371,9 +3665,18 @@ mod tests {
             table: &TableDef,
             columns: &[ColumnId],
         ) -> Result<Vec<bool>, StorageError> {
-            let projection = PresenceProjection::resolve(table, columns)?;
+            let projection = ConsumerProjection::resolve(table, &[], columns)?;
+            let mut value_slots = Vec::new();
+            let mut values = Vec::new();
             let mut presence = vec![false; columns.len()];
-            decode_row_presence(payload, table, &projection, &mut presence)?;
+            decode_row_for_consumer(
+                payload,
+                table,
+                &projection,
+                &mut value_slots,
+                &mut values,
+                &mut presence,
+            )?;
             Ok(presence)
         }
 
@@ -3399,6 +3702,33 @@ mod tests {
             ScalarValue::Text("extra".into()),
         ])
         .expect("encode presence row");
+        let projection = ConsumerProjection::resolve(
+            &schema,
+            &[ColumnId(2), ColumnId(1), ColumnId(2)],
+            &[ColumnId(2), ColumnId(4)],
+        )
+        .expect("resolve mixed projection");
+        let mut value_slots = vec![None; 3];
+        let mut values = Vec::with_capacity(3);
+        let mut presence = vec![false; 2];
+        decode_row_for_consumer(
+            &encoded,
+            &schema,
+            &projection,
+            &mut value_slots,
+            &mut values,
+            &mut presence,
+        )
+        .expect("decode mixed projection");
+        assert_eq!(
+            values,
+            [
+                ScalarValue::Text("note".into()),
+                ScalarValue::Int64(7),
+                ScalarValue::Text("note".into()),
+            ]
+        );
+        assert_eq!(presence, [true, true]);
         assert_eq!(
             decode(
                 &encoded,
@@ -3997,6 +4327,23 @@ mod tests {
                 non_null_counts: vec![4, 4],
             }
         );
+        let mut visited_ids = Vec::new();
+        storage
+            .visit_columns_with_presence::<StorageError, _>(
+                &[ColumnId(1)],
+                &[ColumnId(2)],
+                |values, presence| {
+                    let [ScalarValue::Int64(id)] = values else {
+                        panic!("visitor must return one Int64 ID");
+                    };
+                    assert_eq!(presence, [true]);
+                    visited_ids.push(*id);
+                    Ok(())
+                },
+            )
+            .expect("visit mixed page kinds");
+        visited_ids.sort_unstable();
+        assert_eq!(visited_ids, [1, 3, 4, 5]);
         let rows = storage.scan().expect("scan mixed page kinds");
         assert_eq!(rows.len(), 4);
         for expected in [reused, filler, destination, relocated] {
@@ -4020,6 +4367,16 @@ mod tests {
             }
         );
         assert_eq!(reopened.scan().expect("scan reopened heap"), rows);
+        let mut reopened_visits = 0;
+        reopened
+            .visit_columns_with_presence::<StorageError, _>(&[], &[], |values, presence| {
+                assert!(values.is_empty());
+                assert!(presence.is_empty());
+                reopened_visits += 1;
+                Ok(())
+            })
+            .expect("visit reopened mixed-page heap");
+        assert_eq!(reopened_visits, 4);
         reopened.close().expect("close reopened heap");
         cleanup(&path);
     }
@@ -4903,6 +5260,22 @@ mod tests {
         ));
         assert!(matches!(
             reopened.scan_presence_counts(&[ColumnId(1)]),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
+        assert!(matches!(
+            reopened.visit_columns_with_presence::<StorageError, _>(
+                &[ColumnId(1)],
+                &[],
+                |_, _| Ok(())
+            ),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
+        assert!(matches!(
+            reopened.visit_columns_with_presence::<StorageError, _>(
+                &[],
+                &[ColumnId(2)],
+                |_, _| Ok(())
+            ),
             Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
         cleanup(&path);

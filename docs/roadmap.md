@@ -727,19 +727,49 @@ reporting.
   0.657/0.646/0.685/0.622/0.686 ms, approximately 42–46%, with exact plan,
   source-column, result, and metadata gates and no timing threshold.
 
-### Phase 7N — Filtered COUNT consumer path (selected, not started)
+### Phase 7N — Streaming filtered COUNT presence consumer (complete)
 
-Post-7M filtered single/pair COUNT controls remain approximately 1.299/1.279
-ms versus 0.617–0.686 ms for direct presence-summary cases. The next
-investigation should define a correctness-preserving filtered COUNT consumer
-boundary without weakening three-valued predicate semantics or persisted-row
-validation. No Phase 7N implementation is included here.
+- an executor-private specialization accepts only global all-COUNT output over
+  direct `Filter → SeqScan`, with at least one COUNT(column); the physical plan
+  and planner remain unchanged;
+- source-order predicate columns become owned `ScalarValue` scratch, while
+  unique source-order COUNT columns become NULL-presence scratch; overlap and
+  duplicate/multi/mixed-star output mappings remain exact;
+- one current Heap traversal validates each page once, validates non-Heap
+  payloads, fully validates every scalar, and invokes the synchronous callback
+  only after the whole live tuple is valid;
+- storage knows no SQL `Expr`; executor retains the existing dynamic
+  `evaluate_truth`, so TRUE qualifies and FALSE/UNKNOWN do not;
+- count-only Text never becomes an owned String, predicate Text remains owned,
+  and neither scanned nor filtered `ExecutionRow` collections are created;
+- callback errors stop immediately, scratch containers are allocated outside
+  the row loop, intermediate `u128` and final per-output `u64` overflow remain
+  checked and attributed;
+- all-star-only, grouped, mixed-function, nested Filter, Sort, Join, IndexScan,
+  RangeIndexScan, missing/mismatched identity, and unused-scan-column shapes
+  retain the generic executor;
+- isolated serial full x3 reduced median-of-three filtered ID, nullable,
+  payload, pair, star+payload, and output-order cases from
+  0.969/0.979/1.253/1.267/1.263/1.305 ms to
+  0.725/0.715/0.719/0.738/0.735/0.775 ms, with no timing threshold;
+- filtered payload/direct payload contracted from 2.046x to 1.321x and filtered
+  payload/filtered ID from 1.292x to 0.992x. The Text-predicate control remains
+  1.868x the Bool-predicate target because predicate Text still owns.
 
-Direct COUNT(*) live-row specialization, MIN/MAX ownership, group-key
-ownership, Filter predicate prebinding, Filter borrowed Text evaluation,
-AND/OR short-circuiting, BufferPool page snapshot cloning, covering/index-only
-reads, broader HashJoin eligibility, multi-inequality intersection, and
-sequential PageManager traversal remain separate candidates.
+### Phase 7O — Borrowed Text Filter evaluation (selected, not started)
+
+Post-7N data isolates the remaining owned Text predicate cost: filtered
+COUNT(payload) with a Text equality predicate is 1.344 ms versus 0.719 ms with
+the Bool predicate, while count-only Text no longer differs from filtered ID.
+The first Phase 7O investigation should retain dynamic column lookup and
+attribute only borrowed Text predicate scalar evaluation. It must not be
+implemented as part of Phase 7N.
+
+Filter predicate prebinding, direct COUNT(*) live-row specialization, MIN/MAX
+ownership, group-key ownership, AND/OR short-circuiting, BufferPool page
+snapshot cloning, covering/index-only reads, broader HashJoin eligibility,
+multi-inequality intersection, and sequential PageManager traversal remain
+separate candidates.
 
 ### Later Phase 7 work
 

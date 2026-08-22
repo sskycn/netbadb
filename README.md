@@ -652,8 +652,12 @@ The implementation sequence is intentionally vertical:
 41. Direct multi-COUNT presence summary (Phase 7M) — complete; one exact Heap
     scan shares live-row and source-order non-NULL counts across duplicate,
     nullable, mixed-star, and reordered COUNT outputs.
-42. Filtered COUNT consumer path (Phase 7N) — selected from post-7M controls,
-    not started.
+42. Streaming filtered COUNT presence consumer (Phase 7N) — complete; one
+    validated Heap visitor traversal owns only predicate values, reports
+    COUNT-column presence, retains dynamic three-valued Filter evaluation, and
+    materializes no intermediate ExecutionRows.
+43. Borrowed Text Filter evaluation (Phase 7O) — selected from the post-7N Text
+    predicate control, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

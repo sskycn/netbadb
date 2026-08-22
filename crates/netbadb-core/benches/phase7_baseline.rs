@@ -492,6 +492,35 @@ fn run_projection_attribution_scenarios(
     )?;
     let filtered_count = active_count(rows);
     run_attribution_query(
+        "aggregate_count_id_filter",
+        rows,
+        "SELECT COUNT(id) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, ACTIVE_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(filtered_count),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    let filtered_nullable_count = active_non_null_count(rows, NullDistribution::Low);
+    run_attribution_query(
+        "aggregate_count_nullable_filter",
+        rows,
+        "SELECT COUNT(nullable_key) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[NULLABLE_COLUMN_ID, ACTIVE_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(filtered_nullable_count),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
         "aggregate_count_pair_filter_control",
         rows,
         "SELECT COUNT(id), COUNT(payload) FROM items WHERE active = true",
@@ -505,7 +534,79 @@ fn run_projection_attribution_scenarios(
         |result| count_values_observation(result, &[filtered_count, filtered_count]),
         measurements,
     )?;
+    run_attribution_query(
+        "aggregate_count_star_payload_filter",
+        rows,
+        "SELECT COUNT(*), COUNT(payload) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ACTIVE_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(filtered_count) * 2,
+        },
+        settings,
+        |result| count_values_observation(result, &[filtered_count, filtered_count]),
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_filtered_output_order",
+        rows,
+        "SELECT COUNT(payload), COUNT(*), COUNT(nullable_key), COUNT(payload), COUNT(id) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[
+            ID_COLUMN_ID,
+            NULLABLE_COLUMN_ID,
+            ACTIVE_COLUMN_ID,
+            PAYLOAD_COLUMN_ID,
+        ],
+        Observation {
+            rows: 1,
+            checksum: u128::from(filtered_count) * 4 + u128::from(filtered_nullable_count),
+        },
+        settings,
+        |result| {
+            count_values_observation(
+                result,
+                &[
+                    filtered_count,
+                    filtered_count,
+                    filtered_nullable_count,
+                    filtered_count,
+                    filtered_count,
+                ],
+            )
+        },
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_star_pair_filter_control",
+        rows,
+        "SELECT COUNT(*), COUNT(*) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ACTIVE_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(filtered_count) * 2,
+        },
+        settings,
+        |result| count_values_observation(result, &[filtered_count, filtered_count]),
+        measurements,
+    )?;
     let middle = rows / 2;
+    run_attribution_query(
+        "aggregate_count_payload_text_filter",
+        rows,
+        &format!("SELECT COUNT(payload) FROM items WHERE payload = 'payload-{middle:016}'"),
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: 1,
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
     run_attribution_query(
         "hidden_filter_payload",
         rows,
@@ -2018,6 +2119,14 @@ const fn low_non_null_count(rows: u64) -> u64 {
 
 const fn active_count(rows: u64) -> u64 {
     rows.saturating_add(2) / 3
+}
+
+fn active_non_null_count(rows: u64, distribution: NullDistribution) -> u64 {
+    (0..rows)
+        .filter(|id| id % 3 == 0 && !distribution.is_null(*id))
+        .count()
+        .try_into()
+        .expect("fixture row count fits u64")
 }
 
 fn group_observation(result: &QueryResult) -> BenchResult<Observation> {

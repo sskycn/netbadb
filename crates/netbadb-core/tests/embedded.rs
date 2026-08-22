@@ -549,7 +549,7 @@ fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
     assert_eq!(
         database
             .query("SELECT COUNT(note), COUNT(score) FROM items WHERE id >= 2")
-            .expect("execute filtered multi-count fallback")
+            .expect("execute filtered multi-count")
             .rows,
         vec![vec![ScalarValue::UInt64(1), ScalarValue::UInt64(1)]]
     );
@@ -564,6 +564,148 @@ fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
         vec![vec![ScalarValue::UInt64(2)]]
     );
     reopened.close().expect("close reopened count database");
+    cleanup(&path);
+}
+
+#[test]
+fn filtered_counts_preserve_null_truth_overlap_output_order_and_all_star_fallback() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-filtered-count-{}-{:?}.db",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let table = TableDef::new(
+        TableId(97),
+        "items",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(ColumnId(2), "note", TypeSpec::Physical(PhysicalType::Text))
+                .nullable(true),
+            ColumnDef::new(
+                ColumnId(3),
+                "score",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+            ColumnDef::new(
+                ColumnId(4),
+                "active",
+                TypeSpec::Physical(PhysicalType::Bool),
+            ),
+        ],
+    );
+    let mut database = Database::create(&path, table).expect("create filtered count database");
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE active = true")
+            .expect("count empty filtered table")
+            .rows,
+        vec![vec![ScalarValue::UInt64(0)]]
+    );
+    for row in [
+        vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Text("a".into()),
+            ScalarValue::Int64(10),
+            ScalarValue::Bool(true),
+        ],
+        vec![
+            ScalarValue::Int64(2),
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Bool(true),
+        ],
+        vec![
+            ScalarValue::Int64(3),
+            ScalarValue::Text("b".into()),
+            ScalarValue::Int64(30),
+            ScalarValue::Bool(false),
+        ],
+        vec![
+            ScalarValue::Int64(4),
+            ScalarValue::Null,
+            ScalarValue::Int64(40),
+            ScalarValue::Bool(true),
+        ],
+    ] {
+        database.insert(&row).expect("insert filtered count row");
+    }
+
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE active = true")
+            .expect("execute filtered note count")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    let ordered = database
+        .query(
+            "SELECT COUNT(*), COUNT(note), COUNT(score), COUNT(note) \
+             FROM items WHERE active = true",
+        )
+        .expect("execute ordered filtered counts");
+    assert_eq!(
+        ordered.rows,
+        vec![vec![
+            ScalarValue::UInt64(3),
+            ScalarValue::UInt64(1),
+            ScalarValue::UInt64(2),
+            ScalarValue::UInt64(1),
+        ]]
+    );
+    assert_eq!(
+        ordered
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.data_type.physical,
+                column.nullable
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("COUNT(*)", PhysicalType::UInt64, false),
+            ("COUNT(note)", PhysicalType::UInt64, false),
+            ("COUNT(score)", PhysicalType::UInt64, false),
+            ("COUNT(note)", PhysicalType::UInt64, false),
+        ]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE score > 20")
+            .expect("exclude UNKNOWN score predicate")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE note = 'a'")
+            .expect("count overlapping Text predicate source")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*), COUNT(*) FROM items WHERE active = true")
+            .expect("execute all-star generic fallback")
+            .rows,
+        vec![vec![ScalarValue::UInt64(3), ScalarValue::UInt64(3)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE id < 0")
+            .expect("execute all-FALSE filtered count")
+            .rows,
+        vec![vec![ScalarValue::UInt64(0)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE score = NULL")
+            .expect("execute all-UNKNOWN filtered count")
+            .rows,
+        vec![vec![ScalarValue::UInt64(0)]]
+    );
+    database.close().expect("close filtered count database");
     cleanup(&path);
 }
 

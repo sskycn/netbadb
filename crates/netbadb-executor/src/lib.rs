@@ -11,7 +11,7 @@ use netbadb_rel::{
     ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_storage::{HeapStorage, PresenceCountSummary, StorageError, Transaction};
-use netbadb_types::{RowId, ScalarValue, TableId};
+use netbadb_types::{ColumnId, RelationBindingId, RowId, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
@@ -621,7 +621,12 @@ fn execute_rows(
             group_keys,
             outputs,
         } => {
-            if let Some(result) = try_execute_direct_counts(input, group_keys, outputs, storages)? {
+            if let Some(result) = try_execute_filtered_counts(input, group_keys, outputs, storages)?
+            {
+                Ok(result)
+            } else if let Some(result) =
+                try_execute_direct_counts(input, group_keys, outputs, storages)?
+            {
                 Ok(result)
             } else {
                 let input = execute_rows(input, storages)?;
@@ -785,6 +790,181 @@ struct DirectCountPlan<'a> {
     outputs: Vec<DirectCountOutput<'a>>,
 }
 
+#[derive(Debug)]
+struct FilteredCountPlan<'a> {
+    table_id: TableId,
+    predicate: &'a Expr,
+    predicate_columns: Vec<&'a ColumnRef>,
+    presence_columns: Vec<&'a ColumnRef>,
+    outputs: Vec<DirectCountOutput<'a>>,
+    star_aggregate: Option<&'a AggregateExpr>,
+    presence_aggregates: Vec<&'a AggregateExpr>,
+}
+
+#[derive(Debug)]
+struct FilteredCountSummary {
+    qualified_rows: u128,
+    non_null_counts: Vec<u128>,
+}
+
+type SourceIdentity = (RelationBindingId, TableId, ColumnId);
+
+fn source_identity(column: &ColumnRef) -> SourceIdentity {
+    (column.binding_id, column.table_id, column.column_id)
+}
+
+fn collect_filter_columns(predicate: &Expr) -> BTreeSet<SourceIdentity> {
+    fn collect(expression: &Expr, columns: &mut BTreeSet<SourceIdentity>) {
+        match &expression.kind {
+            ExprKind::Column(column) => {
+                columns.insert(source_identity(column));
+            }
+            ExprKind::Literal(_) => {}
+            ExprKind::Binary { left, right, .. } => {
+                collect(left, columns);
+                collect(right, columns);
+            }
+            ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+                collect(expression, columns);
+            }
+        }
+    }
+
+    let mut columns = BTreeSet::new();
+    collect(predicate, &mut columns);
+    columns
+}
+
+fn filtered_count_eligibility<'a>(
+    input: &'a PhysicalPlan,
+    group_keys: &[ColumnRef],
+    outputs: &'a [AggregateOutput],
+) -> Option<FilteredCountPlan<'a>> {
+    if !group_keys.is_empty() || outputs.is_empty() {
+        return None;
+    }
+    let PhysicalPlan::Filter { input, predicate } = input else {
+        return None;
+    };
+    let PhysicalPlan::SeqScan {
+        binding_id,
+        table_id,
+        columns,
+        ..
+    } = input.as_ref()
+    else {
+        return None;
+    };
+    let scan_identities = columns.iter().map(source_identity).collect::<BTreeSet<_>>();
+    if scan_identities.len() != columns.len()
+        || columns
+            .iter()
+            .any(|column| column.binding_id != *binding_id || column.table_id != *table_id)
+    {
+        return None;
+    }
+
+    let predicate_identities = collect_filter_columns(predicate);
+    if predicate_identities
+        .iter()
+        .any(|(binding, table, _)| binding != binding_id || table != table_id)
+    {
+        return None;
+    }
+    let predicate_columns = columns
+        .iter()
+        .filter(|column| predicate_identities.contains(&source_identity(column)))
+        .collect::<Vec<_>>();
+    if predicate_columns.len() != predicate_identities.len() {
+        return None;
+    }
+
+    let mut count_identities = BTreeSet::new();
+    let mut star_aggregate = None;
+    for output in outputs {
+        let AggregateOutput::Aggregate(aggregate) = output else {
+            return None;
+        };
+        if aggregate.function != AggregateFunction::Count {
+            return None;
+        }
+        match &aggregate.input {
+            AggregateInput::All => {
+                if star_aggregate.is_none() {
+                    star_aggregate = Some(aggregate);
+                }
+            }
+            AggregateInput::Column(column) => {
+                if column.binding_id != *binding_id || column.table_id != *table_id {
+                    return None;
+                }
+                count_identities.insert(source_identity(column));
+            }
+        }
+    }
+    if count_identities.is_empty() {
+        return None;
+    }
+    let presence_columns = columns
+        .iter()
+        .filter(|column| count_identities.contains(&source_identity(column)))
+        .collect::<Vec<_>>();
+    if presence_columns.len() != count_identities.len()
+        || columns.iter().any(|column| {
+            let identity = source_identity(column);
+            !predicate_identities.contains(&identity) && !count_identities.contains(&identity)
+        })
+    {
+        return None;
+    }
+
+    let presence_aggregates = presence_columns
+        .iter()
+        .map(|column| {
+            outputs.iter().find_map(|output| {
+                let AggregateOutput::Aggregate(aggregate) = output else {
+                    return None;
+                };
+                match &aggregate.input {
+                    AggregateInput::Column(candidate)
+                        if source_identity(candidate) == source_identity(column) =>
+                    {
+                        Some(aggregate)
+                    }
+                    AggregateInput::All | AggregateInput::Column(_) => None,
+                }
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let direct_outputs = outputs
+        .iter()
+        .map(|output| {
+            let AggregateOutput::Aggregate(aggregate) = output else {
+                return None;
+            };
+            let source = match &aggregate.input {
+                AggregateInput::All => DirectCountSource::All,
+                AggregateInput::Column(column) => {
+                    DirectCountSource::Column(presence_columns.iter().position(|candidate| {
+                        source_identity(candidate) == source_identity(column)
+                    })?)
+                }
+            };
+            Some(DirectCountOutput { source, aggregate })
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(FilteredCountPlan {
+        table_id: *table_id,
+        predicate,
+        predicate_columns,
+        presence_columns,
+        outputs: direct_outputs,
+        star_aggregate,
+        presence_aggregates,
+    })
+}
+
 fn direct_count_eligibility<'a>(
     input: &'a PhysicalPlan,
     group_keys: &[ColumnRef],
@@ -847,6 +1027,89 @@ fn direct_count_eligibility<'a>(
     })
 }
 
+fn try_execute_filtered_counts(
+    input: &PhysicalPlan,
+    group_keys: &[ColumnRef],
+    outputs: &[AggregateOutput],
+    storages: &mut [HeapStorage],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let Some(plan) = filtered_count_eligibility(input, group_keys, outputs) else {
+        return Ok(None);
+    };
+    let predicate_column_ids = plan
+        .predicate_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<Vec<_>>();
+    let presence_column_ids = plan
+        .presence_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<Vec<_>>();
+    let predicate_fields = plan
+        .predicate_columns
+        .iter()
+        .map(|column| OutputField::Source((*column).clone()))
+        .collect::<Vec<_>>();
+    let mut summary = FilteredCountSummary {
+        qualified_rows: 0,
+        non_null_counts: vec![0; plan.presence_columns.len()],
+    };
+    storage_for_table(storages, plan.table_id)?.visit_columns_with_presence::<ExecutionError, _>(
+        &predicate_column_ids,
+        &presence_column_ids,
+        |values, presence| {
+            if evaluate_truth(plan.predicate, values, &predicate_fields)? == TruthValue::True {
+                update_filtered_count_summary(&plan, &mut summary, presence)?;
+            }
+            Ok(())
+        },
+    )?;
+    let values = materialize_count_values(
+        &plan.outputs,
+        summary.qualified_rows,
+        &summary.non_null_counts,
+    )?;
+    Ok(Some(ExecutionRows {
+        fields: outputs.iter().map(AggregateOutput::output_field).collect(),
+        rows: vec![ExecutionRow {
+            row_id: None,
+            values,
+        }],
+    }))
+}
+
+fn update_filtered_count_summary(
+    plan: &FilteredCountPlan<'_>,
+    summary: &mut FilteredCountSummary,
+    presence: &[bool],
+) -> Result<(), ExecutionError> {
+    if presence.len() != plan.presence_aggregates.len()
+        || summary.non_null_counts.len() != plan.presence_aggregates.len()
+    {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    if let Some(aggregate) = plan.star_aggregate {
+        summary.qualified_rows = summary
+            .qualified_rows
+            .checked_add(1)
+            .ok_or_else(|| aggregate_overflow(aggregate))?;
+    }
+    for ((count, present), aggregate) in summary
+        .non_null_counts
+        .iter_mut()
+        .zip(presence.iter().copied())
+        .zip(&plan.presence_aggregates)
+    {
+        if present {
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| aggregate_overflow(aggregate))?;
+        }
+    }
+    Ok(())
+}
+
 fn try_execute_direct_counts(
     input: &PhysicalPlan,
     group_keys: &[ColumnRef],
@@ -879,13 +1142,20 @@ fn materialize_direct_count_values(
     if summary.non_null_counts.len() != plan.scan_columns.len() {
         return Err(ExecutionError::TypeMismatch);
     }
-    plan.outputs
+    materialize_count_values(&plan.outputs, summary.live_rows, &summary.non_null_counts)
+}
+
+fn materialize_count_values(
+    outputs: &[DirectCountOutput<'_>],
+    live_rows: u128,
+    non_null_counts: &[u128],
+) -> Result<Vec<ScalarValue>, ExecutionError> {
+    outputs
         .iter()
         .map(|output| {
             let count = match output.source {
-                DirectCountSource::All => summary.live_rows,
-                DirectCountSource::Column(position) => *summary
-                    .non_null_counts
+                DirectCountSource::All => live_rows,
+                DirectCountSource::Column(position) => *non_null_counts
                     .get(position)
                     .ok_or(ExecutionError::TypeMismatch)?,
             };
@@ -2061,14 +2331,16 @@ fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, E
 mod tests {
     use super::{
         BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
-        ExecutionError, ExecutionRow, InequalityExecutionStrategy, ProjectionPlan, QueryResult,
-        TruthValue, bind_expression, choose_inequality_strategy, count_to_sql_u64,
-        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
-        evaluate_bound_truth, evaluate_bound_values, evaluate_truth, evaluate_truth_values,
-        evaluate_values, exact_candidate_pair_count, execute, execute_inequality_sweep,
-        execute_nested_loop_join, execute_rows, execute_with_storages, find_required_inequality,
+        ExecutionError, ExecutionRow, FilteredCountSummary, InequalityExecutionStrategy,
+        ProjectionPlan, QueryResult, TruthValue, bind_expression, choose_inequality_strategy,
+        collect_filter_columns, count_to_sql_u64, direct_count_eligibility, evaluate,
+        evaluate_binary, evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values,
+        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
+        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
+        execute_with_storages, filtered_count_eligibility, find_required_inequality,
         inequality_can_match, materialize_direct_count_values, potential_left_indices,
         project_execution_row, required_right_extreme, sorted_non_null_indices,
+        update_filtered_count_summary,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -2418,6 +2690,14 @@ mod tests {
                 nullable: false,
             },
         };
+        let point_filter = PhysicalPlan::Filter {
+            input: Box::new(scan.clone()),
+            predicate: bound(BinaryOp::Eq, 10),
+        };
+        assert!(
+            filtered_count_eligibility(&point_filter, &[], std::slice::from_ref(&count_id))
+                .is_none()
+        );
         let range_logical = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::Scan {
                 binding_id: RelationBindingId(0),
@@ -2464,6 +2744,9 @@ mod tests {
             input.as_ref(),
             PhysicalPlan::RangeIndexScan { .. }
         ));
+        assert!(
+            filtered_count_eligibility(&range_plan, &[], std::slice::from_ref(&count_id)).is_none()
+        );
         assert!(direct_count_eligibility(input, &[], std::slice::from_ref(&count_id)).is_none());
 
         let candidates =
@@ -4685,6 +4968,318 @@ mod tests {
             }],
         };
         assert!(direct_count_eligibility(&sorted, &[], &[count]).is_none());
+    }
+
+    #[test]
+    fn filtered_count_eligibility_maps_source_order_and_rejects_other_shapes() {
+        let column =
+            |binding_id: u32, table_id: u64, column_id: u32, name: &str, physical| ColumnRef {
+                binding_id: RelationBindingId(binding_id),
+                table_id: TableId(table_id),
+                column_id: ColumnId(column_id),
+                relation_name: format!("t{table_id}"),
+                name: name.into(),
+                data_type: SemanticType::physical(physical),
+                nullable: false,
+            };
+        let id = column(0, 7, 1, "id", PhysicalType::Int64);
+        let note = column(0, 7, 2, "note", PhysicalType::Text);
+        let active = column(0, 7, 3, "active", PhysicalType::Bool);
+        let extra = column(0, 7, 4, "extra", PhysicalType::Int64);
+        let column_expr = |column: ColumnRef| Expr {
+            expr_type: ExprType {
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            },
+            kind: ExprKind::Column(column),
+        };
+        let bool_type = ExprType {
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable: false,
+        };
+        let true_literal = Expr {
+            kind: ExprKind::Literal(ScalarValue::Bool(true)),
+            expr_type: bool_type.clone(),
+        };
+        let predicate = Expr {
+            kind: ExprKind::Binary {
+                operator: BinaryOp::Eq,
+                left: Box::new(column_expr(active.clone())),
+                right: Box::new(true_literal.clone()),
+            },
+            expr_type: bool_type.clone(),
+        };
+        let scan = |columns| PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns,
+        };
+        let filtered = |input, predicate: Expr| PhysicalPlan::Filter {
+            input: Box::new(input),
+            predicate,
+        };
+        let aggregate = |function, input, name: &str| {
+            AggregateOutput::Aggregate(AggregateExpr {
+                function,
+                input,
+                output: DerivedField {
+                    name: name.into(),
+                    data_type: SemanticType::physical(PhysicalType::UInt64),
+                    nullable: false,
+                },
+            })
+        };
+        let count_note = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(note.clone()),
+            "COUNT(note)",
+        );
+        let count_id = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(id.clone()),
+            "COUNT(id)",
+        );
+        let count_all = aggregate(AggregateFunction::Count, AggregateInput::All, "COUNT(*)");
+        let outputs = [
+            count_note.clone(),
+            count_all.clone(),
+            count_note.clone(),
+            count_id.clone(),
+        ];
+        let eligible_input = filtered(
+            scan(vec![id.clone(), note.clone(), active.clone()]),
+            predicate.clone(),
+        );
+        let eligible = filtered_count_eligibility(&eligible_input, &[], &outputs)
+            .expect("filtered mixed COUNT is eligible");
+        assert_eq!(eligible.table_id, TableId(7));
+        assert_eq!(eligible.predicate_columns, [&active]);
+        assert_eq!(eligible.presence_columns, [&id, &note]);
+        assert_eq!(
+            eligible
+                .outputs
+                .iter()
+                .map(|output| output.source)
+                .collect::<Vec<_>>(),
+            [
+                super::DirectCountSource::Column(1),
+                super::DirectCountSource::All,
+                super::DirectCountSource::Column(1),
+                super::DirectCountSource::Column(0),
+            ]
+        );
+        assert_eq!(
+            eligible
+                .star_aggregate
+                .map(|item| item.output.name.as_str()),
+            Some("COUNT(*)")
+        );
+        assert_eq!(
+            eligible
+                .presence_aggregates
+                .iter()
+                .map(|item| item.output.name.as_str())
+                .collect::<Vec<_>>(),
+            ["COUNT(id)", "COUNT(note)"]
+        );
+        let mut star_overflow = FilteredCountSummary {
+            qualified_rows: u128::MAX,
+            non_null_counts: vec![0, 0],
+        };
+        assert!(matches!(
+            update_filtered_count_summary(&eligible, &mut star_overflow, &[false, false]),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Count,
+                output,
+            }) if output == "COUNT(*)"
+        ));
+        let mut column_overflow = FilteredCountSummary {
+            qualified_rows: 0,
+            non_null_counts: vec![u128::MAX, 0],
+        };
+        assert!(matches!(
+            update_filtered_count_summary(&eligible, &mut column_overflow, &[true, false]),
+            Err(ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Count,
+                output,
+            }) if output == "COUNT(id)"
+        ));
+
+        assert!(filtered_count_eligibility(&eligible_input, &[], &[]).is_none());
+        assert!(
+            filtered_count_eligibility(&eligible_input, std::slice::from_ref(&id), &outputs)
+                .is_none()
+        );
+        assert!(
+            filtered_count_eligibility(
+                &eligible_input,
+                &[],
+                &[count_all.clone(), count_all.clone()]
+            )
+            .is_none()
+        );
+        assert!(
+            filtered_count_eligibility(
+                &eligible_input,
+                &[],
+                &[
+                    count_note.clone(),
+                    aggregate(
+                        AggregateFunction::Sum,
+                        AggregateInput::Column(id.clone()),
+                        "SUM(id)"
+                    )
+                ]
+            )
+            .is_none()
+        );
+        assert!(
+            filtered_count_eligibility(
+                &eligible_input,
+                &[],
+                &[AggregateOutput::GroupKey(id.clone())]
+            )
+            .is_none()
+        );
+
+        let unused_scan_column = filtered(
+            scan(vec![
+                id.clone(),
+                note.clone(),
+                active.clone(),
+                extra.clone(),
+            ]),
+            predicate.clone(),
+        );
+        assert!(filtered_count_eligibility(&unused_scan_column, &[], &outputs).is_none());
+        let missing_predicate_column =
+            filtered(scan(vec![id.clone(), note.clone()]), predicate.clone());
+        assert!(filtered_count_eligibility(&missing_predicate_column, &[], &outputs).is_none());
+        let missing_count_column =
+            filtered(scan(vec![id.clone(), active.clone()]), predicate.clone());
+        assert!(filtered_count_eligibility(&missing_count_column, &[], &outputs).is_none());
+
+        let mut mismatched_predicate = predicate.clone();
+        let ExprKind::Binary { left, .. } = &mut mismatched_predicate.kind else {
+            panic!("expected binary predicate");
+        };
+        **left = column_expr(column(1, 7, 3, "active", PhysicalType::Bool));
+        assert!(
+            filtered_count_eligibility(
+                &filtered(
+                    scan(vec![id.clone(), note.clone(), active.clone()]),
+                    mismatched_predicate
+                ),
+                &[],
+                &outputs
+            )
+            .is_none()
+        );
+        let mismatched_count = aggregate(
+            AggregateFunction::Count,
+            AggregateInput::Column(column(0, 8, 2, "note", PhysicalType::Text)),
+            "COUNT(other.note)",
+        );
+        assert!(
+            filtered_count_eligibility(
+                &eligible_input,
+                &[],
+                std::slice::from_ref(&mismatched_count)
+            )
+            .is_none()
+        );
+
+        let nested_filter = filtered(
+            filtered(
+                scan(vec![id.clone(), note.clone(), active.clone()]),
+                predicate.clone(),
+            ),
+            predicate.clone(),
+        );
+        assert!(filtered_count_eligibility(&nested_filter, &[], &outputs).is_none());
+        let sorted = filtered(
+            PhysicalPlan::Sort {
+                input: Box::new(scan(vec![id.clone(), note.clone(), active.clone()])),
+                keys: vec![SortKey {
+                    column: id.clone(),
+                    direction: SortDirection::Asc,
+                    null_order: NullOrder::First,
+                }],
+            },
+            predicate.clone(),
+        );
+        assert!(filtered_count_eligibility(&sorted, &[], &outputs).is_none());
+        let right = column(1, 8, 1, "id", PhysicalType::Int64);
+        let joined = filtered(
+            PhysicalPlan::NestedLoopJoin {
+                left: Box::new(scan(vec![id.clone(), note.clone(), active.clone()])),
+                right: Box::new(PhysicalPlan::SeqScan {
+                    binding_id: RelationBindingId(1),
+                    table_id: TableId(8),
+                    table_name: "t8".into(),
+                    columns: vec![right],
+                }),
+                kind: JoinKind::Inner,
+                predicate: true_literal,
+                columns: vec![id.clone(), note.clone(), active.clone()],
+            },
+            predicate,
+        );
+        assert!(filtered_count_eligibility(&joined, &[], &outputs).is_none());
+    }
+
+    #[test]
+    fn filtered_column_collection_covers_every_expression_shape() {
+        let column = |id: u32, name: &str| ColumnRef {
+            binding_id: RelationBindingId(2),
+            table_id: TableId(9),
+            column_id: ColumnId(id),
+            relation_name: "items".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable: true,
+        };
+        let bool_type = ExprType {
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable: true,
+        };
+        let leaf = |column| Expr {
+            kind: ExprKind::Column(column),
+            expr_type: bool_type.clone(),
+        };
+        let predicate = Expr {
+            kind: ExprKind::Binary {
+                operator: BinaryOp::Or,
+                left: Box::new(Expr {
+                    kind: ExprKind::Unary {
+                        operator: UnaryOp::Not,
+                        expression: Box::new(leaf(column(1, "active"))),
+                    },
+                    expr_type: bool_type.clone(),
+                }),
+                right: Box::new(Expr {
+                    kind: ExprKind::IsNull {
+                        expression: Box::new(leaf(column(2, "flag"))),
+                        negated: false,
+                    },
+                    expr_type: bool_type,
+                }),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: true,
+            },
+        };
+        assert_eq!(
+            collect_filter_columns(&predicate),
+            [
+                (RelationBindingId(2), TableId(9), ColumnId(1)),
+                (RelationBindingId(2), TableId(9), ColumnId(2)),
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
