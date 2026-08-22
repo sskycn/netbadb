@@ -402,7 +402,78 @@ fn run_projection_attribution_scenarios(
             checksum: u128::from(rows) * 2,
         },
         settings,
-        count_pair_observation,
+        |result| count_values_observation(result, &[rows, rows]),
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_duplicate_payload",
+        rows,
+        "SELECT COUNT(payload), COUNT(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 2,
+        },
+        settings,
+        |result| count_values_observation(result, &[rows, rows]),
+        measurements,
+    )?;
+    let nullable_count = low_non_null_count(rows);
+    run_attribution_query(
+        "aggregate_count_mixed_nullable",
+        rows,
+        "SELECT COUNT(id), COUNT(nullable_key), COUNT(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, NULLABLE_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 2 + u128::from(nullable_count),
+        },
+        settings,
+        |result| count_values_observation(result, &[rows, nullable_count, rows]),
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_star_payload",
+        rows,
+        "SELECT COUNT(*), COUNT(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 2,
+        },
+        settings,
+        |result| count_values_observation(result, &[rows, rows]),
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_output_order",
+        rows,
+        "SELECT COUNT(payload), COUNT(*), COUNT(nullable_key), COUNT(payload), COUNT(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, NULLABLE_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 4 + u128::from(nullable_count),
+        },
+        settings,
+        |result| count_values_observation(result, &[rows, rows, nullable_count, rows, rows]),
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_star_pair_control",
+        rows,
+        "SELECT COUNT(*), COUNT(*) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 2,
+        },
+        settings,
+        |result| count_values_observation(result, &[rows, rows]),
         measurements,
     )?;
     run_attribution_query(
@@ -417,6 +488,21 @@ fn run_projection_attribution_scenarios(
         },
         settings,
         count_observation,
+        measurements,
+    )?;
+    let filtered_count = active_count(rows);
+    run_attribution_query(
+        "aggregate_count_pair_filter_control",
+        rows,
+        "SELECT COUNT(id), COUNT(payload) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, ACTIVE_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(filtered_count) * 2,
+        },
+        settings,
+        |result| count_values_observation(result, &[filtered_count, filtered_count]),
         measurements,
     )?;
     let middle = rows / 2;
@@ -1896,19 +1982,34 @@ fn count_observation(result: &QueryResult) -> BenchResult<Observation> {
     })
 }
 
-fn count_pair_observation(result: &QueryResult) -> BenchResult<Observation> {
+fn count_values_observation(result: &QueryResult, expected: &[u64]) -> BenchResult<Observation> {
     let [row] = result.rows.as_slice() else {
-        return Err(message_error("COUNT pair query must return one row"));
+        return Err(message_error("COUNT query must return one row"));
     };
-    let [ScalarValue::UInt64(left), ScalarValue::UInt64(right)] = row.as_slice() else {
-        return Err(message_error(
-            "COUNT pair query must return two UInt64 columns",
-        ));
-    };
-    Ok(Observation {
-        rows: 1,
-        checksum: u128::from(*left) + u128::from(*right),
-    })
+    if row.len() != expected.len() {
+        return Err(message_error(format!(
+            "COUNT query returned {} columns; expected {}",
+            row.len(),
+            expected.len()
+        )));
+    }
+    let mut checksum = 0_u128;
+    for (index, (value, expected)) in row.iter().zip(expected).enumerate() {
+        let ScalarValue::UInt64(value) = value else {
+            return Err(message_error(format!(
+                "COUNT output {index} must be UInt64"
+            )));
+        };
+        if value != expected {
+            return Err(message_error(format!(
+                "COUNT output {index} was {value}; expected {expected}"
+            )));
+        }
+        checksum = checksum
+            .checked_add(u128::from(*value))
+            .ok_or_else(|| message_error("COUNT checksum overflow"))?;
+    }
+    Ok(Observation { rows: 1, checksum })
 }
 
 const fn low_non_null_count(rows: u64) -> u64 {
