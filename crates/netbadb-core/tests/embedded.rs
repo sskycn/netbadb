@@ -686,6 +686,16 @@ fn filtered_counts_preserve_null_truth_overlap_output_order_and_all_star_fallbac
     );
     assert_eq!(
         database
+            .query(
+                "SELECT COUNT(note) FROM items \
+                 WHERE note >= 'a' AND note <= 'a'",
+            )
+            .expect("count repeated overlapping Text predicate source")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    assert_eq!(
+        database
             .query("SELECT COUNT(*), COUNT(*) FROM items WHERE active = true")
             .expect("execute all-star generic fallback")
             .rows,

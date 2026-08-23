@@ -1059,7 +1059,9 @@ fn try_execute_filtered_counts(
         &predicate_column_ids,
         &presence_column_ids,
         |values, presence| {
-            if evaluate_truth(plan.predicate, values, &predicate_fields)? == TruthValue::True {
+            if evaluate_dynamic_borrowed_truth(plan.predicate, values, &predicate_fields)?
+                == TruthValue::True
+            {
                 update_filtered_count_summary(&plan, &mut summary, presence)?;
             }
             Ok(())
@@ -2149,6 +2151,70 @@ fn evaluate_bound_truth<'a>(
     TruthValue::from_scalar_ref(value.as_ref())
 }
 
+fn evaluate_dynamic_borrowed_values<'a>(
+    expression: &'a Expr,
+    values: EvaluationValues<'a>,
+    fields: &[OutputField],
+) -> Result<EvaluatedScalar<'a>, ExecutionError> {
+    match &expression.kind {
+        ExprKind::Column(column) => {
+            let position = find_source_position(fields, column)?;
+            values
+                .get(position)
+                .map(EvaluatedScalar::Borrowed)
+                .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
+        }
+        ExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(value)),
+        ExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = evaluate_dynamic_borrowed_values(left, values, fields)?;
+            let right = evaluate_dynamic_borrowed_values(right, values, fields)?;
+            evaluate_binary_refs(*operator, left.as_ref(), right.as_ref())
+                .map(EvaluatedScalar::Owned)
+        }
+        ExprKind::Unary {
+            operator: UnaryOp::Not,
+            expression,
+        } => Ok(EvaluatedScalar::Owned(
+            evaluate_dynamic_borrowed_truth_values(expression, values, fields)?
+                .not()
+                .into_scalar(),
+        )),
+        ExprKind::IsNull {
+            expression,
+            negated,
+        } => {
+            let value = evaluate_dynamic_borrowed_values(expression, values, fields)?;
+            let is_null = matches!(value.as_ref(), ScalarValue::Null);
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(if *negated {
+                !is_null
+            } else {
+                is_null
+            })))
+        }
+    }
+}
+
+fn evaluate_dynamic_borrowed_truth_values<'a>(
+    expression: &'a Expr,
+    values: EvaluationValues<'a>,
+    fields: &[OutputField],
+) -> Result<TruthValue, ExecutionError> {
+    let value = evaluate_dynamic_borrowed_values(expression, values, fields)?;
+    TruthValue::from_scalar_ref(value.as_ref())
+}
+
+fn evaluate_dynamic_borrowed_truth<'a>(
+    expression: &'a Expr,
+    row: &'a [ScalarValue],
+    fields: &[OutputField],
+) -> Result<TruthValue, ExecutionError> {
+    evaluate_dynamic_borrowed_truth_values(expression, EvaluationValues::Contiguous(row), fields)
+}
+
 fn evaluate_values(
     expression: &Expr,
     values: EvaluationValues<'_>,
@@ -2335,12 +2401,12 @@ mod tests {
         ProjectionPlan, QueryResult, TruthValue, bind_expression, choose_inequality_strategy,
         collect_filter_columns, count_to_sql_u64, direct_count_eligibility, evaluate,
         evaluate_binary, evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
-        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
-        execute_with_storages, filtered_count_eligibility, find_required_inequality,
-        inequality_can_match, materialize_direct_count_values, potential_left_indices,
-        project_execution_row, required_right_extreme, sorted_non_null_indices,
-        update_filtered_count_summary,
+        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_with_storages,
+        filtered_count_eligibility, find_required_inequality, inequality_can_match,
+        materialize_direct_count_values, potential_left_indices, project_execution_row,
+        required_right_extreme, sorted_non_null_indices, update_filtered_count_summary,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -3848,6 +3914,19 @@ mod tests {
             binary(
                 BinaryOp::And,
                 binary(
+                    BinaryOp::GtEq,
+                    column_expr(&left_columns[3]),
+                    literal(ScalarValue::Text("shared".into()), PhysicalType::Text),
+                ),
+                binary(
+                    BinaryOp::LtEq,
+                    column_expr(&left_columns[3]),
+                    literal(ScalarValue::Text("shared".into()), PhysicalType::Text),
+                ),
+            ),
+            binary(
+                BinaryOp::And,
+                binary(
                     BinaryOp::Lt,
                     column_expr(&left_columns[1]),
                     column_expr(&right_columns[1]),
@@ -3872,6 +3951,9 @@ mod tests {
             );
             let dynamic =
                 evaluate_values(&expression, joined, &fields).expect("dynamic evaluation");
+            let dynamic_borrowed = evaluate_dynamic_borrowed_values(&expression, joined, &fields)
+                .expect("borrowed dynamic evaluation");
+            assert_eq!(&dynamic, dynamic_borrowed.as_ref());
             let evaluated = evaluate_bound_values(&bound, joined).expect("bound evaluation");
             assert_eq!(&dynamic, evaluated.as_ref());
             assert_eq!(
@@ -3881,6 +3963,11 @@ mod tests {
             assert_eq!(
                 evaluate_truth_values(&expression, joined, &fields).expect("dynamic truth"),
                 evaluate_bound_truth(&bound, joined).expect("bound truth")
+            );
+            assert_eq!(
+                evaluate_truth_values(&expression, joined, &fields).expect("dynamic truth"),
+                evaluate_dynamic_borrowed_truth_values(&expression, joined, &fields)
+                    .expect("borrowed dynamic truth")
             );
         }
 
@@ -3902,6 +3989,17 @@ mod tests {
             bind_expression(&column_expr(&missing), &fields),
             Err(ExecutionError::MissingColumn(name)) if name == "missing"
         ));
+        assert!(matches!(
+            evaluate_dynamic_borrowed_values(
+                &column_expr(&missing),
+                EvaluationValues::Joined {
+                    left: &left,
+                    right: &right,
+                },
+                &fields
+            ),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
 
         let bound_right_signed =
             bind_expression(&right_signed, &fields).expect("bind right signed column");
@@ -3912,6 +4010,245 @@ mod tests {
             ),
             Err(ExecutionError::MissingColumn(name)) if name == "signed"
         ));
+        assert!(matches!(
+            evaluate_dynamic_borrowed_values(
+                &right_signed,
+                EvaluationValues::Contiguous(&left[..1]),
+                &fields
+            ),
+            Err(ExecutionError::MissingColumn(name)) if name == "signed"
+        ));
+    }
+
+    #[test]
+    fn dynamic_borrowed_leaf_values_preserve_identity_and_computed_values_are_owned() {
+        let column = |binding_id: u32, name: &str, physical: PhysicalType| ColumnRef {
+            binding_id: RelationBindingId(binding_id),
+            table_id: TableId(7),
+            column_id: ColumnId(1),
+            relation_name: format!("side_{binding_id}"),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable: false,
+        };
+        let left = column(1, "left_number", PhysicalType::Int64);
+        let right = column(2, "right_text", PhysicalType::Text);
+        let fields = vec![
+            OutputField::Source(left.clone()),
+            OutputField::Source(right.clone()),
+        ];
+        let values = vec![ScalarValue::Int64(7), ScalarValue::Text("row-text".into())];
+        let expression = |column: ColumnRef| Expr {
+            expr_type: ExprType {
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            },
+            kind: ExprKind::Column(column),
+        };
+
+        for (column, position) in [(left.clone(), 0), (right.clone(), 1)] {
+            let expression = expression(column);
+            match evaluate_dynamic_borrowed_values(
+                &expression,
+                EvaluationValues::Contiguous(&values),
+                &fields,
+            )
+            .expect("evaluate borrowed column")
+            {
+                EvaluatedScalar::Borrowed(value) => {
+                    assert!(std::ptr::eq(value, &values[position]));
+                    if position == 1 {
+                        assert_eq!(text_pointer(value), text_pointer(&values[position]));
+                    }
+                }
+                EvaluatedScalar::Owned(_) => panic!("dynamic column must remain borrowed"),
+            }
+        }
+
+        let literal = Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Text),
+                nullable: false,
+            },
+            kind: ExprKind::Literal(ScalarValue::Text("literal-text".into())),
+        };
+        let literal_pointer = match &literal.kind {
+            ExprKind::Literal(value) => text_pointer(value),
+            _ => panic!("expected literal"),
+        };
+        match evaluate_dynamic_borrowed_values(
+            &literal,
+            EvaluationValues::Contiguous(&values),
+            &fields,
+        )
+        .expect("evaluate borrowed literal")
+        {
+            EvaluatedScalar::Borrowed(value) => assert_eq!(text_pointer(value), literal_pointer),
+            EvaluatedScalar::Owned(_) => panic!("dynamic literal must remain borrowed"),
+        }
+
+        let comparison = Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+            kind: ExprKind::Binary {
+                operator: BinaryOp::Eq,
+                left: Box::new(expression(right)),
+                right: Box::new(literal),
+            },
+        };
+        assert!(matches!(
+            evaluate_dynamic_borrowed_values(
+                &comparison,
+                EvaluationValues::Contiguous(&values),
+                &fields
+            ),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(false)))
+        ));
+
+        let null_literal = || Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Int64),
+                nullable: true,
+            },
+            kind: ExprKind::Literal(ScalarValue::Null),
+        };
+        let null_comparison = Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: true,
+            },
+            kind: ExprKind::Binary {
+                operator: BinaryOp::Eq,
+                left: Box::new(expression(left)),
+                right: Box::new(null_literal()),
+            },
+        };
+        assert!(matches!(
+            evaluate_dynamic_borrowed_values(
+                &null_comparison,
+                EvaluationValues::Contiguous(&values),
+                &fields
+            ),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Null))
+        ));
+
+        let is_null = Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+            kind: ExprKind::IsNull {
+                expression: Box::new(null_literal()),
+                negated: false,
+            },
+        };
+        assert!(matches!(
+            evaluate_dynamic_borrowed_values(
+                &is_null,
+                EvaluationValues::Contiguous(&values),
+                &fields
+            ),
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(true)))
+        ));
+
+        for value in [ScalarValue::Bool(true), ScalarValue::Null] {
+            let expected = match &value {
+                ScalarValue::Bool(true) => ScalarValue::Bool(false),
+                ScalarValue::Null => ScalarValue::Null,
+                _ => unreachable!("test input is Bool or NULL"),
+            };
+            let not = Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+                kind: ExprKind::Unary {
+                    operator: UnaryOp::Not,
+                    expression: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: matches!(value, ScalarValue::Null),
+                        },
+                        kind: ExprKind::Literal(value),
+                    }),
+                },
+            };
+            assert!(matches!(
+                evaluate_dynamic_borrowed_values(
+                    &not,
+                    EvaluationValues::Contiguous(&values),
+                    &fields
+                ),
+                Ok(EvaluatedScalar::Owned(value)) if value == expected
+            ));
+        }
+
+        for operator in [BinaryOp::And, BinaryOp::Or] {
+            let left_value = ScalarValue::Bool(matches!(operator, BinaryOp::And));
+            let boolean_with_null = Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: false,
+                        },
+                        kind: ExprKind::Literal(left_value),
+                    }),
+                    right: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: true,
+                        },
+                        kind: ExprKind::Literal(ScalarValue::Null),
+                    }),
+                },
+            };
+            assert!(matches!(
+                evaluate_dynamic_borrowed_values(
+                    &boolean_with_null,
+                    EvaluationValues::Contiguous(&values),
+                    &fields
+                ),
+                Ok(EvaluatedScalar::Owned(ScalarValue::Null))
+            ));
+        }
+
+        let missing = column(3, "missing", PhysicalType::Bool);
+        for operator in [BinaryOp::And, BinaryOp::Or] {
+            let left_value = matches!(operator, BinaryOp::Or);
+            let expression = Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: false,
+                        },
+                        kind: ExprKind::Literal(ScalarValue::Bool(left_value)),
+                    }),
+                    right: Box::new(expression(missing.clone())),
+                },
+            };
+            assert!(matches!(
+                evaluate_dynamic_borrowed_values(
+                    &expression,
+                    EvaluationValues::Contiguous(&values),
+                    &fields
+                ),
+                Err(ExecutionError::MissingColumn(name)) if name == "missing"
+            ));
+        }
     }
 
     #[test]

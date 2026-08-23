@@ -542,7 +542,7 @@ direct Filter → SeqScan eligible?
                  ↓
         one validated Heap visitor scan
                  ↓
-       existing dynamic predicate evaluation
+       dynamic borrowed leaf evaluation
                  ↓
         TRUE updates checked counts
                  ↓
@@ -553,10 +553,37 @@ The Heap visitor knows only ColumnIds, owned `ScalarValue` requests, and
 presence requests; storage never receives relational `Expr` or SQL truth
 semantics. It invokes the callback only after full row-codec validation.
 Executor still applies three-valued logic, so only TRUE qualifies and FALSE or
-UNKNOWN is discarded. Count-only Text never becomes an owned String, but Text
-used by the predicate remains owned because the current dynamic Filter
-evaluator is deliberately unchanged. Grouped, mixed-function, all-star-only,
-nested, join, sort, and index-backed shapes retain the generic aggregate path.
+UNKNOWN is discarded. Count-only Text never becomes an owned String. Text used
+by the predicate still becomes one owned String at the Heap visitor value
+boundary.
+
+Phase 7O changes only the private evaluator called by that filtered-count
+consumer. It retains dynamic `find_source_position` lookup, then returns the
+existing `EvaluatedScalar::Borrowed` for Column and Literal leaves. Binary
+nodes reuse the reference-based comparison/truth core and produce an owned
+Bool or NULL; Unary and IsNull results are also owned. AND/OR still evaluate
+both sides. The generic PhysicalPlan Filter, UPDATE expressions, and the
+prebound Join evaluator remain unchanged, so this is neither Filter prebinding
+nor a zero-copy persisted-Text path:
+
+```text
+validated Heap visitor
+        ↓
+owned predicate ScalarValue scratch
+        ↓
+dynamic source-position lookup
+        ↓
+borrow Column/Literal leaves
+        ↓
+reference binary/truth semantics
+        ↓
+owned computed Bool/NULL
+        ↓
+filtered COUNT summary
+```
+
+Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
+shapes retain the generic aggregate path.
 
 `ScalarValue` equality and hashing are used only for current-process group
 lookup. NULL equals NULL for grouping, so all NULLs at the same key position

@@ -594,9 +594,39 @@ fn run_projection_attribution_scenarios(
     )?;
     let middle = rows / 2;
     run_attribution_query(
+        "aggregate_count_payload_id_filter",
+        rows,
+        &format!("SELECT COUNT(payload) FROM items WHERE id = {middle}"),
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: 1,
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
         "aggregate_count_payload_text_filter",
         rows,
         &format!("SELECT COUNT(payload) FROM items WHERE payload = 'payload-{middle:016}'"),
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: 1,
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_payload_text_repeated_filter",
+        rows,
+        &format!(
+            "SELECT COUNT(payload) FROM items WHERE payload >= 'payload-{middle:016}' AND payload <= 'payload-{middle:016}'"
+        ),
         &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
         &[PAYLOAD_COLUMN_ID],
         Observation {

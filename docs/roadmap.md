@@ -756,20 +756,43 @@ reporting.
   payload/filtered ID from 1.292x to 0.992x. The Text-predicate control remains
   1.868x the Bool-predicate target because predicate Text still owns.
 
-### Phase 7O — Borrowed Text Filter evaluation (selected, not started)
+### Phase 7O — Borrowed dynamic Filter predicate evaluation (complete)
 
-Post-7N data isolates the remaining owned Text predicate cost: filtered
-COUNT(payload) with a Text equality predicate is 1.344 ms versus 0.719 ms with
-the Bool predicate, while count-only Text no longer differs from filtered ID.
-The first Phase 7O investigation should retain dynamic column lookup and
-attribute only borrowed Text predicate scalar evaluation. It must not be
-implemented as part of Phase 7N.
+- only the Phase 7N filtered-count callback uses the new private evaluator;
+  generic Filter, UPDATE, and the Phase 7G prebound Join evaluator are
+  unchanged;
+- existing `EvaluatedScalar` is reused: dynamic Column and Literal leaves
+  borrow, while Binary, Unary, and IsNull computed results remain owned;
+- `find_source_position` remains dynamic and binding-aware, binary semantics
+  remain centralized in `evaluate_binary_refs`, and AND/OR still evaluate both
+  sides;
+- storage still owns one String for predicate Text at the visitor value
+  boundary; there is no Filter prebinding, borrowed persisted Text, or
+  storage-to-executor zero-copy;
+- semantic equivalence covers every ExprKind, BinaryOp, Bool/Int64/UInt64/Text/
+  NULL, three-valued truth, repeated leaves, missing/short rows, and relation
+  binding identity; pointer tests prove Text Column/Literal leaf borrowing;
+- isolated serial full x3 reduced median-of-three single Text equality from
+  1.462 to 1.037 ms and repeated Text from 2.013 to 1.163 ms, while Int64
+  equality remained 0.767/0.766 ms and generic hidden Text Filter remained
+  observational at 1.610/1.650 ms;
+- Text/Int contracted from 1.906x to 1.353x, repeated/single Text from 1.377x
+  to 1.122x, and Text/Bool from 1.889x to 1.305x, with no timing threshold.
 
-Filter predicate prebinding, direct COUNT(*) live-row specialization, MIN/MAX
-ownership, group-key ownership, AND/OR short-circuiting, BufferPool page
-snapshot cloning, covering/index-only reads, broader HashJoin eligibility,
-multi-inequality intersection, and sequential PageManager traversal remain
-separate candidates.
+### Phase 7P — Storage-to-executor borrowed predicate values (selected, not started)
+
+Post-7O Text equality remains 1.353x its equivalent Int64 case, while repeated
+leaf scaling contracted to 1.122x and the generic Filter control did not
+improve. The first Phase 7P investigation should therefore isolate borrowing
+predicate Text across the Heap visitor callback boundary without weakening
+complete persisted-row validation or spreading page-backed lifetimes. It must
+not be implemented as part of Phase 7O.
+
+Filter position prebinding, generic borrowed Filter rollout, AND/OR
+short-circuiting, direct COUNT(*) live-row specialization, MIN/MAX ownership,
+group-key ownership, BufferPool page snapshot cloning, covering/index-only
+reads, broader HashJoin eligibility, multi-inequality intersection, and
+sequential PageManager traversal remain separate candidates.
 
 ### Later Phase 7 work
 

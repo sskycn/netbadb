@@ -16,7 +16,9 @@ materialization from one measured direct global COUNT(column) shape while
 retaining complete current-Heap validation. Phase 7M shares one presence scan
 across direct multi-COUNT outputs. Phase 7N streams Filter-qualified COUNT
 consumption without owning count-only scalars or materializing intermediate
-rows. The target uses
+rows. Phase 7O then removes dynamic evaluator leaf clones only inside that
+filtered-count consumer, while deliberately retaining the storage-owned
+predicate value and dynamic column lookup. The target uses
 `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
 optimized bench profile.
 
@@ -671,6 +673,60 @@ BufferPool page snapshot cloning, covering/index-only reads, broader HashJoin
 eligibility, multi-inequality intersection, and sequential PageManager
 traversal remain separate candidates. There is no timing threshold.
 
+Phase 7O first added two attribution cases without changing production: an
+Int64 equality with the same one-column/one-literal/one-match shape as the Text
+equality, and a repeated Text range that evaluates the same Column and literal
+shape twice through AND. The existing Bool equality and generic
+`hidden_filter_payload` controls remain unchanged.
+
+The new executor-private dynamic borrowed evaluator reuses Phase 7G's
+`EvaluatedScalar`; it does not introduce another scalar-reference domain.
+Column leaves still call `find_source_position` on every evaluation but borrow
+the selected row value. Literal leaves borrow the value stored in `Expr`.
+Binary nodes evaluate both children and call `evaluate_binary_refs`, while
+Unary NOT, IsNull, and binary results own only their computed Bool or NULL.
+AND/OR deliberately retain full two-sided evaluation. The original
+`evaluate_values`, `evaluate_truth_values`, `evaluate`, and `evaluate_truth`
+remain authoritative for generic Filter, UPDATE, and other dynamic callers;
+the prebound Join evaluator is unchanged.
+
+Only the Phase 7N visitor callback calls this evaluator. The Heap visitor still
+decodes predicate Text into one owned `ScalarValue::Text(String)` before the
+callback, so Phase 7O is not borrowed persisted Text, storage-to-executor
+zero-copy, Filter prebinding, or a generic Filter rollout. It removes the
+subsequent dynamic Column clone, Literal clone, and repeated leaf clones.
+
+Three strictly serial full pre/post runs used separate
+`/private/tmp/netbadb-phase7o-pre-target` and
+`/private/tmp/netbadb-phase7o-post-target` build directories. Median-of-three
+medians in milliseconds were:
+
+| scenario | pre | post | change |
+| --- | ---: | ---: | ---: |
+| filtered Bool equality COUNT(payload) | 0.774 | 0.795 | observational |
+| filtered Int64 equality COUNT(payload) | 0.767 | 0.766 | -0.1% |
+| filtered Text equality COUNT(payload) | 1.462 | 1.037 | -29.1% |
+| filtered repeated Text COUNT(payload) | 2.013 | 1.163 | -42.2% |
+| generic hidden Text Filter | 1.610 | 1.650 | observational |
+| direct COUNT(payload) | 0.602 | 0.589 | observational |
+
+The Text/Int ratio contracted from 1.906x to 1.353x, repeated/single Text from
+1.377x to 1.122x, and Text/Bool from 1.889x to 1.305x. The generic Filter
+control changed by +2.5%, while filtered ID and the direct ID/nullable/payload/
+pair controls remained observational at 0.770 and 0.589/0.585/0.589/0.616 ms.
+The Phase 7N Bool-filtered ID/payload/pair controls changed from
+0.773/0.774/0.767 to 0.770/0.795/0.805 ms, also observational.
+The third post run showed broad machine-wide slowdowns, so the documented
+median-of-three remains the comparison basis; there is no timing threshold.
+
+Removing leaf clones therefore explains a substantial portion of the Text
+predicate cost and repeated-leaf scaling, without changing generic Filter.
+Text equality remains 1.353x the equivalent Int64 case, while repeated leaves
+add only 1.122x including the extra comparison and AND. This evidence selects
+storage-to-executor borrowed predicate values as the first Phase 7P
+investigation. Dynamic Filter position prebinding and generic borrowed Filter
+rollout remain separate candidates. Phase 7P is not implemented here.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -679,9 +735,9 @@ and has no pass/fail timing threshold.
 
 Phase 7B changed the Inspection JSON contract from v1 to v2 for
 RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
-represent HashJoin. Phases 7E through 7N introduce no plan or inspection
+represent HashJoin. Phases 7E through 7O introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
-format. Phase 7N specifically leaves Canonical Schema v1, Heap metadata v3,
+format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
-encoding unchanged. It adds no dependency and no unsafe code.
+encoding unchanged. They add no dependency and no unsafe code.

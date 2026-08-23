@@ -656,8 +656,11 @@ The implementation sequence is intentionally vertical:
     validated Heap visitor traversal owns only predicate values, reports
     COUNT-column presence, retains dynamic three-valued Filter evaluation, and
     materializes no intermediate ExecutionRows.
-43. Borrowed Text Filter evaluation (Phase 7O) — selected from the post-7N Text
-    predicate control, not started.
+43. Borrowed dynamic Filter predicate evaluation (Phase 7O) — complete for the
+    Phase 7N consumer path; dynamic Column/Literal leaves borrow already-owned
+    ScalarValues while computed results remain owned.
+44. Storage-to-executor borrowed predicate values (Phase 7P) — selected from
+    the remaining post-7O Text/Int gap, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.
