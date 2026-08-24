@@ -490,6 +490,34 @@ fn run_projection_attribution_scenarios(
         count_observation,
         measurements,
     )?;
+    run_attribution_query(
+        "aggregate_count_payload_text_is_not_null_filter",
+        rows,
+        "SELECT COUNT(payload) FROM items WHERE payload IS NOT NULL",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_payload_id_is_not_null_filter",
+        rows,
+        "SELECT COUNT(payload) FROM items WHERE id IS NOT NULL",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows),
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
     let filtered_count = active_count(rows);
     run_attribution_query(
         "aggregate_count_id_filter",

@@ -11,7 +11,7 @@ use netbadb_rel::{
     ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_storage::{HeapStorage, PresenceCountSummary, StorageError, Transaction};
-use netbadb_types::{ColumnId, RelationBindingId, RowId, ScalarValue, TableId};
+use netbadb_types::{ColumnId, RelationBindingId, RowId, ScalarRef, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
@@ -1055,18 +1055,19 @@ fn try_execute_filtered_counts(
         qualified_rows: 0,
         non_null_counts: vec![0; plan.presence_columns.len()],
     };
-    storage_for_table(storages, plan.table_id)?.visit_columns_with_presence::<ExecutionError, _>(
-        &predicate_column_ids,
-        &presence_column_ids,
-        |values, presence| {
-            if evaluate_dynamic_borrowed_truth(plan.predicate, values, &predicate_fields)?
-                == TruthValue::True
-            {
-                update_filtered_count_summary(&plan, &mut summary, presence)?;
-            }
-            Ok(())
-        },
-    )?;
+    storage_for_table(storages, plan.table_id)?
+        .visit_scalar_refs_with_presence::<ExecutionError, _>(
+            &predicate_column_ids,
+            &presence_column_ids,
+            |values, presence| {
+                if evaluate_dynamic_scalar_ref_truth(plan.predicate, values, &predicate_fields)?
+                    == TruthValue::True
+                {
+                    update_filtered_count_summary(&plan, &mut summary, presence)?;
+                }
+                Ok(())
+            },
+        )?;
     let values = materialize_count_values(
         &plan.outputs,
         summary.qualified_rows,
@@ -2087,15 +2088,15 @@ impl<'a> EvaluationValues<'a> {
 }
 
 enum EvaluatedScalar<'a> {
-    Borrowed(&'a ScalarValue),
+    Borrowed(ScalarRef<'a>),
     Owned(ScalarValue),
 }
 
 impl EvaluatedScalar<'_> {
-    fn as_ref(&self) -> &ScalarValue {
+    fn as_scalar_ref(&self) -> ScalarRef<'_> {
         match self {
-            Self::Borrowed(value) => value,
-            Self::Owned(value) => value,
+            Self::Borrowed(value) => *value,
+            Self::Owned(value) => ScalarRef::from(value),
         }
     }
 }
@@ -2107,9 +2108,10 @@ fn evaluate_bound_values<'a>(
     match &expression.kind {
         BoundExprKind::Column { position, name } => values
             .get(*position)
+            .map(ScalarRef::from)
             .map(EvaluatedScalar::Borrowed)
             .ok_or_else(|| ExecutionError::MissingColumn((*name).to_owned())),
-        BoundExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(value)),
+        BoundExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(*value))),
         BoundExprKind::Binary {
             operator,
             left,
@@ -2117,7 +2119,7 @@ fn evaluate_bound_values<'a>(
         } => {
             let left = evaluate_bound_values(left, values)?;
             let right = evaluate_bound_values(right, values)?;
-            evaluate_binary_refs(*operator, left.as_ref(), right.as_ref())
+            evaluate_binary_scalar_refs(*operator, left.as_scalar_ref(), right.as_scalar_ref())
                 .map(EvaluatedScalar::Owned)
         }
         BoundExprKind::Unary {
@@ -2133,7 +2135,7 @@ fn evaluate_bound_values<'a>(
             negated,
         } => {
             let value = evaluate_bound_values(expression, values)?;
-            let is_null = matches!(value.as_ref(), ScalarValue::Null);
+            let is_null = value.as_scalar_ref().is_null();
             Ok(EvaluatedScalar::Owned(ScalarValue::Bool(if *negated {
                 !is_null
             } else {
@@ -2148,47 +2150,51 @@ fn evaluate_bound_truth<'a>(
     values: EvaluationValues<'a>,
 ) -> Result<TruthValue, ExecutionError> {
     let value = evaluate_bound_values(expression, values)?;
-    TruthValue::from_scalar_ref(value.as_ref())
+    TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
-fn evaluate_dynamic_borrowed_values<'a>(
+fn evaluate_dynamic_with<'a, G>(
     expression: &'a Expr,
-    values: EvaluationValues<'a>,
     fields: &[OutputField],
-) -> Result<EvaluatedScalar<'a>, ExecutionError> {
+    value_at: &G,
+) -> Result<EvaluatedScalar<'a>, ExecutionError>
+where
+    G: Fn(usize) -> Option<ScalarRef<'a>>,
+{
     match &expression.kind {
         ExprKind::Column(column) => {
             let position = find_source_position(fields, column)?;
-            values
-                .get(position)
+            value_at(position)
                 .map(EvaluatedScalar::Borrowed)
                 .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
         }
-        ExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(value)),
+        ExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(value))),
         ExprKind::Binary {
             operator,
             left,
             right,
         } => {
-            let left = evaluate_dynamic_borrowed_values(left, values, fields)?;
-            let right = evaluate_dynamic_borrowed_values(right, values, fields)?;
-            evaluate_binary_refs(*operator, left.as_ref(), right.as_ref())
+            let left = evaluate_dynamic_with(left, fields, value_at)?;
+            let right = evaluate_dynamic_with(right, fields, value_at)?;
+            evaluate_binary_scalar_refs(*operator, left.as_scalar_ref(), right.as_scalar_ref())
                 .map(EvaluatedScalar::Owned)
         }
         ExprKind::Unary {
             operator: UnaryOp::Not,
             expression,
         } => Ok(EvaluatedScalar::Owned(
-            evaluate_dynamic_borrowed_truth_values(expression, values, fields)?
-                .not()
-                .into_scalar(),
+            TruthValue::from_scalar_view(
+                evaluate_dynamic_with(expression, fields, value_at)?.as_scalar_ref(),
+            )?
+            .not()
+            .into_scalar(),
         )),
         ExprKind::IsNull {
             expression,
             negated,
         } => {
-            let value = evaluate_dynamic_borrowed_values(expression, values, fields)?;
-            let is_null = matches!(value.as_ref(), ScalarValue::Null);
+            let value = evaluate_dynamic_with(expression, fields, value_at)?;
+            let is_null = value.as_scalar_ref().is_null();
             Ok(EvaluatedScalar::Owned(ScalarValue::Bool(if *negated {
                 !is_null
             } else {
@@ -2198,21 +2204,36 @@ fn evaluate_dynamic_borrowed_values<'a>(
     }
 }
 
+#[cfg(test)]
+fn evaluate_dynamic_borrowed_values<'a>(
+    expression: &'a Expr,
+    values: EvaluationValues<'a>,
+    fields: &[OutputField],
+) -> Result<EvaluatedScalar<'a>, ExecutionError> {
+    evaluate_dynamic_with(expression, fields, &|position| {
+        values.get(position).map(ScalarRef::from)
+    })
+}
+
+#[cfg(test)]
 fn evaluate_dynamic_borrowed_truth_values<'a>(
     expression: &'a Expr,
     values: EvaluationValues<'a>,
     fields: &[OutputField],
 ) -> Result<TruthValue, ExecutionError> {
     let value = evaluate_dynamic_borrowed_values(expression, values, fields)?;
-    TruthValue::from_scalar_ref(value.as_ref())
+    TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
-fn evaluate_dynamic_borrowed_truth<'a>(
+fn evaluate_dynamic_scalar_ref_truth<'a>(
     expression: &'a Expr,
-    row: &'a [ScalarValue],
+    values: &[ScalarRef<'a>],
     fields: &[OutputField],
 ) -> Result<TruthValue, ExecutionError> {
-    evaluate_dynamic_borrowed_truth_values(expression, EvaluationValues::Contiguous(row), fields)
+    let value = evaluate_dynamic_with(expression, fields, &|position| {
+        values.get(position).copied()
+    })?;
+    TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
 fn evaluate_values(
@@ -2290,14 +2311,19 @@ enum TruthValue {
 
 impl TruthValue {
     fn from_scalar(value: ScalarValue) -> Result<Self, ExecutionError> {
-        Self::from_scalar_ref(&value)
+        Self::from_scalar_view(ScalarRef::from(&value))
     }
 
+    #[cfg(test)]
     fn from_scalar_ref(value: &ScalarValue) -> Result<Self, ExecutionError> {
+        Self::from_scalar_view(ScalarRef::from(value))
+    }
+
+    fn from_scalar_view(value: ScalarRef<'_>) -> Result<Self, ExecutionError> {
         match value {
-            ScalarValue::Bool(true) => Ok(Self::True),
-            ScalarValue::Bool(false) => Ok(Self::False),
-            ScalarValue::Null => Ok(Self::Unknown),
+            ScalarRef::Bool(true) => Ok(Self::True),
+            ScalarRef::Bool(false) => Ok(Self::False),
+            ScalarRef::Null => Ok(Self::Unknown),
             _ => Err(ExecutionError::ExpectedBoolean),
         }
     }
@@ -2348,10 +2374,18 @@ fn evaluate_binary_refs(
     left: &ScalarValue,
     right: &ScalarValue,
 ) -> Result<ScalarValue, ExecutionError> {
+    evaluate_binary_scalar_refs(operator, ScalarRef::from(left), ScalarRef::from(right))
+}
+
+fn evaluate_binary_scalar_refs(
+    operator: BinaryOp,
+    left: ScalarRef<'_>,
+    right: ScalarRef<'_>,
+) -> Result<ScalarValue, ExecutionError> {
     match operator {
         BinaryOp::And | BinaryOp::Or => {
-            let left = TruthValue::from_scalar_ref(left)?;
-            let right = TruthValue::from_scalar_ref(right)?;
+            let left = TruthValue::from_scalar_view(left)?;
+            let right = TruthValue::from_scalar_view(right)?;
             let value = if operator == BinaryOp::And {
                 left.and(right)
             } else {
@@ -2365,10 +2399,10 @@ fn evaluate_binary_refs(
         | BinaryOp::LtEq
         | BinaryOp::Gt
         | BinaryOp::GtEq => {
-            if matches!(left, ScalarValue::Null) || matches!(right, ScalarValue::Null) {
+            if left.is_null() || right.is_null() {
                 return Ok(ScalarValue::Null);
             }
-            let ordering = compare_values(left, right)?;
+            let ordering = compare_scalar_refs(left, right)?;
             let result = match operator {
                 BinaryOp::Eq => ordering == Ordering::Equal,
                 BinaryOp::NotEq => ordering != Ordering::Equal,
@@ -2384,11 +2418,18 @@ fn evaluate_binary_refs(
 }
 
 fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, ExecutionError> {
+    compare_scalar_refs(ScalarRef::from(left), ScalarRef::from(right))
+}
+
+fn compare_scalar_refs(
+    left: ScalarRef<'_>,
+    right: ScalarRef<'_>,
+) -> Result<Ordering, ExecutionError> {
     match (left, right) {
-        (ScalarValue::Bool(left), ScalarValue::Bool(right)) => Ok(left.cmp(right)),
-        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => Ok(left.cmp(right)),
-        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => Ok(left.cmp(right)),
-        (ScalarValue::Text(left), ScalarValue::Text(right)) => Ok(left.cmp(right)),
+        (ScalarRef::Bool(left), ScalarRef::Bool(right)) => Ok(left.cmp(&right)),
+        (ScalarRef::Int64(left), ScalarRef::Int64(right)) => Ok(left.cmp(&right)),
+        (ScalarRef::UInt64(left), ScalarRef::UInt64(right)) => Ok(left.cmp(&right)),
+        (ScalarRef::Text(left), ScalarRef::Text(right)) => Ok(left.cmp(right)),
         _ => Err(ExecutionError::TypeMismatch),
     }
 }
@@ -2400,13 +2441,15 @@ mod tests {
         ExecutionError, ExecutionRow, FilteredCountSummary, InequalityExecutionStrategy,
         ProjectionPlan, QueryResult, TruthValue, bind_expression, choose_inequality_strategy,
         collect_filter_columns, count_to_sql_u64, direct_count_eligibility, evaluate,
-        evaluate_binary, evaluate_binary_refs, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values, evaluate_truth,
-        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
-        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_with_storages,
-        filtered_count_eligibility, find_required_inequality, inequality_can_match,
-        materialize_direct_count_values, potential_left_indices, project_execution_row,
-        required_right_extreme, sorted_non_null_indices, update_filtered_count_summary,
+        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_truth,
+        evaluate_bound_values, evaluate_dynamic_borrowed_truth_values,
+        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
+        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
+        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
+        execute_with_storages, filtered_count_eligibility, find_required_inequality,
+        inequality_can_match, materialize_direct_count_values, potential_left_indices,
+        project_execution_row, required_right_extreme, sorted_non_null_indices,
+        update_filtered_count_summary,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -2419,7 +2462,7 @@ mod tests {
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_storage::{HeapStorage, IndexStatistics, PresenceCountSummary, TableStatistics};
     use netbadb_types::{
-        ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, RowId, ScalarValue,
+        ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, RowId, ScalarRef, ScalarValue,
         SemanticType, TableId,
     };
 
@@ -2427,6 +2470,13 @@ mod tests {
         match value {
             ScalarValue::Text(value) => value.as_ptr(),
             _ => panic!("expected Text value"),
+        }
+    }
+
+    fn scalar_ref_text_pointer(value: ScalarRef<'_>) -> *const u8 {
+        match value {
+            ScalarRef::Text(value) => value.as_ptr(),
+            _ => panic!("expected Text scalar view"),
         }
     }
 
@@ -2954,6 +3004,15 @@ mod tests {
                         .expect("owned comparison"),
                     evaluate_binary_refs(operator, left, right).expect("reference comparison")
                 );
+                assert_eq!(
+                    evaluate_binary_refs(operator, left, right).expect("reference comparison"),
+                    evaluate_binary_scalar_refs(
+                        operator,
+                        ScalarRef::from(left),
+                        ScalarRef::from(right),
+                    )
+                    .expect("scalar-view comparison")
+                );
             }
         }
 
@@ -2970,6 +3029,16 @@ mod tests {
                             .expect("owned truth operation"),
                         evaluate_binary_refs(operator, left, right)
                             .expect("reference truth operation")
+                    );
+                    assert_eq!(
+                        evaluate_binary_refs(operator, left, right)
+                            .expect("reference truth operation"),
+                        evaluate_binary_scalar_refs(
+                            operator,
+                            ScalarRef::from(left),
+                            ScalarRef::from(right),
+                        )
+                        .expect("scalar-view truth operation")
                     );
                 }
             }
@@ -3833,6 +3902,7 @@ mod tests {
         ];
         let mut contiguous = left.clone();
         contiguous.extend(right.iter().cloned());
+        let scalar_refs = contiguous.iter().map(ScalarRef::from).collect::<Vec<_>>();
 
         let expressions = vec![
             binary(
@@ -3953,9 +4023,9 @@ mod tests {
                 evaluate_values(&expression, joined, &fields).expect("dynamic evaluation");
             let dynamic_borrowed = evaluate_dynamic_borrowed_values(&expression, joined, &fields)
                 .expect("borrowed dynamic evaluation");
-            assert_eq!(&dynamic, dynamic_borrowed.as_ref());
+            assert_eq!(dynamic, dynamic_borrowed.as_scalar_ref().to_owned());
             let evaluated = evaluate_bound_values(&bound, joined).expect("bound evaluation");
-            assert_eq!(&dynamic, evaluated.as_ref());
+            assert_eq!(dynamic, evaluated.as_scalar_ref().to_owned());
             assert_eq!(
                 evaluate_truth(&expression, &contiguous, &fields).expect("contiguous truth"),
                 evaluate_truth_values(&expression, joined, &fields).expect("joined truth")
@@ -3968,6 +4038,11 @@ mod tests {
                 evaluate_truth_values(&expression, joined, &fields).expect("dynamic truth"),
                 evaluate_dynamic_borrowed_truth_values(&expression, joined, &fields)
                     .expect("borrowed dynamic truth")
+            );
+            assert_eq!(
+                evaluate_truth_values(&expression, joined, &fields).expect("dynamic truth"),
+                evaluate_dynamic_scalar_ref_truth(&expression, &scalar_refs, &fields)
+                    .expect("scalar-view dynamic truth")
             );
         }
 
@@ -4000,6 +4075,11 @@ mod tests {
             ),
             Err(ExecutionError::MissingColumn(name)) if name == "missing"
         ));
+        let missing_expression = column_expr(&missing);
+        assert!(matches!(
+            evaluate_dynamic_scalar_ref_truth(&missing_expression, &scalar_refs, &fields),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
 
         let bound_right_signed =
             bind_expression(&right_signed, &fields).expect("bind right signed column");
@@ -4016,6 +4096,11 @@ mod tests {
                 EvaluationValues::Contiguous(&left[..1]),
                 &fields
             ),
+            Err(ExecutionError::MissingColumn(name)) if name == "signed"
+        ));
+        let short_scalar_refs = left[..1].iter().map(ScalarRef::from).collect::<Vec<_>>();
+        assert!(matches!(
+            evaluate_dynamic_scalar_ref_truth(&right_signed, &short_scalar_refs, &fields),
             Err(ExecutionError::MissingColumn(name)) if name == "signed"
         ));
     }
@@ -4038,6 +4123,7 @@ mod tests {
             OutputField::Source(right.clone()),
         ];
         let values = vec![ScalarValue::Int64(7), ScalarValue::Text("row-text".into())];
+        let scalar_refs = values.iter().map(ScalarRef::from).collect::<Vec<_>>();
         let expression = |column: ColumnRef| Expr {
             expr_type: ExprType {
                 data_type: column.data_type.clone(),
@@ -4056,12 +4142,31 @@ mod tests {
             .expect("evaluate borrowed column")
             {
                 EvaluatedScalar::Borrowed(value) => {
-                    assert!(std::ptr::eq(value, &values[position]));
+                    assert_eq!(value, ScalarRef::from(&values[position]));
                     if position == 1 {
-                        assert_eq!(text_pointer(value), text_pointer(&values[position]));
+                        assert_eq!(
+                            scalar_ref_text_pointer(value),
+                            text_pointer(&values[position])
+                        );
                     }
                 }
                 EvaluatedScalar::Owned(_) => panic!("dynamic column must remain borrowed"),
+            }
+            match evaluate_dynamic_with(&expression, &fields, &|index| {
+                scalar_refs.get(index).copied()
+            })
+            .expect("evaluate scalar-view column")
+            {
+                EvaluatedScalar::Borrowed(value) => {
+                    assert_eq!(value, scalar_refs[position]);
+                    if position == 1 {
+                        assert_eq!(
+                            scalar_ref_text_pointer(value),
+                            scalar_ref_text_pointer(scalar_refs[position])
+                        );
+                    }
+                }
+                EvaluatedScalar::Owned(_) => panic!("scalar-view column must remain borrowed"),
             }
         }
 
@@ -4083,8 +4188,18 @@ mod tests {
         )
         .expect("evaluate borrowed literal")
         {
-            EvaluatedScalar::Borrowed(value) => assert_eq!(text_pointer(value), literal_pointer),
+            EvaluatedScalar::Borrowed(value) => {
+                assert_eq!(scalar_ref_text_pointer(value), literal_pointer);
+            }
             EvaluatedScalar::Owned(_) => panic!("dynamic literal must remain borrowed"),
+        }
+        match evaluate_dynamic_with(&literal, &fields, &|index| scalar_refs.get(index).copied())
+            .expect("evaluate scalar-view literal")
+        {
+            EvaluatedScalar::Borrowed(value) => {
+                assert_eq!(scalar_ref_text_pointer(value), literal_pointer);
+            }
+            EvaluatedScalar::Owned(_) => panic!("scalar-view literal must remain borrowed"),
         }
 
         let comparison = Expr {
@@ -4270,7 +4385,13 @@ mod tests {
                 evaluate_bound_values(&expression, evaluation_values).expect("evaluate column");
             match evaluated {
                 EvaluatedScalar::Borrowed(value) => {
-                    assert!(std::ptr::eq(value, &values[position]));
+                    assert_eq!(value, ScalarRef::from(&values[position]));
+                    if position == 1 {
+                        assert_eq!(
+                            scalar_ref_text_pointer(value),
+                            text_pointer(&values[position])
+                        );
+                    }
                 }
                 EvaluatedScalar::Owned(_) => panic!("bound column must remain borrowed"),
             }
@@ -4283,7 +4404,10 @@ mod tests {
         let evaluated =
             evaluate_bound_values(&literal, evaluation_values).expect("evaluate literal");
         match evaluated {
-            EvaluatedScalar::Borrowed(value) => assert!(std::ptr::eq(value, &literal_value)),
+            EvaluatedScalar::Borrowed(value) => {
+                assert_eq!(value, ScalarRef::from(&literal_value));
+                assert_eq!(scalar_ref_text_pointer(value), text_pointer(&literal_value));
+            }
             EvaluatedScalar::Owned(_) => panic!("bound literal must remain borrowed"),
         }
 

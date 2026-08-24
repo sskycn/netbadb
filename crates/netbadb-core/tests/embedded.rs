@@ -696,6 +696,27 @@ fn filtered_counts_preserve_null_truth_overlap_output_order_and_all_star_fallbac
     );
     assert_eq!(
         database
+            .query("SELECT COUNT(note) FROM items WHERE note IS NOT NULL")
+            .expect("count borrowed Text IS NOT NULL predicate")
+            .rows,
+        vec![vec![ScalarValue::UInt64(2)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(note) FROM items WHERE id IS NOT NULL")
+            .expect("count Int64 IS NOT NULL control")
+            .rows,
+        vec![vec![ScalarValue::UInt64(2)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT id FROM items WHERE note = 'a'")
+            .expect("execute generic Text Filter control")
+            .rows,
+        vec![vec![ScalarValue::Int64(1)]]
+    );
+    assert_eq!(
+        database
             .query("SELECT COUNT(*), COUNT(*) FROM items WHERE active = true")
             .expect("execute all-star generic fallback")
             .rows,

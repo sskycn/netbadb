@@ -17,8 +17,10 @@ retaining complete current-Heap validation. Phase 7M shares one presence scan
 across direct multi-COUNT outputs. Phase 7N streams Filter-qualified COUNT
 consumption without owning count-only scalars or materializing intermediate
 rows. Phase 7O then removes dynamic evaluator leaf clones only inside that
-filtered-count consumer, while deliberately retaining the storage-owned
-predicate value and dynamic column lookup. The target uses
+filtered-count consumer. Phase 7P keeps predicate Text borrowed from the
+validated Heap payload through that synchronous callback, while deliberately
+retaining dynamic column lookup and fully owned generic Filter/QueryResult
+boundaries. The target uses
 `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
 optimized bench profile.
 
@@ -474,7 +476,7 @@ tuples. It resolves the requested ColumnId once, validates each immutable page
 once, validates non-Heap single payloads, skips tombstones, and decodes every
 column of every live row. Bool encodings, Text lengths/bounds/UTF-8, physical
 types, NULL constraints, truncation, and trailing values all remain checked.
-The target value stays a borrowed `DecodedScalar` long enough to record only
+The target value stays a borrowed `ScalarRef` long enough to record only
 NULL presence; it never becomes an owned `ScalarValue`, and scanned tuples
 never become `ExecutionRow`s. The scan neither reads cached ANALYZE statistics
 nor persists a count, writes WAL, or acquires a transaction writer. It returns
@@ -549,7 +551,7 @@ pushdown. Every managed page is fully validated once, non-Heap single payloads
 remain validated, and every live tuple fully decodes all selected and
 unselected scalars. Bool encodings, Text bounds and UTF-8, physical types,
 NULL constraints, truncation, and trailing values remain checked without
-calling `DecodedScalar::into_owned`. Tombstones are excluded and slot reuse,
+calling `ScalarRef::to_owned`. Tombstones are excluded and slot reuse,
 relocation, index/ANALYZE mixed pages, and reopen count only current live
 tuples.
 
@@ -722,10 +724,68 @@ median-of-three remains the comparison basis; there is no timing threshold.
 Removing leaf clones therefore explains a substantial portion of the Text
 predicate cost and repeated-leaf scaling, without changing generic Filter.
 Text equality remains 1.353x the equivalent Int64 case, while repeated leaves
-add only 1.122x including the extra comparison and AND. This evidence selects
-storage-to-executor borrowed predicate values as the first Phase 7P
-investigation. Dynamic Filter position prebinding and generic borrowed Filter
-rollout remain separate candidates. Phase 7P is not implemented here.
+add only 1.122x including the extra comparison and AND. This evidence selected
+storage-to-executor borrowed predicate values as Phase 7P.
+
+Phase 7P first added Text and Int64 `IS NOT NULL` attribution cases without
+changing production. The Text case isolates storage ownership because it needs
+the Text Column value but performs no Text comparison and has no Text literal;
+the Int64 case is its ownership control.
+
+`netbadb-types` now provides one shared `ScalarRef<'a>` runtime view for Bool,
+Int64, UInt64, borrowed Text, and NULL. It is not a persistent representation,
+wire type, schema type, or SQL IR node. Heap decoding returns `ScalarRef`
+directly, validates the complete persisted row, and exposes requested values
+through an HRTB synchronous visitor. Its Text reference can exist only while
+the validated page, record payload, and current callback remain alive. Scratch
+vectors are reused per validated Heap page, and no unsafe code or page-backed
+reference escapes the callback.
+
+The old owned visitor remains additive-compatible and delegates the same
+authoritative traversal, converting only requested values with
+`ScalarRef::to_owned`. Only the Phase 7N filtered-count callback uses the new
+borrowed visitor. `EvaluatedScalar::Borrowed` now contains a `ScalarRef`, while
+computed Binary, Unary, and IsNull values remain owned. Dynamic binding-aware
+`find_source_position` lookup remains unchanged, and existing ScalarValue
+binary/comparison/truth helpers are thin wrappers over one ScalarRef semantic
+core. Generic PhysicalPlan Filter still consumes fully owned SeqScan rows.
+
+Three strictly serial full pre/post runs used separate
+`/private/tmp/netbadb-phase7p-pre-target` and
+`/private/tmp/netbadb-phase7p-post-target` build directories. Median-of-three
+medians in milliseconds were:
+
+| scenario | pre | post | change |
+| --- | ---: | ---: | ---: |
+| filtered Text `IS NOT NULL` COUNT(payload) | 0.969 | 0.646 | -33.3% |
+| filtered Int64 `IS NOT NULL` COUNT(payload) | 0.710 | 0.624 | -12.1% |
+| filtered Text equality COUNT(payload) | 1.028 | 0.702 | -31.7% |
+| filtered Int64 equality COUNT(payload) | 0.775 | 0.672 | -13.3% |
+| filtered repeated Text COUNT(payload) | 1.211 | 0.879 | -27.5% |
+| generic hidden Text Filter | 1.641 | 1.510 | observational |
+| filtered Bool equality COUNT(payload) | 0.797 | 0.711 | observational |
+
+Text/Int equality contracted from 1.327x to 1.045x, while Text/Int `IS NOT
+NULL` contracted from 1.365x to 1.035x. This is direct evidence that the
+storage-created predicate Text owner is no longer visible. Repeated/single Text
+changed from 1.178x to 1.251x: both improved in absolute time, but repeated
+dynamic lookup and expression work are now a larger fraction after ownership
+was removed. The generic hidden Filter remains outside the specialization.
+
+Direct ID/nullable/payload/pair COUNT controls changed from
+0.599/0.590/0.592/0.612 ms to 0.611/0.544/0.550/0.576 ms. Phase 7N filtered
+ID/payload/pair controls changed from 0.780/0.797/0.799 ms to
+0.739/0.711/0.719 ms. These broader changes are observational machine and code
+layout variance; there is no timing threshold.
+
+Post-7P data therefore selects Filter position prebinding as Phase 7Q: the
+Text ownership gap is effectively closed, while repeated leaves still scale
+with dynamic source-position lookup. The reordered candidates are: Filter
+position prebinding; generic Filter borrowed-evaluator rollout; direct COUNT(*)
+live-row specialization; sequential PageManager traversal; BufferPool page
+snapshot cloning; AND/OR short-circuiting; MIN/MAX ownership; group-key
+ownership; covering/index-only reads; broader HashJoin eligibility; and
+multi-inequality intersection. Phase 7Q is not implemented here.
 
 ## CI and compatibility
 
@@ -740,4 +800,6 @@ change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
-encoding unchanged. They add no dependency and no unsafe code.
+encoding unchanged. Phase 7P retains those contracts as well as Protocol v1,
+SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
+QueryResult rows. These phases add no dependency and no unsafe code.

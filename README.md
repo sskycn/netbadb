@@ -659,8 +659,12 @@ The implementation sequence is intentionally vertical:
 43. Borrowed dynamic Filter predicate evaluation (Phase 7O) — complete for the
     Phase 7N consumer path; dynamic Column/Literal leaves borrow already-owned
     ScalarValues while computed results remain owned.
-44. Storage-to-executor borrowed predicate values (Phase 7P) — selected from
-    the remaining post-7O Text/Int gap, not started.
+44. Storage-to-executor borrowed predicate scalar views (Phase 7P) — complete;
+    a shared `ScalarRef` and HRTB Heap callback keep validated predicate Text
+    borrowed through Phase 7N evaluation while retaining the owned visitor and
+    fully owned QueryResult boundary.
+45. Filter position prebinding (Phase 7Q) — selected from the remaining
+    repeated-leaf dynamic lookup cost, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

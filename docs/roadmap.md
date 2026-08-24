@@ -779,20 +779,56 @@ reporting.
 - Text/Int contracted from 1.906x to 1.353x, repeated/single Text from 1.377x
   to 1.122x, and Text/Bool from 1.889x to 1.305x, with no timing threshold.
 
-### Phase 7P — Storage-to-executor borrowed predicate values (selected, not started)
+### Phase 7P — Storage-to-executor borrowed predicate scalar views (complete)
 
-Post-7O Text equality remains 1.353x its equivalent Int64 case, while repeated
-leaf scaling contracted to 1.122x and the generic Filter control did not
-improve. The first Phase 7P investigation should therefore isolate borrowing
-predicate Text across the Heap visitor callback boundary without weakening
-complete persisted-row validation or spreading page-backed lifetimes. It must
-not be implemented as part of Phase 7O.
+- `netbadb-types::ScalarRef<'a>` is the single shared runtime scalar view;
+  Bool/Int64/UInt64 copy by value, Text borrows `&str`, and NULL remains
+  explicit. It is not a persistent, wire, schema, or SQL IR contract;
+- Heap row decoding returns `ScalarRef` directly and still validates every
+  persisted tag, width, Text length/bounds/UTF-8, physical type, NULL
+  constraint, truncation, and trailing value before invoking a consumer;
+- the new HRTB synchronous visitor scopes borrowed Text to the current
+  validated-page callback. Page and record guards remain alive through that
+  callback, references cannot escape in safe Rust, and per-page scratch avoids
+  per-live-row vector allocation;
+- request order, duplicate values, duplicate presence, value/presence overlap,
+  zero-width projections, callback errors, tombstones, reuse, relocation,
+  reopen, and non-Heap validation remain exact;
+- the prior owned visitor is retained and delegates the borrowed traversal,
+  converting requested views with `to_owned`; its public behavior is
+  unchanged;
+- `EvaluatedScalar::Borrowed` consumes `ScalarRef`, while computed values stay
+  owned. One ScalarRef binary/comparison/truth core backs the retained
+  ScalarValue wrappers and the Phase 7G bound evaluator adaptation;
+- only the Phase 7N filtered-count callback switches to the borrowed visitor.
+  Binding-aware dynamic lookup remains, literals still borrow from `Expr`, and
+  generic Filter, UPDATE, INSERT, Join algorithms, planner, compiler, and
+  inspection behavior are unchanged;
+- isolated serial full x3 reduced median-of-three Text `IS NOT NULL` from
+  0.969 to 0.646 ms and Text equality from 1.028 to 0.702 ms. Their equivalent
+  Int64 controls changed from 0.710 to 0.624 ms and 0.775 to 0.672 ms;
+- Text/Int `IS NOT NULL` contracted from 1.365x to 1.035x and Text/Int equality
+  from 1.327x to 1.045x. Repeated/single Text changed from 1.178x to 1.251x,
+  while generic hidden Filter remained observational at 1.641/1.510 ms. There
+  is no timing threshold;
+- row encoding and every persistent/machine contract remain unchanged; no
+  dependency or unsafe code was added, and QueryResult stays fully owned.
 
-Filter position prebinding, generic borrowed Filter rollout, AND/OR
-short-circuiting, direct COUNT(*) live-row specialization, MIN/MAX ownership,
-group-key ownership, BufferPool page snapshot cloning, covering/index-only
-reads, broader HashJoin eligibility, multi-inequality intersection, and
-sequential PageManager traversal remain separate candidates.
+### Phase 7Q — Filter position prebinding (selected, not started)
+
+Post-7P Text ownership ratios are near parity, so further local Text ownership
+work is not selected. Repeated predicate leaves still cost 1.251x a single
+Text equality after the storage owner was removed, and every leaf still calls
+binding-aware `find_source_position`. Phase 7Q should therefore investigate
+prebinding Filter source positions without changing Filter eligibility,
+three-valued logic, AND/OR evaluation, or generic row ownership. It is not
+implemented as part of Phase 7P.
+
+The remaining measured candidates, in current order, are generic Filter
+borrowed-evaluator rollout, direct COUNT(*) live-row specialization, sequential
+PageManager traversal, BufferPool page snapshot cloning, AND/OR
+short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
+reads, broader HashJoin eligibility, and multi-inequality intersection.
 
 ### Later Phase 7 work
 

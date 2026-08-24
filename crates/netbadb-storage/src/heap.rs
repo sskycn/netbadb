@@ -9,7 +9,7 @@ use netbadb_index::{
     validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
-use netbadb_types::{ColumnId, PageId, PhysicalType, RowId, ScalarValue, SlotId};
+use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId};
 
 use crate::recovery::RecoveryManager;
 use crate::transaction::TransactionManager;
@@ -1485,8 +1485,7 @@ impl HeapStorage {
     /// presence for the other requested columns.
     ///
     /// Both projections preserve request order and duplicates, and a column
-    /// may appear in both. Projection resolution and scratch allocation happen
-    /// once before traversal. The callback runs synchronously only after the
+    /// may appear in both. The callback runs synchronously only after the
     /// complete row has been decoded and validated; its first error stops the
     /// scan immediately and is returned unchanged. This read-only primitive
     /// performs no WAL or persistent mutation and does not acquire a writer.
@@ -1500,10 +1499,36 @@ impl HeapStorage {
         E: From<StorageError>,
         F: FnMut(&[ScalarValue], &[bool]) -> Result<(), E>,
     {
+        let mut owned_values = Vec::with_capacity(value_columns.len());
+        self.visit_scalar_refs_with_presence(value_columns, presence_columns, |values, presence| {
+            owned_values.clear();
+            owned_values.extend(values.iter().copied().map(ScalarRef::to_owned));
+            visitor(&owned_values, presence)
+        })
+    }
+
+    /// Visits each current live Heap row with borrowed scalar views after
+    /// complete persisted-row validation.
+    ///
+    /// Both projections preserve request order and duplicates, and a column
+    /// may appear in both. Text views borrow the validated Heap record payload
+    /// only for the current synchronous callback. The higher-ranked callback
+    /// bound prevents safe code from retaining any row-borrowed view after the
+    /// callback returns. Scratch allocations are reused for all live slots in
+    /// one validated Heap page. The first callback error stops the scan and is
+    /// returned unchanged.
+    pub fn visit_scalar_refs_with_presence<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        mut visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+        F: for<'row> FnMut(&[ScalarRef<'row>], &[bool]) -> Result<(), E>,
+    {
         let projection = ConsumerProjection::resolve(&self.table, value_columns, presence_columns)
             .map_err(E::from)?;
-        let mut value_slots = vec![None; projection.value_count];
-        let mut values = Vec::with_capacity(projection.value_count);
         let mut presence = vec![false; projection.presence_count];
         for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
             let page_id = PageId(page_number);
@@ -1516,6 +1541,8 @@ impl HeapStorage {
                     .map_err(E::from)?;
                 continue;
             }
+            let mut value_slots = vec![None; projection.value_count];
+            let mut values = Vec::with_capacity(projection.value_count);
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
                 if let Some((_slot_entry, payload)) =
@@ -1885,7 +1912,7 @@ fn decode_row(payload: &[u8], table: &TableDef) -> Result<Vec<ScalarValue>, Stor
     for column in &table.columns {
         let value = decode_value(payload, &mut offset)?;
         validate_decoded_scalar(value, column)?;
-        values.push(value.into_owned());
+        values.push(value.to_owned());
     }
     ensure_row_consumed(offset, payload.len())?;
     Ok(values)
@@ -1918,7 +1945,7 @@ fn decode_row_columns(
             let value = decode_value(payload, &mut offset)?;
             validate_decoded_scalar(value, column)?;
             if positions.get(next_position) == Some(&schema_position) {
-                selected.push(value.into_owned());
+                selected.push(value.to_owned());
                 next_position += 1;
             }
         }
@@ -1935,7 +1962,7 @@ fn decode_row_columns(
     ensure_row_consumed(offset, payload.len())?;
     Ok(positions
         .iter()
-        .map(|position| decoded[*position].into_owned())
+        .map(|position| decoded[*position].to_owned())
         .collect())
 }
 
@@ -1946,12 +1973,12 @@ fn ensure_row_consumed(offset: usize, payload_length: usize) -> Result<(), Stora
     Ok(())
 }
 
-fn decode_row_for_consumer(
-    payload: &[u8],
+fn decode_row_for_consumer<'a>(
+    payload: &'a [u8],
     table: &TableDef,
     projection: &ConsumerProjection,
-    value_slots: &mut [Option<ScalarValue>],
-    values: &mut Vec<ScalarValue>,
+    value_slots: &mut [Option<ScalarRef<'a>>],
+    values: &mut Vec<ScalarRef<'a>>,
     presence: &mut [bool],
 ) -> Result<(), StorageError> {
     if value_slots.len() != projection.value_count || presence.len() != projection.presence_count {
@@ -1963,12 +1990,12 @@ fn decode_row_for_consumer(
     for (schema_position, column) in table.columns.iter().enumerate() {
         let value = decode_value(payload, &mut offset)?;
         validate_decoded_scalar(value, column)?;
-        let present = !matches!(value, DecodedScalar::Null);
+        let present = !value.is_null();
         for output_slot in &projection.presence_output_slots_by_schema_position[schema_position] {
             presence[*output_slot] = present;
         }
         for output_slot in &projection.value_output_slots_by_schema_position[schema_position] {
-            value_slots[*output_slot] = Some(value.into_owned());
+            value_slots[*output_slot] = Some(value);
         }
     }
     ensure_row_consumed(offset, payload.len())?;
@@ -1995,7 +2022,7 @@ fn decode_row_presence(
     for (schema_position, column) in table.columns.iter().enumerate() {
         let value = decode_value(payload, &mut offset)?;
         validate_decoded_scalar(value, column)?;
-        if !matches!(value, DecodedScalar::Null) {
+        if !value.is_null() {
             for output_slot in &projection.output_slots_by_schema_position[schema_position] {
                 row_presence[*output_slot] = true;
             }
@@ -2020,42 +2047,11 @@ fn resolve_projection(table: &TableDef, columns: &[ColumnId]) -> Result<Vec<usiz
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodedScalar<'a> {
-    Bool(bool),
-    Int64(i64),
-    UInt64(u64),
-    Text(&'a str),
-    Null,
-}
-
-impl DecodedScalar<'_> {
-    const fn physical_type(self) -> Option<PhysicalType> {
-        match self {
-            Self::Bool(_) => Some(PhysicalType::Bool),
-            Self::Int64(_) => Some(PhysicalType::Int64),
-            Self::UInt64(_) => Some(PhysicalType::UInt64),
-            Self::Text(_) => Some(PhysicalType::Text),
-            Self::Null => None,
-        }
-    }
-
-    fn into_owned(self) -> ScalarValue {
-        match self {
-            Self::Bool(value) => ScalarValue::Bool(value),
-            Self::Int64(value) => ScalarValue::Int64(value),
-            Self::UInt64(value) => ScalarValue::UInt64(value),
-            Self::Text(value) => ScalarValue::Text(value.to_owned()),
-            Self::Null => ScalarValue::Null,
-        }
-    }
-}
-
 fn validate_decoded_scalar(
-    value: DecodedScalar<'_>,
+    value: ScalarRef<'_>,
     column: &netbadb_schema::ColumnDef,
 ) -> Result<(), StorageError> {
-    if matches!(value, DecodedScalar::Null) {
+    if value.is_null() {
         if !column.nullable {
             return Err(StorageError::NullNotAllowed {
                 column: column.name.clone(),
@@ -2071,25 +2067,22 @@ fn validate_decoded_scalar(
     Ok(())
 }
 
-fn decode_value<'a>(
-    payload: &'a [u8],
-    offset: &mut usize,
-) -> Result<DecodedScalar<'a>, StorageError> {
+fn decode_value<'a>(payload: &'a [u8], offset: &mut usize) -> Result<ScalarRef<'a>, StorageError> {
     let tag = *payload.get(*offset).ok_or(CodecError::MissingScalarTag)?;
     *offset += 1;
     match tag {
         0 => {
             let value = read_byte(payload, offset)?;
             match value {
-                0 => Ok(DecodedScalar::Bool(false)),
-                1 => Ok(DecodedScalar::Bool(true)),
+                0 => Ok(ScalarRef::Bool(false)),
+                1 => Ok(ScalarRef::Bool(true)),
                 other => Err(CodecError::InvalidBoolean(other).into()),
             }
         }
-        1 => Ok(DecodedScalar::Int64(i64::from_le_bytes(read_array(
+        1 => Ok(ScalarRef::Int64(i64::from_le_bytes(read_array(
             payload, offset,
         )?))),
-        2 => Ok(DecodedScalar::UInt64(u64::from_le_bytes(read_array(
+        2 => Ok(ScalarRef::UInt64(u64::from_le_bytes(read_array(
             payload, offset,
         )?))),
         3 => {
@@ -2102,9 +2095,9 @@ fn decode_value<'a>(
                 .ok_or(CodecError::ScalarTruncated)?;
             let text = std::str::from_utf8(text_bytes).map_err(|_| CodecError::TextNotUtf8)?;
             *offset = end;
-            Ok(DecodedScalar::Text(text))
+            Ok(ScalarRef::Text(text))
         }
-        4 => Ok(DecodedScalar::Null),
+        4 => Ok(ScalarRef::Null),
         other => Err(CodecError::UnknownScalarTag(other).into()),
     }
 }
@@ -2147,8 +2140,8 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsumerProjection, DecodedScalar, HeapStorage, decode_row, decode_row_columns,
-        decode_row_for_consumer, decode_value, encode_row, resolve_projection,
+        ConsumerProjection, HeapStorage, decode_row, decode_row_columns, decode_row_for_consumer,
+        decode_value, encode_row, resolve_projection,
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
@@ -2161,7 +2154,9 @@ mod tests {
         decode_index_catalog, encode_index_catalog,
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, Lsn, PageId, PhysicalType, ScalarValue, SemanticType, TableId};
+    use netbadb_types::{
+        ColumnId, Lsn, PageId, PhysicalType, ScalarRef, ScalarValue, SemanticType, TableId,
+    };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
 
@@ -3549,6 +3544,108 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_consumer_visitor_preserves_views_order_duplicates_and_zero_width() {
+        let path = test_path("heap-borrowed-consumer-visitor");
+        let schema = TableDef::new(
+            TableId(43),
+            "borrowed_consumer_items",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "note", TypeSpec::Physical(PhysicalType::Text))
+                    .nullable(true),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+            ],
+        );
+        let mut storage = HeapStorage::create(&path, schema).expect("create borrowed heap");
+        for row in [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("borrowed".into()),
+                ScalarValue::Bool(true),
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::Null,
+                ScalarValue::Bool(false),
+            ],
+        ] {
+            storage.insert(&row).expect("insert borrowed consumer row");
+        }
+
+        let mut observed = Vec::new();
+        storage
+            .visit_scalar_refs_with_presence::<StorageError, _>(
+                &[ColumnId(2), ColumnId(1), ColumnId(2)],
+                &[ColumnId(2), ColumnId(3), ColumnId(2)],
+                |values, presence| {
+                    if let [ScalarRef::Text(first), _, ScalarRef::Text(second)] = values {
+                        assert_eq!(first.as_ptr(), second.as_ptr());
+                    }
+                    observed.push((
+                        values
+                            .iter()
+                            .copied()
+                            .map(ScalarRef::to_owned)
+                            .collect::<Vec<_>>(),
+                        presence.to_vec(),
+                    ));
+                    Ok(())
+                },
+            )
+            .expect("visit borrowed projections");
+        assert_eq!(
+            observed,
+            vec![
+                (
+                    vec![
+                        ScalarValue::Text("borrowed".into()),
+                        ScalarValue::Int64(1),
+                        ScalarValue::Text("borrowed".into()),
+                    ],
+                    vec![true, true, true],
+                ),
+                (
+                    vec![ScalarValue::Null, ScalarValue::Int64(2), ScalarValue::Null],
+                    vec![false, true, false],
+                ),
+            ]
+        );
+
+        let mut zero_width_visits = 0;
+        storage
+            .visit_scalar_refs_with_presence::<StorageError, _>(&[], &[], |values, presence| {
+                assert!(values.is_empty());
+                assert!(presence.is_empty());
+                zero_width_visits += 1;
+                Ok(())
+            })
+            .expect("visit borrowed zero-width projection");
+        assert_eq!(zero_width_visits, 2);
+
+        for (values, presence) in [
+            (&[ColumnId(99)][..], &[][..]),
+            (&[][..], &[ColumnId(99)][..]),
+        ] {
+            assert!(matches!(
+                storage.visit_scalar_refs_with_presence::<StorageError, _>(
+                    values,
+                    presence,
+                    |_, _| Ok(())
+                ),
+                Err(StorageError::UnknownColumn {
+                    column_id: ColumnId(99)
+                })
+            ));
+        }
+        storage.close().expect("close borrowed heap");
+        cleanup(&path);
+    }
+
+    #[test]
     fn consumer_visitor_stops_at_the_first_callback_error_without_mutation() {
         #[derive(Debug)]
         enum VisitError {
@@ -3623,10 +3720,16 @@ mod tests {
         let mut offset = 0;
         let _id = decode_value(&encoded, &mut offset).expect("borrow ID");
         let _active = decode_value(&encoded, &mut offset).expect("borrow active");
-        assert!(matches!(
-            decode_value(&encoded, &mut offset).expect("borrow Text"),
-            DecodedScalar::Text("payload")
-        ));
+        let ScalarRef::Text(text) = decode_value(&encoded, &mut offset).expect("borrow Text")
+        else {
+            panic!("encoded Text must decode to a borrowed Text view");
+        };
+        assert_eq!(text, "payload");
+        let payload_start = encoded.as_ptr() as usize;
+        let payload_end = payload_start + encoded.len();
+        let text_start = text.as_ptr() as usize;
+        assert!(text_start >= payload_start);
+        assert!(text_start + text.len() <= payload_end);
 
         let mut invalid_bool = encoded.clone();
         invalid_bool[10] = 2;
@@ -3723,9 +3826,9 @@ mod tests {
         assert_eq!(
             values,
             [
-                ScalarValue::Text("note".into()),
-                ScalarValue::Int64(7),
-                ScalarValue::Text("note".into()),
+                ScalarRef::Text("note"),
+                ScalarRef::Int64(7),
+                ScalarRef::Text("note"),
             ]
         );
         assert_eq!(presence, [true, true]);
@@ -5278,6 +5381,33 @@ mod tests {
             ),
             Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
+        for (values, presence) in [
+            (&[ColumnId(2)][..], &[][..]),
+            (&[][..], &[ColumnId(2)][..]),
+            (&[][..], &[][..]),
+        ] {
+            assert!(matches!(
+                reopened.visit_scalar_refs_with_presence::<StorageError, _>(
+                    values,
+                    presence,
+                    |_, _| Ok(())
+                ),
+                Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+            ));
+        }
+        let mut callbacks = 0;
+        assert!(matches!(
+            reopened.visit_scalar_refs_with_presence::<StorageError, _>(
+                &[ColumnId(1)],
+                &[],
+                |_, _| {
+                    callbacks += 1;
+                    Ok(())
+                }
+            ),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
+        assert_eq!(callbacks, 0);
         cleanup(&path);
     }
 

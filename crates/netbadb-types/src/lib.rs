@@ -119,6 +119,69 @@ pub enum ScalarValue {
     Null,
 }
 
+/// A borrowed runtime view of a scalar value.
+///
+/// This type carries no persistence, wire, schema, or SQL-expression
+/// semantics. In particular, [`ScalarRef::Text`] may borrow short-lived
+/// validated storage bytes and must remain scoped to their owning operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarRef<'a> {
+    Bool(bool),
+    Int64(i64),
+    UInt64(u64),
+    Text(&'a str),
+    Null,
+}
+
+impl ScalarRef<'_> {
+    #[must_use]
+    pub const fn physical_type(self) -> Option<PhysicalType> {
+        match self {
+            Self::Bool(_) => Some(PhysicalType::Bool),
+            Self::Int64(_) => Some(PhysicalType::Int64),
+            Self::UInt64(_) => Some(PhysicalType::UInt64),
+            Self::Text(_) => Some(PhysicalType::Text),
+            Self::Null => None,
+        }
+    }
+
+    #[must_use]
+    pub fn matches_type(self, expected: &SemanticType) -> bool {
+        match self.physical_type() {
+            Some(actual) => actual == expected.physical,
+            None => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_null(self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    #[must_use]
+    pub fn to_owned(self) -> ScalarValue {
+        match self {
+            Self::Bool(value) => ScalarValue::Bool(value),
+            Self::Int64(value) => ScalarValue::Int64(value),
+            Self::UInt64(value) => ScalarValue::UInt64(value),
+            Self::Text(value) => ScalarValue::Text(value.to_owned()),
+            Self::Null => ScalarValue::Null,
+        }
+    }
+}
+
+impl<'a> From<&'a ScalarValue> for ScalarRef<'a> {
+    fn from(value: &'a ScalarValue) -> Self {
+        match value {
+            ScalarValue::Bool(value) => Self::Bool(*value),
+            ScalarValue::Int64(value) => Self::Int64(*value),
+            ScalarValue::UInt64(value) => Self::UInt64(*value),
+            ScalarValue::Text(value) => Self::Text(value.as_str()),
+            ScalarValue::Null => Self::Null,
+        }
+    }
+}
+
 impl ScalarValue {
     #[must_use]
     pub fn physical_type(&self) -> Option<PhysicalType> {
@@ -142,7 +205,7 @@ impl ScalarValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{PageId, PhysicalType, RowId, SemanticType};
+    use super::{PageId, PhysicalType, RowId, ScalarRef, ScalarValue, SemanticType};
 
     #[test]
     fn nominal_types_do_not_collapse_to_their_physical_type() {
@@ -169,5 +232,47 @@ mod tests {
                 ..first
             }
         );
+    }
+
+    #[test]
+    fn scalar_refs_preserve_kind_type_nullability_and_owned_value() {
+        let cases = [
+            ScalarValue::Bool(true),
+            ScalarValue::Int64(-7),
+            ScalarValue::UInt64(11),
+            ScalarValue::Text("payload".into()),
+            ScalarValue::Null,
+        ];
+        for value in &cases {
+            let scalar_ref = ScalarRef::from(value);
+            assert_eq!(scalar_ref.physical_type(), value.physical_type());
+            assert_eq!(scalar_ref.is_null(), matches!(value, ScalarValue::Null));
+            assert_eq!(scalar_ref.to_owned(), *value);
+            for physical in [
+                PhysicalType::Bool,
+                PhysicalType::Int64,
+                PhysicalType::UInt64,
+                PhysicalType::Text,
+            ] {
+                let semantic = SemanticType::physical(physical);
+                assert_eq!(
+                    scalar_ref.matches_type(&semantic),
+                    value.matches_type(&semantic)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_scalar_ref_borrows_the_original_string_allocation() {
+        let value = ScalarValue::Text(String::from("borrowed payload"));
+        let ScalarValue::Text(text) = &value else {
+            panic!("test value must be Text");
+        };
+        let ScalarRef::Text(view) = ScalarRef::from(&value) else {
+            panic!("Text value must produce a Text view");
+        };
+        assert_eq!(view, text);
+        assert_eq!(view.as_ptr(), text.as_ptr());
     }
 }

@@ -549,38 +549,61 @@ direct Filter → SeqScan eligible?
           one materialized result row
 ```
 
-The Heap visitor knows only ColumnIds, owned `ScalarValue` requests, and
+The Heap visitor knows only ColumnIds, runtime scalar-view requests, and
 presence requests; storage never receives relational `Expr` or SQL truth
 semantics. It invokes the callback only after full row-codec validation.
 Executor still applies three-valued logic, so only TRUE qualifies and FALSE or
-UNKNOWN is discarded. Count-only Text never becomes an owned String. Text used
-by the predicate still becomes one owned String at the Heap visitor value
-boundary.
+UNKNOWN is discarded. Count-only Text never becomes an owned String.
 
-Phase 7O changes only the private evaluator called by that filtered-count
-consumer. It retains dynamic `find_source_position` lookup, then returns the
-existing `EvaluatedScalar::Borrowed` for Column and Literal leaves. Binary
-nodes reuse the reference-based comparison/truth core and produce an owned
-Bool or NULL; Unary and IsNull results are also owned. AND/OR still evaluate
-both sides. The generic PhysicalPlan Filter, UPDATE expressions, and the
-prebound Join evaluator remain unchanged, so this is neither Filter prebinding
-nor a zero-copy persisted-Text path:
+Phase 7O changed only the private evaluator called by that filtered-count
+consumer. Phase 7P adds one language-independent `ScalarRef<'a>` runtime view
+in `netbadb-types` and makes the Heap decoder return it directly. This view is
+not a persistent, wire, schema, or SQL IR type. Its Text variant can borrow the
+validated record payload only during a higher-ranked synchronous callback:
 
 ```text
-validated Heap visitor
+persisted row payload
         ↓
-owned predicate ScalarValue scratch
+decode + complete validation
+        ↓
+ScalarRef<'row>
+  Bool/Int64/UInt64 by value
+  Text(&str)
+  Null
+        ↓
+HRTB synchronous visitor callback
         ↓
 dynamic source-position lookup
         ↓
-borrow Column/Literal leaves
+borrowed Column/Literal scalar views
         ↓
-reference binary/truth semantics
+ScalarRef binary/truth semantics
         ↓
 owned computed Bool/NULL
         ↓
 filtered COUNT summary
 ```
+
+The page guard, validated page, and record payload remain alive for the whole
+callback. The HRTB prevents safe code from storing the row-borrowed Text after
+the callback returns. Scratch vectors are allocated once per validated Heap
+page and reused across its live slots; there is no per-live-row vector
+allocation and no unsafe lifetime manipulation. Callback invocation still
+waits until every persisted scalar in the row has passed validation, including
+completely unrequested trailing values.
+
+The original owned visitor remains and delegates this traversal, converting
+only requested views to `ScalarValue`. `EvaluatedScalar::Borrowed` now stores a
+copied `ScalarRef`; Binary, Unary, and IsNull results remain owned. Existing
+ScalarValue binary, comparison, and truth helpers delegate one ScalarRef
+semantic core. Dynamic `find_source_position` remains binding-aware and runs
+for every Column leaf, and AND/OR still evaluate both sides.
+
+Only Phase 7N uses the borrowed visitor. Generic PhysicalPlan Filter continues
+to materialize owned SeqScan rows, QueryResult remains fully owned, and no page
+pin or borrowed persisted row escapes into executor state. UPDATE, INSERT, the
+prebound Join evaluator and Join algorithms, planner, compiler, protocol, and
+inspection behavior are unchanged.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.
