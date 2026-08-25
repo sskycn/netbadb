@@ -10,16 +10,17 @@ use netbadb_compiler::{CompileError, CompiledStatement, compile_statement};
 use netbadb_executor::{ExecutionError, execute_statement, execute_with_read_views};
 use netbadb_inspect::{CatalogInspection, StatementInspection};
 use netbadb_planner::{
-    IndexAccessPath, PhysicalStatement, TableAccessStatistics, plan_statement_with_statistics,
+    AccessPath, AccessPathCapabilities, PhysicalStatement, TableAccessStatistics,
+    plan_statement_with_statistics,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
-use netbadb_storage::{HeapStorage, StorageError, TransactionError};
+use netbadb_storage::{StorageError, TableStorage, TransactionError};
 use netbadb_types::{ColumnId, ScalarValue, TableId};
 
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
+pub use netbadb_storage::StorageTransaction as Transaction;
 pub use netbadb_storage::{
-    IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics, Transaction,
-    TransactionState,
+    IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics, TransactionState,
 };
 
 /// Canonical table identities read or written by one successfully compiled SQL
@@ -164,13 +165,13 @@ impl From<ExecutionError> for DatabaseError {
 
 pub struct Database {
     schema: Schema,
-    storages: Vec<HeapStorage>,
+    storages: Vec<TableStorage>,
 }
 
 impl Database {
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
         let schema = Schema::new(vec![table.clone()])?;
-        let storage = HeapStorage::create(path, table)?;
+        let storage = TableStorage::create_heap(path, table)?;
         Ok(Self {
             schema,
             storages: vec![storage],
@@ -179,7 +180,7 @@ impl Database {
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
         let schema = Schema::new(vec![table.clone()])?;
-        let storage = HeapStorage::open(path, table)?;
+        let storage = TableStorage::open_heap(path, table)?;
         Ok(Self {
             schema,
             storages: vec![storage],
@@ -194,7 +195,7 @@ impl Database {
         let mut storages = Vec::with_capacity(tables.len());
         let mut created_paths = Vec::with_capacity(tables.len());
         for (path, table) in tables {
-            match HeapStorage::create(&path, table) {
+            match TableStorage::create_heap(&path, table) {
                 Ok(storage) => {
                     storages.push(storage);
                     created_paths.push(path);
@@ -226,7 +227,7 @@ impl Database {
         let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
         for (path, table) in tables {
-            storages.push(HeapStorage::open(path, table)?);
+            storages.push(TableStorage::open_heap(path, table)?);
         }
         Ok(Self { schema, storages })
     }
@@ -249,11 +250,11 @@ impl Database {
             .begin_transaction_with_isolation(isolation_level)?)
     }
 
-    /// Begins a transaction owned by the heap for `table_id`.
+    /// Begins a transaction owned by the table storage for `table_id`.
     ///
     /// The returned handle is valid only for writes to that same table through
     /// [`Self::insert_into_in`] or [`Self::execute_in`]. A transaction cannot
-    /// span multiple table heaps; attempting to use it with another table
+    /// span multiple table storages; attempting to use it with another table
     /// returns a foreign-transaction error without rolling back its owner.
     pub fn begin_transaction_for(
         &mut self,
@@ -366,7 +367,7 @@ impl Database {
         let views = self
             .storages
             .iter()
-            .map(HeapStorage::read_view)
+            .map(TableStorage::read_view)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(execute_with_read_views(&plan, &mut self.storages, &views)?)
     }
@@ -406,7 +407,7 @@ impl Database {
             let views = self
                 .storages
                 .iter()
-                .map(HeapStorage::read_view)
+                .map(TableStorage::read_view)
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(ExecutionResult::Query(execute_with_read_views(
                 plan,
@@ -511,25 +512,29 @@ impl Database {
             .collect()
     }
 
-    fn planner_access_paths(&self) -> Vec<IndexAccessPath> {
+    fn planner_access_paths(&self) -> Vec<AccessPath> {
         self.storages
             .iter()
             .flat_map(|storage| {
                 let table_id = storage.table().id;
                 storage
-                    .indexes()
-                    .iter()
-                    .map(move |definition| IndexAccessPath {
+                    .access_paths()
+                    .into_iter()
+                    .map(move |path| AccessPath {
                         table_id,
-                        column_id: definition.column_id,
-                        handle: definition.handle,
-                        statistics: storage.index_statistics(definition.column_id),
+                        column_id: path.column_id,
+                        id: path.id,
+                        capabilities: AccessPathCapabilities {
+                            point_lookup: path.capabilities.point_lookup,
+                            range_lookup: path.capabilities.range_lookup,
+                        },
+                        statistics: path.statistics,
                     })
             })
             .collect()
     }
 
-    fn primary_storage_mut(&mut self) -> Result<&mut HeapStorage, DatabaseError> {
+    fn primary_storage_mut(&mut self) -> Result<&mut TableStorage, DatabaseError> {
         match self.storages.as_mut_slice() {
             [] => Err(DatabaseError::EmptyCatalog),
             [storage] => Ok(storage),
@@ -537,14 +542,14 @@ impl Database {
         }
     }
 
-    fn storage_mut(&mut self, table_id: TableId) -> Result<&mut HeapStorage, DatabaseError> {
+    fn storage_mut(&mut self, table_id: TableId) -> Result<&mut TableStorage, DatabaseError> {
         self.storages
             .iter_mut()
             .find(|storage| storage.table().id == table_id)
             .ok_or_else(|| ExecutionError::MissingTableStorage(table_id).into())
     }
 
-    fn storage(&self, table_id: TableId) -> Result<&HeapStorage, DatabaseError> {
+    fn storage(&self, table_id: TableId) -> Result<&TableStorage, DatabaseError> {
         self.storages
             .iter()
             .find(|storage| storage.table().id == table_id)
@@ -556,7 +561,8 @@ impl Database {
         for storage in &self.storages {
             match storage.validate_transaction(transaction) {
                 Ok(()) => return Ok(()),
-                Err(StorageError::Transaction(TransactionError::ForeignTransaction { .. })) => {
+                Err(StorageError::StorageContextMismatch { .. })
+                | Err(StorageError::Transaction(TransactionError::ForeignTransaction { .. })) => {
                     foreign = Some(StorageError::Transaction(
                         TransactionError::ForeignTransaction {
                             txn_id: transaction.id(),
@@ -621,7 +627,7 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
 mod tests {
     use super::{
         Database, DatabaseError, ExecutionResult, IsolationLevel, PhysicalStatement,
-        TransactionState,
+        TransactionState, cleanup_created_table_files,
     };
     use netbadb_inspect::{
         AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
@@ -630,7 +636,8 @@ mod tests {
     };
     use netbadb_planner::PhysicalPlan;
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PageId, PhysicalType, ScalarValue, TableId};
+    use netbadb_storage::{HeapStorage, TableStorage};
+    use netbadb_types::{AccessPathId, ColumnId, PhysicalType, ScalarValue, TableId};
 
     fn table() -> TableDef {
         TableDef::new(
@@ -677,9 +684,11 @@ mod tests {
         )
     }
 
-    fn planned_index(plan: &PhysicalPlan) -> Option<(PageId, &ScalarValue)> {
+    fn planned_index(plan: &PhysicalPlan) -> Option<(AccessPathId, &ScalarValue)> {
         match plan {
-            PhysicalPlan::IndexScan { handle, key, .. } => Some((handle.meta_page, key)),
+            PhysicalPlan::IndexScan {
+                access_path, key, ..
+            } => Some((*access_path, key)),
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Project { input, .. }
@@ -693,13 +702,94 @@ mod tests {
         }
     }
 
-    fn planned_statement_index(statement: &PhysicalStatement) -> Option<(PageId, &ScalarValue)> {
+    fn planned_statement_index(
+        statement: &PhysicalStatement,
+    ) -> Option<(AccessPathId, &ScalarValue)> {
         match statement {
             PhysicalStatement::Query(plan)
             | PhysicalStatement::Update { input: plan, .. }
             | PhysicalStatement::Delete { input: plan, .. } => planned_index(plan),
             PhysicalStatement::Insert { .. } => None,
         }
+    }
+
+    fn heap_storage(storage: &mut TableStorage) -> &mut HeapStorage {
+        match storage {
+            TableStorage::Heap(storage) => storage,
+        }
+    }
+
+    #[test]
+    fn database_composes_heap_through_the_table_storage_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-table-storage-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut database = Database::create(&path, table()).expect("create database");
+        assert!(matches!(
+            database.storages.as_slice(),
+            [TableStorage::Heap(_)]
+        ));
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .expect("execute through table storage");
+        assert_eq!(
+            database
+                .query("SELECT name FROM users WHERE id = 1")
+                .expect("query through table storage")
+                .rows,
+            vec![vec![ScalarValue::Text("Ada".into())]]
+        );
+        database.close().expect("close database");
+        cleanup_created_table_files(std::slice::from_ref(&path));
+    }
+
+    #[test]
+    fn table_storage_boundary_finds_a_transaction_owned_by_a_later_table() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let users_path = std::env::temp_dir().join(format!("netbadb-core-owner-users-{suffix}"));
+        let teams_path = std::env::temp_dir().join(format!("netbadb-core-owner-teams-{suffix}"));
+        let paths = [users_path.clone(), teams_path.clone()];
+        cleanup_created_table_files(&paths);
+        let mut database =
+            Database::create_tables(vec![(users_path, table()), (teams_path, teams_table())])
+                .expect("create multi-table database");
+
+        let mut transaction = database
+            .begin_transaction_for(TableId(2))
+            .expect("begin transaction for later table");
+        assert_eq!(
+            affected(
+                database
+                    .execute_in(&mut transaction, "INSERT INTO teams (id) VALUES (7)")
+                    .expect("write through owned storage context"),
+            ),
+            1
+        );
+        let own_read = database
+            .execute_in(&mut transaction, "SELECT id FROM teams")
+            .expect("read through owned storage context");
+        assert_eq!(
+            match own_read {
+                ExecutionResult::Query(result) => result.rows,
+                ExecutionResult::AffectedRows(_) => panic!("expected query result"),
+            },
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        transaction
+            .rollback()
+            .expect("rollback later-table transaction");
+        assert!(
+            database
+                .query("SELECT id FROM teams")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        database.close().expect("close multi-table database");
+        cleanup_created_table_files(&paths);
     }
 
     fn affected(result: ExecutionResult) -> u64 {
@@ -1261,9 +1351,7 @@ mod tests {
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
             .expect("SQL insert");
-        let inserted = database
-            .storage_mut(TableId(1))
-            .unwrap()
+        let inserted = heap_storage(database.storage_mut(TableId(1)).unwrap())
             .btree()
             .lookup(definition.handle, &ScalarValue::Text("Ada".into()))
             .expect("lookup inserted index entry");
@@ -1273,9 +1361,7 @@ mod tests {
             .execute("UPDATE users SET name = 'Grace' WHERE id = 1")
             .expect("SQL update");
         assert_eq!(
-            database
-                .storage_mut(TableId(1))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(1)).unwrap())
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("Ada".into()))
                 .unwrap()
@@ -1291,9 +1377,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            database
-                .storage_mut(TableId(1))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(1)).unwrap())
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("Grace".into()))
                 .unwrap()
@@ -1305,9 +1389,7 @@ mod tests {
             .execute("DELETE FROM users WHERE id = 1")
             .expect("SQL delete");
         assert_eq!(
-            database
-                .storage_mut(TableId(1))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(1)).unwrap())
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("Grace".into()))
                 .unwrap()
@@ -1325,9 +1407,7 @@ mod tests {
             .execute("UPDATE users SET name = 'shared' WHERE id >= 2")
             .expect("multi-row SQL update");
         assert_eq!(
-            database
-                .storage_mut(TableId(1))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(1)).unwrap())
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("shared".into()))
                 .unwrap()
@@ -1338,9 +1418,7 @@ mod tests {
             .execute("DELETE FROM users WHERE id >= 2")
             .expect("multi-row SQL delete");
         assert!(
-            database
-                .storage_mut(TableId(1))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(1)).unwrap())
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("shared".into()))
                 .unwrap()
@@ -1409,7 +1487,10 @@ mod tests {
             .expect("plan indexed select");
         assert_eq!(
             planned_statement_index(&select),
-            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+            Some((
+                AccessPathId(team.handle.meta_page.0),
+                &ScalarValue::Int64(10)
+            ))
         );
         assert_eq!(
             database
@@ -1427,7 +1508,10 @@ mod tests {
             .expect("plan deterministic choice");
         assert_eq!(
             planned_statement_index(&deterministic),
-            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+            Some((
+                AccessPathId(team.handle.meta_page.0),
+                &ScalarValue::Int64(10)
+            ))
         );
         assert_ne!(team.handle, name.handle);
 
@@ -1436,7 +1520,7 @@ mod tests {
             .expect("plan IS NULL");
         assert_eq!(
             planned_statement_index(&is_null),
-            Some((team.handle.meta_page, &ScalarValue::Null))
+            Some((AccessPathId(team.handle.meta_page.0), &ScalarValue::Null))
         );
         assert_eq!(
             database
@@ -1494,7 +1578,10 @@ mod tests {
             .expect("plan self-index update");
         assert_eq!(
             planned_statement_index(&update),
-            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+            Some((
+                AccessPathId(team.handle.meta_page.0),
+                &ScalarValue::Int64(10)
+            ))
         );
         assert_eq!(
             affected(
@@ -1505,9 +1592,7 @@ mod tests {
             3
         );
         assert_eq!(
-            database
-                .storage_mut(TableId(9))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(9)).unwrap())
                 .btree()
                 .lookup(team.handle, &ScalarValue::Int64(10))
                 .unwrap()
@@ -1516,9 +1601,7 @@ mod tests {
             "MVCC retains old-key candidates until vacuum"
         );
         assert_eq!(
-            database
-                .storage_mut(TableId(9))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(9)).unwrap())
                 .btree()
                 .lookup(team.handle, &ScalarValue::Int64(20))
                 .unwrap()
@@ -1538,7 +1621,10 @@ mod tests {
             .expect("plan self-index delete");
         assert_eq!(
             planned_statement_index(&delete),
-            Some((team.handle.meta_page, &ScalarValue::Int64(10)))
+            Some((
+                AccessPathId(team.handle.meta_page.0),
+                &ScalarValue::Int64(10)
+            ))
         );
         assert_eq!(
             affected(
@@ -1549,9 +1635,7 @@ mod tests {
             2
         );
         assert!(
-            database
-                .storage_mut(TableId(9))
-                .unwrap()
+            heap_storage(database.storage_mut(TableId(9)).unwrap())
                 .btree()
                 .lookup(team.handle, &ScalarValue::Int64(10))
                 .unwrap()
@@ -1573,7 +1657,10 @@ mod tests {
             .expect("plan reopened text lookup");
         assert_eq!(
             planned_statement_index(&reopened_plan),
-            Some((name.handle.meta_page, &ScalarValue::Text("Ada".into())))
+            Some((
+                AccessPathId(name.handle.meta_page.0),
+                &ScalarValue::Text("Ada".into())
+            ))
         );
         assert_eq!(
             reopened
@@ -1615,12 +1702,15 @@ mod tests {
         let source = "SELECT name FROM members WHERE team_id = 0 AND id = 42";
         assert_eq!(
             planned_statement_index(&database.plan_source(source).expect("fallback plan")),
-            Some((team.handle.meta_page, &ScalarValue::Int64(0)))
+            Some((
+                AccessPathId(team.handle.meta_page.0),
+                &ScalarValue::Int64(0)
+            ))
         );
         database.analyze(TableId(9)).expect("analyze table");
         assert_eq!(
             planned_statement_index(&database.plan_source(source).expect("costed plan")),
-            Some((id.handle.meta_page, &ScalarValue::Int64(42)))
+            Some((AccessPathId(id.handle.meta_page.0), &ScalarValue::Int64(42)))
         );
 
         assert_eq!(
@@ -1638,7 +1728,7 @@ mod tests {
                     .plan_source(stale_source)
                     .expect("stale statistics plan")
             ),
-            Some((id.handle.meta_page, &ScalarValue::Int64(1)))
+            Some((AccessPathId(id.handle.meta_page.0), &ScalarValue::Int64(1)))
         );
         assert_eq!(
             database

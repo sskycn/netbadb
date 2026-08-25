@@ -15,13 +15,13 @@ use netbadb_rel::{
     ExprKind, JoinKind, LogicalStatement, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_schema::Schema;
-use netbadb_storage::HeapStorage;
+use netbadb_storage::TableStorage;
 
 use crate::DatabaseError;
 
 pub(crate) fn catalog(
     schema: &Schema,
-    storages: &[HeapStorage],
+    storages: &[TableStorage],
 ) -> Result<CatalogInspection, DatabaseError> {
     let mut tables = Vec::with_capacity(schema.tables().len());
     for table in schema.tables() {
@@ -222,7 +222,7 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
             table_name,
             columns,
             index_column,
-            handle: _,
+            access_path: _,
             key,
         } => PlanNodeInspection::IndexScan {
             binding_id: *binding_id,
@@ -238,7 +238,7 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
             table_name,
             columns,
             index_column,
-            handle: _,
+            access_path: _,
             range,
         } => PlanNodeInspection::RangeIndexScan {
             binding_id: *binding_id,

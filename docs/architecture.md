@@ -181,8 +181,8 @@ source → AST → resolved/type-checked HIR → logical plan → physical plan
 ```
 
 HIR owns source-level resolution and semantic type checking. Relational IR
-owns relational meaning and column provenance. Core snapshots registered
-indexes into lightweight planner access paths; the planner selects exact point
+owns relational meaning and column provenance. Core snapshots each table
+storage's advertised access paths; the planner selects exact point
 IndexScan or SeqScan access and the correctness-first nested-loop
 implementation for logical INNER JOIN. The executor evaluates typed
 expressions against rows returned by storage.
@@ -222,9 +222,10 @@ PhysicalPlan::NestedLoopJoin or eligible PhysicalPlan::HashJoin
 
 Every physical node has binding-aware output columns. Expression and projection
 lookup uses `RelationBindingId + ColumnId`, which remains unambiguous for self
-joins. A scan row retains one hidden `RowId` for Phase 3B DML; a joined row
-combines scalar values and intentionally drops mutation identity because
-multi-table UPDATE/DELETE are not supported.
+joins. A scan row retains one hidden, storage-owned `StorageRowHandle` for DML;
+the current Heap implementation privately maps it to a generation-safe `RowId`.
+A joined row combines scalar values and intentionally drops mutation identity
+because multi-table UPDATE/DELETE are not supported.
 
 The planner keeps NestedLoopJoin as the general implementation. At the current
 join node it considers HashJoin only for an INNER JOIN over two direct logical
@@ -370,7 +371,7 @@ discovery order. A repeated result projection remains repeated while its base
 scan reads the source once. `COUNT(*)` can drive a zero-column scan. Phase 7R's
 executor specialization consumes that exact shape through the Heap presence
 summary, so direct all-star aggregates no longer construct one empty
-RowId-bearing execution row per live tuple.
+storage-row-handle-bearing execution row per live tuple.
 
 Join children may retain columns needed only by their own predicates. The join
 executor therefore binds the current predicate against the concrete
@@ -403,7 +404,8 @@ owned input ExecutionRows
 
 The identity path neither rebuilds each row's values Vec nor clones a
 ScalarValue. Generic projection preserves checked indexing, output order,
-duplicates, nullable/type metadata, and RowId. A repeated Text output still
+duplicates, nullable/type metadata, and the opaque `StorageRowHandle`. A
+repeated Text output still
 requires independent String owners, so the last-use rule only removes clones
 that are not semantically necessary. Join candidate materialization is
 unchanged because child rows may produce several matches; only a temporary
@@ -644,13 +646,14 @@ The hot bound evaluator receives no fields and cannot call
 errors, and AND/OR still evaluate both sides.
 
 Phase 7T makes the row-aware borrowed storage visitor authoritative. The older
-borrowed visitor is a thin wrapper that ignores RowId, and the owned visitor
-delegates through the borrowed traversal. Exact direct `Filter → SeqScan` may
+borrowed visitor is a thin wrapper that ignores mutation identity, and the
+owned visitor delegates through the borrowed traversal. Exact direct
+`Filter → SeqScan` may
 consume the row-aware boundary before child row ownership; every other Filter
 continues to receive fully owned child `ExecutionRows`:
 
 ```text
-validated live Heap row + exact RowId
+validated live Heap row + opaque StorageRowHandle
         ↓
 exact direct sequential Filter
         ↓
@@ -669,7 +672,7 @@ owned computed Bool/NULL
 own every       own nothing
 SeqScan value
   ↓
-ExecutionRow + exact RowId
+ExecutionRow + opaque StorageRowHandle
 ```
 
 Eligibility requires exact SeqScan input, unique scan source identities, every
@@ -687,13 +690,44 @@ the old owned child scan; after a successful traversal the saved predicate
 error is returned. QueryResult remains fully owned, and no page pin or borrowed
 persisted row escapes into executor state.
 
-Phase 7T is intentionally not Project-aware. TRUE owns the complete SeqScan
-row even when a parent Project drops a predicate-only Text value. UPDATE and
-DELETE select through the same path but mutate only after `execute_rows`
-succeeds; assignment evaluation, index maintenance, transactions, INSERT, Join
-algorithms, Phase 7N filtered-count precedence, planner, compiler, protocol,
-and inspection behavior are unchanged. There is no predicate pushdown,
-expression bytecode/compiler, planner rewrite, dependency, or unsafe code.
+Phase 7U adds one executor-local consumer for exact
+`Project → Filter → SeqScan`. It reuses the Phase 7T visitor, dynamic predicate
+lookup, three-valued semantics, and deferred predicate-error handling, but
+precomputes the Project's source positions once before traversal:
+
+```text
+validated complete borrowed SeqScan row
+        ↓
+dynamic Filter predicate
+       / \
+ TRUE     FALSE/UNKNOWN
+  ↓             ↓
+own only        own nothing
+Project values
+  ↓
+ExecutionRow + opaque StorageRowHandle
+```
+
+The specialization requires at least one predicate-used scan column that is
+not retained by Project. Every scan column must be used either by the
+predicate or by Project, and every Project source must resolve by
+`RelationBindingId + ColumnId`. Duplicate and reordered Project sources retain
+their exact output semantics, including independent owned Text duplicates;
+zero-width output retains the qualifying row handle with no scalar ownership.
+Unused scan columns, missing sources, duplicate/mismatched scan identities,
+nested Filter, Sort, Join, index scans, and future shapes fall back to generic
+execution.
+
+The complete persisted row is still decoded and validated before predicate
+evaluation. A retained Text value is necessarily owned at the fully owned
+QueryResult boundary; when all predicate columns are also retained, the
+specialization deliberately does not apply. UPDATE and DELETE continue to use
+the Phase 7T direct Filter path and mutate only after `execute_rows` succeeds.
+Assignment evaluation, index maintenance, transactions, INSERT, Join
+algorithms, Phase 7N filtered-count precedence, planner, compiler, Rel IR,
+PhysicalPlan, protocol, and inspection behavior are unchanged. There is no
+generic Filter prebinding, predicate pushdown, expression bytecode/compiler,
+planner rewrite, dependency, or unsafe code.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.
@@ -772,8 +806,9 @@ Logical and physical statement enums preserve that distinction. UPDATE and
 DELETE select targets through the existing sequential Scan + optional Filter
 tree rather than embedding a second predicate implementation.
 
-Execution scan tuples carry a hidden `RowId` alongside values. Projection can
-discard SQL-visible columns without manufacturing a `_rowid` feature. DML
+Execution scan tuples carry a hidden, opaque `StorageRowHandle` alongside
+values. Projection can discard SQL-visible columns without manufacturing a
+`_rowid` feature, and executor cannot inspect Heap PageId/SlotId details. DML
 collects all selected targets before mutation, avoiding scan interference when
 a page is compacted. UPDATE evaluates every assignment against the original
 row and constructs one complete replacement, so `SET a = b, b = a` swaps the
@@ -802,8 +837,10 @@ The synchronous storage path is now:
 ```text
 Executor
     ↓
-HeapStorage
-    ↘ BTree persistence orchestration
+TableStorage capability API
+    ↓
+TableStorage::Heap(HeapStorage)
+    ↘ registered BTree access methods
     ↓
 TransactionManager + WAL
     ↓
@@ -815,6 +852,22 @@ Database file
 ```
 
 `netbadb-storage` keeps the boundaries concrete and small:
+
+- `TableStorage` is the database composition boundary and currently has one
+  real variant, `Heap`. It uses static enum dispatch; there is no empty LSM or
+  Columnar placeholder and no giant `dyn StorageEngine` interface. B+Tree is
+  an access method owned by Heap, not a table-storage variant.
+- `StorageRowHandle` is an opaque, table-scoped executor mutation identity.
+  Its current private Heap representation contains the generation-safe RowId,
+  but executor, planner, Rel IR, and SQL cannot inspect PageId or SlotId.
+  `StorageReadView` and `StorageTransaction` similarly keep current Heap MVCC
+  and WAL transaction state below the table-storage boundary.
+- The capability API covers projected scans, point/range access, borrowed
+  row visitors, presence summaries, and mutation. Heap dispatch delegates
+  directly to its validated-once selective/borrowed implementations, so direct
+  COUNT and streaming Filter do not fall back to `Vec<Vec<ScalarValue>>`.
+  A future batch/chunk producer can be added as another capability without
+  replacing the current row visitor.
 
 - `PageManager` owns fixed-size file I/O, page allocation, checked page-offset
   arithmetic, and file sync. It does not interpret heap or index semantics.
@@ -1124,11 +1177,13 @@ first physical mutation; any later failure marks the transaction
 
 Logical plans remain storage-independent: query meaning is still represented
 as `Filter(Scan)`, never as a logical index operator. Core walks table storage
-order and each heap's persistent index-registration order to materialize plain
-table/index planning context. Entries contain stable IDs, handles, and optional
+order and each storage's advertised access paths to materialize plain planning
+context. Entries contain table/column identity, opaque table-scoped
+`AccessPathId`, point/range capabilities, and optional
 `TableStatistics`/`IndexStatistics` domain values. The planner depends on the
-pure `netbadb-index` domain crate, not on `netbadb-storage`, and receives no
-page, WAL, buffer, or catalog representation.
+pure `netbadb-index` domain crate for typed ranges and statistics, not on
+`netbadb-storage`, and receives no BTreeHandle, PageId, WAL, buffer, or catalog
+representation.
 
 For a Filter directly above a Scan, point access recognizes
 `indexed_column = non-NULL literal`, its commuted form, and nullable-column
@@ -1173,16 +1228,19 @@ The physical shape always retains the complete predicate:
 PhysicalPlan::Filter(original predicate)
     -> costed access selection
          -> PhysicalPlan::SeqScan
-         -> PhysicalPlan::IndexScan(registered handle, exact key)
-         -> PhysicalPlan::RangeIndexScan(registered handle, typed bounds)
+         -> PhysicalPlan::IndexScan(opaque AccessPathId, exact key)
+         -> PhysicalPlan::RangeIndexScan(opaque AccessPathId, typed bounds)
 ```
 
-Point IndexScan performs `BTree::lookup`; RangeIndexScan locates the lower leaf
-and traverses ordered `next_leaf` links until the upper endpoint. Both treat
-returned RowIds as candidates and load Heap rows through the statement's same
-ReadView. Invisible versions are skipped; a stale, missing, wrong-page, or
-corrupt locator remains an error and execution never hides it by falling back
-to SeqScan. UPDATE and DELETE therefore finish index traversal and
+Executor passes the opaque access identity and typed key/range to TableStorage.
+The current Heap variant resolves it only against its registered B+Trees; point
+lookup performs `BTree::lookup`, while range lookup locates the lower leaf and
+traverses ordered `next_leaf` links. Both treat returned RowIds as candidates,
+apply the statement's same ReadView, and return opaque `StorageRowHandle`
+values. Invisible versions are skipped; an unknown access path, stale/missing
+locator, wrong page, or corruption remains an error and execution never hides
+it by falling back to SeqScan. UPDATE and DELETE therefore finish access
+traversal and
 target materialization before maintaining the same index, avoiding iterator
 invalidation or revisiting newly inserted keys. Because the complete Filter
 remains, stale statistics can affect performance and plan shape but not query

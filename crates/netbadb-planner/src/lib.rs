@@ -2,24 +2,31 @@
 
 use std::cmp::Ordering;
 
-use netbadb_index::{
-    BTreeHandle, IndexBound, IndexRange, IndexStatistics, TableStatistics, compare_values,
-};
+use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics, compare_values};
 use netbadb_rel::{
     AggregateInput, AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind,
     LogicalPlan, LogicalStatement, OutputField, SortKey,
 };
-use netbadb_types::{ColumnId, RelationBindingId, ScalarValue, TableId};
+use netbadb_types::{AccessPathId, ColumnId, RelationBindingId, ScalarValue, TableId};
 
-/// One registered single-column lookup capability available to physical planning.
+/// Executable operations advertised by one physical access path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessPathCapabilities {
+    pub point_lookup: bool,
+    pub range_lookup: bool,
+}
+
+/// One registered single-column access capability available to physical planning.
 ///
 /// Callers preserve registration order in the slice. The planner receives
-/// immutable domain snapshots, never storage objects or catalog pages.
+/// immutable domain snapshots and an opaque table-scoped identity, never
+/// storage objects, B+Tree handles, catalog pages, or future engine internals.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexAccessPath {
+pub struct AccessPath {
     pub table_id: TableId,
     pub column_id: ColumnId,
-    pub handle: BTreeHandle,
+    pub id: AccessPathId,
+    pub capabilities: AccessPathCapabilities,
     pub statistics: Option<IndexStatistics>,
 }
 
@@ -44,7 +51,7 @@ pub enum PhysicalPlan {
         table_name: String,
         columns: Vec<ColumnRef>,
         index_column: ColumnRef,
-        handle: BTreeHandle,
+        access_path: AccessPathId,
         key: ScalarValue,
     },
     RangeIndexScan {
@@ -53,7 +60,7 @@ pub enum PhysicalPlan {
         table_name: String,
         columns: Vec<ColumnRef>,
         index_column: ColumnRef,
-        handle: BTreeHandle,
+        access_path: AccessPathId,
         range: IndexRange,
     },
     NestedLoopJoin {
@@ -144,10 +151,7 @@ pub fn plan(logical: &netbadb_rel::LogicalPlan) -> PhysicalPlan {
 /// Selects physical operators from logical meaning and an ordered snapshot of
 /// registered single-column access paths.
 #[must_use]
-pub fn plan_with_access_paths(
-    logical: &LogicalPlan,
-    access_paths: &[IndexAccessPath],
-) -> PhysicalPlan {
+pub fn plan_with_access_paths(logical: &LogicalPlan, access_paths: &[AccessPath]) -> PhysicalPlan {
     plan_with_statistics(logical, &[], access_paths)
 }
 
@@ -157,7 +161,7 @@ pub fn plan_with_access_paths(
 pub fn plan_with_statistics(
     logical: &LogicalPlan,
     table_statistics: &[TableAccessStatistics],
-    access_paths: &[IndexAccessPath],
+    access_paths: &[AccessPath],
 ) -> PhysicalPlan {
     let raw = plan_raw_with_statistics(logical, table_statistics, access_paths);
     let required = raw
@@ -171,7 +175,7 @@ pub fn plan_with_statistics(
 fn plan_raw_with_statistics(
     logical: &LogicalPlan,
     table_statistics: &[TableAccessStatistics],
-    access_paths: &[IndexAccessPath],
+    access_paths: &[AccessPath],
 ) -> PhysicalPlan {
     match logical {
         LogicalPlan::Scan {
@@ -343,7 +347,7 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             table_name,
             columns,
             index_column,
-            handle,
+            access_path,
             key,
         } => PhysicalPlan::IndexScan {
             binding_id,
@@ -351,7 +355,7 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             table_name,
             columns: prune_columns(columns, parent_required),
             index_column,
-            handle,
+            access_path,
             key,
         },
         PhysicalPlan::RangeIndexScan {
@@ -360,7 +364,7 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             table_name,
             columns,
             index_column,
-            handle,
+            access_path,
             range,
         } => PhysicalPlan::RangeIndexScan {
             binding_id,
@@ -368,7 +372,7 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             table_name,
             columns: prune_columns(columns, parent_required),
             index_column,
-            handle,
+            access_path,
             range,
         },
         PhysicalPlan::Filter { input, predicate } => {
@@ -621,7 +625,7 @@ enum IndexLookupCandidate {
 
 #[derive(Debug)]
 struct IndexCandidate<'a> {
-    access_path: &'a IndexAccessPath,
+    access_path: &'a AccessPath,
     index_column: ColumnRef,
     lookup: IndexLookupCandidate,
 }
@@ -633,33 +637,37 @@ fn choose_index_access(
     table_name: &str,
     columns: &[ColumnRef],
     table_statistics: &[TableAccessStatistics],
-    access_paths: &[IndexAccessPath],
+    access_paths: &[AccessPath],
 ) -> Option<PhysicalPlan> {
     let mut eligible = Vec::new();
     for access_path in access_paths {
         if access_path.table_id != table_id {
             continue;
         }
-        if let Some((index_column, key)) =
-            find_point_constraint(predicate, binding_id, table_id, access_path.column_id)
-        {
-            eligible.push(IndexCandidate {
-                access_path,
-                index_column,
-                lookup: IndexLookupCandidate::Point { key },
-            });
+        if access_path.capabilities.point_lookup {
+            if let Some((index_column, key)) =
+                find_point_constraint(predicate, binding_id, table_id, access_path.column_id)
+            {
+                eligible.push(IndexCandidate {
+                    access_path,
+                    index_column,
+                    lookup: IndexLookupCandidate::Point { key },
+                });
+            }
         }
-        if let Some((index_column, range, possible_integer_keys)) =
-            find_range_constraint(predicate, binding_id, table_id, access_path.column_id)
-        {
-            eligible.push(IndexCandidate {
-                access_path,
-                index_column,
-                lookup: IndexLookupCandidate::Range {
-                    range,
-                    possible_integer_keys,
-                },
-            });
+        if access_path.capabilities.range_lookup {
+            if let Some((index_column, range, possible_integer_keys)) =
+                find_range_constraint(predicate, binding_id, table_id, access_path.column_id)
+            {
+                eligible.push(IndexCandidate {
+                    access_path,
+                    index_column,
+                    lookup: IndexLookupCandidate::Range {
+                        range,
+                        possible_integer_keys,
+                    },
+                });
+            }
         }
     }
     let first_point = eligible
@@ -714,7 +722,7 @@ fn build_index_scan(
             table_name: table_name.to_owned(),
             columns: columns.to_vec(),
             index_column: candidate.index_column.clone(),
-            handle: candidate.access_path.handle,
+            access_path: candidate.access_path.id,
             key: key.clone(),
         },
         IndexLookupCandidate::Range { range, .. } => PhysicalPlan::RangeIndexScan {
@@ -723,7 +731,7 @@ fn build_index_scan(
             table_name: table_name.to_owned(),
             columns: columns.to_vec(),
             index_column: candidate.index_column.clone(),
-            handle: candidate.access_path.handle,
+            access_path: candidate.access_path.id,
             range: range.clone(),
         },
     }
@@ -1085,7 +1093,7 @@ pub fn plan_statement(logical: &LogicalStatement) -> PhysicalStatement {
 #[must_use]
 pub fn plan_statement_with_access_paths(
     logical: &LogicalStatement,
-    access_paths: &[IndexAccessPath],
+    access_paths: &[AccessPath],
 ) -> PhysicalStatement {
     plan_statement_with_statistics(logical, &[], access_paths)
 }
@@ -1096,7 +1104,7 @@ pub fn plan_statement_with_access_paths(
 pub fn plan_statement_with_statistics(
     logical: &LogicalStatement,
     table_statistics: &[TableAccessStatistics],
-    access_paths: &[IndexAccessPath],
+    access_paths: &[AccessPath],
 ) -> PhysicalStatement {
     match logical {
         LogicalStatement::Query(query) => {
@@ -1130,15 +1138,15 @@ pub fn plan_statement_with_statistics(
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexAccessPath, PhysicalPlan, PhysicalStatement, TableAccessStatistics, plan,
-        plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
+        AccessPath, AccessPathCapabilities, PhysicalPlan, PhysicalStatement, TableAccessStatistics,
+        plan, plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
         plan_with_access_paths, plan_with_statistics,
     };
-    use netbadb_index::{BTreeHandle, IndexBound, IndexRange, IndexStatistics, TableStatistics};
+    use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
     use netbadb_types::{
-        ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
-        TableId,
+        AccessPathId, ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarValue,
+        SemanticType, TableId,
     };
 
     #[test]
@@ -1766,12 +1774,14 @@ mod tests {
         }
     }
 
-    fn access_path(column_id: u32, page_id: u64) -> IndexAccessPath {
-        IndexAccessPath {
+    fn access_path(column_id: u32, page_id: u64) -> AccessPath {
+        AccessPath {
             table_id: TableId(1),
             column_id: ColumnId(column_id),
-            handle: BTreeHandle {
-                meta_page: PageId(page_id),
+            id: AccessPathId(page_id),
+            capabilities: AccessPathCapabilities {
+                point_lookup: true,
+                range_lookup: true,
             },
             statistics: None,
         }
@@ -1783,7 +1793,7 @@ mod tests {
         distinct_non_null_keys: u64,
         null_count: u64,
         tree_height: u32,
-    ) -> IndexAccessPath {
+    ) -> AccessPath {
         let mut path = access_path(column_id, page_id);
         path.statistics = Some(IndexStatistics {
             distinct_non_null_keys,
@@ -2092,9 +2102,7 @@ mod tests {
         assert!(matches!(
             index_scan_input(&mixed),
             Some(PhysicalPlan::IndexScan {
-                handle: BTreeHandle {
-                    meta_page: PageId(50)
-                },
+                access_path: AccessPathId(50),
                 ..
             })
         ));
@@ -2153,17 +2161,37 @@ mod tests {
                 index_scan_input(&physical),
                 Some(PhysicalPlan::IndexScan {
                     binding_id: RelationBindingId(7),
-                    handle,
+                    access_path,
                     key: ScalarValue::Int64(42),
                     index_column,
                     ..
-                }) if *handle == path.handle && index_column.relation_name == "u"
+                }) if *access_path == path.id && index_column.relation_name == "u"
             ));
             assert_eq!(
                 physical.output_fields(),
                 vec![netbadb_rel::OutputField::Source(id.clone())]
             );
         }
+    }
+
+    #[test]
+    fn access_path_capabilities_gate_physical_lookup_selection() {
+        let id = test_column(1, "id", false);
+        let logical = filtered_scan(
+            binary(
+                BinaryOp::Eq,
+                column_expr(&id),
+                literal(ScalarValue::Int64(42)),
+            ),
+            vec![id],
+        );
+        let mut path = access_path(1, 40);
+        path.capabilities.point_lookup = false;
+        let physical = plan_with_access_paths(&logical, &[path]);
+        assert!(matches!(
+            index_scan_input(&physical),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
     }
 
     #[test]
@@ -2276,9 +2304,7 @@ mod tests {
         assert!(matches!(
             index_scan_input(&physical),
             Some(PhysicalPlan::IndexScan {
-                handle: BTreeHandle {
-                    meta_page: PageId(50)
-                },
+                access_path: AccessPathId(50),
                 key: ScalarValue::Int64(10),
                 ..
             })
@@ -2394,9 +2420,7 @@ mod tests {
         assert!(matches!(
             index_scan_input(&cheaper_later),
             Some(PhysicalPlan::IndexScan {
-                handle: BTreeHandle {
-                    meta_page: PageId(60)
-                },
+                access_path: AccessPathId(60),
                 ..
             })
         ));
@@ -2412,9 +2436,7 @@ mod tests {
         assert!(matches!(
             index_scan_input(&tied),
             Some(PhysicalPlan::IndexScan {
-                handle: BTreeHandle {
-                    meta_page: PageId(50)
-                },
+                access_path: AccessPathId(50),
                 ..
             })
         ));
@@ -2425,9 +2447,7 @@ mod tests {
         assert!(matches!(
             index_scan_input(&partial),
             Some(PhysicalPlan::IndexScan {
-                handle: BTreeHandle {
-                    meta_page: PageId(60)
-                },
+                access_path: AccessPathId(60),
                 ..
             })
         ));
@@ -2436,9 +2456,7 @@ mod tests {
         assert!(matches!(
             index_scan_input(&only_unknown),
             Some(PhysicalPlan::IndexScan {
-                handle: BTreeHandle {
-                    meta_page: PageId(50)
-                },
+                access_path: AccessPathId(50),
                 ..
             })
         ));

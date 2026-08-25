@@ -50,7 +50,9 @@ Scan + nested-loop join + sort + grouped aggregate physical plan
     ↓
 Join / filter / sort / aggregate / projection / limit + mutation executor
     ↓
-Heap
+TableStorage capability boundary
+    ↓
+Heap row layout + registered B+Tree access methods
     ↓
 Transaction lifecycle + versioned WAL
     ↓
@@ -170,6 +172,8 @@ The current code genuinely supports:
 - typed query/DML HIR and logical relational IR;
 - deterministic registered-index point scans, sequential scans, and
   left-major/right-minor nested-loop join physical planning;
+- enum-dispatched `TableStorage` composition, opaque executor row/read/transaction
+  contexts, and access-path-neutral planner identities and capabilities;
 - synchronous heap storage with fixed 4 KiB pages;
 - version 5 slotted heap pages with persistent pageLSNs, PageId-bound full-page
   CRC32C, generation-bearing reusable tombstones, and checked bounds;
@@ -450,7 +454,9 @@ snapshots into an ordered, read-only planner context. Eligible
 `column = non-NULL literal`, commuted equality, and nullable `column IS NULL`
 predicates use exact point `IndexScan`; analyzed two-sided Int64/UInt64 bounds
 can use a costed `RangeIndexScan`;
-the executor then fetches complete Heap rows by generation-safe RowId. The
+the executor passes an opaque access-path ID to `TableStorage`, which validates
+complete Heap rows and returns storage-owned row handles; generation-safe
+`RowId` remains private to the Heap implementation. The
 original SQL Filter remains above every IndexScan. Without statistics, the
 first eligible registered index still wins. With statistics, SeqScan costs
 `managed_page_count`, point IndexScan costs
@@ -688,10 +694,13 @@ The implementation sequence is intentionally vertical:
     exact `Filter → SeqScan` evaluates the dynamic predicate over validated
     borrowed scalar views and owns the complete SeqScan row only for TRUE,
     while every other shape keeps the generic executor.
-49. Retained-column-aware Filter/Project attribution (Phase 7U) — selected,
-    not started; post-7T all-TRUE Text remains expensive because qualifying
-    rows still own predicate-only columns before the parent Project drops them.
-    Generic Filter position prebinding remains the next strong candidate.
+49. Retained-column-aware Project/Filter streaming materialization (Phase 7U)
+    — complete; exact `Project → Filter → SeqScan` evaluates over the complete
+    validated borrowed scan row but owns only Project-retained values for TRUE,
+    with conservative fallback for every other shape.
+50. Generic Filter position prebinding (Phase 7V) — selected, not started;
+    post-7U predicate-only all-TRUE Text is within 1.031x of the primitive
+    control while wide/single Int64 dynamic lookup remains 2.241x.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items.

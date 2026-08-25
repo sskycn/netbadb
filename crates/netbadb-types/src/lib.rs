@@ -17,6 +17,12 @@ id_type!(TableId, u64);
 pub struct RelationBindingId(pub u32);
 id_type!(ColumnId, u32);
 id_type!(IndexId, u64);
+/// Table-scoped opaque identity for one executable physical access path.
+///
+/// The planner may compare and copy this value but must not infer a B+Tree
+/// page, LSM structure, or columnar segment from its numeric representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccessPathId(pub u64);
 id_type!(PageId, u64);
 id_type!(FrameId, u32);
 id_type!(TxnId, u64);

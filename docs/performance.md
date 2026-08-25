@@ -976,6 +976,54 @@ ownership, group-key ownership, covering/index-only reads, broader HashJoin
 eligibility, and multi-inequality intersection remain separate candidates.
 Phase 7T implements none of those follow-ups.
 
+Phase 7U specializes exact `Project → Filter → SeqScan` inside the executor.
+The complete borrowed SeqScan row still drives dynamic predicate evaluation
+and full persisted validation. On TRUE, however, only the Project's precomputed
+source positions become owned; FALSE and UNKNOWN still own nothing. This skips
+the complete owned Filter `ExecutionRows` that Project would immediately
+discard, without changing PhysicalPlan, Inspection JSON, planner pruning, the
+Filter schema contract, or the fully owned QueryResult boundary. Shapes with
+no predicate-only scan column, including retained Text, intentionally use the
+Phase 7T/generic path.
+
+Per the requested run limit, one serial full pre run and one serial full post
+run used `/private/tmp/netbadb-phase7u-pre-target` and
+`/private/tmp/netbadb-phase7u-post-target`. The retained-all-TRUE Text scenario
+was present before the pre run. A post-change quick run used the post target;
+every exact plan, base-column, row-count, checksum, and fixed-width Text gate
+passed. No extra full rerun was performed. Full-run medians in milliseconds
+were:
+
+| scenario | pre | post | post/pre | change |
+| --- | ---: | ---: | ---: | ---: |
+| all-TRUE predicate-only Text | 1.292270 | 0.924291 | 0.715x | -28.5% |
+| all-TRUE Int64 | 0.827728 | 0.896187 | 1.083x | +8.3% |
+| all-TRUE retained Text | 0.952895 | 1.003125 | 1.053x | +5.3% |
+| selective hidden Text equality | 0.772958 | 0.776166 | 1.004x | +0.4% |
+| selective hidden Int64 equality | 0.758854 | 0.706167 | 0.931x | -6.9% |
+| selective owned Text output | 0.746749 | 0.760812 | 1.019x | +1.9% |
+| hidden wide dynamic lookup | 1.463499 | 1.582333 | 1.081x | +8.1% |
+| specialized filtered-count Text equality | 0.702583 | 0.731021 | 1.040x | observational |
+| direct COUNT(*) | 0.554562 | 0.543896 | 0.981x | observational |
+| direct COUNT(id) | 0.580104 | 0.581833 | 1.003x | observational |
+| direct COUNT(payload) | 0.605062 | 0.572146 | 0.946x | observational |
+
+The predicate-only all-TRUE Text/Int64 ratio contracted from 1.561x to
+1.031x, and predicate-only all-TRUE/selective Text contracted from 1.672x to
+1.191x. In contrast, retained Text/Int64 remained 1.151x/1.119x, and the
+retained Text control did not share the target's improvement. This directly
+attributes the target reduction to avoiding ownership of qualified
+predicate-only Text, not to borrowing output Text. The wide/single Int64 ratio
+remained high and expanded from 1.929x to 2.241x. These one-run wall-clock
+values have no timing threshold.
+
+The post baseline therefore stops the Filter ownership line and selects
+generic Filter position prebinding for Phase 7V; it is not implemented here.
+Sequential PageManager traversal, BufferPool page snapshot cloning, AND/OR
+short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
+reads, broader HashJoin eligibility, and multi-inequality intersection remain
+later measured candidates. Phase 7U adds no dependency or unsafe code.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -991,6 +1039,7 @@ format. At completion of Phases 7N and 7O, Canonical Schema v1, Heap metadata v3
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
 encoding unchanged. Phases 7P through 7T retain those contracts as well as
 Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
-QueryResult rows. The later MVCC phase deliberately advances Heap metadata to
-v4 and adds tuple/status formats; it does not invalidate these performance-path
-results. These phases add no dependency and no unsafe code.
+QueryResult rows. Phase 7U retains those contracts as well. The later MVCC
+phase deliberately advances Heap metadata to v4 and adds tuple/status formats;
+it does not invalidate these performance-path results. These phases add no
+dependency and no unsafe code.

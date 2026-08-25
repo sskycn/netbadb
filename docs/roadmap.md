@@ -969,21 +969,42 @@ reporting.
   persistent formats are unchanged. QueryResult remains fully owned; no
   dependency or unsafe code was added.
 
-### Phase 7U — Retained-column-aware Filter/Project attribution (selected, not started)
+### Phase 7U — Retained-column-aware Project/Filter streaming materialization (complete)
 
-Post-7T selective Text/Int equality is 1.102x, while the all-TRUE Text/Int
-control remains 1.566x and all-TRUE Text is 1.680x selective Text. This points
-first to qualifying rows owning predicate-only Text that the parent Project
-immediately drops. Phase 7U therefore investigates retained-column-aware
-Filter/Project materialization without weakening the Filter output-schema or
-fully owned QueryResult contracts.
+- the executor specializes only exact `Project → Filter → SeqScan` when at
+  least one predicate-used scan column is not retained and every scan column
+  is used by either Filter or Project. Malformed, unused, duplicate scan, and
+  non-sequential shapes retain the generic path;
+- Filter still evaluates dynamically over the complete validated borrowed
+  SeqScan row. FALSE and UNKNOWN own nothing; TRUE owns only source positions
+  retained by Project. Duplicate, reordered, and zero-width outputs preserve
+  their exact row and ownership semantics;
+- the Phase 7T visitor and predicate/storage error ordering are unchanged.
+  Retained Text remains owned at the QueryResult boundary, and a shape with no
+  predicate-only column intentionally falls back;
+- planner, compiler, Rel IR, PhysicalPlan, inspection, protocol, SDK, and
+  persistent formats are unchanged. No dependency, unsafe code, generic
+  expression prebinding, or new physical operator was added.
 
-Generic Filter position prebinding remains the next strong candidate because
-wide/single Int64 is still 2.058x. After those candidates, the measured order
-is sequential PageManager traversal, BufferPool page snapshot cloning,
-AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
-covering/index-only reads, broader HashJoin eligibility, and
-multi-inequality intersection. Phase 7U is not implemented in Phase 7T.
+One isolated full pre/post run changed the all-TRUE predicate-only Text target
+from 1.292270 to 0.924291 ms, contracting its ratio to the all-TRUE Int64
+control from 1.561x to 1.031x. The retained Text control changed from 0.952895
+to 1.003125 ms and therefore did not share that target-level improvement.
+Every benchmark correctness gate passed; there is no timing threshold and no
+extra full run was performed.
+
+### Phase 7V — Generic Filter position prebinding (selected, not started)
+
+Phase 7U ends the Filter ownership line: predicate-only all-TRUE Text is now
+close to the primitive control, while retained Text is necessary QueryResult
+ownership. The wide/single Int64 dynamic-lookup ratio remains 2.241x after
+Phase 7U, so binding generic Filter Column identities to checked source
+positions once is the strongest next measured candidate.
+
+Phase 7V is not implemented here. Later candidates remain sequential
+PageManager traversal, BufferPool page snapshot cloning, AND/OR
+short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
+reads, broader HashJoin eligibility, and multi-inequality intersection.
 
 ### Later Phase 7 work
 
@@ -991,3 +1012,40 @@ multi-inequality intersection. Phase 7U is not implemented in Phase 7T.
 - predicate rewrites and property inference;
 - broader join ordering and algorithms;
 - benchmarks before introducing complexity.
+
+## Phase 8 — Multi-Storage Engine Foundation (complete)
+
+- Core composes `Vec<TableStorage>` rather than `Vec<HeapStorage>`; the only
+  implemented layout variant is `TableStorage::Heap`;
+- B+Tree remains a registered Heap access method and is not modeled as a table
+  storage engine;
+- executor-facing projected scan, point/range access, borrowed visitor,
+  presence/count summary, and mutation capabilities preserve every Phase 7
+  Heap specialization through direct enum delegation;
+- `StorageRowHandle` carries storage-owned mutation identity without exposing
+  Heap PageId/SlotId to executor, planner, SQL, or relational IR. Heap RowId
+  remains the checked generation-safe physical locator inside Heap and B+Tree;
+- `StorageReadView` and `StorageTransaction` reserve database-facing context
+  boundaries while delegating to the already implemented Heap MVCC and
+  physical WAL transaction machinery;
+- Planner consumes ordered `AccessPath` snapshots containing table/column IDs,
+  opaque table-scoped `AccessPathId`, point/range capabilities, and optional
+  statistics. Physical index plans no longer carry `BTreeHandle`;
+- Heap point/range execution resolves opaque IDs against registered access
+  methods and reuses the same MVCC candidate validation as SeqScan;
+- architecture tests cover enum dispatch, capability planning, point/range
+  execution, borrowed/presence fast paths, cross-storage context rejection,
+  transaction rollback, and stale Heap locator protection.
+
+This phase adds no LSM or Columnar implementation, fake placeholder, vectorized
+executor, or new async runtime. It does not change Heap metadata v4, MVCC tuple
+v1, transaction-status v1, Page v5, BTree/IndexCatalog payloads, WAL v3/record
+v2, Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, or SQL
+semantics. The prompt's earlier “no MVCC yet” premise was superseded by the
+already completed single-writer MVCC phase; Phase 8 preserves that behavior and
+only moves it behind storage-owned contexts.
+
+The next storage-engine phase should add one concrete second layout only when
+its real row identity, transaction context, scan capabilities, persistence, and
+recovery model are specified. Batch/chunk execution remains a separate measured
+executor phase rather than a prerequisite for this boundary.

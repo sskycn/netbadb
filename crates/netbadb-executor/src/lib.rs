@@ -10,8 +10,11 @@ use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
-use netbadb_storage::{HeapStorage, PresenceCountSummary, ReadView, StorageError, Transaction};
-use netbadb_types::{ColumnId, RelationBindingId, RowId, ScalarRef, ScalarValue, TableId};
+use netbadb_storage::{
+    PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
+    TableStorage,
+};
+use netbadb_types::{ColumnId, RelationBindingId, ScalarRef, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
@@ -115,28 +118,28 @@ impl From<StorageError> for ExecutionError {
 
 pub fn execute(
     plan: &PhysicalPlan,
-    storage: &mut HeapStorage,
+    storage: &mut TableStorage,
 ) -> Result<QueryResult, ExecutionError> {
     execute_with_storages(plan, std::slice::from_mut(storage))
 }
 
-/// Executes a read-only physical query against the table heaps in `storages`.
-/// Each planned `TableId` must have exactly one corresponding heap.
+/// Executes a read-only physical query through table-storage capabilities.
+/// Each planned `TableId` must have exactly one corresponding storage.
 pub fn execute_with_storages(
     plan: &PhysicalPlan,
-    storages: &mut [HeapStorage],
+    storages: &mut [TableStorage],
 ) -> Result<QueryResult, ExecutionError> {
     let read_views = storages
         .iter()
-        .map(HeapStorage::read_view)
+        .map(TableStorage::read_view)
         .collect::<Result<Vec<_>, _>>()?;
     execute_with_read_views(plan, storages, &read_views)
 }
 
 pub fn execute_with_read_views(
     plan: &PhysicalPlan,
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<QueryResult, ExecutionError> {
     let result = execute_rows_with_views(plan, storages, read_views)?;
     Ok(QueryResult {
@@ -155,8 +158,8 @@ pub fn execute_with_read_views(
 
 pub fn execute_statement(
     statement: &PhysicalStatement,
-    storage: &mut HeapStorage,
-    transaction: Option<&mut Transaction>,
+    storage: &mut TableStorage,
+    transaction: Option<&mut StorageTransaction>,
 ) -> Result<ExecutionResult, ExecutionError> {
     let mut transaction = transaction;
     let read_view = match transaction.as_deref_mut() {
@@ -228,7 +231,7 @@ pub fn execute_statement(
 
 #[derive(Debug)]
 struct ExecutionRow {
-    row_id: Option<RowId>,
+    row_id: Option<StorageRowHandle>,
     values: Vec<ScalarValue>,
 }
 
@@ -333,19 +336,19 @@ fn project_join_values(
 #[cfg(test)]
 fn execute_rows(
     plan: &PhysicalPlan,
-    storages: &mut [HeapStorage],
+    storages: &mut [TableStorage],
 ) -> Result<ExecutionRows, ExecutionError> {
     let views = storages
         .iter()
-        .map(HeapStorage::read_view)
+        .map(TableStorage::read_view)
         .collect::<Result<Vec<_>, _>>()?;
     execute_rows_with_views(plan, storages, &views)
 }
 
 fn execute_rows_with_views(
     plan: &PhysicalPlan,
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<ExecutionRows, ExecutionError> {
     match plan {
         PhysicalPlan::SeqScan {
@@ -373,7 +376,7 @@ fn execute_rows_with_views(
         PhysicalPlan::IndexScan {
             table_id,
             columns,
-            handle,
+            access_path,
             key,
             ..
         } => {
@@ -383,20 +386,14 @@ fn execute_rows_with_views(
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
-            let row_ids = storage.btree().lookup(*handle, key)?;
-            let rows = row_ids
+            let rows = storage
+                .point_lookup_columns_with_view(*access_path, key, &column_ids, view)?
                 .into_iter()
-                .filter_map(|row_id| {
-                    match storage.read_row_columns_with_view(row_id, &column_ids, view) {
-                        Ok(Some(values)) => Some(Ok(ExecutionRow {
-                            row_id: Some(row_id),
-                            values,
-                        })),
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error.into())),
-                    }
+                .map(|(row_id, values)| ExecutionRow {
+                    row_id: Some(row_id),
+                    values,
                 })
-                .collect::<Result<Vec<_>, ExecutionError>>()?;
+                .collect();
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
@@ -405,7 +402,7 @@ fn execute_rows_with_views(
         PhysicalPlan::RangeIndexScan {
             table_id,
             columns,
-            handle,
+            access_path,
             range,
             ..
         } => {
@@ -415,20 +412,14 @@ fn execute_rows_with_views(
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
-            let row_ids = storage.btree().lookup_range(*handle, range)?;
-            let rows = row_ids
+            let rows = storage
+                .range_lookup_columns_with_view(*access_path, range, &column_ids, view)?
                 .into_iter()
-                .filter_map(|row_id| {
-                    match storage.read_row_columns_with_view(row_id, &column_ids, view) {
-                        Ok(Some(values)) => Some(Ok(ExecutionRow {
-                            row_id: Some(row_id),
-                            values,
-                        })),
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error.into())),
-                    }
+                .map(|(row_id, values)| ExecutionRow {
+                    row_id: Some(row_id),
+                    values,
                 })
-                .collect::<Result<Vec<_>, ExecutionError>>()?;
+                .collect();
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
@@ -953,8 +944,8 @@ fn streaming_seq_filter_eligibility<'a>(
 fn try_execute_streaming_seq_filter(
     input: &PhysicalPlan,
     predicate: &Expr,
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = streaming_seq_filter_eligibility(input, predicate) else {
         return Ok(None);
@@ -1026,8 +1017,8 @@ fn projected_streaming_seq_filter_eligibility<'a>(
 fn try_execute_projected_streaming_seq_filter(
     input: &PhysicalPlan,
     project_columns: &[ColumnRef],
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = projected_streaming_seq_filter_eligibility(input, project_columns) else {
         return Ok(None);
@@ -1046,8 +1037,8 @@ fn execute_streaming_seq_filter_with_projection(
     plan: &StreamingSeqFilterPlan<'_>,
     output_positions: &[usize],
     output_fields: Vec<OutputField>,
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<ExecutionRows, ExecutionError> {
     let predicate_fields = plan
         .columns
@@ -1073,7 +1064,7 @@ fn execute_streaming_seq_filter_with_projection(
                 plan.predicate,
                 &predicate_fields,
                 output_positions,
-                row_id,
+                Some(row_id),
                 values,
                 &mut rows,
                 &mut pending_predicate_error,
@@ -1094,7 +1085,7 @@ fn collect_streaming_filter_row(
     predicate: &Expr,
     predicate_fields: &[OutputField],
     output_positions: &[usize],
-    row_id: RowId,
+    row_id: Option<StorageRowHandle>,
     values: &[ScalarRef<'_>],
     rows: &mut Vec<ExecutionRow>,
     pending_predicate_error: &mut Option<ExecutionError>,
@@ -1115,10 +1106,7 @@ fn collect_streaming_filter_row(
                 })
                 .collect::<Result<Vec<_>, _>>();
             match projected_values {
-                Ok(values) => rows.push(ExecutionRow {
-                    row_id: Some(row_id),
-                    values,
-                }),
+                Ok(values) => rows.push(ExecutionRow { row_id, values }),
                 Err(error) => *pending_predicate_error = Some(error),
             }
         }
@@ -1321,8 +1309,8 @@ fn try_execute_filtered_counts(
     input: &PhysicalPlan,
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = filtered_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
@@ -1409,8 +1397,8 @@ fn try_execute_direct_counts(
     input: &PhysicalPlan,
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
-    storages: &mut [HeapStorage],
-    read_views: &[ReadView],
+    storages: &mut [TableStorage],
+    read_views: &[StorageReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = direct_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
@@ -1730,9 +1718,9 @@ fn finalize_aggregate_state(state: AggregateState) -> ScalarValue {
 }
 
 fn storage_for_table(
-    storages: &mut [HeapStorage],
+    storages: &mut [TableStorage],
     table_id: TableId,
-) -> Result<&mut HeapStorage, ExecutionError> {
+) -> Result<&mut TableStorage, ExecutionError> {
     storages
         .iter_mut()
         .find(|storage| storage.table().id == table_id)
@@ -1740,10 +1728,10 @@ fn storage_for_table(
 }
 
 fn read_view_for_table<'a>(
-    storages: &[HeapStorage],
-    read_views: &'a [ReadView],
+    storages: &[TableStorage],
+    read_views: &'a [StorageReadView],
     table_id: TableId,
-) -> Result<&'a ReadView, ExecutionError> {
+) -> Result<&'a StorageReadView, ExecutionError> {
     let position = storages
         .iter()
         .position(|storage| storage.table().id == table_id)
@@ -1751,7 +1739,7 @@ fn read_view_for_table<'a>(
     read_views.get(position).ok_or(ExecutionError::TypeMismatch)
 }
 
-fn ensure_table(table_id: TableId, storage: &HeapStorage) -> Result<(), ExecutionError> {
+fn ensure_table(table_id: TableId, storage: &TableStorage) -> Result<(), ExecutionError> {
     let storage_table_id = storage.table().id;
     if table_id != storage_table_id {
         return Err(ExecutionError::TableMismatch {
@@ -1765,7 +1753,7 @@ fn ensure_table(table_id: TableId, storage: &HeapStorage) -> Result<(), Executio
 fn build_replacements(
     input: &ExecutionRows,
     assignments: &[Assignment],
-) -> Result<Vec<(RowId, Vec<ScalarValue>)>, ExecutionError> {
+) -> Result<Vec<(StorageRowHandle, Vec<ScalarValue>)>, ExecutionError> {
     input
         .rows
         .iter()
@@ -2780,7 +2768,8 @@ mod tests {
         update_filtered_count_summary,
     };
     use netbadb_planner::{
-        IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
+        AccessPath, AccessPathCapabilities, PhysicalPlan, TableAccessStatistics, plan,
+        plan_with_statistics,
     };
     use netbadb_rel::{
         AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
@@ -2788,10 +2777,12 @@ mod tests {
         SortKey, UnaryOp,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_storage::{HeapStorage, IndexStatistics, PresenceCountSummary, TableStatistics};
+    use netbadb_storage::{
+        IndexStatistics, PresenceCountSummary, StorageRowHandle, TableStatistics, TableStorage,
+    };
     use netbadb_types::{
-        ColumnId, ExprType, PageId, PhysicalType, RelationBindingId, RowId, ScalarRef, ScalarValue,
-        SemanticType, TableId,
+        ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, SemanticType,
+        TableId,
     };
 
     fn text_pointer(value: &ScalarValue) -> *const u8 {
@@ -2808,15 +2799,43 @@ mod tests {
         }
     }
 
+    fn test_storage_row_handle(case: &str) -> StorageRowHandle {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-executor-row-handle-{case}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(netbadb_storage::txn_status_path(&path));
+        let _ = std::fs::remove_file(&path);
+        let table = TableDef::new(
+            TableId(999),
+            "row_handle",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "value",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        );
+        let mut storage = TableStorage::create_heap(&path, table).expect("create row handle heap");
+        let row = storage
+            .insert(&[ScalarValue::Int64(1)])
+            .expect("insert row handle");
+        storage.close().expect("close row handle heap");
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(netbadb_storage::txn_status_path(&path));
+        let _ = std::fs::remove_file(path);
+        row
+    }
+
     #[test]
     fn projection_identity_moves_the_complete_row_without_rebuilding_values() {
         let text = String::from("payload");
         let pointer = text.as_ptr();
-        let row_id = RowId {
-            page: PageId(7),
-            slot: 2,
-            generation: 3,
-        };
+        let row_id = test_storage_row_handle("identity");
         let row = ExecutionRow {
             row_id: Some(row_id),
             values: vec![ScalarValue::Text(text)],
@@ -2911,12 +2930,8 @@ mod tests {
             vec![ScalarValue::Int64(7), ScalarValue::Int64(7)]
         );
 
-        let row_id = RowId {
-            page: PageId(8),
-            slot: 1,
-            generation: 4,
-        };
         let empty = ProjectionPlan::from_positions(1, Vec::new()).expect("empty plan");
+        let row_id = test_storage_row_handle("empty-projection");
         let projected = project_execution_row(
             ExecutionRow {
                 row_id: Some(row_id),
@@ -2955,7 +2970,7 @@ mod tests {
             ],
         );
         let path = std::env::temp_dir().join(format!("netbadb-executor-{}", std::process::id()));
-        let mut storage = HeapStorage::create(&path, table).expect("create heap");
+        let mut storage = TableStorage::create_heap(&path, table).expect("create heap");
         let first_row_id = storage
             .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
             .expect("insert");
@@ -3124,7 +3139,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let mut storage = HeapStorage::create(&path, table).expect("create empty heap");
+        let mut storage = TableStorage::create_heap(&path, table).expect("create empty heap");
         let column = |column_id: u32, name: &str, physical: PhysicalType| ColumnRef {
             binding_id: RelationBindingId(0),
             table_id: TableId(1),
@@ -3191,7 +3206,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let mut storage = HeapStorage::create(&path, table).expect("create indexed heap");
+        let mut storage = TableStorage::create_heap(&path, table).expect("create indexed heap");
         let first = storage
             .insert(&[
                 ScalarValue::Int64(1),
@@ -3213,9 +3228,10 @@ mod tests {
                 ScalarValue::Bool(true),
             ])
             .expect("insert other key");
-        let definition = storage
+        storage
             .create_index(ColumnId(2))
             .expect("create team index");
+        let access_path = storage.access_paths()[0].id;
 
         let columns = [
             (1, "id", PhysicalType::Int64),
@@ -3238,7 +3254,7 @@ mod tests {
             table_name: "users".into(),
             columns: columns.clone(),
             index_column: columns[1].clone(),
-            handle: definition.handle,
+            access_path,
             key: ScalarValue::UInt64(10),
         };
 
@@ -3313,10 +3329,14 @@ mod tests {
                     managed_page_count: 100,
                 }),
             }],
-            &[IndexAccessPath {
+            &[AccessPath {
                 table_id: TableId(101),
                 column_id: ColumnId(2),
-                handle: definition.handle,
+                id: access_path,
+                capabilities: AccessPathCapabilities {
+                    point_lookup: true,
+                    range_lookup: true,
+                },
                 statistics: Some(IndexStatistics {
                     distinct_non_null_keys: 10_000,
                     null_count: 0,
@@ -5225,10 +5245,10 @@ mod tests {
                 )
             };
             let mut left_storage =
-                HeapStorage::create(&left_path, table(left_table_id, "left_rows"))
+                TableStorage::create_heap(&left_path, table(left_table_id, "left_rows"))
                     .expect("create left heap");
             let mut right_storage =
-                HeapStorage::create(&right_path, table(right_table_id, "right_rows"))
+                TableStorage::create_heap(&right_path, table(right_table_id, "right_rows"))
                     .expect("create right heap");
             let (first_key, second_key) = key_values(physical);
             for row in [
@@ -5469,7 +5489,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let mut storage = HeapStorage::create(&path, table).expect("create heap");
+        let mut storage = TableStorage::create_heap(&path, table).expect("create heap");
         for row in [
             vec![
                 ScalarValue::Int64(1),
@@ -5636,7 +5656,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let mut storage = HeapStorage::create(&path, table).expect("create grouped heap");
+        let mut storage = TableStorage::create_heap(&path, table).expect("create grouped heap");
         for row in [
             vec![ScalarValue::Int64(20), ScalarValue::Int64(1)],
             vec![ScalarValue::Int64(10), ScalarValue::Int64(2)],
@@ -5852,14 +5872,10 @@ mod tests {
                 nullable,
             },
         };
-        let row_id = RowId {
-            page: PageId(4),
-            slot: 3,
-            generation: 9,
-        };
         let text = String::from("qualified");
         let original_pointer = text.as_ptr();
         let values = [ScalarRef::Int64(7), ScalarRef::Text(&text)];
+        let row_id = test_storage_row_handle("streaming-filter");
         let mut rows = Vec::new();
         let mut pending = None;
 
@@ -5867,7 +5883,7 @@ mod tests {
             &predicate(ScalarValue::Bool(false), false),
             &fields,
             &[0, 1],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5876,7 +5892,7 @@ mod tests {
             &predicate(ScalarValue::Null, true),
             &fields,
             &[0, 1],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5888,7 +5904,7 @@ mod tests {
             &predicate(ScalarValue::Bool(true), false),
             &fields,
             &[0, 1],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5906,7 +5922,7 @@ mod tests {
             &predicate(ScalarValue::Bool(true), false),
             &fields,
             &[0],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5919,7 +5935,7 @@ mod tests {
             &predicate(ScalarValue::Bool(true), false),
             &fields,
             &[1, 0, 1],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5944,7 +5960,7 @@ mod tests {
             &predicate(ScalarValue::Bool(true), false),
             &fields,
             &[],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5963,7 +5979,7 @@ mod tests {
             },
             &fields,
             &[0, 1],
-            row_id,
+            Some(row_id),
             &values,
             &mut rows,
             &mut pending,
@@ -5973,7 +5989,7 @@ mod tests {
             &predicate(ScalarValue::Bool(true), false),
             &[],
             &[],
-            row_id,
+            Some(row_id),
             &[],
             &mut rows,
             &mut pending,
@@ -6848,7 +6864,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let mut storage = HeapStorage::create(&path, table).expect("create heap");
+        let mut storage = TableStorage::create_heap(&path, table).expect("create heap");
         storage
             .insert(&[
                 ScalarValue::Int64(i64::MAX),

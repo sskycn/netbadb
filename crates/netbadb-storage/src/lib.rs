@@ -8,6 +8,7 @@ mod heap;
 mod mvcc;
 mod page;
 mod recovery;
+mod table;
 mod transaction;
 mod txn_status;
 mod wal;
@@ -22,6 +23,10 @@ pub use page::{
     PageType, SLOT_SIZE, Slot, SlotRef, SlotState,
 };
 pub use recovery::RecoveryError;
+pub use table::{
+    AccessPathCapabilities, StorageAccessPath, StorageReadView, StorageRowHandle,
+    StorageTransaction, TableStorage,
+};
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
 pub use wal::{
@@ -34,7 +39,7 @@ use std::fmt;
 
 use netbadb_index::IndexError;
 use netbadb_schema::{SchemaError, SchemaFingerprint};
-use netbadb_types::{PageId, PhysicalType, SlotId, TableId};
+use netbadb_types::{AccessPathId, PageId, PhysicalType, SlotId, TableId};
 
 /// Errors raised while validating or mutating a raw database page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,6 +504,14 @@ pub enum StorageError {
     },
     InvalidMvccHeader(&'static str),
     UnsupportedTupleVersion(u16),
+    StorageContextMismatch {
+        expected: TableId,
+        actual: TableId,
+    },
+    UnknownAccessPath {
+        table_id: TableId,
+        access_path: AccessPathId,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -579,6 +592,19 @@ impl fmt::Display for StorageError {
             Self::UnsupportedTupleVersion(version) => {
                 write!(formatter, "unsupported MVCC tuple version {version}")
             }
+            Self::StorageContextMismatch { expected, actual } => write!(
+                formatter,
+                "storage context belongs to table {}, expected table {}",
+                actual.0, expected.0
+            ),
+            Self::UnknownAccessPath {
+                table_id,
+                access_path,
+            } => write!(
+                formatter,
+                "table {} has no registered access path {}",
+                table_id.0, access_path.0
+            ),
         }
     }
 }
