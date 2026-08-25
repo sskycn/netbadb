@@ -772,6 +772,48 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "hidden_filter_payload_is_not_null",
+        rows,
+        "SELECT id FROM items WHERE payload IS NOT NULL",
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_id_is_not_null_all",
+        rows,
+        "SELECT id FROM items WHERE id IS NOT NULL",
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_owned_text_output",
+        rows,
+        &format!("SELECT payload FROM items WHERE id = {middle}"),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        |result| single_payload_observation(result, middle),
+        measurements,
+    )?;
+    run_attribution_query(
         "hidden_filter_payload_repeated",
         rows,
         &format!(
@@ -2132,6 +2174,24 @@ fn payload_observation(result: &QueryResult) -> BenchResult<Observation> {
         rows: u64::try_from(result.rows.len())
             .map_err(|_| message_error("result row count exceeds u64"))?,
         checksum,
+    })
+}
+
+fn single_payload_observation(result: &QueryResult, expected_id: u64) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("expected exactly one payload row"));
+    };
+    let [ScalarValue::Text(payload)] = row.as_slice() else {
+        return Err(message_error(
+            "single payload query must return one non-NULL Text column",
+        ));
+    };
+    let expected_id = usize::try_from(expected_id)
+        .map_err(|_| message_error("expected payload ID exceeds usize"))?;
+    validate_payload(expected_id, payload)?;
+    Ok(Observation {
+        rows: 1,
+        checksum: expected_id as u128,
     })
 }
 

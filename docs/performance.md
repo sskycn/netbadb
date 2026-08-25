@@ -20,7 +20,9 @@ rows. Phase 7O then removes dynamic evaluator leaf clones only inside that
 filtered-count consumer. Phase 7P keeps predicate Text borrowed from the
 validated Heap payload through that synchronous callback, while deliberately
 retaining dynamic column lookup and fully owned generic Filter/QueryResult
-boundaries. The target uses
+boundaries. Phase 7S rolls the borrowed dynamic evaluator into generic Filter,
+and Phase 7T streams exact direct sequential Filters over borrowed validated
+rows so rejected rows are never owned. The target uses
 `std::time::Instant` and `std::hint::black_box`, and Cargo builds it with the
 optimized bench profile.
 
@@ -917,6 +919,63 @@ and multi-inequality intersection remain separate candidates. Phase 7S adds no
 streaming, prebinding, storage visitor, predicate pushdown, dependency, unsafe
 code, or compatibility change.
 
+Phase 7T adds one authoritative row-aware sibling to the borrowed Heap visitor.
+It yields the live slot's exact `RowId` plus ordered borrowed `ScalarRef` values
+after complete persisted-row validation. Scratch storage remains per validated
+page, the HRTB callback prevents a row borrow from escaping, the old borrowed
+visitor ignores RowId through a thin wrapper, and the owned visitor continues
+to delegate to borrowed traversal.
+
+The executor consumes this boundary only for exact `Filter → SeqScan` with
+unique, binding/table-consistent scan identities and every predicate identity
+present in the scan output. It retains dynamic `find_source_position` lookup
+on every Column leaf. FALSE and UNKNOWN own nothing; TRUE materializes every
+SeqScan column and the exact RowId before returning to the existing parent.
+This is intentionally not Filter/Project fusion: a predicate-only Text column
+is still owned for a qualifying row even when Project immediately drops it.
+All other physical shapes and malformed identities fall back to the prior
+generic executor. Storage validation also retains priority over an earlier
+predicate error by completing the scan before returning the saved first error.
+
+Per the requested run limit, one serial full pre run and one serial full post
+run used separate `/private/tmp/netbadb-phase7t-pre-target` and
+`/private/tmp/netbadb-phase7t-post-target` directories. A post-change quick run
+used the post target and passed every exact plan, result, base-column, and
+checksum gate. Full-run medians in milliseconds were:
+
+| scenario | pre | post | post/pre | change |
+| --- | ---: | ---: | ---: | ---: |
+| hidden Text equality | 1.172708 | 0.771625 | 0.658x | -34.2% |
+| hidden Int64 equality | 0.891999 | 0.700458 | 0.785x | -21.5% |
+| hidden Text IS NULL | 1.089500 | 0.695416 | 0.638x | -36.2% |
+| hidden Int64 IS NULL | 0.838041 | 0.650563 | 0.776x | -22.4% |
+| hidden repeated Text | 1.351271 | 0.962791 | 0.713x | -28.7% |
+| hidden repeated Int64 | 1.062854 | 0.881395 | 0.829x | -17.1% |
+| hidden wide dynamic lookup | 1.652646 | 1.441604 | 0.872x | -12.8% |
+| all-TRUE hidden Text | 1.205125 | 1.296416 | 1.076x | +7.6% |
+| all-TRUE hidden Int64 | 0.740396 | 0.827771 | 1.118x | +11.8% |
+| selective owned Text output | 1.155479 | 0.737333 | 0.638x | -36.2% |
+| specialized filtered-count Text equality | 0.744812 | 0.712458 | 0.957x | observational |
+| direct COUNT(*) | 0.554833 | 0.546521 | 0.985x | observational |
+| direct COUNT(id) | 0.604021 | 0.597542 | 0.989x | observational |
+| direct COUNT(payload) | 0.592792 | 0.564624 | 0.952x | observational |
+
+Text/Int equality contracted from 1.315x to 1.102x and Text/Int IS NULL from
+1.300x to 1.069x, strongly attributing the selective improvements to avoiding
+ownership for rejected rows. The all-TRUE Text/Int ratio remains 1.566x and
+all-TRUE/selective Text expanded from 1.028x to 1.680x because every qualified
+row must still own predicate-only Text. Wide/single Int64 also remains 2.058x.
+These one-run wall-clock values have no timing threshold.
+
+The post baseline therefore selects retained-column-aware Filter/Project
+materialization for Phase 7U investigation; it targets qualified predicate-only
+columns without changing this phase's Filter schema contract. Generic Filter
+position prebinding remains the next strong candidate. Sequential PageManager
+traversal, BufferPool page snapshot cloning, AND/OR short-circuiting, MIN/MAX
+ownership, group-key ownership, covering/index-only reads, broader HashJoin
+eligibility, and multi-inequality intersection remain separate candidates.
+Phase 7T implements none of those follow-ups.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -930,6 +989,6 @@ change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
-encoding unchanged. Phases 7P through 7S retain those contracts as well as
+encoding unchanged. Phases 7P through 7T retain those contracts as well as
 Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
 QueryResult rows. These phases add no dependency and no unsafe code.

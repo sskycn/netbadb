@@ -643,18 +643,20 @@ The hot bound evaluator receives no fields and cannot call
 `RelationBindingId + ColumnId`, missing fields and short rows remain typed
 errors, and AND/OR still evaluate both sides.
 
-Only Phase 7N uses the borrowed storage visitor. Generic PhysicalPlan Filter
-continues to receive fully owned child `ExecutionRows`; Phase 7S changes only
-how its predicate views those already-owned values:
+Phase 7T makes the row-aware borrowed storage visitor authoritative. The older
+borrowed visitor is a thin wrapper that ignores RowId, and the owned visitor
+delegates through the borrowed traversal. Exact direct `Filter → SeqScan` may
+consume the row-aware boundary before child row ownership; every other Filter
+continues to receive fully owned child `ExecutionRows`:
 
 ```text
-owned child ExecutionRows
+validated live Heap row + exact RowId
         ↓
-generic Filter
+exact direct sequential Filter
         ↓
 dynamic find_source_position per Column leaf
         ↓
-ScalarRef view of owned row value or Expr literal
+borrowed persisted ScalarRef or Expr literal
         ↓
 borrowed Column/Literal leaves
         ↓
@@ -664,18 +666,34 @@ owned computed Bool/NULL
        / \
  TRUE     FALSE/UNKNOWN
   ↓             ↓
-move original   drop row
-ExecutionRow
+own every       own nothing
+SeqScan value
+  ↓
+ExecutionRow + exact RowId
 ```
 
+Eligibility requires exact SeqScan input, unique scan source identities, every
+scan identity to match its binding and table, and every predicate identity to
+be present in the scan fields. Literal predicates are eligible. IndexScan,
+RangeIndexScan, Join, Sort, nested Filter, and malformed shapes retain generic
+execution, including the empty-input behavior that does not evaluate a missing
+predicate field.
+
 The dynamic evaluator deliberately does not prebind positions and AND/OR still
-evaluate both sides. QueryResult remains fully owned, and no page pin or
-borrowed persisted row escapes into executor state. UPDATE and DELETE
-selection naturally use the same generic Filter path, while assignment
-evaluation, INSERT, the Join algorithms, Phase 7N's prebound borrowed visitor,
-planner, compiler, protocol, and inspection behavior are unchanged. Phase 7S
-is neither storage-to-generic-Filter borrowed Text, streaming execution,
-predicate pushdown, nor an expression bytecode/compiler or planner rewrite.
+evaluate both sides. The callback saves the first predicate error and stops
+later predicate evaluation, but returns success so storage still validates all
+later rows. A later storage error therefore has the same priority as completing
+the old owned child scan; after a successful traversal the saved predicate
+error is returned. QueryResult remains fully owned, and no page pin or borrowed
+persisted row escapes into executor state.
+
+Phase 7T is intentionally not Project-aware. TRUE owns the complete SeqScan
+row even when a parent Project drops a predicate-only Text value. UPDATE and
+DELETE select through the same path but mutate only after `execute_rows`
+succeeds; assignment evaluation, index maintenance, transactions, INSERT, Join
+algorithms, Phase 7N filtered-count precedence, planner, compiler, protocol,
+and inspection behavior are unchanged. There is no predicate pushdown,
+expression bytecode/compiler, planner rewrite, dependency, or unsafe code.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.

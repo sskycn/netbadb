@@ -906,21 +906,57 @@ reporting.
   0.549937/0.586416/0.585979 ms post. There is no timing threshold and no
   extra rerun was necessary.
 
-### Phase 7T — Generic Filter predicate-only ownership attribution (selected, not started)
+### Phase 7T — Direct sequential Filter borrowed-row streaming (complete)
 
-The remaining 1.329x Text/Int IS NULL ratio isolates owned predicate Text
-created by SeqScan more directly than comparison cost, so Phase 7T first
-measures generic Filter-to-SeqScan predicate-only ownership and a possible
-direct streaming boundary. It must preserve fully owned QueryResult rows and
-must not be treated as authorization to spread page-backed borrows through the
-executor. Generic Filter position prebinding is the second candidate because
-the wide/single-Int64 ratio remains 1.834x.
+- storage exposes one authoritative row-aware borrowed visitor. It validates
+  every scalar in every live persisted tuple, reports the current page, slot,
+  and generation as `RowId`, and lends ordered `ScalarRef` values only for the
+  synchronous callback. The older borrowed visitor is a thin RowId-ignoring
+  wrapper and the owned visitor still delegates to borrowed traversal;
+- the executor specializes only exact `Filter → SeqScan`. It conservatively
+  rejects duplicate or mismatched scan identities and predicates whose
+  binding/table/column identity is absent from the SeqScan output. Literal
+  predicates are eligible; IndexScan, RangeIndexScan, Join, Sort, nested
+  Filter, and malformed shapes retain the generic path;
+- each live row is fully decoded and validated before dynamic three-valued
+  predicate evaluation. FALSE and UNKNOWN create no owned scalar, row vector,
+  or `ExecutionRow`; TRUE owns every SeqScan output value and preserves the
+  exact current `RowId`. Dynamic `find_source_position` remains on every
+  Column leaf and there is no expression prebinding or Project-aware shortcut;
+- the first predicate error is saved while storage continues validation. A
+  later storage error therefore retains the old child-first priority; after a
+  successful scan the saved predicate error is returned. UPDATE and DELETE do
+  not mutate until `execute_rows` succeeds, and assignment, index maintenance,
+  transaction, Phase 7N filtered counts, and Phase 7Q/7R behavior are unchanged;
+- one isolated serial full pre/post run changed hidden Text/Int equality from
+  1.172708/0.891999 ms to 0.771625/0.700458 ms, and Text/Int IS NULL from
+  1.089500/0.838041 ms to 0.695416/0.650563 ms. Repeated Text/Int changed
+  1.351271/1.062854 ms to 0.962791/0.881395 ms; the wide lookup control changed
+  1.652646 to 1.441604 ms;
+- all-TRUE Text/Int controls changed 1.205125/0.740396 ms to
+  1.296416/0.827771 ms. They intentionally still own complete SeqScan rows.
+  The selective owned-Text-output control improved from 1.155479 to
+  0.737333 ms. COUNT controls remained observational. There is no timing
+  threshold and no extra full run was performed;
+- planner, compiler, Rel IR, PhysicalPlan, inspection, protocol, SDK, and
+  persistent formats are unchanged. QueryResult remains fully owned; no
+  dependency or unsafe code was added.
 
-After those two candidates, the measured order is sequential PageManager
-traversal, BufferPool page snapshot cloning, AND/OR short-circuiting, MIN/MAX
-ownership, group-key ownership, covering/index-only reads, broader HashJoin
-eligibility, and multi-inequality intersection. Phase 7T is not implemented in
-Phase 7S.
+### Phase 7U — Retained-column-aware Filter/Project attribution (selected, not started)
+
+Post-7T selective Text/Int equality is 1.102x, while the all-TRUE Text/Int
+control remains 1.566x and all-TRUE Text is 1.680x selective Text. This points
+first to qualifying rows owning predicate-only Text that the parent Project
+immediately drops. Phase 7U therefore investigates retained-column-aware
+Filter/Project materialization without weakening the Filter output-schema or
+fully owned QueryResult contracts.
+
+Generic Filter position prebinding remains the next strong candidate because
+wide/single Int64 is still 2.058x. After those candidates, the measured order
+is sequential PageManager traversal, BufferPool page snapshot cloning,
+AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
+covering/index-only reads, broader HashJoin eligibility, and
+multi-inequality intersection. Phase 7U is not implemented in Phase 7T.
 
 ### Later Phase 7 work
 

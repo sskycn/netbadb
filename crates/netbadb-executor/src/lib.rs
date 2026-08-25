@@ -561,6 +561,9 @@ fn execute_rows(
             Ok(ExecutionRows { fields, rows })
         }
         PhysicalPlan::Filter { input, predicate } => {
+            if let Some(result) = try_execute_streaming_seq_filter(input, predicate, storages)? {
+                return Ok(result);
+            }
             let mut result = execute_rows(input, storages)?;
             let fields = result.fields.clone();
             result.rows = result
@@ -811,6 +814,12 @@ struct FilteredCountSummary {
     non_null_counts: Vec<u128>,
 }
 
+struct StreamingSeqFilterPlan<'a> {
+    table_id: TableId,
+    columns: &'a [ColumnRef],
+    predicate: &'a Expr,
+}
+
 type SourceIdentity = (RelationBindingId, TableId, ColumnId);
 
 fn source_identity(column: &ColumnRef) -> SourceIdentity {
@@ -837,6 +846,104 @@ fn collect_filter_columns(predicate: &Expr) -> BTreeSet<SourceIdentity> {
     let mut columns = BTreeSet::new();
     collect(predicate, &mut columns);
     columns
+}
+
+fn streaming_seq_filter_eligibility<'a>(
+    input: &'a PhysicalPlan,
+    predicate: &'a Expr,
+) -> Option<StreamingSeqFilterPlan<'a>> {
+    let PhysicalPlan::SeqScan {
+        binding_id,
+        table_id,
+        columns,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    let scan_identities = columns.iter().map(source_identity).collect::<BTreeSet<_>>();
+    if scan_identities.len() != columns.len()
+        || columns
+            .iter()
+            .any(|column| column.binding_id != *binding_id || column.table_id != *table_id)
+    {
+        return None;
+    }
+    if collect_filter_columns(predicate)
+        .iter()
+        .any(|identity| !scan_identities.contains(identity))
+    {
+        return None;
+    }
+    Some(StreamingSeqFilterPlan {
+        table_id: *table_id,
+        columns,
+        predicate,
+    })
+}
+
+fn try_execute_streaming_seq_filter(
+    input: &PhysicalPlan,
+    predicate: &Expr,
+    storages: &mut [HeapStorage],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let Some(plan) = streaming_seq_filter_eligibility(input, predicate) else {
+        return Ok(None);
+    };
+    let fields = plan
+        .columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    let column_ids = plan
+        .columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<Vec<_>>();
+    let storage = storage_for_table(storages, plan.table_id)?;
+    let mut rows = Vec::new();
+    let mut pending_predicate_error = None;
+    storage.visit_row_scalar_refs_with_presence::<ExecutionError, _>(
+        &column_ids,
+        &[],
+        |row_id, values, _presence| {
+            collect_streaming_filter_row(
+                plan.predicate,
+                &fields,
+                row_id,
+                values,
+                &mut rows,
+                &mut pending_predicate_error,
+            );
+            Ok(())
+        },
+    )?;
+    if let Some(error) = pending_predicate_error {
+        return Err(error);
+    }
+    Ok(Some(ExecutionRows { fields, rows }))
+}
+
+fn collect_streaming_filter_row(
+    predicate: &Expr,
+    fields: &[OutputField],
+    row_id: RowId,
+    values: &[ScalarRef<'_>],
+    rows: &mut Vec<ExecutionRow>,
+    pending_predicate_error: &mut Option<ExecutionError>,
+) {
+    if pending_predicate_error.is_some() {
+        return;
+    }
+    match evaluate_dynamic_scalar_ref_truth(predicate, values, fields) {
+        Ok(TruthValue::True) => rows.push(ExecutionRow {
+            row_id: Some(row_id),
+            values: values.iter().copied().map(ScalarRef::to_owned).collect(),
+        }),
+        Ok(TruthValue::False | TruthValue::Unknown) => {}
+        Err(error) => *pending_predicate_error = Some(error),
+    }
 }
 
 fn filtered_count_eligibility<'a>(
@@ -2244,7 +2351,6 @@ fn evaluate_dynamic_borrowed_truth_values<'a>(
     TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
-#[cfg(test)]
 fn evaluate_dynamic_scalar_ref_truth<'a>(
     expression: &'a Expr,
     values: &[ScalarRef<'a>],
@@ -2461,17 +2567,17 @@ mod tests {
         BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
         ExecutionError, ExecutionRow, FilteredCountSummary, InequalityExecutionStrategy,
         ProjectionPlan, QueryResult, TruthValue, bind_expression, choose_inequality_strategy,
-        collect_filter_columns, count_to_sql_u64, direct_count_eligibility, evaluate,
-        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
-        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        collect_filter_columns, collect_streaming_filter_row, count_to_sql_u64,
+        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
+        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
         evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
         evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
         execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
         execute_with_storages, filtered_count_eligibility, find_required_inequality,
         inequality_can_match, materialize_count_values, materialize_direct_count_values,
         potential_left_indices, project_execution_row, required_right_extreme,
-        sorted_non_null_indices, update_filtered_count_summary,
+        sorted_non_null_indices, streaming_seq_filter_eligibility, update_filtered_count_summary,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -2650,10 +2756,10 @@ mod tests {
         );
         let path = std::env::temp_dir().join(format!("netbadb-executor-{}", std::process::id()));
         let mut storage = HeapStorage::create(&path, table).expect("create heap");
-        storage
+        let first_row_id = storage
             .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
             .expect("insert");
-        storage
+        let second_row_id = storage
             .insert(&[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())])
             .expect("insert");
         let id = ColumnRef {
@@ -2674,6 +2780,53 @@ mod tests {
             data_type: SemanticType::physical(PhysicalType::Text),
             nullable: false,
         };
+        let direct_filter = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: vec![id.clone(), name.clone()],
+            }),
+            predicate: Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+                kind: ExprKind::Binary {
+                    operator: BinaryOp::Gt,
+                    left: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Int64),
+                            nullable: false,
+                        },
+                        kind: ExprKind::Column(id.clone()),
+                    }),
+                    right: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Int64),
+                            nullable: false,
+                        },
+                        kind: ExprKind::Literal(ScalarValue::Int64(1)),
+                    }),
+                },
+            },
+        };
+        let direct = execute_rows(&direct_filter, std::slice::from_mut(&mut storage))
+            .expect("execute direct streaming filter");
+        assert_eq!(
+            direct.fields,
+            vec![
+                OutputField::Source(id.clone()),
+                OutputField::Source(name.clone())
+            ]
+        );
+        assert_eq!(direct.rows.len(), 1);
+        assert_eq!(direct.rows[0].row_id, Some(second_row_id));
+        assert_eq!(
+            direct.rows[0].values,
+            vec![ScalarValue::Int64(2), ScalarValue::Text("Lin".into())]
+        );
+        assert_ne!(first_row_id, second_row_id);
         let logical = LogicalPlan::Limit {
             input: Box::new(LogicalPlan::Project {
                 input: Box::new(LogicalPlan::Filter {
@@ -5322,6 +5475,209 @@ mod tests {
         storage.close().expect("close grouped heap");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn streaming_seq_filter_eligibility_is_exact_and_identity_aware() {
+        let column =
+            |binding_id: u32, table_id: u64, column_id: u32, name: &str, physical| ColumnRef {
+                binding_id: RelationBindingId(binding_id),
+                table_id: TableId(table_id),
+                column_id: ColumnId(column_id),
+                relation_name: format!("t{table_id}"),
+                name: name.into(),
+                data_type: SemanticType::physical(physical),
+                nullable: false,
+            };
+        let id = column(0, 7, 1, "id", PhysicalType::Int64);
+        let active = column(0, 7, 2, "active", PhysicalType::Bool);
+        let true_literal = Expr {
+            kind: ExprKind::Literal(ScalarValue::Bool(true)),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let active_predicate = Expr {
+            kind: ExprKind::Column(active.clone()),
+            expr_type: ExprType {
+                data_type: active.data_type.clone(),
+                nullable: false,
+            },
+        };
+        let scan = |columns| PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns,
+        };
+
+        let eligible_scan = scan(vec![id.clone(), active.clone()]);
+        let eligible = streaming_seq_filter_eligibility(&eligible_scan, &active_predicate)
+            .expect("direct valid SeqScan is eligible");
+        assert_eq!(eligible.table_id, TableId(7));
+        assert_eq!(eligible.columns, [id.clone(), active.clone()]);
+        assert!(streaming_seq_filter_eligibility(&eligible_scan, &true_literal).is_some());
+
+        let missing = column(0, 7, 3, "missing", PhysicalType::Bool);
+        let missing_predicate = Expr {
+            kind: ExprKind::Column(missing),
+            expr_type: active_predicate.expr_type.clone(),
+        };
+        assert!(streaming_seq_filter_eligibility(&eligible_scan, &missing_predicate).is_none());
+        assert!(
+            streaming_seq_filter_eligibility(&scan(vec![id.clone(), id.clone()]), &true_literal)
+                .is_none()
+        );
+        assert!(
+            streaming_seq_filter_eligibility(
+                &PhysicalPlan::SeqScan {
+                    binding_id: RelationBindingId(1),
+                    table_id: TableId(7),
+                    table_name: "t7".into(),
+                    columns: vec![id.clone()],
+                },
+                &true_literal
+            )
+            .is_none()
+        );
+        assert!(
+            streaming_seq_filter_eligibility(
+                &PhysicalPlan::SeqScan {
+                    binding_id: RelationBindingId(0),
+                    table_id: TableId(8),
+                    table_name: "t8".into(),
+                    columns: vec![id.clone()],
+                },
+                &true_literal
+            )
+            .is_none()
+        );
+
+        let sorted = PhysicalPlan::Sort {
+            input: Box::new(eligible_scan.clone()),
+            keys: vec![SortKey {
+                column: id.clone(),
+                direction: SortDirection::Asc,
+                null_order: NullOrder::First,
+            }],
+        };
+        let nested_filter = PhysicalPlan::Filter {
+            input: Box::new(eligible_scan.clone()),
+            predicate: true_literal.clone(),
+        };
+        let right_id = column(1, 8, 1, "right_id", PhysicalType::Int64);
+        let joined = PhysicalPlan::NestedLoopJoin {
+            left: Box::new(eligible_scan),
+            right: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(1),
+                table_id: TableId(8),
+                table_name: "t8".into(),
+                columns: vec![right_id.clone()],
+            }),
+            kind: JoinKind::Inner,
+            predicate: true_literal.clone(),
+            columns: vec![id, active, right_id],
+        };
+        for input in [sorted, nested_filter, joined] {
+            assert!(streaming_seq_filter_eligibility(&input, &true_literal).is_none());
+        }
+    }
+
+    #[test]
+    fn streaming_filter_materializes_only_true_rows_and_preserves_first_error() {
+        let column = |column_id: u32, name: &str, physical| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            column_id: ColumnId(column_id),
+            relation_name: "items".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable: false,
+        };
+        let fields = vec![
+            OutputField::Source(column(1, "id", PhysicalType::Int64)),
+            OutputField::Source(column(2, "payload", PhysicalType::Text)),
+        ];
+        let predicate = |value, nullable| Expr {
+            kind: ExprKind::Literal(value),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable,
+            },
+        };
+        let row_id = RowId {
+            page: PageId(4),
+            slot: 3,
+            generation: 9,
+        };
+        let text = String::from("qualified");
+        let original_pointer = text.as_ptr();
+        let values = [ScalarRef::Int64(7), ScalarRef::Text(&text)];
+        let mut rows = Vec::new();
+        let mut pending = None;
+
+        collect_streaming_filter_row(
+            &predicate(ScalarValue::Bool(false), false),
+            &fields,
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        collect_streaming_filter_row(
+            &predicate(ScalarValue::Null, true),
+            &fields,
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert!(rows.is_empty());
+        assert!(pending.is_none());
+
+        collect_streaming_filter_row(
+            &predicate(ScalarValue::Bool(true), false),
+            &fields,
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row_id, Some(row_id));
+        assert_eq!(
+            rows[0].values,
+            [ScalarValue::Int64(7), ScalarValue::Text("qualified".into())]
+        );
+        assert_ne!(text_pointer(&rows[0].values[1]), original_pointer);
+
+        rows.clear();
+        collect_streaming_filter_row(
+            &Expr {
+                kind: ExprKind::Literal(ScalarValue::Int64(1)),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: false,
+                },
+            },
+            &fields,
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert!(matches!(pending, Some(ExecutionError::ExpectedBoolean)));
+        collect_streaming_filter_row(
+            &predicate(ScalarValue::Bool(true), false),
+            &[],
+            row_id,
+            &[],
+            &mut rows,
+            &mut pending,
+        );
+        assert!(rows.is_empty());
+        assert!(matches!(pending, Some(ExecutionError::ExpectedBoolean)));
     }
 
     #[test]

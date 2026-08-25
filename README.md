@@ -672,9 +672,14 @@ The implementation sequence is intentionally vertical:
 47. Generic Filter borrowed-evaluator rollout (Phase 7S) — complete; generic
     Filter keeps owned child rows but borrows Column and Literal leaves during
     dynamic predicate evaluation, then moves qualifying rows unchanged.
-48. Generic Filter predicate-only ownership/streaming attribution (Phase 7T) —
-    selected from the post-7S full baseline, not started; generic Filter
-    position prebinding remains the next measured candidate.
+48. Direct sequential Filter borrowed-row streaming (Phase 7T) — complete;
+    exact `Filter → SeqScan` evaluates the dynamic predicate over validated
+    borrowed scalar views and owns the complete SeqScan row only for TRUE,
+    while every other shape keeps the generic executor.
+49. Retained-column-aware Filter/Project attribution (Phase 7U) — selected,
+    not started; post-7T all-TRUE Text remains expensive because qualifying
+    rows still own predicate-only columns before the parent Project drops them.
+    Generic Filter position prebinding remains the next strong candidate.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

@@ -1527,6 +1527,32 @@ impl HeapStorage {
         E: From<StorageError>,
         F: for<'row> FnMut(&[ScalarRef<'row>], &[bool]) -> Result<(), E>,
     {
+        self.visit_row_scalar_refs_with_presence(
+            value_columns,
+            presence_columns,
+            |_row_id, values, presence| visitor(values, presence),
+        )
+    }
+
+    /// Visits each current live Heap row with its exact current [`RowId`] and
+    /// borrowed scalar views after complete persisted-row validation.
+    ///
+    /// Both projections preserve request order and duplicates, and a column
+    /// may appear in both. The row identity uses the live slot's page, slot,
+    /// and generation. Text views borrow the validated Heap record payload only
+    /// for the current synchronous callback. Scratch allocations are reused for
+    /// all live slots in one validated Heap page. The first callback error stops
+    /// the scan and is returned unchanged.
+    pub fn visit_row_scalar_refs_with_presence<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        mut visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+        F: for<'row> FnMut(RowId, &[ScalarRef<'row>], &[bool]) -> Result<(), E>,
+    {
         let projection = ConsumerProjection::resolve(&self.table, value_columns, presence_columns)
             .map_err(E::from)?;
         let mut presence = vec![false; projection.presence_count];
@@ -1545,9 +1571,7 @@ impl HeapStorage {
             let mut values = Vec::with_capacity(projection.value_count);
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
-                if let Some((_slot_entry, payload)) =
-                    validated.live_record(slot).map_err(E::from)?
-                {
+                if let Some((slot_entry, payload)) = validated.live_record(slot).map_err(E::from)? {
                     value_slots.fill(None);
                     values.clear();
                     presence.fill(false);
@@ -1560,7 +1584,15 @@ impl HeapStorage {
                         &mut presence,
                     )
                     .map_err(E::from)?;
-                    visitor(&values, &presence)?;
+                    visitor(
+                        RowId {
+                            page: page_id,
+                            slot: slot.0,
+                            generation: slot_entry.generation,
+                        },
+                        &values,
+                        &presence,
+                    )?;
                 }
             }
         }
@@ -3561,6 +3593,18 @@ mod tests {
             ],
         );
         let mut storage = HeapStorage::create(&path, schema).expect("create borrowed heap");
+        let mut empty_visits = 0;
+        storage
+            .visit_row_scalar_refs_with_presence::<StorageError, _>(
+                &[ColumnId(1)],
+                &[ColumnId(2)],
+                |_, _, _| {
+                    empty_visits += 1;
+                    Ok(())
+                },
+            )
+            .expect("visit empty borrowed heap with row identity");
+        assert_eq!(empty_visits, 0);
         for row in [
             vec![
                 ScalarValue::Int64(1),
@@ -3613,6 +3657,43 @@ mod tests {
                     vec![false, true, false],
                 ),
             ]
+        );
+
+        let scanned = storage
+            .scan_columns(&[ColumnId(2), ColumnId(1), ColumnId(2)])
+            .expect("scan matching row-aware projection");
+        let mut row_aware = Vec::new();
+        storage
+            .visit_row_scalar_refs_with_presence::<StorageError, _>(
+                &[ColumnId(2), ColumnId(1), ColumnId(2)],
+                &[ColumnId(2), ColumnId(3), ColumnId(2)],
+                |row_id, values, presence| {
+                    row_aware.push((
+                        row_id,
+                        values
+                            .iter()
+                            .copied()
+                            .map(ScalarRef::to_owned)
+                            .collect::<Vec<_>>(),
+                        presence.to_vec(),
+                    ));
+                    Ok(())
+                },
+            )
+            .expect("visit row-aware borrowed projections");
+        assert_eq!(
+            row_aware
+                .iter()
+                .map(|(row_id, values, _)| (*row_id, values.clone()))
+                .collect::<Vec<_>>(),
+            scanned
+        );
+        assert_eq!(
+            row_aware
+                .iter()
+                .map(|(_, _, presence)| presence.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![true, true, true], vec![false, true, false]]
         );
 
         let mut zero_width_visits = 0;
@@ -3671,14 +3752,18 @@ mod tests {
         }
         let mut visits = 0;
         let error = storage
-            .visit_columns_with_presence::<VisitError, _>(&[ColumnId(1)], &[ColumnId(2)], |_, _| {
-                visits += 1;
-                if visits == 2 {
-                    Err(VisitError::Stop)
-                } else {
-                    Ok(())
-                }
-            })
+            .visit_row_scalar_refs_with_presence::<VisitError, _>(
+                &[ColumnId(1)],
+                &[ColumnId(2)],
+                |_, _, _| {
+                    visits += 1;
+                    if visits == 2 {
+                        Err(VisitError::Stop)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
             .expect_err("callback error must stop the scan");
         assert!(matches!(error, VisitError::Stop));
         assert_eq!(visits, 2);
@@ -4449,6 +4534,26 @@ mod tests {
         assert_eq!(visited_ids, [1, 3, 4, 5]);
         let rows = storage.scan().expect("scan mixed page kinds");
         assert_eq!(rows.len(), 4);
+        let mut row_aware_rows = Vec::new();
+        storage
+            .visit_row_scalar_refs_with_presence::<StorageError, _>(
+                &[ColumnId(1), ColumnId(2)],
+                &[],
+                |row_id, values, presence| {
+                    assert!(presence.is_empty());
+                    row_aware_rows.push((
+                        row_id,
+                        values
+                            .iter()
+                            .copied()
+                            .map(ScalarRef::to_owned)
+                            .collect::<Vec<_>>(),
+                    ));
+                    Ok(())
+                },
+            )
+            .expect("visit row identities across reuse and relocation");
+        assert_eq!(row_aware_rows, rows);
         for expected in [reused, filler, destination, relocated] {
             assert!(rows.iter().any(|(row_id, _)| *row_id == expected));
         }
@@ -4470,6 +4575,25 @@ mod tests {
             }
         );
         assert_eq!(reopened.scan().expect("scan reopened heap"), rows);
+        let mut reopened_row_aware = Vec::new();
+        reopened
+            .visit_row_scalar_refs_with_presence::<StorageError, _>(
+                &[ColumnId(1), ColumnId(2)],
+                &[],
+                |row_id, values, _| {
+                    reopened_row_aware.push((
+                        row_id,
+                        values
+                            .iter()
+                            .copied()
+                            .map(ScalarRef::to_owned)
+                            .collect::<Vec<_>>(),
+                    ));
+                    Ok(())
+                },
+            )
+            .expect("visit reopened row identities");
+        assert_eq!(reopened_row_aware, rows);
         let mut reopened_visits = 0;
         reopened
             .visit_columns_with_presence::<StorageError, _>(&[], &[], |values, presence| {
@@ -5395,6 +5519,14 @@ mod tests {
                     values,
                     presence,
                     |_, _| Ok(())
+                ),
+                Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+            ));
+            assert!(matches!(
+                reopened.visit_row_scalar_refs_with_presence::<StorageError, _>(
+                    values,
+                    presence,
+                    |_, _, _| Ok(())
                 ),
                 Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
             ));
