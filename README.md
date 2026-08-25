@@ -666,8 +666,11 @@ The implementation sequence is intentionally vertical:
 45. Filtered-count predicate position prebinding (Phase 7Q) — complete; the
     Phase 7N specialization reuses `BoundExpr`, binds source positions once
     before Heap traversal, and evaluates borrowed ScalarRefs by checked index.
-46. Direct COUNT(*) live-row specialization (Phase 7R) — selected from the
-    post-7Q full baseline, not started.
+46. Direct COUNT(*) live-row specialization (Phase 7R) — complete; direct
+    zero-column SeqScan single/pair/multi star outputs reuse the existing exact
+    Heap presence summary without materializing empty ExecutionRows.
+47. Generic Filter borrowed-evaluator rollout (Phase 7S) — selected from the
+    post-7R full baseline for attribution, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

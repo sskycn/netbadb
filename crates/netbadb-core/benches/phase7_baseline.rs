@@ -477,6 +477,20 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "aggregate_count_star_triple",
+        rows,
+        "SELECT COUNT(*), COUNT(*), COUNT(*) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows) * 3,
+        },
+        settings,
+        |result| count_values_observation(result, &[rows, rows, rows]),
+        measurements,
+    )?;
+    run_attribution_query(
         "aggregate_count_payload_filter_control",
         rows,
         "SELECT COUNT(payload) FROM items WHERE active = true",

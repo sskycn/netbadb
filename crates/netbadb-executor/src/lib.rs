@@ -990,7 +990,6 @@ fn direct_count_eligibility<'a>(
     }
 
     let mut used_scan_columns = vec![false; columns.len()];
-    let mut has_column_count = false;
     let mut direct_outputs = Vec::with_capacity(outputs.len());
     for output in outputs {
         let AggregateOutput::Aggregate(aggregate) = output else {
@@ -1011,13 +1010,12 @@ fn direct_count_eligibility<'a>(
                         && scan_column.column_id == column.column_id
                 })?;
                 used_scan_columns[position] = true;
-                has_column_count = true;
                 DirectCountSource::Column(position)
             }
         };
         direct_outputs.push(DirectCountOutput { source, aggregate });
     }
-    if !has_column_count || used_scan_columns.iter().any(|used| !used) {
+    if used_scan_columns.iter().any(|used| !used) {
         return None;
     }
     Some(DirectCountPlan {
@@ -2469,9 +2467,9 @@ mod tests {
         evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
         execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
         execute_with_storages, filtered_count_eligibility, find_required_inequality,
-        inequality_can_match, materialize_direct_count_values, potential_left_indices,
-        project_execution_row, required_right_extreme, sorted_non_null_indices,
-        update_filtered_count_summary,
+        inequality_can_match, materialize_count_values, materialize_direct_count_values,
+        potential_left_indices, project_execution_row, required_right_extreme,
+        sorted_non_null_indices, update_filtered_count_summary,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -5292,6 +5290,12 @@ mod tests {
             table_name: "t7".into(),
             columns: vec![value.clone()],
         };
+        let zero_scan = PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(7),
+            table_name: "t7".into(),
+            columns: vec![],
+        };
         let aggregate = |function, input| {
             AggregateOutput::Aggregate(AggregateExpr {
                 function,
@@ -5374,6 +5378,19 @@ mod tests {
             ]
         );
         let count_all = aggregate(AggregateFunction::Count, AggregateInput::All);
+        for output_count in 1..=3 {
+            let all_star_outputs = vec![count_all.clone(); output_count];
+            let all_star = direct_count_eligibility(&zero_scan, &[], &all_star_outputs)
+                .expect("zero-column all-star COUNT is eligible");
+            assert!(all_star.scan_columns.is_empty());
+            assert_eq!(all_star.outputs.len(), output_count);
+            assert!(
+                all_star
+                    .outputs
+                    .iter()
+                    .all(|output| output.source == super::DirectCountSource::All)
+            );
+        }
         let mixed_outputs = [count_all.clone(), count.clone(), count_all.clone()];
         let mixed = direct_count_eligibility(&single_scan, &[], &mixed_outputs)
             .expect("star mixed with column COUNT is eligible");
@@ -5446,6 +5463,41 @@ mod tests {
             ),
             Err(ExecutionError::TypeMismatch)
         ));
+        let named_star_outputs = [
+            named_count("first_star", AggregateInput::All),
+            named_count("second_star", AggregateInput::All),
+            named_count("third_star", AggregateInput::All),
+        ];
+        let named_star_plan = direct_count_eligibility(&zero_scan, &[], &named_star_outputs)
+            .expect("named triple-star COUNT is eligible");
+        assert_eq!(
+            materialize_direct_count_values(
+                &named_star_plan,
+                &PresenceCountSummary {
+                    live_rows: 9,
+                    non_null_counts: vec![],
+                }
+            )
+            .expect("materialize triple-star counts"),
+            vec![
+                ScalarValue::UInt64(9),
+                ScalarValue::UInt64(9),
+                ScalarValue::UInt64(9),
+            ]
+        );
+        for (start, expected) in [(0, "first_star"), (1, "second_star"), (2, "third_star")] {
+            assert!(matches!(
+                materialize_count_values(
+                    &named_star_plan.outputs[start..],
+                    u128::from(u64::MAX) + 1,
+                    &[]
+                ),
+                Err(ExecutionError::AggregateOverflow {
+                    function: AggregateFunction::Count,
+                    output,
+                }) if output == expected
+            ));
+        }
         assert!(
             direct_count_eligibility(&single_scan, &[], std::slice::from_ref(&count_all)).is_none()
         );

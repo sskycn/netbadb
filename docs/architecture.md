@@ -367,9 +367,10 @@ typed physical query
 
 Membership is deduplicated, but operators never reorder source columns by
 discovery order. A repeated result projection remains repeated while its base
-scan reads the source once. `COUNT(*)` can drive a zero-column scan; every live
-row still produces an execution row with its RowId and an empty value vector,
-so row-count semantics are unchanged.
+scan reads the source once. `COUNT(*)` can drive a zero-column scan. Phase 7R's
+executor specialization consumes that exact shape through the Heap presence
+summary, so direct all-star aggregates no longer construct one empty
+RowId-bearing execution row per live tuple.
 
 Join children may retain columns needed only by their own predicates. The join
 executor therefore binds the current predicate against the concrete
@@ -525,11 +526,39 @@ SUM uses checked signed or unsigned addition.
 
 Two executor-private global COUNT specializations avoid that generic row
 materialization without changing physical plans. A direct `Aggregate →
-SeqScan` can request an exact Heap presence summary. Phase 7N additionally
-recognizes only `Aggregate → Filter → SeqScan`, with all outputs COUNT and at
-least one COUNT(column). It splits the scan's source-order columns into values
-needed by the predicate and NULL-presence bits needed by COUNT, then consumes
-each completely validated live tuple synchronously:
+SeqScan` whose nonempty outputs are all COUNT can request an exact Heap presence
+summary when every scan column is consumed by a COUNT(column). This includes a
+zero-column scan with one or more COUNT(*) outputs:
+
+```text
+direct Aggregate COUNT outputs
+              ↓
+       direct SeqScan[] ?
+          /          \
+        no            yes
+        |              |
+     generic   scan_presence_counts([])
+                       ↓
+              full row validation
+                       ↓
+              exact live_rows u128
+                       ↓
+         checked ordered COUNT outputs
+```
+
+Phase 7R adds no storage counter: it reuses the Phase 7M summary and performs
+one checked SQL `u64` conversion against each output's exact `AggregateExpr`.
+The summary is a current Heap traversal, not statistics, a row-count cache, an
+index-only count, or an O(1) slot-header shortcut. Every persisted scalar is
+still decoded and validated; tombstones, slot reuse, relocation, index and
+ANALYZE pages, stale statistics, and reopen therefore retain exact current-row
+semantics. An all-star aggregate over a nonempty SeqScan is rejected by the
+specialization rather than guessed about.
+
+Phase 7N additionally recognizes only `Aggregate → Filter → SeqScan`, with all
+outputs COUNT and at least one COUNT(column). It splits the scan's source-order
+columns into values needed by the predicate and NULL-presence bits needed by
+COUNT, then consumes each completely validated live tuple synchronously:
 
 ```text
 Aggregate COUNT outputs

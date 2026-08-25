@@ -5366,6 +5366,10 @@ mod tests {
             Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
         ));
         assert!(matches!(
+            reopened.scan_presence_counts(&[]),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
+        assert!(matches!(
             reopened.visit_columns_with_presence::<StorageError, _>(
                 &[ColumnId(1)],
                 &[],

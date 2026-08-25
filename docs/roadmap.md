@@ -847,19 +847,51 @@ reporting.
 - no dependency or unsafe code was added, and all persistent/machine contracts
   and row encoding remain unchanged.
 
-### Phase 7R — Direct COUNT(*) live-row specialization (selected, not started)
+### Phase 7R — Direct COUNT(*) live-row specialization (complete)
 
-The post-7Q full baseline leaves direct COUNT(*) on the generic Aggregate →
-SeqScan path at 0.736 ms, 1.304x direct COUNT(id) and 1.356x direct
-COUNT(payload). Phase 7R should investigate an exact current-live-row count
-without weakening complete Heap validation or changing grouped/mixed/filter
-eligibility. It is not implemented as part of Phase 7Q.
+- the existing direct-count eligibility no longer requires a COUNT(column).
+  Pure single/pair/multi COUNT(*) is eligible only when its direct child is the
+  planner's zero-column `SeqScan[]`; a nonempty all-star scan still falls back
+  through the existing unused-column check;
+- execution reuses Phase 7M's exact `scan_presence_counts([])` and its checked
+  `live_rows: u128`. It performs one Heap traversal and creates only the final
+  result row, with no scanned empty `ExecutionRow` or per-row `ScalarValue`;
+- every output independently calls the existing checked SQL `u64` conversion
+  with its exact `AggregateExpr`, preserving order, duplicate names, metadata,
+  and precise overflow attribution;
+- no storage counter, statistics access, cache, slot-header shortcut, or
+  index-only path was added. Zero requested columns still decode and validate
+  every persisted scalar; invalid Text remains an error rather than a count;
+- tests cover empty and NULL-containing tables, single/pair/triple star
+  eligibility, malformed nonempty-scan fallback, mixed and duplicate column
+  paths, per-output overflow metadata, delete and slot reuse, index creation,
+  stale ANALYZE statistics, reopen, and filtered all-star fallback. Existing
+  storage tests retain relocation and mixed-page current-tuple coverage;
+- per the requested limit, one isolated serial full pre/post run changed
+  single/pair/triple star from 0.757/0.731/0.739 ms to
+  0.558/0.550/0.545 ms. COUNT(*)/COUNT(id) changed 1.298x→0.859x and
+  COUNT(*)/COUNT(payload) 1.303x→0.954x;
+- pair/single remained 0.964x/0.986x and triple/single 0.976x/0.976x.
+  Filtered all-star changed 0.948/0.968 ms and stays generic; there is no
+  timing threshold;
+- planner, PhysicalPlan, Inspection JSON v3, storage production, persistent
+  formats, protocol, SDK contracts, ScalarValue, ScalarRef, and fully owned
+  QueryResult rows are unchanged. No dependency or unsafe code was added.
 
-The remaining measured candidates, in current order, are generic Filter
-borrowed-evaluator rollout, sequential PageManager traversal, BufferPool page
-snapshot cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key
-ownership, covering/index-only reads, broader HashJoin eligibility, and
-multi-inequality intersection.
+### Phase 7S — Generic Filter borrowed-evaluator rollout (selected, not started)
+
+The post-7R full baseline leaves generic hidden Text Filter at 1.621 ms, while
+the direct projection and specialized filtered-count controls remain materially
+lower. Phase 7S should first add attribution that separates generic predicate
+leaf ownership/evaluation from necessary fully owned QueryResult rows, then
+investigate reuse of the existing borrowed semantic core without changing
+planner eligibility, DML, or SQL truth. It is not implemented as part of Phase
+7R.
+
+The remaining measured candidates, in current order, are sequential
+PageManager traversal, BufferPool page snapshot cloning, AND/OR
+short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
+reads, broader HashJoin eligibility, and multi-inequality intersection.
 
 ### Later Phase 7 work
 

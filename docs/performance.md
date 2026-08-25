@@ -519,14 +519,15 @@ COUNT(id)+COUNT(payload), 1.137 ms for duplicate COUNT(payload), 1.182 ms for
 three mixed-nullability column counts, 1.143 ms for COUNT(*)+COUNT(payload),
 and 1.179 ms for the five-output order/reuse case.
 
-The executor-private direct-count specialization now recognizes a global
-Aggregate whose nonempty outputs are all COUNT, whose child is a direct
-SeqScan, and which contains at least one COUNT(column):
+The executor-private direct-count specialization recognizes a global Aggregate
+whose nonempty outputs are all COUNT, whose child is a direct SeqScan, and
+whose scan columns are exactly the columns consumed by COUNT(column). Phase 7R
+extends this to pure COUNT(*) outputs when that exact scan layout is empty:
 
 ```text
 Global Aggregate
       ↓
-all outputs COUNT + direct SeqScan + at least one COUNT(column)?
+all outputs COUNT + direct SeqScan + no unused scan columns?
      / \
    no   yes
    |     |
@@ -555,13 +556,14 @@ calling `ScalarRef::to_owned`. Tombstones are excluded and slot reuse,
 relocation, index/ANALYZE mixed pages, and reopen count only current live
 tuples.
 
-Duplicate COUNT(column) outputs reuse one source-order summary slot. Mixed
-COUNT(*) reads the same summary's live-row count, while each final output uses
-its own `AggregateExpr` for typed overflow attribution. A single COUNT(*) and
-all-star multi-output aggregates deliberately remain generic. Grouping,
-Filter, Join, Sort, IndexScan, RangeIndexScan, unused/mismatched scan columns,
-and mixed COUNT with SUM/MIN/MAX also retain the complete generic executor.
-The planner, PhysicalPlan, and Inspection JSON are unchanged.
+Duplicate COUNT(column) outputs reuse one source-order summary slot. Mixed and
+pure COUNT(*) outputs read the same summary's live-row count, while each final
+output uses its own `AggregateExpr` for typed overflow attribution. Pure
+COUNT(*) is eligible only for `SeqScan[]`; a nonempty all-star scan falls back
+defensively. Grouping, Filter, Join, Sort, IndexScan, RangeIndexScan,
+unused/mismatched scan columns, and mixed COUNT with SUM/MIN/MAX retain the
+complete generic executor. The planner, PhysicalPlan, and Inspection JSON are
+unchanged.
 
 Post quick passed every plan/result/column gate. Three strictly serial full
 post runs reduced the median-of-three medians to 0.657 ms for the pair, 0.646
@@ -828,14 +830,54 @@ ID/payload/pair controls changed from 0.780/0.807/0.805 ms to
 0.713/0.759/0.753 ms. The bounded improvement and broad machine/code-layout
 movement mean further Phase 7N micro-tuning is not selected.
 
-The post full baseline instead selects direct COUNT(*) live-row specialization
-for Phase 7R. Direct COUNT(*) remains 0.736 ms, 1.304x direct COUNT(id) and
-1.356x direct COUNT(payload), while still taking the generic Aggregate →
-SeqScan path. Remaining measured candidates are generic Filter borrowed-
-evaluator rollout, sequential PageManager traversal, BufferPool page snapshot
+The post-7Q full baseline selected direct COUNT(*) live-row specialization for
+Phase 7R. Before changing production, Phase 7R added a triple-star scenario to
+the existing single and pair cases. The implementation removes only the
+artificial requirement that a direct-count plan contain COUNT(column). Existing
+unused-scan-column validation therefore admits pure star outputs only for the
+planner's `SeqScan[]` shape and continues to reject a future or malformed
+all-star `SeqScan[column]`.
+
+The resulting path calls the existing `scan_presence_counts([])` exactly once,
+materializes no scanned `ExecutionRow` or per-row `ScalarValue`, and reuses the
+exact checked `live_rows: u128` for every star output. Final SQL `u64`
+conversion remains per output, so overflow is attributed through that output's
+exact `AggregateExpr`. No storage API, statistic, cache, slot-only shortcut,
+index-only path, dependency, or unsafe code was added. The zero-column summary
+still decodes and validates every persisted scalar, including unrequested
+Text, before counting the current live tuple.
+
+Per the requested run limit, one serial full pre run and one serial full post
+run used separate `/private/tmp/netbadb-phase7r-pre-target` and
+`/private/tmp/netbadb-phase7r-post-target` directories. Their medians in
+milliseconds were:
+
+| scenario | pre | post | change |
+| --- | ---: | ---: | ---: |
+| direct COUNT(*) | 0.757 | 0.558 | -26.3% |
+| direct COUNT(*), COUNT(*) | 0.731 | 0.550 | -24.6% |
+| direct triple COUNT(*) | 0.739 | 0.545 | -26.3% |
+| direct COUNT(id) | 0.584 | 0.650 | observational |
+| direct COUNT(payload) | 0.581 | 0.585 | observational |
+| filtered COUNT(*), COUNT(*) | 0.948 | 0.968 | observational |
+
+COUNT(*)/COUNT(id) changed from 1.298x to 0.859x and
+COUNT(*)/COUNT(payload) from 1.303x to 0.954x. Pair/single stayed
+0.964x/0.986x and triple/single stayed 0.976x/0.976x, consistent with one Heap
+traversal regardless of star-output multiplicity. Direct COUNT(id) moved
+11.3% while the direct pair, filtered all-star, generic hidden Filter, and
+other controls moved much less; these one-run wall-clock values have no timing
+threshold and do not attribute every absolute change to Phase 7R.
+
+The post-7R full baseline leaves generic hidden Text Filter at 1.621 ms while
+the direct projection and specialized filtered-count controls are materially
+lower. Phase 7S therefore selects a generic Filter borrowed-evaluator rollout
+for attribution, not implementation here. It must first separate predicate
+leaf ownership/evaluation from the fully owned QueryResult boundary. Remaining
+candidates are sequential PageManager traversal, BufferPool page snapshot
 cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
 covering/index-only reads, broader HashJoin eligibility, and multi-inequality
-intersection. Phase 7R is not implemented here.
+intersection.
 
 ## CI and compatibility
 
@@ -850,6 +892,6 @@ change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
-encoding unchanged. Phases 7P and 7Q retain those contracts as well as Protocol
-v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
+encoding unchanged. Phases 7P through 7R retain those contracts as well as
+Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
 QueryResult rows. These phases add no dependency and no unsafe code.

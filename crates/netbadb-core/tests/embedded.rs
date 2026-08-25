@@ -449,7 +449,7 @@ fn typed_global_aggregates_cover_null_empty_types_limit_and_reopen() {
 }
 
 #[test]
-fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
+fn direct_counts_preserve_current_live_rows_nullable_output_order_and_metadata() {
     let path = std::env::temp_dir().join(format!(
         "netbadb-direct-count-column-{}-{:?}.db",
         std::process::id(),
@@ -471,6 +471,17 @@ fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
         ],
     );
     let mut database = Database::create(&path, table.clone()).expect("create count database");
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*), COUNT(*), COUNT(*) FROM items")
+            .expect("count empty direct table")
+            .rows,
+        vec![vec![
+            ScalarValue::UInt64(0),
+            ScalarValue::UInt64(0),
+            ScalarValue::UInt64(0),
+        ]]
+    );
     for row in [
         vec![
             ScalarValue::Int64(1),
@@ -541,10 +552,14 @@ fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
     );
     assert_eq!(
         database
-            .query("SELECT COUNT(*), COUNT(*) FROM items")
-            .expect("execute all-star generic fallback")
+            .query("SELECT COUNT(*), COUNT(*), COUNT(*) FROM items")
+            .expect("execute direct triple-star count")
             .rows,
-        vec![vec![ScalarValue::UInt64(4), ScalarValue::UInt64(4)]]
+        vec![vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+        ]]
     );
     assert_eq!(
         database
@@ -552,6 +567,73 @@ fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
             .expect("execute filtered multi-count")
             .rows,
         vec![vec![ScalarValue::UInt64(1), ScalarValue::UInt64(1)]]
+    );
+    database
+        .analyze(TableId(96))
+        .expect("analyze direct counts");
+    assert_eq!(
+        affected(
+            database
+                .execute("DELETE FROM items WHERE id = 2")
+                .expect("delete direct count row")
+        ),
+        1
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM items")
+            .expect("count after delete with stale statistics")
+            .rows,
+        vec![vec![ScalarValue::UInt64(3)]]
+    );
+    database
+        .insert(&[ScalarValue::Int64(5), ScalarValue::Null, ScalarValue::Null])
+        .expect("insert nullable replacement row");
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM items")
+            .expect("count nullable row after slot reuse")
+            .rows,
+        vec![vec![ScalarValue::UInt64(4)]]
+    );
+    database
+        .create_index(TableId(96), ColumnId(1))
+        .expect("create direct count index");
+    database
+        .analyze(TableId(96))
+        .expect("analyze indexed direct counts");
+    database
+        .insert(&[
+            ScalarValue::Int64(6),
+            ScalarValue::Text("c".into()),
+            ScalarValue::Int64(60),
+        ])
+        .expect("insert after analyze");
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM items")
+            .expect("count insert after stale indexed statistics")
+            .rows,
+        vec![vec![ScalarValue::UInt64(5)]]
+    );
+    assert_eq!(
+        affected(
+            database
+                .execute("DELETE FROM items WHERE id = 1")
+                .expect("delete after stale indexed statistics")
+        ),
+        1
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*), COUNT(*), COUNT(*) FROM items")
+            .expect("count current indexed rows")
+            .rows,
+        vec![vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+        ]]
     );
     database.close().expect("close count database");
 
@@ -562,6 +644,17 @@ fn direct_counts_preserve_nullable_output_order_metadata_and_fallbacks() {
             .expect("count after reopen")
             .rows,
         vec![vec![ScalarValue::UInt64(2)]]
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT COUNT(*), COUNT(*), COUNT(*) FROM items")
+            .expect("count direct rows after reopen")
+            .rows,
+        vec![vec![
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt64(4),
+        ]]
     );
     reopened.close().expect("close reopened count database");
     cleanup(&path);
