@@ -869,15 +869,53 @@ traversal regardless of star-output multiplicity. Direct COUNT(id) moved
 other controls moved much less; these one-run wall-clock values have no timing
 threshold and do not attribute every absolute change to Phase 7R.
 
-The post-7R full baseline leaves generic hidden Text Filter at 1.621 ms while
-the direct projection and specialized filtered-count controls are materially
-lower. Phase 7S therefore selects a generic Filter borrowed-evaluator rollout
-for attribution, not implementation here. It must first separate predicate
-leaf ownership/evaluation from the fully owned QueryResult boundary. Remaining
-candidates are sequential PageManager traversal, BufferPool page snapshot
-cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
-covering/index-only reads, broader HashJoin eligibility, and multi-inequality
-intersection.
+The post-7R full baseline left generic hidden Text Filter at 1.619 ms. Phase 7S
+added matching Int64, IS NULL, repeated-leaf, and wide dynamic-lookup cases,
+then reused the existing dynamic borrowed evaluator in generic
+`PhysicalPlan::Filter`. The Filter still receives owned child `ExecutionRows`.
+Each Column leaf still performs binding-aware `find_source_position`, but the
+selected owned row value is viewed as `ScalarRef` rather than cloned; Literal
+leaves borrow from `Expr`. Binary, Unary, and IsNull results remain owned, and
+AND/OR still evaluate both sides. TRUE moves the original owned row unchanged;
+FALSE and UNKNOWN drop it. QueryResult remains fully owned.
+
+Per the requested run limit, one serial full pre run and one serial full post
+run used separate `/private/tmp/netbadb-phase7s-pre-target` and
+`/private/tmp/netbadb-phase7s-post-full-target` directories. A post-change
+quick run used a third independent target and passed every exact plan, result,
+and base-column gate. Full-run medians in milliseconds were:
+
+| scenario | pre | post | change |
+| --- | ---: | ---: | ---: |
+| hidden Text equality | 1.619354 | 1.191853 | -26.4% |
+| hidden Int64 equality | 0.904979 | 0.912250 | observational |
+| hidden Text IS NULL | 1.358145 | 1.109500 | -18.3% |
+| hidden Int64 IS NULL | 0.866979 | 0.834645 | observational |
+| hidden repeated Text | 2.202375 | 1.335562 | -39.4% |
+| hidden repeated Int64 | 1.103104 | 1.059334 | observational |
+| hidden wide dynamic lookup | 1.698895 | 1.673500 | observational |
+| specialized filtered-count Text equality | 0.744437 | 0.726146 | observational |
+
+Text/Int equality contracted from 1.789x to 1.306x, Text/Int IS NULL from
+1.567x to 1.329x, and repeated/single Text from 1.360x to 1.121x. The matching
+repeated/single Int64 ratio changed only from 1.219x to 1.161x. The wide/single
+Int64 ratio remained 1.877x/1.834x. Phase 7N's specialized repeated-Text
+control changed from 0.929541 to 0.899354 ms. Direct COUNT(*)/COUNT(id)/
+COUNT(payload) controls changed from 0.575042/0.615562/0.612854 ms to
+0.549937/0.586416/0.585979 ms. These one-run wall-clock controls have no timing
+threshold, and their small absolute movement is observational.
+
+The target-specific improvements and stable controls strongly attribute the
+removed cost to dynamic leaf cloning. The remaining Text/Int IS NULL gap more
+directly exposes owned predicate-only Text created by SeqScan, so Phase 7T
+selects generic Filter-to-SeqScan ownership/streaming attribution first.
+Generic Filter position prebinding remains second because the wide lookup case
+is still 1.834x the single Int64 case. Sequential PageManager traversal,
+BufferPool page snapshot cloning, AND/OR short-circuiting, MIN/MAX ownership,
+group-key ownership, covering/index-only reads, broader HashJoin eligibility,
+and multi-inequality intersection remain separate candidates. Phase 7S adds no
+streaming, prebinding, storage visitor, predicate pushdown, dependency, unsafe
+code, or compatibility change.
 
 ## CI and compatibility
 
@@ -892,6 +930,6 @@ change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
-encoding unchanged. Phases 7P through 7R retain those contracts as well as
+encoding unchanged. Phases 7P through 7S retain those contracts as well as
 Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
 QueryResult rows. These phases add no dependency and no unsafe code.

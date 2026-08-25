@@ -669,8 +669,12 @@ The implementation sequence is intentionally vertical:
 46. Direct COUNT(*) live-row specialization (Phase 7R) — complete; direct
     zero-column SeqScan single/pair/multi star outputs reuse the existing exact
     Heap presence summary without materializing empty ExecutionRows.
-47. Generic Filter borrowed-evaluator rollout (Phase 7S) — selected from the
-    post-7R full baseline for attribution, not started.
+47. Generic Filter borrowed-evaluator rollout (Phase 7S) — complete; generic
+    Filter keeps owned child rows but borrows Column and Literal leaves during
+    dynamic predicate evaluation, then moves qualifying rows unchanged.
+48. Generic Filter predicate-only ownership/streaming attribution (Phase 7T) —
+    selected from the post-7S full baseline, not started; generic Filter
+    position prebinding remains the next measured candidate.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

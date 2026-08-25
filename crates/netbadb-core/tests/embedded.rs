@@ -1184,6 +1184,17 @@ fn public_query_pipeline_obeys_null_and_three_valued_logic_after_reopen() {
         vec![vec![ScalarValue::Int64(2)]]
     );
     assert_eq!(
+        ids(&mut database, "nickname >= 'lin' AND nickname <= 'lin'"),
+        vec![vec![ScalarValue::Int64(2)]]
+    );
+    assert_eq!(
+        database
+            .query("SELECT nickname FROM users WHERE nickname = 'lin'")
+            .expect("filtered Text output remains owned")
+            .rows,
+        vec![vec![ScalarValue::Text("lin".into())]]
+    );
+    assert_eq!(
         ids(&mut database, "active"),
         vec![vec![ScalarValue::Int64(1)]]
     );

@@ -643,12 +643,39 @@ The hot bound evaluator receives no fields and cannot call
 `RelationBindingId + ColumnId`, missing fields and short rows remain typed
 errors, and AND/OR still evaluate both sides.
 
-Only Phase 7N uses the borrowed visitor. Generic PhysicalPlan Filter continues
-to materialize owned SeqScan rows, QueryResult remains fully owned, and no page
-pin or borrowed persisted row escapes into executor state. UPDATE, INSERT, the
-Join algorithms, planner, compiler, protocol, and inspection behavior are
-unchanged. Phase 7Q is neither generic Filter prebinding nor an expression
-bytecode/compiler or planner predicate rewrite.
+Only Phase 7N uses the borrowed storage visitor. Generic PhysicalPlan Filter
+continues to receive fully owned child `ExecutionRows`; Phase 7S changes only
+how its predicate views those already-owned values:
+
+```text
+owned child ExecutionRows
+        ↓
+generic Filter
+        ↓
+dynamic find_source_position per Column leaf
+        ↓
+ScalarRef view of owned row value or Expr literal
+        ↓
+borrowed Column/Literal leaves
+        ↓
+ScalarRef binary/truth semantics
+        ↓
+owned computed Bool/NULL
+       / \
+ TRUE     FALSE/UNKNOWN
+  ↓             ↓
+move original   drop row
+ExecutionRow
+```
+
+The dynamic evaluator deliberately does not prebind positions and AND/OR still
+evaluate both sides. QueryResult remains fully owned, and no page pin or
+borrowed persisted row escapes into executor state. UPDATE and DELETE
+selection naturally use the same generic Filter path, while assignment
+evaluation, INSERT, the Join algorithms, Phase 7N's prebound borrowed visitor,
+planner, compiler, protocol, and inspection behavior are unchanged. Phase 7S
+is neither storage-to-generic-Filter borrowed Text, streaming execution,
+predicate pushdown, nor an expression bytecode/compiler or planner rewrite.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.

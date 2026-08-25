@@ -566,13 +566,17 @@ fn execute_rows(
             result.rows = result
                 .rows
                 .into_iter()
-                .filter_map(
-                    |row| match evaluate_truth(predicate, &row.values, &fields) {
+                .filter_map(|row| {
+                    match evaluate_dynamic_borrowed_truth_values(
+                        predicate,
+                        EvaluationValues::Contiguous(&row.values),
+                        &fields,
+                    ) {
                         Ok(TruthValue::True) => Some(Ok(row)),
                         Ok(TruthValue::False | TruthValue::Unknown) => None,
                         Err(error) => Some(Err(error)),
-                    },
-                )
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(result)
         }
@@ -2170,7 +2174,6 @@ fn evaluate_bound_scalar_ref_truth<'a>(
     TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
-#[cfg(test)]
 fn evaluate_dynamic_with<'a, G>(
     expression: &'a Expr,
     fields: &[OutputField],
@@ -2222,7 +2225,6 @@ where
     }
 }
 
-#[cfg(test)]
 fn evaluate_dynamic_borrowed_values<'a>(
     expression: &'a Expr,
     values: EvaluationValues<'a>,
@@ -2233,7 +2235,6 @@ fn evaluate_dynamic_borrowed_values<'a>(
     })
 }
 
-#[cfg(test)]
 fn evaluate_dynamic_borrowed_truth_values<'a>(
     expression: &'a Expr,
     values: EvaluationValues<'a>,
@@ -2313,6 +2314,7 @@ fn evaluate_truth_values(
     TruthValue::from_scalar(evaluate_values(expression, values, fields)?)
 }
 
+#[cfg(test)]
 fn evaluate_truth(
     expression: &Expr,
     row: &[ScalarValue],
@@ -2712,6 +2714,57 @@ mod tests {
         let result: QueryResult = execute(&plan(&logical), &mut storage).expect("execute");
         assert_eq!(result.rows, vec![vec![ScalarValue::Text("Lin".into())]]);
         storage.close().expect("close storage");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
+    }
+
+    #[test]
+    fn empty_generic_filter_does_not_evaluate_its_predicate() {
+        let table = TableDef::new(
+            TableId(1),
+            "items",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-executor-empty-filter-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut storage = HeapStorage::create(&path, table).expect("create empty heap");
+        let column = |column_id: u32, name: &str, physical: PhysicalType| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(column_id),
+            relation_name: "items".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable: false,
+        };
+        let id = column(1, "id", PhysicalType::Int64);
+        let missing = column(2, "missing", PhysicalType::Bool);
+        let filter = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "items".into(),
+                columns: vec![id],
+            }),
+            predicate: Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+                kind: ExprKind::Column(missing),
+            },
+        };
+
+        let result = execute(&filter, &mut storage).expect("empty filter skips predicate");
+        assert!(result.rows.is_empty());
+        storage.close().expect("close empty heap");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }

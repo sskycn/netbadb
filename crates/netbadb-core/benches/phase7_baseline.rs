@@ -728,6 +728,99 @@ fn run_projection_attribution_scenarios(
         settings,
         ids_observation,
         measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_id",
+        rows,
+        &format!("SELECT id FROM items WHERE id = {middle}"),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_payload_is_null",
+        rows,
+        "SELECT id FROM items WHERE payload IS NULL",
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 0,
+            checksum: 0,
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_id_is_null",
+        rows,
+        "SELECT id FROM items WHERE id IS NULL",
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 0,
+            checksum: 0,
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_payload_repeated",
+        rows,
+        &format!(
+            "SELECT id FROM items WHERE payload >= 'payload-{middle:016}' AND payload <= 'payload-{middle:016}'"
+        ),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_id_repeated",
+        rows,
+        &format!("SELECT id FROM items WHERE id >= {middle} AND id <= {middle}"),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "hidden_filter_lookup_wide_control",
+        rows,
+        &format!(
+            "SELECT id FROM items WHERE id = id AND team_id = team_id AND bucket_id = bucket_id AND active = active AND id = {middle}"
+        ),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[
+            ID_COLUMN_ID,
+            TEAM_COLUMN_ID,
+            BUCKET_COLUMN_ID,
+            ACTIVE_COLUMN_ID,
+        ],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
     )
 }
 

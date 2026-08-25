@@ -878,20 +878,49 @@ reporting.
   formats, protocol, SDK contracts, ScalarValue, ScalarRef, and fully owned
   QueryResult rows are unchanged. No dependency or unsafe code was added.
 
-### Phase 7S — Generic Filter borrowed-evaluator rollout (selected, not started)
+### Phase 7S — Generic Filter borrowed-evaluator rollout (complete)
 
-The post-7R full baseline leaves generic hidden Text Filter at 1.621 ms, while
-the direct projection and specialized filtered-count controls remain materially
-lower. Phase 7S should first add attribution that separates generic predicate
-leaf ownership/evaluation from necessary fully owned QueryResult rows, then
-investigate reuse of the existing borrowed semantic core without changing
-planner eligibility, DML, or SQL truth. It is not implemented as part of Phase
-7R.
+- generic `PhysicalPlan::Filter` now reuses the existing dynamic borrowed
+  evaluator over its owned child `ExecutionRows`. Column leaves retain dynamic,
+  binding-aware `find_source_position` lookup and borrow the selected row
+  `ScalarValue`; Literal leaves borrow from `Expr`;
+- computed Binary, Unary, and IsNull values remain owned. AND/OR evaluate both
+  sides, TRUE moves the original row unchanged, and FALSE/UNKNOWN drop it;
+- no generic Filter prebinding, storage borrowed visitor, streaming, predicate
+  pushdown, planner/compiler/IR change, dependency, or unsafe code was added.
+  QueryResult and every surviving row remain fully owned. DML selection uses
+  the new predicate evaluator naturally; assignment and index-maintenance
+  semantics are unchanged;
+- one isolated serial full pre/post run changed hidden Text equality from
+  1.619354 to 1.191853 ms, Text IS NULL from 1.358145 to 1.109500 ms, and
+  repeated Text from 2.202375 to 1.335562 ms. Matching Int64 equality, IS NULL,
+  and repeated controls changed 0.904979→0.912250, 0.866979→0.834645, and
+  1.103104→1.059334 ms;
+- Text/Int equality contracted 1.789x→1.306x, Text/Int IS NULL
+  1.567x→1.329x, and repeated/single Text 1.360x→1.121x. Repeated/single
+  Int64 changed 1.219x→1.161x. The wide lookup control remained
+  1.698895/1.673500 ms, or 1.877x/1.834x single Int64;
+- the Phase 7N specialized Text-equality control remained
+  0.744437/0.726146 ms and direct COUNT(*)/COUNT(id)/COUNT(payload) remained
+  0.575042/0.615562/0.612854 ms pre and
+  0.549937/0.586416/0.585979 ms post. There is no timing threshold and no
+  extra rerun was necessary.
 
-The remaining measured candidates, in current order, are sequential
-PageManager traversal, BufferPool page snapshot cloning, AND/OR
-short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
-reads, broader HashJoin eligibility, and multi-inequality intersection.
+### Phase 7T — Generic Filter predicate-only ownership attribution (selected, not started)
+
+The remaining 1.329x Text/Int IS NULL ratio isolates owned predicate Text
+created by SeqScan more directly than comparison cost, so Phase 7T first
+measures generic Filter-to-SeqScan predicate-only ownership and a possible
+direct streaming boundary. It must preserve fully owned QueryResult rows and
+must not be treated as authorization to spread page-backed borrows through the
+executor. Generic Filter position prebinding is the second candidate because
+the wide/single-Int64 ratio remains 1.834x.
+
+After those two candidates, the measured order is sequential PageManager
+traversal, BufferPool page snapshot cloning, AND/OR short-circuiting, MIN/MAX
+ownership, group-key ownership, covering/index-only reads, broader HashJoin
+eligibility, and multi-inequality intersection. Phase 7T is not implemented in
+Phase 7S.
 
 ### Later Phase 7 work
 
