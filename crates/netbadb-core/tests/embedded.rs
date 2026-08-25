@@ -696,6 +696,23 @@ fn filtered_counts_preserve_null_truth_overlap_output_order_and_all_star_fallbac
     );
     assert_eq!(
         database
+            .query("SELECT COUNT(note) FROM items WHERE id >= 1 AND id <= 1")
+            .expect("count repeated Int64 predicate source")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT COUNT(note) FROM items \
+                 WHERE id = id AND score = score AND active = active AND id = 1",
+            )
+            .expect("count wide primitive predicate sources")
+            .rows,
+        vec![vec![ScalarValue::UInt64(1)]]
+    );
+    assert_eq!(
+        database
             .query("SELECT COUNT(note) FROM items WHERE note IS NOT NULL")
             .expect("count borrowed Text IS NOT NULL predicate")
             .rows,

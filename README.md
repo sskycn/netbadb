@@ -663,8 +663,11 @@ The implementation sequence is intentionally vertical:
     a shared `ScalarRef` and HRTB Heap callback keep validated predicate Text
     borrowed through Phase 7N evaluation while retaining the owned visitor and
     fully owned QueryResult boundary.
-45. Filter position prebinding (Phase 7Q) — selected from the remaining
-    repeated-leaf dynamic lookup cost, not started.
+45. Filtered-count predicate position prebinding (Phase 7Q) — complete; the
+    Phase 7N specialization reuses `BoundExpr`, binds source positions once
+    before Heap traversal, and evaluates borrowed ScalarRefs by checked index.
+46. Direct COUNT(*) live-row specialization (Phase 7R) — selected from the
+    post-7Q full baseline, not started.
 
 Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
 roadmap items.

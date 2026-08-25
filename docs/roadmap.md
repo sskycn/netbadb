@@ -814,21 +814,52 @@ reporting.
 - row encoding and every persistent/machine contract remain unchanged; no
   dependency or unsafe code was added, and QueryResult stays fully owned.
 
-### Phase 7Q — Filter position prebinding (selected, not started)
+### Phase 7Q — Filtered-count predicate position prebinding (complete)
 
-Post-7P Text ownership ratios are near parity, so further local Text ownership
-work is not selected. Repeated predicate leaves still cost 1.251x a single
-Text equality after the storage owner was removed, and every leaf still calls
-binding-aware `find_source_position`. Phase 7Q should therefore investigate
-prebinding Filter source positions without changing Filter eligibility,
-three-valued logic, AND/OR evaluation, or generic row ownership. It is not
-implemented as part of Phase 7P.
+- the Phase 7N specialization constructs source-order predicate fields once
+  and calls the existing `bind_expression` before Heap traversal; no bound IR,
+  expression bytecode, or PhysicalPlan variant was added;
+- every bound Column stores the checked source position and diagnostic name.
+  The callback evaluator receives only `BoundExpr + &[ScalarRef]`, never
+  fields, so the row hot path cannot call `find_source_position`;
+- one generalized BoundExpr recursive core accepts a ScalarRef getter. The
+  existing Join wrapper adapts owned rows, while the filtered-count wrapper
+  uses `values.get(position).copied()`;
+- Column/Literal leaves remain borrowed, Binary/Unary/IsNull results remain
+  owned, NULL truth is unchanged, and AND/OR continue evaluating both sides;
+- binding tests cover repeated columns, multiple source-order positions,
+  same-table/same-column self-binding identity, bind-time missing fields, and
+  runtime short rows. ScalarRef tests cover every ExprKind, BinaryOp, scalar
+  kind, TRUE/FALSE/UNKNOWN, Text pointer identity, and no short-circuit;
+- only the specialized Aggregate → Filter → SeqScan COUNT path changes.
+  Generic Filter, UPDATE, INSERT, Join algorithms, planner, compiler, storage,
+  protocol, inspection, and fully owned QueryResult rows remain unchanged;
+- Phase 7Q added repeated Int64 and wide primitive attribution before changing
+  production. Isolated serial full x3 changed median-of-three single/repeated
+  Int64 from 0.737/0.916 to 0.665/0.822 ms, single/repeated Text from
+  0.774/0.948 to 0.696/0.839 ms, and wide lookup from 1.524 to 1.242 ms;
+- repeated/single Int64 changed only 1.243x→1.235x and Text
+  1.225x→1.204x because repeated predicates still perform extra semantic work.
+  Wide/single Int64 contracted 2.068x→1.866x, the clearest lookup attribution;
+- generic hidden Filter changed 1.641/1.494 ms and the direct/filtered controls
+  also moved broadly. There is no timing threshold, so further Phase 7N local
+  micro-tuning is not selected;
+- no dependency or unsafe code was added, and all persistent/machine contracts
+  and row encoding remain unchanged.
+
+### Phase 7R — Direct COUNT(*) live-row specialization (selected, not started)
+
+The post-7Q full baseline leaves direct COUNT(*) on the generic Aggregate →
+SeqScan path at 0.736 ms, 1.304x direct COUNT(id) and 1.356x direct
+COUNT(payload). Phase 7R should investigate an exact current-live-row count
+without weakening complete Heap validation or changing grouped/mixed/filter
+eligibility. It is not implemented as part of Phase 7Q.
 
 The remaining measured candidates, in current order, are generic Filter
-borrowed-evaluator rollout, direct COUNT(*) live-row specialization, sequential
-PageManager traversal, BufferPool page snapshot cloning, AND/OR
-short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
-reads, broader HashJoin eligibility, and multi-inequality intersection.
+borrowed-evaluator rollout, sequential PageManager traversal, BufferPool page
+snapshot cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key
+ownership, covering/index-only reads, broader HashJoin eligibility, and
+multi-inequality intersection.
 
 ### Later Phase 7 work
 

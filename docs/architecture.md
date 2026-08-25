@@ -559,9 +559,19 @@ Phase 7O changed only the private evaluator called by that filtered-count
 consumer. Phase 7P adds one language-independent `ScalarRef<'a>` runtime view
 in `netbadb-types` and makes the Heap decoder return it directly. This view is
 not a persistent, wire, schema, or SQL IR type. Its Text variant can borrow the
-validated record payload only during a higher-ranked synchronous callback:
+validated record payload only during a higher-ranked synchronous callback.
+Phase 7Q then reuses the existing Join `BoundExpr` to resolve predicate source
+positions once before the Heap traversal:
 
 ```text
+FilteredCountPlan
+        ↓
+source-order predicate fields
+        ↓
+bind_expression once
+        ↓
+BoundExpr checked positions
+        ↓
 persisted row payload
         ↓
 decode + complete validation
@@ -573,7 +583,7 @@ ScalarRef<'row>
         ↓
 HRTB synchronous visitor callback
         ↓
-dynamic source-position lookup
+position-indexed bound evaluation
         ↓
 borrowed Column/Literal scalar views
         ↓
@@ -593,17 +603,23 @@ waits until every persisted scalar in the row has passed validation, including
 completely unrequested trailing values.
 
 The original owned visitor remains and delegates this traversal, converting
-only requested views to `ScalarValue`. `EvaluatedScalar::Borrowed` now stores a
+only requested views to `ScalarValue`. `EvaluatedScalar::Borrowed` stores a
 copied `ScalarRef`; Binary, Unary, and IsNull results remain owned. Existing
 ScalarValue binary, comparison, and truth helpers delegate one ScalarRef
-semantic core. Dynamic `find_source_position` remains binding-aware and runs
-for every Column leaf, and AND/OR still evaluate both sides.
+semantic core. Phase 7Q generalizes the existing bound evaluator around a
+checked ScalarRef getter: the Join wrapper adapts owned rows, while the
+filtered-count wrapper adapts the callback slice with `get(position).copied()`.
+The hot bound evaluator receives no fields and cannot call
+`find_source_position`. Binding remains identity-aware by
+`RelationBindingId + ColumnId`, missing fields and short rows remain typed
+errors, and AND/OR still evaluate both sides.
 
 Only Phase 7N uses the borrowed visitor. Generic PhysicalPlan Filter continues
 to materialize owned SeqScan rows, QueryResult remains fully owned, and no page
 pin or borrowed persisted row escapes into executor state. UPDATE, INSERT, the
-prebound Join evaluator and Join algorithms, planner, compiler, protocol, and
-inspection behavior are unchanged.
+Join algorithms, planner, compiler, protocol, and inspection behavior are
+unchanged. Phase 7Q is neither generic Filter prebinding nor an expression
+bytecode/compiler or planner predicate rewrite.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.

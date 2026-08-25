@@ -778,14 +778,64 @@ ID/payload/pair controls changed from 0.780/0.797/0.799 ms to
 0.739/0.711/0.719 ms. These broader changes are observational machine and code
 layout variance; there is no timing threshold.
 
-Post-7P data therefore selects Filter position prebinding as Phase 7Q: the
-Text ownership gap is effectively closed, while repeated leaves still scale
-with dynamic source-position lookup. The reordered candidates are: Filter
-position prebinding; generic Filter borrowed-evaluator rollout; direct COUNT(*)
-live-row specialization; sequential PageManager traversal; BufferPool page
-snapshot cloning; AND/OR short-circuiting; MIN/MAX ownership; group-key
-ownership; covering/index-only reads; broader HashJoin eligibility; and
-multi-inequality intersection. Phase 7Q is not implemented here.
+Post-7P data therefore selected filtered-count predicate position prebinding as
+Phase 7Q. Repeated/single alone was not sufficient attribution because the
+repeated predicate also adds a comparison, literal, and AND node. Phase 7Q
+first added a repeated Int64 range with the same expression shape and a wide
+primitive predicate whose five source fields make repeated linear lookup more
+visible, without changing production.
+
+The implementation reuses the existing executor-private `BoundExpr`; no bound
+IR or PhysicalPlan variant was added. `try_execute_filtered_counts` builds its
+source-order predicate fields and calls `bind_expression` once before entering
+the Heap visitor. The callback evaluates the resulting positions through a
+checked ScalarRef getter and receives no fields, so no Column leaf can call
+`find_source_position` in the row hot path. The existing Join owned-row wrapper
+and the new filtered-count ScalarRef wrapper share one recursive bound semantic
+core. Literal borrowing, three-valued logic, full two-sided AND/OR evaluation,
+and owned computed values remain unchanged. Generic PhysicalPlan Filter still
+uses `evaluate_truth` over owned SeqScan rows.
+
+Three strictly serial full pre/post runs used separate
+`/private/tmp/netbadb-phase7q-pre-target` and
+`/private/tmp/netbadb-phase7q-post-target` build directories. Median-of-three
+medians in milliseconds were:
+
+| scenario | pre | post | change |
+| --- | ---: | ---: | ---: |
+| filtered Int64 equality COUNT(payload) | 0.737 | 0.665 | -9.7% |
+| filtered repeated Int64 COUNT(payload) | 0.916 | 0.822 | -10.3% |
+| filtered wide primitive COUNT(payload) | 1.524 | 1.242 | -18.5% |
+| filtered Text equality COUNT(payload) | 0.774 | 0.696 | -10.0% |
+| filtered repeated Text COUNT(payload) | 0.948 | 0.839 | -11.6% |
+| filtered Bool equality COUNT(payload) | 0.807 | 0.759 | observational |
+| filtered Text `IS NOT NULL` COUNT(payload) | 0.716 | 0.617 | observational |
+| filtered Int64 `IS NOT NULL` COUNT(payload) | 0.706 | 0.627 | observational |
+| generic hidden Text Filter | 1.641 | 1.494 | observational |
+
+Repeated/single Int64 changed only from 1.243x to 1.235x and Text from
+1.225x to 1.204x, confirming that the additional expression work dominates
+those ratios. The wide/single-Int64 ratio contracted from 2.068x to 1.866x,
+while Text/Int64 equality stayed near parity at 1.050x/1.046x and Text/Int64
+`IS NOT NULL` at 1.014x/0.983x. The wide case therefore gives the clearest
+positive attribution, but the generic Filter and controls also moved broadly;
+there is no timing threshold and no claim that all absolute movement is caused
+by prebinding.
+
+Direct ID/nullable/payload/pair COUNT controls changed from
+0.622/0.625/0.634/0.647 ms to 0.564/0.547/0.542/0.580 ms. Phase 7N filtered
+ID/payload/pair controls changed from 0.780/0.807/0.805 ms to
+0.713/0.759/0.753 ms. The bounded improvement and broad machine/code-layout
+movement mean further Phase 7N micro-tuning is not selected.
+
+The post full baseline instead selects direct COUNT(*) live-row specialization
+for Phase 7R. Direct COUNT(*) remains 0.736 ms, 1.304x direct COUNT(id) and
+1.356x direct COUNT(payload), while still taking the generic Aggregate →
+SeqScan path. Remaining measured candidates are generic Filter borrowed-
+evaluator rollout, sequential PageManager traversal, BufferPool page snapshot
+cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
+covering/index-only reads, broader HashJoin eligibility, and multi-inequality
+intersection. Phase 7R is not implemented here.
 
 ## CI and compatibility
 
@@ -800,6 +850,6 @@ change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
 format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
-encoding unchanged. Phase 7P retains those contracts as well as Protocol v1,
-SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
+encoding unchanged. Phases 7P and 7Q retain those contracts as well as Protocol
+v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
 QueryResult rows. These phases add no dependency and no unsafe code.

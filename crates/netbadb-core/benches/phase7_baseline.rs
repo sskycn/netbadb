@@ -636,6 +636,42 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "aggregate_count_payload_int_repeated_filter",
+        rows,
+        &format!("SELECT COUNT(payload) FROM items WHERE id >= {middle} AND id <= {middle}"),
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: 1,
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "aggregate_count_payload_lookup_wide_filter",
+        rows,
+        &format!(
+            "SELECT COUNT(payload) FROM items WHERE id = id AND team_id = team_id AND bucket_id = bucket_id AND active = active AND id = {middle}"
+        ),
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[
+            ID_COLUMN_ID,
+            TEAM_COLUMN_ID,
+            BUCKET_COLUMN_ID,
+            ACTIVE_COLUMN_ID,
+            PAYLOAD_COLUMN_ID,
+        ],
+        Observation {
+            rows: 1,
+            checksum: 1,
+        },
+        settings,
+        count_observation,
+        measurements,
+    )?;
+    run_attribution_query(
         "aggregate_count_payload_text_filter",
         rows,
         &format!("SELECT COUNT(payload) FROM items WHERE payload = 'payload-{middle:016}'"),
