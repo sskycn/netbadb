@@ -151,6 +151,7 @@ cleanup rolls back active transactions. Metrics add
 were also admitted. Thus an unlisted trusted certificate increments the TLS
 handshake and authorization-denial counters, but not authenticated connections.
 
-Manifest v4 changes deployment configuration only. Protocol v1, Canonical
-Schema v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree payload v1, and
-IndexCatalog v2 remain unchanged.
+Manifest v4 changes deployment configuration only. The current independent
+persistent contracts are Protocol v1, Canonical Schema v1, Heap metadata v4,
+MVCC tuple v1, transaction-status v1, Page v5, WAL v3/record v2, BTree payload
+v1, and IndexCatalog v2.

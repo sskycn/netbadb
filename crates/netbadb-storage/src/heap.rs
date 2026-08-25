@@ -11,18 +11,21 @@ use netbadb_index::{
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId};
 
+use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
 use crate::recovery::RecoveryManager;
 use crate::transaction::TransactionManager;
+use crate::txn_status::{SharedTxnStatus, TxnStatusStore, txn_status_path};
 use crate::{
-    BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE,
-    Page, PageError, PageManager, PageType, SLOT_SIZE, SlotRef, SlotState, StorageError,
-    Transaction, TransactionError, WalManager, wal_path,
+    BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, IsolationLevel, MetadataError,
+    PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageError, PageManager, PageType, ReadView, SLOT_SIZE,
+    SlotRef, SlotState, Snapshot, StorageError, Transaction, TransactionError, WalManager,
+    WalRecordKind, wal_path,
 };
 
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_MANAGED_PAGE: PageId = PageId(1);
 const HEADER_MAGIC: &[u8; 4] = b"NBD1";
-const HEAP_FORMAT_VERSION: u16 = 3;
+const HEAP_FORMAT_VERSION: u16 = 4;
 const HEAP_METADATA_OFFSET: usize = 16;
 const HEAP_VERSION_OFFSET: usize = HEAP_METADATA_OFFSET + 4;
 const HEAP_RESERVED_OFFSET: usize = HEAP_VERSION_OFFSET + 2;
@@ -41,6 +44,7 @@ pub struct HeapStorage {
     buffer: BufferPool,
     table: TableDef,
     transactions: TransactionManager,
+    statuses: SharedTxnStatus,
     indexes: Vec<IndexDefinition>,
     index_plans: Vec<RegisteredIndexPlan>,
     table_statistics: Option<TableStatistics>,
@@ -179,6 +183,7 @@ impl HeapStorage {
         BufferPool::validate_capacity(buffer_pool_size)?;
         let path = path.as_ref();
         let wal_path = wal_path(path);
+        let status_path = txn_status_path(path);
         let wal_manager = WalManager::create(&wal_path)?;
         let pages = match PageManager::create(path) {
             Ok(pages) => pages,
@@ -188,6 +193,17 @@ impl HeapStorage {
                 return Err(error);
             }
         };
+        let status_store = match TxnStatusStore::create(&status_path) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                drop(pages);
+                drop(wal_manager);
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(wal_path);
+                return Err(error.into());
+            }
+        };
+        let statuses = Rc::new(RefCell::new(status_store));
         let wal = Rc::new(RefCell::new(wal_manager));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
@@ -220,11 +236,13 @@ impl HeapStorage {
         }
         buffer.flush_all()?;
         let next_txn_id = wal.borrow().next_txn_id();
-        let transactions = TransactionManager::new(wal, buffer.clone(), next_txn_id)?;
+        let transactions =
+            TransactionManager::new(wal, buffer.clone(), next_txn_id, statuses.clone())?;
         Ok(Self {
             buffer,
             table,
             transactions,
+            statuses,
             indexes: Vec::new(),
             index_plans: Vec::new(),
             table_statistics: None,
@@ -266,6 +284,7 @@ impl HeapStorage {
         let catalog_root =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         validate_catalog_root_bounds(catalog_root, pages.page_count())?;
+        let statuses = Rc::new(RefCell::new(TxnStatusStore::open(txn_status_path(path))?));
         let (mut wal_manager, records, truncated_wal_tail) =
             WalManager::open_for_recovery(wal_path(path))?;
         if let Err(error) =
@@ -275,6 +294,21 @@ impl HeapStorage {
                 crate::RecoveryError::Storage(storage) => *storage,
                 recovery => recovery.into(),
             });
+        }
+        // A durable Commit in WAL is the decision record. Reconcile it into
+        // the durable status sidecar before exposing a snapshot. This closes
+        // the crash window after WAL sync and before status publication.
+        let recovered_records = wal_manager.scan()?;
+        for record in &recovered_records {
+            match record.kind {
+                WalRecordKind::Commit => statuses
+                    .borrow_mut()
+                    .record_committed(record.txn_id, netbadb_types::CommitSeq(record.lsn.0))?,
+                WalRecordKind::RollbackComplete => {
+                    statuses.borrow_mut().record_aborted(record.txn_id)?;
+                }
+                WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } | WalRecordKind::Abort => {}
+            }
         }
         let recovered_catalog_root =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
@@ -291,11 +325,13 @@ impl HeapStorage {
             validate_heap_metadata(header.page().bytes(), &table, fingerprint)?;
         }
         let next_txn_id = wal.borrow().next_txn_id();
-        let transactions = TransactionManager::new(wal, buffer.clone(), next_txn_id)?;
+        let transactions =
+            TransactionManager::new(wal, buffer.clone(), next_txn_id, statuses.clone())?;
         let mut storage = Self {
             buffer,
             table,
             transactions,
+            statuses,
             indexes: Vec::new(),
             index_plans: Vec::new(),
             table_statistics: None,
@@ -880,6 +916,31 @@ impl HeapStorage {
         self.transactions.begin()
     }
 
+    pub fn begin_transaction_with_isolation(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction, StorageError> {
+        self.transactions.begin_with_isolation(isolation_level)
+    }
+
+    /// Pins a committed statement snapshot for a read that is not associated
+    /// with an explicit transaction.
+    pub fn read_view(&self) -> Result<ReadView, StorageError> {
+        let visible_csn = self
+            .statuses
+            .try_borrow()
+            .map_err(|_| TransactionError::StatusBusy)?
+            .maximum_commit_seq();
+        ReadView::new(
+            Snapshot {
+                visible_csn,
+                own_txn: None,
+                command_id: netbadb_types::CommandId(1),
+            },
+            self.statuses.clone(),
+        )
+    }
+
     pub(crate) fn buffer(&self) -> &BufferPool {
         &self.buffer
     }
@@ -903,7 +964,11 @@ impl HeapStorage {
     ) -> Result<RowId, StorageError> {
         self.validate_transaction(transaction)?;
         self.validate_row(values)?;
-        let payload = encode_row(values)?;
+        let row_payload = encode_row(values)?;
+        let payload = encode_tuple(
+            &TupleHeader::inserted_by(transaction.id(), transaction.command_id()),
+            &row_payload,
+        );
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
         if payload.len() > max_record_size {
             return Err(PageError::RecordTooLarge {
@@ -944,15 +1009,28 @@ impl HeapStorage {
     }
 
     pub fn read_row(&self, row_id: RowId) -> Result<Vec<ScalarValue>, StorageError> {
+        let view = self.read_view()?;
+        self.read_row_with_view(row_id, &view)?
+            .ok_or(StorageError::RowNotFound { row_id })
+    }
+
+    pub fn read_row_with_view(
+        &self,
+        row_id: RowId,
+        view: &ReadView,
+    ) -> Result<Option<Vec<ScalarValue>>, StorageError> {
         self.ensure_row_page(row_id)?;
         let page = self.buffer.read_page(row_id.page)?;
         let slot = validate_row_slot(page.page(), row_id)?;
-        decode_row(
-            page.page()
-                .read_record(slot)
-                .map_err(|error| map_row_error(error, row_id))?,
-            &self.table,
-        )
+        let tuple = page
+            .page()
+            .read_record(slot)
+            .map_err(|error| map_row_error(error, row_id))?;
+        let (header, payload) = decode_tuple(tuple)?;
+        if !is_visible(&header, view)? {
+            return Ok(None);
+        }
+        decode_row(payload, &self.table).map(Some)
     }
 
     /// Reads requested columns in caller-provided order while validating the
@@ -962,17 +1040,30 @@ impl HeapStorage {
         row_id: RowId,
         columns: &[ColumnId],
     ) -> Result<Vec<ScalarValue>, StorageError> {
+        let view = self.read_view()?;
+        self.read_row_columns_with_view(row_id, columns, &view)?
+            .ok_or(StorageError::RowNotFound { row_id })
+    }
+
+    pub fn read_row_columns_with_view(
+        &self,
+        row_id: RowId,
+        columns: &[ColumnId],
+        view: &ReadView,
+    ) -> Result<Option<Vec<ScalarValue>>, StorageError> {
         let positions = resolve_projection(&self.table, columns)?;
         self.ensure_row_page(row_id)?;
         let page = self.buffer.read_page(row_id.page)?;
         let slot = validate_row_slot(page.page(), row_id)?;
-        decode_row_columns(
-            page.page()
-                .read_record(slot)
-                .map_err(|error| map_row_error(error, row_id))?,
-            &self.table,
-            &positions,
-        )
+        let tuple = page
+            .page()
+            .read_record(slot)
+            .map_err(|error| map_row_error(error, row_id))?;
+        let (header, payload) = decode_tuple(tuple)?;
+        if !is_visible(&header, view)? {
+            return Ok(None);
+        }
+        decode_row_columns(payload, &self.table, &positions).map(Some)
     }
 
     /// Transactional form of [`Self::update`]. A failure after relocation has
@@ -985,9 +1076,16 @@ impl HeapStorage {
         values: &[ScalarValue],
     ) -> Result<RowId, StorageError> {
         self.validate_transaction(transaction)?;
-        let old_values = self.read_row(row_id)?;
+        let view = transaction.current_read_view()?;
+        let old_values = self
+            .read_row_with_view(row_id, &view)?
+            .ok_or(StorageError::RowNotFound { row_id })?;
         self.validate_row(values)?;
-        let payload = encode_row(values)?;
+        let row_payload = encode_row(values)?;
+        let payload = encode_tuple(
+            &TupleHeader::inserted_by(transaction.id(), transaction.command_id()),
+            &row_payload,
+        );
         let max_record_size = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE;
         if payload.len() > max_record_size {
             return Err(PageError::RecordTooLarge {
@@ -1015,24 +1113,8 @@ impl HeapStorage {
         self.crash_after_registered_publish(
             crate::crash_test::TestCrashPoint::RegisteredUpdateAfterHeapPublish,
         )?;
-        let mut completed_index_mutations = 0;
-        for plan in plans {
-            let old_key = &old_values[plan.column_position];
+        for (completed_index_mutations, plan) in plans.into_iter().enumerate() {
             let new_key = &values[plan.column_position];
-            if old_key == new_key && row_id == current_row_id {
-                continue;
-            }
-
-            self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
-            if let Err(error) =
-                self.btree()
-                    .delete_in(transaction, plan.definition.handle, old_key.clone(), row_id)
-            {
-                transaction.require_rollback();
-                return Err(error);
-            }
-            completed_index_mutations += 1;
-
             self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
             if let Err(error) = self.btree().insert_in(
                 transaction,
@@ -1043,7 +1125,6 @@ impl HeapStorage {
                 transaction.require_rollback();
                 return Err(error);
             }
-            completed_index_mutations += 1;
         }
         Ok(current_row_id)
     }
@@ -1061,25 +1142,81 @@ impl HeapStorage {
             page.page().clone()
         };
         let slot = validate_row_slot(&source_before, row_id)?;
-        let mut source_replacement = source_before.clone();
-        match source_replacement.replace_record(slot, payload) {
-            Ok(()) => {
-                let mut page = self.buffer.write_page(row_id.page)?;
-                let before = page.page().clone();
-                let mut after = before.clone();
-                let slot = validate_row_slot(&after, row_id)?;
-                after
-                    .replace_record(slot, payload)
-                    .map_err(|error| map_row_error(error, row_id))?;
-                transaction.log_page_update(&before, &mut after)?;
-                *page.page_mut() = after;
-                Ok(row_id)
-            }
-            Err(StorageError::Page(PageError::UpdateWouldOverflowPage { .. })) => {
-                self.relocate_update(transaction, row_id, slot, source_before, payload)
-            }
-            Err(error) => Err(map_row_error(error, row_id)),
+        let old_tuple = source_before
+            .read_record(slot)
+            .map_err(|error| map_row_error(error, row_id))?;
+        let (mut old_header, old_payload) = decode_tuple(old_tuple)?;
+        let mut destination = self.prepare_insert(payload, None)?;
+        let new_row_id = destination.row_id();
+        old_header.expire(transaction.id(), transaction.command_id(), Some(new_row_id));
+        let expired = encode_tuple(&old_header, old_payload);
+
+        if destination.page_id == row_id.page {
+            destination
+                .after
+                .replace_record(slot, &expired)
+                .map_err(|error| map_row_error(error, row_id))?;
+            return self.apply_single_page_insert(transaction, destination);
         }
+
+        let mut source_after = source_before.clone();
+        source_after
+            .replace_record(slot, &expired)
+            .map_err(|error| map_row_error(error, row_id))?;
+        transaction.log_page_update(&destination.before, &mut destination.after)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::RelocationAfterFirstPageUpdateLog,
+        );
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_relocation_second_log) {
+            self.transactions
+                .wal()
+                .try_borrow_mut()
+                .map_err(|_| TransactionError::WalBusy)?
+                .inject_partial_append_failure(0);
+        }
+        let source_lsn = match transaction.log_page_update(&source_before, &mut source_after) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                transaction.require_rollback();
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(
+            crate::crash_test::TestCrashPoint::RelocationAfterBothPageUpdateLogs,
+        );
+        let publish_destination = if destination.new_page {
+            transaction
+                .flush_through(source_lsn)
+                .and_then(|()| self.publish_new_page(&destination))
+        } else {
+            self.publish_existing_page(&destination)
+        };
+        if let Err(error) = publish_destination {
+            transaction.require_rollback();
+            return Err(error);
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_relocation_source_publish) {
+            self.buffer.inject_page_write_failure();
+        }
+        #[cfg(test)]
+        if crate::crash_test::is_enabled(
+            crate::crash_test::TestCrashPoint::RelocationAfterFirstPagePublish,
+        ) {
+            if let Err(error) = self.buffer.flush_page(destination.page_id) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+            crate::crash_test::crash_now();
+        }
+        if let Err(error) = self.publish_page_image(row_id.page, source_after) {
+            transaction.require_rollback();
+            return Err(error);
+        }
+        Ok(new_row_id)
     }
 
     pub fn delete_in(
@@ -1088,7 +1225,10 @@ impl HeapStorage {
         row_id: RowId,
     ) -> Result<(), StorageError> {
         self.validate_transaction(transaction)?;
-        let old_values = self.read_row(row_id)?;
+        let view = transaction.current_read_view()?;
+        let old_values = self
+            .read_row_with_view(row_id, &view)?
+            .ok_or(StorageError::RowNotFound { row_id })?;
         transaction.acquire_writer()?;
         let plans = self.index_plans.clone();
         for plan in &plans {
@@ -1101,35 +1241,11 @@ impl HeapStorage {
             }
         }
 
-        let mut completed_index_mutations = 0;
-        for plan in plans {
-            self.maybe_fail_registered_mutation(transaction, completed_index_mutations);
-            if let Err(error) = self.btree().delete_in(
-                transaction,
-                plan.definition.handle,
-                old_values[plan.column_position].clone(),
-                row_id,
-            ) {
-                if completed_index_mutations != 0 {
-                    transaction.require_rollback();
-                }
-                return Err(error);
-            }
-            completed_index_mutations += 1;
-            #[cfg(test)]
-            if completed_index_mutations == 1 {
-                self.crash_after_registered_publish(
-                    crate::crash_test::TestCrashPoint::RegisteredDeleteAfterFirstIndexPublish,
-                )?;
-            }
-        }
-
-        if let Err(error) = self.delete_heap_in(transaction, row_id) {
-            if completed_index_mutations != 0 {
-                transaction.require_rollback();
-            }
-            return Err(error);
-        }
+        self.delete_heap_in(transaction, row_id)?;
+        #[cfg(test)]
+        self.crash_after_registered_publish(
+            crate::crash_test::TestCrashPoint::RegisteredDeleteAfterFirstIndexPublish,
+        )?;
         Ok(())
     }
 
@@ -1142,8 +1258,14 @@ impl HeapStorage {
         let before = page.page().clone();
         let mut after = before.clone();
         let slot = validate_row_slot(&after, row_id)?;
+        let tuple = after
+            .read_record(slot)
+            .map_err(|error| map_row_error(error, row_id))?;
+        let (mut header, payload) = decode_tuple(tuple)?;
+        header.expire(transaction.id(), transaction.command_id(), None);
+        let expired = encode_tuple(&header, payload);
         after
-            .delete_record(slot)
+            .replace_record(slot, &expired)
             .map_err(|error| map_row_error(error, row_id))?;
         transaction.log_page_update(&before, &mut after)?;
         *page.page_mut() = after;
@@ -1289,78 +1411,6 @@ impl HeapStorage {
         Ok(prepared.row_id())
     }
 
-    fn relocate_update(
-        &mut self,
-        transaction: &mut Transaction,
-        row_id: RowId,
-        source_slot: SlotId,
-        source_before: Page,
-        payload: &[u8],
-    ) -> Result<RowId, StorageError> {
-        let mut source_after = source_before.clone();
-        source_after.delete_record(source_slot)?;
-        let mut destination = self.prepare_insert(payload, Some(row_id.page))?;
-        transaction.acquire_writer()?;
-
-        transaction.log_page_update(&destination.before, &mut destination.after)?;
-        #[cfg(test)]
-        crate::crash_test::maybe_crash(
-            crate::crash_test::TestCrashPoint::RelocationAfterFirstPageUpdateLog,
-        );
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_relocation_second_log) {
-            self.transactions
-                .wal()
-                .try_borrow_mut()
-                .map_err(|_| TransactionError::WalBusy)?
-                .inject_partial_append_failure(0);
-        }
-        let source_lsn = match transaction.log_page_update(&source_before, &mut source_after) {
-            Ok(lsn) => lsn,
-            Err(error) => {
-                transaction.require_rollback();
-                return Err(error);
-            }
-        };
-        #[cfg(test)]
-        crate::crash_test::maybe_crash(
-            crate::crash_test::TestCrashPoint::RelocationAfterBothPageUpdateLogs,
-        );
-
-        let publish_destination = if destination.new_page {
-            transaction
-                .flush_through(source_lsn)
-                .and_then(|()| self.publish_new_page(&destination))
-        } else {
-            self.publish_existing_page(&destination)
-        };
-        if let Err(error) = publish_destination {
-            transaction.require_rollback();
-            return Err(error);
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_relocation_source_publish) {
-            self.buffer.inject_page_write_failure();
-        }
-        #[cfg(test)]
-        if crate::crash_test::is_enabled(
-            crate::crash_test::TestCrashPoint::RelocationAfterFirstPagePublish,
-        ) {
-            // Exercise the mixed STEAL state: destination is durable while
-            // source still contains its before-image and no Commit exists.
-            if let Err(error) = self.buffer.flush_page(destination.page_id) {
-                transaction.require_rollback();
-                return Err(error);
-            }
-            crate::crash_test::crash_now();
-        }
-        if let Err(error) = self.publish_page_image(row_id.page, source_after) {
-            transaction.require_rollback();
-            return Err(error);
-        }
-        Ok(destination.row_id())
-    }
-
     fn publish_existing_page(&self, prepared: &PreparedInsert) -> Result<(), StorageError> {
         self.publish_page_image(prepared.page_id, prepared.after.clone())
     }
@@ -1385,13 +1435,21 @@ impl HeapStorage {
     }
 
     pub fn scan(&mut self) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
+        let view = self.read_view()?;
+        self.scan_with_view(&view)
+    }
+
+    pub fn scan_with_view(
+        &mut self,
+        view: &ReadView,
+    ) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
         let columns = self
             .table
             .columns
             .iter()
             .map(|column| column.id)
             .collect::<Vec<_>>();
-        self.scan_columns(&columns)
+        self.scan_columns_with_view(&columns, view)
     }
 
     /// Scans requested columns in caller-provided order while validating every
@@ -1400,6 +1458,15 @@ impl HeapStorage {
     pub fn scan_columns(
         &mut self,
         columns: &[ColumnId],
+    ) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
+        let view = self.read_view()?;
+        self.scan_columns_with_view(columns, &view)
+    }
+
+    pub fn scan_columns_with_view(
+        &mut self,
+        columns: &[ColumnId],
+        view: &ReadView,
     ) -> Result<Vec<(RowId, Vec<ScalarValue>)>, StorageError> {
         let positions = resolve_projection(&self.table, columns)?;
         let mut rows = Vec::new();
@@ -1414,7 +1481,11 @@ impl HeapStorage {
             }
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
-                if let Some((slot_entry, payload)) = validated.live_record(slot)? {
+                if let Some((slot_entry, tuple)) = validated.live_record(slot)? {
+                    let (tuple_header, payload) = decode_tuple(tuple)?;
+                    if !is_visible(&tuple_header, view)? {
+                        continue;
+                    }
                     let values = decode_row_columns(payload, &self.table, &positions)?;
                     rows.push((
                         RowId {
@@ -1441,6 +1512,15 @@ impl HeapStorage {
         &mut self,
         columns: &[ColumnId],
     ) -> Result<PresenceCountSummary, StorageError> {
+        let view = self.read_view()?;
+        self.scan_presence_counts_with_view(columns, &view)
+    }
+
+    pub fn scan_presence_counts_with_view(
+        &mut self,
+        columns: &[ColumnId],
+        view: &ReadView,
+    ) -> Result<PresenceCountSummary, StorageError> {
         let projection = PresenceProjection::resolve(&self.table, columns)?;
         let mut summary = PresenceCountSummary {
             live_rows: 0,
@@ -1458,7 +1538,11 @@ impl HeapStorage {
             }
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
-                if let Some((_slot_entry, payload)) = validated.live_record(slot)? {
+                if let Some((_slot_entry, tuple)) = validated.live_record(slot)? {
+                    let (tuple_header, payload) = decode_tuple(tuple)?;
+                    if !is_visible(&tuple_header, view)? {
+                        continue;
+                    }
                     row_presence.fill(false);
                     decode_row_presence(payload, &self.table, &projection, &mut row_presence)?;
                     summary.live_rows = summary
@@ -1493,6 +1577,21 @@ impl HeapStorage {
         &mut self,
         value_columns: &[ColumnId],
         presence_columns: &[ColumnId],
+        visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+        F: FnMut(&[ScalarValue], &[bool]) -> Result<(), E>,
+    {
+        let view = self.read_view().map_err(E::from)?;
+        self.visit_columns_with_presence_view(value_columns, presence_columns, &view, visitor)
+    }
+
+    pub fn visit_columns_with_presence_view<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        view: &ReadView,
         mut visitor: F,
     ) -> Result<(), E>
     where
@@ -1500,11 +1599,16 @@ impl HeapStorage {
         F: FnMut(&[ScalarValue], &[bool]) -> Result<(), E>,
     {
         let mut owned_values = Vec::with_capacity(value_columns.len());
-        self.visit_scalar_refs_with_presence(value_columns, presence_columns, |values, presence| {
-            owned_values.clear();
-            owned_values.extend(values.iter().copied().map(ScalarRef::to_owned));
-            visitor(&owned_values, presence)
-        })
+        self.visit_scalar_refs_with_presence_view(
+            value_columns,
+            presence_columns,
+            view,
+            |values, presence| {
+                owned_values.clear();
+                owned_values.extend(values.iter().copied().map(ScalarRef::to_owned));
+                visitor(&owned_values, presence)
+            },
+        )
     }
 
     /// Visits each current live Heap row with borrowed scalar views after
@@ -1521,15 +1625,31 @@ impl HeapStorage {
         &mut self,
         value_columns: &[ColumnId],
         presence_columns: &[ColumnId],
+        visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+        F: for<'row> FnMut(&[ScalarRef<'row>], &[bool]) -> Result<(), E>,
+    {
+        let view = self.read_view().map_err(E::from)?;
+        self.visit_scalar_refs_with_presence_view(value_columns, presence_columns, &view, visitor)
+    }
+
+    pub fn visit_scalar_refs_with_presence_view<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        view: &ReadView,
         mut visitor: F,
     ) -> Result<(), E>
     where
         E: From<StorageError>,
         F: for<'row> FnMut(&[ScalarRef<'row>], &[bool]) -> Result<(), E>,
     {
-        self.visit_row_scalar_refs_with_presence(
+        self.visit_row_scalar_refs_with_presence_view(
             value_columns,
             presence_columns,
+            view,
             |_row_id, values, presence| visitor(values, presence),
         )
     }
@@ -1547,6 +1667,26 @@ impl HeapStorage {
         &mut self,
         value_columns: &[ColumnId],
         presence_columns: &[ColumnId],
+        visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+        F: for<'row> FnMut(RowId, &[ScalarRef<'row>], &[bool]) -> Result<(), E>,
+    {
+        let view = self.read_view().map_err(E::from)?;
+        self.visit_row_scalar_refs_with_presence_view(
+            value_columns,
+            presence_columns,
+            &view,
+            visitor,
+        )
+    }
+
+    pub fn visit_row_scalar_refs_with_presence_view<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        view: &ReadView,
         mut visitor: F,
     ) -> Result<(), E>
     where
@@ -1571,7 +1711,11 @@ impl HeapStorage {
             let mut values = Vec::with_capacity(projection.value_count);
             for slot_number in 0..header.slot_count {
                 let slot = SlotId(slot_number);
-                if let Some((slot_entry, payload)) = validated.live_record(slot).map_err(E::from)? {
+                if let Some((slot_entry, tuple)) = validated.live_record(slot).map_err(E::from)? {
+                    let (tuple_header, payload) = decode_tuple(tuple).map_err(E::from)?;
+                    if !is_visible(&tuple_header, view).map_err(E::from)? {
+                        continue;
+                    }
                     value_slots.fill(None);
                     values.clear();
                     presence.fill(false);
@@ -1612,6 +1756,118 @@ impl HeapStorage {
             .into_iter()
             .next()
             .ok_or_else(|| crate::invalid_format("presence summary omitted requested column"))
+    }
+
+    pub fn scan_column_presence_count_with_view(
+        &mut self,
+        column_id: ColumnId,
+        view: &ReadView,
+    ) -> Result<u128, StorageError> {
+        self.scan_presence_counts_with_view(&[column_id], view)?
+            .non_null_counts
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::invalid_format("presence summary omitted requested column"))
+    }
+
+    /// Conservatively reclaims tuple versions that no active snapshot can
+    /// still observe. This synchronous phase-1 vacuum also removes the exact
+    /// candidate entries retained in every registered BTree.
+    pub fn vacuum(&mut self) -> Result<u64, StorageError> {
+        let horizon = {
+            let statuses = self
+                .statuses
+                .try_borrow()
+                .map_err(|_| TransactionError::StatusBusy)?;
+            statuses
+                .oldest_snapshot()
+                .unwrap_or_else(|| statuses.maximum_commit_seq())
+        };
+        let mut dead = Vec::new();
+        for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
+            let page_id = PageId(page_number);
+            let page = self.buffer.read_page(page_id)?;
+            let validated = page.page().validated()?;
+            if validated.header().page_type != PageType::Heap {
+                page.page().single_payload(validated.header().page_type)?;
+                continue;
+            }
+            for slot_number in 0..validated.header().slot_count {
+                let slot = SlotId(slot_number);
+                let Some((entry, tuple)) = validated.live_record(slot)? else {
+                    continue;
+                };
+                let (header, payload) = decode_tuple(tuple)?;
+                if is_dead_before(&header, horizon, &self.statuses)? {
+                    dead.push((
+                        RowId {
+                            page: page_id,
+                            slot: slot.0,
+                            generation: entry.generation,
+                        },
+                        decode_row(payload, &self.table)?,
+                    ));
+                }
+            }
+        }
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self.begin_transaction()?;
+        transaction.acquire_writer()?;
+        let result = (|| {
+            let plans = self.index_plans.clone();
+            for (row_id, values) in &dead {
+                for plan in &plans {
+                    let key = values.get(plan.column_position).cloned().ok_or(
+                        StorageError::InvalidRowLength {
+                            expected: self.table.columns.len(),
+                            actual: values.len(),
+                        },
+                    )?;
+                    if self
+                        .btree()
+                        .contains_exact(plan.definition.handle, &key, *row_id)?
+                    {
+                        self.btree().delete_in(
+                            &mut transaction,
+                            plan.definition.handle,
+                            key,
+                            *row_id,
+                        )?;
+                    }
+                }
+                self.physical_delete_heap_in(&mut transaction, *row_id)?;
+            }
+            u64::try_from(dead.len()).map_err(|_| StorageError::CountOverflow)
+        })();
+        match result {
+            Ok(reclaimed) => {
+                transaction.commit()?;
+                Ok(reclaimed)
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
+        }
+    }
+
+    fn physical_delete_heap_in(
+        &mut self,
+        transaction: &mut Transaction,
+        row_id: RowId,
+    ) -> Result<(), StorageError> {
+        let mut page = self.buffer.write_page(row_id.page)?;
+        let before = page.page().clone();
+        let mut after = before.clone();
+        let slot = validate_row_slot(&after, row_id)?;
+        after
+            .delete_record(slot)
+            .map_err(|error| map_row_error(error, row_id))?;
+        transaction.log_page_update(&before, &mut after)?;
+        *page.page_mut() = after;
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
@@ -2179,7 +2435,7 @@ mod tests {
     use crate::{
         BufferError, CheckpointError, PageError, PageManager, PageType, SlotId, StorageError,
         TransactionError, TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError,
-        WalManager, WalRecordKind, wal_alternate_path, wal_path,
+        WalManager, WalRecordKind, txn_status_path, wal_alternate_path, wal_path,
     };
     use netbadb_index::{
         BTreeHandle, IndexCatalogNode, IndexError, IndexSpec, IndexStatistics, TableStatistics,
@@ -2210,9 +2466,294 @@ mod tests {
 
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(txn_status_path(path));
         let wal = wal_path(path);
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    fn mvcc_text(value: &str) -> Vec<ScalarValue> {
+        vec![ScalarValue::Int64(1), ScalarValue::Text(value.to_owned())]
+    }
+
+    #[test]
+    fn mvcc_dirty_update_commit_and_repeatable_snapshot_visibility() {
+        let path = test_path("mvcc-dirty-update");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create MVCC heap");
+        let old = storage.insert(&mvcc_text("A")).expect("insert A");
+        let old_snapshot = storage.read_view().expect("old snapshot");
+
+        let mut writer = storage.begin_transaction().expect("begin writer");
+        let _writer_statement = writer.begin_statement().expect("writer statement");
+        let new = storage
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("version update");
+
+        assert_ne!(new, old);
+        assert_eq!(
+            storage.scan_with_view(&old_snapshot).expect("dirty reader"),
+            vec![(old, mvcc_text("A"))]
+        );
+        let own_view = writer.begin_statement().expect("own next statement");
+        assert_eq!(
+            storage.scan_with_view(&own_view).expect("own scan"),
+            vec![(new, mvcc_text("B"))]
+        );
+
+        writer.commit().expect("commit B");
+        let committed = storage.read_view().expect("committed snapshot");
+        assert_eq!(
+            storage.scan_with_view(&committed).expect("new snapshot"),
+            vec![(new, mvcc_text("B"))]
+        );
+        assert_eq!(
+            storage
+                .scan_with_view(&old_snapshot)
+                .expect("repeat old snapshot"),
+            vec![(old, mvcc_text("A"))]
+        );
+        drop(committed);
+        drop(old_snapshot);
+        storage.close().expect("close MVCC heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mvcc_dirty_delete_and_rollback_keep_old_version_visible() {
+        let path = test_path("mvcc-dirty-delete");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create MVCC heap");
+        let row = storage.insert(&mvcc_text("A")).expect("insert A");
+        let mut writer = storage.begin_transaction().expect("begin delete");
+        let _statement = writer.begin_statement().expect("delete statement");
+        storage.delete_in(&mut writer, row).expect("expire row");
+
+        let other = storage.read_view().expect("other snapshot");
+        assert_eq!(
+            storage.scan_with_view(&other).expect("dirty delete scan"),
+            vec![(row, mvcc_text("A"))]
+        );
+        let own = writer.begin_statement().expect("own statement");
+        assert!(
+            storage
+                .scan_with_view(&own)
+                .expect("own delete scan")
+                .is_empty()
+        );
+        drop(own);
+        drop(other);
+        writer.rollback().expect("rollback delete");
+        assert_eq!(
+            storage.scan().expect("post rollback"),
+            vec![(row, mvcc_text("A"))]
+        );
+        storage.close().expect("close MVCC heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_committed_refreshes_while_repeatable_read_reuses_snapshot() {
+        let path = test_path("mvcc-isolation-levels");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create MVCC heap");
+        let old = storage.insert(&mvcc_text("A")).expect("insert A");
+        let mut read_committed = storage
+            .begin_transaction_with_isolation(crate::IsolationLevel::ReadCommitted)
+            .expect("begin RC");
+        let rc_before = read_committed.begin_statement().expect("RC before");
+        let mut repeatable = storage
+            .begin_transaction_with_isolation(crate::IsolationLevel::RepeatableRead)
+            .expect("begin RR");
+        let rr_before = repeatable.begin_statement().expect("RR before");
+        assert_eq!(
+            storage.scan_with_view(&rc_before).unwrap()[0].1,
+            mvcc_text("A")
+        );
+        assert_eq!(
+            storage.scan_with_view(&rr_before).unwrap()[0].1,
+            mvcc_text("A")
+        );
+        drop(rc_before);
+        drop(rr_before);
+
+        let mut writer = storage.begin_transaction().expect("begin writer");
+        let _statement = writer.begin_statement().expect("writer statement");
+        let new = storage
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("update B");
+        writer.commit().expect("commit B");
+
+        let rc_after = read_committed.begin_statement().expect("RC after");
+        let rr_after = repeatable.begin_statement().expect("RR after");
+        assert_eq!(
+            storage.scan_with_view(&rc_after).unwrap(),
+            vec![(new, mvcc_text("B"))]
+        );
+        assert_eq!(
+            storage.scan_with_view(&rr_after).unwrap(),
+            vec![(old, mvcc_text("A"))]
+        );
+        drop(rc_after);
+        drop(rr_after);
+        read_committed.commit().expect("finish RC");
+        repeatable.commit().expect("finish RR");
+        storage.close().expect("close MVCC heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mvcc_vacuum_waits_for_repeatable_snapshot_and_preserves_generation_safety() {
+        let path = test_path("mvcc-vacuum");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create MVCC heap");
+        let old = storage.insert(&mvcc_text("A")).expect("insert A");
+        let mut reader = storage
+            .begin_transaction_with_isolation(crate::IsolationLevel::RepeatableRead)
+            .expect("begin RR");
+        let old_view = reader.begin_statement().expect("pin RR");
+        drop(old_view);
+        let mut writer = storage.begin_transaction().expect("begin writer");
+        let _statement = writer.begin_statement().expect("writer statement");
+        storage
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("update B");
+        drop(_statement);
+        writer.commit().expect("commit B");
+
+        assert_eq!(storage.vacuum().expect("blocked vacuum"), 0);
+        reader.commit().expect("finish RR");
+        assert_eq!(storage.vacuum().expect("reclaim old"), 1);
+        let reused = storage.insert(&mvcc_text("C")).expect("reuse vacuum slot");
+        assert_eq!((reused.page, reused.slot), (old.page, old.slot));
+        assert!(reused.generation > old.generation);
+        assert!(matches!(
+            storage.read_row(old),
+            Err(StorageError::StaleRowId { .. })
+        ));
+        storage.close().expect("close MVCC heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mvcc_status_survives_checkpoint_rotation_and_reopen() {
+        let path = test_path("mvcc-status-checkpoint");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create MVCC heap");
+        let old = storage.insert(&mvcc_text("A")).expect("insert A");
+        let mut writer = storage.begin_transaction().expect("begin writer");
+        let _statement = writer.begin_statement().expect("writer statement");
+        let new = storage
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("update B");
+        writer.commit().expect("commit B");
+        storage.checkpoint().expect("checkpoint");
+        storage.close().expect("close");
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("reopen");
+        assert_eq!(
+            reopened.scan().expect("scan reopened"),
+            vec![(new, mvcc_text("B"))]
+        );
+        reopened.close().expect("close reopened");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mvcc_seq_scan_and_index_candidates_apply_identical_visibility() {
+        let path = test_path("mvcc-index-equivalence");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create MVCC heap");
+        let index = storage
+            .create_index(ColumnId(2))
+            .expect("create name index");
+        let old = storage.insert(&mvcc_text("A")).expect("insert A");
+        let old_view = storage.read_view().expect("old view");
+        let mut writer = storage.begin_transaction().expect("begin writer");
+        let statement = writer.begin_statement().expect("writer statement");
+        let new = storage
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("update B");
+
+        let old_candidates = storage
+            .btree()
+            .lookup(index.handle, &ScalarValue::Text("A".into()))
+            .expect("lookup A candidates");
+        let mut old_index_rows = Vec::new();
+        for row_id in old_candidates {
+            if let Some(values) = storage
+                .read_row_with_view(row_id, &old_view)
+                .expect("visible A candidate")
+            {
+                old_index_rows.push((row_id, values));
+            }
+        }
+        assert_eq!(storage.scan_with_view(&old_view).unwrap(), old_index_rows);
+
+        drop(statement);
+        writer.commit().expect("commit B");
+        let new_view = storage.read_view().expect("new view");
+        let new_candidates = storage
+            .btree()
+            .lookup(index.handle, &ScalarValue::Text("B".into()))
+            .expect("lookup B candidates");
+        let new_index_rows = new_candidates
+            .into_iter()
+            .filter_map(
+                |row_id| match storage.read_row_with_view(row_id, &new_view) {
+                    Ok(Some(values)) => Some(Ok((row_id, values))),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<Result<Vec<_>, StorageError>>()
+            .expect("visible B candidates");
+        assert_eq!(storage.scan_with_view(&new_view).unwrap(), new_index_rows);
+        assert_eq!(new_index_rows, vec![(new, mvcc_text("B"))]);
+        drop(new_view);
+        drop(old_view);
+        storage.close().expect("close MVCC heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mvcc_crash_recovery_undoes_dirty_update_and_redoes_committed_update() {
+        let loser_path = test_path("mvcc-crash-loser-update");
+        cleanup(&loser_path);
+        let mut loser = HeapStorage::create(&loser_path, table()).expect("create loser heap");
+        let old = loser.insert(&mvcc_text("A")).expect("insert A");
+        loser.flush().expect("flush baseline");
+        let mut writer = loser.begin_transaction().expect("begin loser");
+        let statement = writer.begin_statement().expect("loser statement");
+        loser
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("dirty update");
+        loser.flush().expect("STEAL dirty versions");
+        drop(statement);
+        drop(writer);
+        loser.simulate_crash();
+        let mut recovered = HeapStorage::open(&loser_path, table()).expect("recover loser");
+        assert_eq!(recovered.scan().unwrap(), vec![(old, mvcc_text("A"))]);
+        recovered.close().expect("close loser recovery");
+        cleanup(&loser_path);
+
+        let winner_path = test_path("mvcc-crash-winner-update");
+        cleanup(&winner_path);
+        let mut winner = HeapStorage::create(&winner_path, table()).expect("create winner heap");
+        let old = winner.insert(&mvcc_text("A")).expect("insert A");
+        winner.flush().expect("flush baseline");
+        let mut writer = winner.begin_transaction().expect("begin winner");
+        let statement = writer.begin_statement().expect("winner statement");
+        let new = winner
+            .update_in(&mut writer, old, &mvcc_text("B"))
+            .expect("winner update");
+        drop(statement);
+        writer.commit().expect("durable commit");
+        winner.simulate_crash();
+        let mut recovered = HeapStorage::open(&winner_path, table()).expect("recover winner");
+        assert_eq!(recovered.scan().unwrap(), vec![(new, mvcc_text("B"))]);
+        recovered.close().expect("close winner recovery");
+        cleanup(&winner_path);
     }
 
     fn identity_table() -> TableDef {
@@ -2709,18 +3250,18 @@ mod tests {
                 ],
             )
             .expect("unchanged update");
-        assert_eq!(same, first);
+        assert_ne!(same, first);
         let page_updates_after = storage
             .wal_records()
             .unwrap()
             .iter()
             .filter(|record| matches!(record.kind, WalRecordKind::PageUpdate { .. }))
             .count();
-        assert_eq!(page_updates_after - page_updates_before, 1);
+        assert!(page_updates_after > page_updates_before);
 
         let key_changed = storage
             .update(
-                first,
+                same,
                 &[
                     ScalarValue::UInt64(1),
                     ScalarValue::Null,
@@ -2728,25 +3269,25 @@ mod tests {
                 ],
             )
             .expect("key change");
-        assert_eq!(key_changed, first);
-        assert_eq!(
+        assert_ne!(key_changed, same);
+        assert!(
             storage
                 .btree()
                 .lookup(team.handle, &ScalarValue::UInt64(10))
-                .expect("old duplicate key"),
-            vec![duplicate]
+                .expect("old candidates")
+                .contains(&duplicate)
         );
         assert_eq!(
             storage
                 .btree()
                 .lookup(team.handle, &ScalarValue::Null)
                 .expect("new NULL key"),
-            vec![first]
+            vec![key_changed]
         );
 
         let relocated = storage
             .update(
-                first,
+                key_changed,
                 &[
                     ScalarValue::UInt64(1),
                     ScalarValue::UInt64(20),
@@ -2764,9 +3305,9 @@ mod tests {
             ),
         ] {
             assert!(
-                !storage
+                storage
                     .btree()
-                    .contains_exact(handle, &old_key, first)
+                    .contains_exact(handle, &old_key, key_changed)
                     .unwrap()
             );
             assert!(
@@ -2790,7 +3331,7 @@ mod tests {
             .expect("relocate without changing team key");
         assert_ne!(same_key_relocated, same_key_old);
         assert!(
-            !storage
+            storage
                 .btree()
                 .contains_exact(team.handle, &ScalarValue::UInt64(10), same_key_old)
                 .unwrap()
@@ -2808,26 +3349,26 @@ mod tests {
                 .btree()
                 .lookup(team.handle, &ScalarValue::UInt64(20))
                 .unwrap()
-                .is_empty()
+                .contains(&relocated)
         );
         storage.checkpoint().expect("checkpoint maintained indexes");
         storage.close().expect("close indexed heap");
 
         let mut reopened = HeapStorage::open_with_buffer_pool_size(&path, schema, 1)
             .expect("reopen maintained indexes");
-        assert_eq!(
+        assert!(
             reopened
                 .btree()
                 .lookup(team.handle, &ScalarValue::UInt64(10))
-                .unwrap(),
-            vec![same_key_relocated]
+                .unwrap()
+                .contains(&same_key_relocated)
         );
         reopened.close().expect("close reopened heap");
         cleanup(&path);
     }
 
     #[test]
-    fn registered_index_key_preflight_and_missing_entry_leave_transaction_active() {
+    fn registered_index_row_preflight_and_missing_entry_leave_transaction_active() {
         let path = test_path("registered-index-preflight");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
@@ -2840,7 +3381,7 @@ mod tests {
             ])
             .expect("insert baseline");
 
-        let too_large = "x".repeat(4020);
+        let too_large = "x".repeat(3990);
         let mut transaction = storage.begin_transaction().expect("begin preflight");
         assert!(matches!(
             storage.insert_in(
@@ -2851,7 +3392,7 @@ mod tests {
                     ScalarValue::Text(too_large.clone()),
                 ],
             ),
-            Err(StorageError::Index(IndexError::KeyTooLarge { .. }))
+            Err(StorageError::Page(PageError::RecordTooLarge { .. }))
         ));
         assert_eq!(transaction.state(), TransactionState::Active);
         assert!(matches!(
@@ -2864,7 +3405,7 @@ mod tests {
                     ScalarValue::Text(too_large),
                 ],
             ),
-            Err(StorageError::Index(IndexError::KeyTooLarge { .. }))
+            Err(StorageError::Page(PageError::RecordTooLarge { .. }))
         ));
         assert_eq!(transaction.state(), TransactionState::Active);
         transaction
@@ -3000,10 +3541,10 @@ mod tests {
 
         let before_delete = storage.read_row(row).expect("read delete baseline");
         let mut transaction = storage.begin_transaction().expect("begin failed delete");
-        storage.inject_registered_mutation_failure_after(1);
-        assert!(storage.delete_in(&mut transaction, row).is_err());
-        assert_eq!(transaction.state(), TransactionState::RollbackRequired);
-        transaction.rollback().expect("rollback partial delete");
+        storage
+            .delete_in(&mut transaction, row)
+            .expect("logical delete retains index candidates");
+        transaction.rollback().expect("rollback logical delete");
         assert_eq!(storage.read_row(row).unwrap(), before_delete);
         assert!(
             storage
@@ -3131,7 +3672,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_column_and_backfill_failures_leave_no_registry_or_pages() {
+    fn unknown_column_leaves_no_registry_and_maximum_row_backfills() {
         let path = test_path("index-build-rollback");
         cleanup(&path);
         let text_table = TableDef::new(
@@ -3145,7 +3686,7 @@ mod tests {
         );
         let mut storage = HeapStorage::create(&path, text_table.clone()).expect("create heap");
         storage
-            .insert(&[ScalarValue::Text("x".repeat(4_030))])
+            .insert(&[ScalarValue::Text("x".repeat(4_007))])
             .expect("insert valid heap row");
         let baseline_pages = storage.buffer.page_count();
         let baseline_wal = storage.wal_records().expect("baseline WAL").len();
@@ -3161,12 +3702,18 @@ mod tests {
             baseline_wal
         );
 
-        assert!(matches!(
-            storage.create_index(ColumnId(1)),
-            Err(StorageError::Index(IndexError::KeyTooLarge { .. }))
-        ));
-        assert!(storage.indexes().is_empty());
-        assert_eq!(storage.buffer.page_count(), baseline_pages);
+        let definition = storage
+            .create_index(ColumnId(1))
+            .expect("maximum heap row fits index backfill");
+        assert_eq!(storage.indexes(), std::slice::from_ref(&definition));
+        assert!(
+            storage
+                .btree()
+                .lookup(definition.handle, &ScalarValue::Text("x".repeat(4_007)))
+                .expect("lookup maximum key")
+                .iter()
+                .any(|row_id| storage.read_row(*row_id).is_ok())
+        );
         assert_eq!(
             storage.scan().expect("heap survives build failure").len(),
             1
@@ -3176,7 +3723,7 @@ mod tests {
             .expect("write after rollback");
         storage.close().expect("close heap");
         let reopened = HeapStorage::open(&path, text_table).expect("reopen heap");
-        assert!(reopened.indexes().is_empty());
+        assert_eq!(reopened.indexes(), &[definition]);
         cleanup(&path);
     }
 
@@ -4082,6 +4629,7 @@ mod tests {
         ));
 
         storage.delete(row_ids[1]).expect("delete NULL row");
+        assert_eq!(storage.vacuum().expect("vacuum deleted row"), 1);
         let reused = storage
             .insert(&[
                 ScalarValue::Int64(5),
@@ -4251,7 +4799,7 @@ mod tests {
         let mut header = pages.read_page(PageId(0)).expect("read metadata page");
         let bytes = header.bytes();
         assert_eq!(&bytes[16..20], b"NBD1");
-        assert_eq!(&bytes[20..22], &3_u16.to_le_bytes());
+        assert_eq!(&bytes[20..22], &4_u16.to_le_bytes());
         assert_eq!(&bytes[22..24], &[0, 0]);
         assert_eq!(&bytes[24..32], &table.id.0.to_le_bytes());
         assert_eq!(&bytes[32..34], &2_u16.to_le_bytes());
@@ -4384,15 +4932,15 @@ mod tests {
             .insert(&[ScalarValue::Int64(3), ScalarValue::Text("third".into())])
             .expect("insert third");
 
-        storage
+        let first_shrunk = storage
             .update(
                 first,
                 &[ScalarValue::Int64(1), ScalarValue::Text("x".into())],
             )
             .expect("shrink first");
-        storage
+        let first_current = storage
             .update(
-                first,
+                first_shrunk,
                 &[
                     ScalarValue::Int64(1),
                     ScalarValue::Text("a replacement that grows again".into()),
@@ -4402,7 +4950,7 @@ mod tests {
         storage.delete(middle).expect("delete middle");
         assert!(matches!(
             storage.read_row(middle),
-            Err(StorageError::RowDeleted { row_id }) if row_id == middle
+            Err(StorageError::RowNotFound { row_id }) if row_id == middle
         ));
         assert_eq!(
             storage.read_row(third).expect("third remains")[0],
@@ -4413,11 +4961,11 @@ mod tests {
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         let rows = reopened.scan().expect("scan");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, first);
-        assert_eq!(rows[1].0, third);
+        assert!(rows.iter().any(|(row_id, _)| *row_id == first_current));
+        assert!(rows.iter().any(|(row_id, _)| *row_id == third));
         assert!(matches!(
             reopened.delete(middle),
-            Err(StorageError::RowDeleted { .. })
+            Err(StorageError::RowNotFound { .. })
         ));
         cleanup(&path);
     }
@@ -4433,8 +4981,9 @@ mod tests {
         storage.delete(old).expect("delete old occupant");
         assert!(matches!(
             storage.read_row(old),
-            Err(StorageError::RowDeleted { row_id }) if row_id == old
+            Err(StorageError::RowNotFound { row_id }) if row_id == old
         ));
+        assert_eq!(storage.vacuum().expect("vacuum old occupant"), 1);
 
         let new = storage
             .insert(&[ScalarValue::Int64(2), ScalarValue::Text("new".into())])
@@ -4486,6 +5035,7 @@ mod tests {
             .insert(&text_row(2, 100, b'b'))
             .expect("insert tombstone source");
         storage.delete(deleted).expect("delete row");
+        storage.vacuum().expect("vacuum deleted row");
         let reused = storage
             .insert(&text_row(3, 50, b'c'))
             .expect("reuse deleted slot");
@@ -4624,6 +5174,7 @@ mod tests {
         let page_count = storage.buffer.page_count();
 
         storage.delete(earlier).expect("delete earlier row");
+        assert_eq!(storage.vacuum().expect("vacuum earlier row"), 1);
         let reused = storage
             .insert(&text_row(3, 100, b'c'))
             .expect("reuse page 1");
@@ -4647,7 +5198,7 @@ mod tests {
             .insert(&text_row(1, 3_500, b'a'))
             .expect("fill page 1");
         let second = storage
-            .insert(&text_row(2, 1_000, b'b'))
+            .insert(&text_row(2, 900, b'b'))
             .expect("create page 2");
         let third = storage
             .insert(&text_row(3, 3_000, b'c'))
@@ -4659,9 +5210,11 @@ mod tests {
         storage
             .update(first, &text_row(1, 10, b'd'))
             .expect("shrink page 1");
+        storage.vacuum().expect("vacuum old first version");
         storage
             .update(second, &text_row(2, 10, b'e'))
             .expect("shrink page 2");
+        storage.vacuum().expect("vacuum old second version");
         let page_count = storage.buffer.page_count();
 
         for id in 10..15 {
@@ -4719,13 +5272,13 @@ mod tests {
             .expect("create destination");
         assert_eq!(destination_seed.page, PageId(3));
 
-        let unchanged = storage
+        let first_version = storage
             .update(old, &text_row(1, 50, b'd'))
-            .expect("in-place update");
-        assert_eq!(unchanged, old);
+            .expect("first version update");
+        assert_ne!(first_version, old);
         let relocated = storage
-            .update(old, &text_row(1, 1_000, b'e'))
-            .expect("relocate update");
+            .update(first_version, &text_row(1, 1_000, b'e'))
+            .expect("second version update");
         assert_eq!(relocated.page, PageId(3));
         assert_ne!(relocated, old);
         assert_eq!(
@@ -4733,17 +5286,18 @@ mod tests {
             text_row(1, 1_000, b'e')
         );
         assert!(
-            matches!(storage.read_row(old), Err(StorageError::RowDeleted { row_id }) if row_id == old)
+            matches!(storage.read_row(old), Err(StorageError::RowNotFound { row_id }) if row_id == old)
         );
         assert!(matches!(
             storage.update(old, &text_row(1, 10, b'x')),
-            Err(StorageError::RowDeleted { .. })
+            Err(StorageError::RowNotFound { .. })
         ));
         assert!(matches!(
             storage.delete(old),
-            Err(StorageError::RowDeleted { .. })
+            Err(StorageError::RowNotFound { .. })
         ));
 
+        assert_eq!(storage.vacuum().expect("vacuum expired versions"), 2);
         let source_reuse = storage
             .insert(&text_row(4, 20, b'f'))
             .expect("reuse source slot");
@@ -4773,6 +5327,7 @@ mod tests {
         storage
             .delete(destination)
             .expect("create destination tombstone");
+        storage.vacuum().expect("vacuum destination tombstone");
 
         let relocated = storage
             .update(old, &text_row(1, 1_000, b'd'))
@@ -4857,7 +5412,7 @@ mod tests {
         );
         assert!(matches!(
             reopened.read_row(old),
-            Err(StorageError::RowDeleted { row_id }) if row_id == old
+            Err(StorageError::RowNotFound { row_id }) if row_id == old
         ));
         reopened.close().expect("close reopened heap");
         cleanup(&path);
@@ -4932,6 +5487,7 @@ mod tests {
         storage
             .delete(tombstone)
             .expect("commit destination tombstone");
+        storage.vacuum().expect("vacuum destination tombstone");
         let mut transaction = storage.begin_transaction().expect("begin relocation");
         let relocated = storage
             .update_in(&mut transaction, old, &text_row(1, 1_000, b'd'))
@@ -5073,6 +5629,7 @@ mod tests {
             .insert(&text_row(2, 20, b'b'))
             .expect("insert valid source");
         storage.delete(stale).expect("delete stale source");
+        storage.vacuum().expect("vacuum stale source");
         storage
             .insert(&text_row(3, 20, b'c'))
             .expect("reuse stale source");
@@ -5086,10 +5643,10 @@ mod tests {
         let current = storage
             .update_in(&mut transaction, valid, &text_row(2, 20, b'd'))
             .expect("valid update");
-        assert_eq!(current, valid);
+        assert_ne!(current, valid);
         transaction.commit().expect("commit after ordinary error");
         assert_eq!(
-            storage.read_row(valid).expect("read valid update"),
+            storage.read_row(current).expect("read valid update"),
             text_row(2, 20, b'd')
         );
         storage.close().expect("close heap");
@@ -5105,6 +5662,7 @@ mod tests {
             .expect("insert initial occupant");
         for generation in 2..=65 {
             storage.delete(current).expect("delete current occupant");
+            storage.vacuum().expect("vacuum current occupant");
             current = storage
                 .insert(&[
                     ScalarValue::Int64(i64::from(generation)),
@@ -5133,6 +5691,7 @@ mod tests {
             .insert(&[ScalarValue::Int64(1), ScalarValue::Text("old".into())])
             .expect("insert old occupant");
         storage.delete(old).expect("commit tombstone");
+        storage.vacuum().expect("vacuum committed delete");
 
         let mut transaction = storage.begin_transaction().expect("begin reuse");
         let candidate = storage
@@ -5167,6 +5726,7 @@ mod tests {
             .insert(&[ScalarValue::Int64(1), ScalarValue::Text("old".into())])
             .expect("insert old occupant");
         storage.delete(old).expect("commit tombstone");
+        storage.vacuum().expect("vacuum first tombstone");
         storage.close().expect("persist tombstone baseline");
 
         let mut storage = HeapStorage::open(&path, table()).expect("open tombstone baseline");
@@ -5182,6 +5742,7 @@ mod tests {
             committed
         );
         storage.delete(committed).expect("commit second tombstone");
+        storage.vacuum().expect("vacuum second tombstone");
         storage.close().expect("persist second tombstone");
 
         let mut storage = HeapStorage::open(&path, table()).expect("open second tombstone");
@@ -5224,7 +5785,7 @@ mod tests {
             .insert(&[ScalarValue::Int64(2), ScalarValue::Text("second".into())])
             .expect("insert second");
         let mut transaction = storage.begin_transaction().expect("begin");
-        storage
+        let _updated = storage
             .update_in(
                 &mut transaction,
                 first,
@@ -5260,7 +5821,7 @@ mod tests {
 
         let mut storage = HeapStorage::open(&path, table()).expect("open baseline");
         let mut winner = storage.begin_transaction().expect("begin winner");
-        storage
+        let committed = storage
             .update_in(
                 &mut winner,
                 first,
@@ -5272,7 +5833,7 @@ mod tests {
 
         let mut storage = HeapStorage::open(&path, table()).expect("redo winner");
         assert_eq!(
-            storage.read_row(first).expect("committed row")[1],
+            storage.read_row(committed).expect("committed row")[1],
             ScalarValue::Text("committed".into())
         );
         let mut loser = storage.begin_transaction().expect("begin loser");
@@ -5299,13 +5860,13 @@ mod tests {
         let mut storage = HeapStorage::open(&path, table()).expect("redo delete winner");
         assert!(matches!(
             storage.read_row(second),
-            Err(StorageError::RowDeleted { .. })
+            Err(StorageError::RowNotFound { .. })
         ));
         let mut update_loser = storage.begin_transaction().expect("begin update loser");
         storage
             .update_in(
                 &mut update_loser,
-                first,
+                committed,
                 &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
             )
             .expect("loser update");
@@ -5315,12 +5876,14 @@ mod tests {
 
         let recovered = HeapStorage::open(&path, table()).expect("undo update loser");
         assert_eq!(
-            recovered.read_row(first).expect("restored winner value")[1],
+            recovered
+                .read_row(committed)
+                .expect("restored winner value")[1],
             ScalarValue::Text("committed".into())
         );
         assert!(matches!(
             recovered.read_row(second),
-            Err(StorageError::RowDeleted { .. })
+            Err(StorageError::RowNotFound { .. })
         ));
         drop(recovered);
         cleanup(&path);
@@ -5439,7 +6002,7 @@ mod tests {
         let mut pages = PageManager::open(&path).expect("open page manager");
         let mut page = pages.read_page(FIRST_HEAP_PAGE).expect("read data page");
         let slot = page.slot(SlotId(0)).expect("read row slot");
-        page.bytes_mut()[usize::from(slot.offset)] = 99;
+        page.bytes_mut()[usize::from(slot.offset) + crate::mvcc::TUPLE_HEADER_SIZE] = 99;
         page.refresh_checksum();
         pages.write_page(&page).expect("write corrupt row");
         pages.sync().expect("sync corrupt row");
@@ -5465,7 +6028,7 @@ mod tests {
         let mut pages = PageManager::open(&path).expect("open page manager");
         let mut page = pages.read_page(FIRST_HEAP_PAGE).expect("read data page");
         let slot = page.slot(SlotId(0)).expect("read row slot");
-        let text_payload = usize::from(slot.offset) + 9 + 1 + 4;
+        let text_payload = usize::from(slot.offset) + crate::mvcc::TUPLE_HEADER_SIZE + 9 + 1 + 4;
         page.bytes_mut()[text_payload] = 0xff;
         page.refresh_checksum();
         pages.write_page(&page).expect("write corrupt row");
@@ -5933,7 +6496,7 @@ mod tests {
             ))
         ));
         assert_eq!(transaction.state(), TransactionState::RollbackPending);
-        assert_eq!(storage.scan().expect("scan partial rollback").len(), 2);
+        assert_eq!(storage.scan().expect("scan partial rollback").len(), 1);
         transaction.rollback().expect("rollback transaction");
         let rows = storage.scan().expect("scan after rollback");
         assert_eq!(rows.len(), 1);
@@ -6660,7 +7223,9 @@ mod tests {
         transaction: &mut crate::Transaction,
         value: &str,
     ) {
-        let (row_id, _) = only_row(storage);
+        let view = transaction.current_read_view().expect("writer view");
+        let rows = storage.scan_with_view(&view).expect("scan writer row");
+        let (row_id, _) = rows.into_iter().next().expect("writer row");
         storage
             .update_in(
                 transaction,
@@ -7231,6 +7796,7 @@ mod tests {
             ])
             .expect("insert reuse baseline");
         storage.delete(old).expect("commit reuse tombstone");
+        storage.vacuum().expect("vacuum reuse tombstone");
         storage.close().expect("close reuse baseline");
         (path, old)
     }
@@ -7367,7 +7933,7 @@ mod tests {
         let mut reopened = HeapStorage::open(&path, table()).expect("redo relocation winner");
         assert!(matches!(
             reopened.read_row(old),
-            Err(StorageError::RowDeleted { .. })
+            Err(StorageError::RowNotFound { .. })
         ));
         let (current, values) = reopened
             .scan()

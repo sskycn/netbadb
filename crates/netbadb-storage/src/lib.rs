@@ -5,14 +5,17 @@ mod buffer;
 #[cfg(test)]
 mod crash_test;
 mod heap;
+mod mvcc;
 mod page;
 mod recovery;
 mod transaction;
+mod txn_status;
 mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::{HeapStorage, PresenceCountSummary};
+pub use mvcc::{IsolationLevel, ReadView, Snapshot};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
 pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
@@ -20,6 +23,7 @@ pub use page::{
 };
 pub use recovery::RecoveryError;
 pub use transaction::{Transaction, TransactionState};
+pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
 pub use wal::{
     WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
     WalRecordKind, wal_alternate_path, wal_path,
@@ -337,6 +341,8 @@ pub enum TransactionError {
     IdExhausted,
     OutstandingTransactionCountOverflow,
     WalBusy,
+    StatusBusy,
+    CommandIdExhausted,
     WriterBusy {
         txn_id: netbadb_types::TxnId,
     },
@@ -371,6 +377,8 @@ impl fmt::Display for TransactionError {
                 formatter.write_str("outstanding transaction count overflowed")
             }
             Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
+            Self::StatusBusy => formatter.write_str("transaction-status store is already borrowed"),
+            Self::CommandIdExhausted => formatter.write_str("transaction command ID exhausted"),
             Self::WriterBusy { txn_id } => {
                 write!(formatter, "transaction {} is the active writer", txn_id.0)
             }
@@ -446,6 +454,7 @@ pub enum StorageError {
     Recovery(RecoveryError),
     Wal(WalError),
     Transaction(TransactionError),
+    TxnStatus(TxnStatusError),
     Checkpoint(CheckpointError),
     TableIdMismatch {
         expected: TableId,
@@ -488,6 +497,8 @@ pub enum StorageError {
     PageOffsetOverflow {
         page_id: PageId,
     },
+    InvalidMvccHeader(&'static str),
+    UnsupportedTupleVersion(u16),
 }
 
 impl fmt::Display for StorageError {
@@ -504,6 +515,7 @@ impl fmt::Display for StorageError {
             Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
             Self::Wal(error) => write!(formatter, "write-ahead log error: {error}"),
             Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
+            Self::TxnStatus(error) => write!(formatter, "transaction-status error: {error}"),
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::TableIdMismatch { expected, actual } => write!(
                 formatter,
@@ -561,6 +573,12 @@ impl fmt::Display for StorageError {
                     page_id.0
                 )
             }
+            Self::InvalidMvccHeader(message) => {
+                write!(formatter, "invalid MVCC tuple header: {message}")
+            }
+            Self::UnsupportedTupleVersion(version) => {
+                write!(formatter, "unsupported MVCC tuple version {version}")
+            }
         }
     }
 }
@@ -578,6 +596,7 @@ impl Error for StorageError {
             Self::Recovery(error) => Some(error),
             Self::Wal(error) => Some(error),
             Self::Transaction(error) => Some(error),
+            Self::TxnStatus(error) => Some(error),
             Self::Checkpoint(error) => Some(error),
             _ => None,
         }
@@ -641,6 +660,12 @@ impl From<WalError> for StorageError {
 impl From<TransactionError> for StorageError {
     fn from(error: TransactionError) -> Self {
         Self::Transaction(error)
+    }
+}
+
+impl From<TxnStatusError> for StorageError {
+    fn from(error: TxnStatusError) -> Self {
+        Self::TxnStatus(error)
     }
 }
 

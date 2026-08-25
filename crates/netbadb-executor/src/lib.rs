@@ -10,7 +10,7 @@ use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
-use netbadb_storage::{HeapStorage, PresenceCountSummary, StorageError, Transaction};
+use netbadb_storage::{HeapStorage, PresenceCountSummary, ReadView, StorageError, Transaction};
 use netbadb_types::{ColumnId, RelationBindingId, RowId, ScalarRef, ScalarValue, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +126,19 @@ pub fn execute_with_storages(
     plan: &PhysicalPlan,
     storages: &mut [HeapStorage],
 ) -> Result<QueryResult, ExecutionError> {
-    let result = execute_rows(plan, storages)?;
+    let read_views = storages
+        .iter()
+        .map(HeapStorage::read_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    execute_with_read_views(plan, storages, &read_views)
+}
+
+pub fn execute_with_read_views(
+    plan: &PhysicalPlan,
+    storages: &mut [HeapStorage],
+    read_views: &[ReadView],
+) -> Result<QueryResult, ExecutionError> {
+    let result = execute_rows_with_views(plan, storages, read_views)?;
     Ok(QueryResult {
         columns: result
             .fields
@@ -146,8 +158,18 @@ pub fn execute_statement(
     storage: &mut HeapStorage,
     transaction: Option<&mut Transaction>,
 ) -> Result<ExecutionResult, ExecutionError> {
+    let mut transaction = transaction;
+    let read_view = match transaction.as_deref_mut() {
+        Some(transaction) => transaction.begin_statement()?,
+        None => storage.read_view()?,
+    };
     match statement {
-        PhysicalStatement::Query(plan) => execute(plan, storage).map(ExecutionResult::Query),
+        PhysicalStatement::Query(plan) => execute_with_read_views(
+            plan,
+            std::slice::from_mut(storage),
+            std::slice::from_ref(&read_view),
+        )
+        .map(ExecutionResult::Query),
         PhysicalStatement::Insert {
             table_id, values, ..
         } => {
@@ -169,7 +191,11 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows(input, std::slice::from_mut(storage))?;
+            let input = execute_rows_with_views(
+                input,
+                std::slice::from_mut(storage),
+                std::slice::from_ref(&read_view),
+            )?;
             let replacements = build_replacements(&input, assignments)?;
             let affected = u64::try_from(replacements.len())
                 .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
@@ -182,7 +208,11 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows(input, std::slice::from_mut(storage))?;
+            let input = execute_rows_with_views(
+                input,
+                std::slice::from_mut(storage),
+                std::slice::from_ref(&read_view),
+            )?;
             let affected = u64::try_from(input.rows.len())
                 .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
             for row in input.rows {
@@ -300,21 +330,35 @@ fn project_join_values(
         .collect()
 }
 
+#[cfg(test)]
 fn execute_rows(
     plan: &PhysicalPlan,
     storages: &mut [HeapStorage],
+) -> Result<ExecutionRows, ExecutionError> {
+    let views = storages
+        .iter()
+        .map(HeapStorage::read_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    execute_rows_with_views(plan, storages, &views)
+}
+
+fn execute_rows_with_views(
+    plan: &PhysicalPlan,
+    storages: &mut [HeapStorage],
+    read_views: &[ReadView],
 ) -> Result<ExecutionRows, ExecutionError> {
     match plan {
         PhysicalPlan::SeqScan {
             table_id, columns, ..
         } => {
-            let storage = storage_for_table(storages, *table_id)?;
             let column_ids = columns
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
+            let view = read_view_for_table(storages, read_views, *table_id)?;
+            let storage = storage_for_table(storages, *table_id)?;
             let rows = storage
-                .scan_columns(&column_ids)?
+                .scan_columns_with_view(&column_ids, view)?
                 .into_iter()
                 .map(|(row_id, values)| ExecutionRow {
                     row_id: Some(row_id),
@@ -333,6 +377,7 @@ fn execute_rows(
             key,
             ..
         } => {
+            let view = read_view_for_table(storages, read_views, *table_id)?;
             let storage = storage_for_table(storages, *table_id)?;
             let column_ids = columns
                 .iter()
@@ -341,11 +386,15 @@ fn execute_rows(
             let row_ids = storage.btree().lookup(*handle, key)?;
             let rows = row_ids
                 .into_iter()
-                .map(|row_id| {
-                    Ok(ExecutionRow {
-                        row_id: Some(row_id),
-                        values: storage.read_row_columns(row_id, &column_ids)?,
-                    })
+                .filter_map(|row_id| {
+                    match storage.read_row_columns_with_view(row_id, &column_ids, view) {
+                        Ok(Some(values)) => Some(Ok(ExecutionRow {
+                            row_id: Some(row_id),
+                            values,
+                        })),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error.into())),
+                    }
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
             Ok(ExecutionRows {
@@ -360,6 +409,7 @@ fn execute_rows(
             range,
             ..
         } => {
+            let view = read_view_for_table(storages, read_views, *table_id)?;
             let storage = storage_for_table(storages, *table_id)?;
             let column_ids = columns
                 .iter()
@@ -368,11 +418,15 @@ fn execute_rows(
             let row_ids = storage.btree().lookup_range(*handle, range)?;
             let rows = row_ids
                 .into_iter()
-                .map(|row_id| {
-                    Ok(ExecutionRow {
-                        row_id: Some(row_id),
-                        values: storage.read_row_columns(row_id, &column_ids)?,
-                    })
+                .filter_map(|row_id| {
+                    match storage.read_row_columns_with_view(row_id, &column_ids, view) {
+                        Ok(Some(values)) => Some(Ok(ExecutionRow {
+                            row_id: Some(row_id),
+                            values,
+                        })),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error.into())),
+                    }
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
             Ok(ExecutionRows {
@@ -387,8 +441,8 @@ fn execute_rows(
             columns,
             ..
         } => {
-            let left = execute_rows(left, storages)?;
-            let right = execute_rows(right, storages)?;
+            let left = execute_rows_with_views(left, storages, read_views)?;
+            let right = execute_rows_with_views(right, storages, read_views)?;
             let mut joined_fields = left.fields.clone();
             joined_fields.extend(right.fields.clone());
             let output_positions = columns
@@ -502,8 +556,8 @@ fn execute_rows(
             if !left_key.data_type.is_compatible_with(&right_key.data_type) {
                 return Err(ExecutionError::TypeMismatch);
             }
-            let left = execute_rows(left, storages)?;
-            let right = execute_rows(right, storages)?;
+            let left = execute_rows_with_views(left, storages, read_views)?;
+            let right = execute_rows_with_views(right, storages, read_views)?;
             let left_key_position = find_source_position(&left.fields, left_key)?;
             let right_key_position = find_source_position(&right.fields, right_key)?;
             let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
@@ -561,10 +615,12 @@ fn execute_rows(
             Ok(ExecutionRows { fields, rows })
         }
         PhysicalPlan::Filter { input, predicate } => {
-            if let Some(result) = try_execute_streaming_seq_filter(input, predicate, storages)? {
+            if let Some(result) =
+                try_execute_streaming_seq_filter(input, predicate, storages, read_views)?
+            {
                 return Ok(result);
             }
-            let mut result = execute_rows(input, storages)?;
+            let mut result = execute_rows_with_views(input, storages, read_views)?;
             let fields = result.fields.clone();
             result.rows = result
                 .rows
@@ -584,7 +640,7 @@ fn execute_rows(
             Ok(result)
         }
         PhysicalPlan::Sort { input, keys } => {
-            let mut result = execute_rows(input, storages)?;
+            let mut result = execute_rows_with_views(input, storages, read_views)?;
             let positions = resolve_sort_positions(&result.fields, keys)?;
             validate_sort_values(&result.rows, &positions, keys)?;
 
@@ -607,7 +663,12 @@ fn execute_rows(
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
-            let input_result = execute_rows(input, storages)?;
+            if let Some(result) =
+                try_execute_projected_streaming_seq_filter(input, columns, storages, read_views)?
+            {
+                return Ok(result);
+            }
+            let input_result = execute_rows_with_views(input, storages, read_views)?;
             let projection = build_projection_plan(&input_result.fields, columns)?;
             let rows = if projection.identity {
                 input_result.rows
@@ -628,20 +689,21 @@ fn execute_rows(
             group_keys,
             outputs,
         } => {
-            if let Some(result) = try_execute_filtered_counts(input, group_keys, outputs, storages)?
+            if let Some(result) =
+                try_execute_filtered_counts(input, group_keys, outputs, storages, read_views)?
             {
                 Ok(result)
             } else if let Some(result) =
-                try_execute_direct_counts(input, group_keys, outputs, storages)?
+                try_execute_direct_counts(input, group_keys, outputs, storages, read_views)?
             {
                 Ok(result)
             } else {
-                let input = execute_rows(input, storages)?;
+                let input = execute_rows_with_views(input, storages, read_views)?;
                 execute_aggregate(input, group_keys, outputs)
             }
         }
         PhysicalPlan::Limit { input, limit } => {
-            let mut result = execute_rows(input, storages)?;
+            let mut result = execute_rows_with_views(input, storages, read_views)?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
@@ -820,6 +882,12 @@ struct StreamingSeqFilterPlan<'a> {
     predicate: &'a Expr,
 }
 
+struct ProjectedStreamingSeqFilterPlan<'a> {
+    filter: StreamingSeqFilterPlan<'a>,
+    output_positions: Vec<usize>,
+    output_fields: Vec<OutputField>,
+}
+
 type SourceIdentity = (RelationBindingId, TableId, ColumnId);
 
 fn source_identity(column: &ColumnRef) -> SourceIdentity {
@@ -886,11 +954,102 @@ fn try_execute_streaming_seq_filter(
     input: &PhysicalPlan,
     predicate: &Expr,
     storages: &mut [HeapStorage],
+    read_views: &[ReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = streaming_seq_filter_eligibility(input, predicate) else {
         return Ok(None);
     };
-    let fields = plan
+    let output_fields = plan
+        .columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    let output_positions = (0..plan.columns.len()).collect::<Vec<_>>();
+    execute_streaming_seq_filter_with_projection(
+        &plan,
+        &output_positions,
+        output_fields,
+        storages,
+        read_views,
+    )
+    .map(Some)
+}
+
+fn projected_streaming_seq_filter_eligibility<'a>(
+    input: &'a PhysicalPlan,
+    project_columns: &[ColumnRef],
+) -> Option<ProjectedStreamingSeqFilterPlan<'a>> {
+    let PhysicalPlan::Filter { input, predicate } = input else {
+        return None;
+    };
+    let filter = streaming_seq_filter_eligibility(input, predicate)?;
+    let predicate_identities = collect_filter_columns(predicate);
+    let project_identities = project_columns
+        .iter()
+        .map(|column| (column.binding_id, column.column_id))
+        .collect::<BTreeSet<_>>();
+    let predicate_only_exists = filter.columns.iter().any(|column| {
+        predicate_identities.contains(&source_identity(column))
+            && !project_identities.contains(&(column.binding_id, column.column_id))
+    });
+    if !predicate_only_exists
+        || filter.columns.iter().any(|column| {
+            !predicate_identities.contains(&source_identity(column))
+                && !project_identities.contains(&(column.binding_id, column.column_id))
+        })
+    {
+        return None;
+    }
+    let predicate_fields = filter
+        .columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    let output_positions = project_columns
+        .iter()
+        .map(|column| find_source_position(&predicate_fields, column))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(ProjectedStreamingSeqFilterPlan {
+        filter,
+        output_positions,
+        output_fields: project_columns
+            .iter()
+            .cloned()
+            .map(OutputField::Source)
+            .collect(),
+    })
+}
+
+fn try_execute_projected_streaming_seq_filter(
+    input: &PhysicalPlan,
+    project_columns: &[ColumnRef],
+    storages: &mut [HeapStorage],
+    read_views: &[ReadView],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let Some(plan) = projected_streaming_seq_filter_eligibility(input, project_columns) else {
+        return Ok(None);
+    };
+    execute_streaming_seq_filter_with_projection(
+        &plan.filter,
+        &plan.output_positions,
+        plan.output_fields,
+        storages,
+        read_views,
+    )
+    .map(Some)
+}
+
+fn execute_streaming_seq_filter_with_projection(
+    plan: &StreamingSeqFilterPlan<'_>,
+    output_positions: &[usize],
+    output_fields: Vec<OutputField>,
+    storages: &mut [HeapStorage],
+    read_views: &[ReadView],
+) -> Result<ExecutionRows, ExecutionError> {
+    let predicate_fields = plan
         .columns
         .iter()
         .cloned()
@@ -901,16 +1060,19 @@ fn try_execute_streaming_seq_filter(
         .iter()
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
+    let view = read_view_for_table(storages, read_views, plan.table_id)?;
     let storage = storage_for_table(storages, plan.table_id)?;
     let mut rows = Vec::new();
     let mut pending_predicate_error = None;
-    storage.visit_row_scalar_refs_with_presence::<ExecutionError, _>(
+    storage.visit_row_scalar_refs_with_presence_view::<ExecutionError, _>(
         &column_ids,
         &[],
+        view,
         |row_id, values, _presence| {
             collect_streaming_filter_row(
                 plan.predicate,
-                &fields,
+                &predicate_fields,
+                output_positions,
                 row_id,
                 values,
                 &mut rows,
@@ -922,12 +1084,16 @@ fn try_execute_streaming_seq_filter(
     if let Some(error) = pending_predicate_error {
         return Err(error);
     }
-    Ok(Some(ExecutionRows { fields, rows }))
+    Ok(ExecutionRows {
+        fields: output_fields,
+        rows,
+    })
 }
 
 fn collect_streaming_filter_row(
     predicate: &Expr,
-    fields: &[OutputField],
+    predicate_fields: &[OutputField],
+    output_positions: &[usize],
     row_id: RowId,
     values: &[ScalarRef<'_>],
     rows: &mut Vec<ExecutionRow>,
@@ -936,11 +1102,26 @@ fn collect_streaming_filter_row(
     if pending_predicate_error.is_some() {
         return;
     }
-    match evaluate_dynamic_scalar_ref_truth(predicate, values, fields) {
-        Ok(TruthValue::True) => rows.push(ExecutionRow {
-            row_id: Some(row_id),
-            values: values.iter().copied().map(ScalarRef::to_owned).collect(),
-        }),
+    match evaluate_dynamic_scalar_ref_truth(predicate, values, predicate_fields) {
+        Ok(TruthValue::True) => {
+            let projected_values = output_positions
+                .iter()
+                .map(|position| {
+                    values
+                        .get(*position)
+                        .copied()
+                        .map(ScalarRef::to_owned)
+                        .ok_or(ExecutionError::TypeMismatch)
+                })
+                .collect::<Result<Vec<_>, _>>();
+            match projected_values {
+                Ok(values) => rows.push(ExecutionRow {
+                    row_id: Some(row_id),
+                    values,
+                }),
+                Err(error) => *pending_predicate_error = Some(error),
+            }
+        }
         Ok(TruthValue::False | TruthValue::Unknown) => {}
         Err(error) => *pending_predicate_error = Some(error),
     }
@@ -1141,6 +1322,7 @@ fn try_execute_filtered_counts(
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
     storages: &mut [HeapStorage],
+    read_views: &[ReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = filtered_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
@@ -1165,10 +1347,12 @@ fn try_execute_filtered_counts(
         qualified_rows: 0,
         non_null_counts: vec![0; plan.presence_columns.len()],
     };
+    let view = read_view_for_table(storages, read_views, plan.table_id)?;
     storage_for_table(storages, plan.table_id)?
-        .visit_scalar_refs_with_presence::<ExecutionError, _>(
+        .visit_scalar_refs_with_presence_view::<ExecutionError, _>(
             &predicate_column_ids,
             &presence_column_ids,
+            view,
             |values, presence| {
                 if evaluate_bound_scalar_ref_truth(&bound_predicate, values)? == TruthValue::True {
                     update_filtered_count_summary(&plan, &mut summary, presence)?;
@@ -1226,6 +1410,7 @@ fn try_execute_direct_counts(
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
     storages: &mut [HeapStorage],
+    read_views: &[ReadView],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = direct_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
@@ -1235,7 +1420,9 @@ fn try_execute_direct_counts(
         .iter()
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
-    let summary = storage_for_table(storages, plan.table_id)?.scan_presence_counts(&column_ids)?;
+    let view = read_view_for_table(storages, read_views, plan.table_id)?;
+    let summary = storage_for_table(storages, plan.table_id)?
+        .scan_presence_counts_with_view(&column_ids, view)?;
     let values = materialize_direct_count_values(&plan, &summary)?;
     Ok(Some(ExecutionRows {
         fields: outputs.iter().map(AggregateOutput::output_field).collect(),
@@ -1550,6 +1737,18 @@ fn storage_for_table(
         .iter_mut()
         .find(|storage| storage.table().id == table_id)
         .ok_or(ExecutionError::MissingTableStorage(table_id))
+}
+
+fn read_view_for_table<'a>(
+    storages: &[HeapStorage],
+    read_views: &'a [ReadView],
+    table_id: TableId,
+) -> Result<&'a ReadView, ExecutionError> {
+    let position = storages
+        .iter()
+        .position(|storage| storage.table().id == table_id)
+        .ok_or(ExecutionError::MissingTableStorage(table_id))?;
+    read_views.get(position).ok_or(ExecutionError::TypeMismatch)
 }
 
 fn ensure_table(table_id: TableId, storage: &HeapStorage) -> Result<(), ExecutionError> {
@@ -2576,8 +2775,9 @@ mod tests {
         execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
         execute_with_storages, filtered_count_eligibility, find_required_inequality,
         inequality_can_match, materialize_count_values, materialize_direct_count_values,
-        potential_left_indices, project_execution_row, required_right_extreme,
-        sorted_non_null_indices, streaming_seq_filter_eligibility, update_filtered_count_summary,
+        potential_left_indices, project_execution_row, projected_streaming_seq_filter_eligibility,
+        required_right_extreme, sorted_non_null_indices, streaming_seq_filter_eligibility,
+        update_filtered_count_summary,
     };
     use netbadb_planner::{
         IndexAccessPath, PhysicalPlan, TableAccessStatistics, plan, plan_with_statistics,
@@ -2827,6 +3027,43 @@ mod tests {
             vec![ScalarValue::Int64(2), ScalarValue::Text("Lin".into())]
         );
         assert_ne!(first_row_id, second_row_id);
+
+        let projected_filter = PhysicalPlan::Project {
+            input: Box::new(PhysicalPlan::Filter {
+                input: Box::new(PhysicalPlan::SeqScan {
+                    binding_id: RelationBindingId(0),
+                    table_id: TableId(1),
+                    table_name: "users".into(),
+                    columns: vec![id.clone(), name.clone()],
+                }),
+                predicate: Expr {
+                    expr_type: ExprType {
+                        data_type: SemanticType::physical(PhysicalType::Bool),
+                        nullable: false,
+                    },
+                    kind: ExprKind::IsNull {
+                        expression: Box::new(Expr {
+                            expr_type: ExprType {
+                                data_type: name.data_type.clone(),
+                                nullable: false,
+                            },
+                            kind: ExprKind::Column(name.clone()),
+                        }),
+                        negated: true,
+                    },
+                },
+            }),
+            columns: vec![id.clone()],
+        };
+        let projected = execute_rows(&projected_filter, std::slice::from_mut(&mut storage))
+            .expect("execute retained-column-aware streaming filter");
+        assert_eq!(projected.fields, [OutputField::Source(id.clone())]);
+        assert_eq!(projected.rows.len(), 2);
+        assert_eq!(projected.rows[0].row_id, Some(first_row_id));
+        assert_eq!(projected.rows[0].values, [ScalarValue::Int64(1)]);
+        assert_eq!(projected.rows[1].row_id, Some(second_row_id));
+        assert_eq!(projected.rows[1].values, [ScalarValue::Int64(2)]);
+
         let logical = LogicalPlan::Limit {
             input: Box::new(LogicalPlan::Project {
                 input: Box::new(LogicalPlan::Filter {
@@ -2911,12 +3148,20 @@ mod tests {
                     data_type: SemanticType::physical(PhysicalType::Bool),
                     nullable: false,
                 },
-                kind: ExprKind::Column(missing),
+                kind: ExprKind::Column(missing.clone()),
             },
         };
 
         let result = execute(&filter, &mut storage).expect("empty filter skips predicate");
         assert!(result.rows.is_empty());
+        let malformed_project = PhysicalPlan::Project {
+            input: Box::new(filter),
+            columns: vec![missing],
+        };
+        assert!(matches!(
+            execute(&malformed_project, &mut storage),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
         storage.close().expect("close empty heap");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
@@ -3139,18 +3384,19 @@ mod tests {
         );
 
         storage.delete(first).expect("delete indexed row");
-        storage
-            .btree()
-            .insert(definition.handle, ScalarValue::UInt64(10), first)
-            .expect("inject deleted locator");
-        assert!(matches!(
-            execute(&scan, &mut storage),
-            Err(ExecutionError::Storage(
-                netbadb_storage::StorageError::RowDeleted { .. }
-            ))
-        ));
+        assert_eq!(
+            execute(&scan, &mut storage)
+                .expect("skip expired candidate")
+                .rows,
+            vec![vec![
+                ScalarValue::Int64(2),
+                ScalarValue::UInt64(10),
+                ScalarValue::Bool(false),
+            ]]
+        );
 
         storage.close().expect("close indexed heap");
+        let _ = std::fs::remove_file(netbadb_storage::txn_status_path(&path));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_path(&path));
     }
@@ -5620,6 +5866,7 @@ mod tests {
         collect_streaming_filter_row(
             &predicate(ScalarValue::Bool(false), false),
             &fields,
+            &[0, 1],
             row_id,
             &values,
             &mut rows,
@@ -5628,6 +5875,7 @@ mod tests {
         collect_streaming_filter_row(
             &predicate(ScalarValue::Null, true),
             &fields,
+            &[0, 1],
             row_id,
             &values,
             &mut rows,
@@ -5639,6 +5887,7 @@ mod tests {
         collect_streaming_filter_row(
             &predicate(ScalarValue::Bool(true), false),
             &fields,
+            &[0, 1],
             row_id,
             &values,
             &mut rows,
@@ -5654,6 +5903,57 @@ mod tests {
 
         rows.clear();
         collect_streaming_filter_row(
+            &predicate(ScalarValue::Bool(true), false),
+            &fields,
+            &[0],
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert_eq!(rows[0].row_id, Some(row_id));
+        assert_eq!(rows[0].values, [ScalarValue::Int64(7)]);
+
+        rows.clear();
+        collect_streaming_filter_row(
+            &predicate(ScalarValue::Bool(true), false),
+            &fields,
+            &[1, 0, 1],
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert_eq!(
+            rows[0].values,
+            [
+                ScalarValue::Text("qualified".into()),
+                ScalarValue::Int64(7),
+                ScalarValue::Text("qualified".into())
+            ]
+        );
+        assert_ne!(text_pointer(&rows[0].values[0]), original_pointer);
+        assert_ne!(text_pointer(&rows[0].values[2]), original_pointer);
+        assert_ne!(
+            text_pointer(&rows[0].values[0]),
+            text_pointer(&rows[0].values[2])
+        );
+
+        rows.clear();
+        collect_streaming_filter_row(
+            &predicate(ScalarValue::Bool(true), false),
+            &fields,
+            &[],
+            row_id,
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert_eq!(rows[0].row_id, Some(row_id));
+        assert!(rows[0].values.is_empty());
+
+        rows.clear();
+        collect_streaming_filter_row(
             &Expr {
                 kind: ExprKind::Literal(ScalarValue::Int64(1)),
                 expr_type: ExprType {
@@ -5662,6 +5962,7 @@ mod tests {
                 },
             },
             &fields,
+            &[0, 1],
             row_id,
             &values,
             &mut rows,
@@ -5671,6 +5972,7 @@ mod tests {
         collect_streaming_filter_row(
             &predicate(ScalarValue::Bool(true), false),
             &[],
+            &[],
             row_id,
             &[],
             &mut rows,
@@ -5678,6 +5980,150 @@ mod tests {
         );
         assert!(rows.is_empty());
         assert!(matches!(pending, Some(ExecutionError::ExpectedBoolean)));
+    }
+
+    #[test]
+    fn projected_streaming_filter_eligibility_requires_predicate_only_columns() {
+        let column =
+            |binding_id: u32, table_id: u64, column_id: u32, name: &str, physical| ColumnRef {
+                binding_id: RelationBindingId(binding_id),
+                table_id: TableId(table_id),
+                column_id: ColumnId(column_id),
+                relation_name: format!("t{table_id}"),
+                name: name.into(),
+                data_type: SemanticType::physical(physical),
+                nullable: false,
+            };
+        let id = column(0, 7, 1, "id", PhysicalType::Int64);
+        let payload = column(0, 7, 2, "payload", PhysicalType::Text);
+        let marker = column(0, 7, 3, "marker", PhysicalType::Bool);
+        let predicate = |column: &ColumnRef| Expr {
+            kind: ExprKind::IsNull {
+                expression: Box::new(Expr {
+                    kind: ExprKind::Column(column.clone()),
+                    expr_type: ExprType {
+                        data_type: column.data_type.clone(),
+                        nullable: column.nullable,
+                    },
+                }),
+                negated: true,
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let filter = |columns: Vec<ColumnRef>, predicate: Expr| PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(7),
+                table_name: "t7".into(),
+                columns,
+            }),
+            predicate,
+        };
+
+        let eligible = filter(vec![id.clone(), payload.clone()], predicate(&payload));
+        let plan = projected_streaming_seq_filter_eligibility(&eligible, std::slice::from_ref(&id))
+            .expect("predicate-only payload is eligible");
+        assert_eq!(plan.output_positions, [0]);
+        assert_eq!(plan.output_fields, [OutputField::Source(id.clone())]);
+
+        let duplicate =
+            projected_streaming_seq_filter_eligibility(&eligible, &[id.clone(), id.clone()])
+                .expect("duplicate projected source is eligible");
+        assert_eq!(duplicate.output_positions, [0, 0]);
+
+        let reorder = filter(
+            vec![id.clone(), payload.clone(), marker.clone()],
+            predicate(&marker),
+        );
+        let reordered = projected_streaming_seq_filter_eligibility(
+            &reorder,
+            &[payload.clone(), id.clone(), payload.clone()],
+        )
+        .expect("reordered duplicate projection is eligible");
+        assert_eq!(reordered.output_positions, [1, 0, 1]);
+
+        let zero_width = filter(vec![payload.clone()], predicate(&payload));
+        let zero = projected_streaming_seq_filter_eligibility(&zero_width, &[])
+            .expect("zero-width output with a predicate-only source is eligible");
+        assert!(zero.output_positions.is_empty());
+        assert!(zero.output_fields.is_empty());
+
+        assert!(
+            projected_streaming_seq_filter_eligibility(
+                &filter(vec![id.clone()], predicate(&id)),
+                std::slice::from_ref(&id)
+            )
+            .is_none()
+        );
+        assert!(
+            projected_streaming_seq_filter_eligibility(
+                &filter(vec![payload.clone()], predicate(&payload)),
+                std::slice::from_ref(&payload)
+            )
+            .is_none()
+        );
+        assert!(
+            projected_streaming_seq_filter_eligibility(
+                &filter(
+                    vec![id.clone(), payload.clone(), marker.clone()],
+                    predicate(&payload)
+                ),
+                std::slice::from_ref(&id)
+            )
+            .is_none()
+        );
+        let missing = column(0, 7, 4, "missing", PhysicalType::Int64);
+        assert!(
+            projected_streaming_seq_filter_eligibility(&eligible, std::slice::from_ref(&missing))
+                .is_none()
+        );
+        assert!(
+            projected_streaming_seq_filter_eligibility(
+                &filter(vec![id.clone(), payload.clone()], predicate(&missing)),
+                std::slice::from_ref(&id)
+            )
+            .is_none()
+        );
+        assert!(
+            projected_streaming_seq_filter_eligibility(
+                &filter(
+                    vec![id.clone(), id.clone(), payload.clone()],
+                    predicate(&payload)
+                ),
+                std::slice::from_ref(&id)
+            )
+            .is_none()
+        );
+
+        let sorted = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::Sort {
+                input: Box::new(PhysicalPlan::SeqScan {
+                    binding_id: RelationBindingId(0),
+                    table_id: TableId(7),
+                    table_name: "t7".into(),
+                    columns: vec![id.clone(), payload.clone()],
+                }),
+                keys: vec![SortKey {
+                    column: id.clone(),
+                    direction: SortDirection::Asc,
+                    null_order: NullOrder::First,
+                }],
+            }),
+            predicate: predicate(&payload),
+        };
+        let nested = PhysicalPlan::Filter {
+            input: Box::new(eligible.clone()),
+            predicate: predicate(&payload),
+        };
+        for input in [sorted, nested] {
+            assert!(
+                projected_streaming_seq_filter_eligibility(&input, std::slice::from_ref(&id))
+                    .is_none()
+            );
+        }
     }
 
     #[test]

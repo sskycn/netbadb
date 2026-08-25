@@ -2,8 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use netbadb_types::{Lsn, TxnId};
+use netbadb_types::{CommandId, CommitSeq, Lsn, TxnId};
 
+use crate::mvcc::{IsolationLevel, ReadView, Snapshot};
+use crate::txn_status::SharedTxnStatus;
 use crate::wal::page_update_kind;
 use crate::{
     BufferPool, Page, StorageError, TransactionError, WalManager, WalRecord, WalRecordKind,
@@ -38,9 +40,9 @@ pub enum TransactionState {
     RolledBack,
 }
 
-/// A synchronous transaction handle with durable commit and physical runtime
-/// rollback. The single-writer rule prevents dirty-write dependencies; it is
-/// not transaction isolation and reads may observe an active writer's pages.
+/// A synchronous transaction handle with durable commit, snapshot reads, and
+/// physical runtime rollback. The single-writer rule prevents dirty-write
+/// dependencies while MVCC visibility hides uncommitted versions from peers.
 #[derive(Debug)]
 pub struct Transaction {
     id: TxnId,
@@ -49,6 +51,11 @@ pub struct Transaction {
     wal: SharedWal,
     buffer: BufferPool,
     runtime: SharedRuntime,
+    statuses: SharedTxnStatus,
+    isolation_level: IsolationLevel,
+    command_id: CommandId,
+    next_command_id: CommandId,
+    repeatable_read_view: Option<ReadView>,
     registered: bool,
     has_page_updates: bool,
     rollback_start_lsn: Option<Lsn>,
@@ -108,6 +115,14 @@ impl Transaction {
             .flush_through(commit_lsn)?;
         #[cfg(test)]
         crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::CommitAfterWalSync);
+        // The Commit WAL record is the durable decision. Its monotonic logical
+        // LSN is the CommitSeq. Publishing the sidecar status only afterwards
+        // prevents a transaction without durable Commit from becoming visible;
+        // startup reconciles a durable Commit if a crash occurs in between.
+        self.statuses
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::StatusBusy)?
+            .record_committed(self.id, CommitSeq(commit_lsn.0))?;
         self.state = TransactionState::Committed;
         self.release_writer();
         self.unregister();
@@ -150,6 +165,10 @@ impl Transaction {
                 .try_borrow_mut()
                 .map_err(|_| TransactionError::WalBusy)?
                 .flush_through(complete_lsn)?;
+            self.statuses
+                .try_borrow_mut()
+                .map_err(|_| TransactionError::StatusBusy)?
+                .record_aborted(self.id)?;
             self.finish_rollback();
             return Ok(());
         }
@@ -193,6 +212,10 @@ impl Transaction {
         crate::crash_test::maybe_crash(
             crate::crash_test::TestCrashPoint::RollbackAfterCompleteSync,
         );
+        self.statuses
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::StatusBusy)?
+            .record_aborted(self.id)?;
         self.finish_rollback();
         Ok(())
     }
@@ -223,6 +246,104 @@ impl Transaction {
 
     pub(crate) fn belongs_to(&self, wal: &SharedWal) -> bool {
         Rc::ptr_eq(&self.wal, wal)
+    }
+
+    #[must_use]
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.isolation_level
+    }
+
+    #[must_use]
+    pub(crate) fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    /// Starts one statement and returns the statement's pinned MVCC view.
+    pub fn begin_statement(&mut self) -> Result<ReadView, StorageError> {
+        self.ensure_active()?;
+        let command_id = self.next_command_id;
+        self.command_id = command_id;
+        self.next_command_id = CommandId(
+            command_id
+                .0
+                .checked_add(1)
+                .ok_or(TransactionError::CommandIdExhausted)?,
+        );
+        let visible_csn = match self.isolation_level {
+            IsolationLevel::ReadCommitted => self
+                .statuses
+                .try_borrow()
+                .map_err(|_| TransactionError::StatusBusy)?
+                .maximum_commit_seq(),
+            IsolationLevel::RepeatableRead => {
+                if let Some(view) = self.repeatable_read_view.as_ref() {
+                    view.snapshot().visible_csn
+                } else {
+                    let visible = self
+                        .statuses
+                        .try_borrow()
+                        .map_err(|_| TransactionError::StatusBusy)?
+                        .maximum_commit_seq();
+                    let pinned = ReadView::new(
+                        Snapshot {
+                            visible_csn: visible,
+                            own_txn: Some(self.id),
+                            command_id,
+                        },
+                        self.statuses.clone(),
+                    )?;
+                    self.repeatable_read_view = Some(pinned);
+                    visible
+                }
+            }
+        };
+        ReadView::new(
+            Snapshot {
+                visible_csn,
+                own_txn: Some(self.id),
+                command_id,
+            },
+            self.statuses.clone(),
+        )
+    }
+
+    pub(crate) fn current_read_view(&mut self) -> Result<ReadView, StorageError> {
+        self.ensure_active()?;
+        let visible_csn = match self.isolation_level {
+            IsolationLevel::ReadCommitted => self
+                .statuses
+                .try_borrow()
+                .map_err(|_| TransactionError::StatusBusy)?
+                .maximum_commit_seq(),
+            IsolationLevel::RepeatableRead => {
+                if let Some(view) = self.repeatable_read_view.as_ref() {
+                    view.snapshot().visible_csn
+                } else {
+                    let visible = self
+                        .statuses
+                        .try_borrow()
+                        .map_err(|_| TransactionError::StatusBusy)?
+                        .maximum_commit_seq();
+                    self.repeatable_read_view = Some(ReadView::new(
+                        Snapshot {
+                            visible_csn: visible,
+                            own_txn: Some(self.id),
+                            command_id: self.command_id,
+                        },
+                        self.statuses.clone(),
+                    )?);
+                    visible
+                }
+            }
+        };
+        ReadView::new(
+            Snapshot {
+                visible_csn,
+                own_txn: Some(self.id),
+                command_id: self.command_id,
+            },
+            self.statuses.clone(),
+        )
     }
 
     pub(crate) fn acquire_writer(&self) -> Result<(), StorageError> {
@@ -282,6 +403,7 @@ impl Transaction {
             self.runtime.outstanding.set(outstanding.saturating_sub(1));
             self.registered = false;
         }
+        self.repeatable_read_view = None;
     }
 
     fn finish_rollback(&mut self) {
@@ -369,17 +491,20 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         let owns_writer = self.runtime.writer.get() == WriterState::Active(self.id);
-        if owns_writer
+        let recovery_required = owns_writer
             && (matches!(
                 self.state,
                 TransactionState::RollbackRequired
                     | TransactionState::CommitPending
                     | TransactionState::RollbackPending
-            ) || (self.state == TransactionState::Active && self.has_page_updates))
-        {
+            ) || (self.state == TransactionState::Active && self.has_page_updates));
+        if recovery_required {
             self.runtime.writer.set(WriterState::RecoveryRequired);
         } else if owns_writer && self.state == TransactionState::Active {
             self.release_writer();
+        }
+        if !recovery_required {
+            self.statuses.borrow_mut().clear_active(self.id);
         }
         self.unregister();
     }
@@ -391,6 +516,7 @@ pub(crate) struct TransactionManager {
     buffer: BufferPool,
     next_txn_id: TxnId,
     runtime: SharedRuntime,
+    statuses: SharedTxnStatus,
 }
 
 impl TransactionManager {
@@ -398,6 +524,7 @@ impl TransactionManager {
         wal: SharedWal,
         buffer: BufferPool,
         next_txn_id: TxnId,
+        statuses: SharedTxnStatus,
     ) -> Result<Self, StorageError> {
         if next_txn_id.0 == 0 {
             return Err(TransactionError::IdExhausted.into());
@@ -410,10 +537,18 @@ impl TransactionManager {
                 writer: Cell::new(WriterState::Idle),
                 outstanding: Cell::new(0),
             }),
+            statuses,
         })
     }
 
     pub(crate) fn begin(&mut self) -> Result<Transaction, StorageError> {
+        self.begin_with_isolation(IsolationLevel::ReadCommitted)
+    }
+
+    pub(crate) fn begin_with_isolation(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction, StorageError> {
         let id = self.next_txn_id;
         let next = id.0.checked_add(1).ok_or(TransactionError::IdExhausted)?;
         let outstanding = self
@@ -429,6 +564,10 @@ impl TransactionManager {
             .append(id, None, WalRecordKind::Begin)?;
         self.runtime.outstanding.set(outstanding);
         self.next_txn_id = TxnId(next);
+        self.statuses
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::StatusBusy)?
+            .mark_active(id);
         Ok(Transaction {
             id,
             state: TransactionState::Active,
@@ -436,6 +575,11 @@ impl TransactionManager {
             wal: Rc::clone(&self.wal),
             buffer: self.buffer.clone(),
             runtime: Rc::clone(&self.runtime),
+            statuses: self.statuses.clone(),
+            isolation_level,
+            command_id: CommandId(1),
+            next_command_id: CommandId(1),
+            repeatable_read_view: None,
             registered: true,
             has_page_updates: false,
             rollback_start_lsn: None,
@@ -492,6 +636,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::{TransactionManager, TransactionState};
+    use crate::txn_status::TxnStatusStore;
 
     use crate::{
         BufferPool, PageManager, StorageError, TransactionError, WalManager, WalRecordKind,
@@ -521,12 +666,17 @@ mod tests {
         let pages = PageManager::create(&page_path).expect("create page file");
         let buffer = BufferPool::with_wal(pages, 2, Rc::clone(&wal)).expect("buffer pool");
         let next_txn_id = wal.borrow().next_txn_id();
-        let manager = TransactionManager::new(Rc::clone(&wal), buffer, next_txn_id)
+        let statuses = Rc::new(RefCell::new(
+            TxnStatusStore::create(page_path.with_extension("status"))
+                .expect("create transaction statuses"),
+        ));
+        let manager = TransactionManager::new(Rc::clone(&wal), buffer, next_txn_id, statuses)
             .expect("transaction manager");
         (page_path, wal_path, wal, manager)
     }
 
     fn cleanup(page_path: PathBuf, wal_path: PathBuf) {
+        let _ = std::fs::remove_file(page_path.with_extension("status"));
         let _ = std::fs::remove_file(page_path);
         let _ = std::fs::remove_file(wal_path);
     }

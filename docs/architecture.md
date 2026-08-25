@@ -782,7 +782,7 @@ UNKNOWN are skipped.
 
 `ExecutionResult` distinguishes query rows from `AffectedRows(u64)`. INSERT
 returns one; UPDATE counts selected rows, including same-value assignments;
-DELETE counts slots actually tombstoned. `Database::execute` wraps one DML
+DELETE counts versions logically expired. `Database::execute` wraps one DML
 statement in an implicit transaction. `Database::execute_in` uses an explicit
 transaction and permits reads of the transaction's currently buffered writes.
 Because savepoints do not exist, an execution-time mutating-statement failure
@@ -829,10 +829,12 @@ Database file
   directory at the front, free space in the middle, and tuple bytes packed
   from the end of the page backward.
 - `TransactionManager` allocates strong `TxnId` values, appends `Begin`, and
-  owns the per-open-database writer/health state. A transaction tracks
+  owns the per-open-database writer/health state and durable status store. A transaction tracks
   `Active`, `RollbackRequired`, `CommitPending`, `RollbackPending`, `Committed`,
   or `RolledBack` and owns its last LSN. Writer ownership is acquired lazily
   before the first heap mutation; read-only transactions do not reserve it.
+  Read Committed statements capture fresh ReadViews, while Repeatable Read pins
+  its first ReadView until transaction completion.
 - `HeapStorage` validates and encodes rows, constructs a candidate after-image,
   appends its `PageUpdate`, and only then publishes the page to the buffer
   frame. It no longer flushes the entire buffer after each insert. Page guards
@@ -870,12 +872,12 @@ still pass their existing single-payload validation before Heap scan skips
 them.
 
 The experimental container retains the legacy `NBPG` file-root marker. Heap
-metadata has its own `NBD1` marker and version 3 little-endian layout inside
+metadata has its own `NBD1` marker and version 4 little-endian layout inside
 the header page:
 
 ```text
 16..20  NBD1 heap metadata magic
-20..22  u16 heap metadata version (3)
+20..22  u16 heap metadata version (4)
 22..24  reserved bytes (zero)
 24..32  u64 table ID
 32..34  u16 declared column count
@@ -887,7 +889,7 @@ the header page:
 Create validates the complete table before creating the WAL or heap file. Open
 validates metadata and schema identity before recovery can mutate storage, then
 checks it again after recovery. A table-ID mismatch and a schema-fingerprint
-mismatch are distinct typed storage errors. Heap metadata versions 1 and 2 are
+mismatch are distinct typed storage errors. Heap metadata versions 1 through 3 are
 rejected without migration; the file format remains experimental and may
 change again between versions. New files reserve page 1 for the empty catalog
 root and page 2 for the initial Heap page.
@@ -926,9 +928,10 @@ Every allocated slot has a nonzero little-endian `u32` generation. A live slot
 stores its checked offset and length; zero-length records remain legal and use
 their real offset. The reserved pair `(offset = 0, length = 65535)` means
 Deleted and retains the generation. Either reserved component without the
-complete pair, or generation zero, is typed corruption. DELETE rebuilds the
-live tuple area while retaining every slot index and generation. UPDATE retains
-both. INSERT deterministically reuses the lowest deleted SlotId whose generation
+complete pair, or generation zero, is typed corruption. Normal DELETE and
+UPDATE do not create Page tombstones: they update MVCC tuple headers and UPDATE
+inserts a new physical version. Manual vacuum rebuilds affected pages and marks
+only horizon-dead versions Deleted. INSERT deterministically reuses the lowest deleted SlotId whose generation
 is below `u32::MAX`, increments it with checked arithmetic, and otherwise
 appends a generation-1 slot. A generation-maximum tombstone is permanently
 ineligible, so generation can never wrap.
@@ -940,26 +943,48 @@ other errors fail immediately. If no existing page accepts the tuple, the
 existing WAL-before-file-extension protocol allocates a new page. This is
 intentionally O(number of heap pages); there is no persistent free-space map.
 
-UPDATE first attempts same-page replacement and returns the unchanged `RowId`
-when it fits. On `UpdateWouldOverflowPage`, it skips the source and relocates to
-the lowest PageId accepted by normal Page v5 insertion, or to a newly allocated
-page. Storage returns the destination `RowId`; SQL currently needs only its
-affected-row count. Relocation writes no forwarding pointer.
+UPDATE inserts its replacement through normal deterministic first-fit, then
+expires the predecessor with `xmax/cmax` and a next-version RowId. Both page
+images share the caller transaction and full-page WAL chain. The replacement
+always has a distinct RowId, even if both versions occupy one page.
 
 `RowId` is the versioned physical locator `PageId + SlotId + generation`, not a
-business key, primary key, or globally monotonic identifier. A same-generation
-locator for a tombstone reports `RowDeleted`; after slot reuse, the old
-generation reports `StaleRowId` before live/deleted state is considered. Scans
-return the persisted generation, so executor UPDATE/DELETE retain the complete
-locator. Relocation changes the locator: its source is a same-generation
-tombstone and therefore reports `RowDeleted` until reuse increments that slot,
-after which the source locator reports `StaleRowId`.
+business key, primary key, or globally monotonic identifier. Before vacuum, an
+old-version locator still names a checked physical tuple whose visibility is
+decided by its ReadView. Vacuum turns dead versions into tombstones; after slot
+reuse, the old generation reports `StaleRowId` before live/deleted state is
+considered. Scans return the persisted generation, so executor UPDATE/DELETE
+retain the complete candidate locator.
 
 Version 3 intentionally changed the meaning of a formerly invalid slot pair;
 version 4 added data-page integrity without moving existing header fields;
 version 5 adds explicit slot generation. It replaces the pre-Foundation
 sequential `HEAP` layout and page versions 1 through 4. These experimental
 formats have no migration path and are rejected rather than reinterpreted.
+
+Every live Heap slot payload starts with this fixed 48-byte little-endian MVCC
+header before the existing typed row encoding:
+
+```text
+0..4    NBMV tuple magic
+4..6    u16 tuple format version (1)
+6..8    u16 presence flags for xmax, cmax, and next version
+8..16   u64 xmin TxnId (non-zero)
+16..24  u64 xmax TxnId (zero only when absent)
+24..28  u32 cmin CommandId (non-zero)
+28..32  u32 cmax CommandId (zero only when absent)
+32..40  u64 next-version PageId
+40..44  u32 next-version SlotId (checked to u16)
+44..48  u32 next-version generation
+48..    typed row payload
+```
+
+Presence bits and zero fields must agree; `xmax` and `cmax` are either both
+present or both absent, and an optional version pointer has no zero component.
+Malformed magic, flags, widths, reserved absence encodings, transaction IDs,
+command IDs, or pointers are typed storage errors. Heap metadata v4 is the
+compatibility boundary requiring this tuple format; legacy unversioned row
+payloads are not guessed or migrated.
 
 ## Persistent B+Tree boundary
 
@@ -1026,7 +1051,7 @@ reclamation. Uniqueness, SQL index DDL, and range lookup remain deferred.
 
 ## Persistent index registry
 
-Heap metadata v3 points to a fixed `IndexCatalog` root. Catalog pages are
+Heap metadata v4 points to a fixed `IndexCatalog` root. Catalog pages are
 ordinary checksummed Page v5 single-payload pages containing version-2 `NBIC`
 payloads; v1 is rejected without migration. They form an append-only,
 cycle-checked linked chain in creation order. Overflow logs the new catalog
@@ -1065,8 +1090,9 @@ count at most row count, a valid distinct count for the non-NULL population,
 and tree height at least one. It deliberately does not compare a persisted
 snapshot with current rows or current tree height.
 
-Phase 4F changes only IndexCatalog v1 to v2. Canonical Schema v1, Heap metadata
-v3, Page v5, BTree payload v1, WAL v3, and WAL record v2 remain unchanged.
+Phase 4F changed only IndexCatalog v1 to v2. The later MVCC phase changes Heap
+metadata to v4 and tuple payloads to `NBMV` v1; Canonical Schema v1, Page v5,
+BTree payload v1, WAL v3, and WAL record v2 remain unchanged.
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees are never discovered by scanning page
@@ -1082,16 +1108,17 @@ creates the tree, materializes the current live heap rows, backfills every
 typed `(value, RowId)` entry, and writes the catalog registration as the final
 logical mutation. Only a successful durable commit updates the in-memory
 registry, so crashes or errors before commit leave no visible partial index.
-For every committed live Heap row and every registered index, exactly one leaf
-entry `(row[column], current RowId)` exists. Raw B+Trees are outside this
-invariant. INSERT publishes the Heap row before registered-index inserts in
-persistent creation order. DELETE removes registered entries in creation order
-before tombstoning the Heap row. UPDATE changes an index exactly when its key
-or the physical RowId changes, always deleting the old exact identity before
-inserting the new one. All operations share the caller's transaction, buffer
-pool, WAL, and prevLSN chain. Pure key-size and exact old-entry preflight run
-while holding the single-writer lease before the first physical mutation; any
-later failure marks the transaction `RollbackRequired`.
+For every physical Heap version that has not been vacuumed and every registered
+index, one candidate entry `(version[column], version RowId)` exists. Raw
+B+Trees are outside this invariant. INSERT and UPDATE publish a new Heap version
+before inserting its candidates in persistent creation order. UPDATE and DELETE
+leave predecessor candidates intact because an older snapshot may still need
+them. Manual vacuum removes each dead version's exact candidates before
+physically tombstoning its Heap record. All operations share the caller's
+transaction, buffer pool, WAL, and prevLSN chain. Candidate key-size and exact
+predecessor-entry checks run while holding the single-writer lease before the
+first physical mutation; any later failure marks the transaction
+`RollbackRequired`.
 
 ## ANALYZE snapshots and costed index access
 
@@ -1151,11 +1178,11 @@ PhysicalPlan::Filter(original predicate)
 ```
 
 Point IndexScan performs `BTree::lookup`; RangeIndexScan locates the lower leaf
-and traverses ordered `next_leaf` links until the upper endpoint. Both
-materialize returned RowIds and then load every complete Heap row through
-`HeapStorage::read_row`. A stale,
-deleted, missing, or corrupt locator is an error; execution never hides it by
-falling back to SeqScan. UPDATE and DELETE therefore finish index traversal and
+and traverses ordered `next_leaf` links until the upper endpoint. Both treat
+returned RowIds as candidates and load Heap rows through the statement's same
+ReadView. Invisible versions are skipped; a stale, missing, wrong-page, or
+corrupt locator remains an error and execution never hides it by falling back
+to SeqScan. UPDATE and DELETE therefore finish index traversal and
 target materialization before maintaining the same index, avoiding iterator
 invalidation or revisiting newly inserted keys. Because the complete Filter
 remains, stale statistics can affect performance and plan shape but not query
@@ -1181,6 +1208,47 @@ The first generation starts at logical LSN 1. A new generation's base is the
 old generation's logical end, which is strictly greater than every record LSN
 that existed there. Physical offsets can therefore restart at byte 48 without
 making historical pageLSNs incomparable or reusable.
+
+MVCC completion state is stored separately in `<database>-txn-status`. The
+append-only file has a checksummed 16-byte header followed by checksummed
+32-byte fixed records:
+
+```text
+header
+0..4    NBTS magic
+4..6    u16 status format version (1)
+6..8    u16 header size (16)
+8..12   reserved zero
+12..16  u32 CRC32C
+
+record
+0..4    TXST magic
+4..6    u16 record version (1)
+6       u8 status (Committed=1, Aborted=2)
+7       reserved zero
+8..16   u64 TxnId (non-zero)
+16..24  u64 CommitSeq (non-zero only for Committed)
+24..28  u32 CRC32C
+28..32  reserved zero
+```
+
+Active state is runtime-only. A tuple that references neither a durable status
+nor a transaction active in this process is corruption, not implicitly aborted.
+The status file is synced for each terminal record and rejects truncation,
+unknown tags, conflicting duplicate decisions, nonzero reserved fields, and
+checksum failures.
+
+`Snapshot` consists of `visible_csn`, optional own `TxnId`, and a nonzero
+statement `CommandId`. The visible CSN is the greatest durably published commit
+sequence at capture. Read Committed captures it per statement; Repeatable Read
+pins the first capture. Insertion is visible when its owner committed no later
+than the snapshot, or it is the reader's own transaction with `cmin` no later
+than the statement. Deletion/expiration hides a version only when `xmax`
+committed no later than the snapshot, or it is the reader's own transaction
+with `cmax` no later than the statement. Active and aborted inserters are
+invisible; active and aborted expiring transactions leave the predecessor
+visible. Sequential scans, selective/borrowed fast paths, direct counts,
+point/range index candidates, and RowId fetches all call this rule.
 
 The WAL file header is:
 
@@ -1245,9 +1313,13 @@ construct after-image with pageLSN
     → write data page
 ```
 
-Commit uses `append Commit → flush_through(commitLSN) → Committed`. If the
-flush fails, the handle remains `CommitPending`; retrying commit flushes the
-same record and does not append a duplicate. A new-page update is also flushed
+Commit uses `append Commit → flush_through(commitLSN) → append and sync
+Committed(TxnId, CommitSeq(commitLSN)) → Committed`. Publishing status cannot
+overtake the WAL decision. If a crash occurs after WAL sync but before status
+sync, startup scans the durable WAL and idempotently reconciles the missing
+status before admitting reads. If a flush or status write fails, the handle
+remains `CommitPending`; retrying commit reuses the same record and decision.
+A new-page update is also flushed
 before extending the database file, because writing the allocator's zero page
 is itself a data-file write that must not overtake its WAL record.
 
@@ -1268,11 +1340,12 @@ Active
 `RollbackRequired` is distinct from `RollbackPending`. The former means a
 compound logical operation has appended only part of its physical WAL history;
 no Abort exists yet, and only `rollback()` is permitted. The latter means Abort
-has been appended and physical undo is running or retryable. Relocation prepares
-both after-images before WAL publication, then deterministically logs the
-destination PageUpdate followed by the source PageUpdate. Any later logging,
+has been appended and physical undo is running or retryable. A two-page
+versioned UPDATE prepares both after-images before WAL publication, then
+deterministically logs the new-version PageUpdate followed by the predecessor
+expiration PageUpdate. Any later logging,
 flush, allocation, buffer acquisition, or publication failure marks the
-transaction `RollbackRequired`, so a half relocation can never commit.
+transaction `RollbackRequired`, so a half update can never commit.
 
 Before-images restore their historical pageLSN; rollback does not generate
 ordinary PageUpdate records. A rollback error leaves `RollbackPending` and
@@ -1327,6 +1400,13 @@ that was still Active, appends RollbackComplete, and flushes those terminal
 records before returning. This prevents a recovered loser from conflicting
 with or overwriting a later winner on another restart.
 
+After physical recovery, open rescans the selected durable WAL generation and
+reconciles the status sidecar: every Commit becomes
+`Committed(TxnId, CommitSeq(commit_lsn))`, and every RollbackComplete becomes
+`Aborted`. Records already present are idempotent; conflicting decisions are
+corruption. This closes both crash windows around terminal status publication
+before any ReadView can be created.
+
 A checksum-invalid current page is a hard recovery error before its pageLSN is
 read or compared. Recovery does not blindly repair it from retained WAL because
 a checkpoint may already have recycled the page's complete history.
@@ -1340,8 +1420,8 @@ unfinished dirty writer marks the open storage recovery-required; later writes
 and close fail, while read-only handles may still be created. Analysis also
 rejects historical retained WAL where a committed page update follows an
 unresolved loser update to the same page before recovery writes any page. This
-is a single-writer safety invariant, not general isolation or cross-process
-locking.
+is the write-side safety invariant; read isolation comes from MVCC status and
+ReadViews rather than from the writer lease. It is not cross-process locking.
 
 The algorithm intentionally has no compensation log records. During runtime
 rollback, Abort is durable before physical undo and RollbackComplete becomes
@@ -1361,9 +1441,25 @@ with typed errors.
 
 The current model is single-writer, STEAL, NO-FORCE, WAL-protected, and supports
 synchronous physical runtime rollback plus startup crash recovery. `abort` is
-an alias for that rollback operation. Reads have no snapshot or visibility
-isolation and may observe active-writer pages. There is no MVCC, fuzzy
-checkpoint, concurrent writer queue, or cross-process writer lock.
+an alias for that rollback operation. MVCC provides Read Committed and
+Repeatable Read snapshot visibility over active-writer pages. There is no
+Serializable isolation, fuzzy checkpoint, concurrent writer queue, or
+cross-process writer lock.
+
+## Manual vacuum
+
+`HeapStorage::vacuum` and `Database::vacuum(TableId)` are explicit synchronous
+maintenance operations. A ReadView pins its `visible_csn` in the in-memory
+status store until drop. Vacuum chooses the oldest pinned CSN, or the current
+maximum committed CSN when none is pinned, and reclaims only tuples whose
+inserter aborted or whose committed `xmax` is no later than that horizon. Active
+or aborted expirers are never dead. The operation first validates and collects
+dead versions, then owns one normal write transaction, removes every matching
+exact registered-index candidate, physically tombstones the Heap slot, and
+commits through the ordinary WAL/status path. Errors roll back the whole vacuum.
+Slot reuse still increments generation, so a locator retained past vacuum cannot
+name a later occupant. There is no background worker, automatic scheduling,
+status-log compaction, or file shrinking in this phase.
 
 ## Checkpoint and WAL lifecycle
 
@@ -1531,11 +1627,12 @@ correctness and contain no SQL, values, table names, certificate contents, or
 client-address labels.
 
 Networking remains synchronous and must not leak async into parser, compiler,
-planner, executor, page, storage, WAL, or recovery.
-Protocol v1 is a network contract, not a database-file format: Canonical Schema
-v1, Heap metadata v3, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog v2
-remain unchanged. Deployment manifest v4 is configuration, not a database
-format or canonical schema identity.
+planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
+contract, not a database-file format. The current independent persistent
+contracts are Canonical Schema v1, Heap metadata v4, MVCC tuple v1,
+transaction-status v1, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog
+v2. Deployment manifest v4 is configuration, not a database format or canonical
+schema identity.
 
 Rust applications choose either the default embedded SDK or the optional
 synchronous remote surface:

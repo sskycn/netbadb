@@ -21,6 +21,10 @@ id_type!(PageId, u64);
 id_type!(FrameId, u32);
 id_type!(TxnId, u64);
 id_type!(Lsn, u64);
+// Monotonic MVCC commit order, currently derived from a durable Commit LSN.
+id_type!(CommitSeq, u64);
+// Transaction-local statement order used for own-write visibility.
+id_type!(CommandId, u32);
 
 /// A stable, explicitly sized slot identifier inside a database page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

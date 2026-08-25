@@ -987,8 +987,10 @@ RangeIndexScan. Phase 7D changes the current contract from v2 to v3 solely to
 represent HashJoin. Phases 7E through 7O introduce no plan or inspection
 change, so v3 remains current. They change no NetbaDB Protocol v1 message, SDK
 Schema Spec v1 field, deployment manifest v4 field, or database persistent
-format. Phases 7N and 7O specifically leave Canonical Schema v1, Heap metadata v3,
+format. At completion of Phases 7N and 7O, Canonical Schema v1, Heap metadata v3,
 Page v5, WAL v3, WAL record v2, BTree payload v1, IndexCatalog v2, and row
 encoding unchanged. Phases 7P through 7T retain those contracts as well as
 Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
-QueryResult rows. These phases add no dependency and no unsafe code.
+QueryResult rows. The later MVCC phase deliberately advances Heap metadata to
+v4 and adds tuple/status formats; it does not invalidate these performance-path
+results. These phases add no dependency and no unsafe code.

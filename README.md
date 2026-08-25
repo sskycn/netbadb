@@ -173,20 +173,25 @@ The current code genuinely supports:
 - synchronous heap storage with fixed 4 KiB pages;
 - version 5 slotted heap pages with persistent pageLSNs, PageId-bound full-page
   CRC32C, generation-bearing reusable tombstones, and checked bounds;
+- heap metadata v4, versioned MVCC tuple headers, and a checksummed durable
+  transaction-status sidecar with monotonic commit sequences;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
 - versioned little-endian WAL records for begin, full-page update, commit,
   abort, and rollback completion, with strong LSNs and per-transaction prevLSN
   chains;
-- explicit transaction handles plus implicit statement transactions;
+- explicit Read Committed and Repeatable Read transaction handles plus implicit
+  Read Committed statement transactions;
 - commit durability through WAL sync and WAL-before-data-page writeback;
 - lazy single-writer admission and synchronous physical runtime rollback;
 - synchronous startup recovery with analysis, repeat-history redo, and
   reverse-LSN undo of incomplete or aborted transactions;
 - explicit quiescent checkpoints with bounded two-generation WAL retention,
   monotonic logical LSNs, and persistent transaction-ID high-water marks;
-- generation-safe RowId insert, update, delete, scan, stale-locator detection,
-  file reopen, row encoding, and row decoding;
+- snapshot-visible RowId insert, append-version update, logical delete, scan,
+  stale-locator detection, file reopen, row encoding, and row decoding;
+- explicit horizon-safe vacuum that reclaims dead Heap versions and their exact
+  registered-index candidates without invalidating active snapshots;
 - persistent transactional B+Tree create, insert, exact delete, merge-only
   rebalance/root collapse, and duplicate-preserving point lookup with typed
   keys, arbitrary height, and buffer capacity one;
@@ -261,16 +266,16 @@ Project move already-owned values into results, cloning only the additional
 owners required by duplicate output columns.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
-Heap metadata version 3 retains the canonical table-schema fingerprint and adds
-the stable IndexCatalog root PageId; versions 1 and 2 are rejected rather than
-guessed or migrated. Phase 2A bumped
+Heap metadata version 4 retains the canonical table-schema fingerprint and the
+stable IndexCatalog root PageId while requiring MVCC tuple encoding version 1;
+versions 1 through 3 are rejected rather than guessed or migrated. Phase 2A bumped
 data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
 version 3 because a formerly invalid slot encoding now means Deleted. Page v4
 added a 28-byte header and CRC32C integrity; Page v5 expands each slot with a
 generation used for safe tombstone reuse. Versions 1 through 4 are rejected
 rather than guessed or migrated. Files created by
 the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
-The legacy metadata page 0 retains its separate version-3 layout and is not a
+The legacy metadata page 0 retains its separate version-4 layout and is not a
 checksummed Page v5 data page.
 
 IndexCatalog payload version 2 stores optional table and per-index optimizer
@@ -279,21 +284,24 @@ without migration. These values are snapshots created only by explicit
 `ANALYZE`; ordinary DML deliberately does not update or invalidate them.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
-`<database>-wal.next`. Creation uses create-new semantics and refuses to
-overwrite an existing database or WAL slot. A successful checkpoint retains
+`<database>-wal.next`, plus a durable append-only transaction-status file named
+`<database>-txn-status`. Creation uses create-new semantics and refuses to
+overwrite any of them. A successful checkpoint retains
 only the current generation; at most one superseded slot can remain after an
 interrupted rotation and is cleaned on open or the next checkpoint.
 `Database::insert` runs as an implicit transaction. Call
 `begin_transaction`, `insert_in`, and `Transaction::commit` when several
 inserts must share one WAL chain, or call `Transaction::rollback` (equivalently
-`abort`) to remove their physical effects. A successful commit means its
-commit record has reached durable storage; heap pages may remain buffered until
-eviction, `flush`, or `close`.
+`abort`) to remove their physical effects. A successful commit means its Commit
+WAL record and matching committed status have reached durable storage; heap
+pages may remain buffered until eviction, `flush`, or `close`. The Commit
+record's monotonic logical LSN is its `CommitSeq`; startup reconciles a crash
+between WAL sync and status publication.
 
 The current full-page-image model permits one writer per open database object.
 Writer ownership is acquired lazily by the first write, so read-only
 transactions do not reserve it. Commit releases ownership only after the
-Commit record is durable. Rollback first makes Abort durable, follows the
+Commit record and committed status are durable. Rollback first makes Abort durable, follows the
 transaction's prevLSN chain backward, installs and synchronizes each validated
 before-image (or removes newly allocated trailing pages), then durably records
 RollbackComplete and releases ownership. A failed commit or rollback remains
@@ -303,7 +311,11 @@ Dropping an unfinished dirty writer does not silently release it: the open
 storage becomes recovery-required for subsequent writes, and `close` reports
 an error. `flush` remains legal during an active transaction because the engine
 uses STEAL and WAL-orders each page write; flush success does not mean commit.
-Readers are not isolated and may observe an active writer's buffered changes.
+Every Heap read applies one authoritative MVCC visibility rule. Read Committed
+captures a new view at each statement; Repeatable Read pins the first view for
+the transaction. A transaction sees its own earlier commands, while peers never
+see active or aborted inserts and continue to see the predecessor of an active
+or aborted update/delete.
 
 `Database::checkpoint` and `HeapStorage::checkpoint` are explicit synchronous
 quiescent checkpoints. They return a typed error instead of waiting whenever a
@@ -359,8 +371,9 @@ post-checkpoint generation. Clean shutdown markers are intentionally omitted:
 the bounded current generation is scanned on open, avoiding a second persistent
 state machine whose marker would need invalidation before writes.
 
-Phase 2C still does not provide MVCC, reader isolation, fuzzy or background
-checkpoints, concurrent writers, or cross-process writer coordination. A
+The first MVCC phase still does not provide Serializable isolation, concurrent
+writers, fuzzy/background vacuum or checkpoints, or cross-process writer
+coordination. A
 successful explicit `close` rejects every outstanding transaction and then
 WAL-orders and flushes dirty pages; WAL recycling remains an explicit
 checkpoint operation.
@@ -385,18 +398,17 @@ SELECT predicate evaluator, so FALSE and UNKNOWN do not mutate a row.
 
 Mutation is located by an internal versioned physical `RowId` (`PageId +
 SlotId + u32 generation`) that is never exposed as a SQL column or treated as a
-business key. Generation zero is never issued. DELETE compacts tuple bytes
-without renumbering slots and retains the current generation in an explicit
-tombstone. A later insertion may reuse the lowest eligible tombstone after a
-checked generation increment. Before reuse, the old locator reports
-`RowDeleted`; afterward it reports `StaleRowId` and cannot access the new
-occupant. UPDATE rebuilds the current 4 KiB page while preserving the slot and
-generation when it fits. Otherwise storage relocates the replacement to the
-lowest existing PageId accepted by normal Page v5 insertion, or allocates a new
-page, and returns the current `RowId`. The source becomes a same-generation
-tombstone (`RowDeleted`) until later reuse makes the old locator stale. Heap
-insertion uses the same deterministic linear first-fit search across all data
-pages. There is no persistent free-space map or forwarding pointer.
+business key. Generation zero is never issued. Each physical Heap record begins
+with a checked 48-byte `NBMV` v1 header containing `xmin/xmax`, `cmin/cmax`, and
+an optional next-version RowId. UPDATE appends a replacement version and expires
+the predecessor; DELETE only expires the current version. Neither operation
+physically removes snapshot-visible history. Registered B+Trees are candidate
+generators: old entries remain until vacuum and every candidate is rechecked
+against the same Heap ReadView used by sequential scans. `vacuum` computes the
+oldest pinned snapshot horizon, deletes exact index candidates for dead
+versions, then turns those Heap records into Page v5 tombstones. Later insertion
+may reuse such a slot only after checked generation increment, so stale RowIds
+cannot access a replacement occupant. There is no persistent free-space map.
 Implicit DML owns one transaction. `execute_in` supports multiple statements
 in an explicit transaction; until savepoints exist, an execution-time DML
 failure rolls back that whole transaction.
@@ -428,10 +440,10 @@ right pages and old roots remain valid, unreachable index pages and are not
 reclaimed or reused yet.
 
 The registry persists `ColumnId -> BTreeHandle` separately from raw B+Trees.
-`create_index` atomically backfills current rows and registers only after the
+`create_index` atomically backfills currently visible rows and registers only after the
 full build; reopen discovers and validates the mapping. Later Heap and SQL DML
-maintains all registered indexes in the same transaction and propagates every
-RowId relocation. Raw B+Trees remain independent. Raw BTree lookup alone does
+maintains all registered indexes in the same transaction by adding new-version
+candidates and retaining older candidates until vacuum. Raw B+Trees remain independent. Raw BTree lookup alone does
 not validate referenced Heap rows or enforce uniqueness, and SQL index DDL
 remains deferred. Core maps registered definitions and their cached optimizer
 snapshots into an ordered, read-only planner context. Eligible
@@ -681,8 +693,8 @@ The implementation sequence is intentionally vertical:
     rows still own predicate-only columns before the parent Project drops them.
     Generic Filter position prebinding remains the next strong candidate.
 
-Isolation/MVCC, one-sided/Text range costing, and index-join planning remain
-roadmap items.
+Serializable isolation, concurrent writers, one-sided/Text range costing, and
+index-join planning remain roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
 

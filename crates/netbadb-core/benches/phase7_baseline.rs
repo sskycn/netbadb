@@ -786,6 +786,20 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "hidden_filter_payload_retained_all_true",
+        rows,
+        "SELECT payload FROM items WHERE payload IS NOT NULL",
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        payload_observation,
+        measurements,
+    )?;
+    run_attribution_query(
         "hidden_filter_id_is_not_null_all",
         rows,
         "SELECT id FROM items WHERE id IS NOT NULL",

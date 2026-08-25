@@ -917,6 +917,7 @@ mod tests {
         let wal = wal_path(path);
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(crate::txn_status_path(path));
         let _ = std::fs::remove_file(path);
     }
 

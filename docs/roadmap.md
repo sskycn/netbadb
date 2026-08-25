@@ -102,6 +102,33 @@ synchronous and explicit: there is no fuzzy checkpoint, background policy, WAL
 archive, replication, or PITR. Subprocess termination tests model abrupt process
 loss without Rust destructors, not machine or storage-device power loss.
 
+## Single-writer MVCC + snapshot read isolation (complete)
+
+- strong `CommitSeq` and `CommandId` types, one canonical Snapshot/ReadView,
+  per-statement Read Committed, and transaction-pinned Repeatable Read;
+- heap metadata v4 and checked `NBMV` tuple v1 headers containing
+  `xmin/xmax`, `cmin/cmax`, and an optional next-version RowId;
+- durable checksummed `<database>-txn-status` v1 storage for committed and
+  aborted decisions, with Commit WAL LSN as the monotonic commit sequence;
+- commit ordering that syncs WAL before status publication and startup
+  reconciliation of the intervening crash window;
+- append-version UPDATE, logical DELETE, own-command visibility, dirty-read
+  prevention, and aborted-version handling;
+- one visibility implementation shared by sequential scans, selective and
+  borrowed visitors, direct COUNT/presence paths, RowId reads, and point/range
+  index scans;
+- B+Trees as MVCC candidate generators, retaining old version entries until
+  exact horizon-safe reclamation;
+- explicit synchronous vacuum using the oldest pinned snapshot, with
+  generation-safe Heap slot reuse and WAL-backed index/Heap cleanup;
+- deterministic corruption, rollback, RC/RR, index-equivalence, vacuum,
+  checkpoint/reopen, and abrupt-process recovery coverage.
+
+This phase intentionally retains one physical writer, STEAL/NO-FORCE full-page
+WAL, synchronous core execution, and quiescent checkpoints. Serializable,
+multi-writer conflict detection, background vacuum, cross-process writer
+coordination, replication, and distributed transactions remain deferred.
+
 ## WAL integrity hardening (complete)
 
 - WAL format v3 keeps the 48-byte generation header and adds a whole-header
@@ -119,7 +146,7 @@ loss without Rust destructors, not machine or storage-device power loss.
 
 WAL v2 and record v1 remain unsupported experimental formats. At this
 WAL-integrity-hardening phase, heap metadata remained v2; the current heap
-metadata format is v3. Canonical schema encoding remains v1.
+metadata format is v4. Canonical schema encoding remains v1.
 
 ## Data-page integrity hardening (complete)
 
@@ -138,7 +165,7 @@ metadata format is v3. Canonical schema encoding remains v1.
 
 Page v5 retains this checksum unchanged while extending slot entries with a
 generation; versions 1 through 4 are unsupported experimental formats. Page 0
-now carries heap metadata v3 and remains outside data-page checksum coverage.
+carried heap metadata v3 at this phase and remains outside data-page checksum coverage.
 WAL v3, record v2, and canonical schema v1 are unchanged. Page CRC
 detects persistent data-page corruption independently of WAL CRC after log
 recycling; neither checksum repairs corruption nor authenticates malicious
@@ -203,12 +230,12 @@ join reordering, hash/merge/index join, or multi-table DML.
 - unified typed validation for canonical schemas and table definitions;
 - explicit canonical table-schema encoding version 1 and SHA-256 fingerprint;
 - heap metadata format version 2 originally added persisted schema identity;
-  at that phase metadata remained v2, while the current format is v3;
+  at that phase metadata remained v2, while the current format is v4;
 - pre-recovery rejection of table-ID and full-schema mismatches;
 - deterministic golden, sensitivity, invalid-schema, and reopen tests.
 
-Heap metadata versions 1 and 2 have no migration path and are rejected by the
-current version 3 decoder. The experimental format may continue to change
+Heap metadata versions 1 through 3 have no migration path and are rejected by the
+current version 4 decoder. The experimental format may continue to change
 between versions.
 
 ## Phase 3D — Aggregate + Sort (complete)

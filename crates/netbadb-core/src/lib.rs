@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use netbadb_compiler::{CompileError, CompiledStatement, compile_statement};
-use netbadb_executor::{ExecutionError, execute_statement, execute_with_storages};
+use netbadb_executor::{ExecutionError, execute_statement, execute_with_read_views};
 use netbadb_inspect::{CatalogInspection, StatementInspection};
 use netbadb_planner::{
     IndexAccessPath, PhysicalStatement, TableAccessStatistics, plan_statement_with_statistics,
@@ -18,7 +18,8 @@ use netbadb_types::{ColumnId, ScalarValue, TableId};
 
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_storage::{
-    IndexDefinition, IndexStatistics, TableStatistics, Transaction, TransactionState,
+    IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics, Transaction,
+    TransactionState,
 };
 
 /// Canonical table identities read or written by one successfully compiled SQL
@@ -239,6 +240,15 @@ impl Database {
         Ok(self.primary_storage_mut()?.begin_transaction()?)
     }
 
+    pub fn begin_transaction_with_isolation(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction, DatabaseError> {
+        Ok(self
+            .primary_storage_mut()?
+            .begin_transaction_with_isolation(isolation_level)?)
+    }
+
     /// Begins a transaction owned by the heap for `table_id`.
     ///
     /// The returned handle is valid only for writes to that same table through
@@ -250,6 +260,16 @@ impl Database {
         table_id: TableId,
     ) -> Result<Transaction, DatabaseError> {
         Ok(self.storage_mut(table_id)?.begin_transaction()?)
+    }
+
+    pub fn begin_transaction_for_with_isolation(
+        &mut self,
+        table_id: TableId,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction, DatabaseError> {
+        Ok(self
+            .storage_mut(table_id)?
+            .begin_transaction_with_isolation(isolation_level)?)
     }
 
     pub fn insert_in(
@@ -326,6 +346,10 @@ impl Database {
         Ok(())
     }
 
+    pub fn vacuum(&mut self, table_id: TableId) -> Result<u64, DatabaseError> {
+        Ok(self.storage_mut(table_id)?.vacuum()?)
+    }
+
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
         for storage in self.storages {
@@ -339,7 +363,12 @@ impl Database {
         let PhysicalStatement::Query(plan) = physical else {
             return Err(DatabaseError::ExpectedQuery);
         };
-        Ok(execute_with_storages(&plan, &mut self.storages)?)
+        let views = self
+            .storages
+            .iter()
+            .map(HeapStorage::read_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(execute_with_read_views(&plan, &mut self.storages, &views)?)
     }
 
     /// Compiles SQL and reports its canonical table access without planning,
@@ -374,9 +403,15 @@ impl Database {
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
         let physical = self.plan_source(source)?;
         if let PhysicalStatement::Query(plan) = &physical {
-            return Ok(ExecutionResult::Query(execute_with_storages(
+            let views = self
+                .storages
+                .iter()
+                .map(HeapStorage::read_view)
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(ExecutionResult::Query(execute_with_read_views(
                 plan,
                 &mut self.storages,
+                &views,
             )?));
         }
 
@@ -409,9 +444,25 @@ impl Database {
         self.validate_transaction(transaction)?;
         let physical = self.plan_source(source)?;
         if let PhysicalStatement::Query(plan) = &physical {
-            return Ok(ExecutionResult::Query(execute_with_storages(
+            let owner = self
+                .storages
+                .iter()
+                .position(|storage| storage.validate_transaction(transaction).is_ok())
+                .ok_or(DatabaseError::EmptyCatalog)?;
+            let owner_view = transaction.begin_statement()?;
+            let mut owner_view = Some(owner_view);
+            let mut views = Vec::with_capacity(self.storages.len());
+            for (position, storage) in self.storages.iter().enumerate() {
+                if position == owner {
+                    views.push(owner_view.take().ok_or(DatabaseError::EmptyCatalog)?);
+                } else {
+                    views.push(storage.read_view()?);
+                }
+            }
+            return Ok(ExecutionResult::Query(execute_with_read_views(
                 plan,
                 &mut self.storages,
+                &views,
             )?));
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
@@ -550,6 +601,7 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
             database_path.clone(),
             wal_path.clone(),
             netbadb_storage::wal_alternate_path(&wal_path),
+            netbadb_storage::txn_status_path(database_path),
         ];
         for target in targets {
             match std::fs::remove_file(&target) {
@@ -567,7 +619,10 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, DatabaseError, ExecutionResult, PhysicalStatement, TransactionState};
+    use super::{
+        Database, DatabaseError, ExecutionResult, IsolationLevel, PhysicalStatement,
+        TransactionState,
+    };
     use netbadb_inspect::{
         AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
         ExpressionKindInspection, NullOrderInspection, PlanNodeInspection, SortDirectionInspection,
@@ -652,6 +707,109 @@ mod tests {
             ExecutionResult::AffectedRows(rows) => rows,
             ExecutionResult::Query(_) => panic!("expected affected rows"),
         }
+    }
+
+    #[test]
+    fn mvcc_fast_paths_hide_dirty_insert_and_explicit_transaction_reads_own_write() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-mvcc-fast-paths-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut database = Database::create(&path, table()).expect("create database");
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'A')")
+            .expect("insert A");
+        let mut writer = database.begin_transaction().expect("begin writer");
+        database
+            .insert_in(
+                &mut writer,
+                &[ScalarValue::Int64(2), ScalarValue::Text("B".into())],
+            )
+            .expect("insert dirty B");
+
+        assert_eq!(
+            database.query("SELECT COUNT(*) FROM users").unwrap().rows,
+            vec![vec![ScalarValue::UInt64(1)]]
+        );
+        assert_eq!(
+            database
+                .query("SELECT name FROM users WHERE name IS NOT NULL")
+                .unwrap()
+                .rows,
+            vec![vec![ScalarValue::Text("A".into())]]
+        );
+        let own = database
+            .execute_in(&mut writer, "SELECT name FROM users ORDER BY id")
+            .expect("own read");
+        assert_eq!(
+            match own {
+                ExecutionResult::Query(result) => result.rows,
+                ExecutionResult::AffectedRows(_) => unreachable!(),
+            },
+            vec![
+                vec![ScalarValue::Text("A".into())],
+                vec![ScalarValue::Text("B".into())],
+            ]
+        );
+        writer.rollback().expect("rollback dirty insert");
+        database.close().expect("close database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(netbadb_storage::txn_status_path(&path));
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mvcc_repeatable_read_and_index_scan_keep_the_old_view() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-mvcc-rr-index-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut database = Database::create(&path, table()).expect("create database");
+        database
+            .create_index(TableId(1), ColumnId(2))
+            .expect("create name index");
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'A')")
+            .expect("insert A");
+        let mut repeatable = database
+            .begin_transaction_with_isolation(IsolationLevel::RepeatableRead)
+            .expect("begin RR");
+        let before = database
+            .execute_in(&mut repeatable, "SELECT name FROM users WHERE name = 'A'")
+            .expect("RR before");
+        assert!(matches!(before, ExecutionResult::Query(ref result) if result.rows.len() == 1));
+
+        database
+            .execute("UPDATE users SET name = 'B' WHERE id = 1")
+            .expect("commit B");
+        let old = database
+            .execute_in(&mut repeatable, "SELECT name FROM users WHERE name = 'A'")
+            .expect("RR old index candidate");
+        assert_eq!(
+            match old {
+                ExecutionResult::Query(result) => result.rows,
+                ExecutionResult::AffectedRows(_) => unreachable!(),
+            },
+            vec![vec![ScalarValue::Text("A".into())]]
+        );
+        assert_eq!(
+            database
+                .query("SELECT name FROM users WHERE name = 'B'")
+                .unwrap()
+                .rows,
+            vec![vec![ScalarValue::Text("B".into())]]
+        );
+        repeatable.commit().expect("finish RR");
+        database.close().expect("close database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(netbadb_storage::txn_status_path(&path));
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(path);
     }
 
     fn inspected_index(plan: &PlanNodeInspection) -> Option<(ColumnId, &ScalarValue)> {
@@ -846,6 +1004,56 @@ mod tests {
         database
             .insert(&[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())])
             .expect("insert Lin");
+
+        let predicate_only = database
+            .query("SELECT id FROM users WHERE name IS NOT NULL")
+            .expect("predicate-only Text projection");
+        assert_eq!(
+            predicate_only.rows,
+            vec![vec![ScalarValue::Int64(1)], vec![ScalarValue::Int64(2)]]
+        );
+        let inspected = database
+            .inspect_statement("SELECT id FROM users WHERE name IS NOT NULL")
+            .expect("inspect predicate-only Text projection");
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&inspected.plan)),
+            Some(vec![ColumnId(1), ColumnId(2)])
+        );
+
+        let retained_filter = database
+            .query("SELECT name FROM users WHERE name IS NOT NULL")
+            .expect("retained Text filter");
+        assert_eq!(
+            retained_filter.rows,
+            vec![
+                vec![ScalarValue::Text("Ada".into())],
+                vec![ScalarValue::Text("Lin".into())]
+            ]
+        );
+        let inspected = database
+            .inspect_statement("SELECT name FROM users WHERE name IS NOT NULL")
+            .expect("inspect retained Text filter");
+        assert_eq!(
+            inspected_scan_columns(inspected_root(&inspected.plan)),
+            Some(vec![ColumnId(2)])
+        );
+
+        let duplicate_filtered = database
+            .query("SELECT name, name FROM users WHERE id IS NOT NULL")
+            .expect("duplicate retained Text after predicate-only filter");
+        assert_eq!(
+            duplicate_filtered.rows,
+            vec![
+                vec![
+                    ScalarValue::Text("Ada".into()),
+                    ScalarValue::Text("Ada".into())
+                ],
+                vec![
+                    ScalarValue::Text("Lin".into()),
+                    ScalarValue::Text("Lin".into())
+                ]
+            ]
+        );
 
         let payload = database.query("SELECT name FROM users").expect("payload");
         assert_eq!(
@@ -1064,13 +1272,22 @@ mod tests {
         database
             .execute("UPDATE users SET name = 'Grace' WHERE id = 1")
             .expect("SQL update");
-        assert!(
+        assert_eq!(
             database
                 .storage_mut(TableId(1))
                 .unwrap()
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("Ada".into()))
                 .unwrap()
+                .len(),
+            1,
+            "MVCC retains the old index candidate until vacuum"
+        );
+        assert!(
+            database
+                .query("SELECT id FROM users WHERE name = 'Ada'")
+                .unwrap()
+                .rows
                 .is_empty()
         );
         assert_eq!(
@@ -1079,21 +1296,23 @@ mod tests {
                 .unwrap()
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("Grace".into()))
-                .unwrap(),
-            inserted
+                .unwrap()
+                .len(),
+            1
         );
 
         database
             .execute("DELETE FROM users WHERE id = 1")
             .expect("SQL delete");
-        assert!(
+        assert_eq!(
             database
                 .storage_mut(TableId(1))
                 .unwrap()
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("Grace".into()))
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
 
         database
@@ -1125,7 +1344,8 @@ mod tests {
                 .btree()
                 .lookup(definition.handle, &ScalarValue::Text("shared".into()))
                 .unwrap()
-                .is_empty()
+                .len()
+                >= 2
         );
         database.close().expect("close database");
         let wal = netbadb_storage::wal_path(&path);
@@ -1284,14 +1504,16 @@ mod tests {
             ),
             3
         );
-        assert!(
+        assert_eq!(
             database
                 .storage_mut(TableId(9))
                 .unwrap()
                 .btree()
                 .lookup(team.handle, &ScalarValue::Int64(10))
                 .unwrap()
-                .is_empty()
+                .len(),
+            3,
+            "MVCC retains old-key candidates until vacuum"
         );
         assert_eq!(
             database
@@ -1333,6 +1555,14 @@ mod tests {
                 .btree()
                 .lookup(team.handle, &ScalarValue::Int64(10))
                 .unwrap()
+                .len()
+                >= 2
+        );
+        assert!(
+            database
+                .query("SELECT id FROM members WHERE team_id = 10")
+                .unwrap()
+                .rows
                 .is_empty()
         );
 
