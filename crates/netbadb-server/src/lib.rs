@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_core::{
-    Database, DatabaseError, ExecutionResult, QueryResult, Transaction, TransactionState,
+    Database, DatabaseError, DatabaseTransaction, ExecutionResult, QueryResult, TransactionState,
 };
 use netbadb_protocol::{
     ClientMessage, MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, ProtocolError,
@@ -128,7 +128,7 @@ impl From<ProtocolError> for ServerError {
 #[derive(Debug, Default)]
 pub struct SessionState {
     handshaken: bool,
-    transaction: Option<Transaction>,
+    transaction: Option<DatabaseTransaction>,
     policy: SessionPolicy,
 }
 
@@ -517,6 +517,8 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         DatabaseError::Storage(_) => ProtocolErrorCode::Storage,
         DatabaseError::Execution(_) => ProtocolErrorCode::Execution,
         DatabaseError::ExpectedQuery
+        | DatabaseError::Registry(_)
+        | DatabaseError::Transaction(_)
         | DatabaseError::EmptyCatalog
         | DatabaseError::TableSelectionRequired
         | DatabaseError::DuplicateStoragePath(_)
@@ -876,6 +878,92 @@ mod tests {
 
         database.close().unwrap();
         cleanup(&path);
+    }
+
+    #[test]
+    fn session_owns_cross_storage_reads_and_disconnect_rolls_back_the_unique_writer() {
+        let users_path = test_path("coordinator-users");
+        let teams_path = test_path("coordinator-teams");
+        cleanup(&users_path);
+        cleanup(&teams_path);
+        let mut database = Database::create_tables(vec![
+            (users_path.clone(), users_table()),
+            (teams_path.clone(), teams_table()),
+        ])
+        .unwrap();
+        database
+            .insert_into(TableId(2), &[ScalarValue::UInt64(7)])
+            .unwrap();
+        let mut session = SessionState::new();
+        hello(&mut session, &mut database);
+        assert_eq!(
+            session
+                .handle(
+                    &mut database,
+                    2,
+                    ClientMessage::Begin {
+                        table_id: TableId(1),
+                    },
+                )
+                .messages,
+            vec![ServerMessage::TransactionStarted]
+        );
+        let read_other = session.handle(
+            &mut database,
+            3,
+            ClientMessage::Execute {
+                sql: "SELECT id FROM teams".into(),
+            },
+        );
+        assert!(matches!(
+            read_other.messages.as_slice(),
+            [
+                ServerMessage::QueryStart { .. },
+                ServerMessage::QueryRow { .. },
+                ServerMessage::QueryEnd { row_count: 1 }
+            ]
+        ));
+        assert_eq!(
+            session
+                .handle(
+                    &mut database,
+                    4,
+                    ClientMessage::Execute {
+                        sql: "INSERT INTO users (id, name) VALUES (1, 'temporary')".into(),
+                    },
+                )
+                .messages,
+            vec![ServerMessage::AffectedRows { count: 1 }]
+        );
+        let second_writer = session.handle(
+            &mut database,
+            5,
+            ClientMessage::Execute {
+                sql: "UPDATE teams SET id = id WHERE id = id".into(),
+            },
+        );
+        assert_error(
+            &second_writer,
+            ProtocolErrorCode::Database,
+            WireTransactionState::Active,
+        );
+        session.close().expect("disconnect rollback");
+        assert_eq!(session.transaction_state(), WireTransactionState::None);
+        assert!(
+            database
+                .query("SELECT id FROM users")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            database.query("SELECT id FROM teams").unwrap().rows.len(),
+            1
+        );
+
+        database.close().unwrap();
+        cleanup(&users_path);
+        cleanup(&teams_path);
     }
 
     #[test]

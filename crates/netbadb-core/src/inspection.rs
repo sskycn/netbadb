@@ -1,3 +1,5 @@
+use crate::DatabaseError;
+use crate::registry::{PhysicalBindings, StorageRegistry};
 use netbadb_index::IndexBound;
 use netbadb_inspect::{
     AggregateFunctionInspection, AggregateInputInspection, AggregateOutputInspection,
@@ -15,19 +17,17 @@ use netbadb_rel::{
     ExprKind, JoinKind, LogicalStatement, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_schema::Schema;
-use netbadb_storage::TableStorage;
-
-use crate::DatabaseError;
 
 pub(crate) fn catalog(
     schema: &Schema,
-    storages: &[TableStorage],
+    bindings: &PhysicalBindings,
+    registry: &StorageRegistry,
 ) -> Result<CatalogInspection, DatabaseError> {
     let mut tables = Vec::with_capacity(schema.tables().len());
     for table in schema.tables() {
-        let storage = storages
-            .iter()
-            .find(|storage| storage.table().id == table.id)
+        let storage_id = bindings.resolve_current(table.id)?;
+        let storage = registry
+            .get(storage_id)
             .ok_or(DatabaseError::InspectionStorageMissing { table_id: table.id })?;
         let mut indexes = Vec::with_capacity(storage.indexes().len());
         for (position, definition) in storage.indexes().iter().enumerate() {

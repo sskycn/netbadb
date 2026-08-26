@@ -1049,3 +1049,55 @@ The next storage-engine phase should add one concrete second layout only when
 its real row identity, transaction context, scan capabilities, persistence, and
 recovery model are specified. Batch/chunk execution remains a separate measured
 executor phase rather than a prerequisite for this boundary.
+
+## Phase 8B — Database Transaction Coordinator Foundation (complete)
+
+- added strong `StorageId` physical identity and separate runtime-only
+  `DatabaseTxnId`; neither changes Heap/WAL identities or persistent formats;
+- Core owns deterministic `PhysicalBindings` and `StorageRegistry` boundaries.
+  Current validated catalog order assigns StorageIds starting at one, while all
+  routing resolves TableId → StorageId explicitly rather than treating a Vec
+  position as identity;
+- planner snapshots, inspection, SELECT/DML, index management, ANALYZE, vacuum,
+  checkpoint, and executor storage/read-view lookup all route through these
+  boundaries;
+- `DatabaseTransaction` now owns SQL transaction identity, isolation,
+  lifecycle, lazy participants, and the database-level read context.
+  `StorageTransaction` is an engine participant containing the current Heap
+  WAL/MVCC transaction;
+- `DatabaseReadView` groups the StorageReadViews used by one logical statement.
+  Explicit transactions support reads and joins across multiple StorageIds;
+- participants have explicit Read/Write mode and support Read → Write upgrade.
+  Multiple readers plus exactly one physical writer are supported;
+- a second writer is rejected before physical mutation. Commit never attempts
+  sequential multi-writer durability; rollback coordinates the unique writer
+  and all read contexts. Participant failures leave the database transaction
+  pending instead of falsely reporting a terminal state;
+- Server `SessionState` owns `DatabaseTransaction`; BEGIN/QUERY/DML/COMMIT,
+  ROLLBACK, and disconnect rollback retain their Protocol v1 lifecycle.
+  Authorization remains based on compiler-resolved logical TableIds.
+
+Architecture invariants:
+
+```text
+TableId is logical identity.
+StorageId is physical storage identity.
+TableId does not permanently imply exactly one physical storage.
+
+DatabaseTransaction owns SQL transaction semantics.
+StorageTransaction is one engine participant context.
+```
+
+This phase adds no atomic multi-storage writes, prepare/2PC, coordinator WAL,
+partitioning or pruning, cross-partition DML, placement, remote storage, LSM,
+Columnar, Raft, or replication. It changes no Heap metadata, Page, BTree,
+IndexCatalog, transaction-status, WAL, Protocol v1, SDK Schema Spec v1,
+manifest v4, Inspection JSON v3, or SQL result semantics. Current StorageIds
+resolve locally and exist only for one opened database composition.
+
+The next required durability phase is **Atomic Multi-Storage Commit
+Foundation**. Before cross-partition UPDATE can exist, it must define prepare
+semantics, a durable coordinator decision, participant recovery and idempotent
+resolution, plus crash behavior for every window before and after the commit
+decision. Partitioned reads/pruning may arrive independently, but a
+cross-partition writer must wait for that atomic protocol.

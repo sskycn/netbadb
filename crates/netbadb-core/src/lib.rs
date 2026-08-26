@@ -1,27 +1,37 @@
 //! Native synchronous embedded API for NetbaDB.
 
 mod inspection;
+mod registry;
+mod transaction;
 
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use netbadb_compiler::{CompileError, CompiledStatement, compile_statement};
-use netbadb_executor::{ExecutionError, execute_statement, execute_with_read_views};
+use netbadb_executor::{
+    ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding,
+    execute_statement, execute_with_storage_context,
+};
 use netbadb_inspect::{CatalogInspection, StatementInspection};
 use netbadb_planner::{
     AccessPath, AccessPathCapabilities, PhysicalStatement, TableAccessStatistics,
     plan_statement_with_statistics,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
-use netbadb_storage::{StorageError, TableStorage, TransactionError};
-use netbadb_types::{ColumnId, ScalarValue, TableId};
+use netbadb_storage::{StorageError, TableStorage};
+use netbadb_types::{ColumnId, DatabaseTxnId, ScalarValue, StorageId, TableId};
+
+use registry::{PhysicalBindings, StorageRegistry};
 
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
-pub use netbadb_storage::StorageTransaction as Transaction;
-pub use netbadb_storage::{
-    IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics, TransactionState,
+pub use netbadb_storage::{IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics};
+pub use registry::StorageRegistryError;
+pub use transaction::{
+    CoordinatorError, DatabaseReadView, DatabaseTransaction, ParticipantMode, TransactionState,
 };
+pub type Transaction = DatabaseTransaction;
 
 /// Canonical table identities read or written by one successfully compiled SQL
 /// statement. This exposes no syntax, compiler IR, plan, or storage details.
@@ -49,6 +59,8 @@ pub enum DatabaseError {
     Schema(SchemaError),
     Storage(StorageError),
     Execution(ExecutionError),
+    Registry(StorageRegistryError),
+    Transaction(CoordinatorError),
     ExpectedQuery,
     EmptyCatalog,
     TableSelectionRequired,
@@ -78,6 +90,8 @@ impl fmt::Display for DatabaseError {
             Self::Schema(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
+            Self::Registry(error) => error.fmt(formatter),
+            Self::Transaction(error) => error.fmt(formatter),
             Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
             Self::EmptyCatalog => formatter.write_str("database requires at least one table"),
             Self::TableSelectionRequired => formatter
@@ -127,6 +141,8 @@ impl Error for DatabaseError {
             Self::Schema(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
+            Self::Registry(error) => Some(error),
+            Self::Transaction(error) => Some(error),
             Self::CreateTablesRollback { creation, .. } => Some(creation),
             Self::ExpectedQuery
             | Self::EmptyCatalog
@@ -163,28 +179,40 @@ impl From<ExecutionError> for DatabaseError {
     }
 }
 
+impl From<StorageRegistryError> for DatabaseError {
+    fn from(error: StorageRegistryError) -> Self {
+        Self::Registry(error)
+    }
+}
+
+impl From<CoordinatorError> for DatabaseError {
+    fn from(error: CoordinatorError) -> Self {
+        match error {
+            CoordinatorError::Storage(storage) => Self::Storage(storage),
+            other => Self::Transaction(other),
+        }
+    }
+}
+
 pub struct Database {
     schema: Schema,
-    storages: Vec<TableStorage>,
+    bindings: PhysicalBindings,
+    registry: StorageRegistry,
+    transaction_owner: Rc<()>,
+    next_transaction_id: DatabaseTxnId,
 }
 
 impl Database {
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
         let schema = Schema::new(vec![table.clone()])?;
         let storage = TableStorage::create_heap(path, table)?;
-        Ok(Self {
-            schema,
-            storages: vec![storage],
-        })
+        Self::compose(schema, vec![storage])
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
         let schema = Schema::new(vec![table.clone()])?;
         let storage = TableStorage::open_heap(path, table)?;
-        Ok(Self {
-            schema,
-            storages: vec![storage],
-        })
+        Self::compose(schema, vec![storage])
     }
 
     /// Creates one heap file per validated table and composes them into one
@@ -218,7 +246,7 @@ impl Database {
                 }
             }
         }
-        Ok(Self { schema, storages })
+        Self::compose(schema, storages)
     }
 
     /// Opens one existing heap-format file per table as a single query catalog.
@@ -229,7 +257,18 @@ impl Database {
         for (path, table) in tables {
             storages.push(TableStorage::open_heap(path, table)?);
         }
-        Ok(Self { schema, storages })
+        Self::compose(schema, storages)
+    }
+
+    fn compose(schema: Schema, storages: Vec<TableStorage>) -> Result<Self, DatabaseError> {
+        let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
+        Ok(Self {
+            schema,
+            bindings,
+            registry,
+            transaction_owner: Rc::new(()),
+            next_transaction_id: DatabaseTxnId(1),
+        })
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<(), DatabaseError> {
@@ -238,29 +277,29 @@ impl Database {
     }
 
     pub fn begin_transaction(&mut self) -> Result<Transaction, DatabaseError> {
-        Ok(self.primary_storage_mut()?.begin_transaction()?)
+        let _ = self.primary_storage_id()?;
+        self.begin_database_transaction(IsolationLevel::ReadCommitted)
     }
 
     pub fn begin_transaction_with_isolation(
         &mut self,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, DatabaseError> {
-        Ok(self
-            .primary_storage_mut()?
-            .begin_transaction_with_isolation(isolation_level)?)
+        let _ = self.primary_storage_id()?;
+        self.begin_database_transaction(isolation_level)
     }
 
-    /// Begins a transaction owned by the table storage for `table_id`.
+    /// Begins a database transaction after validating `table_id`'s current
+    /// physical binding. Participant registration remains lazy.
     ///
-    /// The returned handle is valid only for writes to that same table through
-    /// [`Self::insert_into_in`] or [`Self::execute_in`]. A transaction cannot
-    /// span multiple table storages; attempting to use it with another table
-    /// returns a foreign-transaction error without rolling back its owner.
+    /// The table argument is retained for embedded/protocol compatibility; it
+    /// does not bind the transaction to one physical storage.
     pub fn begin_transaction_for(
         &mut self,
         table_id: TableId,
     ) -> Result<Transaction, DatabaseError> {
-        Ok(self.storage_mut(table_id)?.begin_transaction()?)
+        let _ = self.resolve_storage_id(table_id)?;
+        self.begin_database_transaction(IsolationLevel::ReadCommitted)
     }
 
     pub fn begin_transaction_for_with_isolation(
@@ -268,9 +307,8 @@ impl Database {
         table_id: TableId,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, DatabaseError> {
-        Ok(self
-            .storage_mut(table_id)?
-            .begin_transaction_with_isolation(isolation_level)?)
+        let _ = self.resolve_storage_id(table_id)?;
+        self.begin_database_transaction(isolation_level)
     }
 
     pub fn insert_in(
@@ -278,7 +316,13 @@ impl Database {
         transaction: &mut Transaction,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
-        self.primary_storage_mut()?.insert_in(transaction, values)?;
+        let storage_id = self.primary_storage_id()?;
+        self.validate_transaction(transaction)?;
+        let context = transaction.write_context(storage_id, &mut self.registry)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .insert_in(context, values)?;
         Ok(())
     }
 
@@ -294,33 +338,37 @@ impl Database {
         Ok(())
     }
 
-    /// Inserts into `table_id` using a transaction created by
-    /// [`Self::begin_transaction_for`] for that same table.
-    ///
-    /// Cross-table use is rejected as a foreign transaction. NetbaDB does not
-    /// currently provide atomic write transactions spanning multiple heaps.
+    /// Inserts into `table_id` through a database transaction. A participant
+    /// for this storage is registered lazily, and a second physical writer is
+    /// rejected before this method reaches storage mutation.
     pub fn insert_into_in(
         &mut self,
         table_id: TableId,
         transaction: &mut Transaction,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
-        self.storage_mut(table_id)?.insert_in(transaction, values)?;
+        self.validate_transaction(transaction)?;
+        let storage_id = self.resolve_storage_id(table_id)?;
+        let context = transaction.write_context(storage_id, &mut self.registry)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .insert_in(context, values)?;
         Ok(())
     }
 
     /// Flushes dirty pages and reports any write or sync failure.
     pub fn flush(&self) -> Result<(), DatabaseError> {
-        for storage in &self.storages {
-            storage.flush()?;
+        for entry in self.registry.iter() {
+            entry.storage.flush()?;
         }
         Ok(())
     }
 
     /// Creates a quiescent checkpoint and recycles the previous WAL history.
     pub fn checkpoint(&mut self) -> Result<(), DatabaseError> {
-        for storage in &mut self.storages {
-            storage.checkpoint()?;
+        for entry in self.registry.iter_mut() {
+            entry.storage.checkpoint()?;
         }
         Ok(())
     }
@@ -353,23 +401,20 @@ impl Database {
 
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
-        for storage in self.storages {
-            storage.close()?;
+        for entry in self.registry.into_entries() {
+            entry.storage.close()?;
         }
         Ok(())
     }
 
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
-        let physical = self.plan_source(source)?;
+        let (compiled, physical) = self.compile_and_plan(source)?;
         let PhysicalStatement::Query(plan) = physical else {
             return Err(DatabaseError::ExpectedQuery);
         };
-        let views = self
-            .storages
-            .iter()
-            .map(TableStorage::read_view)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(execute_with_read_views(&plan, &mut self.storages, &views)?)
+        let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
+        let view = self.autocommit_read_view(&storage_ids)?;
+        self.execute_query_plan(&plan, &view)
     }
 
     /// Compiles SQL and reports its canonical table access without planning,
@@ -386,7 +431,7 @@ impl Database {
     /// order, and cached `ANALYZE` snapshots without scanning data or
     /// refreshing statistics.
     pub fn inspect_catalog(&self) -> Result<CatalogInspection, DatabaseError> {
-        inspection::catalog(&self.schema, &self.storages)
+        inspection::catalog(&self.schema, &self.bindings, &self.registry)
     }
 
     /// Compiles and physically plans one statement, then converts that exact
@@ -402,74 +447,60 @@ impl Database {
     /// Executes SELECT or one typed DML statement. DML runs in one implicit
     /// transaction and returns an explicit affected-row count.
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
-        let physical = self.plan_source(source)?;
+        let (compiled, physical) = self.compile_and_plan(source)?;
         if let PhysicalStatement::Query(plan) = &physical {
-            let views = self
-                .storages
-                .iter()
-                .map(TableStorage::read_view)
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(ExecutionResult::Query(execute_with_read_views(
-                plan,
-                &mut self.storages,
-                &views,
-            )?));
+            let storage_ids =
+                self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
+            let view = self.autocommit_read_view(&storage_ids)?;
+            return self
+                .execute_query_plan(plan, &view)
+                .map(ExecutionResult::Query);
         }
 
-        let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
-        let storage = self.storage_mut(table_id)?;
-        let mut transaction = storage.begin_transaction()?;
-        match execute_statement(&physical, storage, Some(&mut transaction)) {
+        let mut transaction = self.begin_database_transaction(IsolationLevel::ReadCommitted)?;
+        match self.execute_mutation_in(&mut transaction, &physical) {
             Ok(result) => {
                 transaction.commit()?;
                 Ok(result)
             }
             Err(error) => match transaction.rollback() {
-                Ok(()) => Err(error.into()),
+                Ok(()) => Err(error),
                 Err(rollback_error) => Err(rollback_error.into()),
             },
         }
     }
 
-    /// Executes a statement using an existing transaction. Mutating statements
-    /// must target the same table passed to [`Self::begin_transaction_for`].
+    /// Executes a statement using an existing database transaction. Reads may
+    /// span physical storages; writes may target exactly one `StorageId`.
     /// Until savepoints exist, an execution-time DML failure rolls back the
-    /// whole transaction.
+    /// whole transaction, while second-writer preflight rejection leaves it
+    /// active for explicit rollback.
     pub fn execute_in(
         &mut self,
         transaction: &mut Transaction,
         source: &str,
     ) -> Result<ExecutionResult, DatabaseError> {
-        // Reject inactive or foreign handles before compilation/execution. A
-        // foreign handle must never be rolled back by this database object.
         self.validate_transaction(transaction)?;
-        let physical = self.plan_source(source)?;
+        let (compiled, physical) = self.compile_and_plan(source)?;
         if let PhysicalStatement::Query(plan) = &physical {
-            let owner = self
-                .storages
-                .iter()
-                .position(|storage| storage.validate_transaction(transaction).is_ok())
-                .ok_or(DatabaseError::EmptyCatalog)?;
-            let owner_view = transaction.begin_statement()?;
-            let mut owner_view = Some(owner_view);
-            let mut views = Vec::with_capacity(self.storages.len());
-            for (position, storage) in self.storages.iter().enumerate() {
-                if position == owner {
-                    views.push(owner_view.take().ok_or(DatabaseError::EmptyCatalog)?);
-                } else {
-                    views.push(storage.read_view()?);
-                }
-            }
-            return Ok(ExecutionResult::Query(execute_with_read_views(
-                plan,
-                &mut self.storages,
-                &views,
-            )?));
+            let storage_ids =
+                self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
+            let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
+            return self
+                .execute_query_plan(plan, &view)
+                .map(ExecutionResult::Query);
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
-        let storage = self.storage_mut(table_id)?;
-        storage.validate_transaction(transaction)?;
-        match execute_statement(&physical, storage, Some(transaction)) {
+        let storage_id = self.resolve_storage_id(table_id)?;
+        // Coordinator preflight is deliberately outside the execution error
+        // rollback branch. Rejecting a second writer changes no physical data
+        // and leaves the existing participant available for explicit rollback.
+        let context = transaction.write_context(storage_id, &mut self.registry)?;
+        let storage = self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+        match execute_statement(&physical, storage, Some(context)) {
             Ok(result) => Ok(result),
             Err(error) => match transaction.rollback() {
                 Ok(()) => Err(error.into()),
@@ -483,6 +514,7 @@ impl Database {
         &self.schema
     }
 
+    #[cfg(test)]
     fn plan_source(&self, source: &str) -> Result<PhysicalStatement, DatabaseError> {
         self.compile_and_plan(source).map(|(_, physical)| physical)
     }
@@ -503,76 +535,181 @@ impl Database {
     }
 
     fn planner_table_statistics(&self) -> Vec<TableAccessStatistics> {
-        self.storages
+        self.bindings
             .iter()
-            .map(|storage| TableAccessStatistics {
-                table_id: storage.table().id,
-                statistics: storage.table_statistics(),
-            })
-            .collect()
-    }
-
-    fn planner_access_paths(&self) -> Vec<AccessPath> {
-        self.storages
-            .iter()
-            .flat_map(|storage| {
-                let table_id = storage.table().id;
-                storage
-                    .access_paths()
-                    .into_iter()
-                    .map(move |path| AccessPath {
-                        table_id,
-                        column_id: path.column_id,
-                        id: path.id,
-                        capabilities: AccessPathCapabilities {
-                            point_lookup: path.capabilities.point_lookup,
-                            range_lookup: path.capabilities.range_lookup,
-                        },
-                        statistics: path.statistics,
+            .filter_map(|binding| {
+                self.registry
+                    .get(binding.storage_id)
+                    .map(|storage| TableAccessStatistics {
+                        table_id: binding.table_id,
+                        statistics: storage.table_statistics(),
                     })
             })
             .collect()
     }
 
-    fn primary_storage_mut(&mut self) -> Result<&mut TableStorage, DatabaseError> {
-        match self.storages.as_mut_slice() {
-            [] => Err(DatabaseError::EmptyCatalog),
-            [storage] => Ok(storage),
-            [_, ..] => Err(DatabaseError::TableSelectionRequired),
+    fn planner_access_paths(&self) -> Vec<AccessPath> {
+        let mut paths = Vec::new();
+        for binding in self.bindings.iter() {
+            let Some(storage) = self.registry.get(binding.storage_id) else {
+                continue;
+            };
+            paths.extend(storage.access_paths().into_iter().map(|path| AccessPath {
+                table_id: binding.table_id,
+                column_id: path.column_id,
+                id: path.id,
+                capabilities: AccessPathCapabilities {
+                    point_lookup: path.capabilities.point_lookup,
+                    range_lookup: path.capabilities.range_lookup,
+                },
+                statistics: path.statistics,
+            }));
         }
+        paths
+    }
+
+    fn begin_database_transaction(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction, DatabaseError> {
+        let id = self.next_transaction_id;
+        let next =
+            id.0.checked_add(1)
+                .ok_or(CoordinatorError::TransactionIdExhausted)?;
+        self.next_transaction_id = DatabaseTxnId(next);
+        Ok(DatabaseTransaction::new(
+            Rc::clone(&self.transaction_owner),
+            id,
+            isolation_level,
+        ))
+    }
+
+    fn autocommit_read_view(
+        &self,
+        storage_ids: &[StorageId],
+    ) -> Result<DatabaseReadView, DatabaseError> {
+        let mut views = Vec::with_capacity(storage_ids.len());
+        for storage_id in storage_ids {
+            let storage =
+                self.registry
+                    .get(*storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId {
+                        storage_id: *storage_id,
+                    })?;
+            views.push((*storage_id, storage.read_view()?));
+        }
+        Ok(DatabaseReadView::autocommit(
+            IsolationLevel::ReadCommitted,
+            views,
+        ))
+    }
+
+    fn execute_query_plan(
+        &mut self,
+        plan: &netbadb_planner::PhysicalPlan,
+        view: &DatabaseReadView,
+    ) -> Result<QueryResult, DatabaseError> {
+        let bindings = self
+            .bindings
+            .iter()
+            .map(|binding| ExecutionStorageBinding {
+                table_id: binding.table_id,
+                storage_id: binding.storage_id,
+            })
+            .collect::<Vec<_>>();
+        let read_views = view
+            .iter()
+            .map(|(storage_id, view)| ExecutionReadView { storage_id, view })
+            .collect::<Vec<_>>();
+        let mut storages = self
+            .registry
+            .iter_mut()
+            .map(|entry| ExecutionStorage {
+                storage_id: entry.id,
+                storage: &mut entry.storage,
+            })
+            .collect::<Vec<_>>();
+        Ok(execute_with_storage_context(
+            plan,
+            &bindings,
+            &mut storages,
+            &read_views,
+        )?)
+    }
+
+    fn execute_mutation_in(
+        &mut self,
+        transaction: &mut Transaction,
+        physical: &PhysicalStatement,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        let table_id = statement_table_id(physical).ok_or(DatabaseError::ExpectedQuery)?;
+        let storage_id = self.resolve_storage_id(table_id)?;
+        let context = transaction.write_context(storage_id, &mut self.registry)?;
+        let storage = self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+        Ok(execute_statement(physical, storage, Some(context))?)
+    }
+
+    fn storage_ids_for_tables(
+        &self,
+        table_ids: Vec<TableId>,
+    ) -> Result<Vec<StorageId>, DatabaseError> {
+        let mut storage_ids = Vec::with_capacity(table_ids.len());
+        for table_id in table_ids {
+            let storage_id = self.resolve_storage_id(table_id)?;
+            if !storage_ids.contains(&storage_id) {
+                storage_ids.push(storage_id);
+            }
+        }
+        Ok(storage_ids)
+    }
+
+    fn primary_storage_id(&self) -> Result<StorageId, DatabaseError> {
+        if self.registry.len() != 1 {
+            return if self.registry.len() == 0 {
+                Err(DatabaseError::EmptyCatalog)
+            } else {
+                Err(DatabaseError::TableSelectionRequired)
+            };
+        }
+        self.bindings
+            .iter()
+            .next()
+            .map(|binding| binding.storage_id)
+            .ok_or(DatabaseError::EmptyCatalog)
+    }
+
+    fn resolve_storage_id(&self, table_id: TableId) -> Result<StorageId, DatabaseError> {
+        Ok(self.bindings.resolve_current(table_id)?)
+    }
+
+    fn primary_storage_mut(&mut self) -> Result<&mut TableStorage, DatabaseError> {
+        let storage_id = self.primary_storage_id()?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or_else(|| StorageRegistryError::UnknownStorageId { storage_id }.into())
     }
 
     fn storage_mut(&mut self, table_id: TableId) -> Result<&mut TableStorage, DatabaseError> {
-        self.storages
-            .iter_mut()
-            .find(|storage| storage.table().id == table_id)
-            .ok_or_else(|| ExecutionError::MissingTableStorage(table_id).into())
+        let storage_id = self.resolve_storage_id(table_id)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or_else(|| StorageRegistryError::UnknownStorageId { storage_id }.into())
     }
 
     fn storage(&self, table_id: TableId) -> Result<&TableStorage, DatabaseError> {
-        self.storages
-            .iter()
-            .find(|storage| storage.table().id == table_id)
-            .ok_or_else(|| ExecutionError::MissingTableStorage(table_id).into())
+        let storage_id = self.resolve_storage_id(table_id)?;
+        self.registry
+            .get(storage_id)
+            .ok_or_else(|| StorageRegistryError::UnknownStorageId { storage_id }.into())
     }
 
     fn validate_transaction(&self, transaction: &Transaction) -> Result<(), DatabaseError> {
-        let mut foreign = None;
-        for storage in &self.storages {
-            match storage.validate_transaction(transaction) {
-                Ok(()) => return Ok(()),
-                Err(StorageError::StorageContextMismatch { .. })
-                | Err(StorageError::Transaction(TransactionError::ForeignTransaction { .. })) => {
-                    foreign = Some(StorageError::Transaction(
-                        TransactionError::ForeignTransaction {
-                            txn_id: transaction.id(),
-                        },
-                    ));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(foreign.ok_or(DatabaseError::EmptyCatalog)?.into())
+        transaction
+            .validate_owner(&self.transaction_owner)
+            .map_err(DatabaseError::from)
     }
 }
 
@@ -625,9 +762,15 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{
-        Database, DatabaseError, ExecutionResult, IsolationLevel, PhysicalStatement,
-        TransactionState, cleanup_created_table_files,
+        CoordinatorError, Database, DatabaseError, ExecutionResult, IsolationLevel,
+        ParticipantMode, PhysicalStatement, TransactionState, cleanup_created_table_files,
+    };
+    use crate::registry::{
+        PhysicalBindings, PhysicalTableBinding, StorageRegistry, StorageRegistryEntry,
+        StorageRegistryError,
     };
     use netbadb_inspect::{
         AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
@@ -635,9 +778,11 @@ mod tests {
         StatementPlanInspection, StatementResultInspection, UnaryOpInspection,
     };
     use netbadb_planner::PhysicalPlan;
-    use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+    use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_storage::{HeapStorage, TableStorage};
-    use netbadb_types::{AccessPathId, ColumnId, PhysicalType, ScalarValue, TableId};
+    use netbadb_types::{
+        AccessPathId, ColumnId, DatabaseTxnId, PhysicalType, ScalarValue, StorageId, TableId,
+    };
 
     fn table() -> TableDef {
         TableDef::new(
@@ -728,8 +873,8 @@ mod tests {
         ));
         let mut database = Database::create(&path, table()).expect("create database");
         assert!(matches!(
-            database.storages.as_slice(),
-            [TableStorage::Heap(_)]
+            database.registry.iter().collect::<Vec<_>>().as_slice(),
+            [entry] if matches!(entry.storage, TableStorage::Heap(_))
         ));
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
@@ -743,6 +888,168 @@ mod tests {
         );
         database.close().expect("close database");
         cleanup_created_table_files(std::slice::from_ref(&path));
+    }
+
+    #[test]
+    fn physical_registry_identity_is_deterministic_validated_and_not_vector_position() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let users_path = std::env::temp_dir().join(format!("netbadb-registry-users-{suffix}"));
+        let teams_path = std::env::temp_dir().join(format!("netbadb-registry-teams-{suffix}"));
+        let paths = [users_path.clone(), teams_path.clone()];
+        cleanup_created_table_files(&paths);
+        let users = TableStorage::create_heap(&users_path, table()).expect("create users storage");
+        let teams =
+            TableStorage::create_heap(&teams_path, teams_table()).expect("create teams storage");
+
+        // Registry order is deliberately the reverse of logical binding order,
+        // and neither physical identity equals a vector position.
+        let registry = StorageRegistry::new(vec![
+            StorageRegistryEntry {
+                id: StorageId(20),
+                storage: teams,
+            },
+            StorageRegistryEntry {
+                id: StorageId(10),
+                storage: users,
+            },
+        ])
+        .expect("build reordered registry");
+        let bindings = PhysicalBindings::new(
+            vec![
+                PhysicalTableBinding {
+                    table_id: TableId(1),
+                    storage_id: StorageId(10),
+                },
+                PhysicalTableBinding {
+                    table_id: TableId(2),
+                    storage_id: StorageId(20),
+                },
+            ],
+            &registry,
+        )
+        .expect("build physical bindings");
+        assert!(matches!(
+            PhysicalBindings::new(
+                vec![
+                    PhysicalTableBinding {
+                        table_id: TableId(1),
+                        storage_id: StorageId(10),
+                    },
+                    PhysicalTableBinding {
+                        table_id: TableId(1),
+                        storage_id: StorageId(20),
+                    },
+                ],
+                &registry,
+            ),
+            Err(StorageRegistryError::DuplicateTableBinding {
+                table_id: TableId(1)
+            })
+        ));
+        let missing = PhysicalBindings::new(Vec::new(), &registry).expect("empty binding set");
+        assert!(matches!(
+            missing.resolve_current(TableId(1)),
+            Err(StorageRegistryError::MissingPhysicalBinding {
+                table_id: TableId(1)
+            })
+        ));
+        assert!(matches!(
+            PhysicalBindings::new(
+                vec![PhysicalTableBinding {
+                    table_id: TableId(1),
+                    storage_id: StorageId(99),
+                }],
+                &registry,
+            ),
+            Err(StorageRegistryError::UnknownStorageId {
+                storage_id: StorageId(99)
+            })
+        ));
+
+        let schema = Schema::new(vec![table(), teams_table()]).expect("build schema");
+        let mut database = Database {
+            schema,
+            bindings,
+            registry,
+            transaction_owner: Rc::new(()),
+            next_transaction_id: DatabaseTxnId(1),
+        };
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .expect("route users insert");
+        database
+            .execute("INSERT INTO teams (id) VALUES (1)")
+            .expect("route teams insert");
+        assert_eq!(
+            database
+                .query("SELECT u.name FROM users u JOIN teams t ON u.id = t.id")
+                .expect("route join through bindings")
+                .rows,
+            vec![vec![ScalarValue::Text("Ada".into())]]
+        );
+        database
+            .create_index(TableId(1), ColumnId(2))
+            .expect("route index creation");
+        database.analyze(TableId(1)).expect("route analyze");
+        assert_eq!(
+            affected(
+                database
+                    .execute("UPDATE users SET name = 'Grace' WHERE id = 1")
+                    .expect("route update"),
+            ),
+            1
+        );
+        assert_eq!(
+            affected(
+                database
+                    .execute("DELETE FROM teams WHERE id = 1")
+                    .expect("route delete"),
+            ),
+            1
+        );
+        assert_eq!(
+            database.query("SELECT name FROM users").unwrap().rows,
+            vec![vec![ScalarValue::Text("Grace".into())]]
+        );
+        assert!(
+            database
+                .query("SELECT id FROM teams")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        database.close().expect("close reordered registry");
+        cleanup_created_table_files(&paths);
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_physical_storage_identity() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let users_path =
+            std::env::temp_dir().join(format!("netbadb-registry-duplicate-users-{suffix}"));
+        let teams_path =
+            std::env::temp_dir().join(format!("netbadb-registry-duplicate-teams-{suffix}"));
+        let paths = [users_path.clone(), teams_path.clone()];
+        cleanup_created_table_files(&paths);
+        let users = TableStorage::create_heap(&users_path, table()).expect("create users storage");
+        let teams =
+            TableStorage::create_heap(&teams_path, teams_table()).expect("create teams storage");
+        assert!(matches!(
+            StorageRegistry::new(vec![
+                StorageRegistryEntry {
+                    id: StorageId(7),
+                    storage: users,
+                },
+                StorageRegistryEntry {
+                    id: StorageId(7),
+                    storage: teams,
+                },
+            ]),
+            Err(StorageRegistryError::DuplicateStorageId {
+                storage_id: StorageId(7)
+            })
+        ));
+        cleanup_created_table_files(&paths);
     }
 
     #[test]
@@ -790,6 +1097,221 @@ mod tests {
 
         database.close().expect("close multi-table database");
         cleanup_created_table_files(&paths);
+    }
+
+    #[test]
+    fn database_transaction_reads_two_storages_and_joins_in_one_read_context() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let users_path = std::env::temp_dir().join(format!("netbadb-txn-read-users-{suffix}"));
+        let teams_path = std::env::temp_dir().join(format!("netbadb-txn-read-teams-{suffix}"));
+        let paths = [users_path.clone(), teams_path.clone()];
+        cleanup_created_table_files(&paths);
+        let mut database =
+            Database::create_tables(vec![(users_path, table()), (teams_path, teams_table())])
+                .expect("create multi-storage database");
+        assert_eq!(
+            database.bindings.iter().collect::<Vec<_>>(),
+            vec![
+                PhysicalTableBinding {
+                    table_id: TableId(1),
+                    storage_id: StorageId(1),
+                },
+                PhysicalTableBinding {
+                    table_id: TableId(2),
+                    storage_id: StorageId(2),
+                },
+            ]
+        );
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .expect("insert user");
+        database
+            .execute("INSERT INTO teams (id) VALUES (1)")
+            .expect("insert team");
+
+        let mut transaction = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin database transaction");
+        for source in ["SELECT name FROM users", "SELECT id FROM teams"] {
+            assert!(matches!(
+                database.execute_in(&mut transaction, source),
+                Ok(ExecutionResult::Query(_))
+            ));
+        }
+        let joined = database
+            .execute_in(
+                &mut transaction,
+                "SELECT u.name FROM users u JOIN teams t ON u.id = t.id",
+            )
+            .expect("join through database read view");
+        assert_eq!(
+            match joined {
+                ExecutionResult::Query(result) => result.rows,
+                ExecutionResult::AffectedRows(_) => panic!("expected query"),
+            },
+            vec![vec![ScalarValue::Text("Ada".into())]]
+        );
+        assert_eq!(transaction.participant_count(), 2);
+        assert_eq!(
+            transaction.participant_mode(StorageId(1)),
+            Some(ParticipantMode::Read)
+        );
+        assert_eq!(
+            transaction.participant_mode(StorageId(2)),
+            Some(ParticipantMode::Read)
+        );
+        assert_eq!(transaction.write_participant(), None);
+        transaction.commit().expect("commit read-only transaction");
+        assert_eq!(transaction.state(), TransactionState::Committed);
+
+        database.close().expect("close database");
+        cleanup_created_table_files(&paths);
+    }
+
+    #[test]
+    fn one_writer_with_multiple_readers_and_read_to_write_upgrade_commits() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let users_path =
+            std::env::temp_dir().join(format!("netbadb-txn-one-writer-users-{suffix}"));
+        let teams_path =
+            std::env::temp_dir().join(format!("netbadb-txn-one-writer-teams-{suffix}"));
+        let paths = [users_path.clone(), teams_path.clone()];
+        cleanup_created_table_files(&paths);
+        let mut database =
+            Database::create_tables(vec![(users_path, table()), (teams_path, teams_table())])
+                .expect("create multi-storage database");
+        database
+            .execute("INSERT INTO teams (id) VALUES (1)")
+            .expect("seed read participant");
+
+        let mut transaction = database.begin_transaction_for(TableId(1)).unwrap();
+        database
+            .execute_in(&mut transaction, "SELECT id FROM users")
+            .expect("read future writer");
+        database
+            .execute_in(&mut transaction, "SELECT id FROM teams")
+            .expect("read second storage");
+        database
+            .execute_in(
+                &mut transaction,
+                "INSERT INTO users (id, name) VALUES (2, 'Grace')",
+            )
+            .expect("upgrade users participant to writer");
+        database
+            .execute_in(&mut transaction, "SELECT id FROM teams")
+            .expect("read after write");
+        assert_eq!(transaction.write_participant(), Some(StorageId(1)));
+        assert_eq!(
+            transaction.participant_mode(StorageId(1)),
+            Some(ParticipantMode::Write)
+        );
+        assert_eq!(
+            transaction.participant_mode(StorageId(2)),
+            Some(ParticipantMode::Read)
+        );
+        transaction.commit().expect("commit unique writer");
+        assert_eq!(
+            database.query("SELECT name FROM users").unwrap().rows,
+            vec![vec![ScalarValue::Text("Grace".into())]]
+        );
+
+        let mut write_later = database.begin_transaction_for(TableId(1)).unwrap();
+        database
+            .execute_in(&mut write_later, "SELECT id FROM users")
+            .expect("read users");
+        database
+            .execute_in(&mut write_later, "SELECT id FROM teams")
+            .expect("read teams before upgrade");
+        database
+            .execute_in(&mut write_later, "INSERT INTO teams (id) VALUES (3)")
+            .expect("upgrade teams participant");
+        assert_eq!(write_later.write_participant(), Some(StorageId(2)));
+        write_later.commit().expect("commit later writer");
+
+        database.close().expect("close database");
+        cleanup_created_table_files(&paths);
+    }
+
+    #[test]
+    fn reverse_second_writer_is_rejected_before_mutation_and_rollback_cleans_first() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let users_path = std::env::temp_dir().join(format!("netbadb-txn-reverse-users-{suffix}"));
+        let teams_path = std::env::temp_dir().join(format!("netbadb-txn-reverse-teams-{suffix}"));
+        let paths = [users_path.clone(), teams_path.clone()];
+        cleanup_created_table_files(&paths);
+        let mut database =
+            Database::create_tables(vec![(users_path, table()), (teams_path, teams_table())])
+                .expect("create multi-storage database");
+        let mut transaction = database.begin_transaction_for(TableId(2)).unwrap();
+        database
+            .execute_in(&mut transaction, "SELECT id FROM users")
+            .expect("register users reader");
+        database
+            .execute_in(&mut transaction, "SELECT id FROM teams")
+            .expect("register teams reader");
+        database
+            .execute_in(&mut transaction, "INSERT INTO teams (id) VALUES (9)")
+            .expect("write teams first");
+        assert!(matches!(
+            database.execute_in(
+                &mut transaction,
+                "INSERT INTO users (id, name) VALUES (9, 'must not appear')"
+            ),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::MultipleWriteParticipantsUnsupported {
+                    existing: StorageId(2),
+                    requested: StorageId(1)
+                }
+            ))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        transaction.rollback().expect("coordinate rollback");
+        assert!(
+            database
+                .query("SELECT id FROM teams")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert!(
+            database
+                .query("SELECT id FROM users")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        database.close().expect("close database");
+        cleanup_created_table_files(&paths);
+    }
+
+    #[test]
+    fn participant_commit_error_does_not_mark_database_transaction_committed() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-coordinator-commit-state-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_created_table_files(std::slice::from_ref(&path));
+        let mut database = Database::create(&path, table()).expect("create database");
+        let mut transaction = database.begin_transaction().expect("begin transaction");
+        let context = transaction
+            .write_context(StorageId(1), &mut database.registry)
+            .expect("register write participant");
+        context
+            .rollback()
+            .expect("force non-committable participant state");
+        assert!(matches!(
+            transaction.commit(),
+            Err(CoordinatorError::ParticipantStateViolation {
+                storage_id: StorageId(1),
+                ..
+            })
+        ));
+        assert_eq!(transaction.state(), TransactionState::CommitPending);
+
+        database.close().expect("close database");
+        cleanup_created_table_files(std::slice::from_ref(&path));
     }
 
     fn affected(result: ExecutionResult) -> u64 {

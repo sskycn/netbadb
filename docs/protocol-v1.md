@@ -76,8 +76,11 @@ client-only kinds.
 
 - `Hello`, `Commit`, `Rollback`, and `Ping` have empty payloads.
 - `Execute` is `u32 sql_byte_length` followed by strict UTF-8 SQL bytes.
-- `Begin` is one `u64 TableId`. Transactions belong to this one table heap and
-  do not imply cross-table atomicity.
+- `Begin` is one `u64 TableId`. The table remains the authorization and
+  compatibility validation target; the resulting database transaction may
+  read other authorized tables. It may write one physical `StorageId`; a
+  second physical writer is rejected and cross-storage atomicity is not
+  implied.
 - `Analyze` is one `u64 TableId`.
 
 Hello must be the first successful request. A second Hello is an error.

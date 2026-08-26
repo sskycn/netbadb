@@ -11,6 +11,17 @@ macro_rules! id_type {
 
 id_type!(DatabaseId, u64);
 id_type!(TableId, u64);
+/// Physical storage identity within one opened database composition.
+///
+/// This is distinct from logical [`TableId`], is deterministically assigned
+/// from validated catalog order, and is not currently persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StorageId(pub u64);
+/// Database-coordinator transaction identity within one opened database.
+///
+/// Heap WAL transactions retain their independent [`TxnId`] identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DatabaseTxnId(pub u64);
 /// Query-local identity for one occurrence of a relation in a FROM tree.
 /// Unlike [`TableId`], this identifier is never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

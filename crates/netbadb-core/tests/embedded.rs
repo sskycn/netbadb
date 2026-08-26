@@ -1,4 +1,4 @@
-use netbadb_core::{Database, DatabaseError, ExecutionResult, TransactionState};
+use netbadb_core::{CoordinatorError, Database, DatabaseError, ExecutionResult, TransactionState};
 use netbadb_executor::ExecutionError;
 use netbadb_inspect::{PlanNodeInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
@@ -1605,7 +1605,9 @@ fn foreign_transaction_is_rejected_without_rolling_back_its_owner() {
             &mut transaction,
             "UPDATE users SET name = 'wrong database' WHERE id = 999"
         ),
-        Err(DatabaseError::Storage(StorageError::Transaction(_)))
+        Err(DatabaseError::Transaction(
+            CoordinatorError::ForeignDatabaseTransaction { .. }
+        ))
     ));
     assert_eq!(transaction.state(), TransactionState::Active);
     transaction.rollback().expect("owner can still roll back");
@@ -1816,7 +1818,7 @@ fn reopen_rejects_swapped_nominal_types_with_identical_physical_layout() {
 }
 
 #[test]
-fn table_bound_transaction_rejects_cross_table_writes_without_rollback() {
+fn coordinator_rejects_a_second_storage_writer_without_rollback() {
     let base = std::env::temp_dir().join(format!(
         "netbadb-core-table-transaction-{}-{:?}",
         std::process::id(),
@@ -1858,7 +1860,9 @@ fn table_bound_transaction_rejects_cross_table_writes_without_rollback() {
                 ScalarValue::Text("wrong table".into())
             ],
         ),
-        Err(DatabaseError::Storage(StorageError::Transaction(_)))
+        Err(DatabaseError::Transaction(
+            CoordinatorError::MultipleWriteParticipantsUnsupported { .. }
+        ))
     ));
     assert_eq!(transaction.state(), TransactionState::Active);
     transaction.rollback().expect("owner can still roll back");

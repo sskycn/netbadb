@@ -14,7 +14,24 @@ use netbadb_storage::{
     PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
     TableStorage,
 };
-use netbadb_types::{ColumnId, RelationBindingId, ScalarRef, ScalarValue, TableId};
+use netbadb_types::{ColumnId, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionStorageBinding {
+    pub table_id: TableId,
+    pub storage_id: StorageId,
+}
+
+pub struct ExecutionStorage<'a> {
+    pub storage_id: StorageId,
+    pub storage: &'a mut TableStorage,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExecutionReadView<'a> {
+    pub storage_id: StorageId,
+    pub view: &'a StorageReadView,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
@@ -52,6 +69,9 @@ pub enum ExecutionError {
     },
     MissingRowIdentity,
     MissingTableStorage(TableId),
+    MissingPhysicalStorage(StorageId),
+    MissingStorageReadView(StorageId),
+    StorageIdentityOverflow,
     TableMismatch {
         planned: TableId,
         storage: TableId,
@@ -91,6 +111,19 @@ impl fmt::Display for ExecutionError {
             }
             Self::MissingTableStorage(table_id) => {
                 write!(formatter, "no storage is attached for table {}", table_id.0)
+            }
+            Self::MissingPhysicalStorage(storage_id) => write!(
+                formatter,
+                "physical storage {} is not attached for execution",
+                storage_id.0
+            ),
+            Self::MissingStorageReadView(storage_id) => write!(
+                formatter,
+                "physical storage {} has no statement read view",
+                storage_id.0
+            ),
+            Self::StorageIdentityOverflow => {
+                formatter.write_str("execution storage identity allocation overflowed")
             }
             Self::TableMismatch { planned, storage } => write!(
                 formatter,
@@ -141,7 +174,33 @@ pub fn execute_with_read_views(
     storages: &mut [TableStorage],
     read_views: &[StorageReadView],
 ) -> Result<QueryResult, ExecutionError> {
-    let result = execute_rows_with_views(plan, storages, read_views)?;
+    let bindings = compatibility_bindings(storages)?;
+    let mut execution_storages = storages
+        .iter_mut()
+        .zip(&bindings)
+        .map(|(storage, binding)| ExecutionStorage {
+            storage_id: binding.storage_id,
+            storage,
+        })
+        .collect::<Vec<_>>();
+    let execution_views = read_views
+        .iter()
+        .zip(&bindings)
+        .map(|(view, binding)| ExecutionReadView {
+            storage_id: binding.storage_id,
+            view,
+        })
+        .collect::<Vec<_>>();
+    execute_with_storage_context(plan, &bindings, &mut execution_storages, &execution_views)
+}
+
+pub fn execute_with_storage_context(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<QueryResult, ExecutionError> {
+    let result = execute_rows_with_views(plan, bindings, storages, read_views)?;
     Ok(QueryResult {
         columns: result
             .fields
@@ -154,6 +213,25 @@ pub fn execute_with_read_views(
             .collect(),
         rows: result.rows.into_iter().map(|row| row.values).collect(),
     })
+}
+
+fn compatibility_bindings(
+    storages: &[TableStorage],
+) -> Result<Vec<ExecutionStorageBinding>, ExecutionError> {
+    storages
+        .iter()
+        .enumerate()
+        .map(|(position, storage)| {
+            let ordinal = position
+                .checked_add(1)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(ExecutionError::StorageIdentityOverflow)?;
+            Ok(ExecutionStorageBinding {
+                table_id: storage.table().id,
+                storage_id: StorageId(ordinal),
+            })
+        })
+        .collect()
 }
 
 pub fn execute_statement(
@@ -196,8 +274,18 @@ pub fn execute_statement(
             ensure_table(*table_id, storage)?;
             let input = execute_rows_with_views(
                 input,
-                std::slice::from_mut(storage),
-                std::slice::from_ref(&read_view),
+                &[ExecutionStorageBinding {
+                    table_id: storage.table().id,
+                    storage_id: StorageId(1),
+                }],
+                &mut [ExecutionStorage {
+                    storage_id: StorageId(1),
+                    storage,
+                }],
+                &[ExecutionReadView {
+                    storage_id: StorageId(1),
+                    view: &read_view,
+                }],
             )?;
             let replacements = build_replacements(&input, assignments)?;
             let affected = u64::try_from(replacements.len())
@@ -213,8 +301,18 @@ pub fn execute_statement(
             ensure_table(*table_id, storage)?;
             let input = execute_rows_with_views(
                 input,
-                std::slice::from_mut(storage),
-                std::slice::from_ref(&read_view),
+                &[ExecutionStorageBinding {
+                    table_id: storage.table().id,
+                    storage_id: StorageId(1),
+                }],
+                &mut [ExecutionStorage {
+                    storage_id: StorageId(1),
+                    storage,
+                }],
+                &[ExecutionReadView {
+                    storage_id: StorageId(1),
+                    view: &read_view,
+                }],
             )?;
             let affected = u64::try_from(input.rows.len())
                 .map_err(|_| ExecutionError::AffectedRowsOverflow)?;
@@ -342,13 +440,31 @@ fn execute_rows(
         .iter()
         .map(TableStorage::read_view)
         .collect::<Result<Vec<_>, _>>()?;
-    execute_rows_with_views(plan, storages, &views)
+    let bindings = compatibility_bindings(storages)?;
+    let mut execution_storages = storages
+        .iter_mut()
+        .zip(&bindings)
+        .map(|(storage, binding)| ExecutionStorage {
+            storage_id: binding.storage_id,
+            storage,
+        })
+        .collect::<Vec<_>>();
+    let execution_views = views
+        .iter()
+        .zip(&bindings)
+        .map(|(view, binding)| ExecutionReadView {
+            storage_id: binding.storage_id,
+            view,
+        })
+        .collect::<Vec<_>>();
+    execute_rows_with_views(plan, &bindings, &mut execution_storages, &execution_views)
 }
 
 fn execute_rows_with_views(
     plan: &PhysicalPlan,
-    storages: &mut [TableStorage],
-    read_views: &[StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
 ) -> Result<ExecutionRows, ExecutionError> {
     match plan {
         PhysicalPlan::SeqScan {
@@ -358,8 +474,8 @@ fn execute_rows_with_views(
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
-            let view = read_view_for_table(storages, read_views, *table_id)?;
-            let storage = storage_for_table(storages, *table_id)?;
+            let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage = storage_for_table(bindings, storages, *table_id)?;
             let rows = storage
                 .scan_columns_with_view(&column_ids, view)?
                 .into_iter()
@@ -380,8 +496,8 @@ fn execute_rows_with_views(
             key,
             ..
         } => {
-            let view = read_view_for_table(storages, read_views, *table_id)?;
-            let storage = storage_for_table(storages, *table_id)?;
+            let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage = storage_for_table(bindings, storages, *table_id)?;
             let column_ids = columns
                 .iter()
                 .map(|column| column.column_id)
@@ -406,8 +522,8 @@ fn execute_rows_with_views(
             range,
             ..
         } => {
-            let view = read_view_for_table(storages, read_views, *table_id)?;
-            let storage = storage_for_table(storages, *table_id)?;
+            let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage = storage_for_table(bindings, storages, *table_id)?;
             let column_ids = columns
                 .iter()
                 .map(|column| column.column_id)
@@ -432,8 +548,8 @@ fn execute_rows_with_views(
             columns,
             ..
         } => {
-            let left = execute_rows_with_views(left, storages, read_views)?;
-            let right = execute_rows_with_views(right, storages, read_views)?;
+            let left = execute_rows_with_views(left, bindings, storages, read_views)?;
+            let right = execute_rows_with_views(right, bindings, storages, read_views)?;
             let mut joined_fields = left.fields.clone();
             joined_fields.extend(right.fields.clone());
             let output_positions = columns
@@ -547,8 +663,8 @@ fn execute_rows_with_views(
             if !left_key.data_type.is_compatible_with(&right_key.data_type) {
                 return Err(ExecutionError::TypeMismatch);
             }
-            let left = execute_rows_with_views(left, storages, read_views)?;
-            let right = execute_rows_with_views(right, storages, read_views)?;
+            let left = execute_rows_with_views(left, bindings, storages, read_views)?;
+            let right = execute_rows_with_views(right, bindings, storages, read_views)?;
             let left_key_position = find_source_position(&left.fields, left_key)?;
             let right_key_position = find_source_position(&right.fields, right_key)?;
             let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
@@ -607,11 +723,11 @@ fn execute_rows_with_views(
         }
         PhysicalPlan::Filter { input, predicate } => {
             if let Some(result) =
-                try_execute_streaming_seq_filter(input, predicate, storages, read_views)?
+                try_execute_streaming_seq_filter(input, predicate, bindings, storages, read_views)?
             {
                 return Ok(result);
             }
-            let mut result = execute_rows_with_views(input, storages, read_views)?;
+            let mut result = execute_rows_with_views(input, bindings, storages, read_views)?;
             let fields = result.fields.clone();
             result.rows = result
                 .rows
@@ -631,7 +747,7 @@ fn execute_rows_with_views(
             Ok(result)
         }
         PhysicalPlan::Sort { input, keys } => {
-            let mut result = execute_rows_with_views(input, storages, read_views)?;
+            let mut result = execute_rows_with_views(input, bindings, storages, read_views)?;
             let positions = resolve_sort_positions(&result.fields, keys)?;
             validate_sort_values(&result.rows, &positions, keys)?;
 
@@ -654,12 +770,12 @@ fn execute_rows_with_views(
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
-            if let Some(result) =
-                try_execute_projected_streaming_seq_filter(input, columns, storages, read_views)?
-            {
+            if let Some(result) = try_execute_projected_streaming_seq_filter(
+                input, columns, bindings, storages, read_views,
+            )? {
                 return Ok(result);
             }
-            let input_result = execute_rows_with_views(input, storages, read_views)?;
+            let input_result = execute_rows_with_views(input, bindings, storages, read_views)?;
             let projection = build_projection_plan(&input_result.fields, columns)?;
             let rows = if projection.identity {
                 input_result.rows
@@ -680,21 +796,21 @@ fn execute_rows_with_views(
             group_keys,
             outputs,
         } => {
-            if let Some(result) =
-                try_execute_filtered_counts(input, group_keys, outputs, storages, read_views)?
-            {
+            if let Some(result) = try_execute_filtered_counts(
+                input, group_keys, outputs, bindings, storages, read_views,
+            )? {
                 Ok(result)
-            } else if let Some(result) =
-                try_execute_direct_counts(input, group_keys, outputs, storages, read_views)?
-            {
+            } else if let Some(result) = try_execute_direct_counts(
+                input, group_keys, outputs, bindings, storages, read_views,
+            )? {
                 Ok(result)
             } else {
-                let input = execute_rows_with_views(input, storages, read_views)?;
+                let input = execute_rows_with_views(input, bindings, storages, read_views)?;
                 execute_aggregate(input, group_keys, outputs)
             }
         }
         PhysicalPlan::Limit { input, limit } => {
-            let mut result = execute_rows_with_views(input, storages, read_views)?;
+            let mut result = execute_rows_with_views(input, bindings, storages, read_views)?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
@@ -944,8 +1060,9 @@ fn streaming_seq_filter_eligibility<'a>(
 fn try_execute_streaming_seq_filter(
     input: &PhysicalPlan,
     predicate: &Expr,
-    storages: &mut [TableStorage],
-    read_views: &[StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = streaming_seq_filter_eligibility(input, predicate) else {
         return Ok(None);
@@ -961,6 +1078,7 @@ fn try_execute_streaming_seq_filter(
         &plan,
         &output_positions,
         output_fields,
+        bindings,
         storages,
         read_views,
     )
@@ -1017,8 +1135,9 @@ fn projected_streaming_seq_filter_eligibility<'a>(
 fn try_execute_projected_streaming_seq_filter(
     input: &PhysicalPlan,
     project_columns: &[ColumnRef],
-    storages: &mut [TableStorage],
-    read_views: &[StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = projected_streaming_seq_filter_eligibility(input, project_columns) else {
         return Ok(None);
@@ -1027,6 +1146,7 @@ fn try_execute_projected_streaming_seq_filter(
         &plan.filter,
         &plan.output_positions,
         plan.output_fields,
+        bindings,
         storages,
         read_views,
     )
@@ -1037,8 +1157,9 @@ fn execute_streaming_seq_filter_with_projection(
     plan: &StreamingSeqFilterPlan<'_>,
     output_positions: &[usize],
     output_fields: Vec<OutputField>,
-    storages: &mut [TableStorage],
-    read_views: &[StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
 ) -> Result<ExecutionRows, ExecutionError> {
     let predicate_fields = plan
         .columns
@@ -1051,8 +1172,8 @@ fn execute_streaming_seq_filter_with_projection(
         .iter()
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
-    let view = read_view_for_table(storages, read_views, plan.table_id)?;
-    let storage = storage_for_table(storages, plan.table_id)?;
+    let view = read_view_for_table(bindings, read_views, plan.table_id)?;
+    let storage = storage_for_table(bindings, storages, plan.table_id)?;
     let mut rows = Vec::new();
     let mut pending_predicate_error = None;
     storage.visit_row_scalar_refs_with_presence_view::<ExecutionError, _>(
@@ -1309,8 +1430,9 @@ fn try_execute_filtered_counts(
     input: &PhysicalPlan,
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
-    storages: &mut [TableStorage],
-    read_views: &[StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = filtered_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
@@ -1335,8 +1457,8 @@ fn try_execute_filtered_counts(
         qualified_rows: 0,
         non_null_counts: vec![0; plan.presence_columns.len()],
     };
-    let view = read_view_for_table(storages, read_views, plan.table_id)?;
-    storage_for_table(storages, plan.table_id)?
+    let view = read_view_for_table(bindings, read_views, plan.table_id)?;
+    storage_for_table(bindings, storages, plan.table_id)?
         .visit_scalar_refs_with_presence_view::<ExecutionError, _>(
             &predicate_column_ids,
             &presence_column_ids,
@@ -1397,8 +1519,9 @@ fn try_execute_direct_counts(
     input: &PhysicalPlan,
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
-    storages: &mut [TableStorage],
-    read_views: &[StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(plan) = direct_count_eligibility(input, group_keys, outputs) else {
         return Ok(None);
@@ -1408,8 +1531,8 @@ fn try_execute_direct_counts(
         .iter()
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
-    let view = read_view_for_table(storages, read_views, plan.table_id)?;
-    let summary = storage_for_table(storages, plan.table_id)?
+    let view = read_view_for_table(bindings, read_views, plan.table_id)?;
+    let summary = storage_for_table(bindings, storages, plan.table_id)?
         .scan_presence_counts_with_view(&column_ids, view)?;
     let values = materialize_direct_count_values(&plan, &summary)?;
     Ok(Some(ExecutionRows {
@@ -1717,26 +1840,38 @@ fn finalize_aggregate_state(state: AggregateState) -> ScalarValue {
     }
 }
 
-fn storage_for_table(
-    storages: &mut [TableStorage],
+fn storage_for_table<'a>(
+    bindings: &[ExecutionStorageBinding],
+    storages: &'a mut [ExecutionStorage<'_>],
     table_id: TableId,
-) -> Result<&mut TableStorage, ExecutionError> {
+) -> Result<&'a mut TableStorage, ExecutionError> {
+    let storage_id = bindings
+        .iter()
+        .find(|binding| binding.table_id == table_id)
+        .map(|binding| binding.storage_id)
+        .ok_or(ExecutionError::MissingTableStorage(table_id))?;
     storages
         .iter_mut()
-        .find(|storage| storage.table().id == table_id)
-        .ok_or(ExecutionError::MissingTableStorage(table_id))
+        .find(|storage| storage.storage_id == storage_id)
+        .map(|storage| &mut *storage.storage)
+        .ok_or(ExecutionError::MissingPhysicalStorage(storage_id))
 }
 
 fn read_view_for_table<'a>(
-    storages: &[TableStorage],
-    read_views: &'a [StorageReadView],
+    bindings: &[ExecutionStorageBinding],
+    read_views: &'a [ExecutionReadView<'_>],
     table_id: TableId,
 ) -> Result<&'a StorageReadView, ExecutionError> {
-    let position = storages
+    let storage_id = bindings
         .iter()
-        .position(|storage| storage.table().id == table_id)
+        .find(|binding| binding.table_id == table_id)
+        .map(|binding| binding.storage_id)
         .ok_or(ExecutionError::MissingTableStorage(table_id))?;
-    read_views.get(position).ok_or(ExecutionError::TypeMismatch)
+    read_views
+        .iter()
+        .find(|entry| entry.storage_id == storage_id)
+        .map(|entry| entry.view)
+        .ok_or(ExecutionError::MissingStorageReadView(storage_id))
 }
 
 fn ensure_table(table_id: TableId, storage: &TableStorage) -> Result<(), ExecutionError> {

@@ -830,12 +830,67 @@ and only then install the dirty page. Runtime rollback and startup recovery
 therefore need no DML-specific undo or WAL record type. A mid-statement error
 causes the owning transaction to restore all preceding page images.
 
+## Physical storage identity and database transactions
+
+Logical and physical identity are now separate:
+
+```text
+Schema TableId
+    ↓ PhysicalBindings (current one-to-one resolver)
+StorageId
+    ↓ deterministic StorageRegistry
+TableStorage
+```
+
+`TableId` remains SQL/catalog identity and authorization continues to use it.
+`StorageId` identifies one physical storage instance in an opened database. It
+is assigned deterministically from validated catalog order, is never a Vec
+index, pointer, or file descriptor, and is not persisted. The current resolver
+maps one table to one storage, but routing is centralized so a later partition
+map can resolve one logical table to several StorageIds without redefining SQL
+identity.
+
+`DatabaseTransaction` owns database-level runtime identity, isolation intent,
+lifecycle, and a deterministic participant set. Its `DatabaseTxnId` is scoped
+to one opened `Database` and is distinct from each Heap WAL `TxnId`.
+Participants are registered on first access and contain:
+
+```text
+StorageId + Read/Write mode + StorageTransaction
+```
+
+Read participants do not acquire the Heap writer lease. A participant may
+upgrade Read → Write. Multiple read participants plus one writer are supported;
+requesting a different second writer returns a typed coordinator error before
+the second storage transaction can mutate data. Commit finishes read-only
+contexts first and then durably commits the unique writer. Rollback undoes the
+unique writer and releases every read participant. Physical commit/rollback
+failure leaves the database transaction pending for retry.
+
+Every explicit query builds one `DatabaseReadView` owned by the database
+transaction and containing the `StorageReadView` adapters for all StorageIds
+used by that statement. Executor receives explicit TableId→StorageId bindings,
+StorageId-tagged storages, and StorageId-tagged views; it never correlates
+parallel vectors by position. Current Heap status stores have independent
+CommitSeq domains, so `DatabaseReadView` owns logical transaction/isolation
+context without inventing a false database-global timestamp.
+
+Atomic writes to multiple StorageIds, prepare/2PC, coordinator WAL, partitions,
+placement, remote storage, LSM, Columnar, Raft, and replication are not
+implemented. In particular, commit never loops over multiple writers.
+
 ## Storage boundary
 
 The synchronous storage path is now:
 
 ```text
 Executor
+    ↓
+DatabaseTransaction / DatabaseReadView
+    ↓
+PhysicalBindings: TableId → StorageId
+    ↓
+StorageRegistry
     ↓
 TableStorage capability API
     ↓

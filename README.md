@@ -50,6 +50,8 @@ Scan + nested-loop join + sort + grouped aggregate physical plan
     ↓
 Join / filter / sort / aggregate / projection / limit + mutation executor
     ↓
+TableId binding → StorageId → deterministic StorageRegistry
+    ↓
 TableStorage capability boundary
     ↓
 Heap row layout + registered B+Tree access methods
@@ -293,18 +295,28 @@ Each database uses two alternating WAL slots named `<database>-wal` and
 overwrite any of them. A successful checkpoint retains
 only the current generation; at most one superseded slot can remain after an
 interrupted rotation and is cleaned on open or the next checkpoint.
-`Database::insert` runs as an implicit transaction. Call
-`begin_transaction`, `insert_in`, and `Transaction::commit` when several
-inserts must share one WAL chain, or call `Transaction::rollback` (equivalently
-`abort`) to remove their physical effects. A successful commit means its Commit
-WAL record and matching committed status have reached durable storage; heap
-pages may remain buffered until eviction, `flush`, or `close`. The Commit
-record's monotonic logical LSN is its `CommitSeq`; startup reconciles a crash
-between WAL sync and status publication.
+`Database::insert` runs as an implicit database transaction. `Transaction` is
+the compatibility name for `DatabaseTransaction`, not a Heap WAL handle. It
+owns a database-scoped runtime ID, isolation/state, a `DatabaseReadView`, and
+lazy `StorageId` participants. Explicit transactions may read any number of
+physical storages and may upgrade one read participant to Write. A second
+physical write participant is rejected before mutation because no durable
+atomic multi-storage commit protocol exists. `StorageTransaction` remains the
+engine participant context and currently delegates to Heap WAL/MVCC.
 
-The current full-page-image model permits one writer per open database object.
-Writer ownership is acquired lazily by the first write, so read-only
-transactions do not reserve it. Commit releases ownership only after the
+Call `begin_transaction`, `insert_in`, and `Transaction::commit` when several
+operations target one physical writer, or call `Transaction::rollback`
+(equivalently `abort`) to coordinate its undo and release read participants. A
+successful writer commit means its Commit WAL record and matching committed
+status have reached durable storage; heap pages may remain buffered until
+eviction, `flush`, or `close`. The physical Commit record's monotonic logical
+LSN is its storage-local `CommitSeq`; this phase does not invent a global commit
+timestamp.
+
+The current full-page-image model permits one writer per open Heap storage.
+The database coordinator additionally restricts a transaction to one physical
+write participant. Writer ownership is acquired lazily by the first write, so
+read-only participants do not reserve it. Commit releases ownership only after the
 Commit record and committed status are durable. Rollback first makes Abort durable, follows the
 transaction's prevLSN chain backward, installs and synchronizes each validated
 before-image (or removes newly allocated trailing pages), then durably records
@@ -413,9 +425,11 @@ oldest pinned snapshot horizon, deletes exact index candidates for dead
 versions, then turns those Heap records into Page v5 tombstones. Later insertion
 may reuse such a slot only after checked generation increment, so stale RowIds
 cannot access a replacement occupant. There is no persistent free-space map.
-Implicit DML owns one transaction. `execute_in` supports multiple statements
-in an explicit transaction; until savepoints exist, an execution-time DML
-failure rolls back that whole transaction.
+Implicit DML owns one database transaction. `execute_in` supports multi-storage
+reads and multiple statements in an explicit transaction; until savepoints
+exist, an execution-time DML failure rolls back that whole transaction. A
+second-writer preflight failure performs no mutation and leaves the transaction
+active for explicit rollback.
 
 Heap and B+Tree pages share one database file, buffer pool, transaction chain,
 WAL, recovery pass, and checkpoint. Page v5 assigns distinct page-type tags to
