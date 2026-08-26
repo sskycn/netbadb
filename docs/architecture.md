@@ -832,23 +832,55 @@ causes the owning transaction to restore all preceding page images.
 
 ## Physical storage identity and database transactions
 
-Logical and physical identity are now separate:
+Logical partition and physical identity are separate:
 
 ```text
-Schema TableId
-    ↓ PhysicalBindings (current one-to-one resolver)
-StorageId
+Schema TableId (logical SQL relation)
+    ↓ TablePlacement
+Single ───────────────────────────────→ StorageId
+RangePartitioned
+    ↓
+PartitionId (stable logical partition) → StorageId
     ↓ deterministic StorageRegistry
 TableStorage
 ```
 
 `TableId` remains SQL/catalog identity and authorization continues to use it.
-`StorageId` identifies one physical storage instance. Heap metadata v5 stores
+`PartitionId` identifies a durable logical physical partition and is not a
+range-vector index or path. `StorageId` identifies one physical storage instance. Heap metadata v5 stores
 it as a nonzero little-endian value, so close/reopen, process restart, pathname
 changes, and catalog reorder preserve identity. It is never a Vec index,
-pointer, file descriptor, or pathname. The current resolver maps one table to
-one storage, but routing is centralized so a later partition map can resolve
-one logical table to several StorageIds without redefining SQL identity.
+pointer, file descriptor, or pathname. `Single` maps one table to one storage;
+`RangePartitioned` resolves one logical table through ordered PartitionIds to
+several StorageIds without redefining SQL identity.
+
+PartitionCatalog v1 is an immutable, explicit database-level file with its own
+path, magic/version, little-endian fields, bounded counts, schema fingerprints,
+and CRC32C. It stores the partition key and ordered `[lower, upper)` Int64 or
+UInt64 bounds. Bounds may be unbounded and gaps are legal; overlap, empty
+ranges, nullable keys, wrong types, duplicate identities, missing storages,
+and schema mismatch are hard typed errors. Paths are open-time materialization
+inputs only: reopen matches heap-persisted StorageIds, so reorder or move does
+not change partition identity.
+
+Planning consumes a pure range snapshot and never reads the catalog file.
+Nested AND comparisons (`=`, `<`, `<=`, `>`, `>=`, including reversed
+operands) produce an exact integer interval. OR/NOT conservatively select every
+partition. A contradiction produces an empty `PartitionedScan` with the normal
+output schema. Each selected partition then chooses its own local SeqScan,
+IndexScan, or RangeIndexScan; the complete residual Filter remains above the
+scan. Execution concatenates partitions in canonical range order and retains
+required-column propagation. Global indexes do not exist.
+
+INSERT evaluates and validates its typed row before routing. UPDATE and DELETE
+materialize every original target first; UPDATE also evaluates every
+replacement and resolves every destination before the first mutation. A
+cross-partition UPDATE is one source delete plus one destination insert in the
+same `DatabaseTransaction`, consuming the old physical handle and creating a
+new one. Existing Prepare/CommitDecision recovery therefore makes
+multi-partition INSERT, DELETE, and row movement all-or-nothing across crashes.
+`StorageRowHandle` validates its opaque owning StorageId so partitions of the
+same TableId cannot exchange physical locators.
 
 `DatabaseTransaction` owns database-level identity, isolation intent,
 lifecycle, and a deterministic participant set. Its `DatabaseTxnId` is
@@ -885,7 +917,8 @@ transactions never write the coordinator log.
 
 Every explicit query builds one `DatabaseReadView` owned by the database
 transaction and containing the `StorageReadView` adapters for all StorageIds
-used by that statement. Executor receives explicit TableId→StorageId bindings,
+used by that statement. Executor receives explicit Single TableId→StorageId
+bindings plus StorageId-explicit partition scan scopes,
 StorageId-tagged storages, and StorageId-tagged views; it never correlates
 parallel vectors by position. Current Heap status stores have independent
 CommitSeq domains, so `DatabaseReadView` owns logical transaction/isolation
@@ -902,8 +935,9 @@ Checkpoint and close retain their quiescent rule, so prepared/in-doubt state is
 rejected rather than recycling required WAL.
 
 The coordinator log is append-only in this phase; GC/checkpoint is deferred.
-Partitions, placement, remote storage, LSM, Columnar, Raft, replication, and
-distributed transactions are not implemented.
+HASH/LIST/DEFAULT partitioning, partition DDL/split/merge, global indexes,
+remote placement, LSM, Columnar, Raft, replication, and distributed
+transactions are not implemented.
 
 ## Storage boundary
 
@@ -914,7 +948,9 @@ Executor
     ↓
 DatabaseTransaction / DatabaseReadView
     ↓
-PhysicalBindings: TableId → StorageId
+PhysicalBindings: TableId → TablePlacement
+                         ├─ Single → StorageId
+                         └─ Range → PartitionId → StorageId
     ↓
 StorageRegistry
     ↓

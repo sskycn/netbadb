@@ -1,4 +1,5 @@
 use crate::DatabaseError;
+use crate::registry::TablePlacement;
 use crate::registry::{PhysicalBindings, StorageRegistry};
 use netbadb_index::IndexBound;
 use netbadb_inspect::{
@@ -6,12 +7,13 @@ use netbadb_inspect::{
     AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
     ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
     IndexRangeInspection, IndexStatisticsInspection, JoinKindInspection, NullOrderInspection,
-    PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SortDirectionInspection,
-    SortKeyInspection, SourceColumnInspection, StatementAccessInspection, StatementInspection,
-    StatementKind, StatementPlanInspection, StatementResultInspection, TableInspection,
+    PartitionAccessInspection, PartitionScanInspection, PlanNodeInspection, RangeBoundInspection,
+    RangePartitionInspection, ResultFieldInspection, SortDirectionInspection, SortKeyInspection,
+    SourceColumnInspection, StatementAccessInspection, StatementInspection, StatementKind,
+    StatementPlanInspection, StatementResultInspection, TableInspection, TablePlacementInspection,
     TableStatisticsInspection, UnaryOpInspection,
 };
-use netbadb_planner::{PhysicalPlan, PhysicalStatement};
+use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
     AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr,
     ExprKind, JoinKind, LogicalStatement, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
@@ -25,12 +27,22 @@ pub(crate) fn catalog(
 ) -> Result<CatalogInspection, DatabaseError> {
     let mut tables = Vec::with_capacity(schema.tables().len());
     for table in schema.tables() {
-        let storage_id = bindings.resolve_current(table.id)?;
-        let storage = registry
-            .get(storage_id)
-            .ok_or(DatabaseError::InspectionStorageMissing { table_id: table.id })?;
-        let mut indexes = Vec::with_capacity(storage.indexes().len());
-        for (position, definition) in storage.indexes().iter().enumerate() {
+        let placement = bindings.placement(table.id)?;
+        let single_storage = match placement {
+            TablePlacement::Single { storage_id, .. } => Some(
+                registry
+                    .get(*storage_id)
+                    .ok_or(DatabaseError::InspectionStorageMissing { table_id: table.id })?,
+            ),
+            TablePlacement::RangePartitioned { .. } => None,
+        };
+        let mut indexes =
+            Vec::with_capacity(single_storage.map_or(0, |storage| storage.indexes().len()));
+        for (position, definition) in single_storage
+            .into_iter()
+            .flat_map(|storage| storage.indexes())
+            .enumerate()
+        {
             let registration_order = u32::try_from(position).map_err(|_| {
                 DatabaseError::InspectionRegistrationOrderOverflow {
                     table_id: table.id,
@@ -47,8 +59,8 @@ pub(crate) fn catalog(
                 column_id: definition.column_id,
                 column_name: column.name.clone(),
                 registration_order,
-                statistics: storage
-                    .index_statistics(definition.column_id)
+                statistics: single_storage
+                    .and_then(|storage| storage.index_statistics(definition.column_id))
                     .map(|statistics| IndexStatisticsInspection {
                         distinct_non_null_keys: statistics.distinct_non_null_keys,
                         null_count: statistics.null_count,
@@ -72,12 +84,30 @@ pub(crate) fn catalog(
                 })
                 .collect(),
             indexes,
-            statistics: storage
-                .table_statistics()
+            statistics: single_storage
+                .and_then(|storage| storage.table_statistics())
                 .map(|statistics| TableStatisticsInspection {
                     row_count: statistics.row_count,
                     managed_page_count: statistics.managed_page_count,
                 }),
+            placement: match placement {
+                TablePlacement::Single { .. } => TablePlacementInspection::Single,
+                TablePlacement::RangePartitioned {
+                    partition_key,
+                    partitions,
+                    ..
+                } => TablePlacementInspection::RangePartitioned {
+                    partition_key: *partition_key,
+                    partitions: partitions
+                        .iter()
+                        .map(|partition| RangePartitionInspection {
+                            partition_id: partition.partition_id,
+                            lower: partition.lower.clone(),
+                            upper: partition.upper.clone(),
+                        })
+                        .collect(),
+                },
+            },
         });
     }
     Ok(CatalogInspection { tables })
@@ -250,6 +280,47 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
                 lower: range_bound(&range.lower),
                 upper: range_bound(&range.upper),
             },
+        },
+        PhysicalPlan::PartitionedScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            partition_key,
+            total_partitions,
+            partitions,
+        } => PlanNodeInspection::PartitionedScan {
+            binding_id: *binding_id,
+            table_id: *table_id,
+            table_name: table_name.clone(),
+            columns: columns.iter().map(column_reference).collect(),
+            partition_key: *partition_key,
+            total_partitions: *total_partitions,
+            partitions: partitions
+                .iter()
+                .map(|partition| PartitionScanInspection {
+                    partition_id: partition.partition_id,
+                    access: match &partition.access {
+                        PartitionAccessPlan::SeqScan => PartitionAccessInspection::SeqScan,
+                        PartitionAccessPlan::IndexScan { index_column, .. } => {
+                            PartitionAccessInspection::IndexScan {
+                                column: column_reference(index_column),
+                            }
+                        }
+                        PartitionAccessPlan::RangeIndexScan {
+                            index_column,
+                            range,
+                            ..
+                        } => PartitionAccessInspection::RangeIndexScan {
+                            column: column_reference(index_column),
+                            range: IndexRangeInspection {
+                                lower: range_bound(&range.lower),
+                                upper: range_bound(&range.upper),
+                            },
+                        },
+                    },
+                })
+                .collect(),
         },
         PhysicalPlan::NestedLoopJoin {
             left,

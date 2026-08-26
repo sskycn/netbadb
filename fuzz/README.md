@@ -24,6 +24,11 @@ bytes must remain bounded and return either a catalog node or typed error.
 version-1 coordinator scanner. Participant counts and record sizes are bounded;
 malformed records must return a typed error without panicking.
 
+`partition_catalog_decode` accepts at most 64 KiB and exercises the immutable
+PartitionCatalog v1 decoder directly. Header, checksum, bounded table and
+partition counts, typed integer bounds, identities, ordering, and overlap
+validation must reject corrupt input without panic or unbounded allocation.
+
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 
 ```bash
@@ -33,6 +38,7 @@ cargo +nightly fuzz run page_decode -- -runs=1000
 cargo +nightly fuzz run btree_decode -- -runs=1000
 cargo +nightly fuzz run index_catalog_decode -- -runs=1000
 cargo +nightly fuzz run coordinator_log_decode -- -runs=1000
+cargo +nightly fuzz run partition_catalog_decode -- -runs=1000
 ```
 
 The generated WAL corpus contains empty input, a valid v4 header, Begin,

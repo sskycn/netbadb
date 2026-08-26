@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
-use netbadb_planner::{PhysicalPlan, PhysicalStatement};
+use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
@@ -50,6 +50,28 @@ pub struct QueryResult {
 pub enum ExecutionResult {
     Query(QueryResult),
     AffectedRows(u64),
+}
+
+#[derive(Debug)]
+pub struct PreparedUpdateRow {
+    pub row: StorageRowHandle,
+    pub values: Vec<ScalarValue>,
+}
+
+#[derive(Debug)]
+pub enum PreparedMutation {
+    Insert {
+        table_id: TableId,
+        values: Vec<ScalarValue>,
+    },
+    Update {
+        table_id: TableId,
+        rows: Vec<PreparedUpdateRow>,
+    },
+    Delete {
+        table_id: TableId,
+        rows: Vec<StorageRowHandle>,
+    },
 }
 
 #[derive(Debug)]
@@ -327,6 +349,56 @@ pub fn execute_statement(
     }
 }
 
+/// Materializes and validates every target/replacement for one DML statement
+/// without performing physical mutation. Core uses this boundary to route all
+/// destinations before an atomic multi-storage write begins.
+pub fn prepare_mutation_with_storage_context(
+    statement: &PhysicalStatement,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<PreparedMutation, ExecutionError> {
+    match statement {
+        PhysicalStatement::Query(_) => Err(ExecutionError::TransactionRequired),
+        PhysicalStatement::Insert {
+            table_id, values, ..
+        } => Ok(PreparedMutation::Insert {
+            table_id: *table_id,
+            values: values
+                .iter()
+                .map(|value| evaluate(value, &[], &[]))
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        PhysicalStatement::Update {
+            input,
+            table_id,
+            assignments,
+        } => {
+            let input = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let rows = build_replacements(&input, assignments)?
+                .into_iter()
+                .map(|(row, values)| PreparedUpdateRow { row, values })
+                .collect();
+            Ok(PreparedMutation::Update {
+                table_id: *table_id,
+                rows,
+            })
+        }
+        PhysicalStatement::Delete { input, table_id } => {
+            let input = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let rows = input
+                .rows
+                .into_iter()
+                .map(|row| row.row_id.ok_or(ExecutionError::MissingRowIdentity))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PreparedMutation::Delete {
+                table_id: *table_id,
+                rows,
+            })
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ExecutionRow {
     row_id: Option<StorageRowHandle>,
@@ -536,6 +608,56 @@ fn execute_rows_with_views(
                     values,
                 })
                 .collect();
+            Ok(ExecutionRows {
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
+                rows,
+            })
+        }
+        PhysicalPlan::PartitionedScan {
+            table_id,
+            columns,
+            partitions,
+            ..
+        } => {
+            let column_ids = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for partition in partitions {
+                let view = read_view_for_storage(read_views, partition.storage_id)?;
+                let storage = storage_for_id(storages, partition.storage_id)?;
+                ensure_table(*table_id, storage)?;
+                let partition_rows = match &partition.access {
+                    PartitionAccessPlan::SeqScan => {
+                        storage.scan_columns_with_view(&column_ids, view)?
+                    }
+                    PartitionAccessPlan::IndexScan {
+                        access_path, key, ..
+                    } => storage.point_lookup_columns_with_view(
+                        *access_path,
+                        key,
+                        &column_ids,
+                        view,
+                    )?,
+                    PartitionAccessPlan::RangeIndexScan {
+                        access_path, range, ..
+                    } => storage.range_lookup_columns_with_view(
+                        *access_path,
+                        range,
+                        &column_ids,
+                        view,
+                    )?,
+                };
+                rows.extend(
+                    partition_rows
+                        .into_iter()
+                        .map(|(row_id, values)| ExecutionRow {
+                            row_id: Some(row_id),
+                            values,
+                        }),
+                );
+            }
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
@@ -1857,6 +1979,17 @@ fn storage_for_table<'a>(
         .ok_or(ExecutionError::MissingPhysicalStorage(storage_id))
 }
 
+fn storage_for_id<'a>(
+    storages: &'a mut [ExecutionStorage<'_>],
+    storage_id: StorageId,
+) -> Result<&'a mut TableStorage, ExecutionError> {
+    storages
+        .iter_mut()
+        .find(|storage| storage.storage_id == storage_id)
+        .map(|storage| &mut *storage.storage)
+        .ok_or(ExecutionError::MissingPhysicalStorage(storage_id))
+}
+
 fn read_view_for_table<'a>(
     bindings: &[ExecutionStorageBinding],
     read_views: &'a [ExecutionReadView<'_>],
@@ -1867,6 +2000,17 @@ fn read_view_for_table<'a>(
         .find(|binding| binding.table_id == table_id)
         .map(|binding| binding.storage_id)
         .ok_or(ExecutionError::MissingTableStorage(table_id))?;
+    read_views
+        .iter()
+        .find(|entry| entry.storage_id == storage_id)
+        .map(|entry| entry.view)
+        .ok_or(ExecutionError::MissingStorageReadView(storage_id))
+}
+
+fn read_view_for_storage<'a>(
+    read_views: &'a [ExecutionReadView<'_>],
+    storage_id: StorageId,
+) -> Result<&'a StorageReadView, ExecutionError> {
     read_views
         .iter()
         .find(|entry| entry.storage_id == storage_id)

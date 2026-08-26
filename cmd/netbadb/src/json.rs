@@ -2,11 +2,11 @@ use netbadb_sdk::inspection::{
     AggregateFunctionInspection, AggregateInputInspection, AggregateOutputInspection,
     AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
     ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
-    IndexStatisticsInspection, JoinKindInspection, NullOrderInspection, PlanNodeInspection,
-    RangeBoundInspection, ResultFieldInspection, SortDirectionInspection, SortKeyInspection,
-    SourceColumnInspection, StatementAccessInspection, StatementInspection, StatementKind,
-    StatementPlanInspection, StatementResultInspection, TableInspection, TableStatisticsInspection,
-    UnaryOpInspection,
+    IndexStatisticsInspection, JoinKindInspection, NullOrderInspection, PartitionAccessInspection,
+    PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SortDirectionInspection,
+    SortKeyInspection, SourceColumnInspection, StatementAccessInspection, StatementInspection,
+    StatementKind, StatementPlanInspection, StatementResultInspection, TableInspection,
+    TablePlacementInspection, TableStatisticsInspection, UnaryOpInspection,
 };
 use netbadb_sdk::{PhysicalType, ScalarValue, SemanticType};
 use serde::Serialize;
@@ -17,7 +17,16 @@ const INSPECTION_JSON_FORMAT: &str = "netbadb-inspection";
 pub(crate) fn render_catalog(catalog: &CatalogInspection) -> Result<String, serde_json::Error> {
     let envelope = CatalogEnvelope {
         format: INSPECTION_JSON_FORMAT,
-        version: INSPECTION_JSON_VERSION,
+        version: if catalog.tables.iter().any(|table| {
+            matches!(
+                table.placement,
+                TablePlacementInspection::RangePartitioned { .. }
+            )
+        }) {
+            4
+        } else {
+            INSPECTION_JSON_VERSION
+        },
         kind: "catalog",
         catalog: CatalogJson::from(catalog),
     };
@@ -29,11 +38,41 @@ pub(crate) fn render_statement(
 ) -> Result<String, serde_json::Error> {
     let envelope = StatementEnvelope {
         format: INSPECTION_JSON_FORMAT,
-        version: INSPECTION_JSON_VERSION,
+        version: if statement_has_partitions(statement) {
+            4
+        } else {
+            INSPECTION_JSON_VERSION
+        },
         kind: "statement",
         statement: StatementJson::from(statement),
     };
     pretty(&envelope)
+}
+
+fn statement_has_partitions(statement: &StatementInspection) -> bool {
+    fn plan_has_partitions(plan: &PlanNodeInspection) -> bool {
+        match plan {
+            PlanNodeInspection::PartitionedScan { .. } => true,
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
+                plan_has_partitions(left) || plan_has_partitions(right)
+            }
+            PlanNodeInspection::Filter { input, .. }
+            | PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => plan_has_partitions(input),
+            PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::IndexScan { .. }
+            | PlanNodeInspection::RangeIndexScan { .. } => false,
+        }
+    }
+    match &statement.plan {
+        StatementPlanInspection::Query { root } => plan_has_partitions(root),
+        StatementPlanInspection::Update { input, .. }
+        | StatementPlanInspection::Delete { input, .. } => plan_has_partitions(input),
+        StatementPlanInspection::Insert { .. } => false,
+    }
 }
 
 fn pretty(value: &impl Serialize) -> Result<String, serde_json::Error> {
@@ -71,6 +110,24 @@ struct TableJson<'a> {
     columns: Vec<ColumnJson<'a>>,
     indexes: Vec<IndexJson<'a>>,
     statistics: Option<TableStatisticsJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement: Option<TablePlacementJson<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TablePlacementJson<'a> {
+    RangePartitioned {
+        partition_key: u32,
+        partitions: Vec<RangePartitionJson<'a>>,
+    },
+}
+
+#[derive(Serialize)]
+struct RangePartitionJson<'a> {
+    partition_id: u64,
+    lower: Option<ScalarJson<'a>>,
+    upper: Option<ScalarJson<'a>>,
 }
 
 impl<'a> From<&'a TableInspection> for TableJson<'a> {
@@ -82,6 +139,23 @@ impl<'a> From<&'a TableInspection> for TableJson<'a> {
             columns: table.columns.iter().map(ColumnJson::from).collect(),
             indexes: table.indexes.iter().map(IndexJson::from).collect(),
             statistics: table.statistics.map(TableStatisticsJson::from),
+            placement: match &table.placement {
+                TablePlacementInspection::Single => None,
+                TablePlacementInspection::RangePartitioned {
+                    partition_key,
+                    partitions,
+                } => Some(TablePlacementJson::RangePartitioned {
+                    partition_key: partition_key.0,
+                    partitions: partitions
+                        .iter()
+                        .map(|partition| RangePartitionJson {
+                            partition_id: partition.partition_id.0,
+                            lower: partition.lower.as_ref().map(ScalarJson::from),
+                            upper: partition.upper.as_ref().map(ScalarJson::from),
+                        })
+                        .collect(),
+                }),
+            },
         }
     }
 }
@@ -396,6 +470,15 @@ enum PlanJson<'a> {
         lower_bound: RangeBoundJson<'a>,
         upper_bound: RangeBoundJson<'a>,
     },
+    PartitionedScan {
+        binding_id: u32,
+        table_id: u64,
+        table_name: &'a str,
+        columns: Vec<ColumnReferenceJson<'a>>,
+        partition_key: u32,
+        total_partitions: usize,
+        partitions: Vec<PartitionScanJson<'a>>,
+    },
     NestedLoopJoin {
         kind: &'static str,
         predicate: ExpressionJson<'a>,
@@ -430,6 +513,29 @@ enum PlanJson<'a> {
     Limit {
         limit: u64,
         input: Box<PlanJson<'a>>,
+    },
+}
+
+#[derive(Serialize)]
+struct PartitionScanJson<'a> {
+    partition_id: u64,
+    access: PartitionAccessJson<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PartitionAccessJson<'a> {
+    #[serde(rename = "seq_scan")]
+    Seq,
+    #[serde(rename = "index_scan")]
+    Index {
+        column: ColumnReferenceJson<'a>,
+    },
+    #[serde(rename = "range_index_scan")]
+    RangeIndex {
+        column: ColumnReferenceJson<'a>,
+        lower_bound: RangeBoundJson<'a>,
+        upper_bound: RangeBoundJson<'a>,
     },
 }
 
@@ -477,6 +583,43 @@ impl<'a> From<&'a PlanNodeInspection> for PlanJson<'a> {
                 index_column: ColumnReferenceJson::from(index_column),
                 lower_bound: RangeBoundJson::from(&range.lower),
                 upper_bound: RangeBoundJson::from(&range.upper),
+            },
+            PlanNodeInspection::PartitionedScan {
+                binding_id,
+                table_id,
+                table_name,
+                columns,
+                partition_key,
+                total_partitions,
+                partitions,
+            } => Self::PartitionedScan {
+                binding_id: binding_id.0,
+                table_id: table_id.0,
+                table_name,
+                columns: columns.iter().map(ColumnReferenceJson::from).collect(),
+                partition_key: partition_key.0,
+                total_partitions: *total_partitions,
+                partitions: partitions
+                    .iter()
+                    .map(|partition| PartitionScanJson {
+                        partition_id: partition.partition_id.0,
+                        access: match &partition.access {
+                            PartitionAccessInspection::SeqScan => PartitionAccessJson::Seq,
+                            PartitionAccessInspection::IndexScan { column } => {
+                                PartitionAccessJson::Index {
+                                    column: ColumnReferenceJson::from(column),
+                                }
+                            }
+                            PartitionAccessInspection::RangeIndexScan { column, range } => {
+                                PartitionAccessJson::RangeIndex {
+                                    column: ColumnReferenceJson::from(column),
+                                    lower_bound: RangeBoundJson::from(&range.lower),
+                                    upper_bound: RangeBoundJson::from(&range.upper),
+                                }
+                            }
+                        },
+                    })
+                    .collect(),
             },
             PlanNodeInspection::NestedLoopJoin {
                 kind,
@@ -794,7 +937,8 @@ mod tests {
         ExpressionKindInspection, IndexInspection, IndexRangeInspection, IndexStatisticsInspection,
         PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SourceColumnInspection,
         StatementAccessInspection, StatementInspection, StatementKind, StatementPlanInspection,
-        StatementResultInspection, TableInspection, TableStatisticsInspection,
+        StatementResultInspection, TableInspection, TablePlacementInspection,
+        TableStatisticsInspection,
     };
     use netbadb_sdk::{
         ColumnId, PhysicalType, RelationBindingId, ScalarValue, SchemaFingerprint, SemanticType,
@@ -896,6 +1040,7 @@ mod tests {
                     row_count: 8,
                     managed_page_count: 2,
                 }),
+                placement: TablePlacementInspection::Single,
             }],
         };
         assert_eq!(

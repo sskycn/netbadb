@@ -2,15 +2,15 @@
 
 #[cfg(feature = "embedded")]
 pub use netbadb_core::{
-    Database, DatabaseError, ExecutionResult, QueryResult, ResultColumn, Transaction,
-    TransactionState,
+    Database, DatabaseError, ExecutionResult, PartitionCatalogConfig, QueryResult,
+    RangePartitionSpec, ResultColumn, TablePlacementSpec, Transaction, TransactionState,
 };
 pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,
     TypeSpec,
 };
 pub use netbadb_types::{
-    ColumnId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+    ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
 };
 
 /// Stable embedded catalog and physical-plan inspection values and renderers.
@@ -21,9 +21,11 @@ pub mod inspection {
         AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
         ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
         IndexRangeInspection, IndexStatisticsInspection, JoinKindInspection, NullOrderInspection,
-        PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SortDirectionInspection,
-        SortKeyInspection, SourceColumnInspection, StatementAccessInspection, StatementInspection,
-        StatementKind, StatementPlanInspection, StatementResultInspection, TableInspection,
+        PartitionAccessInspection, PartitionScanInspection, PlanNodeInspection,
+        RangeBoundInspection, RangePartitionInspection, ResultFieldInspection,
+        SortDirectionInspection, SortKeyInspection, SourceColumnInspection,
+        StatementAccessInspection, StatementInspection, StatementKind, StatementPlanInspection,
+        StatementResultInspection, TableInspection, TablePlacementInspection,
         TableStatisticsInspection, UnaryOpInspection, render_catalog, render_statement,
     };
 }

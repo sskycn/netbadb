@@ -9,7 +9,7 @@ use netbadb_index::{
     validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
-use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId};
+use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId};
 
 use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
 use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
@@ -84,6 +84,14 @@ pub struct PresenceCountSummary {
 pub struct HeapRecoveryInspection {
     pub storage_id: StorageId,
     pub prepared_transactions: Vec<PreparedTransaction>,
+}
+
+/// Durable identities readable before a logical schema is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapIdentityInspection {
+    pub table_id: TableId,
+    pub schema_fingerprint: SchemaFingerprint,
+    pub storage_id: StorageId,
 }
 
 #[derive(Debug)]
@@ -340,6 +348,13 @@ impl HeapStorage {
             storage_id,
             prepared_transactions: inspect_prepared_transactions(&records),
         })
+    }
+
+    pub fn inspect_identity(
+        path: impl AsRef<Path>,
+    ) -> Result<HeapIdentityInspection, StorageError> {
+        let mut pages = PageManager::open(path)?;
+        inspect_heap_identity(pages.read_page(HEADER_PAGE)?.bytes())
     }
 
     fn open_internal(
@@ -2258,6 +2273,40 @@ fn validate_heap_metadata(
         return Err(MetadataError::InvalidStorageId(storage_id).into());
     }
     Ok((catalog_root, storage_id))
+}
+
+fn inspect_heap_identity(bytes: &[u8; PAGE_SIZE]) -> Result<HeapIdentityInspection, StorageError> {
+    if &bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()] != HEADER_MAGIC {
+        return Err(MetadataError::InvalidMagic.into());
+    }
+    let version = read_u16(bytes, HEAP_VERSION_OFFSET)?;
+    if version != HEAP_FORMAT_VERSION {
+        return Err(MetadataError::UnsupportedVersion(version).into());
+    }
+    if bytes[HEAP_RESERVED_OFFSET..HEAP_RESERVED_OFFSET + 2]
+        .iter()
+        .chain(bytes[HEAP_TRAILING_RESERVED_OFFSET..HEAP_TRAILING_RESERVED_END].iter())
+        .any(|byte| *byte != 0)
+    {
+        return Err(MetadataError::InvalidReservedBytes.into());
+    }
+    let table_id = TableId(read_u64(bytes, HEAP_TABLE_ID_OFFSET)?);
+    if table_id.0 == 0 {
+        return Err(crate::invalid_format(
+            "heap metadata has an invalid table identity",
+        ));
+    }
+    let schema_fingerprint =
+        SchemaFingerprint::from_bytes(read_array_at(bytes, HEAP_SCHEMA_FINGERPRINT_OFFSET)?);
+    let storage_id = StorageId(read_u64(bytes, HEAP_STORAGE_ID_OFFSET)?);
+    if storage_id.0 == 0 {
+        return Err(MetadataError::InvalidStorageId(storage_id).into());
+    }
+    Ok(HeapIdentityInspection {
+        table_id,
+        schema_fingerprint,
+        storage_id,
+    })
 }
 
 fn validate_catalog_root_bounds(catalog_root: PageId, page_count: u64) -> Result<(), StorageError> {

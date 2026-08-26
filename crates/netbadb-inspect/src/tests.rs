@@ -102,12 +102,14 @@ fn catalog_renderer_is_explicit_and_deterministic() {
                 row_count: 8,
                 managed_page_count: 2,
             }),
+            placement: TablePlacementInspection::Single,
         }],
     };
     let expected = concat!(
         "Catalog\n",
         "Table users #1\n",
         "  fingerprint: abababababababababababababababababababababababababababababababab\n",
+        "  partitioned: false\n",
         "  columns:\n",
         "    #1 id UserId(INT64) NOT NULL PRIMARY KEY\n",
         "    #2 name TEXT NULL\n",
@@ -368,10 +370,11 @@ fn renderers_escape_free_form_names_without_injecting_lines_or_controls() {
                 statistics: None,
             }],
             statistics: None,
+            placement: TablePlacementInspection::Single,
         }],
     };
     let catalog_text = render_catalog(&catalog);
-    assert_eq!(catalog_text.lines().count(), 9);
+    assert_eq!(catalog_text.lines().count(), 10);
     assert!(catalog_text.contains("Table users\\n\\u{1b}[31m #1"));
     assert!(catalog_text.contains("#1 id\\t\\\\\\\" User\\rId(INT64) NOT NULL"));
     assert!(catalog_text.contains("[0] column #1 id\\t\\\\\\\""));

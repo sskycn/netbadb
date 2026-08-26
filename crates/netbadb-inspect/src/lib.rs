@@ -7,7 +7,7 @@
 use std::fmt::{self, Write};
 
 use netbadb_schema::SchemaFingerprint;
-use netbadb_types::{ColumnId, RelationBindingId, ScalarValue, SemanticType, TableId};
+use netbadb_types::{ColumnId, PartitionId, RelationBindingId, ScalarValue, SemanticType, TableId};
 
 /// One declaration-ordered snapshot of the visible canonical catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,23 @@ pub struct TableInspection {
     pub indexes: Vec<IndexInspection>,
     /// Last explicit `ANALYZE` snapshot. It may be stale.
     pub statistics: Option<TableStatisticsInspection>,
+    pub placement: TablePlacementInspection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TablePlacementInspection {
+    Single,
+    RangePartitioned {
+        partition_key: ColumnId,
+        partitions: Vec<RangePartitionInspection>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangePartitionInspection {
+    pub partition_id: PartitionId,
+    pub lower: Option<ScalarValue>,
+    pub upper: Option<ScalarValue>,
 }
 
 /// One canonical column in declaration order.
@@ -204,6 +221,15 @@ pub enum PlanNodeInspection {
         index_column: ColumnReferenceInspection,
         range: IndexRangeInspection,
     },
+    PartitionedScan {
+        binding_id: RelationBindingId,
+        table_id: TableId,
+        table_name: String,
+        columns: Vec<ColumnReferenceInspection>,
+        partition_key: ColumnId,
+        total_partitions: usize,
+        partitions: Vec<PartitionScanInspection>,
+    },
     NestedLoopJoin {
         kind: JoinKindInspection,
         predicate: ExpressionInspection,
@@ -238,6 +264,24 @@ pub enum PlanNodeInspection {
     Limit {
         limit: u64,
         input: Box<PlanNodeInspection>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionScanInspection {
+    pub partition_id: PartitionId,
+    pub access: PartitionAccessInspection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionAccessInspection {
+    SeqScan,
+    IndexScan {
+        column: ColumnReferenceInspection,
+    },
+    RangeIndexScan {
+        column: ColumnReferenceInspection,
+        range: IndexRangeInspection,
     },
 }
 
@@ -352,6 +396,36 @@ pub fn render_catalog(catalog: &CatalogInspection) -> String {
             format_args!("Table {} #{}", escape_text(&table.name), table.table_id.0),
         );
         renderer.line(1, format_args!("fingerprint: {}", table.fingerprint));
+        match &table.placement {
+            TablePlacementInspection::Single => {
+                renderer.line(1, format_args!("partitioned: false"));
+            }
+            TablePlacementInspection::RangePartitioned {
+                partition_key,
+                partitions,
+            } => {
+                renderer.line(1, format_args!("partitioned: true"));
+                renderer.line(1, format_args!("partition_key: #{}", partition_key.0));
+                renderer.line(1, format_args!("partitions: {}", partitions.len()));
+                for partition in partitions {
+                    renderer.line(
+                        2,
+                        format_args!(
+                            "#{} lower={} upper={}",
+                            partition.partition_id.0,
+                            partition
+                                .lower
+                                .as_ref()
+                                .map_or_else(|| "-inf".to_owned(), scalar_text),
+                            partition
+                                .upper
+                                .as_ref()
+                                .map_or_else(|| "+inf".to_owned(), scalar_text)
+                        ),
+                    );
+                }
+            }
+        }
         renderer.line(1, format_args!("columns:"));
         for column in &table.columns {
             renderer.column(2, column);
@@ -576,6 +650,48 @@ impl Renderer {
                     range_bound_text(&range.upper)
                 ),
             ),
+            PlanNodeInspection::PartitionedScan {
+                binding_id,
+                table_id,
+                table_name,
+                columns,
+                partition_key,
+                total_partitions,
+                partitions,
+            } => {
+                self.line(
+                    depth,
+                    format_args!(
+                        "PartitionedScan table={}#{} binding=#{} columns={} partition_key=#{} selected={}/{}",
+                        escape_text(table_name),
+                        table_id.0,
+                        binding_id.0,
+                        columns_text(columns),
+                        partition_key.0,
+                        partitions.len(),
+                        total_partitions
+                    ),
+                );
+                for partition in partitions {
+                    let access = match &partition.access {
+                        PartitionAccessInspection::SeqScan => "SeqScan".to_owned(),
+                        PartitionAccessInspection::IndexScan { column } => {
+                            format!("IndexScan {}#{}", escape_text(&column.name), column.column_id.0)
+                        }
+                        PartitionAccessInspection::RangeIndexScan { column, range } => format!(
+                            "RangeIndexScan {}#{} lower={} upper={}",
+                            escape_text(&column.name),
+                            column.column_id.0,
+                            range_bound_text(&range.lower),
+                            range_bound_text(&range.upper)
+                        ),
+                    };
+                    self.line(
+                        depth + 1,
+                        format_args!("Partition #{} access={access}", partition.partition_id.0),
+                    );
+                }
+            }
             PlanNodeInspection::NestedLoopJoin {
                 kind,
                 predicate,

@@ -11,10 +11,16 @@ macro_rules! id_type {
 
 id_type!(DatabaseId, u64);
 id_type!(TableId, u64);
+/// Stable identity of one logical physical partition.
+///
+/// A partition belongs to one logical [`TableId`] and resolves to a physical
+/// [`StorageId`]. It is neither a vector position nor a storage identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PartitionId(pub u64);
 /// Physical storage identity within one opened database composition.
 ///
 /// This is distinct from logical [`TableId`], is deterministically assigned
-/// from validated catalog order, and is not currently persisted.
+/// at creation, and is persisted by every physical storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageId(pub u64);
 /// Database-coordinator transaction identity within one opened database.

@@ -15,7 +15,7 @@ mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
-pub use heap::{HeapRecoveryInspection, HeapStorage, PresenceCountSummary};
+pub use heap::{HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, PresenceCountSummary};
 pub use mvcc::{IsolationLevel, ReadView, Snapshot};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
 pub use page::{

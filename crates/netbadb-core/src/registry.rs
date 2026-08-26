@@ -3,57 +3,139 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_storage::TableStorage;
-use netbadb_types::{StorageId, TableId};
+use netbadb_types::{ColumnId, PartitionId, PhysicalType, ScalarValue, StorageId, TableId};
 
-/// Current one-to-one logical-to-physical binding for an opened catalog.
-///
-/// The resolver owns this temporary mapping so callers do not turn it into a
-/// permanent `TableId -> StorageId` assumption when partition routing arrives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PhysicalTableBinding {
-    pub(crate) table_id: TableId,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RangePartitionBinding {
+    pub(crate) partition_id: PartitionId,
     pub(crate) storage_id: StorageId,
+    pub(crate) lower: Option<ScalarValue>,
+    pub(crate) upper: Option<ScalarValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TablePlacement {
+    Single {
+        table_id: TableId,
+        storage_id: StorageId,
+    },
+    RangePartitioned {
+        table_id: TableId,
+        partition_key: ColumnId,
+        key_type: PhysicalType,
+        partitions: Vec<RangePartitionBinding>,
+    },
+}
+
+impl TablePlacement {
+    pub(crate) const fn table_id(&self) -> TableId {
+        match self {
+            Self::Single { table_id, .. } | Self::RangePartitioned { table_id, .. } => *table_id,
+        }
+    }
+
+    pub(crate) fn storage_ids(&self) -> impl Iterator<Item = StorageId> + '_ {
+        let single = match self {
+            Self::Single { storage_id, .. } => Some(*storage_id),
+            Self::RangePartitioned { .. } => None,
+        };
+        let partitions = match self {
+            Self::RangePartitioned { partitions, .. } => Some(partitions.as_slice()),
+            Self::Single { .. } => None,
+        };
+        single.into_iter().chain(
+            partitions
+                .into_iter()
+                .flatten()
+                .map(|entry| entry.storage_id),
+        )
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct PhysicalBindings {
-    bindings: Vec<PhysicalTableBinding>,
+    placements: Vec<TablePlacement>,
 }
 
 impl PhysicalBindings {
     pub(crate) fn new(
-        bindings: Vec<PhysicalTableBinding>,
+        placements: Vec<TablePlacement>,
         registry: &StorageRegistry,
     ) -> Result<Self, StorageRegistryError> {
         let mut tables = BTreeSet::new();
-        for binding in &bindings {
-            if !tables.insert(binding.table_id) {
-                return Err(StorageRegistryError::DuplicateTableBinding {
-                    table_id: binding.table_id,
-                });
+        let mut assigned_storages = BTreeSet::new();
+        for placement in &placements {
+            let table_id = placement.table_id();
+            if !tables.insert(table_id) {
+                return Err(StorageRegistryError::DuplicateTableBinding { table_id });
             }
-            if registry.get(binding.storage_id).is_none() {
-                return Err(StorageRegistryError::UnknownStorageId {
-                    storage_id: binding.storage_id,
-                });
+            for storage_id in placement.storage_ids() {
+                if !assigned_storages.insert(storage_id) {
+                    return Err(StorageRegistryError::DuplicatePlacementStorage { storage_id });
+                }
+                let storage = registry
+                    .get(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+                if storage.table().id != table_id {
+                    return Err(StorageRegistryError::PlacementTableMismatch {
+                        table_id,
+                        storage_id,
+                        storage_table_id: storage.table().id,
+                    });
+                }
             }
         }
-        Ok(Self { bindings })
+        if assigned_storages.len() != registry.len() {
+            let storage_id = registry
+                .iter()
+                .find(|entry| !assigned_storages.contains(&entry.id))
+                .map(|entry| entry.id)
+                .ok_or(StorageRegistryError::StorageCountMismatch)?;
+            return Err(StorageRegistryError::UnboundStorage { storage_id });
+        }
+        Ok(Self { placements })
     }
 
-    pub(crate) fn resolve_current(
+    pub(crate) fn from_single_storages(
+        registry: &StorageRegistry,
+    ) -> Result<Self, StorageRegistryError> {
+        Self::new(
+            registry
+                .iter()
+                .map(|entry| TablePlacement::Single {
+                    table_id: entry.storage.table().id,
+                    storage_id: entry.id,
+                })
+                .collect(),
+            registry,
+        )
+    }
+
+    pub(crate) fn placement(
         &self,
         table_id: TableId,
-    ) -> Result<StorageId, StorageRegistryError> {
-        self.bindings
+    ) -> Result<&TablePlacement, StorageRegistryError> {
+        self.placements
             .iter()
-            .find(|binding| binding.table_id == table_id)
-            .map(|binding| binding.storage_id)
+            .find(|placement| placement.table_id() == table_id)
             .ok_or(StorageRegistryError::MissingPhysicalBinding { table_id })
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = PhysicalTableBinding> + '_ {
-        self.bindings.iter().copied()
+    #[cfg(test)]
+    pub(crate) fn resolve_single(
+        &self,
+        table_id: TableId,
+    ) -> Result<StorageId, StorageRegistryError> {
+        match self.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(*storage_id),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(StorageRegistryError::PartitionRoutingRequired { table_id })
+            }
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &TablePlacement> {
+        self.placements.iter()
     }
 }
 
@@ -63,7 +145,6 @@ pub(crate) struct StorageRegistryEntry {
     pub(crate) storage: TableStorage,
 }
 
-/// Deterministic owner of physical storage instances for one opened database.
 #[derive(Debug)]
 pub(crate) struct StorageRegistry {
     entries: Vec<StorageRegistryEntry>,
@@ -73,27 +154,27 @@ impl StorageRegistry {
     pub(crate) fn from_catalog_order(
         storages: Vec<TableStorage>,
     ) -> Result<(Self, PhysicalBindings), StorageRegistryError> {
-        let mut entries = Vec::with_capacity(storages.len());
-        let mut bindings = Vec::with_capacity(storages.len());
-        for storage in storages {
-            let storage_id = storage.storage_id();
-            bindings.push(PhysicalTableBinding {
-                table_id: storage.table().id,
-                storage_id,
-            });
-            entries.push(StorageRegistryEntry {
-                id: storage_id,
+        let entries = storages
+            .into_iter()
+            .map(|storage| StorageRegistryEntry {
+                id: storage.storage_id(),
                 storage,
-            });
-        }
+            })
+            .collect();
         let registry = Self::new(entries)?;
-        let bindings = PhysicalBindings::new(bindings, &registry)?;
+        let bindings = PhysicalBindings::from_single_storages(&registry)?;
         Ok((registry, bindings))
     }
 
     pub(crate) fn new(entries: Vec<StorageRegistryEntry>) -> Result<Self, StorageRegistryError> {
         let mut ids = BTreeSet::new();
         for entry in &entries {
+            if entry.id != entry.storage.storage_id() {
+                return Err(StorageRegistryError::RegistryStorageIdentityMismatch {
+                    registered: entry.id,
+                    persisted: entry.storage.storage_id(),
+                });
+            }
             if !ids.insert(entry.id) {
                 return Err(StorageRegistryError::DuplicateStorageId {
                     storage_id: entry.id,
@@ -136,26 +217,56 @@ impl StorageRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRegistryError {
-    UnknownStorageId { storage_id: StorageId },
-    MissingPhysicalBinding { table_id: TableId },
-    DuplicateStorageId { storage_id: StorageId },
-    DuplicateTableBinding { table_id: TableId },
+    UnknownStorageId {
+        storage_id: StorageId,
+    },
+    MissingPhysicalBinding {
+        table_id: TableId,
+    },
+    PartitionRoutingRequired {
+        table_id: TableId,
+    },
+    DuplicateStorageId {
+        storage_id: StorageId,
+    },
+    DuplicatePlacementStorage {
+        storage_id: StorageId,
+    },
+    DuplicateTableBinding {
+        table_id: TableId,
+    },
+    PlacementTableMismatch {
+        table_id: TableId,
+        storage_id: StorageId,
+        storage_table_id: TableId,
+    },
+    UnboundStorage {
+        storage_id: StorageId,
+    },
+    StorageCountMismatch,
+    RegistryStorageIdentityMismatch {
+        registered: StorageId,
+        persisted: StorageId,
+    },
     StorageIdExhausted,
 }
 
 impl fmt::Display for StorageRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownStorageId { storage_id } => {
-                write!(
-                    formatter,
-                    "physical storage {} is not registered",
-                    storage_id.0
-                )
-            }
+            Self::UnknownStorageId { storage_id } => write!(
+                formatter,
+                "physical storage {} is not registered",
+                storage_id.0
+            ),
             Self::MissingPhysicalBinding { table_id } => write!(
                 formatter,
                 "logical table {} has no physical storage binding",
+                table_id.0
+            ),
+            Self::PartitionRoutingRequired { table_id } => write!(
+                formatter,
+                "logical table {} requires range-partition routing",
                 table_id.0
             ),
             Self::DuplicateStorageId { storage_id } => write!(
@@ -163,10 +274,40 @@ impl fmt::Display for StorageRegistryError {
                 "physical storage {} is registered more than once",
                 storage_id.0
             ),
+            Self::DuplicatePlacementStorage { storage_id } => write!(
+                formatter,
+                "physical storage {} belongs to more than one placement",
+                storage_id.0
+            ),
             Self::DuplicateTableBinding { table_id } => write!(
                 formatter,
-                "logical table {} has more than one current physical binding",
+                "logical table {} has more than one placement",
                 table_id.0
+            ),
+            Self::PlacementTableMismatch {
+                table_id,
+                storage_id,
+                storage_table_id,
+            } => write!(
+                formatter,
+                "storage {} contains table {}, not placement table {}",
+                storage_id.0, storage_table_id.0, table_id.0
+            ),
+            Self::UnboundStorage { storage_id } => write!(
+                formatter,
+                "physical storage {} is not present in any table placement",
+                storage_id.0
+            ),
+            Self::StorageCountMismatch => {
+                formatter.write_str("physical storage placement count is inconsistent")
+            }
+            Self::RegistryStorageIdentityMismatch {
+                registered,
+                persisted,
+            } => write!(
+                formatter,
+                "registry storage identity {} does not match persisted identity {}",
+                registered.0, persisted.0
             ),
             Self::StorageIdExhausted => {
                 formatter.write_str("physical storage identity space is exhausted")

@@ -520,6 +520,7 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::Registry(_)
         | DatabaseError::Transaction(_)
         | DatabaseError::CoordinatorLog(_)
+        | DatabaseError::Partition(_)
         | DatabaseError::EmptyCatalog
         | DatabaseError::TableSelectionRequired
         | DatabaseError::DuplicateStoragePath(_)

@@ -32,6 +32,7 @@ fn inspected_hash_keys(plan: &PlanNodeInspection) -> Option<(u32, u32)> {
         PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => None,
+        PlanNodeInspection::PartitionedScan { .. } => None,
     }
 }
 
@@ -49,6 +50,7 @@ fn contains_nested_loop_join(plan: &PlanNodeInspection) -> bool {
         PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => false,
+        PlanNodeInspection::PartitionedScan { .. } => false,
     }
 }
 

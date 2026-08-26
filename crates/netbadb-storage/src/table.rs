@@ -8,8 +8,9 @@ use netbadb_types::{
 };
 
 use crate::{
-    HeapRecoveryInspection, HeapStorage, IsolationLevel, PreparedTxnResolution,
-    PresenceCountSummary, ReadView, StorageError, Transaction, TransactionError, TransactionState,
+    HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IsolationLevel,
+    PreparedTxnResolution, PresenceCountSummary, ReadView, StorageError, Transaction,
+    TransactionError, TransactionState,
 };
 
 /// Executable capabilities advertised by one table-scoped access path.
@@ -39,6 +40,7 @@ pub struct StorageAccessPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StorageRowHandle {
     table_id: TableId,
+    storage_id: StorageId,
     inner: StorageRowHandleKind,
 }
 
@@ -48,15 +50,16 @@ enum StorageRowHandleKind {
 }
 
 impl StorageRowHandle {
-    fn heap(table_id: TableId, row_id: RowId) -> Self {
+    fn heap(table_id: TableId, storage_id: StorageId, row_id: RowId) -> Self {
         Self {
             table_id,
+            storage_id,
             inner: StorageRowHandleKind::Heap(row_id),
         }
     }
 
-    fn heap_row_id(self, table_id: TableId) -> Result<RowId, StorageError> {
-        if self.table_id != table_id {
+    fn heap_row_id(self, table_id: TableId, storage_id: StorageId) -> Result<RowId, StorageError> {
+        if self.table_id != table_id || self.storage_id != storage_id {
             return Err(StorageError::StorageContextMismatch {
                 expected: table_id,
                 actual: self.table_id,
@@ -65,6 +68,12 @@ impl StorageRowHandle {
         match self.inner {
             StorageRowHandleKind::Heap(row_id) => Ok(row_id),
         }
+    }
+
+    /// Returns the owning physical storage without exposing its row locator.
+    #[must_use]
+    pub const fn storage_id(self) -> StorageId {
+        self.storage_id
     }
 }
 
@@ -265,6 +274,12 @@ impl TableStorage {
         HeapStorage::inspect_recovery(path, table)
     }
 
+    pub fn inspect_heap_identity(
+        path: impl AsRef<Path>,
+    ) -> Result<HeapIdentityInspection, StorageError> {
+        HeapStorage::inspect_identity(path)
+    }
+
     #[must_use]
     pub fn storage_id(&self) -> StorageId {
         match self {
@@ -322,7 +337,7 @@ impl TableStorage {
                 let table_id = storage.table().id;
                 storage
                     .insert(values)
-                    .map(|row_id| StorageRowHandle::heap(table_id, row_id))
+                    .map(|row_id| StorageRowHandle::heap(table_id, storage.storage_id(), row_id))
             }
         }
     }
@@ -335,8 +350,13 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                let current = storage.update(row.heap_row_id(table_id)?, values)?;
-                Ok(StorageRowHandle::heap(table_id, current))
+                let current =
+                    storage.update(row.heap_row_id(table_id, storage.storage_id())?, values)?;
+                Ok(StorageRowHandle::heap(
+                    table_id,
+                    storage.storage_id(),
+                    current,
+                ))
             }
         }
     }
@@ -345,7 +365,7 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.delete(row.heap_row_id(table_id)?)
+                storage.delete(row.heap_row_id(table_id, storage.storage_id())?)
             }
         }
     }
@@ -360,7 +380,11 @@ impl TableStorage {
                 let table_id = storage.table().id;
                 let row_id =
                     storage.insert_in(transaction.heap_transaction_mut(table_id)?, values)?;
-                Ok(StorageRowHandle::heap(table_id, row_id))
+                Ok(StorageRowHandle::heap(
+                    table_id,
+                    storage.storage_id(),
+                    row_id,
+                ))
             }
         }
     }
@@ -374,13 +398,17 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                let row_id = row.heap_row_id(table_id)?;
+                let row_id = row.heap_row_id(table_id, storage.storage_id())?;
                 let current = storage.update_in(
                     transaction.heap_transaction_mut(table_id)?,
                     row_id,
                     values,
                 )?;
-                Ok(StorageRowHandle::heap(table_id, current))
+                Ok(StorageRowHandle::heap(
+                    table_id,
+                    storage.storage_id(),
+                    current,
+                ))
             }
         }
     }
@@ -395,7 +423,7 @@ impl TableStorage {
                 let table_id = storage.table().id;
                 storage.delete_in(
                     transaction.heap_transaction_mut(table_id)?,
-                    row.heap_row_id(table_id)?,
+                    row.heap_row_id(table_id, storage.storage_id())?,
                 )
             }
         }
@@ -413,7 +441,12 @@ impl TableStorage {
                 Ok(storage
                     .scan_columns_with_view(columns, view)?
                     .into_iter()
-                    .map(|(row_id, values)| (StorageRowHandle::heap(table_id, row_id), values))
+                    .map(|(row_id, values)| {
+                        (
+                            StorageRowHandle::heap(table_id, storage.storage_id(), row_id),
+                            values,
+                        )
+                    })
                     .collect())
             }
         }
@@ -437,7 +470,10 @@ impl TableStorage {
                     if let Some(values) =
                         storage.read_row_columns_with_view(row_id, columns, view)?
                     {
-                        rows.push((StorageRowHandle::heap(table_id, row_id), values));
+                        rows.push((
+                            StorageRowHandle::heap(table_id, storage.storage_id(), row_id),
+                            values,
+                        ));
                     }
                 }
                 Ok(rows)
@@ -463,7 +499,10 @@ impl TableStorage {
                     if let Some(values) =
                         storage.read_row_columns_with_view(row_id, columns, view)?
                     {
-                        rows.push((StorageRowHandle::heap(table_id, row_id), values));
+                        rows.push((
+                            StorageRowHandle::heap(table_id, storage.storage_id(), row_id),
+                            values,
+                        ));
                     }
                 }
                 Ok(rows)
@@ -521,13 +560,18 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
+                let storage_id = storage.storage_id();
                 let view = view.heap_view(table_id).map_err(E::from)?;
                 storage.visit_row_scalar_refs_with_presence_view(
                     value_columns,
                     presence_columns,
                     view,
                     |row_id, values, presence| {
-                        visitor(StorageRowHandle::heap(table_id, row_id), values, presence)
+                        visitor(
+                            StorageRowHandle::heap(table_id, storage_id, row_id),
+                            values,
+                            presence,
+                        )
                     },
                 )
             }

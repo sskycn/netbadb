@@ -8,11 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use netbadb_core::{Database, ExecutionResult, QueryResult};
+use netbadb_core::{
+    Database, ExecutionResult, PartitionCatalogConfig, QueryResult, RangePartitionSpec,
+    TablePlacementSpec,
+};
 use netbadb_inspect::{PlanNodeInspection, StatementInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::HeapStorage;
-use netbadb_types::{ColumnId, PhysicalType, RowId, ScalarValue, TableId};
+use netbadb_types::{ColumnId, PartitionId, PhysicalType, RowId, ScalarValue, TableId};
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
@@ -255,9 +258,104 @@ fn main() -> BenchResult<()> {
     run_insert_scenarios(settings, &mut measurements)?;
     run_update_scenario(settings, &mut measurements)?;
     run_planner_scenario(settings, &mut measurements)?;
+    run_partition_correctness_scenarios()?;
 
     print_report(profile, settings, &measurements)?;
     Ok(())
+}
+
+fn run_partition_correctness_scenarios() -> BenchResult<()> {
+    let fixture = FixturePaths::new("partition-correctness", 5);
+    let table = TableDef::new(
+        TableId(70),
+        "partition_items",
+        vec![ColumnDef::new(
+            ColumnId(1),
+            "key",
+            TypeSpec::Physical(PhysicalType::Int64),
+        )],
+    );
+    let config = PartitionCatalogConfig::new(fixture.path(3), fixture.path(4));
+    let specs = vec![TablePlacementSpec::range_partitioned(
+        table,
+        ColumnId(1),
+        vec![
+            RangePartitionSpec::new(
+                PartitionId(1),
+                fixture.path(0),
+                None,
+                Some(ScalarValue::Int64(0)),
+            ),
+            RangePartitionSpec::new(
+                PartitionId(2),
+                fixture.path(1),
+                Some(ScalarValue::Int64(0)),
+                Some(ScalarValue::Int64(200)),
+            ),
+            RangePartitionSpec::new(
+                PartitionId(3),
+                fixture.path(2),
+                Some(ScalarValue::Int64(200)),
+                None,
+            ),
+        ],
+    )];
+    let mut database = Database::create_with_placements(specs, config)?;
+    database.create_partition_index(TableId(70), PartitionId(2), ColumnId(1))?;
+    for value in [-1, 1, 201] {
+        database.execute(&format!(
+            "INSERT INTO partition_items (key) VALUES ({value})"
+        ))?;
+    }
+    for (sql, expected) in [
+        ("SELECT key FROM partition_items", 3),
+        ("SELECT key FROM partition_items WHERE key = 1", 1),
+        (
+            "SELECT key FROM partition_items WHERE key >= 0 AND key < 300",
+            2,
+        ),
+    ] {
+        let inspection = database.inspect_statement(sql)?;
+        let root = query_root(&inspection)?;
+        let selected = selected_partition_count(root)
+            .ok_or_else(|| message_error("partition benchmark expected PartitionedScan"))?;
+        if selected != expected {
+            return Err(message_error(format!(
+                "partition benchmark selected {selected} partitions for `{sql}`, expected {expected}"
+            )));
+        }
+        let _ = database.query(sql)?;
+    }
+    if database.execute("UPDATE partition_items SET key = 250 WHERE key = -1")?
+        != ExecutionResult::AffectedRows(1)
+    {
+        return Err(message_error("cross-partition UPDATE count mismatch"));
+    }
+    if database.execute("DELETE FROM partition_items WHERE key >= 0")?
+        != ExecutionResult::AffectedRows(3)
+    {
+        return Err(message_error("multi-partition DELETE count mismatch"));
+    }
+    database.close()?;
+    fixture.cleanup()
+}
+
+fn selected_partition_count(plan: &PlanNodeInspection) -> Option<usize> {
+    match plan {
+        PlanNodeInspection::PartitionedScan { partitions, .. } => Some(partitions.len()),
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => selected_partition_count(input),
+        PlanNodeInspection::NestedLoopJoin { left, right, .. }
+        | PlanNodeInspection::HashJoin { left, right, .. } => {
+            selected_partition_count(left).or_else(|| selected_partition_count(right))
+        }
+        PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. } => None,
+    }
 }
 
 fn run_projection_attribution_scenarios(
@@ -2036,6 +2134,9 @@ fn collect_base_scan_columns(plan: &PlanNodeInspection, scans: &mut Vec<Vec<Colu
         | PlanNodeInspection::RangeIndexScan { columns, .. } => {
             scans.push(columns.iter().map(|column| column.column_id).collect());
         }
+        PlanNodeInspection::PartitionedScan { columns, .. } => {
+            scans.push(columns.iter().map(|column| column.column_id).collect());
+        }
         PlanNodeInspection::NestedLoopJoin { left, right, .. }
         | PlanNodeInspection::HashJoin { left, right, .. } => {
             collect_base_scan_columns(left, scans);
@@ -2086,6 +2187,7 @@ fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
             PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. } => false,
+            PlanNodeInspection::PartitionedScan { .. } => false,
         }
 }
 
@@ -2094,6 +2196,7 @@ const fn operator(plan: &PlanNodeInspection) -> Operator {
         PlanNodeInspection::SeqScan { .. } => Operator::SeqScan,
         PlanNodeInspection::IndexScan { .. } => Operator::IndexScan,
         PlanNodeInspection::RangeIndexScan { .. } => Operator::RangeIndexScan,
+        PlanNodeInspection::PartitionedScan { .. } => Operator::SeqScan,
         PlanNodeInspection::NestedLoopJoin { .. } => Operator::NestedLoopJoin,
         PlanNodeInspection::HashJoin { .. } => Operator::HashJoin,
         PlanNodeInspection::Filter { .. } => Operator::Filter,
@@ -2126,6 +2229,7 @@ fn collect_operators(plan: &PlanNodeInspection, operators: &mut Vec<&'static str
         PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => {}
+        PlanNodeInspection::PartitionedScan { .. } => {}
     }
 }
 
@@ -2587,6 +2691,7 @@ fn cleanup_paths(paths: &[PathBuf]) -> BenchResult<()> {
         let wal = netbadb_storage::wal_path(path);
         remove_if_present(&netbadb_storage::wal_alternate_path(&wal))?;
         remove_if_present(&wal)?;
+        remove_if_present(&netbadb_storage::txn_status_path(path))?;
     }
     Ok(())
 }

@@ -60,6 +60,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "partition_catalog_decode"
+path = "fuzz_targets/partition_catalog_decode.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
 

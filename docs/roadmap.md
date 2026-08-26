@@ -1124,8 +1124,38 @@ The CoordinatorLog is intentionally append-only and has no GC/checkpoint yet.
 Protocol v1, SQL grammar/results, SDK Schema Spec v1, manifest v4, Inspection
 JSON v3, Page v5, MVCC tuple v1, and transaction-status v1 are unchanged.
 
-The next recommended phase is **Range Partition Foundation**: explicit range
-partition metadata first, then pruning, INSERT routing, and cross-partition
-UPDATE using the existing atomic coordinator. LSM follows partitioning;
-placement/sharding, replication/Raft, distributed transactions, and a global
-timestamp domain remain later work.
+## Range Partition Foundation (complete)
+
+- added strong, durable `PartitionId`, distinct from logical `TableId` and
+  recoverable `StorageId`;
+- evolved `PhysicalBindings` to `Single` and `RangePartitioned` placements,
+  allowing several physical storages to belong to one logical table without
+  weakening unique storage ownership;
+- added immutable checksummed PartitionCatalog v1 with exact schema identity,
+  typed half-open Int64/UInt64 bounds, bounded strict decoding, path-independent
+  reopen, corruption tests, and a dedicated fuzz target;
+- planner prunes exact AND comparison intervals before selecting a local access
+  path per partition, keeps residual Filters, represents zero selected
+  partitions, and preserves deterministic range order and required columns;
+- INSERT routes typed values; UPDATE materializes and validates every
+  destination before same-partition update or atomic delete+insert movement;
+  DELETE materializes and writes every selected partition in one database
+  transaction;
+- logical SELECT, joins, self joins, and aggregates consume the concatenated
+  relation. ANALYZE refreshes every partition independently; partial refresh is
+  permitted because stale statistics affect cost only, never pruning or query
+  semantics;
+- inspection text and current JSON v4 expose the logical partitioned scan,
+  exact selected PartitionIds, and per-partition access choices while v1/v2/v3
+  remain historical contracts;
+- subprocess tests cover pre/post-decision cross-partition UPDATE,
+  multi-partition DELETE, and explicit multi-partition INSERT recovery.
+
+Scope remains RANGE-only, single-column, NOT NULL, Int64/UInt64, local Heap
+partitions and local indexes. Gaps are legal and have no DEFAULT fallback.
+There is no SQL partition DDL, global index/uniqueness, split/merge, HASH/LIST,
+heterogeneous storage, placement/sharding, replication, or distributed commit.
+
+The next recommended phase is **LSM Storage MVP**. Partition routing now uses
+only PartitionId→StorageId→TableStorage and is therefore ready for one real
+second storage layout without introducing sharding or Raft prematurely.

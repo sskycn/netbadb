@@ -50,7 +50,9 @@ Scan + nested-loop join + sort + grouped aggregate physical plan
     ↓
 Join / filter / sort / aggregate / projection / limit + mutation executor
     ↓
-TableId binding → StorageId → deterministic StorageRegistry
+TableId → Single StorageId or RANGE PartitionId → StorageId
+    ↓
+deterministic StorageRegistry
     ↓
 TableStorage capability boundary
     ↓
@@ -70,8 +72,10 @@ application-specific Rust structs.
 
 ## Strong types
 
-Internal identifiers are newtypes such as `TableId`, `RelationBindingId`,
-`ColumnId`, `PageId`, and `RowId`. A relation binding identifies one
+Internal identifiers are newtypes such as `TableId`, `PartitionId`,
+`StorageId`, `RelationBindingId`, `ColumnId`, `PageId`, and `RowId`.
+`TableId` is the logical SQL relation, `PartitionId` is a stable logical
+physical partition, and `StorageId` is the recoverable storage instance. A relation binding identifies one
 query-local table occurrence, so two aliases of the same `TableId` remain
 distinct in a self join. Schema columns preserve both a physical representation and an
 optional nominal semantic type:
@@ -188,6 +192,10 @@ The current code genuinely supports:
   prevLSN chains;
 - an independent checksummed coordinator log whose durable CommitDecision is
   the atomic commit point for two or more local write storages;
+- immutable checksummed PartitionCatalog v1 metadata for single-column,
+  NOT-NULL Int64/UInt64 RANGE partitioning with half-open bounds, optional
+  infinities, legal gaps, stable PartitionIds, exact planner pruning, typed
+  INSERT routing, and atomic cross-partition UPDATE/DELETE;
 - explicit Read Committed and Repeatable Read transaction handles plus implicit
   Read Committed statement transactions;
 - commit durability through WAL sync and WAL-before-data-page writeback;
@@ -732,9 +740,12 @@ The implementation sequence is intentionally vertical:
     WAL Prepare, an independent coordinator CommitDecision/Complete log,
     presumed-abort startup resolution, retry-safe commit, and 13 abrupt-process
     crash windows.
-52. Range Partition Foundation — next; explicit range metadata precedes
-    pruning, INSERT routing, and cross-partition UPDATE on the existing atomic
-    coordinator.
+52. Range Partition Foundation — complete; PartitionCatalog v1, stable
+    PartitionId→StorageId mapping, exact typed pruning, partition-local access
+    paths, routing, atomic row movement, multi-partition DML, inspection v4,
+    reordered-path reopen, and subprocess recovery proofs.
+53. LSM Storage MVP — next; add one concrete second `TableStorage` layout while
+    retaining the partition/router, transaction, and recovery boundaries.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items.
@@ -742,6 +753,8 @@ See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in
 [`docs/coordinator-log-v1.md`](docs/coordinator-log-v1.md).
+The range metadata layout is specified in
+[`docs/partition-catalog-v1.md`](docs/partition-catalog-v1.md).
 
 ## License
 

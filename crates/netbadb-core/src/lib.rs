@@ -4,6 +4,7 @@
 mod coordinator_crash;
 mod coordinator_log;
 mod inspection;
+mod partition_catalog;
 mod registry;
 mod transaction;
 
@@ -15,28 +16,36 @@ use std::rc::Rc;
 
 use netbadb_compiler::{CompileError, CompiledStatement, compile_statement};
 use netbadb_executor::{
-    ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding,
-    execute_statement, execute_with_storage_context,
+    ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
+    execute_with_storage_context, prepare_mutation_with_storage_context,
 };
 use netbadb_inspect::{CatalogInspection, StatementInspection};
 use netbadb_planner::{
-    AccessPath, AccessPathCapabilities, PhysicalStatement, TableAccessStatistics,
-    plan_statement_with_statistics,
+    AccessPath, AccessPathCapabilities, PartitionPlanningSnapshot, PhysicalStatement,
+    RangeTablePlanningSnapshot, TableAccessStatistics, plan_statement_with_partition_snapshots,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
     HeapRecoveryInspection, PreparedDecision, PreparedTransactionState, PreparedTxnResolution,
     StorageError, TableStorage,
 };
-use netbadb_types::{ColumnId, DatabaseTxnId, ScalarValue, StorageId, TableId, TxnId};
+use netbadb_types::{
+    ColumnId, DatabaseTxnId, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
+};
 
 use coordinator_log::{CoordinatorDecision, CoordinatorLog};
-use registry::{PhysicalBindings, StorageRegistry};
+use partition_catalog::{CatalogTable, PartitionCatalog, canonicalize_partitions, route_partition};
+use registry::{
+    PhysicalBindings, RangePartitionBinding, StorageRegistry, StorageRegistryEntry, TablePlacement,
+};
 use transaction::SharedCoordinatorLog;
 
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_storage::{IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics};
+pub use partition_catalog::{
+    PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
+};
 pub use registry::StorageRegistryError;
 pub use transaction::{
     CoordinatorError, DatabaseReadView, DatabaseTransaction, ParticipantMode, TransactionState,
@@ -50,6 +59,12 @@ pub type Transaction = DatabaseTransaction;
 #[doc(hidden)]
 pub fn fuzz_coordinator_log_file(path: &Path) {
     let _ = CoordinatorLog::open(path);
+}
+
+/// Exercises the strict bounded PartitionCatalog v1 decoder for fuzzing.
+#[doc(hidden)]
+pub fn fuzz_partition_catalog_bytes(bytes: &[u8]) {
+    let _ = PartitionCatalog::decode(bytes);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +115,7 @@ pub enum DatabaseError {
     Registry(StorageRegistryError),
     Transaction(CoordinatorError),
     CoordinatorLog(CoordinatorLogError),
+    Partition(PartitionError),
     ExpectedQuery,
     EmptyCatalog,
     TableSelectionRequired,
@@ -143,6 +159,7 @@ impl fmt::Display for DatabaseError {
             Self::Registry(error) => error.fmt(formatter),
             Self::Transaction(error) => error.fmt(formatter),
             Self::CoordinatorLog(error) => error.fmt(formatter),
+            Self::Partition(error) => error.fmt(formatter),
             Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
             Self::EmptyCatalog => formatter.write_str("database requires at least one table"),
             Self::TableSelectionRequired => formatter
@@ -218,6 +235,7 @@ impl Error for DatabaseError {
             Self::Registry(error) => Some(error),
             Self::Transaction(error) => Some(error),
             Self::CoordinatorLog(error) => Some(error),
+            Self::Partition(error) => Some(error),
             Self::CreateTablesRollback { creation, .. } => Some(creation),
             Self::ExpectedQuery
             | Self::EmptyCatalog
@@ -275,6 +293,12 @@ impl From<CoordinatorError> for DatabaseError {
 impl From<CoordinatorLogError> for DatabaseError {
     fn from(error: CoordinatorLogError) -> Self {
         Self::CoordinatorLog(error)
+    }
+}
+
+impl From<PartitionError> for DatabaseError {
+    fn from(error: PartitionError) -> Self {
+        Self::Partition(error)
     }
 }
 
@@ -472,6 +496,222 @@ impl Database {
         Self::compose_with_coordinator(schema, storages, coordinator, next_transaction_id)
     }
 
+    /// Creates a mixed catalog of single and RANGE-partitioned logical tables.
+    /// The explicit catalog and coordinator paths are never inferred from heap
+    /// locations. All partitioned writes therefore use the durable database
+    /// coordinator from their first release.
+    pub fn create_with_placements(
+        specs: Vec<TablePlacementSpec>,
+        config: PartitionCatalogConfig,
+    ) -> Result<Self, DatabaseError> {
+        if specs.is_empty() {
+            return Err(DatabaseError::EmptyCatalog);
+        }
+        let schema = Schema::new(specs.iter().map(|spec| spec.table().clone()).collect())?;
+        let mut paths = Vec::new();
+        for spec in &specs {
+            match spec {
+                TablePlacementSpec::Single { path, .. } => paths.push(path.clone()),
+                TablePlacementSpec::RangePartitioned { partitions, .. } => {
+                    paths.extend(partitions.iter().map(|partition| partition.path.clone()));
+                }
+            }
+        }
+        validate_physical_paths(&paths, &config)?;
+        prevalidate_placement_specs(&specs)?;
+
+        let mut storages = Vec::with_capacity(paths.len());
+        let mut created_paths = Vec::with_capacity(paths.len());
+        let mut catalog_tables = Vec::with_capacity(specs.len());
+        let mut next_storage_ordinal = 1_u64;
+        for spec in specs {
+            let table = spec.table().clone();
+            let fingerprint = table.fingerprint()?;
+            let placement = match spec {
+                TablePlacementSpec::Single { path, table } => {
+                    let storage_id = StorageId(next_storage_ordinal);
+                    next_storage_ordinal = next_storage_ordinal
+                        .checked_add(1)
+                        .ok_or(StorageRegistryError::StorageIdExhausted)?;
+                    create_partition_storage(
+                        &path,
+                        table.clone(),
+                        storage_id,
+                        &mut storages,
+                        &mut created_paths,
+                    )?;
+                    TablePlacement::Single {
+                        table_id: table.id,
+                        storage_id,
+                    }
+                }
+                TablePlacementSpec::RangePartitioned {
+                    table,
+                    partition_key,
+                    partitions,
+                } => {
+                    let key_type = validate_partition_key(&table, partition_key)?;
+                    let mut bindings = Vec::with_capacity(partitions.len());
+                    for partition in partitions {
+                        let storage_id = StorageId(next_storage_ordinal);
+                        next_storage_ordinal = next_storage_ordinal
+                            .checked_add(1)
+                            .ok_or(StorageRegistryError::StorageIdExhausted)?;
+                        create_partition_storage(
+                            &partition.path,
+                            table.clone(),
+                            storage_id,
+                            &mut storages,
+                            &mut created_paths,
+                        )?;
+                        bindings.push(RangePartitionBinding {
+                            partition_id: partition.partition_id,
+                            storage_id,
+                            lower: partition.lower,
+                            upper: partition.upper,
+                        });
+                    }
+                    let partitions = canonicalize_partitions(key_type, bindings)?;
+                    TablePlacement::RangePartitioned {
+                        table_id: table.id,
+                        partition_key,
+                        key_type,
+                        partitions,
+                    }
+                }
+            };
+            catalog_tables.push(CatalogTable {
+                table_id: table.id,
+                schema_fingerprint: fingerprint,
+                placement,
+            });
+        }
+
+        let catalog_path_existed = config.catalog_path().exists();
+        let catalog = match PartitionCatalog::create(config.catalog_path(), catalog_tables) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                drop(storages);
+                if !catalog_path_existed {
+                    let _ = std::fs::remove_file(config.catalog_path());
+                }
+                let _ = cleanup_created_table_files(&created_paths);
+                return Err(error.into());
+            }
+        };
+        let coordinator = match CoordinatorLog::create(config.coordinator_log_path()) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                drop(storages);
+                let _ = std::fs::remove_file(config.catalog_path());
+                let _ = cleanup_created_table_files(&created_paths);
+                return Err(error.into());
+            }
+        };
+        Self::compose_with_catalog(schema, storages, catalog, coordinator, DatabaseTxnId(1))
+    }
+
+    /// Opens a durable placement catalog from schemas plus an unordered set of
+    /// physical heap paths. Heap identity, not caller order or path, resolves
+    /// every partition before prepared transactions are recovered.
+    pub fn open_with_placements(
+        tables: Vec<TableDef>,
+        storage_paths: Vec<PathBuf>,
+        config: PartitionCatalogConfig,
+    ) -> Result<Self, DatabaseError> {
+        let schema = Schema::new(tables.clone())?;
+        validate_physical_paths(&storage_paths, &config)?;
+        let catalog = PartitionCatalog::open(config.catalog_path())?;
+        validate_catalog_schemas(&catalog, &tables)?;
+        let mut coordinator = CoordinatorLog::open(config.coordinator_log_path())?;
+        let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+
+        let mut inspected = Vec::with_capacity(storage_paths.len());
+        for path in storage_paths {
+            let identity = TableStorage::inspect_heap_identity(&path)?;
+            let table = tables
+                .iter()
+                .find(|table| table.id == identity.table_id)
+                .ok_or(PartitionError::PartitionStorageMismatch(
+                    identity.storage_id,
+                ))?;
+            if table.fingerprint()? != identity.schema_fingerprint {
+                return Err(PartitionError::PartitionStorageMismatch(identity.storage_id).into());
+            }
+            let expected = catalog.tables.iter().any(|entry| {
+                entry.table_id == identity.table_id
+                    && entry
+                        .placement
+                        .storage_ids()
+                        .any(|storage_id| storage_id == identity.storage_id)
+            });
+            if !expected {
+                return Err(PartitionError::PartitionStorageMismatch(identity.storage_id).into());
+            }
+            let recovery = TableStorage::inspect_heap_recovery(&path, table)?;
+            inspected.push(InspectedStorage {
+                path,
+                table: table.clone(),
+                recovery,
+            });
+        }
+        validate_catalog_storage_set(&catalog, &inspected)?;
+        validate_coordinator_recovery(&decisions, &inspected)?;
+
+        let mut maximum_database_txn_id = decisions
+            .iter()
+            .map(|decision| decision.database_txn_id.0)
+            .max()
+            .unwrap_or(0);
+        let mut storages = Vec::with_capacity(inspected.len());
+        for storage in inspected {
+            let mut resolutions = Vec::new();
+            for prepared in &storage.recovery.prepared_transactions {
+                maximum_database_txn_id = maximum_database_txn_id.max(prepared.database_txn_id.0);
+                let decision = decisions
+                    .iter()
+                    .find(|decision| decision.database_txn_id == prepared.database_txn_id);
+                let resolution = if let Some(decision) = decision {
+                    if !decision.participants.iter().any(|participant| {
+                        participant.storage_id == storage.recovery.storage_id
+                            && participant.physical_txn_id == prepared.physical_txn_id
+                    }) || prepared.state == PreparedTransactionState::RolledBack
+                    {
+                        return Err(DatabaseError::PreparedParticipantMismatch {
+                            database_txn_id: prepared.database_txn_id,
+                            storage_id: storage.recovery.storage_id,
+                            physical_txn_id: prepared.physical_txn_id,
+                        });
+                    }
+                    PreparedDecision::Commit
+                } else {
+                    PreparedDecision::Abort
+                };
+                resolutions.push(PreparedTxnResolution {
+                    database_txn_id: prepared.database_txn_id,
+                    physical_txn_id: prepared.physical_txn_id,
+                    decision: resolution,
+                });
+            }
+            storages.push(TableStorage::open_heap_with_prepared_resolutions(
+                storage.path,
+                storage.table,
+                &resolutions,
+            )?);
+        }
+        for decision in &decisions {
+            if !decision.complete {
+                coordinator.complete(decision.database_txn_id)?;
+            }
+        }
+        let next_transaction_id = DatabaseTxnId(
+            maximum_database_txn_id
+                .checked_add(1)
+                .ok_or(CoordinatorError::TransactionIdExhausted)?,
+        );
+        Self::compose_with_catalog(schema, storages, catalog, coordinator, next_transaction_id)
+    }
+
     fn compose(schema: Schema, storages: Vec<TableStorage>) -> Result<Self, DatabaseError> {
         let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
         Ok(Self {
@@ -501,8 +741,53 @@ impl Database {
         })
     }
 
+    fn compose_with_catalog(
+        schema: Schema,
+        storages: Vec<TableStorage>,
+        catalog: PartitionCatalog,
+        coordinator: CoordinatorLog,
+        next_transaction_id: DatabaseTxnId,
+    ) -> Result<Self, DatabaseError> {
+        let registry = StorageRegistry::new(
+            storages
+                .into_iter()
+                .map(|storage| StorageRegistryEntry {
+                    id: storage.storage_id(),
+                    storage,
+                })
+                .collect(),
+        )?;
+        let bindings = PhysicalBindings::new(
+            catalog
+                .tables
+                .into_iter()
+                .map(|entry| entry.placement)
+                .collect(),
+            &registry,
+        )?;
+        Ok(Self {
+            schema,
+            bindings,
+            registry,
+            transaction_owner: Rc::new(()),
+            next_transaction_id,
+            coordinator: Some(Rc::new(RefCell::new(coordinator))),
+        })
+    }
+
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<(), DatabaseError> {
-        self.primary_storage_mut()?.insert(values)?;
+        let storage_id = self.primary_storage_id()?;
+        let table_id = self
+            .registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .table()
+            .id;
+        let routed = self.route_storage_for_values(table_id, values)?;
+        self.registry
+            .get_mut(routed)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id: routed })?
+            .insert(values)?;
         Ok(())
     }
 
@@ -528,7 +813,7 @@ impl Database {
         &mut self,
         table_id: TableId,
     ) -> Result<Transaction, DatabaseError> {
-        let _ = self.resolve_storage_id(table_id)?;
+        let _ = self.bindings.placement(table_id)?;
         self.begin_database_transaction(IsolationLevel::ReadCommitted)
     }
 
@@ -537,7 +822,7 @@ impl Database {
         table_id: TableId,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, DatabaseError> {
-        let _ = self.resolve_storage_id(table_id)?;
+        let _ = self.bindings.placement(table_id)?;
         self.begin_database_transaction(isolation_level)
     }
 
@@ -546,7 +831,16 @@ impl Database {
         transaction: &mut Transaction,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
-        let storage_id = self.primary_storage_id()?;
+        let primary = self.primary_storage_id()?;
+        let table_id = self
+            .registry
+            .get(primary)
+            .ok_or(StorageRegistryError::UnknownStorageId {
+                storage_id: primary,
+            })?
+            .table()
+            .id;
+        let storage_id = self.route_storage_for_values(table_id, values)?;
         self.validate_transaction(transaction)?;
         let context = transaction.write_context(storage_id, &mut self.registry)?;
         self.registry
@@ -564,7 +858,11 @@ impl Database {
         table_id: TableId,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
-        self.storage_mut(table_id)?.insert(values)?;
+        let storage_id = self.route_storage_for_values(table_id, values)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .insert(values)?;
         Ok(())
     }
 
@@ -578,7 +876,7 @@ impl Database {
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
-        let storage_id = self.resolve_storage_id(table_id)?;
+        let storage_id = self.route_storage_for_values(table_id, values)?;
         let context = transaction.write_context(storage_id, &mut self.registry)?;
         self.registry
             .get_mut(storage_id)
@@ -610,23 +908,96 @@ impl Database {
         table_id: TableId,
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
-        Ok(self.storage_mut(table_id)?.create_index(column_id)?)
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .create_index(column_id)?),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
+    }
+
+    /// Creates one explicitly partition-local index. This API cannot create a
+    /// global index and validates that the partition belongs to `table_id`.
+    pub fn create_partition_index(
+        &mut self,
+        table_id: TableId,
+        partition_id: netbadb_types::PartitionId,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, DatabaseError> {
+        let storage_id = match self.bindings.placement(table_id)? {
+            TablePlacement::RangePartitioned { partitions, .. } => partitions
+                .iter()
+                .find(|partition| partition.partition_id == partition_id)
+                .map(|partition| partition.storage_id)
+                .ok_or(PartitionError::UnknownPartitionId(partition_id))?,
+            TablePlacement::Single { .. } => {
+                return Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into());
+            }
+        };
+        Ok(self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .create_index(column_id)?)
     }
 
     /// Returns this table's registered indexes in persistent creation order.
     pub fn indexes(&self, table_id: TableId) -> Result<&[IndexDefinition], DatabaseError> {
-        Ok(self.storage(table_id)?.indexes())
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(self
+                .registry
+                .get(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .indexes()),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
     }
 
     /// Persists a fresh optimizer snapshot for one table and all of its
     /// registered indexes. DML does not maintain this snapshot automatically.
     pub fn analyze(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
-        self.storage_mut(table_id)?.analyze()?;
+        let storage_ids = self
+            .bindings
+            .placement(table_id)?
+            .storage_ids()
+            .collect::<Vec<_>>();
+        for storage_id in storage_ids {
+            self.registry
+                .get_mut(storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                .analyze()?;
+        }
         Ok(())
     }
 
     pub fn vacuum(&mut self, table_id: TableId) -> Result<u64, DatabaseError> {
-        Ok(self.storage_mut(table_id)?.vacuum()?)
+        let storage_ids = self
+            .bindings
+            .placement(table_id)?
+            .storage_ids()
+            .collect::<Vec<_>>();
+        let mut total = 0_u64;
+        for storage_id in storage_ids {
+            total = total
+                .checked_add(
+                    self.registry
+                        .get_mut(storage_id)
+                        .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                        .vacuum()?,
+                )
+                .ok_or(ExecutionError::AffectedRowsOverflow)?;
+        }
+        Ok(total)
     }
 
     /// Explicitly closes the embedded database after flushing dirty pages.
@@ -721,19 +1092,16 @@ impl Database {
                 .map(ExecutionResult::Query);
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
-        let storage_id = self.resolve_storage_id(table_id)?;
-        // Coordinator preflight is deliberately outside the execution error
-        // rollback branch. Rejecting a second writer changes no physical data
-        // and leaves the existing participant available for explicit rollback.
-        let context = transaction.write_context(storage_id, &mut self.registry)?;
-        let storage = self
-            .registry
-            .get_mut(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
-        match execute_statement(&physical, storage, Some(context)) {
+        if let TablePlacement::Single { storage_id, .. } = self.bindings.placement(table_id)? {
+            // Preserve the legacy one-writer preflight boundary: rejecting a
+            // second physical writer mutates no row and leaves the explicit
+            // transaction active for its caller to roll back.
+            let _ = transaction.write_context(*storage_id, &mut self.registry)?;
+        }
+        match self.execute_mutation_in(transaction, &physical) {
             Ok(result) => Ok(result),
             Err(error) => match transaction.rollback() {
-                Ok(()) => Err(error.into()),
+                Ok(()) => Err(error),
                 Err(rollback_error) => Err(rollback_error.into()),
             },
         }
@@ -756,10 +1124,12 @@ impl Database {
         let compiled = compile_statement(&self.schema, source)?;
         let table_statistics = self.planner_table_statistics();
         let access_paths = self.planner_access_paths();
-        let physical = plan_statement_with_statistics(
+        let range_tables = self.planner_range_tables();
+        let physical = plan_statement_with_partition_snapshots(
             &compiled.logical_statement,
             &table_statistics,
             &access_paths,
+            &range_tables,
         );
         Ok((compiled, physical))
     }
@@ -767,11 +1137,18 @@ impl Database {
     fn planner_table_statistics(&self) -> Vec<TableAccessStatistics> {
         self.bindings
             .iter()
-            .filter_map(|binding| {
+            .filter_map(|placement| {
+                let TablePlacement::Single {
+                    table_id,
+                    storage_id,
+                } = placement
+                else {
+                    return None;
+                };
                 self.registry
-                    .get(binding.storage_id)
+                    .get(*storage_id)
                     .map(|storage| TableAccessStatistics {
-                        table_id: binding.table_id,
+                        table_id: *table_id,
                         statistics: storage.table_statistics(),
                     })
             })
@@ -780,12 +1157,19 @@ impl Database {
 
     fn planner_access_paths(&self) -> Vec<AccessPath> {
         let mut paths = Vec::new();
-        for binding in self.bindings.iter() {
-            let Some(storage) = self.registry.get(binding.storage_id) else {
+        for placement in self.bindings.iter() {
+            let TablePlacement::Single {
+                table_id,
+                storage_id,
+            } = placement
+            else {
+                continue;
+            };
+            let Some(storage) = self.registry.get(*storage_id) else {
                 continue;
             };
             paths.extend(storage.access_paths().into_iter().map(|path| AccessPath {
-                table_id: binding.table_id,
+                table_id: *table_id,
                 column_id: path.column_id,
                 id: path.id,
                 capabilities: AccessPathCapabilities {
@@ -796,6 +1180,54 @@ impl Database {
             }));
         }
         paths
+    }
+
+    fn planner_range_tables(&self) -> Vec<RangeTablePlanningSnapshot> {
+        self.bindings
+            .iter()
+            .filter_map(|placement| {
+                let TablePlacement::RangePartitioned {
+                    table_id,
+                    partition_key,
+                    partitions,
+                    ..
+                } = placement
+                else {
+                    return None;
+                };
+                Some(RangeTablePlanningSnapshot {
+                    table_id: *table_id,
+                    partition_key: *partition_key,
+                    partitions: partitions
+                        .iter()
+                        .filter_map(|partition| {
+                            let storage = self.registry.get(partition.storage_id)?;
+                            Some(PartitionPlanningSnapshot {
+                                partition_id: partition.partition_id,
+                                storage_id: partition.storage_id,
+                                lower: partition.lower.clone(),
+                                upper: partition.upper.clone(),
+                                statistics: storage.table_statistics(),
+                                access_paths: storage
+                                    .access_paths()
+                                    .into_iter()
+                                    .map(|path| AccessPath {
+                                        table_id: *table_id,
+                                        column_id: path.column_id,
+                                        id: path.id,
+                                        capabilities: AccessPathCapabilities {
+                                            point_lookup: path.capabilities.point_lookup,
+                                            range_lookup: path.capabilities.range_lookup,
+                                        },
+                                        statistics: path.statistics,
+                                    })
+                                    .collect(),
+                            })
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     fn begin_database_transaction(
@@ -843,9 +1275,15 @@ impl Database {
         let bindings = self
             .bindings
             .iter()
-            .map(|binding| ExecutionStorageBinding {
-                table_id: binding.table_id,
-                storage_id: binding.storage_id,
+            .filter_map(|placement| match placement {
+                TablePlacement::Single {
+                    table_id,
+                    storage_id,
+                } => Some(ExecutionStorageBinding {
+                    table_id: *table_id,
+                    storage_id: *storage_id,
+                }),
+                TablePlacement::RangePartitioned { .. } => None,
             })
             .collect::<Vec<_>>();
         let read_views = view
@@ -874,13 +1312,113 @@ impl Database {
         physical: &PhysicalStatement,
     ) -> Result<ExecutionResult, DatabaseError> {
         let table_id = statement_table_id(physical).ok_or(DatabaseError::ExpectedQuery)?;
-        let storage_id = self.resolve_storage_id(table_id)?;
-        let context = transaction.write_context(storage_id, &mut self.registry)?;
-        let storage = self
-            .registry
-            .get_mut(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
-        Ok(execute_statement(physical, storage, Some(context))?)
+        let storage_ids = self
+            .bindings
+            .placement(table_id)?
+            .storage_ids()
+            .collect::<Vec<_>>();
+        let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
+        let bindings = self
+            .bindings
+            .iter()
+            .filter_map(|placement| match placement {
+                TablePlacement::Single {
+                    table_id,
+                    storage_id,
+                } => Some(ExecutionStorageBinding {
+                    table_id: *table_id,
+                    storage_id: *storage_id,
+                }),
+                TablePlacement::RangePartitioned { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let read_views = view
+            .iter()
+            .map(|(storage_id, view)| ExecutionReadView { storage_id, view })
+            .collect::<Vec<_>>();
+        let prepared = {
+            let mut storages = self
+                .registry
+                .iter_mut()
+                .map(|entry| ExecutionStorage {
+                    storage_id: entry.id,
+                    storage: &mut entry.storage,
+                })
+                .collect::<Vec<_>>();
+            prepare_mutation_with_storage_context(physical, &bindings, &mut storages, &read_views)?
+        };
+        self.apply_prepared_mutation(transaction, prepared)
+    }
+
+    fn apply_prepared_mutation(
+        &mut self,
+        transaction: &mut Transaction,
+        prepared: PreparedMutation,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        match prepared {
+            PreparedMutation::Insert { table_id, values } => {
+                let storage_id = self.route_storage_for_values(table_id, &values)?;
+                let context = transaction.write_context(storage_id, &mut self.registry)?;
+                self.registry
+                    .get_mut(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                    .insert_in(context, &values)
+                    .map_err(ExecutionError::Storage)?;
+                Ok(ExecutionResult::AffectedRows(1))
+            }
+            PreparedMutation::Update { table_id, rows } => {
+                let affected =
+                    u64::try_from(rows.len()).map_err(|_| ExecutionError::AffectedRowsOverflow)?;
+                let routed = rows
+                    .into_iter()
+                    .map(|row| {
+                        let destination = self.route_storage_for_values(table_id, &row.values)?;
+                        Ok((row, destination))
+                    })
+                    .collect::<Result<Vec<_>, DatabaseError>>()?;
+                for (row, destination) in routed {
+                    let source = row.row.storage_id();
+                    if source == destination {
+                        let context = transaction.write_context(source, &mut self.registry)?;
+                        self.registry
+                            .get_mut(source)
+                            .ok_or(StorageRegistryError::UnknownStorageId { storage_id: source })?
+                            .update_in(context, row.row, &row.values)
+                            .map_err(ExecutionError::Storage)?;
+                    } else {
+                        let context = transaction.write_context(source, &mut self.registry)?;
+                        self.registry
+                            .get_mut(source)
+                            .ok_or(StorageRegistryError::UnknownStorageId { storage_id: source })?
+                            .delete_in(context, row.row)
+                            .map_err(ExecutionError::Storage)?;
+                        let context = transaction.write_context(destination, &mut self.registry)?;
+                        self.registry
+                            .get_mut(destination)
+                            .ok_or(StorageRegistryError::UnknownStorageId {
+                                storage_id: destination,
+                            })?
+                            .insert_in(context, &row.values)
+                            .map_err(ExecutionError::Storage)?;
+                    }
+                }
+                Ok(ExecutionResult::AffectedRows(affected))
+            }
+            PreparedMutation::Delete { rows, .. } => {
+                let affected =
+                    u64::try_from(rows.len()).map_err(|_| ExecutionError::AffectedRowsOverflow)?;
+                for row in rows {
+                    let storage_id = row.storage_id();
+                    let context = transaction.write_context(storage_id, &mut self.registry)?;
+                    self.registry
+                        .get_mut(storage_id)
+                        .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                        .delete_in(context, row)
+                        .map_err(ExecutionError::Storage)?;
+                }
+                Ok(ExecutionResult::AffectedRows(affected))
+            }
+        }
     }
 
     fn storage_ids_for_tables(
@@ -889,9 +1427,10 @@ impl Database {
     ) -> Result<Vec<StorageId>, DatabaseError> {
         let mut storage_ids = Vec::with_capacity(table_ids.len());
         for table_id in table_ids {
-            let storage_id = self.resolve_storage_id(table_id)?;
-            if !storage_ids.contains(&storage_id) {
-                storage_ids.push(storage_id);
+            for storage_id in self.bindings.placement(table_id)?.storage_ids() {
+                if !storage_ids.contains(&storage_id) {
+                    storage_ids.push(storage_id);
+                }
             }
         }
         Ok(storage_ids)
@@ -908,33 +1447,52 @@ impl Database {
         self.bindings
             .iter()
             .next()
-            .map(|binding| binding.storage_id)
+            .and_then(|placement| placement.storage_ids().next())
             .ok_or(DatabaseError::EmptyCatalog)
     }
 
-    fn resolve_storage_id(&self, table_id: TableId) -> Result<StorageId, DatabaseError> {
-        Ok(self.bindings.resolve_current(table_id)?)
-    }
-
-    fn primary_storage_mut(&mut self) -> Result<&mut TableStorage, DatabaseError> {
-        let storage_id = self.primary_storage_id()?;
-        self.registry
-            .get_mut(storage_id)
-            .ok_or_else(|| StorageRegistryError::UnknownStorageId { storage_id }.into())
-    }
-
+    #[cfg(test)]
     fn storage_mut(&mut self, table_id: TableId) -> Result<&mut TableStorage, DatabaseError> {
-        let storage_id = self.resolve_storage_id(table_id)?;
+        let storage_id = self.bindings.resolve_single(table_id)?;
         self.registry
             .get_mut(storage_id)
             .ok_or_else(|| StorageRegistryError::UnknownStorageId { storage_id }.into())
     }
 
-    fn storage(&self, table_id: TableId) -> Result<&TableStorage, DatabaseError> {
-        let storage_id = self.resolve_storage_id(table_id)?;
-        self.registry
-            .get(storage_id)
-            .ok_or_else(|| StorageRegistryError::UnknownStorageId { storage_id }.into())
+    fn route_storage_for_values(
+        &self,
+        table_id: TableId,
+        values: &[ScalarValue],
+    ) -> Result<StorageId, DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(*storage_id),
+            TablePlacement::RangePartitioned {
+                partition_key,
+                partitions,
+                ..
+            } => {
+                let table = self
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == table_id)
+                    .ok_or(PartitionError::CatalogCorrupt(
+                        "partition table schema is missing",
+                    ))?;
+                let position = table
+                    .columns
+                    .iter()
+                    .position(|column| column.id == *partition_key)
+                    .ok_or(PartitionError::PartitionKeyMissing {
+                        table_id,
+                        column_id: *partition_key,
+                    })?;
+                let value = values
+                    .get(position)
+                    .ok_or(PartitionError::NoPartitionForValue(ScalarValue::Null))?;
+                Ok(route_partition(partitions, value)?.storage_id)
+            }
+        }
     }
 
     fn validate_transaction(&self, transaction: &Transaction) -> Result<(), DatabaseError> {
@@ -973,6 +1531,195 @@ fn storage_id_for_position(position: usize) -> Result<StorageId, StorageRegistry
         .and_then(|value| u64::try_from(value).ok())
         .ok_or(StorageRegistryError::StorageIdExhausted)?;
     Ok(StorageId(ordinal))
+}
+
+fn validate_partition_key(
+    table: &TableDef,
+    partition_key: ColumnId,
+) -> Result<PhysicalType, DatabaseError> {
+    let column = table
+        .column_by_id(partition_key)
+        .ok_or(PartitionError::PartitionKeyMissing {
+            table_id: table.id,
+            column_id: partition_key,
+        })?;
+    let physical = column.semantic_type().physical;
+    if !matches!(physical, PhysicalType::Int64 | PhysicalType::UInt64) {
+        return Err(PartitionError::UnsupportedPartitionKeyType(physical).into());
+    }
+    if column.nullable {
+        return Err(PartitionError::NullablePartitionKey {
+            table_id: table.id,
+            column_id: partition_key,
+        }
+        .into());
+    }
+    Ok(physical)
+}
+
+fn prevalidate_placement_specs(specs: &[TablePlacementSpec]) -> Result<(), DatabaseError> {
+    let mut next_storage_id = 1_u64;
+    let mut tables = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let table = spec.table();
+        let placement = match spec {
+            TablePlacementSpec::Single { .. } => {
+                let storage_id = StorageId(next_storage_id);
+                next_storage_id = next_storage_id
+                    .checked_add(1)
+                    .ok_or(StorageRegistryError::StorageIdExhausted)?;
+                TablePlacement::Single {
+                    table_id: table.id,
+                    storage_id,
+                }
+            }
+            TablePlacementSpec::RangePartitioned {
+                partition_key,
+                partitions,
+                ..
+            } => {
+                let key_type = validate_partition_key(table, *partition_key)?;
+                let mut bindings = Vec::with_capacity(partitions.len());
+                for partition in partitions {
+                    let storage_id = StorageId(next_storage_id);
+                    next_storage_id = next_storage_id
+                        .checked_add(1)
+                        .ok_or(StorageRegistryError::StorageIdExhausted)?;
+                    bindings.push(RangePartitionBinding {
+                        partition_id: partition.partition_id,
+                        storage_id,
+                        lower: partition.lower.clone(),
+                        upper: partition.upper.clone(),
+                    });
+                }
+                TablePlacement::RangePartitioned {
+                    table_id: table.id,
+                    partition_key: *partition_key,
+                    key_type,
+                    partitions: canonicalize_partitions(key_type, bindings)?,
+                }
+            }
+        };
+        tables.push(CatalogTable {
+            table_id: table.id,
+            schema_fingerprint: table.fingerprint()?,
+            placement,
+        });
+    }
+    PartitionCatalog { tables }.validate()?;
+    Ok(())
+}
+
+fn validate_physical_paths(
+    paths: &[PathBuf],
+    config: &PartitionCatalogConfig,
+) -> Result<(), DatabaseError> {
+    if paths.is_empty() {
+        return Err(DatabaseError::EmptyCatalog);
+    }
+    for (position, path) in paths.iter().enumerate() {
+        if paths[..position].contains(path) {
+            return Err(DatabaseError::DuplicateStoragePath(path.clone()));
+        }
+        if path == config.catalog_path() || path == config.coordinator_log_path() {
+            return Err(DatabaseError::CoordinatorPathConflictsWithStorage(
+                path.clone(),
+            ));
+        }
+    }
+    if config.catalog_path() == config.coordinator_log_path() {
+        return Err(DatabaseError::CoordinatorPathConflictsWithStorage(
+            config.catalog_path().to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn create_partition_storage(
+    path: &Path,
+    table: TableDef,
+    storage_id: StorageId,
+    storages: &mut Vec<TableStorage>,
+    created_paths: &mut Vec<PathBuf>,
+) -> Result<(), DatabaseError> {
+    match TableStorage::create_heap_with_storage_id(path, table, storage_id) {
+        Ok(storage) => {
+            storages.push(storage);
+            created_paths.push(path.to_owned());
+            Ok(())
+        }
+        Err(creation) => {
+            storages.clear();
+            if let Some((cleanup_path, cleanup)) = cleanup_created_table_files(created_paths) {
+                return Err(DatabaseError::CreateTablesRollback {
+                    creation,
+                    cleanup_path,
+                    cleanup,
+                });
+            }
+            Err(creation.into())
+        }
+    }
+}
+
+fn validate_catalog_schemas(
+    catalog: &PartitionCatalog,
+    tables: &[TableDef],
+) -> Result<(), DatabaseError> {
+    if catalog.tables.len() != tables.len() {
+        return Err(PartitionError::CatalogCorrupt("logical table count mismatch").into());
+    }
+    for entry in &catalog.tables {
+        let table = tables
+            .iter()
+            .find(|table| table.id == entry.table_id)
+            .ok_or(PartitionError::SchemaFingerprintMismatch {
+                table_id: entry.table_id,
+            })?;
+        if table.fingerprint()? != entry.schema_fingerprint {
+            return Err(PartitionError::SchemaFingerprintMismatch {
+                table_id: entry.table_id,
+            }
+            .into());
+        }
+        if let TablePlacement::RangePartitioned {
+            partition_key,
+            key_type,
+            ..
+        } = &entry.placement
+        {
+            if validate_partition_key(table, *partition_key)? != *key_type {
+                return Err(PartitionError::SchemaFingerprintMismatch {
+                    table_id: entry.table_id,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_storage_set(
+    catalog: &PartitionCatalog,
+    storages: &[InspectedStorage],
+) -> Result<(), DatabaseError> {
+    let expected = catalog
+        .tables
+        .iter()
+        .flat_map(|entry| entry.placement.storage_ids())
+        .collect::<Vec<_>>();
+    if expected.len() != storages.len() {
+        return Err(PartitionError::CatalogCorrupt("physical storage count mismatch").into());
+    }
+    for storage_id in expected {
+        if !storages
+            .iter()
+            .any(|storage| storage.recovery.storage_id == storage_id)
+        {
+            return Err(PartitionError::PartitionStorageMissing(storage_id).into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1071,12 +1818,12 @@ mod tests {
 
     use super::{
         CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, ExecutionResult,
-        IsolationLevel, ParticipantMode, PhysicalStatement, TransactionState,
-        cleanup_created_table_files,
+        IsolationLevel, ParticipantMode, PartitionCatalogConfig, PhysicalStatement,
+        RangePartitionSpec, TablePlacementSpec, TransactionState, cleanup_created_table_files,
     };
     use crate::registry::{
-        PhysicalBindings, PhysicalTableBinding, StorageRegistry, StorageRegistryEntry,
-        StorageRegistryError,
+        PhysicalBindings, StorageRegistry, StorageRegistryEntry, StorageRegistryError,
+        TablePlacement,
     };
     use netbadb_inspect::{
         AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
@@ -1087,7 +1834,8 @@ mod tests {
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_storage::{HeapStorage, TableStorage};
     use netbadb_types::{
-        AccessPathId, ColumnId, DatabaseTxnId, PhysicalType, ScalarValue, StorageId, TableId,
+        AccessPathId, ColumnId, DatabaseTxnId, PartitionId, PhysicalType, ScalarValue, StorageId,
+        TableId,
     };
 
     fn table() -> TableDef {
@@ -1191,6 +1939,11 @@ mod tests {
         let root = std::env::var_os(crate::coordinator_crash::ROOT_ENV)
             .map(std::path::PathBuf::from)
             .expect("coordinator crash root");
+        let case = std::env::var(crate::coordinator_crash::CASE_ENV).expect("crash case");
+        if let Some(operation) = case.strip_prefix("partition-") {
+            partition_crash_child(&root, operation);
+            panic!("partition crash child returned without reaching its crash point");
+        }
         let (tables, coordinator_path) = coordinator_fixture_tables(&root);
         let mut database = Database::open_tables_with_coordinator(
             tables,
@@ -1289,6 +2042,183 @@ mod tests {
             );
             assert_crash_outcome(&root, committed);
             cleanup_coordinator_fixture(&root);
+        }
+    }
+
+    fn partition_crash_table() -> TableDef {
+        TableDef::new(
+            TableId(50),
+            "items",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "key",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        )
+    }
+
+    fn partition_crash_fixture(
+        root: &std::path::Path,
+    ) -> (Vec<std::path::PathBuf>, PartitionCatalogConfig) {
+        (
+            vec![
+                root.with_extension("left.db"),
+                root.with_extension("right.db"),
+            ],
+            PartitionCatalogConfig::new(
+                root.with_extension("partitions"),
+                root.with_extension("partition-coordinator"),
+            ),
+        )
+    }
+
+    fn partition_crash_specs(root: &std::path::Path) -> Vec<TablePlacementSpec> {
+        let (paths, _) = partition_crash_fixture(root);
+        vec![TablePlacementSpec::range_partitioned(
+            partition_crash_table(),
+            ColumnId(1),
+            vec![
+                RangePartitionSpec::new(
+                    PartitionId(1),
+                    &paths[0],
+                    None,
+                    Some(ScalarValue::Int64(0)),
+                ),
+                RangePartitionSpec::new(
+                    PartitionId(2),
+                    &paths[1],
+                    Some(ScalarValue::Int64(0)),
+                    None,
+                ),
+            ],
+        )]
+    }
+
+    fn cleanup_partition_crash_fixture(root: &std::path::Path) {
+        let (paths, config) = partition_crash_fixture(root);
+        let _ = cleanup_created_table_files(&paths);
+        let _ = std::fs::remove_file(config.catalog_path());
+        let _ = std::fs::remove_file(config.coordinator_log_path());
+    }
+
+    fn partition_crash_child(root: &std::path::Path, operation: &str) {
+        let (mut paths, config) = partition_crash_fixture(root);
+        paths.reverse();
+        let mut database =
+            Database::open_with_placements(vec![partition_crash_table()], paths, config)
+                .expect("open partition crash child");
+        match operation {
+            "update" => {
+                let _ = database
+                    .execute("UPDATE items SET key = 1 WHERE key = -1")
+                    .expect("update until crash");
+            }
+            "delete" => {
+                let _ = database
+                    .execute("DELETE FROM items WHERE key >= -1")
+                    .expect("delete until crash");
+            }
+            "insert" => {
+                let mut transaction = database
+                    .begin_transaction_for(TableId(50))
+                    .expect("begin insert crash transaction");
+                database
+                    .execute_in(&mut transaction, "INSERT INTO items (key) VALUES (-1)")
+                    .expect("insert left");
+                database
+                    .execute_in(&mut transaction, "INSERT INTO items (key) VALUES (1)")
+                    .expect("insert right");
+                transaction.commit().expect("commit inserts until crash");
+            }
+            other => panic!("unknown partition crash operation {other}"),
+        }
+    }
+
+    fn seed_partition_crash_fixture(root: &std::path::Path, operation: &str) {
+        cleanup_partition_crash_fixture(root);
+        let (_, config) = partition_crash_fixture(root);
+        let mut database = Database::create_with_placements(partition_crash_specs(root), config)
+            .expect("create partition crash fixture");
+        match operation {
+            "update" => {
+                database
+                    .execute("INSERT INTO items (key) VALUES (-1)")
+                    .unwrap();
+            }
+            "delete" => {
+                database
+                    .execute("INSERT INTO items (key) VALUES (-1)")
+                    .unwrap();
+                database
+                    .execute("INSERT INTO items (key) VALUES (1)")
+                    .unwrap();
+            }
+            "insert" => {}
+            other => panic!("unknown seed operation {other}"),
+        }
+        database.close().expect("close partition crash seed");
+    }
+
+    fn assert_partition_crash_outcome(root: &std::path::Path, operation: &str, committed: bool) {
+        for pass in 0..2 {
+            let (mut paths, config) = partition_crash_fixture(root);
+            if pass == 1 {
+                paths.reverse();
+            }
+            let mut database =
+                Database::open_with_placements(vec![partition_crash_table()], paths, config)
+                    .expect("recover partition crash fixture");
+            let rows = database
+                .query("SELECT key FROM items")
+                .expect("read recovered partitions")
+                .rows;
+            let expected = match (operation, committed) {
+                ("update", false) => vec![vec![ScalarValue::Int64(-1)]],
+                ("update", true) => vec![vec![ScalarValue::Int64(1)]],
+                ("delete", false) => {
+                    vec![vec![ScalarValue::Int64(-1)], vec![ScalarValue::Int64(1)]]
+                }
+                ("delete", true) | ("insert", false) => Vec::new(),
+                ("insert", true) => vec![vec![ScalarValue::Int64(-1)], vec![ScalarValue::Int64(1)]],
+                _ => panic!("invalid crash expectation"),
+            };
+            assert_eq!(rows, expected, "pass {pass}, operation {operation}");
+            database.close().expect("close recovered partition fixture");
+        }
+    }
+
+    #[test]
+    fn partition_dml_subprocess_crash_matrix_is_all_or_nothing() {
+        let windows = [
+            ("after-all-prepares", false),
+            ("after-durable-decision", true),
+            ("after-commit-1", true),
+        ];
+        for operation in ["update", "delete", "insert"] {
+            for (point, committed) in windows {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-partition-crash-{operation}-{point}-{}",
+                    std::process::id()
+                ));
+                seed_partition_crash_fixture(&root, operation);
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("current core test executable"),
+                );
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                crate::coordinator_crash::configure_child(
+                    &mut command,
+                    &format!("partition-{operation}"),
+                    &root,
+                    point,
+                );
+                let status = command.status().expect("start partition crash child");
+                assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+                assert_partition_crash_outcome(&root, operation, committed);
+                cleanup_partition_crash_fixture(&root);
+            }
         }
     }
 
@@ -1564,7 +2494,9 @@ mod tests {
             | PhysicalPlan::HashJoin { left, right, .. } => {
                 planned_index(left).or_else(|| planned_index(right))
             }
-            PhysicalPlan::SeqScan { .. } | PhysicalPlan::RangeIndexScan { .. } => None,
+            PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::RangeIndexScan { .. }
+            | PhysicalPlan::PartitionedScan { .. } => None,
         }
     }
 
@@ -1618,9 +2550,11 @@ mod tests {
         let teams_path = std::env::temp_dir().join(format!("netbadb-registry-teams-{suffix}"));
         let paths = [users_path.clone(), teams_path.clone()];
         cleanup_created_table_files(&paths);
-        let users = TableStorage::create_heap(&users_path, table()).expect("create users storage");
+        let users = TableStorage::create_heap_with_storage_id(&users_path, table(), StorageId(10))
+            .expect("create users storage");
         let teams =
-            TableStorage::create_heap(&teams_path, teams_table()).expect("create teams storage");
+            TableStorage::create_heap_with_storage_id(&teams_path, teams_table(), StorageId(20))
+                .expect("create teams storage");
 
         // Registry order is deliberately the reverse of logical binding order,
         // and neither physical identity equals a vector position.
@@ -1637,11 +2571,11 @@ mod tests {
         .expect("build reordered registry");
         let bindings = PhysicalBindings::new(
             vec![
-                PhysicalTableBinding {
+                TablePlacement::Single {
                     table_id: TableId(1),
                     storage_id: StorageId(10),
                 },
-                PhysicalTableBinding {
+                TablePlacement::Single {
                     table_id: TableId(2),
                     storage_id: StorageId(20),
                 },
@@ -1652,11 +2586,11 @@ mod tests {
         assert!(matches!(
             PhysicalBindings::new(
                 vec![
-                    PhysicalTableBinding {
+                    TablePlacement::Single {
                         table_id: TableId(1),
                         storage_id: StorageId(10),
                     },
-                    PhysicalTableBinding {
+                    TablePlacement::Single {
                         table_id: TableId(1),
                         storage_id: StorageId(20),
                     },
@@ -1667,16 +2601,18 @@ mod tests {
                 table_id: TableId(1)
             })
         ));
-        let missing = PhysicalBindings::new(Vec::new(), &registry).expect("empty binding set");
+        let empty_registry = StorageRegistry::new(Vec::new()).expect("empty registry");
+        let missing =
+            PhysicalBindings::new(Vec::new(), &empty_registry).expect("empty binding set");
         assert!(matches!(
-            missing.resolve_current(TableId(1)),
+            missing.resolve_single(TableId(1)),
             Err(StorageRegistryError::MissingPhysicalBinding {
                 table_id: TableId(1)
             })
         ));
         assert!(matches!(
             PhysicalBindings::new(
-                vec![PhysicalTableBinding {
+                vec![TablePlacement::Single {
                     table_id: TableId(1),
                     storage_id: StorageId(99),
                 }],
@@ -1753,9 +2689,11 @@ mod tests {
             std::env::temp_dir().join(format!("netbadb-registry-duplicate-teams-{suffix}"));
         let paths = [users_path.clone(), teams_path.clone()];
         cleanup_created_table_files(&paths);
-        let users = TableStorage::create_heap(&users_path, table()).expect("create users storage");
+        let users = TableStorage::create_heap_with_storage_id(&users_path, table(), StorageId(7))
+            .expect("create users storage");
         let teams =
-            TableStorage::create_heap(&teams_path, teams_table()).expect("create teams storage");
+            TableStorage::create_heap_with_storage_id(&teams_path, teams_table(), StorageId(7))
+                .expect("create teams storage");
         assert!(matches!(
             StorageRegistry::new(vec![
                 StorageRegistryEntry {
@@ -1834,11 +2772,11 @@ mod tests {
         assert_eq!(
             database.bindings.iter().collect::<Vec<_>>(),
             vec![
-                PhysicalTableBinding {
+                &TablePlacement::Single {
                     table_id: TableId(1),
                     storage_id: StorageId(1),
                 },
-                PhysicalTableBinding {
+                &TablePlacement::Single {
                     table_id: TableId(2),
                     storage_id: StorageId(2),
                 },
@@ -2160,7 +3098,9 @@ mod tests {
             | PlanNodeInspection::Project { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_index(input),
-            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::RangeIndexScan { .. } => None,
+            PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::RangeIndexScan { .. }
+            | PlanNodeInspection::PartitionedScan { .. } => None,
         }
     }
 
@@ -2178,7 +3118,9 @@ mod tests {
             | PlanNodeInspection::Project { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_range(input),
-            PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::IndexScan { .. } => None,
+            PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::IndexScan { .. }
+            | PlanNodeInspection::PartitionedScan { .. } => None,
         }
     }
 
@@ -2207,6 +3149,11 @@ mod tests {
                 table_id,
                 binding_id,
                 ..
+            }
+            | PlanNodeInspection::PartitionedScan {
+                table_id,
+                binding_id,
+                ..
             } => bindings.push((*table_id, binding_id.0)),
             PlanNodeInspection::NestedLoopJoin { left, right, .. }
             | PlanNodeInspection::HashJoin { left, right, .. } => {
@@ -2226,6 +3173,9 @@ mod tests {
             PlanNodeInspection::SeqScan { columns, .. }
             | PlanNodeInspection::IndexScan { columns, .. }
             | PlanNodeInspection::RangeIndexScan { columns, .. } => {
+                Some(columns.iter().map(|column| column.column_id).collect())
+            }
+            PlanNodeInspection::PartitionedScan { columns, .. } => {
                 Some(columns.iter().map(|column| column.column_id).collect())
             }
             PlanNodeInspection::NestedLoopJoin { left, right, .. }
@@ -2254,6 +3204,7 @@ mod tests {
             PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. } => None,
+            PlanNodeInspection::PartitionedScan { .. } => None,
         }
     }
 

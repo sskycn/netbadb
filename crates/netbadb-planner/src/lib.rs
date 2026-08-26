@@ -7,7 +7,9 @@ use netbadb_rel::{
     AggregateInput, AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind,
     LogicalPlan, LogicalStatement, OutputField, SortKey,
 };
-use netbadb_types::{AccessPathId, ColumnId, RelationBindingId, ScalarValue, TableId};
+use netbadb_types::{
+    AccessPathId, ColumnId, PartitionId, RelationBindingId, ScalarValue, StorageId, TableId,
+};
 
 /// Executable operations advertised by one physical access path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,48 @@ pub struct TableAccessStatistics {
     pub statistics: Option<TableStatistics>,
 }
 
+/// Immutable, storage-independent optimizer input for one physical partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionPlanningSnapshot {
+    pub partition_id: PartitionId,
+    pub storage_id: StorageId,
+    pub lower: Option<ScalarValue>,
+    pub upper: Option<ScalarValue>,
+    pub statistics: Option<TableStatistics>,
+    pub access_paths: Vec<AccessPath>,
+}
+
+/// Exact range metadata for one logical table. Bounds are canonical and
+/// ordered by the core before planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeTablePlanningSnapshot {
+    pub table_id: TableId,
+    pub partition_key: ColumnId,
+    pub partitions: Vec<PartitionPlanningSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionAccessPlan {
+    SeqScan,
+    IndexScan {
+        index_column: ColumnRef,
+        access_path: AccessPathId,
+        key: ScalarValue,
+    },
+    RangeIndexScan {
+        index_column: ColumnRef,
+        access_path: AccessPathId,
+        range: IndexRange,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionScanPlan {
+    pub partition_id: PartitionId,
+    pub storage_id: StorageId,
+    pub access: PartitionAccessPlan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhysicalPlan {
     SeqScan {
@@ -62,6 +106,15 @@ pub enum PhysicalPlan {
         index_column: ColumnRef,
         access_path: AccessPathId,
         range: IndexRange,
+    },
+    PartitionedScan {
+        binding_id: RelationBindingId,
+        table_id: TableId,
+        table_name: String,
+        columns: Vec<ColumnRef>,
+        partition_key: ColumnId,
+        total_partitions: usize,
+        partitions: Vec<PartitionScanPlan>,
     },
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
@@ -128,6 +181,7 @@ impl PhysicalPlan {
             Self::SeqScan { columns, .. }
             | Self::IndexScan { columns, .. }
             | Self::RangeIndexScan { columns, .. }
+            | Self::PartitionedScan { columns, .. }
             | Self::NestedLoopJoin { columns, .. }
             | Self::HashJoin { columns, .. }
             | Self::Project { columns, .. } => {
@@ -163,7 +217,20 @@ pub fn plan_with_statistics(
     table_statistics: &[TableAccessStatistics],
     access_paths: &[AccessPath],
 ) -> PhysicalPlan {
-    let raw = plan_raw_with_statistics(logical, table_statistics, access_paths);
+    plan_with_partition_snapshots(logical, table_statistics, access_paths, &[])
+}
+
+/// Plans one logical relation while treating range partitioning strictly as a
+/// physical concern. Exact bounds drive pruning before each selected
+/// partition performs its own access-path choice.
+#[must_use]
+pub fn plan_with_partition_snapshots(
+    logical: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+) -> PhysicalPlan {
+    let raw = plan_raw_with_statistics(logical, table_statistics, access_paths, range_tables);
     let required = raw
         .output_fields()
         .into_iter()
@@ -176,6 +243,7 @@ fn plan_raw_with_statistics(
     logical: &LogicalPlan,
     table_statistics: &[TableAccessStatistics],
     access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
 ) -> PhysicalPlan {
     match logical {
         LogicalPlan::Scan {
@@ -183,12 +251,18 @@ fn plan_raw_with_statistics(
             table_id,
             table_name,
             columns,
-        } => PhysicalPlan::SeqScan {
-            binding_id: *binding_id,
-            table_id: *table_id,
-            table_name: table_name.clone(),
-            columns: columns.clone(),
-        },
+        } => range_tables
+            .iter()
+            .find(|placement| placement.table_id == *table_id)
+            .map(|placement| {
+                build_partitioned_scan(None, *binding_id, *table_id, table_name, columns, placement)
+            })
+            .unwrap_or_else(|| PhysicalPlan::SeqScan {
+                binding_id: *binding_id,
+                table_id: *table_id,
+                table_name: table_name.clone(),
+                columns: columns.clone(),
+            }),
         LogicalPlan::Join {
             left,
             right,
@@ -200,11 +274,13 @@ fn plan_raw_with_statistics(
                 left,
                 table_statistics,
                 access_paths,
+                range_tables,
             ));
             let physical_right = Box::new(plan_raw_with_statistics(
                 right,
                 table_statistics,
                 access_paths,
+                range_tables,
             ));
             if let Some((left_key, right_key)) =
                 eligible_simple_hash_join(*kind, left, right, predicate, table_statistics)
@@ -235,17 +311,39 @@ fn plan_raw_with_statistics(
                     table_id,
                     table_name,
                     columns,
-                } => choose_index_access(
-                    predicate,
-                    *binding_id,
-                    *table_id,
-                    table_name,
-                    columns,
-                    table_statistics,
-                    access_paths,
-                )
-                .unwrap_or_else(|| plan_raw_with_statistics(input, table_statistics, access_paths)),
-                _ => plan_raw_with_statistics(input, table_statistics, access_paths),
+                } => range_tables
+                    .iter()
+                    .find(|placement| placement.table_id == *table_id)
+                    .map(|placement| {
+                        build_partitioned_scan(
+                            Some(predicate),
+                            *binding_id,
+                            *table_id,
+                            table_name,
+                            columns,
+                            placement,
+                        )
+                    })
+                    .or_else(|| {
+                        choose_index_access(
+                            predicate,
+                            *binding_id,
+                            *table_id,
+                            table_name,
+                            columns,
+                            table_statistics,
+                            access_paths,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        plan_raw_with_statistics(
+                            input,
+                            table_statistics,
+                            access_paths,
+                            range_tables,
+                        )
+                    }),
+                _ => plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
             };
             PhysicalPlan::Filter {
                 input: Box::new(input),
@@ -257,6 +355,7 @@ fn plan_raw_with_statistics(
                 input,
                 table_statistics,
                 access_paths,
+                range_tables,
             )),
             keys: keys.clone(),
         },
@@ -265,6 +364,7 @@ fn plan_raw_with_statistics(
                 input,
                 table_statistics,
                 access_paths,
+                range_tables,
             )),
             columns: columns.clone(),
         },
@@ -277,6 +377,7 @@ fn plan_raw_with_statistics(
                 input,
                 table_statistics,
                 access_paths,
+                range_tables,
             )),
             group_keys: group_keys.clone(),
             outputs: outputs.clone(),
@@ -286,6 +387,7 @@ fn plan_raw_with_statistics(
                 input,
                 table_statistics,
                 access_paths,
+                range_tables,
             )),
             limit: *limit,
         },
@@ -374,6 +476,23 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             index_column,
             access_path,
             range,
+        },
+        PhysicalPlan::PartitionedScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            partition_key,
+            total_partitions,
+            partitions,
+        } => PhysicalPlan::PartitionedScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns: prune_columns(columns, parent_required),
+            partition_key,
+            total_partitions,
+            partitions,
         },
         PhysicalPlan::Filter { input, predicate } => {
             let mut required = parent_required.to_vec();
@@ -628,6 +747,250 @@ struct IndexCandidate<'a> {
     access_path: &'a AccessPath,
     index_column: ColumnRef,
     lookup: IndexLookupCandidate,
+}
+
+#[derive(Debug, Default)]
+struct PartitionConstraint {
+    lower: Option<IndexBound>,
+    upper: Option<IndexBound>,
+    unsafe_boolean: bool,
+}
+
+fn build_partitioned_scan(
+    predicate: Option<&Expr>,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    table_name: &str,
+    columns: &[ColumnRef],
+    placement: &RangeTablePlanningSnapshot,
+) -> PhysicalPlan {
+    let constraint = predicate.map(|predicate| {
+        let mut constraint = PartitionConstraint::default();
+        collect_partition_constraint(
+            predicate,
+            binding_id,
+            table_id,
+            placement.partition_key,
+            &mut constraint,
+        );
+        constraint
+    });
+    let partitions = placement
+        .partitions
+        .iter()
+        .filter(|partition| {
+            constraint
+                .as_ref()
+                .is_none_or(|constraint| partition_may_match(partition, constraint))
+        })
+        .map(|partition| {
+            let local_statistics = [TableAccessStatistics {
+                table_id,
+                statistics: partition.statistics,
+            }];
+            let selected = predicate.and_then(|predicate| {
+                choose_index_access(
+                    predicate,
+                    binding_id,
+                    table_id,
+                    table_name,
+                    columns,
+                    &local_statistics,
+                    &partition.access_paths,
+                )
+            });
+            let access = match selected {
+                Some(PhysicalPlan::IndexScan {
+                    index_column,
+                    access_path,
+                    key,
+                    ..
+                }) => PartitionAccessPlan::IndexScan {
+                    index_column,
+                    access_path,
+                    key,
+                },
+                Some(PhysicalPlan::RangeIndexScan {
+                    index_column,
+                    access_path,
+                    range,
+                    ..
+                }) => PartitionAccessPlan::RangeIndexScan {
+                    index_column,
+                    access_path,
+                    range,
+                },
+                _ => PartitionAccessPlan::SeqScan,
+            };
+            PartitionScanPlan {
+                partition_id: partition.partition_id,
+                storage_id: partition.storage_id,
+                access,
+            }
+        })
+        .collect();
+    PhysicalPlan::PartitionedScan {
+        binding_id,
+        table_id,
+        table_name: table_name.to_owned(),
+        columns: columns.to_vec(),
+        partition_key: placement.partition_key,
+        total_partitions: placement.partitions.len(),
+        partitions,
+    }
+}
+
+fn collect_partition_constraint(
+    expression: &Expr,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    column_id: ColumnId,
+    constraint: &mut PartitionConstraint,
+) {
+    let ExprKind::Binary {
+        operator,
+        left,
+        right,
+    } = &expression.kind
+    else {
+        if matches!(expression.kind, ExprKind::Unary { .. }) {
+            constraint.unsafe_boolean = true;
+        }
+        return;
+    };
+    match operator {
+        BinaryOp::And => {
+            collect_partition_constraint(left, binding_id, table_id, column_id, constraint);
+            collect_partition_constraint(right, binding_id, table_id, column_id, constraint);
+        }
+        BinaryOp::Or => constraint.unsafe_boolean = true,
+        BinaryOp::Eq => {
+            let equality = point_equality(left, right, binding_id, table_id, column_id)
+                .or_else(|| point_equality(right, left, binding_id, table_id, column_id));
+            if let Some((_, value)) = equality {
+                tighten_lower(&mut constraint.lower, IndexBound::Included(value.clone()));
+                tighten_upper(&mut constraint.upper, IndexBound::Included(value));
+            }
+        }
+        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+            if let Some((_, bound, is_lower)) =
+                comparison_bound(*operator, left, right, binding_id, table_id, column_id)
+            {
+                if is_lower {
+                    tighten_lower(&mut constraint.lower, bound);
+                } else {
+                    tighten_upper(&mut constraint.upper, bound);
+                }
+            }
+        }
+        BinaryOp::NotEq => {}
+    }
+}
+
+fn partition_may_match(
+    partition: &PartitionPlanningSnapshot,
+    constraint: &PartitionConstraint,
+) -> bool {
+    if constraint.unsafe_boolean {
+        return true;
+    }
+    let query_lower = constraint.lower.as_ref().and_then(bound_value);
+    let query_upper = constraint.upper.as_ref().and_then(bound_value);
+    let partition_lower = partition.lower.as_ref().map(|value| (value, true));
+    let partition_upper = partition.upper.as_ref().map(|value| (value, false));
+    let lower = strongest_lower(query_lower, partition_lower);
+    let upper = strongest_upper(query_upper, partition_upper);
+    integer_interval_nonempty(lower, upper)
+}
+
+fn strongest_lower<'a>(
+    left: Option<(&'a ScalarValue, bool)>,
+    right: Option<(&'a ScalarValue, bool)>,
+) -> Option<(&'a ScalarValue, bool)> {
+    match (left, right) {
+        (None, value) | (value, None) => value,
+        (Some(left), Some(right)) => match scalar_order(left.0, right.0)? {
+            Ordering::Less => Some(right),
+            Ordering::Greater => Some(left),
+            Ordering::Equal => Some((left.0, left.1 && right.1)),
+        },
+    }
+}
+
+fn strongest_upper<'a>(
+    left: Option<(&'a ScalarValue, bool)>,
+    right: Option<(&'a ScalarValue, bool)>,
+) -> Option<(&'a ScalarValue, bool)> {
+    match (left, right) {
+        (None, value) | (value, None) => value,
+        (Some(left), Some(right)) => match scalar_order(left.0, right.0)? {
+            Ordering::Less => Some(left),
+            Ordering::Greater => Some(right),
+            Ordering::Equal => Some((left.0, left.1 && right.1)),
+        },
+    }
+}
+
+fn integer_interval_nonempty(
+    lower: Option<(&ScalarValue, bool)>,
+    upper: Option<(&ScalarValue, bool)>,
+) -> bool {
+    match (lower, upper) {
+        (
+            Some((ScalarValue::Int64(lower), lower_included)),
+            Some((ScalarValue::Int64(upper), upper_included)),
+        ) => {
+            let minimum = if lower_included {
+                Some(*lower)
+            } else {
+                lower.checked_add(1)
+            };
+            let maximum = if upper_included {
+                Some(*upper)
+            } else {
+                upper.checked_sub(1)
+            };
+            minimum
+                .zip(maximum)
+                .is_some_and(|(minimum, maximum)| minimum <= maximum)
+        }
+        (
+            Some((ScalarValue::UInt64(lower), lower_included)),
+            Some((ScalarValue::UInt64(upper), upper_included)),
+        ) => {
+            let minimum = if lower_included {
+                Some(*lower)
+            } else {
+                lower.checked_add(1)
+            };
+            let maximum = if upper_included {
+                Some(*upper)
+            } else {
+                upper.checked_sub(1)
+            };
+            minimum
+                .zip(maximum)
+                .is_some_and(|(minimum, maximum)| minimum <= maximum)
+        }
+        (Some((ScalarValue::Int64(value), false)), None) => value.checked_add(1).is_some(),
+        (Some((ScalarValue::UInt64(value), false)), None) => value.checked_add(1).is_some(),
+        (None, Some((ScalarValue::Int64(value), false))) => value.checked_sub(1).is_some(),
+        (None, Some((ScalarValue::UInt64(value), false))) => value.checked_sub(1).is_some(),
+        (Some((ScalarValue::Int64(_), true)), None)
+        | (Some((ScalarValue::UInt64(_), true)), None)
+        | (None, Some((ScalarValue::Int64(_), true)))
+        | (None, Some((ScalarValue::UInt64(_), true)))
+        | (None, None) => true,
+        _ => true,
+    }
+}
+
+fn scalar_order(left: &ScalarValue, right: &ScalarValue) -> Option<Ordering> {
+    match (left, right) {
+        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => Some(left.cmp(right)),
+        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
 }
 
 fn choose_index_access(
@@ -1106,10 +1469,23 @@ pub fn plan_statement_with_statistics(
     table_statistics: &[TableAccessStatistics],
     access_paths: &[AccessPath],
 ) -> PhysicalStatement {
+    plan_statement_with_partition_snapshots(logical, table_statistics, access_paths, &[])
+}
+
+#[must_use]
+pub fn plan_statement_with_partition_snapshots(
+    logical: &LogicalStatement,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+) -> PhysicalStatement {
     match logical {
-        LogicalStatement::Query(query) => {
-            PhysicalStatement::Query(plan_with_statistics(query, table_statistics, access_paths))
-        }
+        LogicalStatement::Query(query) => PhysicalStatement::Query(plan_with_partition_snapshots(
+            query,
+            table_statistics,
+            access_paths,
+            range_tables,
+        )),
         LogicalStatement::Insert {
             table_id,
             table_name,
@@ -1124,12 +1500,12 @@ pub fn plan_statement_with_statistics(
             table_id,
             assignments,
         } => PhysicalStatement::Update {
-            input: plan_raw_with_statistics(input, table_statistics, access_paths),
+            input: plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
             table_id: *table_id,
             assignments: assignments.clone(),
         },
         LogicalStatement::Delete { input, table_id } => PhysicalStatement::Delete {
-            input: plan_raw_with_statistics(input, table_statistics, access_paths),
+            input: plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
             table_id: *table_id,
         },
     }
@@ -2577,7 +2953,8 @@ mod tests {
         match plan {
             PhysicalPlan::SeqScan { columns, .. }
             | PhysicalPlan::IndexScan { columns, .. }
-            | PhysicalPlan::RangeIndexScan { columns, .. } => columns,
+            | PhysicalPlan::RangeIndexScan { columns, .. }
+            | PhysicalPlan::PartitionedScan { columns, .. } => columns,
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Project { input, .. }
