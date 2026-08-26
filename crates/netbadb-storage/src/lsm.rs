@@ -316,6 +316,21 @@ struct Manifest {
 }
 
 #[derive(Debug)]
+enum ManifestPublishError {
+    BeforeInstall(StorageError),
+    InstalledButUnsynced {
+        manifest: Box<Manifest>,
+        source: StorageError,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestPublishPoint {
+    BeforeInstall,
+    AfterInstall,
+}
+
+#[derive(Debug)]
 struct Runtime {
     writer: Cell<Option<TxnId>>,
     recovery_required: Cell<bool>,
@@ -572,6 +587,7 @@ impl LsmStorage {
         }
         let (mut wal, records) = LsmWal::open(&root, manifest.storage_id, manifest.wal_generation)?;
         let recovered = analyze_wal(&records)?;
+        validate_recovered_transactions(&recovered, &manifest, &table)?;
         let prepared = classify_prepared(&recovered);
         validate_resolutions(&prepared, resolutions)?;
         let mut memtable = BTreeMap::new();
@@ -614,7 +630,6 @@ impl LsmStorage {
                 let mutations = transaction.mutations.as_ref().ok_or(LsmError::InvalidWal(
                     "committed transaction has no mutation batch",
                 ))?;
-                validate_recovered_mutations(mutations, &manifest, &table)?;
                 apply_mutations(&mut memtable, mutations, commit)?;
                 max_commit = max_commit.max(commit.0);
             }
@@ -670,9 +685,9 @@ impl LsmStorage {
     ) -> Result<LsmRecoveryInspection, StorageError> {
         let manifest = read_manifest(root.as_ref())?;
         validate_manifest_schema(&manifest, table)?;
-        let (_, records) =
-            LsmWal::open(root.as_ref(), manifest.storage_id, manifest.wal_generation)?;
+        let records = LsmWal::inspect(root.as_ref(), manifest.storage_id, manifest.wal_generation)?;
         let recovered = analyze_wal(&records)?;
+        validate_recovered_transactions(&recovered, &manifest, table)?;
         Ok(LsmRecoveryInspection {
             storage_id: manifest.storage_id,
             prepared_transactions: classify_prepared(&recovered),
@@ -1070,11 +1085,11 @@ impl LsmStorage {
         // though it has no disk page, so include row work rather than claiming
         // an unrealistically constant one-block full scan.
         let sequential_work = blocks.max(row_count.saturating_add(1));
-        shared.table_statistics = Some(TableStatistics {
+        let table_statistics = Some(TableStatistics {
             row_count,
             managed_page_count: sequential_work,
         });
-        shared.access_statistics = Some(IndexStatistics {
+        let access_statistics = Some(IndexStatistics {
             distinct_non_null_keys: u64::try_from(distinct)
                 .map_err(|_| StorageError::CountOverflow)?,
             null_count: 0,
@@ -1083,16 +1098,20 @@ impl LsmStorage {
             // each immutable table adds one prunable seek candidate.
             tree_height: u32::try_from(shared.sstables.len()).unwrap_or(u32::MAX),
         });
-        shared.manifest.clustering_statistics = match (rows.first(), rows.last()) {
+        let clustering_statistics = match (rows.first(), rows.last()) {
             (Some(first), Some(last)) => Some((first.key.clustering, last.key.clustering)),
             (None, None) => None,
             _ => return Err(LsmError::InvalidManifest("ANALYZE key bounds differ").into()),
         };
-        shared.manifest.table_statistics = shared.table_statistics;
-        shared.manifest.access_statistics = shared.access_statistics;
-        let root = shared.root.clone();
-        publish_manifest(&root, &mut shared.manifest)?;
-        Ok(())
+        let mut candidate = shared.manifest.clone();
+        candidate.clustering_statistics = clustering_statistics;
+        candidate.table_statistics = table_statistics;
+        candidate.access_statistics = access_statistics;
+        let result = publish_manifest(&shared.root, candidate);
+        let outcome = finish_manifest_publish(&mut shared, result);
+        shared.table_statistics = shared.manifest.table_statistics;
+        shared.access_statistics = shared.manifest.access_statistics;
+        outcome
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
@@ -1215,6 +1234,7 @@ impl LsmTransaction {
     }
 
     pub fn commit(&mut self) -> Result<(), StorageError> {
+        self.ensure_recovery_not_required()?;
         let commit_seq = match self.state {
             TransactionState::Active => {
                 if !self.owns_writer {
@@ -1224,12 +1244,15 @@ impl LsmTransaction {
                 }
                 let batch = self.canonical_batch()?;
                 let mut shared = self.shared.borrow_mut();
+                // Reserve before the first complete WAL record is appended. If
+                // manifest publication fails, the transaction remains Active
+                // without a durable batch that a retry could duplicate.
+                let commit_seq = LsmCommitSeq(shared.allocate_commit_seq()?);
                 let batch_lsn = shared.wal.append(&WalRecord::MutationBatch {
                     txn_id: self.id,
                     mutations: batch.clone(),
                 })?;
                 self.last_lsn = batch_lsn;
-                let commit_seq = LsmCommitSeq(shared.allocate_commit_seq()?);
                 self.durable_batch = Some(batch);
                 self.pending_commit_seq = Some(commit_seq);
                 self.state = TransactionState::CommitPending;
@@ -1278,6 +1301,7 @@ impl LsmTransaction {
     }
 
     pub fn prepare(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        self.ensure_recovery_not_required()?;
         if database_txn_id.0 == 0 {
             return Err(TransactionError::InvalidDatabaseTxnId.into());
         }
@@ -1338,6 +1362,7 @@ impl LsmTransaction {
     }
 
     pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        self.ensure_recovery_not_required()?;
         self.validate_database_txn(database_txn_id)?;
         let commit_seq = match self.state {
             TransactionState::Prepared => {
@@ -1387,6 +1412,7 @@ impl LsmTransaction {
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
+        self.ensure_recovery_not_required()?;
         self.validate_database_txn(database_txn_id)?;
         if self.state == TransactionState::RolledBack {
             return Ok(());
@@ -1455,7 +1481,15 @@ impl LsmTransaction {
         Ok(())
     }
 
+    fn ensure_recovery_not_required(&self) -> Result<(), StorageError> {
+        if self.shared.borrow().runtime.recovery_required.get() {
+            return Err(TransactionError::RecoveryRequired.into());
+        }
+        Ok(())
+    }
+
     fn acquire_writer(&mut self) -> Result<(), StorageError> {
+        self.ensure_recovery_not_required()?;
         if self.owns_writer {
             return Ok(());
         }
@@ -1471,9 +1505,6 @@ impl LsmTransaction {
             }
         }
         let shared = self.shared.borrow();
-        if shared.runtime.recovery_required.get() {
-            return Err(TransactionError::RecoveryRequired.into());
-        }
         match shared.runtime.writer.get() {
             None => {
                 shared.runtime.writer.set(Some(self.id));
@@ -1764,13 +1795,14 @@ fn reserve_if_needed(shared: &mut LsmShared, kind: AllocatorKind) -> Result<(), 
             AllocatorKind::Txn => "transaction ID",
             AllocatorKind::Commit => "commit sequence",
         }))?;
+    let mut candidate = shared.manifest.clone();
     match kind {
-        AllocatorKind::Row => shared.manifest.row_reservation_end = new_end,
-        AllocatorKind::Txn => shared.manifest.txn_reservation_end = new_end,
-        AllocatorKind::Commit => shared.manifest.commit_reservation_end = new_end,
+        AllocatorKind::Row => candidate.row_reservation_end = new_end,
+        AllocatorKind::Txn => candidate.txn_reservation_end = new_end,
+        AllocatorKind::Commit => candidate.commit_reservation_end = new_end,
     }
-    publish_manifest(&shared.root, &mut shared.manifest)?;
-    Ok(())
+    let result = publish_manifest(&shared.root, candidate);
+    finish_manifest_publish(shared, result)
 }
 
 fn new_read_view(
@@ -1859,6 +1891,19 @@ fn apply_mutations(
             .insert(version, value.clone());
         if replaced.as_ref().is_some_and(|previous| previous != &value) {
             return Err(LsmError::InvalidWal("same key/version has conflicting mutations").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovered_transactions(
+    recovered: &BTreeMap<TxnId, RecoveredTxn>,
+    manifest: &Manifest,
+    table: &TableDef,
+) -> Result<(), StorageError> {
+    for transaction in recovered.values() {
+        if let Some(mutations) = &transaction.mutations {
+            validate_recovered_mutations(mutations, manifest, table)?;
         }
     }
     Ok(())
@@ -2282,42 +2327,90 @@ fn write_manifest_initial(root: &Path, manifest: &Manifest) -> Result<(), Storag
     Ok(())
 }
 
-fn publish_manifest(root: &Path, manifest: &mut Manifest) -> Result<(), StorageError> {
+fn publish_manifest(root: &Path, mut manifest: Manifest) -> Result<Manifest, ManifestPublishError> {
     manifest.generation = manifest
         .generation
         .checked_add(1)
-        .ok_or(LsmError::AllocatorExhausted("manifest generation"))?;
-    let bytes = encode_manifest(manifest)?;
+        .ok_or(LsmError::AllocatorExhausted("manifest generation"))
+        .map_err(StorageError::from)
+        .map_err(ManifestPublishError::BeforeInstall)?;
+    let bytes = encode_manifest(&manifest).map_err(ManifestPublishError::BeforeInstall)?;
     let next = manifest_next_path(root);
     match OpenOptions::new().write(true).create_new(true).open(&next) {
         Ok(mut file) => {
-            file.write_all(&bytes)?;
+            file.write_all(&bytes)
+                .map_err(StorageError::from)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             #[cfg(test)]
             maybe_lsm_crash("during-manifest-write");
-            file.sync_all()?;
+            file.sync_all()
+                .map_err(StorageError::from)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             #[cfg(test)]
             maybe_lsm_crash("after-manifest-write");
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            fs::remove_file(&next)?;
+            fs::remove_file(&next)
+                .map_err(StorageError::from)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&next)?;
-            file.write_all(&bytes)?;
+                .open(&next)
+                .map_err(StorageError::from)
+                .map_err(ManifestPublishError::BeforeInstall)?;
+            file.write_all(&bytes)
+                .map_err(StorageError::from)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             #[cfg(test)]
             maybe_lsm_crash("during-manifest-write");
-            file.sync_all()?;
+            file.sync_all()
+                .map_err(StorageError::from)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             #[cfg(test)]
             maybe_lsm_crash("after-manifest-write");
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(ManifestPublishError::BeforeInstall(error.into()));
+        }
     }
-    fs::rename(&next, manifest_path(root))?;
-    sync_directory(root)?;
+    maybe_fail_manifest_publish(ManifestPublishPoint::BeforeInstall)
+        .map_err(ManifestPublishError::BeforeInstall)?;
+    fs::rename(&next, manifest_path(root))
+        .map_err(StorageError::from)
+        .map_err(ManifestPublishError::BeforeInstall)?;
+    if let Err(source) = maybe_fail_manifest_publish(ManifestPublishPoint::AfterInstall)
+        .and_then(|()| sync_directory(root))
+    {
+        return Err(ManifestPublishError::InstalledButUnsynced {
+            manifest: Box::new(manifest),
+            source,
+        });
+    }
     #[cfg(test)]
     maybe_lsm_crash("after-manifest-sync");
-    Ok(())
+    Ok(manifest)
+}
+
+fn finish_manifest_publish(
+    shared: &mut LsmShared,
+    result: Result<Manifest, ManifestPublishError>,
+) -> Result<(), StorageError> {
+    match result {
+        Ok(manifest) => {
+            shared.manifest = manifest;
+            Ok(())
+        }
+        Err(ManifestPublishError::BeforeInstall(error)) => Err(error),
+        Err(ManifestPublishError::InstalledButUnsynced { manifest, source }) => {
+            // The rename is visible, but its directory entry may not survive a
+            // crash. Keep both generations and require reopen before any more
+            // writes can depend on which manifest generation wins.
+            shared.manifest = *manifest;
+            shared.runtime.recovery_required.set(true);
+            Err(source)
+        }
+    }
 }
 
 fn read_manifest(root: &Path) -> Result<Manifest, StorageError> {
@@ -2409,6 +2502,25 @@ impl LsmWal {
             },
             records,
         ))
+    }
+
+    fn inspect(
+        root: &Path,
+        storage_id: StorageId,
+        generation: u64,
+    ) -> Result<Vec<WalRecord>, StorageError> {
+        let mut file = File::open(wal_path(root, generation))?;
+        let mut header = [0_u8; WAL_HEADER_SIZE];
+        file.read_exact(&mut header).map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                StorageError::from(LsmError::InvalidWal("header is truncated"))
+            } else {
+                error.into()
+            }
+        })?;
+        decode_wal_header(&header, storage_id, generation)?;
+        let (records, _) = decode_wal_records(&mut file, storage_id)?;
+        Ok(records)
     }
 
     fn append(&mut self, record: &WalRecord) -> Result<Lsn, StorageError> {
@@ -2998,7 +3110,8 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
         })
         .collect::<Vec<_>>();
     let id = shared.manifest.next_sstable_id;
-    shared.manifest.next_sstable_id = id
+    let mut candidate = shared.manifest.clone();
+    candidate.next_sstable_id = id
         .checked_add(1)
         .ok_or(LsmError::AllocatorExhausted("SSTable ID"))?;
     let sstable = write_sstable(
@@ -3015,14 +3128,41 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
         .checked_add(1)
         .ok_or(LsmError::AllocatorExhausted("WAL generation"))?;
     let new_wal = LsmWal::create(&shared.root, shared.manifest.storage_id, new_wal_generation)?;
-    let old_wal = std::mem::replace(&mut shared.wal, new_wal);
-    shared.manifest.wal_generation = new_wal_generation;
-    shared.manifest.sstables.push(sstable.reference.clone());
-    if let Err(error) = publish_manifest(&shared.root, &mut shared.manifest) {
-        shared.wal = old_wal;
-        shared.manifest.wal_generation = old_wal_generation;
-        shared.manifest.sstables.pop();
+    if let Err(error) = sync_directory(&shared.root) {
+        drop(new_wal);
+        if let Err(cleanup) = remove_unreferenced_file(&sstable.path)
+            .and_then(|()| remove_unreferenced_file(&wal_path(&shared.root, new_wal_generation)))
+        {
+            shared.runtime.recovery_required.set(true);
+            return Err(cleanup);
+        }
         return Err(error);
+    }
+    let old_wal = std::mem::replace(&mut shared.wal, new_wal);
+    candidate.wal_generation = new_wal_generation;
+    candidate.sstables.push(sstable.reference.clone());
+    match publish_manifest(&shared.root, candidate) {
+        Ok(manifest) => shared.manifest = manifest,
+        Err(ManifestPublishError::BeforeInstall(error)) => {
+            let new_wal = std::mem::replace(&mut shared.wal, old_wal);
+            drop(new_wal);
+            if let Err(cleanup) = remove_unreferenced_file(&sstable.path).and_then(|()| {
+                remove_unreferenced_file(&wal_path(&shared.root, new_wal_generation))
+            }) {
+                shared.runtime.recovery_required.set(true);
+                return Err(cleanup);
+            }
+            return Err(error);
+        }
+        Err(ManifestPublishError::InstalledButUnsynced { manifest, source }) => {
+            shared.manifest = *manifest;
+            shared.sstables.push(sstable);
+            shared.memtable.clear();
+            shared.memtable_bytes = 0;
+            shared.runtime.recovery_required.set(true);
+            drop(old_wal);
+            return Err(source);
+        }
     }
     shared.sstables.push(sstable);
     shared.memtable.clear();
@@ -3076,13 +3216,13 @@ fn compact_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
         })
         .collect::<Vec<_>>();
     let old_sstables = shared.sstables.clone();
-    if entries.is_empty() {
-        shared.manifest.sstables.clear();
-        publish_manifest(&shared.root, &mut shared.manifest)?;
-        shared.sstables.clear();
+    let mut candidate = shared.manifest.clone();
+    let output = if entries.is_empty() {
+        candidate.sstables.clear();
+        None
     } else {
         let id = shared.manifest.next_sstable_id;
-        shared.manifest.next_sstable_id = id
+        candidate.next_sstable_id = id
             .checked_add(1)
             .ok_or(LsmError::AllocatorExhausted("SSTable ID"))?;
         let output = write_sstable(
@@ -3093,9 +3233,29 @@ fn compact_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
             &entries,
             &shared.table,
         )?;
-        shared.manifest.sstables = vec![output.reference.clone()];
-        publish_manifest(&shared.root, &mut shared.manifest)?;
-        shared.sstables = vec![output];
+        candidate.sstables = vec![output.reference.clone()];
+        Some(output)
+    };
+    match publish_manifest(&shared.root, candidate) {
+        Ok(manifest) => {
+            shared.manifest = manifest;
+            shared.sstables = output.into_iter().collect();
+        }
+        Err(ManifestPublishError::BeforeInstall(error)) => {
+            if let Some(output) = output {
+                if let Err(cleanup) = remove_unreferenced_file(&output.path) {
+                    shared.runtime.recovery_required.set(true);
+                    return Err(cleanup);
+                }
+            }
+            return Err(error);
+        }
+        Err(ManifestPublishError::InstalledButUnsynced { manifest, source }) => {
+            shared.manifest = *manifest;
+            shared.sstables = output.into_iter().collect();
+            shared.runtime.recovery_required.set(true);
+            return Err(source);
+        }
     }
     for old in old_sstables {
         if !shared
@@ -3115,6 +3275,14 @@ fn compact_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
     sync_directory(&shared.root.join(SST_DIR_NAME))?;
     cleanup_orphans(shared)?;
     Ok(())
+}
+
+fn remove_unreferenced_file(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn cleanup_orphans(shared: &LsmShared) -> Result<(), StorageError> {
@@ -3967,6 +4135,28 @@ pub fn fuzz_lsm_sstable_block_bytes(bytes: &[u8]) {
 }
 
 #[cfg(test)]
+thread_local! {
+    static MANIFEST_PUBLISH_FAILURE: Cell<Option<ManifestPublishPoint>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_fail_manifest_publish(point: ManifestPublishPoint) -> Result<(), StorageError> {
+    MANIFEST_PUBLISH_FAILURE.with(|failure| {
+        if failure.get() == Some(point) {
+            failure.set(None);
+            Err(io::Error::other("injected LSM manifest publish failure").into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn maybe_fail_manifest_publish(_point: ManifestPublishPoint) -> Result<(), StorageError> {
+    Ok(())
+}
+
+#[cfg(test)]
 fn maybe_lsm_crash(point: &str) {
     if std::env::var_os("NETBADB_LSM_CRASH_CHILD").as_deref() == Some(std::ffi::OsStr::new("1"))
         && std::env::var_os("NETBADB_LSM_CRASH_POINT").as_deref()
@@ -3980,7 +4170,9 @@ fn maybe_lsm_crash(point: &str) {
 mod tests {
     use netbadb_index::{IndexBound, IndexRange};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, DatabaseTxnId, PhysicalType, ScalarValue, StorageId, TableId};
+    use netbadb_types::{
+        ColumnId, DatabaseTxnId, LsmRowId, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
+    };
 
     use super::{LsmObservedVersion, LsmStorage};
     use crate::{
@@ -4270,6 +4462,159 @@ mod tests {
         );
         drop(view);
         reopened.close().expect("close reopened");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn manifest_reservation_failure_leaves_no_batch_and_commit_retry_is_canonical() {
+        let root = root("manifest-reservation-retry");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let mut transaction = storage.begin_transaction().expect("transaction");
+        storage
+            .insert_in(&mut transaction, &row(1, "retry"))
+            .expect("insert");
+        let old_reservation = {
+            let mut shared = transaction.shared.borrow_mut();
+            let end = shared.manifest.commit_reservation_end;
+            shared.next_commit_seq = end;
+            end
+        };
+        super::MANIFEST_PUBLISH_FAILURE.with(|failure| {
+            failure.set(Some(super::ManifestPublishPoint::BeforeInstall));
+        });
+        assert!(transaction.commit().is_err());
+        assert_eq!(transaction.state(), TransactionState::Active);
+        assert_eq!(
+            transaction.shared.borrow().manifest.commit_reservation_end,
+            old_reservation
+        );
+        let manifest = super::read_manifest(&root).expect("manifest");
+        let records = super::LsmWal::inspect(&root, manifest.storage_id, manifest.wal_generation)
+            .expect("inspect WAL");
+        assert!(records.is_empty(), "failed reservation wrote a WAL batch");
+
+        transaction.commit().expect("retry commit");
+        let manifest = super::read_manifest(&root).expect("published manifest");
+        let records = super::LsmWal::inspect(&root, manifest.storage_id, manifest.wal_generation)
+            .expect("inspect retried WAL");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, super::WalRecord::MutationBatch { .. }))
+                .count(),
+            1
+        );
+        drop(transaction);
+        storage.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn uncertain_manifest_install_requires_reopen_and_preserves_rows() {
+        let root = root("manifest-uncertain");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.insert(&row(1, "durable")).expect("insert");
+        super::MANIFEST_PUBLISH_FAILURE.with(|failure| {
+            failure.set(Some(super::ManifestPublishPoint::AfterInstall));
+        });
+        assert!(storage.flush().is_err());
+        assert!(storage.shared.borrow().runtime.recovery_required.get());
+        assert!(matches!(
+            storage.insert(&row(2, "blocked")),
+            Err(StorageError::Transaction(
+                crate::TransactionError::RecoveryRequired
+            ))
+        ));
+        drop(storage);
+
+        let mut reopened = LsmStorage::open(&root, table()).expect("reopen uncertain publish");
+        let view = reopened.read_view().expect("view");
+        assert_eq!(
+            reopened
+                .scan_columns_with_view(&[ColumnId(1)], &view)
+                .expect("scan")
+                .len(),
+            1
+        );
+        drop(view);
+        reopened.close().expect("close reopened");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn recovery_inspection_does_not_truncate_a_crash_tail() {
+        use std::io::Write as _;
+
+        let root = root("recovery-inspection-read-only");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.insert(&row(1, "wal")).expect("insert");
+        drop(storage);
+        let manifest = super::read_manifest(&root).expect("manifest");
+        let wal_path = super::wal_path(&root, manifest.wal_generation);
+        let valid_length = std::fs::metadata(&wal_path).expect("WAL metadata").len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .expect("open WAL tail");
+        file.write_all(&[1, 2, 3]).expect("append crash tail");
+        file.sync_all().expect("sync crash tail");
+        drop(file);
+        let tailed_length = valid_length + 3;
+
+        LsmStorage::inspect_recovery(&root, &table()).expect("inspect recovery");
+        assert_eq!(
+            std::fs::metadata(&wal_path)
+                .expect("inspected WAL metadata")
+                .len(),
+            tailed_length
+        );
+        let reopened = LsmStorage::open(&root, table()).expect("open truncates tail");
+        assert_eq!(
+            std::fs::metadata(&wal_path)
+                .expect("recovered WAL metadata")
+                .len(),
+            valid_length
+        );
+        drop(reopened);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn aborted_wal_batches_still_require_schema_valid_rows() {
+        let root = root("aborted-wal-row-validation");
+        cleanup(&root);
+        let storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        drop(storage);
+        let manifest = super::read_manifest(&root).expect("manifest");
+        let (mut wal, records) =
+            super::LsmWal::open(&root, manifest.storage_id, manifest.wal_generation)
+                .expect("open WAL");
+        assert!(records.is_empty());
+        let mut invalid_row = super::encode_row(&row(1, "x")).expect("encode row");
+        *invalid_row.last_mut().expect("text byte") = 0xff;
+        wal.append(&super::WalRecord::MutationBatch {
+            txn_id: TxnId(1),
+            mutations: vec![super::WalMutation::Put {
+                key: super::PhysicalKey {
+                    clustering: super::ClusteringKey::Int64(1),
+                    row_id: LsmRowId(1),
+                },
+                row: invalid_row,
+            }],
+        })
+        .expect("append invalid batch");
+        wal.append(&super::WalRecord::Abort { txn_id: TxnId(1) })
+            .expect("append abort");
+        wal.sync().expect("sync invalid batch");
+        drop(wal);
+
+        assert!(matches!(
+            LsmStorage::open(&root, table()),
+            Err(StorageError::Codec(crate::CodecError::TextNotUtf8))
+        ));
         cleanup(&root);
     }
 
