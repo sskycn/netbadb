@@ -20,6 +20,18 @@ pub struct AccessPathCapabilities {
     pub ordered: bool,
 }
 
+/// Storage-neutral integer costs supplied by an access method.
+///
+/// These are planning work units, not physical page identities. Engines may
+/// derive them from trees, levels, filters, or another persistent layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessCostHints {
+    pub point_probe_base_cost: u32,
+    pub expected_point_io: u32,
+    pub range_startup_cost: u32,
+    pub sequential_unit_cost: u32,
+}
+
 /// One registered single-column access capability available to physical planning.
 ///
 /// Callers preserve registration order in the slice. The planner receives
@@ -32,6 +44,7 @@ pub struct AccessPath {
     pub id: AccessPathId,
     pub capabilities: AccessPathCapabilities,
     pub statistics: Option<IndexStatistics>,
+    pub cost_hints: Option<AccessCostHints>,
 }
 
 /// Optional optimizer snapshot for one table visible to physical planning.
@@ -1050,7 +1063,12 @@ fn choose_index_access(
                 let Some(index) = candidate.access_path.statistics.as_ref() else {
                     continue;
                 };
-                let Some(cost) = candidate_cost(table, index, &candidate.lookup) else {
+                let Some(cost) = candidate_cost(
+                    table,
+                    index,
+                    candidate.access_path.cost_hints.as_ref(),
+                    &candidate.lookup,
+                ) else {
                     continue;
                 };
                 if best.is_none_or(|(_, best_cost)| cost < best_cost) {
@@ -1109,6 +1127,7 @@ fn seq_scan_cost(statistics: &TableStatistics) -> u128 {
 fn candidate_cost(
     table: &TableStatistics,
     index: &IndexStatistics,
+    hints: Option<&AccessCostHints>,
     candidate: &IndexLookupCandidate,
 ) -> Option<u128> {
     let estimated_matches = match candidate {
@@ -1118,6 +1137,16 @@ fn candidate_cost(
             ..
         } => estimate_range_rows(table, index, *possible_integer_keys)?,
     };
+    if let Some(hints) = hints {
+        let startup = match candidate {
+            IndexLookupCandidate::Point { .. } => {
+                u128::from(hints.point_probe_base_cost) + u128::from(hints.expected_point_io)
+            }
+            IndexLookupCandidate::Range { .. } => u128::from(hints.range_startup_cost),
+        };
+        return startup
+            .checked_add(estimated_matches.checked_mul(u128::from(hints.sequential_unit_cost))?);
+    }
     Some(1 + u128::from(index.tree_height) + estimated_matches)
 }
 
@@ -1516,9 +1545,9 @@ pub fn plan_statement_with_partition_snapshots(
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessPath, AccessPathCapabilities, PhysicalPlan, PhysicalStatement, TableAccessStatistics,
-        plan, plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
-        plan_with_access_paths, plan_with_statistics,
+        AccessCostHints, AccessPath, AccessPathCapabilities, PhysicalPlan, PhysicalStatement,
+        TableAccessStatistics, plan, plan_statement, plan_statement_with_access_paths,
+        plan_statement_with_statistics, plan_with_access_paths, plan_with_statistics,
     };
     use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
@@ -2163,6 +2192,7 @@ mod tests {
                 ordered: true,
             },
             statistics: None,
+            cost_hints: None,
         }
     }
 
@@ -2728,6 +2758,35 @@ mod tests {
         assert!(matches!(
             index_scan_input(&duplicate_heavy),
             Some(PhysicalPlan::SeqScan { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_neutral_cost_hints_adjust_point_probe_cost() {
+        let id = test_column(1, "id", false);
+        let logical = filtered_scan(
+            binary(
+                BinaryOp::Eq,
+                column_expr(&id),
+                literal(ScalarValue::Int64(7)),
+            ),
+            vec![id],
+        );
+        let table = [analyzed_table(100, 5)];
+        let mut path = analyzed_path(1, 40, 100, 0, 10);
+        assert!(matches!(
+            index_scan_input(&plan_with_statistics(&logical, &table, &[path.clone()])),
+            Some(PhysicalPlan::SeqScan { .. })
+        ));
+        path.cost_hints = Some(AccessCostHints {
+            point_probe_base_cost: 1,
+            expected_point_io: 1,
+            range_startup_cost: 2,
+            sequential_unit_cost: 1,
+        });
+        assert!(matches!(
+            index_scan_input(&plan_with_statistics(&logical, &table, &[path])),
+            Some(PhysicalPlan::IndexScan { .. })
         ));
     }
 

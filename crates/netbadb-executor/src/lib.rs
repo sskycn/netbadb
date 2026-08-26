@@ -3622,6 +3622,7 @@ mod tests {
                     null_count: 0,
                     tree_height: 2,
                 }),
+                cost_hints: None,
             }],
         );
         let PhysicalPlan::Filter { input, .. } = &range_plan else {

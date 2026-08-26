@@ -1180,7 +1180,24 @@ compression, background work, secondary LSM index, or LSM range partitions.
 Range partition physical layout remains Heap-only; heterogeneous partitions
 remain unsupported.
 
-The next recommended phase is **LSM Hardening — Bloom Filters + Multi-Level
-Compaction**. The new block/sparse-index and manifest boundaries now provide
-the concrete measured surface for reducing negative point-read work and write
-amplification before expanding executor architecture.
+## LSM Hardening — Bloom Filters + Multi-Level Compaction (complete)
+
+- upgraded experimental Manifest and SSTable formats to v2 while retaining LSM
+  WAL v1 and explicitly rejecting old LSM files;
+- added deterministic L0-L3 leveled compaction, stable overlap closure,
+  clustering-group output splitting, and manifest-atomic multi-output publish;
+- added stable checksummed per-SSTable clustering-key Bloom filters containing
+  puts, tombstones, duplicates, and historical versions;
+- replaced all-SST materialization with bounded block cursors and a streaming
+  k-way merge, with binary-searched L1+ point/range routing;
+- separated history-preserving regular compaction from quiescent full-history
+  version/tombstone GC;
+- exposed structural level/Bloom inspection, runtime read/write amplification
+  counters, and storage-neutral integer access cost hints without planner
+  storage-kind matching;
+- retained manifest authority, canonical WAL retry, all-batch recovery
+  validation, and truly read-only recovery inspection.
+
+The next recommended phase is **Vectorized Execution Foundation**. Heap and LSM
+now provide mature, distinct physical storage paths; the next shared bottleneck
+should be measured above the storage boundary before adding Columnar storage.

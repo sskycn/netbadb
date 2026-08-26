@@ -57,7 +57,7 @@ deterministic StorageRegistry
 TableStorage capability boundary
     ↓
 Heap row layout + registered B+Tree access methods
-or LSM MemTable + LSM WAL + immutable L0/L1 SSTables
+or LSM MemTable + LSM WAL + Bloom-bearing immutable L0-L3 SSTables
     ↓
 Database coordinator + physical transaction lifecycle + versioned WAL
     ↓
@@ -753,6 +753,11 @@ The implementation sequence is intentionally vertical:
     Manifest/WAL/SSTable v1 formats, MVCC and read-your-writes, ordered
     point/range access, synchronous flush and L0/L1 compaction, and mixed
     Heap+LSM atomic recovery through the existing coordinator boundary.
+54. LSM Hardening — complete; Manifest/SSTable v2 add bounded L0-L3 leveled
+    metadata, stable per-SSTable clustering-key Bloom filters, deterministic
+    overlap-closure compaction, split outputs, streaming multi-level reads,
+    quiescent full-history GC, amplification counters, and storage-neutral
+    access cost hints. LSM WAL v1 remains unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items.
@@ -762,8 +767,9 @@ durable coordinator byte layout is specified in
 [`docs/coordinator-log-v1.md`](docs/coordinator-log-v1.md).
 The range metadata layout is specified in
 [`docs/partition-catalog-v1.md`](docs/partition-catalog-v1.md).
-The LSM persistent formats and recovery rules are specified in
-[`docs/lsm-format-v1.md`](docs/lsm-format-v1.md).
+The current LSM persistent formats and recovery rules are specified in
+[`docs/lsm-format-v2.md`](docs/lsm-format-v2.md); the rejected experimental v1
+contract remains documented in [`docs/lsm-format-v1.md`](docs/lsm-format-v1.md).
 
 ## License
 

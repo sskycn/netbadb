@@ -963,7 +963,11 @@ TableStorage capability API
     └─ TableStorage::Lsm(LsmStorage)
            ├─ ordered MemTable + transaction-local overlay
            ├─ LSM WAL v1
-           └─ immutable L0/L1 SSTables selected by Manifest v1
+           └─ Manifest v2 selects Bloom-bearing immutable SSTables
+                    ├─ L0 overlapping
+                    ├─ L1 non-overlapping
+                    ├─ L2 non-overlapping
+                    └─ L3 non-overlapping
 ```
 
 `netbadb-storage` keeps the boundaries concrete and small:
@@ -991,9 +995,19 @@ TableStorage capability API
   keep each engine's MVCC and durability state below the boundary.
 - `Database::storage_kind` and `Database::inspect_lsm_storage` expose embedded,
   read-only physical inspection including clustering identity, MemTable/SSTable
-  entries, L0/L1 counts, and last-`ANALYZE` row/min/max statistics. Deployment
+  entries, per-level counts/bytes, Bloom bytes, amplification counters, and
+  last-`ANALYZE` row/min/max statistics. Deployment
   manifest v4 still bootstraps Heap only, so the offline CLI and Inspection JSON
   v4 remain unchanged; LSM CLI/server bootstrap is deliberately deferred.
+
+LSM maintenance is synchronous and quiescent. `compact()` deterministically
+drives L0-count and L1/L2-size triggers, selects complete source/target overlap
+closure, preserves every MVCC version and tombstone, and atomically publishes
+all split outputs. `compact_full()` covers every level and is the only path
+that removes superseded history or tombstones. Per-SSTable Bloom filters index
+all represented clustering keys, including tombstones; point reads use range
+routing then Bloom, while range reads use range/block metadata only. Both feed
+a bounded block-at-a-time k-way merge.
 - The capability API covers projected scans, point/range access, borrowed
   row visitors, presence summaries, and mutation. Heap dispatch delegates
   directly to its validated-once selective/borrowed implementations, so direct
@@ -1316,6 +1330,13 @@ context. Entries contain table/column identity, opaque table-scoped
 pure `netbadb-index` domain crate for typed ranges and statistics, not on
 `netbadb-storage`, and receives no BTreeHandle, PageId, WAL, buffer, or catalog
 representation.
+
+An access path may additionally provide storage-neutral integer cost hints:
+point-probe base work, expected point I/O, range startup work, and sequential
+work per estimated match. Heap keeps the historical height-based default. LSM
+derives hints from overlapping L0 files, nonempty L1+ levels, and a fixed
+conservative Bloom false-positive expectation. The planner does not match
+`StorageKind`, read Bloom bits, or perform storage I/O.
 
 For a Filter directly above a Scan, point access recognizes
 `indexed_column = non-NULL literal`, its commuted form, and nullable-column

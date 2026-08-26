@@ -5,7 +5,7 @@
 //! immutable SSTables through a checksummed manifest generation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -27,9 +27,10 @@ use crate::{
     StorageError, TransactionError, TransactionState,
 };
 
-pub const LSM_MANIFEST_FORMAT_VERSION: u16 = 1;
+pub const LSM_MANIFEST_FORMAT_VERSION: u16 = 2;
 pub const LSM_WAL_FORMAT_VERSION: u16 = 1;
-pub const LSM_SSTABLE_FORMAT_VERSION: u16 = 1;
+pub const LSM_SSTABLE_FORMAT_VERSION: u16 = 2;
+pub const LSM_MAX_LEVELS: u8 = 4;
 pub const LSM_MAX_PENDING_TRANSACTION_BYTES: u64 = 16 * 1024 * 1024;
 pub const LSM_MAX_PENDING_MUTATIONS: u64 = 65_536;
 pub const DEFAULT_LSM_MEMTABLE_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
@@ -39,19 +40,32 @@ const WAL_MAGIC: &[u8; 4] = b"NBLW";
 const WAL_RECORD_MAGIC: &[u8; 4] = b"NBLR";
 const SST_MAGIC: &[u8; 4] = b"NBLS";
 const SST_BLOCK_MAGIC: &[u8; 4] = b"NBLB";
+const SST_FOOTER_MAGIC: &[u8; 4] = b"NBLF";
 const MANIFEST_NAME: &str = "MANIFEST";
 const MANIFEST_NEXT_NAME: &str = "MANIFEST.next";
 const SST_DIR_NAME: &str = "sst";
 const MANIFEST_FIXED_SIZE: usize = 176;
-const MANIFEST_ENTRY_SIZE: usize = 60;
+const MANIFEST_ENTRY_SIZE: usize = 76;
 const MAX_SSTABLES: usize = 4_096;
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_RECORD_HEADER_SIZE: usize = 20;
 const WAL_MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
-const SST_HEADER_SIZE: usize = 144;
+const SST_HEADER_SIZE: usize = 160;
 const SST_BLOCK_HEADER_SIZE: usize = 52;
+const SST_INDEX_ENTRY_SIZE: usize = 56;
+const SST_FOOTER_SIZE: usize = 32;
 const SST_TARGET_BLOCK_BYTES: usize = 32 * 1024;
 const SST_MAX_BLOCK_BYTES: usize = 64 * 1024;
+const SST_MAX_BLOCKS: u32 = 262_144;
+const SST_TARGET_FILE_BYTES: u64 = 256 * 1024;
+const L0_COMPACTION_TRIGGER: usize = 2;
+const BASE_LEVEL_BYTES: u64 = 256 * 1024;
+const LEVEL_SIZE_MULTIPLIER: u64 = 4;
+const BLOOM_ALGORITHM_VERSION: u8 = 1;
+const BLOOM_BITS_PER_KEY: u64 = 10;
+const BLOOM_HASH_COUNT: u8 = 7;
+const BLOOM_MIN_BITS: u64 = 64;
+const BLOOM_MAX_BITS: u64 = 64 * 1024 * 1024;
 const ALLOCATOR_RESERVATION: u64 = 1_024;
 const LSM_ACCESS_PATH_PREFIX: u64 = 0x4c53_4d00_0000_0000;
 
@@ -276,6 +290,8 @@ struct SstableRef {
     id: u64,
     level: u8,
     entry_count: u64,
+    file_bytes: u64,
+    bloom_bytes: u64,
     min: PhysicalKey,
     max: PhysicalKey,
 }
@@ -294,6 +310,126 @@ struct Sstable {
     reference: SstableRef,
     path: PathBuf,
     blocks: Vec<BlockMeta>,
+    bloom: BloomFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BloomFilter {
+    algorithm: u8,
+    bit_count: u64,
+    hash_count: u8,
+    bits: Vec<u8>,
+}
+
+impl BloomFilter {
+    fn empty() -> Self {
+        Self {
+            algorithm: BLOOM_ALGORITHM_VERSION,
+            bit_count: 0,
+            hash_count: 0,
+            bits: Vec::new(),
+        }
+    }
+
+    fn build(entries: &[VersionedEntry]) -> Result<Self, StorageError> {
+        let distinct = entries
+            .iter()
+            .map(|entry| entry.key.clustering)
+            .collect::<BTreeSet<_>>();
+        if distinct.is_empty() {
+            return Ok(Self::empty());
+        }
+        let mut filter = Self::for_distinct_keys(u64::try_from(distinct.len()).map_err(|_| {
+            LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "Bloom key count does not fit u64",
+            }
+        })?)?;
+        for key in distinct {
+            filter.insert(key);
+        }
+        Ok(filter)
+    }
+
+    fn for_distinct_keys(distinct: u64) -> Result<Self, StorageError> {
+        if distinct == 0 {
+            return Ok(Self::empty());
+        }
+        let requested =
+            distinct
+                .checked_mul(BLOOM_BITS_PER_KEY)
+                .ok_or(LsmError::InvalidSstable {
+                    sstable_id: 0,
+                    reason: "Bloom bit count overflows",
+                })?;
+        let bit_count = requested
+            .max(BLOOM_MIN_BITS)
+            .div_ceil(8)
+            .checked_mul(8)
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "Bloom byte alignment overflows",
+            })?;
+        if bit_count > BLOOM_MAX_BITS {
+            return Err(StorageError::ResourceLimit {
+                resource: "LSM Bloom bits",
+                limit: BLOOM_MAX_BITS,
+            });
+        }
+        let byte_count =
+            usize::try_from(bit_count / 8).map_err(|_| StorageError::ResourceLimit {
+                resource: "LSM Bloom bytes",
+                limit: BLOOM_MAX_BITS / 8,
+            })?;
+        Ok(Self {
+            algorithm: BLOOM_ALGORITHM_VERSION,
+            bit_count,
+            hash_count: BLOOM_HASH_COUNT,
+            bits: vec![0; byte_count],
+        })
+    }
+
+    fn insert(&mut self, key: ClusteringKey) {
+        if self.bit_count == 0 {
+            return;
+        }
+        let (first, second) = bloom_hashes(key);
+        for index in 0..self.hash_count {
+            let bit = first.wrapping_add(u64::from(index).wrapping_mul(second)) % self.bit_count;
+            self.bits[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+    }
+
+    fn might_contain(&self, key: ClusteringKey) -> bool {
+        if self.bit_count == 0 {
+            return false;
+        }
+        let (first, second) = bloom_hashes(key);
+        (0..self.hash_count).all(|index| {
+            let bit = first.wrapping_add(u64::from(index).wrapping_mul(second)) % self.bit_count;
+            self.bits[(bit / 8) as usize] & (1 << (bit % 8)) != 0
+        })
+    }
+}
+
+fn bloom_hashes(key: ClusteringKey) -> (u64, u64) {
+    let mut bytes = [0_u8; 9];
+    bytes[0] = match key {
+        ClusteringKey::Int64(_) => 1,
+        ClusteringKey::UInt64(_) => 2,
+    };
+    bytes[1..].copy_from_slice(&key.bits().to_le_bytes());
+    let first = stable_fnv1a64(0xcbf2_9ce4_8422_2325, &bytes);
+    let second = stable_fnv1a64(0x8422_2325_cbf2_9ce4, &bytes) | 1;
+    (first, second)
+}
+
+fn stable_fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +462,8 @@ enum ManifestPublishError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManifestPublishPoint {
+    CandidateWrite,
+    CandidateSync,
     BeforeInstall,
     AfterInstall,
 }
@@ -336,6 +474,75 @@ struct Runtime {
     recovery_required: Cell<bool>,
     outstanding_transactions: Cell<u64>,
     outstanding_read_views: Cell<u64>,
+    amplification: AmplificationCounters,
+}
+
+#[derive(Debug, Default)]
+struct AmplificationCounters {
+    sstables_considered: Cell<u64>,
+    sstables_read: Cell<u64>,
+    data_blocks_read: Cell<u64>,
+    bloom_checks: Cell<u64>,
+    bloom_negatives: Cell<u64>,
+    bloom_positives: Cell<u64>,
+    flush_input_bytes: Cell<u64>,
+    flush_output_bytes: Cell<u64>,
+    compaction_input_bytes: Cell<u64>,
+    compaction_output_bytes: Cell<u64>,
+    obsolete_bytes: Cell<u64>,
+}
+
+impl AmplificationCounters {
+    fn read_snapshot(&self) -> LsmReadAmplification {
+        LsmReadAmplification {
+            sstables_considered: self.sstables_considered.get(),
+            sstables_read: self.sstables_read.get(),
+            data_blocks_read: self.data_blocks_read.get(),
+            bloom_checks: self.bloom_checks.get(),
+            bloom_negatives: self.bloom_negatives.get(),
+            bloom_positives: self.bloom_positives.get(),
+        }
+    }
+
+    fn write_snapshot(&self) -> LsmWriteAmplification {
+        LsmWriteAmplification {
+            flush_input_bytes: self.flush_input_bytes.get(),
+            flush_output_bytes: self.flush_output_bytes.get(),
+            compaction_input_bytes: self.compaction_input_bytes.get(),
+            compaction_output_bytes: self.compaction_output_bytes.get(),
+            obsolete_bytes: self.obsolete_bytes.get(),
+        }
+    }
+}
+
+fn increment(counter: &Cell<u64>, value: u64) {
+    counter.set(counter.get().saturating_add(value));
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LsmReadAmplification {
+    pub sstables_considered: u64,
+    pub sstables_read: u64,
+    pub data_blocks_read: u64,
+    pub bloom_checks: u64,
+    pub bloom_negatives: u64,
+    pub bloom_positives: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LsmWriteAmplification {
+    pub flush_input_bytes: u64,
+    pub flush_output_bytes: u64,
+    pub compaction_input_bytes: u64,
+    pub compaction_output_bytes: u64,
+    pub obsolete_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmLevelInspection {
+    pub level: u8,
+    pub sstable_count: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug)]
@@ -463,6 +670,15 @@ pub struct LsmInspection {
     pub sstable_count: usize,
     pub l0_count: usize,
     pub l1_count: usize,
+    pub level_count: usize,
+    pub levels: Vec<LsmLevelInspection>,
+    pub l0_overlapping_file_count: usize,
+    pub total_sstable_bytes: u64,
+    pub bloom_enabled: bool,
+    pub bloom_version: u8,
+    pub bloom_filter_bytes: u64,
+    pub read_amplification: LsmReadAmplification,
+    pub write_amplification: LsmWriteAmplification,
     pub memtable_entry_count: u64,
     pub sstable_entry_count: u64,
     pub analyzed_live_row_count: Option<u64>,
@@ -532,6 +748,7 @@ impl LsmStorage {
                 recovery_required: Cell::new(false),
                 outstanding_transactions: Cell::new(0),
                 outstanding_read_views: Cell::new(0),
+                amplification: AmplificationCounters::default(),
             });
             Ok(Self {
                 table: table.clone(),
@@ -645,6 +862,7 @@ impl LsmStorage {
             recovery_required: Cell::new(false),
             outstanding_transactions: Cell::new(0),
             outstanding_read_views: Cell::new(0),
+            amplification: AmplificationCounters::default(),
         });
         Ok(Self {
             table: table.clone(),
@@ -712,6 +930,42 @@ impl LsmStorage {
     #[must_use]
     pub fn inspection(&self) -> LsmInspection {
         let shared = self.shared.borrow();
+        let levels = (0..LSM_MAX_LEVELS)
+            .filter_map(|level| {
+                let files = shared
+                    .sstables
+                    .iter()
+                    .filter(|sstable| sstable.reference.level == level)
+                    .collect::<Vec<_>>();
+                (!files.is_empty()).then(|| LsmLevelInspection {
+                    level,
+                    sstable_count: files.len(),
+                    bytes: files
+                        .iter()
+                        .map(|sstable| sstable.reference.file_bytes)
+                        .sum(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let l0 = shared
+            .sstables
+            .iter()
+            .filter(|sstable| sstable.reference.level == 0)
+            .collect::<Vec<_>>();
+        let l0_overlapping_file_count = l0
+            .iter()
+            .filter(|left| {
+                l0.iter().any(|right| {
+                    left.reference.id != right.reference.id
+                        && ranges_overlap(
+                            left.reference.min,
+                            left.reference.max,
+                            right.reference.min,
+                            right.reference.max,
+                        )
+                })
+            })
+            .count();
         LsmInspection {
             clustering_column: shared.manifest.clustering_column,
             clustering_type: shared.manifest.key_type,
@@ -726,6 +980,23 @@ impl LsmStorage {
                 .iter()
                 .filter(|sst| sst.reference.level == 1)
                 .count(),
+            level_count: levels.len(),
+            levels,
+            l0_overlapping_file_count,
+            total_sstable_bytes: shared
+                .sstables
+                .iter()
+                .map(|sstable| sstable.reference.file_bytes)
+                .sum(),
+            bloom_enabled: true,
+            bloom_version: BLOOM_ALGORITHM_VERSION,
+            bloom_filter_bytes: shared
+                .sstables
+                .iter()
+                .map(|sstable| sstable.reference.bloom_bytes)
+                .sum(),
+            read_amplification: shared.runtime.amplification.read_snapshot(),
+            write_amplification: shared.runtime.amplification.write_snapshot(),
             memtable_entry_count: shared
                 .memtable
                 .values()
@@ -1062,6 +1333,38 @@ impl LsmStorage {
         self.shared.borrow().access_statistics
     }
 
+    #[must_use]
+    pub fn access_cost_hints(&self) -> crate::StorageAccessCostHints {
+        let shared = self.shared.borrow();
+        let l0 = shared
+            .sstables
+            .iter()
+            .filter(|sstable| sstable.reference.level == 0)
+            .count() as u64;
+        let upper_levels = (1..LSM_MAX_LEVELS)
+            .filter(|level| {
+                shared
+                    .sstables
+                    .iter()
+                    .any(|sstable| sstable.reference.level == *level)
+            })
+            .count() as u64;
+        let candidates = l0.saturating_add(upper_levels);
+        // Bloom is sized at ten bits/key with seven probes. Use a conservative
+        // integer one-in-eight expectation rather than a floating estimate.
+        let expected_false_positives = candidates.div_ceil(8);
+        crate::StorageAccessCostHints {
+            point_probe_base_cost: 1,
+            expected_point_io: u32::try_from(
+                u64::from(candidates != 0).saturating_add(expected_false_positives),
+            )
+            .unwrap_or(u32::MAX),
+            range_startup_cost: u32::try_from(upper_levels.saturating_add(u64::from(l0 != 0)))
+                .unwrap_or(u32::MAX),
+            sequential_unit_cost: 1,
+        }
+    }
+
     pub fn analyze(&mut self) -> Result<(), StorageError> {
         let view = self.read_view()?;
         let shared = self.shared.borrow();
@@ -1127,6 +1430,17 @@ impl LsmStorage {
             flush_memtable(&mut shared)?;
         }
         compact_sstables(&mut shared)
+    }
+
+    /// Merges every immutable level and discards superseded history. This is
+    /// deliberately quiescent so no snapshot can still require an old version.
+    pub fn compact_full(&self) -> Result<(), StorageError> {
+        let mut shared = self.shared.borrow_mut();
+        ensure_maintenance_safe(&shared)?;
+        if !shared.memtable.is_empty() {
+            flush_memtable(&mut shared)?;
+        }
+        compact_full_sstables(&mut shared)
     }
 
     pub fn checkpoint(&self) -> Result<(), StorageError> {
@@ -1196,6 +1510,24 @@ impl KeyRange {
                 lower.is_none_or(|(bound, included)| max > bound || (included && max == bound))
                     && upper
                         .is_none_or(|(bound, included)| min < bound || (included && min == bound))
+            }
+        }
+    }
+
+    fn starts_after(&self, max: ClusteringKey) -> bool {
+        match self {
+            Self::Point(point) => *point > max,
+            Self::Bounds { lower, .. } => {
+                lower.is_some_and(|(bound, included)| bound > max || (!included && bound == max))
+            }
+        }
+    }
+
+    fn ends_before(&self, min: ClusteringKey) -> bool {
+        match self {
+            Self::Point(point) => *point < min,
+            Self::Bounds { upper, .. } => {
+                upper.is_some_and(|(bound, included)| bound < min || (!included && bound == min))
             }
         }
     }
@@ -1951,44 +2283,50 @@ fn collect_visible_rows(
     view: &LsmReadView,
     range: Option<&KeyRange>,
 ) -> Result<Vec<VisibleRow>, StorageError> {
-    let mut versions = BTreeMap::<PhysicalKey, BTreeMap<LsmCommitSeq, EntryValue>>::new();
-    for sstable in &shared.sstables {
-        if range.is_some_and(|range| {
-            !range.overlaps(
-                sstable.reference.min.clustering,
-                sstable.reference.max.clustering,
-            )
-        }) {
-            continue;
-        }
-        for entry in read_sstable_entries(sstable, &shared.table, range)? {
-            versions
-                .entry(entry.key)
-                .or_default()
-                .insert(entry.version, entry.value);
-        }
+    let mut runs = Vec::new();
+    let memtable = shared
+        .memtable
+        .iter()
+        .filter(|(key, _)| range.is_none_or(|range| range.contains(key.clustering)))
+        .flat_map(|(key, versions)| {
+            versions.iter().map(move |(version, value)| VersionedEntry {
+                key: *key,
+                version: *version,
+                value: value.clone(),
+            })
+        })
+        .collect::<VecDeque<_>>();
+    if !memtable.is_empty() {
+        runs.push(MergeRun::new(EntryCursor::Memory(memtable))?);
     }
-    for (key, mem_versions) in &shared.memtable {
-        if range.is_none_or(|range| range.contains(key.clustering)) {
-            versions
-                .entry(*key)
-                .or_default()
-                .extend(mem_versions.clone());
-        }
+    for sstable in select_sstables_for_read(shared, range) {
+        runs.push(MergeRun::new(EntryCursor::Sstable(
+            SstableEntryCursor::new(
+                sstable,
+                &shared.table,
+                range,
+                Some(&shared.runtime.amplification),
+            )?,
+        ))?);
     }
     let mut visible = BTreeMap::<PhysicalKey, VisibleRow>::new();
-    for (key, entries) in versions {
-        if let Some((version, EntryValue::Put(row))) = entries.range(..=view.horizon).next_back() {
-            visible.insert(
-                key,
-                VisibleRow {
-                    key,
-                    observed: LsmObservedVersion::Committed(*version),
-                    row: row.clone(),
-                },
-            );
+    let mut current_key = None;
+    let mut selected: Option<VersionedEntry> = None;
+    loop {
+        let entry = match next_merged_entry(&mut runs) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => return Err(error),
+        };
+        if current_key.is_some_and(|key| key != entry.key) {
+            install_visible_entry(&mut visible, selected.take());
+        }
+        current_key = Some(entry.key);
+        if entry.version <= view.horizon {
+            selected = Some(entry);
         }
     }
+    install_visible_entry(&mut visible, selected);
     for (row_id, pending) in &view.pending {
         if let Some(original) = pending.original_key {
             visible.remove(&PhysicalKey {
@@ -2014,6 +2352,255 @@ fn collect_visible_rows(
         }
     }
     Ok(visible.into_values().collect())
+}
+
+fn install_visible_entry(
+    visible: &mut BTreeMap<PhysicalKey, VisibleRow>,
+    entry: Option<VersionedEntry>,
+) {
+    if let Some(VersionedEntry {
+        key,
+        version,
+        value: EntryValue::Put(row),
+    }) = entry
+    {
+        visible.insert(
+            key,
+            VisibleRow {
+                key,
+                observed: LsmObservedVersion::Committed(version),
+                row,
+            },
+        );
+    }
+}
+
+enum EntryCursor<'a> {
+    Memory(VecDeque<VersionedEntry>),
+    Sstable(SstableEntryCursor<'a>),
+}
+
+impl EntryCursor<'_> {
+    fn next(&mut self) -> Result<Option<VersionedEntry>, StorageError> {
+        match self {
+            Self::Memory(entries) => Ok(entries.pop_front()),
+            Self::Sstable(cursor) => cursor.next(),
+        }
+    }
+}
+
+struct MergeRun<'a> {
+    cursor: EntryCursor<'a>,
+    current: Option<VersionedEntry>,
+}
+
+impl<'a> MergeRun<'a> {
+    fn new(mut cursor: EntryCursor<'a>) -> Result<Self, StorageError> {
+        let current = cursor.next()?;
+        Ok(Self { cursor, current })
+    }
+
+    fn advance(&mut self) -> Result<(), StorageError> {
+        self.current = self.cursor.next()?;
+        Ok(())
+    }
+}
+
+struct SstableEntryCursor<'a> {
+    sstable: &'a Sstable,
+    table: &'a TableDef,
+    range: Option<&'a KeyRange>,
+    counters: Option<&'a AmplificationCounters>,
+    next_block: usize,
+    entries: VecDeque<VersionedEntry>,
+}
+
+impl<'a> SstableEntryCursor<'a> {
+    fn new(
+        sstable: &'a Sstable,
+        table: &'a TableDef,
+        range: Option<&'a KeyRange>,
+        counters: Option<&'a AmplificationCounters>,
+    ) -> Result<Self, StorageError> {
+        // Validate the path eagerly, but do not retain one descriptor per merge
+        // run. A legal manifest may contain far more SSTables than the process
+        // descriptor limit; each block read opens the file only for that block.
+        drop(File::open(&sstable.path)?);
+        if let Some(counters) = counters {
+            increment(&counters.sstables_read, 1);
+        }
+        Ok(Self {
+            sstable,
+            table,
+            range,
+            counters,
+            next_block: range.map_or(0, |range| {
+                sstable
+                    .blocks
+                    .partition_point(|block| range.starts_after(block.last.clustering))
+            }),
+            entries: VecDeque::new(),
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<VersionedEntry>, StorageError> {
+        loop {
+            if let Some(entry) = self.entries.pop_front() {
+                return Ok(Some(entry));
+            }
+            let Some(meta) = self.sstable.blocks.get(self.next_block) else {
+                return Ok(None);
+            };
+            if self
+                .range
+                .is_some_and(|range| range.ends_before(meta.first.clustering))
+            {
+                return Ok(None);
+            }
+            let block_index = self.next_block;
+            self.next_block += 1;
+            if self
+                .range
+                .is_some_and(|range| !range.overlaps(meta.first.clustering, meta.last.clustering))
+            {
+                continue;
+            }
+            let mut file = File::open(&self.sstable.path)?;
+            let (actual, entries, _) = read_sstable_block(
+                &mut file,
+                self.sstable.reference.id,
+                block_index as u32,
+                meta.offset,
+                meta.first.clustering.kind(),
+                self.table,
+            )?;
+            if actual.payload_length != meta.payload_length
+                || actual.entry_count != meta.entry_count
+                || actual.first != meta.first
+                || actual.last != meta.last
+            {
+                return Err(LsmError::InvalidSstable {
+                    sstable_id: self.sstable.reference.id,
+                    reason: "sparse block metadata changed",
+                }
+                .into());
+            }
+            if let Some(counters) = self.counters {
+                increment(&counters.data_blocks_read, 1);
+            }
+            self.entries.extend(entries.into_iter().filter(|entry| {
+                self.range
+                    .is_none_or(|range| range.contains(entry.key.clustering))
+            }));
+        }
+    }
+}
+
+fn next_merged_entry(runs: &mut [MergeRun<'_>]) -> Result<Option<VersionedEntry>, StorageError> {
+    let Some(key) = runs
+        .iter()
+        .filter_map(|run| run.current.as_ref())
+        .map(|entry| (entry.key, entry.version))
+        .min()
+    else {
+        return Ok(None);
+    };
+    let mut selected = None;
+    for run in runs {
+        if run
+            .current
+            .as_ref()
+            .is_some_and(|entry| (entry.key, entry.version) == key)
+        {
+            let entry = run.current.take().ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "merge cursor lost current entry",
+            })?;
+            if selected
+                .as_ref()
+                .is_some_and(|previous: &VersionedEntry| previous.value != entry.value)
+            {
+                return Err(LsmError::InvalidSstable {
+                    sstable_id: 0,
+                    reason: "duplicate internal key has conflicting values",
+                }
+                .into());
+            }
+            selected = Some(entry);
+            run.advance()?;
+        }
+    }
+    Ok(selected)
+}
+
+fn select_sstables_for_read<'a>(
+    shared: &'a LsmShared,
+    range: Option<&KeyRange>,
+) -> Vec<&'a Sstable> {
+    let mut selected = Vec::new();
+    for level in 0..LSM_MAX_LEVELS {
+        let start = shared
+            .sstables
+            .partition_point(|sstable| sstable.reference.level < level);
+        let end = shared
+            .sstables
+            .partition_point(|sstable| sstable.reference.level <= level);
+        let files = &shared.sstables[start..end];
+        if level == 0 {
+            increment(
+                &shared.runtime.amplification.sstables_considered,
+                files.len() as u64,
+            );
+            for sstable in files {
+                if range.is_none_or(|range| {
+                    range.overlaps(
+                        sstable.reference.min.clustering,
+                        sstable.reference.max.clustering,
+                    )
+                }) && bloom_allows(shared, sstable, range)
+                {
+                    selected.push(sstable);
+                }
+            }
+            continue;
+        }
+        if files.is_empty() {
+            continue;
+        }
+        let first_candidate = range.map_or(0, |range| {
+            files.partition_point(|sstable| range.starts_after(sstable.reference.max.clustering))
+        });
+        for sstable in files.iter().skip(first_candidate) {
+            increment(&shared.runtime.amplification.sstables_considered, 1);
+            if range.is_some_and(|range| range.ends_before(sstable.reference.min.clustering)) {
+                break;
+            }
+            if range.is_none_or(|range| {
+                range.overlaps(
+                    sstable.reference.min.clustering,
+                    sstable.reference.max.clustering,
+                )
+            }) && bloom_allows(shared, sstable, range)
+            {
+                selected.push(sstable);
+            }
+        }
+    }
+    selected
+}
+
+fn bloom_allows(shared: &LsmShared, sstable: &Sstable, range: Option<&KeyRange>) -> bool {
+    let Some(KeyRange::Point(key)) = range else {
+        return true;
+    };
+    increment(&shared.runtime.amplification.bloom_checks, 1);
+    if sstable.bloom.might_contain(*key) {
+        increment(&shared.runtime.amplification.bloom_positives, 1);
+        true
+    } else {
+        increment(&shared.runtime.amplification.bloom_negatives, 1);
+        false
+    }
 }
 
 fn estimate_memtable_bytes(
@@ -2098,6 +2685,7 @@ fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, StorageError> {
             limit: MAX_SSTABLES as u64,
         });
     }
+    validate_manifest_sstable_layout(&manifest.sstables, manifest.key_type)?;
     let count = u32::try_from(manifest.sstables.len())
         .map_err(|_| LsmError::InvalidManifest("SSTable count exceeds u32"))?;
     let total = MANIFEST_FIXED_SIZE
@@ -2157,8 +2745,10 @@ fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, StorageError> {
         bytes[offset..offset + 8].copy_from_slice(&sstable.id.to_le_bytes());
         bytes[offset + 8] = sstable.level;
         bytes[offset + 12..offset + 20].copy_from_slice(&sstable.entry_count.to_le_bytes());
-        encode_physical_key(&mut bytes[offset + 20..offset + 40], sstable.min)?;
-        encode_physical_key(&mut bytes[offset + 40..offset + 60], sstable.max)?;
+        bytes[offset + 20..offset + 28].copy_from_slice(&sstable.file_bytes.to_le_bytes());
+        bytes[offset + 28..offset + 36].copy_from_slice(&sstable.bloom_bytes.to_le_bytes());
+        encode_physical_key(&mut bytes[offset + 36..offset + 56], sstable.min)?;
+        encode_physical_key(&mut bytes[offset + 56..offset + 76], sstable.max)?;
     }
     let checksum = crc32c::crc32c(&bytes);
     bytes.extend_from_slice(&checksum.to_le_bytes());
@@ -2284,18 +2874,38 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, StorageError> {
         let id = read_u64(bytes, offset)?;
         let level = bytes[offset + 8];
         let entry_count = read_u64(bytes, offset + 12)?;
-        let min = decode_physical_key(&bytes[offset + 20..offset + 40], key_type)?;
-        let max = decode_physical_key(&bytes[offset + 40..offset + 60], key_type)?;
-        if id == 0 || !ids.insert(id) || level > 1 || entry_count == 0 || min > max {
+        let file_bytes = read_u64(bytes, offset + 20)?;
+        let bloom_bytes = read_u64(bytes, offset + 28)?;
+        let min = decode_physical_key(&bytes[offset + 36..offset + 56], key_type)?;
+        let max = decode_physical_key(&bytes[offset + 56..offset + 76], key_type)?;
+        if id == 0
+            || !ids.insert(id)
+            || level >= LSM_MAX_LEVELS
+            || entry_count == 0
+            || file_bytes < SST_HEADER_SIZE as u64
+            || bloom_bytes == 0
+            || bloom_bytes > BLOOM_MAX_BITS / 8
+            || min > max
+        {
             return Err(LsmError::InvalidManifest("invalid SSTable descriptor").into());
         }
         sstables.push(SstableRef {
             id,
             level,
             entry_count,
+            file_bytes,
+            bloom_bytes,
             min,
             max,
         });
+    }
+    validate_manifest_sstable_layout(&sstables, key_type)?;
+    if ids
+        .iter()
+        .next_back()
+        .is_some_and(|id| *id >= next_sstable_id)
+    {
+        return Err(LsmError::InvalidManifest("SSTable allocator high-water is stale").into());
     }
     Ok(Manifest {
         storage_id,
@@ -2314,6 +2924,51 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, StorageError> {
         clustering_statistics,
         sstables,
     })
+}
+
+fn validate_manifest_sstable_layout(
+    sstables: &[SstableRef],
+    key_type: PhysicalType,
+) -> Result<(), StorageError> {
+    let mut previous: Option<&SstableRef> = None;
+    let mut ids = BTreeSet::new();
+    for current in sstables {
+        if current.id == 0
+            || !ids.insert(current.id)
+            || current.level >= LSM_MAX_LEVELS
+            || current.entry_count == 0
+            || current.file_bytes < SST_HEADER_SIZE as u64
+            || current.bloom_bytes == 0
+            || current.bloom_bytes > BLOOM_MAX_BITS / 8
+            || current.min > current.max
+            || current.min.clustering.kind() != key_type
+            || current.max.clustering.kind() != key_type
+        {
+            return Err(LsmError::InvalidManifest("invalid SSTable descriptor").into());
+        }
+        if let Some(previous) = previous {
+            if previous.level > current.level {
+                return Err(LsmError::InvalidManifest("SSTable levels are not sorted").into());
+            }
+            if previous.level == current.level {
+                if current.level == 0 {
+                    if previous.id >= current.id {
+                        return Err(LsmError::InvalidManifest(
+                            "L0 generation order is not canonical",
+                        )
+                        .into());
+                    }
+                } else if previous.min >= current.min || previous.max >= current.min {
+                    return Err(LsmError::InvalidManifest(
+                        "L1+ SSTables are unsorted or overlapping",
+                    )
+                    .into());
+                }
+            }
+        }
+        previous = Some(current);
+    }
+    Ok(())
 }
 
 fn write_manifest_initial(root: &Path, manifest: &Manifest) -> Result<(), StorageError> {
@@ -2338,11 +2993,15 @@ fn publish_manifest(root: &Path, mut manifest: Manifest) -> Result<Manifest, Man
     let next = manifest_next_path(root);
     match OpenOptions::new().write(true).create_new(true).open(&next) {
         Ok(mut file) => {
+            maybe_fail_manifest_publish(ManifestPublishPoint::CandidateWrite)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             file.write_all(&bytes)
                 .map_err(StorageError::from)
                 .map_err(ManifestPublishError::BeforeInstall)?;
             #[cfg(test)]
             maybe_lsm_crash("during-manifest-write");
+            maybe_fail_manifest_publish(ManifestPublishPoint::CandidateSync)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             file.sync_all()
                 .map_err(StorageError::from)
                 .map_err(ManifestPublishError::BeforeInstall)?;
@@ -2359,11 +3018,15 @@ fn publish_manifest(root: &Path, mut manifest: Manifest) -> Result<Manifest, Man
                 .open(&next)
                 .map_err(StorageError::from)
                 .map_err(ManifestPublishError::BeforeInstall)?;
+            maybe_fail_manifest_publish(ManifestPublishPoint::CandidateWrite)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             file.write_all(&bytes)
                 .map_err(StorageError::from)
                 .map_err(ManifestPublishError::BeforeInstall)?;
             #[cfg(test)]
             maybe_lsm_crash("during-manifest-write");
+            maybe_fail_manifest_publish(ManifestPublishPoint::CandidateSync)
+                .map_err(ManifestPublishError::BeforeInstall)?;
             file.sync_all()
                 .map_err(StorageError::from)
                 .map_err(ManifestPublishError::BeforeInstall)?;
@@ -3141,6 +3804,7 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
     let old_wal = std::mem::replace(&mut shared.wal, new_wal);
     candidate.wal_generation = new_wal_generation;
     candidate.sstables.push(sstable.reference.clone());
+    canonicalize_manifest_sstables(&mut candidate.sstables);
     match publish_manifest(&shared.root, candidate) {
         Ok(manifest) => shared.manifest = manifest,
         Err(ManifestPublishError::BeforeInstall(error)) => {
@@ -3157,6 +3821,7 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
         Err(ManifestPublishError::InstalledButUnsynced { manifest, source }) => {
             shared.manifest = *manifest;
             shared.sstables.push(sstable);
+            canonicalize_sstables(&mut shared.sstables);
             shared.memtable.clear();
             shared.memtable_bytes = 0;
             shared.runtime.recovery_required.set(true);
@@ -3165,8 +3830,21 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
         }
     }
     shared.sstables.push(sstable);
+    canonicalize_sstables(&mut shared.sstables);
     shared.memtable.clear();
     shared.memtable_bytes = 0;
+    increment(
+        &shared.runtime.amplification.flush_input_bytes,
+        entries.iter().map(estimated_entry_bytes).sum(),
+    );
+    increment(
+        &shared.runtime.amplification.flush_output_bytes,
+        shared
+            .sstables
+            .iter()
+            .find(|sstable| sstable.reference.id == id)
+            .map_or(0, |sstable| sstable.reference.file_bytes),
+    );
     drop(old_wal);
     #[cfg(test)]
     maybe_lsm_crash("before-old-wal-removal");
@@ -3182,99 +3860,681 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
 }
 
 fn compact_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
-    if shared.sstables.len() <= 1
-        && shared
-            .sstables
-            .first()
-            .is_none_or(|sst| sst.reference.level == 1)
-    {
+    while let Some(plan) = pick_compaction(shared)? {
+        execute_compaction(shared, &plan, false)?;
+    }
+    Ok(())
+}
+
+fn compact_full_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
+    if shared.sstables.is_empty() {
         return Ok(());
     }
-    let mut versions = BTreeMap::<PhysicalKey, BTreeMap<LsmCommitSeq, EntryValue>>::new();
-    for sstable in &shared.sstables {
-        for entry in read_sstable_entries(sstable, &shared.table, None)? {
-            versions
-                .entry(entry.key)
-                .or_default()
-                .insert(entry.version, entry.value);
-        }
-    }
-    let entries = versions
-        .into_iter()
-        .filter_map(|(key, versions)| {
-            versions
-                .into_iter()
-                .next_back()
-                .and_then(|(version, value)| match value {
-                    EntryValue::Put(row) => Some(VersionedEntry {
-                        key,
-                        version,
-                        value: EntryValue::Put(row),
-                    }),
-                    EntryValue::Tombstone => None,
-                })
-        })
-        .collect::<Vec<_>>();
-    let old_sstables = shared.sstables.clone();
-    let mut candidate = shared.manifest.clone();
-    let output = if entries.is_empty() {
-        candidate.sstables.clear();
-        None
-    } else {
-        let id = shared.manifest.next_sstable_id;
-        candidate.next_sstable_id = id
-            .checked_add(1)
-            .ok_or(LsmError::AllocatorExhausted("SSTable ID"))?;
-        let output = write_sstable(
-            &shared.root,
-            &shared.manifest,
-            id,
-            1,
-            &entries,
-            &shared.table,
-        )?;
-        candidate.sstables = vec![output.reference.clone()];
-        Some(output)
+    let plan = CompactionPlan {
+        output_level: LSM_MAX_LEVELS - 1,
+        input_ids: shared
+            .sstables
+            .iter()
+            .map(|sstable| sstable.reference.id)
+            .collect(),
     };
+    execute_compaction(shared, &plan, true)
+}
+
+#[derive(Debug)]
+struct CompactionPlan {
+    output_level: u8,
+    input_ids: BTreeSet<u64>,
+}
+
+fn pick_compaction(shared: &LsmShared) -> Result<Option<CompactionPlan>, StorageError> {
+    let l0 = shared
+        .sstables
+        .iter()
+        .filter(|sstable| sstable.reference.level == 0)
+        .collect::<Vec<_>>();
+    if l0.len() >= L0_COMPACTION_TRIGGER {
+        let mut input_ids = l0
+            .iter()
+            .map(|sstable| sstable.reference.id)
+            .collect::<BTreeSet<_>>();
+        let (min, max) = input_range(shared, &input_ids)?;
+        for target in shared
+            .sstables
+            .iter()
+            .filter(|sstable| sstable.reference.level == 1)
+        {
+            if ranges_overlap(min, max, target.reference.min, target.reference.max) {
+                input_ids.insert(target.reference.id);
+            }
+        }
+        return Ok(Some(CompactionPlan {
+            output_level: 1,
+            input_ids,
+        }));
+    }
+    for level in 1..LSM_MAX_LEVELS - 1 {
+        let bytes = shared
+            .sstables
+            .iter()
+            .filter(|sstable| sstable.reference.level == level)
+            .try_fold(0_u64, |total, sstable| {
+                total
+                    .checked_add(sstable.reference.file_bytes)
+                    .ok_or(LsmError::InvalidManifest("level bytes overflow"))
+            })?;
+        if bytes <= level_target_bytes(level)? {
+            continue;
+        }
+        let source = shared
+            .sstables
+            .iter()
+            .filter(|sstable| sstable.reference.level == level)
+            .min_by_key(|sstable| (sstable.reference.min, sstable.reference.id))
+            .ok_or(LsmError::InvalidManifest("overflowing level is empty"))?;
+        let mut input_ids = BTreeSet::from([source.reference.id]);
+        loop {
+            let old_len = input_ids.len();
+            let (min, max) = input_range(shared, &input_ids)?;
+            for sstable in shared.sstables.iter().filter(|sstable| {
+                sstable.reference.level == level || sstable.reference.level == level + 1
+            }) {
+                if ranges_overlap(min, max, sstable.reference.min, sstable.reference.max) {
+                    input_ids.insert(sstable.reference.id);
+                }
+            }
+            if input_ids.len() == old_len {
+                break;
+            }
+        }
+        return Ok(Some(CompactionPlan {
+            output_level: level + 1,
+            input_ids,
+        }));
+    }
+    Ok(None)
+}
+
+fn level_target_bytes(level: u8) -> Result<u64, StorageError> {
+    if level == 0 || level >= LSM_MAX_LEVELS {
+        return Err(LsmError::InvalidManifest("level target requested for invalid level").into());
+    }
+    let mut target = BASE_LEVEL_BYTES;
+    for _ in 1..level {
+        target = target
+            .checked_mul(LEVEL_SIZE_MULTIPLIER)
+            .ok_or(LsmError::InvalidManifest("level target overflows"))?;
+    }
+    Ok(target)
+}
+
+fn input_range(
+    shared: &LsmShared,
+    input_ids: &BTreeSet<u64>,
+) -> Result<(PhysicalKey, PhysicalKey), StorageError> {
+    let mut inputs = shared
+        .sstables
+        .iter()
+        .filter(|sstable| input_ids.contains(&sstable.reference.id));
+    let first = inputs
+        .next()
+        .ok_or(LsmError::InvalidManifest("compaction has no inputs"))?;
+    let mut min = first.reference.min;
+    let mut max = first.reference.max;
+    for input in inputs {
+        min = min.min(input.reference.min);
+        max = max.max(input.reference.max);
+    }
+    Ok((min, max))
+}
+
+fn ranges_overlap(
+    left_min: PhysicalKey,
+    left_max: PhysicalKey,
+    right_min: PhysicalKey,
+    right_max: PhysicalKey,
+) -> bool {
+    left_min <= right_max && right_min <= left_max
+}
+
+fn execute_compaction(
+    shared: &mut LsmShared,
+    plan: &CompactionPlan,
+    garbage_collect: bool,
+) -> Result<(), StorageError> {
+    let inputs = shared
+        .sstables
+        .iter()
+        .filter(|sstable| plan.input_ids.contains(&sstable.reference.id))
+        .collect::<Vec<_>>();
+    let input_bytes = inputs.iter().try_fold(0_u64, |total, input| {
+        total
+            .checked_add(input.reference.file_bytes)
+            .ok_or(LsmError::InvalidManifest("compaction input bytes overflow"))
+    })?;
+    let mut next_id = shared.manifest.next_sstable_id;
+    let outputs = write_compaction_outputs(
+        shared,
+        &inputs,
+        plan.output_level,
+        garbage_collect,
+        &mut next_id,
+    )?;
+    let output_bytes = outputs.iter().try_fold(0_u64, |total, output| {
+        total
+            .checked_add(output.reference.file_bytes)
+            .ok_or(LsmError::InvalidManifest(
+                "compaction output bytes overflow",
+            ))
+    })?;
+    let mut candidate = shared.manifest.clone();
+    candidate.next_sstable_id = next_id;
+    candidate
+        .sstables
+        .retain(|reference| !plan.input_ids.contains(&reference.id));
+    candidate
+        .sstables
+        .extend(outputs.iter().map(|output| output.reference.clone()));
+    canonicalize_manifest_sstables(&mut candidate.sstables);
+    let old_sstables = shared.sstables.clone();
+    let mut next_sstables = shared
+        .sstables
+        .iter()
+        .filter(|sstable| !plan.input_ids.contains(&sstable.reference.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    next_sstables.extend(outputs.iter().cloned());
+    canonicalize_sstables(&mut next_sstables);
     match publish_manifest(&shared.root, candidate) {
         Ok(manifest) => {
             shared.manifest = manifest;
-            shared.sstables = output.into_iter().collect();
+            shared.sstables = next_sstables;
         }
         Err(ManifestPublishError::BeforeInstall(error)) => {
-            if let Some(output) = output {
-                if let Err(cleanup) = remove_unreferenced_file(&output.path) {
-                    shared.runtime.recovery_required.set(true);
-                    return Err(cleanup);
-                }
+            if let Err(cleanup) = cleanup_compaction_outputs(&outputs) {
+                shared.runtime.recovery_required.set(true);
+                return Err(cleanup);
             }
             return Err(error);
         }
         Err(ManifestPublishError::InstalledButUnsynced { manifest, source }) => {
             shared.manifest = *manifest;
-            shared.sstables = output.into_iter().collect();
+            shared.sstables = next_sstables;
             shared.runtime.recovery_required.set(true);
             return Err(source);
         }
     }
+    increment(
+        &shared.runtime.amplification.compaction_input_bytes,
+        input_bytes,
+    );
+    increment(
+        &shared.runtime.amplification.compaction_output_bytes,
+        output_bytes,
+    );
+    increment(&shared.runtime.amplification.obsolete_bytes, input_bytes);
     for old in old_sstables {
-        if !shared
-            .sstables
-            .iter()
-            .any(|current| current.reference.id == old.reference.id)
-        {
+        if plan.input_ids.contains(&old.reference.id) {
             #[cfg(test)]
             maybe_lsm_crash("while-deleting-old-sst");
-            match fs::remove_file(old.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            remove_obsolete_file(&old.path)?;
         }
     }
     sync_directory(&shared.root.join(SST_DIR_NAME))?;
     cleanup_orphans(shared)?;
     Ok(())
+}
+
+fn write_compaction_outputs(
+    shared: &LsmShared,
+    inputs: &[&Sstable],
+    output_level: u8,
+    garbage_collect: bool,
+    next_id: &mut u64,
+) -> Result<Vec<Sstable>, StorageError> {
+    let mut plans = Vec::<CompactionOutputPlan>::new();
+    let mut current: Option<CompactionOutputPlan> = None;
+    for_each_compaction_entry(shared, inputs, garbage_collect, |entry| {
+        if current.as_ref().is_some_and(|plan| {
+            plan.approximate_bytes >= SST_TARGET_FILE_BYTES
+                && plan.max_clustering != entry.key.clustering
+        }) {
+            plans.push(current.take().ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction output plan disappeared",
+            })?);
+        }
+        let plan = current.get_or_insert(CompactionOutputPlan {
+            max_clustering: entry.key.clustering,
+            entry_count: 0,
+            distinct_clustering_keys: 0,
+            approximate_bytes: 0,
+        });
+        if plan.entry_count == 0 || plan.max_clustering != entry.key.clustering {
+            plan.distinct_clustering_keys =
+                plan.distinct_clustering_keys
+                    .checked_add(1)
+                    .ok_or(LsmError::InvalidSstable {
+                        sstable_id: 0,
+                        reason: "distinct clustering-key count overflows",
+                    })?;
+        }
+        plan.max_clustering = entry.key.clustering;
+        plan.entry_count = plan
+            .entry_count
+            .checked_add(1)
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction output entry count overflows",
+            })?;
+        plan.approximate_bytes = plan
+            .approximate_bytes
+            .checked_add(estimated_entry_bytes(entry))
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction output byte estimate overflows",
+            })?;
+        Ok(())
+    })?;
+    if let Some(plan) = current {
+        plans.push(plan);
+    }
+
+    let mut outputs = Vec::new();
+    let mut plan_index = 0_usize;
+    let mut writer: Option<StreamingSstableWriter<'_>> = None;
+    let second_pass = for_each_compaction_entry(shared, inputs, garbage_collect, |entry| {
+        if writer.as_ref().is_some_and(|_| {
+            plans
+                .get(plan_index)
+                .is_some_and(|plan| entry.key.clustering > plan.max_clustering)
+        }) {
+            let output = writer
+                .take()
+                .ok_or(LsmError::InvalidSstable {
+                    sstable_id: 0,
+                    reason: "compaction writer disappeared",
+                })?
+                .finish()?;
+            outputs.push(output);
+            plan_index += 1;
+            #[cfg(test)]
+            maybe_lsm_crash("between-compaction-outputs");
+        }
+        if writer.is_none() {
+            let plan = plans.get(plan_index).ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction produced more entries than planned",
+            })?;
+            let id = *next_id;
+            *next_id = next_id
+                .checked_add(1)
+                .ok_or(LsmError::AllocatorExhausted("SSTable ID"))?;
+            writer = Some(StreamingSstableWriter::create(
+                shared,
+                id,
+                output_level,
+                plan,
+            )?);
+        }
+        writer
+            .as_mut()
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction writer is missing",
+            })?
+            .push(entry)
+    });
+    if let Err(error) = second_pass {
+        drop(writer);
+        cleanup_compaction_outputs(&outputs)?;
+        return Err(error);
+    }
+    if let Some(writer) = writer {
+        match writer.finish() {
+            Ok(output) => {
+                outputs.push(output);
+                plan_index += 1;
+            }
+            Err(error) => {
+                cleanup_compaction_outputs(&outputs)?;
+                return Err(error);
+            }
+        }
+    }
+    if plan_index != plans.len() {
+        cleanup_compaction_outputs(&outputs)?;
+        return Err(LsmError::InvalidSstable {
+            sstable_id: 0,
+            reason: "compaction output plan count differs from writes",
+        }
+        .into());
+    }
+    Ok(outputs)
+}
+
+#[derive(Debug)]
+struct CompactionOutputPlan {
+    max_clustering: ClusteringKey,
+    entry_count: u64,
+    distinct_clustering_keys: u64,
+    approximate_bytes: u64,
+}
+
+fn for_each_compaction_entry(
+    shared: &LsmShared,
+    inputs: &[&Sstable],
+    garbage_collect: bool,
+    mut visitor: impl FnMut(&VersionedEntry) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let mut runs = inputs
+        .iter()
+        .map(|sstable| {
+            SstableEntryCursor::new(sstable, &shared.table, None, None)
+                .and_then(|cursor| MergeRun::new(EntryCursor::Sstable(cursor)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pending_gc: Option<VersionedEntry> = None;
+    while let Some(entry) = next_merged_entry(&mut runs)? {
+        if garbage_collect {
+            if pending_gc
+                .as_ref()
+                .is_some_and(|pending| pending.key != entry.key)
+            {
+                if let Some(completed) = pending_gc
+                    .take()
+                    .filter(|completed| matches!(completed.value, EntryValue::Put(_)))
+                {
+                    visitor(&completed)?;
+                }
+            }
+            pending_gc = Some(entry);
+        } else {
+            visitor(&entry)?;
+        }
+    }
+    if let Some(completed) =
+        pending_gc.filter(|completed| matches!(completed.value, EntryValue::Put(_)))
+    {
+        visitor(&completed)?;
+    }
+    Ok(())
+}
+
+struct StreamingSstableWriter<'a> {
+    shared: &'a LsmShared,
+    id: u64,
+    level: u8,
+    expected_entries: u64,
+    expected_distinct: u64,
+    file: File,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    offset: u64,
+    blocks: Vec<BlockMeta>,
+    block_entries: Vec<VersionedEntry>,
+    block_bytes: usize,
+    bloom: BloomFilter,
+    entry_count: u64,
+    distinct_count: u64,
+    min: Option<PhysicalKey>,
+    max: Option<PhysicalKey>,
+    previous: Option<(PhysicalKey, LsmCommitSeq)>,
+    previous_clustering: Option<ClusteringKey>,
+    finished: bool,
+}
+
+impl<'a> StreamingSstableWriter<'a> {
+    fn create(
+        shared: &'a LsmShared,
+        id: u64,
+        level: u8,
+        plan: &CompactionOutputPlan,
+    ) -> Result<Self, StorageError> {
+        let bloom = BloomFilter::for_distinct_keys(plan.distinct_clustering_keys)?;
+        let temp_path = sstable_temp_path(&shared.root, id, level);
+        let final_path = sstable_path(&shared.root, id, level);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&[0_u8; SST_HEADER_SIZE])?;
+        file.write_all(&bloom.bits)?;
+        Ok(Self {
+            shared,
+            id,
+            level,
+            expected_entries: plan.entry_count,
+            expected_distinct: plan.distinct_clustering_keys,
+            file,
+            temp_path,
+            final_path,
+            offset: SST_HEADER_SIZE as u64 + bloom.bits.len() as u64,
+            blocks: Vec::new(),
+            block_entries: Vec::new(),
+            block_bytes: 0,
+            bloom,
+            entry_count: 0,
+            distinct_count: 0,
+            min: None,
+            max: None,
+            previous: None,
+            previous_clustering: None,
+            finished: false,
+        })
+    }
+
+    fn push(&mut self, entry: &VersionedEntry) -> Result<(), StorageError> {
+        let encoded_bytes = usize::try_from(estimated_entry_bytes(entry)).map_err(|_| {
+            StorageError::ResourceLimit {
+                resource: "LSM SSTable entry bytes",
+                limit: SST_MAX_BLOCK_BYTES as u64,
+            }
+        })?;
+        if encoded_bytes > SST_MAX_BLOCK_BYTES {
+            return Err(StorageError::ResourceLimit {
+                resource: "LSM SSTable entry bytes",
+                limit: SST_MAX_BLOCK_BYTES as u64,
+            });
+        }
+        if self
+            .previous
+            .is_some_and(|previous| previous >= (entry.key, entry.version))
+        {
+            return Err(LsmError::InvalidSstable {
+                sstable_id: self.id,
+                reason: "streamed entries are not strictly sorted",
+            }
+            .into());
+        }
+        if let EntryValue::Put(row) = &entry.value {
+            let _ = decode_row(row, &self.shared.table)?;
+        }
+        if !self.block_entries.is_empty()
+            && self.block_bytes.saturating_add(encoded_bytes) > SST_TARGET_BLOCK_BYTES
+        {
+            self.flush_block()?;
+        }
+        if self.previous_clustering != Some(entry.key.clustering) {
+            self.bloom.insert(entry.key.clustering);
+            self.distinct_count =
+                self.distinct_count
+                    .checked_add(1)
+                    .ok_or(LsmError::InvalidSstable {
+                        sstable_id: self.id,
+                        reason: "streamed distinct key count overflows",
+                    })?;
+        }
+        self.entry_count = self
+            .entry_count
+            .checked_add(1)
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: self.id,
+                reason: "streamed entry count overflows",
+            })?;
+        self.min.get_or_insert(entry.key);
+        self.max = Some(entry.key);
+        self.previous = Some((entry.key, entry.version));
+        self.previous_clustering = Some(entry.key.clustering);
+        self.block_bytes = self.block_bytes.saturating_add(encoded_bytes);
+        self.block_entries.push(entry.clone());
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> Result<(), StorageError> {
+        if self.block_entries.is_empty() {
+            return Ok(());
+        }
+        if self.blocks.len() >= SST_MAX_BLOCKS as usize {
+            return Err(StorageError::ResourceLimit {
+                resource: "LSM SSTable blocks",
+                limit: u64::from(SST_MAX_BLOCKS),
+            });
+        }
+        let (bytes, meta) = encode_sstable_block(
+            self.id,
+            self.blocks.len() as u32,
+            &self.block_entries,
+            self.offset,
+        )?;
+        self.file.write_all(&bytes)?;
+        self.offset =
+            self.offset
+                .checked_add(bytes.len() as u64)
+                .ok_or(LsmError::InvalidSstable {
+                    sstable_id: self.id,
+                    reason: "streamed file offset overflows",
+                })?;
+        self.blocks.push(meta);
+        self.block_entries.clear();
+        self.block_bytes = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Sstable, StorageError> {
+        self.flush_block()?;
+        if self.entry_count != self.expected_entries
+            || self.distinct_count != self.expected_distinct
+            || self.blocks.is_empty()
+        {
+            return Err(LsmError::InvalidSstable {
+                sstable_id: self.id,
+                reason: "streamed output differs from its first-pass plan",
+            }
+            .into());
+        }
+        let index = encode_sstable_index(&self.blocks)?;
+        let footer = encode_sstable_footer(&index, self.blocks.len())?;
+        self.file.write_all(&index)?;
+        self.file.write_all(&footer)?;
+        let file_bytes = self
+            .offset
+            .checked_add(index.len() as u64)
+            .and_then(|value| value.checked_add(SST_FOOTER_SIZE as u64))
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: self.id,
+                reason: "streamed footer offset overflows",
+            })?;
+        let reference = SstableRef {
+            id: self.id,
+            level: self.level,
+            entry_count: self.entry_count,
+            file_bytes,
+            bloom_bytes: self.bloom.bits.len() as u64,
+            min: self.min.ok_or(LsmError::InvalidSstable {
+                sstable_id: self.id,
+                reason: "streamed output has no minimum key",
+            })?,
+            max: self.max.ok_or(LsmError::InvalidSstable {
+                sstable_id: self.id,
+                reason: "streamed output has no maximum key",
+            })?,
+        };
+        let header = encode_sstable_header(
+            &self.shared.manifest,
+            &reference,
+            self.blocks.len() as u32,
+            &self.bloom,
+        )?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&header)?;
+        self.file.write_all(&self.bloom.bits)?;
+        #[cfg(test)]
+        maybe_lsm_crash("during-sst-write");
+        self.file.sync_all()?;
+        #[cfg(test)]
+        maybe_lsm_crash("after-sst-sync");
+        fs::rename(&self.temp_path, &self.final_path)?;
+        sync_directory(&self.shared.root.join(SST_DIR_NAME))?;
+        self.finished = true;
+        Ok(Sstable {
+            reference,
+            path: self.final_path.clone(),
+            blocks: self.blocks.clone(),
+            bloom: self.bloom.clone(),
+        })
+    }
+}
+
+impl Drop for StreamingSstableWriter<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = fs::remove_file(&self.temp_path);
+            let _ = fs::remove_file(&self.final_path);
+        }
+    }
+}
+
+fn cleanup_compaction_outputs(outputs: &[Sstable]) -> Result<(), StorageError> {
+    for output in outputs {
+        remove_unreferenced_file(&output.path)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_manifest_sstables(sstables: &mut [SstableRef]) {
+    sstables.sort_by_key(|sstable| {
+        (
+            sstable.level,
+            if sstable.level == 0 {
+                PhysicalKey {
+                    clustering: match sstable.min.clustering {
+                        ClusteringKey::Int64(_) => ClusteringKey::Int64(i64::MIN),
+                        ClusteringKey::UInt64(_) => ClusteringKey::UInt64(u64::MIN),
+                    },
+                    row_id: LsmRowId(1),
+                }
+            } else {
+                sstable.min
+            },
+            sstable.id,
+        )
+    });
+}
+
+fn canonicalize_sstables(sstables: &mut [Sstable]) {
+    sstables.sort_by_key(|sstable| {
+        (
+            sstable.reference.level,
+            if sstable.reference.level == 0 {
+                PhysicalKey {
+                    clustering: match sstable.reference.min.clustering {
+                        ClusteringKey::Int64(_) => ClusteringKey::Int64(i64::MIN),
+                        ClusteringKey::UInt64(_) => ClusteringKey::UInt64(u64::MIN),
+                    },
+                    row_id: LsmRowId(1),
+                }
+            } else {
+                sstable.reference.min
+            },
+            sstable.reference.id,
+        )
+    });
+}
+
+fn estimated_entry_bytes(entry: &VersionedEntry) -> u64 {
+    32_u64.saturating_add(value_size(&entry.value))
 }
 
 fn remove_unreferenced_file(path: &Path) -> Result<(), StorageError> {
@@ -3283,6 +4543,11 @@ fn remove_unreferenced_file(path: &Path) -> Result<(), StorageError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn remove_obsolete_file(path: &Path) -> Result<(), StorageError> {
+    maybe_fail_obsolete_delete()?;
+    remove_unreferenced_file(path)
 }
 
 fn cleanup_orphans(shared: &LsmShared) -> Result<(), StorageError> {
@@ -3359,10 +4624,10 @@ fn write_sstable(
     entries: &[VersionedEntry],
     table: &TableDef,
 ) -> Result<Sstable, StorageError> {
-    if entries.is_empty() {
+    if entries.is_empty() || level >= LSM_MAX_LEVELS {
         return Err(LsmError::InvalidSstable {
             sstable_id: id,
-            reason: "cannot write an empty SSTable",
+            reason: "cannot write an empty SSTable or invalid level",
         }
         .into());
     }
@@ -3393,10 +4658,47 @@ fn write_sstable(
         previous = Some((entry.key, entry.version));
     }
     let blocks = chunk_entries(entries)?;
+    if blocks.len() > SST_MAX_BLOCKS as usize {
+        return Err(StorageError::ResourceLimit {
+            resource: "LSM SSTable blocks",
+            limit: u64::from(SST_MAX_BLOCKS),
+        });
+    }
+    let bloom = BloomFilter::build(entries)?;
+    let mut offset = (SST_HEADER_SIZE as u64)
+        .checked_add(bloom.bits.len() as u64)
+        .ok_or(LsmError::InvalidSstable {
+            sstable_id: id,
+            reason: "Bloom offset overflows",
+        })?;
+    let mut encoded_blocks = Vec::with_capacity(blocks.len());
+    let mut metas = Vec::with_capacity(blocks.len());
+    for (block_index, block) in blocks.iter().enumerate() {
+        let (block_bytes, meta) = encode_sstable_block(id, block_index as u32, block, offset)?;
+        offset = offset
+            .checked_add(block_bytes.len() as u64)
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: id,
+                reason: "file offset overflows",
+            })?;
+        encoded_blocks.push(block_bytes);
+        metas.push(meta);
+    }
+    let index = encode_sstable_index(&metas)?;
+    let footer = encode_sstable_footer(&index, metas.len())?;
+    offset = offset
+        .checked_add(index.len() as u64)
+        .and_then(|value| value.checked_add(SST_FOOTER_SIZE as u64))
+        .ok_or(LsmError::InvalidSstable {
+            sstable_id: id,
+            reason: "footer offset overflows",
+        })?;
     let reference = SstableRef {
         id,
         level,
         entry_count: entries.len() as u64,
+        file_bytes: offset,
+        bloom_bytes: bloom.bits.len() as u64,
         min: entries
             .first()
             .ok_or(LsmError::InvalidSstable {
@@ -3414,36 +4716,38 @@ fn write_sstable(
     };
     let temp = sstable_temp_path(root, id, level);
     let final_path = sstable_path(root, id, level);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
-    let header = encode_sstable_header(manifest, &reference, blocks.len() as u32)?;
-    file.write_all(&header)?;
-    let mut offset = SST_HEADER_SIZE as u64;
-    let mut metas = Vec::with_capacity(blocks.len());
-    for (block_index, block) in blocks.iter().enumerate() {
-        let (block_bytes, meta) = encode_sstable_block(id, block_index as u32, block, offset)?;
-        file.write_all(&block_bytes)?;
-        offset = offset
-            .checked_add(block_bytes.len() as u64)
-            .ok_or(LsmError::InvalidSstable {
-                sstable_id: id,
-                reason: "file offset overflows",
-            })?;
-        metas.push(meta);
+    let header = encode_sstable_header(manifest, &reference, blocks.len() as u32, &bloom)?;
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&header)?;
+        file.write_all(&bloom.bits)?;
+        for block_bytes in encoded_blocks {
+            file.write_all(&block_bytes)?;
+        }
+        file.write_all(&index)?;
+        file.write_all(&footer)?;
+        #[cfg(test)]
+        maybe_lsm_crash("during-sst-write");
+        file.sync_all()?;
+        #[cfg(test)]
+        maybe_lsm_crash("after-sst-sync");
+        drop(file);
+        fs::rename(&temp, &final_path)?;
+        sync_directory(&root.join(SST_DIR_NAME))
+    })();
+    if let Err(error) = write_result {
+        remove_unreferenced_file(&temp)?;
+        remove_unreferenced_file(&final_path)?;
+        return Err(error);
     }
-    #[cfg(test)]
-    maybe_lsm_crash("during-sst-write");
-    file.sync_all()?;
-    #[cfg(test)]
-    maybe_lsm_crash("after-sst-sync");
-    fs::rename(&temp, &final_path)?;
-    sync_directory(&root.join(SST_DIR_NAME))?;
     Ok(Sstable {
         reference,
         path: final_path,
         blocks: metas,
+        bloom,
     })
 }
 
@@ -3485,6 +4789,7 @@ fn encode_sstable_header(
     manifest: &Manifest,
     reference: &SstableRef,
     block_count: u32,
+    bloom: &BloomFilter,
 ) -> Result<[u8; SST_HEADER_SIZE], StorageError> {
     let mut bytes = [0_u8; SST_HEADER_SIZE];
     bytes[0..4].copy_from_slice(SST_MAGIC);
@@ -3499,8 +4804,14 @@ fn encode_sstable_header(
     bytes[76..80].copy_from_slice(&block_count.to_le_bytes());
     encode_physical_key(&mut bytes[80..100], reference.min)?;
     encode_physical_key(&mut bytes[100..120], reference.max)?;
-    let checksum = crc32c::crc32c(&bytes[..140]);
-    bytes[140..144].copy_from_slice(&checksum.to_le_bytes());
+    bytes[120] = bloom.algorithm;
+    bytes[121] = bloom.hash_count;
+    bytes[124..132].copy_from_slice(&bloom.bit_count.to_le_bytes());
+    bytes[132..140].copy_from_slice(&(bloom.bits.len() as u64).to_le_bytes());
+    bytes[140..144].copy_from_slice(&crc32c::crc32c(&bloom.bits).to_le_bytes());
+    bytes[144..152].copy_from_slice(&reference.file_bytes.to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes[..156]);
+    bytes[156..160].copy_from_slice(&checksum.to_le_bytes());
     Ok(bytes)
 }
 
@@ -3508,7 +4819,7 @@ fn decode_sstable_header(
     bytes: &[u8; SST_HEADER_SIZE],
     manifest: &Manifest,
     reference: &SstableRef,
-) -> Result<u32, StorageError> {
+) -> Result<(u32, BloomFilter), StorageError> {
     let invalid = |reason| LsmError::InvalidSstable {
         sstable_id: reference.id,
         reason,
@@ -3523,7 +4834,8 @@ fn decode_sstable_header(
     if bytes[6..8]
         .iter()
         .chain(bytes[66..68].iter())
-        .chain(bytes[120..140].iter())
+        .chain(bytes[122..124].iter())
+        .chain(bytes[152..156].iter())
         .any(|byte| *byte != 0)
     {
         return Err(invalid("header reserved bytes are nonzero").into());
@@ -3544,11 +4856,12 @@ fn decode_sstable_header(
         || read_u64(bytes, 68)? != reference.entry_count
         || decode_physical_key(&bytes[80..100], manifest.key_type)? != reference.min
         || decode_physical_key(&bytes[100..120], manifest.key_type)? != reference.max
+        || read_u64(bytes, 144)? != reference.file_bytes
     {
         return Err(invalid("header identity differs from manifest").into());
     }
-    let stored = read_u32(bytes, 140)?;
-    let computed = crc32c::crc32c(&bytes[..140]);
+    let stored = read_u32(bytes, 156)?;
+    let computed = crc32c::crc32c(&bytes[..156]);
     if stored != computed {
         return Err(LsmError::SstableChecksum {
             sstable_id: reference.id,
@@ -3559,10 +4872,35 @@ fn decode_sstable_header(
         .into());
     }
     let count = read_u32(bytes, 76)?;
-    if count == 0 || u64::from(count) > reference.entry_count {
+    if count == 0 || count > SST_MAX_BLOCKS || u64::from(count) > reference.entry_count {
         return Err(invalid("invalid block count").into());
     }
-    Ok(count)
+    let algorithm = bytes[120];
+    let hash_count = bytes[121];
+    let bit_count = read_u64(bytes, 124)?;
+    let bloom_bytes = read_u64(bytes, 132)?;
+    if algorithm != BLOOM_ALGORITHM_VERSION
+        || hash_count == 0
+        || hash_count > 32
+        || bit_count == 0
+        || bit_count > BLOOM_MAX_BITS
+        || bit_count % 8 != 0
+        || bloom_bytes != bit_count / 8
+        || bloom_bytes != reference.bloom_bytes
+    {
+        return Err(invalid("Bloom metadata is invalid").into());
+    }
+    let byte_count =
+        usize::try_from(bloom_bytes).map_err(|_| invalid("Bloom byte count does not fit usize"))?;
+    Ok((
+        count,
+        BloomFilter {
+            algorithm,
+            bit_count,
+            hash_count,
+            bits: vec![0; byte_count],
+        },
+    ))
 }
 
 fn encode_sstable_block(
@@ -3616,6 +4954,175 @@ fn encode_sstable_block(
     ))
 }
 
+fn encode_sstable_index(blocks: &[BlockMeta]) -> Result<Vec<u8>, StorageError> {
+    let length =
+        blocks
+            .len()
+            .checked_mul(SST_INDEX_ENTRY_SIZE)
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "block index length overflows",
+            })?;
+    let mut bytes = vec![0_u8; length];
+    for (position, block) in blocks.iter().enumerate() {
+        let offset = position * SST_INDEX_ENTRY_SIZE;
+        bytes[offset..offset + 8].copy_from_slice(&block.offset.to_le_bytes());
+        bytes[offset + 8..offset + 12].copy_from_slice(&block.payload_length.to_le_bytes());
+        bytes[offset + 12..offset + 16].copy_from_slice(&block.entry_count.to_le_bytes());
+        encode_physical_key(&mut bytes[offset + 16..offset + 36], block.first)?;
+        encode_physical_key(&mut bytes[offset + 36..offset + 56], block.last)?;
+    }
+    Ok(bytes)
+}
+
+fn encode_sstable_footer(
+    index: &[u8],
+    block_count: usize,
+) -> Result<[u8; SST_FOOTER_SIZE], StorageError> {
+    if block_count > SST_MAX_BLOCKS as usize {
+        return Err(StorageError::ResourceLimit {
+            resource: "LSM SSTable blocks",
+            limit: u64::from(SST_MAX_BLOCKS),
+        });
+    }
+    let mut bytes = [0_u8; SST_FOOTER_SIZE];
+    bytes[0..4].copy_from_slice(SST_FOOTER_MAGIC);
+    bytes[4..6].copy_from_slice(&LSM_SSTABLE_FORMAT_VERSION.to_le_bytes());
+    bytes[8..12].copy_from_slice(
+        &u32::try_from(block_count)
+            .map_err(|_| LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "block count exceeds u32",
+            })?
+            .to_le_bytes(),
+    );
+    bytes[12..16].copy_from_slice(&(SST_INDEX_ENTRY_SIZE as u32).to_le_bytes());
+    bytes[16..24].copy_from_slice(&(index.len() as u64).to_le_bytes());
+    bytes[24..28].copy_from_slice(&crc32c::crc32c(index).to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes[..28]);
+    bytes[28..32].copy_from_slice(&checksum.to_le_bytes());
+    Ok(bytes)
+}
+
+fn read_sstable_footer(
+    file: &mut File,
+    reference: &SstableRef,
+    block_count: u32,
+    key_type: PhysicalType,
+    first_block_offset: u64,
+) -> Result<Vec<BlockMeta>, StorageError> {
+    let invalid = |reason| LsmError::InvalidSstable {
+        sstable_id: reference.id,
+        reason,
+    };
+    let file_length = file.metadata()?.len();
+    if file_length != reference.file_bytes {
+        return Err(invalid("file length differs from manifest").into());
+    }
+    let footer_offset = file_length
+        .checked_sub(SST_FOOTER_SIZE as u64)
+        .ok_or_else(|| invalid("footer offset underflows"))?;
+    if footer_offset < first_block_offset {
+        return Err(invalid("footer overlaps header or Bloom").into());
+    }
+    file.seek(SeekFrom::Start(footer_offset))?;
+    let mut footer = [0_u8; SST_FOOTER_SIZE];
+    file.read_exact(&mut footer)
+        .map_err(|_| invalid("footer is truncated"))?;
+    if &footer[0..4] != SST_FOOTER_MAGIC
+        || read_u16(&footer, 4)? != LSM_SSTABLE_FORMAT_VERSION
+        || footer[6..8].iter().any(|byte| *byte != 0)
+    {
+        return Err(invalid("footer identity is invalid").into());
+    }
+    let stored_footer = read_u32(&footer, 28)?;
+    let computed_footer = crc32c::crc32c(&footer[..28]);
+    if stored_footer != computed_footer {
+        return Err(LsmError::SstableChecksum {
+            sstable_id: reference.id,
+            block: u32::MAX - 2,
+            stored: stored_footer,
+            computed: computed_footer,
+        }
+        .into());
+    }
+    if read_u32(&footer, 8)? != block_count || read_u32(&footer, 12)? != SST_INDEX_ENTRY_SIZE as u32
+    {
+        return Err(invalid("footer block metadata differs from header").into());
+    }
+    let expected_index_length = usize::try_from(block_count)
+        .ok()
+        .and_then(|count| count.checked_mul(SST_INDEX_ENTRY_SIZE))
+        .ok_or_else(|| invalid("block index length overflows"))?;
+    if read_u64(&footer, 16)? != expected_index_length as u64 {
+        return Err(invalid("block index length is invalid").into());
+    }
+    let index_offset = footer_offset
+        .checked_sub(expected_index_length as u64)
+        .ok_or_else(|| invalid("block index offset underflows"))?;
+    if index_offset < first_block_offset {
+        return Err(invalid("block index overlaps header or Bloom").into());
+    }
+    let mut index = vec![0_u8; expected_index_length];
+    file.seek(SeekFrom::Start(index_offset))?;
+    file.read_exact(&mut index)
+        .map_err(|_| invalid("block index is truncated"))?;
+    let stored_index = read_u32(&footer, 24)?;
+    let computed_index = crc32c::crc32c(&index);
+    if stored_index != computed_index {
+        return Err(LsmError::SstableChecksum {
+            sstable_id: reference.id,
+            block: u32::MAX - 3,
+            stored: stored_index,
+            computed: computed_index,
+        }
+        .into());
+    }
+    let mut blocks = Vec::with_capacity(block_count as usize);
+    let mut expected_offset = first_block_offset;
+    let mut previous_last = None;
+    let mut total_entries = 0_u64;
+    for position in 0..block_count as usize {
+        let offset = position * SST_INDEX_ENTRY_SIZE;
+        let block_offset = read_u64(&index, offset)?;
+        let payload_length = read_u32(&index, offset + 8)?;
+        let entry_count = read_u32(&index, offset + 12)?;
+        let first = decode_physical_key(&index[offset + 16..offset + 36], key_type)?;
+        let last = decode_physical_key(&index[offset + 36..offset + 56], key_type)?;
+        if block_offset != expected_offset
+            || payload_length as usize > SST_MAX_BLOCK_BYTES
+            || entry_count == 0
+            || first > last
+            || previous_last.is_some_and(|previous| previous > first)
+        {
+            return Err(invalid("block index entry is invalid or unsorted").into());
+        }
+        expected_offset = expected_offset
+            .checked_add(SST_BLOCK_HEADER_SIZE as u64)
+            .and_then(|value| value.checked_add(u64::from(payload_length)))
+            .and_then(|value| value.checked_add(4))
+            .ok_or_else(|| invalid("block byte range overflows"))?;
+        if expected_offset > index_offset {
+            return Err(invalid("block bytes overlap the index").into());
+        }
+        total_entries = total_entries
+            .checked_add(u64::from(entry_count))
+            .ok_or_else(|| invalid("block entry count overflows"))?;
+        previous_last = Some(last);
+        blocks.push(BlockMeta {
+            offset: block_offset,
+            payload_length,
+            entry_count,
+            first,
+            last,
+        });
+    }
+    if expected_offset != index_offset || total_entries != reference.entry_count {
+        return Err(invalid("block index coverage differs from file").into());
+    }
+    Ok(blocks)
+}
+
 fn encode_sstable_entry(bytes: &mut Vec<u8>, entry: &VersionedEntry) -> Result<(), StorageError> {
     bytes.extend_from_slice(&entry.key.clustering.bits().to_le_bytes());
     bytes.extend_from_slice(&entry.key.row_id.0.to_le_bytes());
@@ -3662,27 +5169,77 @@ fn open_sstable(
             error.into()
         }
     })?;
-    let block_count = decode_sstable_header(&header, manifest, reference)?;
-    let mut offset = SST_HEADER_SIZE as u64;
-    let mut blocks = Vec::with_capacity(block_count as usize);
+    let (block_count, mut bloom) = decode_sstable_header(&header, manifest, reference)?;
+    file.read_exact(&mut bloom.bits).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            StorageError::from(LsmError::InvalidSstable {
+                sstable_id: reference.id,
+                reason: "Bloom payload is truncated",
+            })
+        } else {
+            error.into()
+        }
+    })?;
+    bloom = decode_bloom_payload(
+        bloom.algorithm,
+        bloom.hash_count,
+        bloom.bit_count,
+        &bloom.bits,
+        read_u32(&header, 140)?,
+        reference.id,
+    )?;
+    let first_block_offset = (SST_HEADER_SIZE as u64)
+        .checked_add(reference.bloom_bytes)
+        .ok_or(LsmError::InvalidSstable {
+            sstable_id: reference.id,
+            reason: "Bloom end overflows",
+        })?;
+    let blocks = read_sstable_footer(
+        &mut file,
+        reference,
+        block_count,
+        manifest.key_type,
+        first_block_offset,
+    )?;
     let mut total_entries = 0_u64;
     let mut previous = None;
-    for block_index in 0..block_count {
-        let (meta, entries, next) = read_sstable_block(
+    let mut actual_min = None;
+    for (block_index, expected) in blocks.iter().enumerate() {
+        let (meta, entries, _) = read_sstable_block(
             &mut file,
             reference.id,
-            block_index,
-            offset,
+            block_index as u32,
+            expected.offset,
             manifest.key_type,
             table,
         )?;
+        if meta.offset != expected.offset
+            || meta.payload_length != expected.payload_length
+            || meta.entry_count != expected.entry_count
+            || meta.first != expected.first
+            || meta.last != expected.last
+        {
+            return Err(LsmError::InvalidSstable {
+                sstable_id: reference.id,
+                reason: "block differs from footer index",
+            }
+            .into());
+        }
         for entry in &entries {
+            actual_min.get_or_insert(entry.key);
             if previous.is_some_and(|previous: (PhysicalKey, LsmCommitSeq)| {
                 previous >= (entry.key, entry.version)
             }) {
                 return Err(LsmError::InvalidSstable {
                     sstable_id: reference.id,
                     reason: "entries are not strictly sorted",
+                }
+                .into());
+            }
+            if !bloom.might_contain(entry.key.clustering) {
+                return Err(LsmError::InvalidSstable {
+                    sstable_id: reference.id,
+                    reason: "Bloom has a false negative for a persisted entry",
                 }
                 .into());
             }
@@ -3695,13 +5252,14 @@ fn open_sstable(
                     sstable_id: reference.id,
                     reason: "entry count overflows",
                 })?;
-        blocks.push(meta);
-        offset = next;
     }
-    if total_entries != reference.entry_count || offset != file.metadata()?.len() {
+    if total_entries != reference.entry_count
+        || actual_min != Some(reference.min)
+        || previous.map(|(key, _)| key) != Some(reference.max)
+    {
         return Err(LsmError::InvalidSstable {
             sstable_id: reference.id,
-            reason: "file length or entry count differs from header",
+            reason: "file entry count or key bounds differ from header",
         }
         .into());
     }
@@ -3709,58 +5267,52 @@ fn open_sstable(
         reference: reference.clone(),
         path,
         blocks,
+        bloom,
     })
 }
 
-fn read_sstable_entries(
-    sstable: &Sstable,
-    table: &TableDef,
-    range: Option<&KeyRange>,
-) -> Result<Vec<VersionedEntry>, StorageError> {
-    let mut file = File::open(&sstable.path)?;
-    let mut entries = Vec::new();
-    for (index, meta) in sstable.blocks.iter().enumerate() {
-        if range.is_some_and(|range| !range.overlaps(meta.first.clustering, meta.last.clustering)) {
-            continue;
+fn decode_bloom_payload(
+    algorithm: u8,
+    hash_count: u8,
+    bit_count: u64,
+    bits: &[u8],
+    stored_checksum: u32,
+    sstable_id: u64,
+) -> Result<BloomFilter, StorageError> {
+    let expected_bytes = bit_count.checked_div(8).ok_or(LsmError::InvalidSstable {
+        sstable_id,
+        reason: "Bloom bit count is invalid",
+    })?;
+    if algorithm != BLOOM_ALGORITHM_VERSION
+        || hash_count == 0
+        || hash_count > 32
+        || bit_count == 0
+        || bit_count > BLOOM_MAX_BITS
+        || bit_count % 8 != 0
+        || expected_bytes != bits.len() as u64
+    {
+        return Err(LsmError::InvalidSstable {
+            sstable_id,
+            reason: "Bloom payload metadata is invalid",
         }
-        let (_, block_entries, _) = read_sstable_block(
-            &mut file,
-            sstable.reference.id,
-            index as u32,
-            meta.offset,
-            meta.first.clustering.kind(),
-            table,
-        )?;
-        if block_entries.len() != meta.entry_count as usize {
-            return Err(LsmError::InvalidSstable {
-                sstable_id: sstable.reference.id,
-                reason: "sparse block entry count changed",
-            }
-            .into());
-        }
-        let expected_payload_end = meta
-            .offset
-            .checked_add(SST_BLOCK_HEADER_SIZE as u64)
-            .and_then(|value| value.checked_add(u64::from(meta.payload_length)))
-            .and_then(|value| value.checked_add(4))
-            .ok_or(LsmError::InvalidSstable {
-                sstable_id: sstable.reference.id,
-                reason: "sparse block offset overflows",
-            })?;
-        if file.stream_position()? != expected_payload_end {
-            return Err(LsmError::InvalidSstable {
-                sstable_id: sstable.reference.id,
-                reason: "sparse block length changed",
-            }
-            .into());
-        }
-        entries.extend(
-            block_entries
-                .into_iter()
-                .filter(|entry| range.is_none_or(|range| range.contains(entry.key.clustering))),
-        );
+        .into());
     }
-    Ok(entries)
+    let computed = crc32c::crc32c(bits);
+    if stored_checksum != computed {
+        return Err(LsmError::SstableChecksum {
+            sstable_id,
+            block: u32::MAX - 1,
+            stored: stored_checksum,
+            computed,
+        }
+        .into());
+    }
+    Ok(BloomFilter {
+        algorithm,
+        bit_count,
+        hash_count,
+        bits: bits.to_vec(),
+    })
 }
 
 fn read_sstable_block(
@@ -4117,6 +5669,77 @@ fn decode_wal_records_cursor(
 
 /// Bounded SSTable-block decoder entry point for the fuzz target.
 pub fn fuzz_lsm_sstable_block_bytes(bytes: &[u8]) {
+    if bytes.len() > 6 {
+        let payload = &bytes[6..];
+        let bit_count = (payload.len() as u64).saturating_mul(8);
+        let stored = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4]));
+        let _ = decode_bloom_payload(bytes[4], bytes[5], bit_count, payload, stored, 1);
+        if let Ok(filter) = decode_bloom_payload(
+            BLOOM_ALGORITHM_VERSION,
+            BLOOM_HASH_COUNT,
+            bit_count,
+            payload,
+            crc32c::crc32c(payload),
+            1,
+        ) {
+            let _ = filter.might_contain(ClusteringKey::Int64(i64::MIN));
+            let _ = filter.might_contain(ClusteringKey::UInt64(u64::MAX));
+        }
+    }
+    if bytes.len() >= SST_HEADER_SIZE && &bytes[0..4] == SST_MAGIC {
+        let header: &[u8; SST_HEADER_SIZE] = match bytes[..SST_HEADER_SIZE].try_into() {
+            Ok(header) => header,
+            Err(_) => return,
+        };
+        let Ok(key_type) = decode_physical_type(header[65]) else {
+            return;
+        };
+        let Ok(min) = decode_physical_key(&header[80..100], key_type) else {
+            return;
+        };
+        let Ok(max) = decode_physical_key(&header[100..120], key_type) else {
+            return;
+        };
+        let manifest = Manifest {
+            storage_id: StorageId(u64::from_le_bytes(
+                header[8..16].try_into().unwrap_or([0; 8]),
+            )),
+            table_id: TableId(u64::from_le_bytes(
+                header[16..24].try_into().unwrap_or([0; 8]),
+            )),
+            schema_fingerprint: SchemaFingerprint::from_bytes(
+                header[24..56].try_into().unwrap_or([0; 32]),
+            ),
+            clustering_column: ColumnId(1),
+            key_type,
+            generation: 1,
+            wal_generation: 1,
+            row_reservation_end: 1,
+            txn_reservation_end: 1,
+            commit_reservation_end: 1,
+            next_sstable_id: u64::MAX,
+            table_statistics: None,
+            access_statistics: None,
+            clustering_statistics: None,
+            sstables: Vec::new(),
+        };
+        let reference = SstableRef {
+            id: u64::from_le_bytes(header[56..64].try_into().unwrap_or([0; 8])),
+            level: header[64],
+            entry_count: u64::from_le_bytes(header[68..76].try_into().unwrap_or([0; 8])),
+            file_bytes: u64::from_le_bytes(header[144..152].try_into().unwrap_or([0; 8])),
+            bloom_bytes: u64::from_le_bytes(header[132..140].try_into().unwrap_or([0; 8])),
+            min,
+            max,
+        };
+        if let Ok((_, bloom)) = decode_sstable_header(header, &manifest, &reference) {
+            let end = SST_HEADER_SIZE.saturating_add(bloom.bits.len());
+            if let Some(payload) = bytes.get(SST_HEADER_SIZE..end) {
+                let _ = crc32c::crc32c(payload)
+                    == u32::from_le_bytes(header[140..144].try_into().unwrap_or([0; 4]));
+            }
+        }
+    }
     if bytes.len() < SST_BLOCK_HEADER_SIZE || &bytes[0..4] != SST_BLOCK_MAGIC {
         return;
     }
@@ -4137,6 +5760,7 @@ pub fn fuzz_lsm_sstable_block_bytes(bytes: &[u8]) {
 #[cfg(test)]
 thread_local! {
     static MANIFEST_PUBLISH_FAILURE: Cell<Option<ManifestPublishPoint>> = const { Cell::new(None) };
+    static OBSOLETE_DELETE_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -4151,8 +5775,24 @@ fn maybe_fail_manifest_publish(point: ManifestPublishPoint) -> Result<(), Storag
     })
 }
 
+#[cfg(test)]
+fn maybe_fail_obsolete_delete() -> Result<(), StorageError> {
+    OBSOLETE_DELETE_FAILURE.with(|failure| {
+        if failure.replace(false) {
+            Err(io::Error::other("injected obsolete SSTable delete failure").into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
 #[cfg(not(test))]
 fn maybe_fail_manifest_publish(_point: ManifestPublishPoint) -> Result<(), StorageError> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_obsolete_delete() -> Result<(), StorageError> {
     Ok(())
 }
 
@@ -4697,6 +6337,147 @@ mod tests {
             Err(StorageError::Lsm(super::LsmError::SstableChecksum { .. }))
         ));
         cleanup(&sst_root);
+
+        for (case, offset_from_end) in [("bloom-corrupt", None), ("footer-corrupt", Some(1))] {
+            let root = root(case);
+            cleanup(&root);
+            let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+            storage.insert(&row(1, "sst")).expect("insert");
+            storage.flush().expect("flush");
+            drop(storage);
+            let manifest = super::read_manifest(&root).expect("manifest");
+            let reference = manifest.sstables.first().expect("reference");
+            let path = super::sstable_path(&root, reference.id, reference.level);
+            let offset = offset_from_end.map_or(super::SST_HEADER_SIZE as u64, |distance| {
+                std::fs::metadata(&path).expect("metadata").len() - distance
+            });
+            flip(&path, offset);
+            assert!(LsmStorage::open(&root, table()).is_err(), "case {case}");
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn self_consistent_false_negative_bloom_is_rejected() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let root = root("semantic-bloom-corrupt");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.insert(&row(1, "sst")).expect("insert");
+        storage.flush().expect("flush");
+        drop(storage);
+
+        let manifest = super::read_manifest(&root).expect("manifest");
+        let reference = manifest.sstables.first().expect("reference");
+        let path = super::sstable_path(&root, reference.id, reference.level);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open SSTable");
+        let mut header = [0_u8; super::SST_HEADER_SIZE];
+        file.read_exact(&mut header).expect("read header");
+        let empty_bits = vec![0_u8; reference.bloom_bytes as usize];
+        header[140..144].copy_from_slice(&crc32c::crc32c(&empty_bits).to_le_bytes());
+        let header_checksum = crc32c::crc32c(&header[..156]);
+        header[156..160].copy_from_slice(&header_checksum.to_le_bytes());
+        file.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        file.write_all(&header).expect("rewrite header");
+        file.write_all(&empty_bits).expect("rewrite Bloom");
+        file.sync_all().expect("sync semantic corruption");
+        drop(file);
+
+        assert!(matches!(
+            LsmStorage::open(&root, table()),
+            Err(StorageError::Lsm(super::LsmError::InvalidSstable {
+                reason: "Bloom has a false negative for a persisted entry",
+                ..
+            }))
+        ));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn self_consistent_file_bounds_mismatch_is_rejected() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let root = root("semantic-bounds-corrupt");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.insert(&row(1, "sst")).expect("insert");
+        storage.flush().expect("flush");
+        drop(storage);
+
+        let mut manifest = super::read_manifest(&root).expect("manifest");
+        let reference = manifest.sstables.first_mut().expect("reference");
+        let false_bound = super::PhysicalKey {
+            clustering: super::ClusteringKey::Int64(2),
+            row_id: LsmRowId(1),
+        };
+        reference.min = false_bound;
+        reference.max = false_bound;
+        let path = super::sstable_path(&root, reference.id, reference.level);
+        let manifest_bytes = super::encode_manifest(&manifest).expect("encode manifest");
+        std::fs::write(super::manifest_path(&root), manifest_bytes).expect("rewrite manifest");
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open SSTable");
+        let mut header = [0_u8; super::SST_HEADER_SIZE];
+        file.read_exact(&mut header).expect("read header");
+        super::encode_physical_key(&mut header[80..100], false_bound).expect("encode min");
+        super::encode_physical_key(&mut header[100..120], false_bound).expect("encode max");
+        let checksum = crc32c::crc32c(&header[..156]);
+        header[156..160].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        file.write_all(&header).expect("rewrite header");
+        file.sync_all().expect("sync semantic corruption");
+        drop(file);
+
+        assert!(matches!(
+            LsmStorage::open(&root, table()),
+            Err(StorageError::Lsm(super::LsmError::InvalidSstable {
+                reason: "file entry count or key bounds differ from header",
+                ..
+            }))
+        ));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sstable_header_rejects_block_count_above_metadata_bound() {
+        use std::io::Read as _;
+
+        let root = root("sstable-block-count-bound");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.insert(&row(1, "sst")).expect("insert");
+        storage.flush().expect("flush");
+        drop(storage);
+
+        let manifest = super::read_manifest(&root).expect("manifest");
+        let reference = manifest.sstables.first().expect("reference");
+        let path = super::sstable_path(&root, reference.id, reference.level);
+        let mut header = [0_u8; super::SST_HEADER_SIZE];
+        std::fs::File::open(path)
+            .expect("open SSTable")
+            .read_exact(&mut header)
+            .expect("read header");
+        header[76..80].copy_from_slice(&(super::SST_MAX_BLOCKS + 1).to_le_bytes());
+        let checksum = crc32c::crc32c(&header[..156]);
+        header[156..160].copy_from_slice(&checksum.to_le_bytes());
+
+        assert!(matches!(
+            super::decode_sstable_header(&header, &manifest, reference),
+            Err(StorageError::Lsm(super::LsmError::InvalidSstable {
+                reason: "invalid block count",
+                ..
+            }))
+        ));
+        cleanup(&root);
     }
 
     #[test]
@@ -4872,7 +6653,12 @@ mod tests {
         panic!("maintenance returned without reaching configured crash point");
     }
 
-    fn run_maintenance_crash(root: &std::path::Path, operation: &str, point: &str) {
+    fn run_maintenance_crash(
+        root: &std::path::Path,
+        operation: &str,
+        point: &str,
+        expected_rows: usize,
+    ) {
         let mut command = std::process::Command::new(
             std::env::current_exe().expect("current storage test executable"),
         );
@@ -4898,7 +6684,7 @@ mod tests {
                     .scan_columns_with_view(&[ColumnId(1)], &view)
                     .expect("scan")
                     .len(),
-                10,
+                expected_rows,
                 "operation {operation}, point {point}, pass {pass}"
             );
             drop(view);
@@ -4926,7 +6712,7 @@ mod tests {
                 storage.insert(&row(key, "value")).expect("insert");
             }
             drop(storage);
-            run_maintenance_crash(&root, "flush", point);
+            run_maintenance_crash(&root, "flush", point, 10);
             cleanup(&root);
         }
     }
@@ -4953,8 +6739,434 @@ mod tests {
             }
             storage.flush().expect("second flush");
             drop(storage);
-            run_maintenance_crash(&root, "compact", point);
+            run_maintenance_crash(&root, "compact", point, 10);
             cleanup(&root);
         }
+    }
+
+    #[test]
+    fn bloom_filter_is_stable_has_no_false_negatives_and_includes_tombstones() {
+        let make = |key, row_id, version, value| super::VersionedEntry {
+            key: super::PhysicalKey {
+                clustering: super::ClusteringKey::Int64(key),
+                row_id: LsmRowId(row_id),
+            },
+            version: netbadb_types::LsmCommitSeq(version),
+            value,
+        };
+        let entries = vec![
+            make(-1, 1, 1, super::EntryValue::Tombstone),
+            make(0, 2, 1, super::EntryValue::Put(vec![1])),
+            make(42, 3, 1, super::EntryValue::Put(vec![2])),
+            make(42, 3, 2, super::EntryValue::Tombstone),
+        ];
+        let bloom = super::BloomFilter::build(&entries).expect("Bloom");
+        assert_eq!(bloom.algorithm, super::BLOOM_ALGORITHM_VERSION);
+        assert_eq!(bloom.bit_count, 64);
+        assert_eq!(bloom.hash_count, 7);
+        assert_eq!(bloom.bits, [0x71, 0x02, 0x04, 0x0c, 0xd0, 0xdf, 0x81, 0x00]);
+        for key in [-1, 0, 42] {
+            assert!(
+                bloom.might_contain(super::ClusteringKey::Int64(key)),
+                "inserted key {key} must never be negative"
+            );
+        }
+        assert!(!super::BloomFilter::empty().might_contain(super::ClusteringKey::Int64(0)));
+
+        let uint_entries = [
+            super::VersionedEntry {
+                key: super::PhysicalKey {
+                    clustering: super::ClusteringKey::UInt64(u64::MIN),
+                    row_id: LsmRowId(1),
+                },
+                version: netbadb_types::LsmCommitSeq(1),
+                value: super::EntryValue::Tombstone,
+            },
+            super::VersionedEntry {
+                key: super::PhysicalKey {
+                    clustering: super::ClusteringKey::UInt64(u64::MAX),
+                    row_id: LsmRowId(2),
+                },
+                version: netbadb_types::LsmCommitSeq(1),
+                value: super::EntryValue::Tombstone,
+            },
+        ];
+        let uint_bloom = super::BloomFilter::build(&uint_entries).expect("UInt Bloom");
+        assert_eq!(
+            uint_bloom.bits,
+            [0x10, 0x0a, 0x90, 0xe0, 0x20, 0x01, 0x0a, 0x41]
+        );
+        assert!(uint_bloom.might_contain(super::ClusteringKey::UInt64(u64::MIN)));
+        assert!(uint_bloom.might_contain(super::ClusteringKey::UInt64(u64::MAX)));
+    }
+
+    #[test]
+    fn point_miss_uses_bloom_without_reading_a_data_block() {
+        let root = root("bloom-negative-read");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.insert(&row(0, "low")).expect("low");
+        storage.insert(&row(100, "high")).expect("high");
+        storage.flush().expect("flush");
+        let absent = {
+            let shared = storage.shared.borrow();
+            (1..100)
+                .find(|key| {
+                    !shared.sstables[0]
+                        .bloom
+                        .might_contain(super::ClusteringKey::Int64(*key))
+                })
+                .expect("the small Bloom must have a negative in the file range")
+        };
+        let before = storage.inspection().read_amplification;
+        let view = storage.read_view().expect("view");
+        assert!(
+            storage
+                .point_lookup_columns_with_view(&ScalarValue::Int64(absent), &[ColumnId(1)], &view,)
+                .expect("point miss")
+                .is_empty()
+        );
+        drop(view);
+        let after = storage.inspection().read_amplification;
+        assert_eq!(after.bloom_checks - before.bloom_checks, 1);
+        assert_eq!(after.bloom_negatives - before.bloom_negatives, 1);
+        assert_eq!(after.data_blocks_read - before.data_blocks_read, 0);
+        storage.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn point_hit_seeks_directly_to_the_sparse_index_block() {
+        let root = root("sparse-index-point-hit");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let payload = "x".repeat(20_000);
+        for key in 0..8 {
+            storage.insert(&row(key, &payload)).expect("insert");
+        }
+        storage.flush().expect("flush");
+        assert!(storage.shared.borrow().sstables[0].blocks.len() > 1);
+
+        let before = storage.inspection().read_amplification;
+        let view = storage.read_view().expect("view");
+        assert_eq!(
+            storage
+                .point_lookup_columns_with_view(&ScalarValue::Int64(7), &[ColumnId(1)], &view)
+                .expect("point hit")
+                .len(),
+            1
+        );
+        drop(view);
+        let after = storage.inspection().read_amplification;
+        assert_eq!(after.bloom_checks - before.bloom_checks, 1);
+        assert_eq!(after.bloom_positives - before.bloom_positives, 1);
+        assert_eq!(after.data_blocks_read - before.data_blocks_read, 1);
+        storage.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn leveled_compaction_splits_outputs_and_reaches_deeper_levels() {
+        let root = root("multi-level-split");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let payload = "x".repeat(40_000);
+        for key in 0..40 {
+            storage.insert(&row(key, &payload)).expect("insert");
+            if key == 19 || key == 39 {
+                storage.flush().expect("flush run");
+            }
+        }
+        storage.compact().expect("drive leveled compaction");
+        let inspection = storage.inspection();
+        assert!(inspection.level_count >= 2);
+        assert!(inspection.levels.iter().any(|level| level.level >= 2));
+        assert!(inspection.sstable_count > 1, "outputs must be split");
+        let shared = storage.shared.borrow();
+        super::validate_manifest_sstable_layout(
+            &shared.manifest.sstables,
+            shared.manifest.key_type,
+        )
+        .expect("level invariants");
+        assert!(
+            shared
+                .manifest
+                .sstables
+                .iter()
+                .all(|reference| reference.file_bytes > reference.bloom_bytes)
+        );
+        drop(shared);
+        let view = storage.read_view().expect("view");
+        assert_eq!(
+            storage
+                .scan_columns_with_view(&[ColumnId(1)], &view)
+                .expect("scan")
+                .len(),
+            40
+        );
+        drop(view);
+        let writes = storage.inspection().write_amplification;
+        assert!(writes.compaction_input_bytes > 0);
+        assert!(writes.compaction_output_bytes > 0);
+        storage.close().expect("close");
+        let reopened = LsmStorage::open(&root, table()).expect("reopen");
+        assert!(
+            reopened
+                .inspection()
+                .levels
+                .iter()
+                .any(|level| level.level >= 2)
+        );
+        reopened.close().expect("close reopened");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn regular_compaction_preserves_history_and_full_compaction_gcs_quiescently() {
+        let root = root("full-gc");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let first = storage.insert(&row(1, "v1")).expect("v1");
+        storage.flush().expect("flush v1");
+        let current = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(first.row_id, &view))
+            .expect("current");
+        let updated = storage.update(current, &row(2, "v2")).expect("move");
+        storage.flush().expect("flush v2");
+        storage.compact().expect("regular compact");
+        let preserved = storage.inspection().sstable_entry_count;
+        assert!(
+            preserved >= 3,
+            "regular compaction must preserve MVCC history"
+        );
+        let current = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(updated.row_id, &view))
+            .expect("updated current");
+        storage.delete(current).expect("delete");
+        storage.flush().expect("flush delete");
+
+        let old_view = storage.read_view().expect("live view");
+        assert!(matches!(
+            storage.compact_full(),
+            Err(StorageError::Lsm(super::LsmError::Busy(
+                "outstanding read views"
+            )))
+        ));
+        drop(old_view);
+        storage.compact_full().expect("full GC");
+        assert_eq!(storage.inspection().sstable_entry_count, 0);
+        let view = storage.read_view().expect("view");
+        assert!(
+            storage
+                .scan_columns_with_view(&[ColumnId(1)], &view)
+                .expect("empty scan")
+                .is_empty()
+        );
+        drop(view);
+        storage.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn manifest_preinstall_faults_keep_old_authority_and_retry() {
+        for point in [
+            super::ManifestPublishPoint::CandidateWrite,
+            super::ManifestPublishPoint::CandidateSync,
+            super::ManifestPublishPoint::BeforeInstall,
+        ] {
+            let root = root(&format!("manifest-fault-{point:?}"));
+            cleanup(&root);
+            let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+            storage.insert(&row(1, "value")).expect("insert");
+            let before = super::read_manifest(&root).expect("old manifest");
+            super::MANIFEST_PUBLISH_FAILURE.with(|failure| failure.set(Some(point)));
+            assert!(storage.flush().is_err());
+            assert_eq!(
+                storage.shared.borrow().manifest.generation,
+                before.generation
+            );
+            assert_eq!(
+                super::read_manifest(&root)
+                    .expect("disk authority")
+                    .generation,
+                before.generation
+            );
+            storage.flush().expect("retry");
+            assert_eq!(storage.inspection().sstable_count, 1);
+            storage.close().expect("close");
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn obsolete_delete_failure_keeps_published_manifest_and_reopen_ignores_orphan() {
+        let root = root("obsolete-delete-failure");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        for key in 0..2 {
+            storage.insert(&row(key, "first")).expect("insert");
+            storage.flush().expect("flush");
+        }
+        let old_generation = storage.shared.borrow().manifest.generation;
+        super::OBSOLETE_DELETE_FAILURE.with(|failure| failure.set(true));
+        assert!(storage.compact().is_err());
+        assert!(storage.shared.borrow().manifest.generation > old_generation);
+        drop(storage);
+        let mut reopened = LsmStorage::open(&root, table()).expect("reopen published manifest");
+        let view = reopened.read_view().expect("view");
+        assert_eq!(
+            reopened
+                .scan_columns_with_view(&[ColumnId(1)], &view)
+                .expect("scan")
+                .len(),
+            2
+        );
+        drop(view);
+        reopened.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn compaction_picker_computes_source_target_overlap_closure() {
+        let root = root("overlap-closure");
+        cleanup(&root);
+        let storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let make = |id, level, min, max, bytes| super::Sstable {
+            reference: super::SstableRef {
+                id,
+                level,
+                entry_count: 1,
+                file_bytes: bytes,
+                bloom_bytes: 8,
+                min: super::PhysicalKey {
+                    clustering: super::ClusteringKey::Int64(min),
+                    row_id: LsmRowId(1),
+                },
+                max: super::PhysicalKey {
+                    clustering: super::ClusteringKey::Int64(max),
+                    row_id: LsmRowId(1),
+                },
+            },
+            path: root.join(format!("dummy-{id}")),
+            blocks: Vec::new(),
+            bloom: super::BloomFilter::empty(),
+        };
+        {
+            let mut shared = storage.shared.borrow_mut();
+            shared.sstables = vec![
+                make(1, 1, 0, 10, super::BASE_LEVEL_BYTES + 1),
+                make(2, 1, 20, 30, 1),
+                make(3, 2, 5, 25, 1),
+            ];
+            let plan = super::pick_compaction(&shared)
+                .expect("pick")
+                .expect("overflow plan");
+            assert_eq!(plan.output_level, 2);
+            assert_eq!(plan.input_ids, std::collections::BTreeSet::from([1, 2, 3]));
+        }
+        drop(storage);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn l1_to_l2_compaction_crash_matrix_preserves_rows() {
+        for point in [
+            "during-sst-write",
+            "after-sst-sync",
+            "during-manifest-write",
+            "after-manifest-write",
+            "after-manifest-sync",
+            "while-deleting-old-sst",
+        ] {
+            let root = root(&format!("l1-l2-crash-{point}"));
+            cleanup(&root);
+            let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+            let payload = "x".repeat(40_000);
+            for key in 0..20 {
+                storage.insert(&row(key, &payload)).expect("insert");
+                if key == 9 || key == 19 {
+                    storage.flush().expect("flush");
+                }
+            }
+            {
+                let mut shared = storage.shared.borrow_mut();
+                let l0_plan = super::pick_compaction(&shared)
+                    .expect("pick L0")
+                    .expect("L0 plan");
+                assert_eq!(l0_plan.output_level, 1);
+                super::execute_compaction(&mut shared, &l0_plan, false).expect("build L1");
+                assert!(
+                    super::pick_compaction(&shared)
+                        .expect("pick L1")
+                        .is_some_and(|plan| plan.output_level == 2)
+                );
+            }
+            drop(storage);
+            run_maintenance_crash(&root, "compact", point, 20);
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn tombstone_bloom_prevents_resurrection_from_a_deeper_level() {
+        let root = root("tombstone-bloom");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let target = storage.insert(&row(10, "old")).expect("target");
+        storage.insert(&row(20, "other")).expect("other");
+        storage.flush().expect("first L0");
+        storage.insert(&row(30, "trigger")).expect("trigger");
+        storage.flush().expect("second L0");
+        storage.compact().expect("put into L1");
+        let target = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(target.row_id, &view))
+            .expect("refresh");
+        storage.delete(target).expect("delete");
+        storage.flush().expect("tombstone L0");
+        let before = storage.inspection().read_amplification;
+        let view = storage.read_view().expect("view");
+        assert!(
+            storage
+                .point_lookup_columns_with_view(&ScalarValue::Int64(10), &[ColumnId(1)], &view)
+                .expect("point")
+                .is_empty()
+        );
+        drop(view);
+        let after = storage.inspection().read_amplification;
+        assert!(after.bloom_positives > before.bloom_positives);
+        storage.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn oversized_duplicate_clustering_group_is_streamed_without_splitting() {
+        let root = root("oversized-duplicate-group");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        let payload = "x".repeat(40_000);
+        for index in 0..10 {
+            storage.insert(&row(7, &payload)).expect("duplicate");
+            if index == 4 || index == 9 {
+                storage.flush().expect("flush duplicate run");
+            }
+        }
+        storage.compact().expect("compact duplicate group");
+        let inspection = storage.inspection();
+        assert_eq!(inspection.sstable_count, 1);
+        assert!(inspection.total_sstable_bytes > super::SST_TARGET_FILE_BYTES);
+        let view = storage.read_view().expect("view");
+        assert_eq!(
+            storage
+                .point_lookup_columns_with_view(&ScalarValue::Int64(7), &[ColumnId(1)], &view,)
+                .expect("point")
+                .len(),
+            10
+        );
+        drop(view);
+        storage.close().expect("close");
+        cleanup(&root);
     }
 }

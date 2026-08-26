@@ -26,6 +26,15 @@ pub struct AccessPathCapabilities {
     pub ordered: bool,
 }
 
+/// Storage-owned form of neutral integer planning costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageAccessCostHints {
+    pub point_probe_base_cost: u32,
+    pub expected_point_io: u32,
+    pub range_startup_cost: u32,
+    pub sequential_unit_cost: u32,
+}
+
 /// Storage-owned optimizer snapshot for one registered access method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageAccessPath {
@@ -33,6 +42,7 @@ pub struct StorageAccessPath {
     pub column_id: ColumnId,
     pub capabilities: AccessPathCapabilities,
     pub statistics: Option<IndexStatistics>,
+    pub cost_hints: Option<StorageAccessCostHints>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +988,7 @@ impl TableStorage {
                         ordered: true,
                     },
                     statistics: storage.index_statistics(definition.column_id),
+                    cost_hints: None,
                 })
                 .collect(),
             Self::Lsm(storage) => vec![StorageAccessPath {
@@ -989,6 +1000,7 @@ impl TableStorage {
                     ordered: true,
                 },
                 statistics: storage.access_statistics(),
+                cost_hints: Some(storage.access_cost_hints()),
             }],
         }
     }
@@ -1067,6 +1079,16 @@ impl TableStorage {
                 storage_kind: "Heap",
             }),
             Self::Lsm(storage) => storage.compact(),
+        }
+    }
+
+    pub fn compact_full(&mut self) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(_) => Err(StorageError::UnsupportedOperation {
+                operation: "LSM full compaction",
+                storage_kind: "Heap",
+            }),
+            Self::Lsm(storage) => storage.compact_full(),
         }
     }
 }

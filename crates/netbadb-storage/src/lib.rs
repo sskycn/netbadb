@@ -20,10 +20,12 @@ pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::{HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, PresenceCountSummary};
 pub(crate) use lsm::LsmRowHandle;
 pub use lsm::{
-    DEFAULT_LSM_MEMTABLE_FLUSH_BYTES, LSM_MANIFEST_FORMAT_VERSION, LSM_MAX_PENDING_MUTATIONS,
-    LSM_MAX_PENDING_TRANSACTION_BYTES, LSM_SSTABLE_FORMAT_VERSION, LSM_WAL_FORMAT_VERSION,
-    LsmError, LsmIdentityInspection, LsmInspection, LsmReadView, LsmRecoveryInspection, LsmStorage,
-    LsmTransaction, fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes, fuzz_lsm_wal_bytes,
+    DEFAULT_LSM_MEMTABLE_FLUSH_BYTES, LSM_MANIFEST_FORMAT_VERSION, LSM_MAX_LEVELS,
+    LSM_MAX_PENDING_MUTATIONS, LSM_MAX_PENDING_TRANSACTION_BYTES, LSM_SSTABLE_FORMAT_VERSION,
+    LSM_WAL_FORMAT_VERSION, LsmError, LsmIdentityInspection, LsmInspection, LsmLevelInspection,
+    LsmReadAmplification, LsmReadView, LsmRecoveryInspection, LsmStorage, LsmTransaction,
+    LsmWriteAmplification, fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes,
+    fuzz_lsm_wal_bytes,
 };
 pub use mvcc::{IsolationLevel, ReadView, Snapshot};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
@@ -36,8 +38,8 @@ pub use recovery::{
     RecoveryError,
 };
 pub use table::{
-    AccessPathCapabilities, StorageAccessPath, StorageKind, StorageReadView, StorageRowHandle,
-    StorageTransaction, TableStorage,
+    AccessPathCapabilities, StorageAccessCostHints, StorageAccessPath, StorageKind,
+    StorageReadView, StorageRowHandle, StorageTransaction, TableStorage,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};

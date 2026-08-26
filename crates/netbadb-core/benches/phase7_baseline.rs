@@ -398,6 +398,138 @@ fn run_lsm_correctness_scenarios(
     database.close()?;
     fixture.cleanup()?;
 
+    let amplification = FixturePaths::new("lsm-amplification", 1);
+    let mut database = Database::create_storages(vec![TableStorageCreateSpec::lsm(
+        amplification.path(0),
+        items_table(),
+        ID_COLUMN_ID,
+    )])?;
+    let large_payload = "x".repeat(40_000);
+    for batch in 0..4_u64 {
+        let mut transaction = database.begin_transaction_for(ITEMS_TABLE_ID)?;
+        for item in 0..10_u64 {
+            let id = (batch * 10 + item) * 2;
+            let mut values = item_row(id, 4, NullDistribution::Low)?;
+            values[5] = ScalarValue::Text(large_payload.clone());
+            database.insert_into_in(ITEMS_TABLE_ID, &mut transaction, &values)?;
+        }
+        transaction.commit()?;
+        database.checkpoint()?;
+    }
+    let compaction_started = Instant::now();
+    database.compact(ITEMS_TABLE_ID)?;
+    let compaction_elapsed = compaction_started.elapsed();
+    database.analyze(ITEMS_TABLE_ID)?;
+    let structural = database
+        .inspect_lsm_storage(ITEMS_TABLE_ID)?
+        .ok_or_else(|| message_error("LSM amplification inspection missing"))?;
+    if !structural.levels.iter().any(|level| level.level >= 2) {
+        return Err(message_error(
+            "LSM amplification fixture did not reach a deeper level",
+        ));
+    }
+    let before = structural.read_amplification;
+    let miss_started = Instant::now();
+    require_observation(
+        "lsm_multi_level_point_miss",
+        Observation {
+            rows: 0,
+            checksum: 0,
+        },
+        ids_observation(&database.query("SELECT id FROM items WHERE id = 19")?)?,
+    )?;
+    let miss_elapsed = miss_started.elapsed();
+    let miss = database
+        .inspect_lsm_storage(ITEMS_TABLE_ID)?
+        .ok_or_else(|| message_error("LSM miss inspection missing"))?
+        .read_amplification;
+    if miss.bloom_checks <= before.bloom_checks || miss.bloom_negatives <= before.bloom_negatives {
+        return Err(message_error(
+            "LSM point miss did not exercise a Bloom-negative path",
+        ));
+    }
+    measurements.push(Measurement {
+        scenario: "lsm_multi_level_point_miss".into(),
+        rows: "0".into(),
+        plan: format!(
+            "Bloom checks={} negatives={} blocks={}",
+            miss.bloom_checks - before.bloom_checks,
+            miss.bloom_negatives - before.bloom_negatives,
+            miss.data_blocks_read - before.data_blocks_read
+        ),
+        operations_per_iteration: 1,
+        durations: vec![miss_elapsed],
+    });
+    for (scenario, sql, expected, required) in [
+        (
+            "lsm_multi_level_point_hit",
+            "SELECT id FROM items WHERE id = 0",
+            Observation {
+                rows: 1,
+                checksum: 0,
+            },
+            Operator::IndexScan,
+        ),
+        (
+            "lsm_multi_level_narrow_range",
+            "SELECT id FROM items WHERE id >= 10 AND id <= 20",
+            Observation {
+                rows: 6,
+                checksum: 90,
+            },
+            Operator::RangeIndexScan,
+        ),
+        (
+            "lsm_multi_level_full_scan",
+            "SELECT id FROM items",
+            Observation {
+                rows: 40,
+                checksum: 1_560,
+            },
+            Operator::SeqScan,
+        ),
+    ] {
+        let plan = inspect_plan(&database, scenario, sql, &[required], &[])?;
+        let durations = measure_checked(
+            scenario,
+            settings.query_warmup,
+            settings.query_iterations,
+            expected,
+            || database.query(sql).map_err(Into::into),
+            ids_observation,
+        )?;
+        measurements.push(Measurement {
+            scenario: scenario.into(),
+            rows: expected.rows.to_string(),
+            plan,
+            operations_per_iteration: 1,
+            durations,
+        });
+    }
+    let amplification_stats = database
+        .inspect_lsm_storage(ITEMS_TABLE_ID)?
+        .ok_or_else(|| message_error("LSM write amplification inspection missing"))?;
+    measurements.push(Measurement {
+        scenario: "lsm_leveled_write_amplification".into(),
+        rows: "40".into(),
+        plan: format!(
+            "flush_in={} flush_out={} compact_in={} compact_out={} obsolete={}",
+            amplification_stats.write_amplification.flush_input_bytes,
+            amplification_stats.write_amplification.flush_output_bytes,
+            amplification_stats
+                .write_amplification
+                .compaction_input_bytes,
+            amplification_stats
+                .write_amplification
+                .compaction_output_bytes,
+            amplification_stats.write_amplification.obsolete_bytes,
+        ),
+        operations_per_iteration: 40,
+        durations: vec![compaction_elapsed],
+    });
+    database.close()?;
+    amplification.cleanup()?;
+
     let mixed = FixturePaths::new("heap-lsm-atomic", 3);
     let heap_table = join_table(TableId(91), "heap_atomic");
     let lsm_table = join_table(TableId(92), "lsm_atomic");

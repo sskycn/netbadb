@@ -21,8 +21,9 @@ use netbadb_executor::{
 };
 use netbadb_inspect::{CatalogInspection, StatementInspection};
 use netbadb_planner::{
-    AccessPath, AccessPathCapabilities, PartitionPlanningSnapshot, PhysicalStatement,
-    RangeTablePlanningSnapshot, TableAccessStatistics, plan_statement_with_partition_snapshots,
+    AccessCostHints, AccessPath, AccessPathCapabilities, PartitionPlanningSnapshot,
+    PhysicalStatement, RangeTablePlanningSnapshot, TableAccessStatistics,
+    plan_statement_with_partition_snapshots,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
@@ -43,7 +44,8 @@ use transaction::SharedCoordinatorLog;
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_storage::{
-    IndexDefinition, IndexStatistics, IsolationLevel, LsmInspection, StorageKind, TableStatistics,
+    IndexDefinition, IndexStatistics, IsolationLevel, LsmInspection, LsmLevelInspection,
+    LsmReadAmplification, LsmWriteAmplification, StorageKind, TableStatistics,
 };
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
@@ -1117,8 +1119,8 @@ impl Database {
         Ok(())
     }
 
-    /// Runs synchronous quiescent LSM full compaction for a single physical
-    /// table. Heap and partitioned layouts return a typed unsupported error.
+    /// Drives synchronous history-preserving leveled compaction for one LSM.
+    /// Heap and partitioned layouts return a typed unsupported error.
     pub fn compact(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => self
@@ -1128,6 +1130,23 @@ impl Database {
                     storage_id: *storage_id,
                 })?
                 .compact()
+                .map_err(Into::into),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
+    }
+
+    /// Runs synchronous quiescent full-history LSM compaction and safe GC.
+    pub fn compact_full(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .compact_full()
                 .map_err(Into::into),
             TablePlacement::RangePartitioned { .. } => {
                 Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
@@ -1445,6 +1464,12 @@ impl Database {
                     ordered: path.capabilities.ordered,
                 },
                 statistics: path.statistics,
+                cost_hints: path.cost_hints.map(|hints| AccessCostHints {
+                    point_probe_base_cost: hints.point_probe_base_cost,
+                    expected_point_io: hints.expected_point_io,
+                    range_startup_cost: hints.range_startup_cost,
+                    sequential_unit_cost: hints.sequential_unit_cost,
+                }),
             }));
         }
         paths
@@ -1489,6 +1514,12 @@ impl Database {
                                             ordered: path.capabilities.ordered,
                                         },
                                         statistics: path.statistics,
+                                        cost_hints: path.cost_hints.map(|hints| AccessCostHints {
+                                            point_probe_base_cost: hints.point_probe_base_cost,
+                                            expected_point_io: hints.expected_point_io,
+                                            range_startup_cost: hints.range_startup_cost,
+                                            sequential_unit_cost: hints.sequential_unit_cost,
+                                        }),
                                     })
                                     .collect(),
                             })

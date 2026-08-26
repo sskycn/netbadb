@@ -1,5 +1,8 @@
 # NetbaDB LSM persistent formats v1
 
+> Historical experimental contract. Current code writes Manifest/SSTable v2
+> and explicitly rejects v1 files; see [`lsm-format-v2.md`](lsm-format-v2.md).
+
 NetbaDB's first LSM layout is a synchronous, single-process `TableStorage`
 implementation. It is not a wrapper around Heap and does not use pages, Heap
 WAL records, or B+Tree handles.
