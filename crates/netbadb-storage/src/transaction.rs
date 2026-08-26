@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use netbadb_types::{CommandId, CommitSeq, Lsn, TxnId};
+use netbadb_types::{CommandId, CommitSeq, DatabaseTxnId, Lsn, TxnId};
 
 use crate::mvcc::{IsolationLevel, ReadView, Snapshot};
 use crate::txn_status::SharedTxnStatus;
@@ -34,6 +34,8 @@ pub enum TransactionState {
     /// A compound logical operation logged only part of its physical work.
     /// The transaction may be rolled back but cannot continue or commit.
     RollbackRequired,
+    PreparePending,
+    Prepared,
     CommitPending,
     RollbackPending,
     Committed,
@@ -60,6 +62,7 @@ pub struct Transaction {
     has_page_updates: bool,
     rollback_start_lsn: Option<Lsn>,
     rollback_complete_lsn: Option<Lsn>,
+    prepared_database_txn_id: Option<DatabaseTxnId>,
     #[cfg(test)]
     interrupt_rollback_after: Option<usize>,
 }
@@ -109,24 +112,103 @@ impl Transaction {
             }
         };
 
+        self.finish_commit(commit_lsn)
+    }
+
+    /// Durably prepares this physical participant for `database_txn_id`.
+    ///
+    /// Success retains writer ownership and does not publish committed MVCC
+    /// status. A failed flush remains retryable with the same identity.
+    pub fn prepare(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        if database_txn_id.0 == 0 {
+            return Err(TransactionError::InvalidDatabaseTxnId.into());
+        }
+        let prepare_lsn = match self.state {
+            TransactionState::Active => {
+                let lsn = self
+                    .wal
+                    .try_borrow_mut()
+                    .map_err(|_| TransactionError::WalBusy)?
+                    .append(
+                        self.id,
+                        Some(self.last_lsn),
+                        WalRecordKind::Prepare { database_txn_id },
+                    )?;
+                self.last_lsn = lsn;
+                self.prepared_database_txn_id = Some(database_txn_id);
+                self.state = TransactionState::PreparePending;
+                lsn
+            }
+            TransactionState::PreparePending
+                if self.prepared_database_txn_id == Some(database_txn_id) =>
+            {
+                self.last_lsn
+            }
+            TransactionState::Prepared
+                if self.prepared_database_txn_id == Some(database_txn_id) =>
+            {
+                return Ok(());
+            }
+            TransactionState::PreparePending | TransactionState::Prepared => {
+                return Err(TransactionError::DatabaseTxnMismatch {
+                    txn_id: self.id,
+                    expected: self.prepared_database_txn_id,
+                    actual: database_txn_id,
+                }
+                .into());
+            }
+            state => {
+                return Err(TransactionError::NotActive {
+                    txn_id: self.id,
+                    state,
+                }
+                .into());
+            }
+        };
         self.wal
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
-            .flush_through(commit_lsn)?;
-        #[cfg(test)]
-        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::CommitAfterWalSync);
-        // The Commit WAL record is the durable decision. Its monotonic logical
-        // LSN is the CommitSeq. Publishing the sidecar status only afterwards
-        // prevents a transaction without durable Commit from becoming visible;
-        // startup reconciles a durable Commit if a crash occurs in between.
-        self.statuses
-            .try_borrow_mut()
-            .map_err(|_| TransactionError::StatusBusy)?
-            .record_committed(self.id, CommitSeq(commit_lsn.0))?;
-        self.state = TransactionState::Committed;
-        self.release_writer();
-        self.unregister();
+            .flush_through(prepare_lsn)?;
+        self.state = TransactionState::Prepared;
         Ok(())
+    }
+
+    /// Commits a prepared participant after Core has durably recorded the
+    /// matching database-level commit decision.
+    pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        self.validate_prepared_database_txn(database_txn_id)?;
+        let commit_lsn = match self.state {
+            TransactionState::Prepared => {
+                let lsn = self
+                    .wal
+                    .try_borrow_mut()
+                    .map_err(|_| TransactionError::WalBusy)?
+                    .append(self.id, Some(self.last_lsn), WalRecordKind::Commit)?;
+                self.last_lsn = lsn;
+                self.state = TransactionState::CommitPending;
+                lsn
+            }
+            TransactionState::CommitPending => self.last_lsn,
+            TransactionState::Committed => return Ok(()),
+            state => {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: self.id,
+                    state,
+                }
+                .into());
+            }
+        };
+        self.finish_commit(commit_lsn)
+    }
+
+    /// Rolls back a prepared participant only while no durable global commit
+    /// decision exists. The caller is responsible for that coordinator proof.
+    pub fn rollback_prepared(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        self.validate_prepared_database_txn(database_txn_id)?;
+        self.rollback_internal(true)
     }
 
     /// Durably records abort intent, physically restores every before-image,
@@ -134,6 +216,10 @@ impl Transaction {
     /// effects are synchronized; a failure remains retryable in
     /// `RollbackPending` and retains an owned writer.
     pub fn rollback(&mut self) -> Result<(), StorageError> {
+        self.rollback_internal(false)
+    }
+
+    fn rollback_internal(&mut self, allow_prepared: bool) -> Result<(), StorageError> {
         match self.state {
             TransactionState::Active | TransactionState::RollbackRequired => {
                 let rollback_start_lsn = self.last_lsn;
@@ -146,6 +232,17 @@ impl Transaction {
                 crate::crash_test::maybe_crash(
                     crate::crash_test::TestCrashPoint::RollbackAfterAbortAppend,
                 );
+                self.last_lsn = abort_lsn;
+                self.rollback_start_lsn = Some(rollback_start_lsn);
+                self.state = TransactionState::RollbackPending;
+            }
+            TransactionState::PreparePending | TransactionState::Prepared if allow_prepared => {
+                let rollback_start_lsn = self.last_lsn;
+                let abort_lsn = self
+                    .wal
+                    .try_borrow_mut()
+                    .map_err(|_| TransactionError::WalBusy)?
+                    .append(self.id, Some(self.last_lsn), WalRecordKind::Abort)?;
                 self.last_lsn = abort_lsn;
                 self.rollback_start_lsn = Some(rollback_start_lsn);
                 self.state = TransactionState::RollbackPending;
@@ -217,6 +314,38 @@ impl Transaction {
             .map_err(|_| TransactionError::StatusBusy)?
             .record_aborted(self.id)?;
         self.finish_rollback();
+        Ok(())
+    }
+
+    fn finish_commit(&mut self, commit_lsn: Lsn) -> Result<(), StorageError> {
+        self.wal
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .flush_through(commit_lsn)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::CommitAfterWalSync);
+        self.statuses
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::StatusBusy)?
+            .record_committed(self.id, CommitSeq(commit_lsn.0))?;
+        self.state = TransactionState::Committed;
+        self.release_writer();
+        self.unregister();
+        Ok(())
+    }
+
+    fn validate_prepared_database_txn(
+        &self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        if self.prepared_database_txn_id != Some(database_txn_id) {
+            return Err(TransactionError::DatabaseTxnMismatch {
+                txn_id: self.id,
+                expected: self.prepared_database_txn_id,
+                actual: database_txn_id,
+            }
+            .into());
+        }
         Ok(())
     }
 
@@ -462,6 +591,7 @@ impl Transaction {
                         }
                     }
                 }
+                WalRecordKind::Prepare { .. } => {}
                 WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::RollbackComplete => {
                     return Err(TransactionError::InvalidRollbackChain {
                         txn_id: self.id,
@@ -495,6 +625,8 @@ impl Drop for Transaction {
             && (matches!(
                 self.state,
                 TransactionState::RollbackRequired
+                    | TransactionState::PreparePending
+                    | TransactionState::Prepared
                     | TransactionState::CommitPending
                     | TransactionState::RollbackPending
             ) || (self.state == TransactionState::Active && self.has_page_updates));
@@ -584,6 +716,7 @@ impl TransactionManager {
             has_page_updates: false,
             rollback_start_lsn: None,
             rollback_complete_lsn: None,
+            prepared_database_txn_id: None,
             #[cfg(test)]
             interrupt_rollback_after: None,
         })
@@ -641,6 +774,7 @@ mod tests {
     use crate::{
         BufferPool, PageManager, StorageError, TransactionError, WalManager, WalRecordKind,
     };
+    use netbadb_types::DatabaseTxnId;
 
     fn test_paths(name: &str) -> (PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!(
@@ -713,6 +847,136 @@ mod tests {
         transaction.commit().expect("retry commit flush");
         assert_eq!(transaction.state(), TransactionState::Committed);
         assert_eq!(wal.borrow_mut().scan().expect("scan WAL").len(), 2);
+        drop(transaction);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn prepare_is_durable_retryable_and_retains_writer_until_commit_prepared() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-prepare-commit");
+        let mut transaction = manager.begin().expect("begin transaction");
+        transaction.acquire_writer().expect("acquire writer");
+        wal.borrow_mut().inject_flush_failure();
+
+        assert!(matches!(
+            transaction.prepare(DatabaseTxnId(41)),
+            Err(StorageError::Wal(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::PreparePending);
+        assert_eq!(wal.borrow_mut().scan().expect("scan prepare WAL").len(), 2);
+        transaction
+            .prepare(DatabaseTxnId(41))
+            .expect("retry prepare flush");
+        assert_eq!(transaction.state(), TransactionState::Prepared);
+        assert!(matches!(
+            manager
+                .begin()
+                .expect("begin competing transaction")
+                .acquire_writer(),
+            Err(StorageError::Transaction(
+                TransactionError::WriterBusy { .. }
+            ))
+        ));
+        assert!(matches!(
+            transaction.prepare(DatabaseTxnId(42)),
+            Err(StorageError::Transaction(
+                TransactionError::DatabaseTxnMismatch { .. }
+            ))
+        ));
+        transaction
+            .commit_prepared(DatabaseTxnId(41))
+            .expect("commit prepared participant");
+        assert_eq!(transaction.state(), TransactionState::Committed);
+        let records = wal.borrow_mut().scan().expect("scan committed WAL");
+        assert!(matches!(
+            records[1].kind,
+            WalRecordKind::Prepare {
+                database_txn_id: DatabaseTxnId(41)
+            }
+        ));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.txn_id == transaction.id()
+                    && matches!(record.kind, WalRecordKind::Commit))
+        );
+        drop(transaction);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn prepare_and_prepared_commit_append_failures_retry_without_duplicate_records() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-prepare-append-failure");
+        let mut transaction = manager.begin().expect("begin transaction");
+        transaction.acquire_writer().expect("acquire writer");
+        transaction.inject_partial_append_failure(8);
+        assert!(matches!(
+            transaction.prepare(DatabaseTxnId(52)),
+            Err(StorageError::Wal(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Active);
+        transaction
+            .prepare(DatabaseTxnId(52))
+            .expect("retry Prepare append");
+
+        transaction.inject_partial_append_failure(8);
+        assert!(matches!(
+            transaction.commit_prepared(DatabaseTxnId(52)),
+            Err(StorageError::Wal(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::Prepared);
+        wal.borrow_mut().inject_flush_failure();
+        assert!(matches!(
+            transaction.commit_prepared(DatabaseTxnId(52)),
+            Err(StorageError::Wal(_))
+        ));
+        assert_eq!(transaction.state(), TransactionState::CommitPending);
+        transaction
+            .commit_prepared(DatabaseTxnId(52))
+            .expect("retry prepared Commit sync");
+
+        let records = wal.borrow_mut().scan().expect("scan retried WAL");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.kind, WalRecordKind::Prepare { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.kind, WalRecordKind::Commit))
+                .count(),
+            1
+        );
+        drop(transaction);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn prepared_participant_can_only_rollback_through_matching_resolution_api() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-prepare-abort");
+        let mut transaction = manager.begin().expect("begin transaction");
+        transaction.acquire_writer().expect("acquire writer");
+        transaction
+            .prepare(DatabaseTxnId(77))
+            .expect("prepare participant");
+        assert!(transaction.rollback().is_err());
+        assert!(transaction.commit().is_err());
+        transaction
+            .rollback_prepared(DatabaseTxnId(77))
+            .expect("rollback prepared participant");
+        assert_eq!(transaction.state(), TransactionState::RolledBack);
+        let records = wal.borrow_mut().scan().expect("scan aborted WAL");
+        assert!(matches!(records[2].kind, WalRecordKind::Abort));
+        assert!(matches!(records[3].kind, WalRecordKind::RollbackComplete));
         drop(transaction);
         drop(manager);
         drop(wal);

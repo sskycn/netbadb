@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+netbadb-core = { path = "../crates/netbadb-core" }
 netbadb-index = { path = "../crates/netbadb-index" }
 netbadb-protocol = { path = "../crates/netbadb-protocol" }
 netbadb-schema = { path = "../crates/netbadb-schema" }
@@ -48,6 +49,13 @@ bench = false
 [[bin]]
 name = "protocol_decode"
 path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coordinator_log_decode"
+path = "fuzz_targets/coordinator_log_decode.rs"
 test = false
 doc = false
 bench = false

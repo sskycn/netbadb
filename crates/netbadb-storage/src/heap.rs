@@ -9,10 +9,10 @@ use netbadb_index::{
     validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
-use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId};
+use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId};
 
 use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
-use crate::recovery::RecoveryManager;
+use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
 use crate::transaction::TransactionManager;
 use crate::txn_status::{SharedTxnStatus, TxnStatusStore, txn_status_path};
 use crate::{
@@ -21,11 +21,12 @@ use crate::{
     SlotRef, SlotState, Snapshot, StorageError, Transaction, TransactionError, WalManager,
     WalRecordKind, wal_path,
 };
+use crate::{PreparedTransaction, PreparedTxnResolution};
 
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_MANAGED_PAGE: PageId = PageId(1);
 const HEADER_MAGIC: &[u8; 4] = b"NBD1";
-const HEAP_FORMAT_VERSION: u16 = 4;
+const HEAP_FORMAT_VERSION: u16 = 5;
 const HEAP_METADATA_OFFSET: usize = 16;
 const HEAP_VERSION_OFFSET: usize = HEAP_METADATA_OFFSET + 4;
 const HEAP_RESERVED_OFFSET: usize = HEAP_VERSION_OFFSET + 2;
@@ -34,7 +35,8 @@ const HEAP_COLUMN_COUNT_OFFSET: usize = HEAP_TABLE_ID_OFFSET + 8;
 const HEAP_SCHEMA_FINGERPRINT_OFFSET: usize = HEAP_COLUMN_COUNT_OFFSET + 2;
 const HEAP_INDEX_CATALOG_ROOT_OFFSET: usize =
     HEAP_SCHEMA_FINGERPRINT_OFFSET + SchemaFingerprint::LENGTH;
-const HEAP_TRAILING_RESERVED_OFFSET: usize = HEAP_INDEX_CATALOG_ROOT_OFFSET + 8;
+const HEAP_STORAGE_ID_OFFSET: usize = HEAP_INDEX_CATALOG_ROOT_OFFSET + 8;
+const HEAP_TRAILING_RESERVED_OFFSET: usize = HEAP_STORAGE_ID_OFFSET + 8;
 const HEAP_TRAILING_RESERVED_END: usize = HEAP_TRAILING_RESERVED_OFFSET + 6;
 
 /// Heap storage over the buffer pool. Heap code interprets pages as heap pages;
@@ -43,6 +45,7 @@ const HEAP_TRAILING_RESERVED_END: usize = HEAP_TRAILING_RESERVED_OFFSET + 6;
 pub struct HeapStorage {
     buffer: BufferPool,
     table: TableDef,
+    storage_id: StorageId,
     transactions: TransactionManager,
     statuses: SharedTxnStatus,
     indexes: Vec<IndexDefinition>,
@@ -75,6 +78,12 @@ pub struct HeapStorage {
 pub struct PresenceCountSummary {
     pub live_rows: u128,
     pub non_null_counts: Vec<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapRecoveryInspection {
+    pub storage_id: StorageId,
+    pub prepared_transactions: Vec<PreparedTransaction>,
 }
 
 #[derive(Debug)]
@@ -171,7 +180,20 @@ impl HeapStorage {
     }
 
     pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        Self::create_with_buffer_pool_size(path, table, DEFAULT_BUFFER_POOL_SIZE)
+        Self::create_with_storage_id(path, table, StorageId(1))
+    }
+
+    pub fn create_with_storage_id(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        storage_id: StorageId,
+    ) -> Result<Self, StorageError> {
+        Self::create_with_storage_id_and_buffer_pool_size(
+            path,
+            table,
+            storage_id,
+            DEFAULT_BUFFER_POOL_SIZE,
+        )
     }
 
     pub fn create_with_buffer_pool_size(
@@ -179,6 +201,23 @@ impl HeapStorage {
         table: TableDef,
         buffer_pool_size: usize,
     ) -> Result<Self, StorageError> {
+        Self::create_with_storage_id_and_buffer_pool_size(
+            path,
+            table,
+            StorageId(1),
+            buffer_pool_size,
+        )
+    }
+
+    fn create_with_storage_id_and_buffer_pool_size(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        storage_id: StorageId,
+        buffer_pool_size: usize,
+    ) -> Result<Self, StorageError> {
+        if storage_id.0 == 0 {
+            return Err(MetadataError::InvalidStorageId(storage_id).into());
+        }
         let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
         let path = path.as_ref();
@@ -213,6 +252,7 @@ impl HeapStorage {
                 &table,
                 fingerprint,
                 FIRST_MANAGED_PAGE,
+                storage_id,
             );
         }
         {
@@ -241,6 +281,7 @@ impl HeapStorage {
         Ok(Self {
             buffer,
             table,
+            storage_id,
             transactions,
             statuses,
             indexes: Vec::new(),
@@ -266,13 +307,46 @@ impl HeapStorage {
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        Self::open_with_buffer_pool_size(path, table, DEFAULT_BUFFER_POOL_SIZE)
+        Self::open_internal(path, table, DEFAULT_BUFFER_POOL_SIZE, None)
     }
 
     pub fn open_with_buffer_pool_size(
         path: impl AsRef<Path>,
         table: TableDef,
         buffer_pool_size: usize,
+    ) -> Result<Self, StorageError> {
+        Self::open_internal(path, table, buffer_pool_size, None)
+    }
+
+    pub fn open_with_prepared_resolutions(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        resolutions: &[PreparedTxnResolution],
+    ) -> Result<Self, StorageError> {
+        Self::open_internal(path, table, DEFAULT_BUFFER_POOL_SIZE, Some(resolutions))
+    }
+
+    pub fn inspect_recovery(
+        path: impl AsRef<Path>,
+        table: &TableDef,
+    ) -> Result<HeapRecoveryInspection, StorageError> {
+        let fingerprint = validate_table(table)?;
+        let path = path.as_ref();
+        let mut pages = PageManager::open(path)?;
+        let (_, storage_id) =
+            validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), table, fingerprint)?;
+        let (_, records, _) = WalManager::open_for_recovery(wal_path(path))?;
+        Ok(HeapRecoveryInspection {
+            storage_id,
+            prepared_transactions: inspect_prepared_transactions(&records),
+        })
+    }
+
+    fn open_internal(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        buffer_pool_size: usize,
+        prepared_resolutions: Option<&[PreparedTxnResolution]>,
     ) -> Result<Self, StorageError> {
         let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
@@ -281,15 +355,24 @@ impl HeapStorage {
         if pages.page_count() < 3 {
             return Err(crate::invalid_format("heap file has no data page"));
         }
-        let catalog_root =
+        let (catalog_root, storage_id) =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         validate_catalog_root_bounds(catalog_root, pages.page_count())?;
         let statuses = Rc::new(RefCell::new(TxnStatusStore::open(txn_status_path(path))?));
         let (mut wal_manager, records, truncated_wal_tail) =
             WalManager::open_for_recovery(wal_path(path))?;
-        if let Err(error) =
+        let recovery = if let Some(resolutions) = prepared_resolutions {
+            RecoveryManager::recover_with_resolutions(
+                &mut pages,
+                &mut wal_manager,
+                &records,
+                truncated_wal_tail,
+                resolutions,
+            )
+        } else {
             RecoveryManager::recover(&mut pages, &mut wal_manager, &records, truncated_wal_tail)
-        {
+        };
+        if let Err(error) = recovery {
             return Err(match error {
                 crate::RecoveryError::Storage(storage) => *storage,
                 recovery => recovery.into(),
@@ -307,15 +390,23 @@ impl HeapStorage {
                 WalRecordKind::RollbackComplete => {
                     statuses.borrow_mut().record_aborted(record.txn_id)?;
                 }
-                WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } | WalRecordKind::Abort => {}
+                WalRecordKind::Begin
+                | WalRecordKind::PageUpdate { .. }
+                | WalRecordKind::Abort
+                | WalRecordKind::Prepare { .. } => {}
             }
         }
-        let recovered_catalog_root =
+        let (recovered_catalog_root, recovered_storage_id) =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         validate_catalog_root_bounds(recovered_catalog_root, pages.page_count())?;
         if recovered_catalog_root != catalog_root {
             return Err(crate::invalid_format(
                 "index catalog root changed during recovery",
+            ));
+        }
+        if recovered_storage_id != storage_id {
+            return Err(crate::invalid_format(
+                "physical storage identity changed during recovery",
             ));
         }
         let wal = Rc::new(RefCell::new(wal_manager));
@@ -330,6 +421,7 @@ impl HeapStorage {
         let mut storage = Self {
             buffer,
             table,
+            storage_id,
             transactions,
             statuses,
             indexes: Vec::new(),
@@ -368,6 +460,11 @@ impl HeapStorage {
     #[must_use]
     pub fn indexes(&self) -> &[IndexDefinition] {
         &self.indexes
+    }
+
+    #[must_use]
+    pub fn storage_id(&self) -> StorageId {
+        self.storage_id
     }
 
     #[must_use]
@@ -2084,6 +2181,7 @@ fn write_heap_metadata(
     table: &TableDef,
     fingerprint: SchemaFingerprint,
     index_catalog_root: PageId,
+    storage_id: StorageId,
 ) {
     bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()]
         .copy_from_slice(HEADER_MAGIC);
@@ -2099,6 +2197,8 @@ fn write_heap_metadata(
         .copy_from_slice(fingerprint.as_bytes());
     bytes[HEAP_INDEX_CATALOG_ROOT_OFFSET..HEAP_INDEX_CATALOG_ROOT_OFFSET + 8]
         .copy_from_slice(&index_catalog_root.0.to_le_bytes());
+    bytes[HEAP_STORAGE_ID_OFFSET..HEAP_STORAGE_ID_OFFSET + 8]
+        .copy_from_slice(&storage_id.0.to_le_bytes());
     bytes[HEAP_TRAILING_RESERVED_OFFSET..HEAP_TRAILING_RESERVED_END].fill(0);
 }
 
@@ -2106,7 +2206,7 @@ fn validate_heap_metadata(
     bytes: &[u8; PAGE_SIZE],
     table: &TableDef,
     expected_fingerprint: SchemaFingerprint,
-) -> Result<PageId, StorageError> {
+) -> Result<(PageId, StorageId), StorageError> {
     if &bytes[HEAP_METADATA_OFFSET..HEAP_METADATA_OFFSET + HEADER_MAGIC.len()] != HEADER_MAGIC {
         return Err(MetadataError::InvalidMagic.into());
     }
@@ -2153,7 +2253,11 @@ fn validate_heap_metadata(
     if catalog_root.0 == 0 {
         return Err(IndexError::InvalidChild(catalog_root).into());
     }
-    Ok(catalog_root)
+    let storage_id = StorageId(read_u64(bytes, HEAP_STORAGE_ID_OFFSET)?);
+    if storage_id.0 == 0 {
+        return Err(MetadataError::InvalidStorageId(storage_id).into());
+    }
+    Ok((catalog_root, storage_id))
 }
 
 fn validate_catalog_root_bounds(catalog_root: PageId, page_count: u64) -> Result<(), StorageError> {
@@ -2433,9 +2537,10 @@ mod tests {
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
-        BufferError, CheckpointError, PageError, PageManager, PageType, SlotId, StorageError,
-        TransactionError, TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError,
-        WalManager, WalRecordKind, txn_status_path, wal_alternate_path, wal_path,
+        BufferError, CheckpointError, PageError, PageManager, PageType, PreparedDecision,
+        PreparedTxnResolution, RecoveryError, SlotId, StorageError, TransactionError,
+        TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
+        WalRecordKind, txn_status_path, wal_alternate_path, wal_path,
     };
     use netbadb_index::{
         BTreeHandle, IndexCatalogNode, IndexError, IndexSpec, IndexStatistics, TableStatistics,
@@ -2443,7 +2548,8 @@ mod tests {
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{
-        ColumnId, Lsn, PageId, PhysicalType, ScalarRef, ScalarValue, SemanticType, TableId,
+        ColumnId, DatabaseTxnId, Lsn, PageId, PhysicalType, ScalarRef, ScalarValue, SemanticType,
+        StorageId, TableId,
     };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
@@ -2470,6 +2576,63 @@ mod tests {
         let wal = wal_path(path);
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn prepared_recovery_requires_coordinator_and_obeys_explicit_commit_or_abort() {
+        for (case, decision) in [
+            ("abort", PreparedDecision::Abort),
+            ("commit", PreparedDecision::Commit),
+        ] {
+            let path = test_path(&format!("prepared-resolution-{case}"));
+            cleanup(&path);
+            let mut storage = HeapStorage::create_with_storage_id(&path, table(), StorageId(91))
+                .expect("create prepared heap");
+            let mut transaction = storage.begin_transaction().expect("begin participant");
+            storage
+                .insert_in(&mut transaction, &mvcc_text("prepared"))
+                .expect("write prepared row");
+            let physical_txn_id = transaction.id();
+            transaction
+                .prepare(DatabaseTxnId(701))
+                .expect("durably prepare participant");
+            drop(transaction);
+            drop(storage);
+
+            assert!(matches!(
+                HeapStorage::open(&path, table()),
+                Err(StorageError::Recovery(
+                    RecoveryError::PreparedTransactionRequiresResolution {
+                        database_txn_id: DatabaseTxnId(701),
+                        physical_txn_id: found,
+                    }
+                )) if found == physical_txn_id
+            ));
+            let inspection = HeapStorage::inspect_recovery(&path, &table())
+                .expect("inspect prepared participant");
+            assert_eq!(inspection.storage_id, StorageId(91));
+            assert_eq!(inspection.prepared_transactions.len(), 1);
+            let mut recovered = HeapStorage::open_with_prepared_resolutions(
+                &path,
+                table(),
+                &[PreparedTxnResolution {
+                    database_txn_id: DatabaseTxnId(701),
+                    physical_txn_id,
+                    decision,
+                }],
+            )
+            .expect("resolve prepared participant");
+            let rows = recovered.scan().expect("scan resolved heap");
+            assert_eq!(
+                rows.len(),
+                usize::from(decision == PreparedDecision::Commit)
+            );
+            recovered.close().expect("close resolved heap");
+            let reopened = HeapStorage::open(&path, table())
+                .expect("terminal participant recovery is idempotent without guessing");
+            reopened.close().expect("close idempotent reopen");
+            cleanup(&path);
+        }
     }
 
     fn mvcc_text(value: &str) -> Vec<ScalarValue> {
@@ -3580,7 +3743,7 @@ mod tests {
                 "wrong-type" => {
                     header.bytes_mut()[66..74].copy_from_slice(&FIRST_HEAP_PAGE.0.to_le_bytes());
                 }
-                "reserved" => header.bytes_mut()[74] = 1,
+                "reserved" => header.bytes_mut()[82] = 1,
                 _ => unreachable!(),
             }
             pages.write_page(&header).expect("write metadata mutation");
@@ -4799,7 +4962,7 @@ mod tests {
         let mut header = pages.read_page(PageId(0)).expect("read metadata page");
         let bytes = header.bytes();
         assert_eq!(&bytes[16..20], b"NBD1");
-        assert_eq!(&bytes[20..22], &4_u16.to_le_bytes());
+        assert_eq!(&bytes[20..22], &5_u16.to_le_bytes());
         assert_eq!(&bytes[22..24], &[0, 0]);
         assert_eq!(&bytes[24..32], &table.id.0.to_le_bytes());
         assert_eq!(&bytes[32..34], &2_u16.to_le_bytes());
@@ -4808,7 +4971,8 @@ mod tests {
             table.fingerprint().expect("table fingerprint").as_bytes()
         );
         assert_eq!(&bytes[66..74], &1_u64.to_le_bytes());
-        assert_eq!(&bytes[74..80], &[0; 6]);
+        assert_eq!(&bytes[74..82], &1_u64.to_le_bytes());
+        assert_eq!(&bytes[82..88], &[0; 6]);
 
         header.bytes_mut()[32..34].copy_from_slice(&1_u16.to_le_bytes());
         pages.write_page(&header).expect("write corrupt count");
@@ -4821,6 +4985,48 @@ mod tests {
                     stored: 1,
                     expected: 2
                 }
+            ))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn physical_storage_identity_survives_reopen_and_rejects_zero() {
+        let path = test_path("heap-storage-identity");
+        cleanup(&path);
+        let table = identity_table();
+        let storage = HeapStorage::create_with_storage_id(
+            &path,
+            table.clone(),
+            StorageId(0x0102_0304_0506_0708),
+        )
+        .expect("create identified heap");
+        assert_eq!(storage.storage_id(), StorageId(0x0102_0304_0506_0708));
+        storage.close().expect("close identified heap");
+        let reopened = HeapStorage::open(&path, table.clone()).expect("reopen identified heap");
+        assert_eq!(reopened.storage_id(), StorageId(0x0102_0304_0506_0708));
+        reopened.close().expect("close reopened heap");
+
+        let mut pages = PageManager::open(&path).expect("open page manager");
+        let mut header = pages.read_page(PageId(0)).expect("read metadata page");
+        header.bytes_mut()[74..82].fill(0);
+        pages.write_page(&header).expect("write zero identity");
+        pages.sync().expect("sync zero identity");
+        drop(pages);
+        assert!(matches!(
+            HeapStorage::open(&path, table.clone()),
+            Err(StorageError::Metadata(
+                crate::MetadataError::InvalidStorageId(StorageId(0))
+            ))
+        ));
+        assert!(matches!(
+            HeapStorage::create_with_storage_id(
+                path.with_extension("zero.db"),
+                table,
+                StorageId(0)
+            ),
+            Err(StorageError::Metadata(
+                crate::MetadataError::InvalidStorageId(StorageId(0))
             ))
         ));
         cleanup(&path);
@@ -6230,7 +6436,7 @@ mod tests {
 
         let mut pages = PageManager::open(&path).expect("open page manager");
         let mut header = pages.read_page(PageId(0)).expect("read metadata page");
-        for old_version in [1_u16, 2] {
+        for old_version in [1_u16, 2, 3, 4] {
             header.bytes_mut()[20..22].copy_from_slice(&old_version.to_le_bytes());
             pages
                 .write_page(&header)
@@ -6907,6 +7113,37 @@ mod tests {
         rollback.rollback().expect("retry rollback");
         storage.checkpoint().expect("checkpoint quiescent storage");
         storage.close().expect("close heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn prepared_participant_blocks_checkpoint_and_clean_close() {
+        let path = test_path("checkpoint-prepared");
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let mut transaction = storage.begin_transaction().expect("begin writer");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("prepared".into())],
+            )
+            .expect("insert prepared row");
+        transaction
+            .prepare(DatabaseTxnId(88))
+            .expect("prepare participant");
+        assert!(matches!(
+            storage.checkpoint(),
+            Err(StorageError::Checkpoint(CheckpointError::WriterActive {
+                txn_id
+            })) if txn_id == transaction.id()
+        ));
+        assert!(matches!(
+            storage.close(),
+            Err(StorageError::Transaction(
+                TransactionError::UnfinishedWriter { txn_id }
+            ))
+                if txn_id == transaction.id()
+        ));
+        drop(transaction);
         cleanup(&path);
     }
 

@@ -75,12 +75,8 @@ impl StorageRegistry {
     ) -> Result<(Self, PhysicalBindings), StorageRegistryError> {
         let mut entries = Vec::with_capacity(storages.len());
         let mut bindings = Vec::with_capacity(storages.len());
-        for (position, storage) in storages.into_iter().enumerate() {
-            let ordinal = position
-                .checked_add(1)
-                .and_then(|value| u64::try_from(value).ok())
-                .ok_or(StorageRegistryError::StorageIdExhausted)?;
-            let storage_id = StorageId(ordinal);
+        for storage in storages {
+            let storage_id = storage.storage_id();
             bindings.push(PhysicalTableBinding {
                 table_id: storage.table().id,
                 storage_id,

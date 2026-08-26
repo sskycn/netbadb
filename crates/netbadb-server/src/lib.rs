@@ -519,9 +519,13 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         DatabaseError::ExpectedQuery
         | DatabaseError::Registry(_)
         | DatabaseError::Transaction(_)
+        | DatabaseError::CoordinatorLog(_)
         | DatabaseError::EmptyCatalog
         | DatabaseError::TableSelectionRequired
         | DatabaseError::DuplicateStoragePath(_)
+        | DatabaseError::CoordinatorPathConflictsWithStorage(_)
+        | DatabaseError::MissingCommitParticipant { .. }
+        | DatabaseError::PreparedParticipantMismatch { .. }
         | DatabaseError::InspectionStorageMissing { .. }
         | DatabaseError::InspectionIndexColumnMissing { .. }
         | DatabaseError::InspectionRegistrationOrderOverflow { .. }
@@ -533,7 +537,12 @@ fn wire_transaction_state(state: TransactionState) -> WireTransactionState {
     match state {
         TransactionState::Active => WireTransactionState::Active,
         TransactionState::RollbackRequired => WireTransactionState::RollbackRequired,
-        TransactionState::CommitPending => WireTransactionState::CommitPending,
+        TransactionState::Preparing
+        | TransactionState::DecisionPending
+        | TransactionState::CommitDecided
+        | TransactionState::ApplyingCommit
+        | TransactionState::FinalizePending
+        | TransactionState::CommitPending => WireTransactionState::CommitPending,
         TransactionState::RollbackPending => WireTransactionState::RollbackPending,
         TransactionState::Committed | TransactionState::RolledBack => WireTransactionState::None,
     }

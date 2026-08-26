@@ -2,11 +2,14 @@ use std::path::Path;
 
 use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, TableStatistics};
 use netbadb_schema::TableDef;
-use netbadb_types::{AccessPathId, ColumnId, Lsn, RowId, ScalarRef, ScalarValue, TableId, TxnId};
+use netbadb_types::{
+    AccessPathId, ColumnId, DatabaseTxnId, Lsn, RowId, ScalarRef, ScalarValue, StorageId, TableId,
+    TxnId,
+};
 
 use crate::{
-    HeapStorage, IsolationLevel, PresenceCountSummary, ReadView, StorageError, Transaction,
-    TransactionError, TransactionState,
+    HeapRecoveryInspection, HeapStorage, IsolationLevel, PreparedTxnResolution,
+    PresenceCountSummary, ReadView, StorageError, Transaction, TransactionError, TransactionState,
 };
 
 /// Executable capabilities advertised by one table-scoped access path.
@@ -183,6 +186,27 @@ impl StorageTransaction {
         self.heap_transaction_mut(table_id)?.commit()
     }
 
+    pub fn prepare(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        let table_id = self.table_id;
+        self.heap_transaction_mut(table_id)?
+            .prepare(database_txn_id)
+    }
+
+    pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        let table_id = self.table_id;
+        self.heap_transaction_mut(table_id)?
+            .commit_prepared(database_txn_id)
+    }
+
+    pub fn rollback_prepared(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        let table_id = self.table_id;
+        self.heap_transaction_mut(table_id)?
+            .rollback_prepared(database_txn_id)
+    }
+
     pub fn rollback(&mut self) -> Result<(), StorageError> {
         let table_id = self.table_id;
         self.heap_transaction_mut(table_id)?.rollback()
@@ -214,8 +238,38 @@ impl TableStorage {
         HeapStorage::create(path, table).map(Self::Heap)
     }
 
+    pub fn create_heap_with_storage_id(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        storage_id: StorageId,
+    ) -> Result<Self, StorageError> {
+        HeapStorage::create_with_storage_id(path, table, storage_id).map(Self::Heap)
+    }
+
     pub fn open_heap(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
         HeapStorage::open(path, table).map(Self::Heap)
+    }
+
+    pub fn open_heap_with_prepared_resolutions(
+        path: impl AsRef<Path>,
+        table: TableDef,
+        resolutions: &[PreparedTxnResolution],
+    ) -> Result<Self, StorageError> {
+        HeapStorage::open_with_prepared_resolutions(path, table, resolutions).map(Self::Heap)
+    }
+
+    pub fn inspect_heap_recovery(
+        path: impl AsRef<Path>,
+        table: &TableDef,
+    ) -> Result<HeapRecoveryInspection, StorageError> {
+        HeapStorage::inspect_recovery(path, table)
+    }
+
+    #[must_use]
+    pub fn storage_id(&self) -> StorageId {
+        match self {
+            Self::Heap(storage) => storage.storage_id(),
+        }
     }
 
     #[must_use]

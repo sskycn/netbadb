@@ -127,14 +127,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-compiler"
+version = "0.1.0"
+dependencies = [
+ "netbadb-hir",
+ "netbadb-parser",
+ "netbadb-rel",
+ "netbadb-schema",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-core"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "netbadb-compiler",
+ "netbadb-executor",
+ "netbadb-index",
+ "netbadb-inspect",
+ "netbadb-planner",
+ "netbadb-rel",
+ "netbadb-schema",
+ "netbadb-storage",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-executor"
+version = "0.1.0"
+dependencies = [
+ "netbadb-planner",
+ "netbadb-rel",
+ "netbadb-storage",
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "netbadb-core",
  "netbadb-index",
  "netbadb-protocol",
  "netbadb-schema",
  "netbadb-storage",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-hir"
+version = "0.1.0"
+dependencies = [
+ "netbadb-parser",
+ "netbadb-schema",
  "netbadb-types",
 ]
 
@@ -146,7 +193,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-inspect"
+version = "0.1.0"
+dependencies = [
+ "netbadb-schema",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-parser"
+version = "0.1.0"
+
+[[package]]
+name = "netbadb-planner"
+version = "0.1.0"
+dependencies = [
+ "netbadb-index",
+ "netbadb-rel",
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-protocol"
+version = "0.1.0"
+dependencies = [
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-rel"
 version = "0.1.0"
 dependencies = [
  "netbadb-types",

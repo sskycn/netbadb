@@ -43,7 +43,8 @@ migrated.
 
 Phase 2A's original runtime was non-isolated: uncommitted changes were not
 hidden and abort itself did not synchronously roll pages back. Its original WAL
-format had no checksum; the current experimental WAL v3 adds integrity checks.
+format had no checksum; WAL v3 added integrity checks and the current WAL v4
+adds the durable Prepare record.
 
 ## Phase 2B — Crash Recovery (complete)
 
@@ -144,9 +145,10 @@ coordination, replication, and distributed transactions remain deferred.
   truncation boundaries, and a file-level WAL recovery fuzz target cover the
   decoder.
 
-WAL v2 and record v1 remain unsupported experimental formats. At this
-WAL-integrity-hardening phase, heap metadata remained v2; the current heap
-metadata format is v4. Canonical schema encoding remains v1.
+WAL versions 1 through 3 and record versions 1 through 2 are unsupported by the
+current WAL v4/record v3 decoder. At this WAL-integrity-hardening phase, heap
+metadata remained v2; the current heap metadata format is v5. Canonical schema
+encoding remains v1.
 
 ## Data-page integrity hardening (complete)
 
@@ -230,12 +232,12 @@ join reordering, hash/merge/index join, or multi-table DML.
 - unified typed validation for canonical schemas and table definitions;
 - explicit canonical table-schema encoding version 1 and SHA-256 fingerprint;
 - heap metadata format version 2 originally added persisted schema identity;
-  at that phase metadata remained v2, while the current format is v4;
+  at that phase metadata remained v2, while the current format is v5;
 - pre-recovery rejection of table-ID and full-schema mismatches;
 - deterministic golden, sensitivity, invalid-schema, and reopen tests.
 
-Heap metadata versions 1 through 3 have no migration path and are rejected by the
-current version 4 decoder. The experimental format may continue to change
+Heap metadata versions 1 through 4 have no migration path and are rejected by the
+current version 5 decoder. The experimental format may continue to change
 between versions.
 
 ## Phase 3D — Aggregate + Sort (complete)
@@ -1088,16 +1090,42 @@ DatabaseTransaction owns SQL transaction semantics.
 StorageTransaction is one engine participant context.
 ```
 
-This phase adds no atomic multi-storage writes, prepare/2PC, coordinator WAL,
-partitioning or pruning, cross-partition DML, placement, remote storage, LSM,
-Columnar, Raft, or replication. It changes no Heap metadata, Page, BTree,
-IndexCatalog, transaction-status, WAL, Protocol v1, SDK Schema Spec v1,
-manifest v4, Inspection JSON v3, or SQL result semantics. Current StorageIds
-resolve locally and exist only for one opened database composition.
+This phase originally added no atomic multi-storage writes, prepare/2PC, or
+coordinator log. Its StorageIds existed only for one opened composition; the
+atomic commit phase below supersedes that limitation with metadata-persistent
+identity.
 
-The next required durability phase is **Atomic Multi-Storage Commit
-Foundation**. Before cross-partition UPDATE can exist, it must define prepare
-semantics, a durable coordinator decision, participant recovery and idempotent
-resolution, plus crash behavior for every window before and after the commit
-decision. Partitioned reads/pruning may arrive independently, but a
-cross-partition writer must wait for that atomic protocol.
+## Atomic Multi-Storage Commit Foundation (complete)
+
+- Heap metadata v5 persists a nonzero `StorageId`; reorder and restart no
+  longer change physical recovery identity, and metadata versions 1–4 are
+  rejected without migration;
+- WAL v4 / record v3 adds a checksummed `Prepare(DatabaseTxnId)` record and a
+  durable Prepared state that retains the storage writer;
+- storage recovery classifies Prepared separately from winners and losers,
+  requires an explicit typed resolution for standalone open, and idempotently
+  commits or undoes exact physical transaction mappings;
+- Core owns an independent append-only CoordinatorLog v1 with bounded,
+  canonical CommitDecision participants and idempotent Complete records;
+- the successful CommitDecision sync is the global commit point. Before it,
+  presumed abort is legal; after it, every participant must eventually commit
+  and rollback is rejected;
+- coordinator-enabled create/open APIs take an explicit log path. Legacy APIs
+  retain the one-write-storage boundary, while read-only and single-writer
+  transactions retain their existing fast paths;
+- startup validates coordinator decisions and all stable participant identities
+  before physical recovery, rejects missing or mismatched participants, applies
+  partial commits, and finishes incomplete Complete records;
+- append/fsync retry tests, corruption/golden tests, bounded decoder fuzzing,
+  repeated recovery, and 13 abrupt-process crash windows cover the durability
+  boundary.
+
+The CoordinatorLog is intentionally append-only and has no GC/checkpoint yet.
+Protocol v1, SQL grammar/results, SDK Schema Spec v1, manifest v4, Inspection
+JSON v3, Page v5, MVCC tuple v1, and transaction-status v1 are unchanged.
+
+The next recommended phase is **Range Partition Foundation**: explicit range
+partition metadata first, then pruning, INSERT routing, and cross-partition
+UPDATE using the existing atomic coordinator. LSM follows partitioning;
+placement/sharding, replication/Raft, distributed transactions, and a global
+timestamp domain remain later work.

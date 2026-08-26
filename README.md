@@ -56,7 +56,7 @@ TableStorage capability boundary
     ↓
 Heap row layout + registered B+Tree access methods
     ↓
-Transaction lifecycle + versioned WAL
+Database coordinator + physical transaction lifecycle + versioned WAL
     ↓
 Buffer pool (guards, pinning, dirty writeback)
     ↓
@@ -179,13 +179,15 @@ The current code genuinely supports:
 - synchronous heap storage with fixed 4 KiB pages;
 - version 5 slotted heap pages with persistent pageLSNs, PageId-bound full-page
   CRC32C, generation-bearing reusable tombstones, and checked bounds;
-- heap metadata v4, versioned MVCC tuple headers, and a checksummed durable
+- heap metadata v5 with persistent `StorageId`, versioned MVCC tuple headers, and a checksummed durable
   transaction-status sidecar with monotonic commit sequences;
 - synchronous buffer-pool guards with pinning, dirty tracking, flush, and
   bounded eviction;
-- versioned little-endian WAL records for begin, full-page update, commit,
-  abort, and rollback completion, with strong LSNs and per-transaction prevLSN
-  chains;
+- versioned little-endian WAL records for begin, full-page update, prepare,
+  commit, abort, and rollback completion, with strong LSNs and per-transaction
+  prevLSN chains;
+- an independent checksummed coordinator log whose durable CommitDecision is
+  the atomic commit point for two or more local write storages;
 - explicit Read Committed and Repeatable Read transaction handles plus implicit
   Read Committed statement transactions;
 - commit durability through WAL sync and WAL-before-data-page writeback;
@@ -272,16 +274,17 @@ Project move already-owned values into results, cloning only the additional
 owners required by duplicate output columns.
 
 The experimental storage format uses versioned heap metadata and slotted pages.
-Heap metadata version 4 retains the canonical table-schema fingerprint and the
-stable IndexCatalog root PageId while requiring MVCC tuple encoding version 1;
-versions 1 through 3 are rejected rather than guessed or migrated. Phase 2A bumped
+Heap metadata version 5 retains the canonical table-schema fingerprint and the
+stable IndexCatalog root PageId, persists the nonzero physical `StorageId`, and
+requires MVCC tuple encoding version 1; versions 1 through 4 are rejected rather
+than guessed or migrated. Phase 2A bumped
 data pages from version 1 to version 2 to add pageLSN. Phase 3B bumps them to
 version 3 because a formerly invalid slot encoding now means Deleted. Page v4
 added a 28-byte header and CRC32C integrity; Page v5 expands each slot with a
 generation used for safe tombstone reuse. Versions 1 through 4 are rejected
 rather than guessed or migrated. Files created by
 the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
-The legacy metadata page 0 retains its separate version-4 layout and is not a
+The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
 IndexCatalog payload version 2 stores optional table and per-index optimizer
@@ -299,9 +302,9 @@ interrupted rotation and is cleaned on open or the next checkpoint.
 the compatibility name for `DatabaseTransaction`, not a Heap WAL handle. It
 owns a database-scoped runtime ID, isolation/state, a `DatabaseReadView`, and
 lazy `StorageId` participants. Explicit transactions may read any number of
-physical storages and may upgrade one read participant to Write. A second
-physical write participant is rejected before mutation because no durable
-atomic multi-storage commit protocol exists. `StorageTransaction` remains the
+physical storages. Databases created/opened with an explicit
+`DatabaseCoordinatorConfig` may also write several storages atomically; legacy
+APIs retain the one-write-storage boundary. `StorageTransaction` remains the
 engine participant context and currently delegates to Heap WAL/MVCC.
 
 Call `begin_transaction`, `insert_in`, and `Transaction::commit` when several
@@ -314,10 +317,14 @@ LSN is its storage-local `CommitSeq`; this phase does not invent a global commit
 timestamp.
 
 The current full-page-image model permits one writer per open Heap storage.
-The database coordinator additionally restricts a transaction to one physical
-write participant. Writer ownership is acquired lazily by the first write, so
-read-only participants do not reserve it. Commit releases ownership only after the
-Commit record and committed status are durable. Rollback first makes Abort durable, follows the
+Writer ownership is acquired lazily by the first write, so read-only
+participants do not reserve it. A one-storage write keeps the existing direct
+commit fast path. For two or more writers, Core durably prepares every
+participant, synchronizes a canonical CommitDecision in the independent
+coordinator log, commits each prepared participant, and finally synchronizes
+Complete. After the CommitDecision sync succeeds—or its result is uncertain—
+rollback is prohibited and commit is retry-only. Rollback before that point
+first makes Abort durable, follows the
 transaction's prevLSN chain backward, installs and synchronizes each validated
 before-image (or removes newly allocated trailing pages), then durably records
 RollbackComplete and releases ownership. A failed commit or rollback remains
@@ -344,8 +351,12 @@ read-only transaction so it cannot invalidate that handle's prevLSN chain.
 
 `Database::open` and `HeapStorage::open` synchronously recover before exposing
 the buffer pool. Recovery classifies transactions with a Commit record as
-winners, RollbackComplete transactions as already physically undone, and
-incomplete or Abort-only transactions as losers. It redoes non-rolled-back page
+winners, RollbackComplete transactions as already physically undone,
+incomplete or Abort-only transactions as losers, and Prepare transactions as
+in-doubt. Standalone open returns a typed error for in-doubt state. A
+coordinator-enabled open scans its decision log first, then commits exact
+`(StorageId, physical TxnId)` participants with a decision and aborts prepared
+participants without one (presumed abort). It redoes non-rolled-back page
 updates in ascending LSN order while using pageLSN to skip installed images,
 then undoes losers in global descending LSN order from full before-images.
 After synchronizing physical undo, startup appends and flushes Abort when
@@ -357,10 +368,10 @@ An incomplete final WAL record caused by EOF is discarded at the recovery
 boundary only when its available header bytes are structurally valid. Invalid
 magic, versions, tags, lengths, checksums, transaction chains, middle records,
 and page images remain hard errors. Existing data pages are fully validated
-before their pageLSN can suppress redo. WAL format v3 protects its 48-byte
-header and every record with CRC32C. Record format v2 reuses bytes 12..16 for
-the checksum, so the fixed record header remains 40 bytes and record sizes and
-logical LSN spacing do not grow. Both checksums cover the complete header or
+before their pageLSN can suppress redo. WAL format v4 protects its 48-byte
+header and every record with CRC32C. Record format v3 adds the bounded Prepare
+payload and retains bytes 12..16 for the checksum; the fixed record header
+remains 40 bytes. Both checksums cover the complete header or
 record with the checksum field treated as zero. A physically complete record
 whose checksum fails is corruption and is never truncated as a crash tail.
 
@@ -427,9 +438,10 @@ may reuse such a slot only after checked generation increment, so stale RowIds
 cannot access a replacement occupant. There is no persistent free-space map.
 Implicit DML owns one database transaction. `execute_in` supports multi-storage
 reads and multiple statements in an explicit transaction; until savepoints
-exist, an execution-time DML failure rolls back that whole transaction. A
-second-writer preflight failure performs no mutation and leaves the transaction
-active for explicit rollback.
+exist, an execution-time DML failure rolls back that whole transaction.
+Coordinator-enabled databases permit multi-storage writes; legacy databases
+reject a second writer before mutation and leave the transaction active for
+explicit rollback.
 
 Heap and B+Tree pages share one database file, buffer pool, transaction chain,
 WAL, recovery pass, and checkpoint. Page v5 assigns distinct page-type tags to
@@ -494,8 +506,9 @@ right-minor order.
 
 The core composes multiple unchanged one-table heap files with
 `Database::create_tables`/`open_tables`; `insert_into` targets a table for
-embedded data loading. No page, heap, WAL, recovery, checkpoint, or transaction
-format changed for JOIN. Multi-table write transactions remain unsupported.
+embedded data loading. JOIN itself changed no persistent format. Atomic
+multi-table writes are available only through the explicit coordinator-enabled
+create/open APIs.
 
 `ORDER BY` accepts one or more qualified or unqualified source-column keys.
 Each key may specify `ASC` or `DESC` and `NULLS FIRST` or `NULLS LAST`; omitted
@@ -715,11 +728,20 @@ The implementation sequence is intentionally vertical:
 50. Generic Filter position prebinding (Phase 7V) — selected, not started;
     post-7U predicate-only all-TRUE Text is within 1.031x of the primitive
     control while wide/single Int64 dynamic lookup remains 2.241x.
+51. Atomic Multi-Storage Commit Foundation — complete; persistent StorageIds,
+    WAL Prepare, an independent coordinator CommitDecision/Complete log,
+    presumed-abort startup resolution, retry-safe commit, and 13 abrupt-process
+    crash windows.
+52. Range Partition Foundation — next; explicit range metadata precedes
+    pruning, INSERT routing, and cross-partition UPDATE on the existing atomic
+    coordinator.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items.
 See [`docs/architecture.md`](docs/architecture.md) and
-[`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes.
+[`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
+durable coordinator byte layout is specified in
+[`docs/coordinator-log-v1.md`](docs/coordinator-log-v1.md).
 
 ## License
 

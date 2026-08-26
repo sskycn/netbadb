@@ -2,7 +2,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::error::Error;
 use std::fmt;
 
-use netbadb_types::{Lsn, PageId, TxnId};
+use netbadb_types::{DatabaseTxnId, Lsn, PageId, TxnId};
 
 use crate::page::{ValidatedBeforeImage, validate_before_image};
 use crate::{Page, PageManager, StorageError, WalError, WalManager, WalRecord, WalRecordKind};
@@ -16,6 +16,65 @@ pub(crate) struct RecoveryReport {
     pub pages_redone: usize,
     pub pages_undone: usize,
     pub truncated_wal_tail: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedTransactionState {
+    Prepared,
+    Committed,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTransaction {
+    pub database_txn_id: DatabaseTxnId,
+    pub physical_txn_id: TxnId,
+    pub state: PreparedTransactionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedDecision {
+    Commit,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTxnResolution {
+    pub database_txn_id: DatabaseTxnId,
+    pub physical_txn_id: TxnId,
+    pub decision: PreparedDecision,
+}
+
+pub(crate) fn inspect_prepared_transactions(records: &[WalRecord]) -> Vec<PreparedTransaction> {
+    let mut transactions = HashMap::<TxnId, PreparedTransaction>::new();
+    for record in records {
+        match record.kind {
+            WalRecordKind::Prepare { database_txn_id } => {
+                transactions.insert(
+                    record.txn_id,
+                    PreparedTransaction {
+                        database_txn_id,
+                        physical_txn_id: record.txn_id,
+                        state: PreparedTransactionState::Prepared,
+                    },
+                );
+            }
+            WalRecordKind::Commit => {
+                if let Some(transaction) = transactions.get_mut(&record.txn_id) {
+                    transaction.state = PreparedTransactionState::Committed;
+                }
+            }
+            WalRecordKind::RollbackComplete => {
+                if let Some(transaction) = transactions.get_mut(&record.txn_id) {
+                    transaction.state = PreparedTransactionState::RolledBack;
+                }
+            }
+            WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } | WalRecordKind::Abort => {}
+        }
+    }
+    let mut inspected = transactions.into_values().collect::<Vec<_>>();
+    inspected.sort_unstable_by_key(|transaction| transaction.physical_txn_id.0);
+    inspected
 }
 
 /// Errors raised while reconstructing database pages from the WAL.
@@ -49,6 +108,28 @@ pub enum RecoveryError {
         expected: TxnId,
         actual: TxnId,
         lsn: Lsn,
+    },
+    PreparedTransactionRequiresResolution {
+        database_txn_id: DatabaseTxnId,
+        physical_txn_id: TxnId,
+    },
+    DuplicatePreparedResolution {
+        physical_txn_id: TxnId,
+    },
+    PreparedResolutionMismatch {
+        physical_txn_id: TxnId,
+        expected: DatabaseTxnId,
+        actual: DatabaseTxnId,
+    },
+    UnknownPreparedResolution {
+        database_txn_id: DatabaseTxnId,
+        physical_txn_id: TxnId,
+    },
+    PreparedResolutionConflictsWithTerminalState {
+        database_txn_id: DatabaseTxnId,
+        physical_txn_id: TxnId,
+        state: PreparedTransactionState,
+        decision: PreparedDecision,
     },
     #[cfg(test)]
     InterruptedForTest,
@@ -105,6 +186,46 @@ impl fmt::Display for RecoveryError {
                 "transaction {} undo chain reaches transaction {} record at {}",
                 expected.0, actual.0, lsn.0
             ),
+            Self::PreparedTransactionRequiresResolution {
+                database_txn_id,
+                physical_txn_id,
+            } => write!(
+                formatter,
+                "prepared physical transaction {} for database transaction {} requires an explicit recovery decision",
+                physical_txn_id.0, database_txn_id.0
+            ),
+            Self::DuplicatePreparedResolution { physical_txn_id } => write!(
+                formatter,
+                "physical transaction {} has more than one prepared recovery resolution",
+                physical_txn_id.0
+            ),
+            Self::PreparedResolutionMismatch {
+                physical_txn_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "physical transaction {} is prepared for database transaction {}, not {}",
+                physical_txn_id.0, expected.0, actual.0
+            ),
+            Self::UnknownPreparedResolution {
+                database_txn_id,
+                physical_txn_id,
+            } => write!(
+                formatter,
+                "recovery resolution names unknown physical transaction {} for database transaction {}",
+                physical_txn_id.0, database_txn_id.0
+            ),
+            Self::PreparedResolutionConflictsWithTerminalState {
+                database_txn_id,
+                physical_txn_id,
+                state,
+                decision,
+            } => write!(
+                formatter,
+                "{decision:?} resolution for database transaction {} physical transaction {} conflicts with terminal state {state:?}",
+                database_txn_id.0, physical_txn_id.0
+            ),
             #[cfg(test)]
             Self::InterruptedForTest => formatter.write_str("recovery interrupted for test"),
         }
@@ -138,6 +259,7 @@ struct TransactionAnalysis {
     last_lsn: Lsn,
     committed: bool,
     rolled_back: bool,
+    prepared_database_txn_id: Option<DatabaseTxnId>,
 }
 
 pub(crate) struct RecoveryManager;
@@ -149,7 +271,24 @@ impl RecoveryManager {
         records: &[WalRecord],
         truncated_wal_tail: bool,
     ) -> Result<RecoveryReport, RecoveryError> {
-        Self::recover_inner(pages, wal, records, truncated_wal_tail, None)
+        Self::recover_inner(pages, wal, records, truncated_wal_tail, None, None)
+    }
+
+    pub(crate) fn recover_with_resolutions(
+        pages: &mut PageManager,
+        wal: &mut WalManager,
+        records: &[WalRecord],
+        truncated_wal_tail: bool,
+        resolutions: &[PreparedTxnResolution],
+    ) -> Result<RecoveryReport, RecoveryError> {
+        Self::recover_inner(
+            pages,
+            wal,
+            records,
+            truncated_wal_tail,
+            Some(resolutions),
+            None,
+        )
     }
 
     fn recover_inner(
@@ -157,6 +296,7 @@ impl RecoveryManager {
         wal: &mut WalManager,
         records: &[WalRecord],
         truncated_wal_tail: bool,
+        resolutions: Option<&[PreparedTxnResolution]>,
         operation_limit: Option<usize>,
     ) -> Result<RecoveryReport, RecoveryError> {
         let mut transactions = HashMap::<TxnId, TransactionAnalysis>::new();
@@ -169,14 +309,19 @@ impl RecoveryManager {
                     last_lsn: record.lsn,
                     committed: false,
                     rolled_back: false,
+                    prepared_database_txn_id: None,
                 });
             transaction.last_lsn = record.lsn;
             if matches!(record.kind, WalRecordKind::Commit) {
                 transaction.committed = true;
             } else if matches!(record.kind, WalRecordKind::RollbackComplete) {
                 transaction.rolled_back = true;
+            } else if let WalRecordKind::Prepare { database_txn_id } = record.kind {
+                transaction.prepared_database_txn_id = Some(database_txn_id);
             }
         }
+
+        Self::apply_prepared_resolutions(wal, &mut transactions, resolutions)?;
 
         let committed_transactions = transactions
             .values()
@@ -354,6 +499,99 @@ impl RecoveryManager {
             wal.flush_through(lsn)?;
         }
         Ok(report)
+    }
+
+    fn apply_prepared_resolutions(
+        wal: &mut WalManager,
+        transactions: &mut HashMap<TxnId, TransactionAnalysis>,
+        resolutions: Option<&[PreparedTxnResolution]>,
+    ) -> Result<(), RecoveryError> {
+        let mut by_physical = HashMap::new();
+        if let Some(resolutions) = resolutions {
+            for resolution in resolutions {
+                if by_physical
+                    .insert(resolution.physical_txn_id, *resolution)
+                    .is_some()
+                {
+                    return Err(RecoveryError::DuplicatePreparedResolution {
+                        physical_txn_id: resolution.physical_txn_id,
+                    });
+                }
+            }
+        }
+
+        let mut commit_lsns = Vec::new();
+        for (physical_txn_id, transaction) in transactions.iter_mut() {
+            let Some(database_txn_id) = transaction.prepared_database_txn_id else {
+                continue;
+            };
+            let terminal = if transaction.committed {
+                Some(PreparedTransactionState::Committed)
+            } else if transaction.rolled_back {
+                Some(PreparedTransactionState::RolledBack)
+            } else {
+                None
+            };
+            let Some(resolution) = by_physical.remove(physical_txn_id) else {
+                if terminal.is_some() {
+                    continue;
+                }
+                return Err(RecoveryError::PreparedTransactionRequiresResolution {
+                    database_txn_id,
+                    physical_txn_id: *physical_txn_id,
+                });
+            };
+            if resolution.database_txn_id != database_txn_id {
+                return Err(RecoveryError::PreparedResolutionMismatch {
+                    physical_txn_id: *physical_txn_id,
+                    expected: database_txn_id,
+                    actual: resolution.database_txn_id,
+                });
+            }
+            if let Some(state) = terminal {
+                let consistent = matches!(
+                    (state, resolution.decision),
+                    (
+                        PreparedTransactionState::Committed,
+                        PreparedDecision::Commit
+                    ) | (
+                        PreparedTransactionState::RolledBack,
+                        PreparedDecision::Abort
+                    )
+                );
+                if !consistent {
+                    return Err(
+                        RecoveryError::PreparedResolutionConflictsWithTerminalState {
+                            database_txn_id,
+                            physical_txn_id: *physical_txn_id,
+                            state,
+                            decision: resolution.decision,
+                        },
+                    );
+                }
+                continue;
+            }
+            if resolution.decision == PreparedDecision::Commit {
+                let commit_lsn = wal.append(
+                    *physical_txn_id,
+                    Some(transaction.last_lsn),
+                    WalRecordKind::Commit,
+                )?;
+                transaction.last_lsn = commit_lsn;
+                transaction.committed = true;
+                commit_lsns.push(commit_lsn);
+            }
+        }
+        if let Some(lsn) = commit_lsns.into_iter().max() {
+            wal.flush_through(lsn)?;
+        }
+        if let Some((_, resolution)) = by_physical.into_iter().next() {
+            return Err(RecoveryError::UnknownPreparedResolution {
+                database_txn_id: resolution.database_txn_id,
+                physical_txn_id: resolution.physical_txn_id,
+            });
+        }
+        Ok(())
     }
 
     fn reject_metadata_page(page_id: PageId, lsn: Lsn) -> Result<(), RecoveryError> {
@@ -552,7 +790,7 @@ impl RecoveryManager {
         records: &[WalRecord],
         operation_limit: usize,
     ) -> Result<RecoveryReport, RecoveryError> {
-        Self::recover_inner(pages, wal, records, false, Some(operation_limit))
+        Self::recover_inner(pages, wal, records, false, None, Some(operation_limit))
     }
 }
 

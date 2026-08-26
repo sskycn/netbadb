@@ -15,7 +15,7 @@ use netbadb_storage::{
     wal_path,
 };
 use netbadb_types::{
-    ColumnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType, TableId, TxnId,
+    ColumnId, DatabaseTxnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType, TableId, TxnId,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,6 +34,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_seed(&output, "valid-begin-commit", |wal, _| {
         let begin = wal.append(TxnId(1), None, WalRecordKind::Begin)?;
         wal.append(TxnId(1), Some(begin), WalRecordKind::Commit)?;
+        Ok(())
+    })?;
+    write_seed(&output, "valid-begin-prepare", |wal, _| {
+        let begin = wal.append(TxnId(1), None, WalRecordKind::Begin)?;
+        wal.append(
+            TxnId(1),
+            Some(begin),
+            WalRecordKind::Prepare {
+                database_txn_id: DatabaseTxnId(7),
+            },
+        )?;
         Ok(())
     })?;
     write_page_update_seed(&output)?;

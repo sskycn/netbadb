@@ -5,21 +5,22 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use netbadb_types::{Lsn, PageId, TxnId};
+use netbadb_types::{DatabaseTxnId, Lsn, PageId, TxnId};
 
 use crate::{PAGE_SIZE, Page};
 
 const WAL_MAGIC: &[u8; 4] = b"NBWL";
 const RECORD_MAGIC: &[u8; 4] = b"WREC";
-const RECORD_FORMAT_VERSION: u16 = 2;
+const RECORD_FORMAT_VERSION: u16 = 3;
 const RECORD_HEADER_SIZE: usize = 40;
 const PAGE_UPDATE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE * 2;
+const PREPARE_PAYLOAD_SIZE: usize = 8;
 const HEADER_CHECKSUM_OFFSET: usize = 40;
 const HEADER_CHECKSUM_END: usize = 44;
 const RECORD_CHECKSUM_OFFSET: usize = 12;
 const RECORD_CHECKSUM_END: usize = 16;
 
-pub const WAL_FORMAT_VERSION: u16 = 3;
+pub const WAL_FORMAT_VERSION: u16 = 4;
 pub const WAL_HEADER_SIZE: usize = 48;
 pub const WAL_MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE + PAGE_UPDATE_PAYLOAD_SIZE;
 
@@ -44,6 +45,9 @@ pub enum WalError {
         checkpoint_lsn: Option<Lsn>,
     },
     InvalidNextTxnId(u64),
+    InvalidDatabaseTxnId {
+        lsn: Lsn,
+    },
     GenerationConflict,
     TruncatedHeader,
     TruncatedRecord {
@@ -139,6 +143,11 @@ impl fmt::Display for WalError {
                     "invalid next transaction ID {txn_id} in WAL header"
                 )
             }
+            Self::InvalidDatabaseTxnId { lsn } => write!(
+                formatter,
+                "WAL Prepare record at {} has database transaction ID zero",
+                lsn.0
+            ),
             Self::GenerationConflict => {
                 formatter.write_str("WAL generation slots have inconsistent generation metadata")
             }
@@ -260,6 +269,10 @@ pub enum WalRecordKind {
     Commit,
     Abort,
     RollbackComplete,
+    /// Durable participant prepare linked to its database-level transaction.
+    Prepare {
+        database_txn_id: DatabaseTxnId,
+    },
 }
 
 impl WalRecordKind {
@@ -270,12 +283,14 @@ impl WalRecordKind {
             Self::Commit => 3,
             Self::Abort => 4,
             Self::RollbackComplete => 5,
+            Self::Prepare { .. } => 6,
         }
     }
 
     const fn payload_len(&self) -> usize {
         match self {
             Self::PageUpdate { .. } => PAGE_UPDATE_PAYLOAD_SIZE,
+            Self::Prepare { .. } => PREPARE_PAYLOAD_SIZE,
             Self::Begin | Self::Commit | Self::Abort | Self::RollbackComplete => 0,
         }
     }
@@ -945,6 +960,11 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
         bytes.extend_from_slice(&page_id.0.to_le_bytes());
         bytes.extend_from_slice(before.as_ref());
         bytes.extend_from_slice(after.as_ref());
+    } else if let WalRecordKind::Prepare { database_txn_id } = &record.kind {
+        if database_txn_id.0 == 0 {
+            return Err(WalError::InvalidDatabaseTxnId { lsn: record.lsn });
+        }
+        bytes.extend_from_slice(&database_txn_id.0.to_le_bytes());
     }
     let checksum = crc32c::crc32c(&bytes);
     bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
@@ -1092,6 +1112,14 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
             3 => WalRecordKind::Commit,
             4 => WalRecordKind::Abort,
             5 => WalRecordKind::RollbackComplete,
+            6 => {
+                let payload = &record_bytes[RECORD_HEADER_SIZE..];
+                let database_txn_id = DatabaseTxnId(read_u64(payload, 0));
+                if database_txn_id.0 == 0 {
+                    return Err(WalError::InvalidDatabaseTxnId { lsn });
+                }
+                WalRecordKind::Prepare { database_txn_id }
+            }
             // Framing validated this tag before reading or allocating the record.
             _ => {
                 return Err(WalError::UnknownRecordType {
@@ -1229,6 +1257,7 @@ fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
     match tag {
         1 | 3 | 4 | 5 => Ok(0),
         2 => Ok(PAGE_UPDATE_PAYLOAD_SIZE as u32),
+        6 => Ok(PREPARE_PAYLOAD_SIZE as u32),
         tag => Err(WalError::UnknownRecordType { lsn, tag }),
     }
 }
@@ -1236,6 +1265,7 @@ fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalTxnState {
     Active,
+    Prepared,
     Aborting,
     Complete,
 }
@@ -1243,6 +1273,7 @@ enum WalTxnState {
 fn wal_state_after(kind: &WalRecordKind) -> WalTxnState {
     match kind {
         WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } => WalTxnState::Active,
+        WalRecordKind::Prepare { .. } => WalTxnState::Prepared,
         WalRecordKind::Abort => WalTxnState::Aborting,
         WalRecordKind::Commit | WalRecordKind::RollbackComplete => WalTxnState::Complete,
     }
@@ -1265,7 +1296,11 @@ fn validate_transaction_tag_sequence(
 ) -> Result<(), WalError> {
     let valid = matches!(
         (state, record_type),
-        (None, 1) | (Some(WalTxnState::Active), 2..=4) | (Some(WalTxnState::Aborting), 5)
+        (None, 1)
+            | (Some(WalTxnState::Active), 2..=4)
+            | (Some(WalTxnState::Active), 6)
+            | (Some(WalTxnState::Prepared), 3..=4)
+            | (Some(WalTxnState::Aborting), 5)
     );
     if !valid {
         return Err(WalError::InvalidTransactionSequence {
@@ -1358,7 +1393,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    use netbadb_types::{PageId, TxnId};
+    use netbadb_types::{DatabaseTxnId, PageId, TxnId};
 
     use super::{WAL_HEADER_SIZE, WalError, WalManager, WalRecordKind};
     use crate::{Page, PageType};
@@ -1448,6 +1483,46 @@ mod tests {
         assert_eq!(*page_id, PageId(1));
         assert_eq!(decoded_before.as_ref(), before.bytes());
         assert_eq!(decoded_after.as_ref(), after.bytes());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepare_record_round_trips_and_zero_database_identity_is_rejected() {
+        let path = test_path("wal-prepare-round-trip");
+        let mut wal = WalManager::create(&path).expect("create WAL");
+        let begin = wal
+            .append(TxnId(4), None, WalRecordKind::Begin)
+            .expect("append Begin");
+        let prepare = wal
+            .append(
+                TxnId(4),
+                Some(begin),
+                WalRecordKind::Prepare {
+                    database_txn_id: DatabaseTxnId(12),
+                },
+            )
+            .expect("append Prepare");
+        wal.flush_through(prepare).expect("flush Prepare");
+        drop(wal);
+        let mut reopened = WalManager::open(&path).expect("reopen prepared WAL");
+        assert!(matches!(
+            reopened.scan().expect("scan prepared WAL")[1].kind,
+            WalRecordKind::Prepare {
+                database_txn_id: DatabaseTxnId(12)
+            }
+        ));
+        drop(reopened);
+
+        overwrite(
+            &path,
+            initial_physical_offset(prepare) + super::RECORD_HEADER_SIZE as u64,
+            &0_u64.to_le_bytes(),
+        );
+        rewrite_record_checksum(&path, prepare);
+        assert!(matches!(
+            WalManager::open(&path),
+            Err(WalError::InvalidDatabaseTxnId { lsn }) if lsn == prepare
+        ));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1736,7 +1811,7 @@ mod tests {
         .expect("encode header");
         assert_eq!(
             super::read_u32(&header, super::HEADER_CHECKSUM_OFFSET),
-            0x7e39_6232
+            0x5a62_e87e
         );
 
         let begin = super::encode_record(&super::WalRecord {
@@ -1748,7 +1823,21 @@ mod tests {
         .expect("encode Begin");
         assert_eq!(
             super::read_u32(&begin, super::RECORD_CHECKSUM_OFFSET),
-            0xa4d9_9237
+            0x9715_298b
+        );
+
+        let prepare = super::encode_record(&super::WalRecord {
+            lsn: netbadb_types::Lsn(163),
+            txn_id: TxnId(9),
+            prev_lsn: Some(netbadb_types::Lsn(123)),
+            kind: WalRecordKind::Prepare {
+                database_txn_id: netbadb_types::DatabaseTxnId(55),
+            },
+        })
+        .expect("encode Prepare");
+        assert_eq!(
+            super::read_u32(&prepare, super::RECORD_CHECKSUM_OFFSET),
+            0x35be_d6a9
         );
 
         let before = Page::new(PageId(5), PageType::Heap);
@@ -1911,27 +2000,32 @@ mod tests {
 
     #[test]
     fn old_wal_and_record_versions_are_explicitly_unsupported() {
-        let wal_path = test_path("wal-v2-unsupported");
-        drop(WalManager::create(&wal_path).expect("create WAL"));
-        overwrite(&wal_path, 4, &2_u16.to_le_bytes());
-        assert!(matches!(
-            WalManager::open(&wal_path),
-            Err(WalError::UnsupportedVersion(2))
-        ));
+        for version in [1_u16, 2, 3] {
+            let wal_path = test_path(&format!("wal-v{version}-unsupported"));
+            drop(WalManager::create(&wal_path).expect("create WAL"));
+            overwrite(&wal_path, 4, &version.to_le_bytes());
+            assert!(matches!(
+                WalManager::open(&wal_path),
+                Err(WalError::UnsupportedVersion(actual)) if actual == version
+            ));
+            let _ = std::fs::remove_file(wal_path);
+        }
 
-        let record_path = test_path("wal-record-v1-unsupported");
-        let lsns = write_committed_page_updates(&record_path, 0);
-        overwrite(
-            &record_path,
-            initial_physical_offset(lsns[0]) + 4,
-            &1_u16.to_le_bytes(),
-        );
-        assert!(matches!(
-            WalManager::open(&record_path),
-            Err(WalError::UnsupportedRecordVersion { version: 1, .. })
-        ));
-        let _ = std::fs::remove_file(wal_path);
-        let _ = std::fs::remove_file(record_path);
+        for version in [1_u16, 2] {
+            let record_path = test_path(&format!("wal-record-v{version}-unsupported"));
+            let lsns = write_committed_page_updates(&record_path, 0);
+            overwrite(
+                &record_path,
+                initial_physical_offset(lsns[0]) + 4,
+                &version.to_le_bytes(),
+            );
+            assert!(matches!(
+                WalManager::open(&record_path),
+                Err(WalError::UnsupportedRecordVersion { version: actual, .. })
+                    if actual == version
+            ));
+            let _ = std::fs::remove_file(record_path);
+        }
     }
 
     #[test]

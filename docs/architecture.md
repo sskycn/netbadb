@@ -843,16 +843,18 @@ TableStorage
 ```
 
 `TableId` remains SQL/catalog identity and authorization continues to use it.
-`StorageId` identifies one physical storage instance in an opened database. It
-is assigned deterministically from validated catalog order, is never a Vec
-index, pointer, or file descriptor, and is not persisted. The current resolver
-maps one table to one storage, but routing is centralized so a later partition
-map can resolve one logical table to several StorageIds without redefining SQL
-identity.
+`StorageId` identifies one physical storage instance. Heap metadata v5 stores
+it as a nonzero little-endian value, so close/reopen, process restart, pathname
+changes, and catalog reorder preserve identity. It is never a Vec index,
+pointer, file descriptor, or pathname. The current resolver maps one table to
+one storage, but routing is centralized so a later partition map can resolve
+one logical table to several StorageIds without redefining SQL identity.
 
-`DatabaseTransaction` owns database-level runtime identity, isolation intent,
-lifecycle, and a deterministic participant set. Its `DatabaseTxnId` is scoped
-to one opened `Database` and is distinct from each Heap WAL `TxnId`.
+`DatabaseTransaction` owns database-level identity, isolation intent,
+lifecycle, and a deterministic participant set. Its `DatabaseTxnId` is
+distinct from each Heap WAL `TxnId`; coordinator history plus prepared WAL
+records provide the restart high-water mark so a still-relevant identity is
+never reused.
 Participants are registered on first access and contain:
 
 ```text
@@ -860,12 +862,26 @@ StorageId + Read/Write mode + StorageTransaction
 ```
 
 Read participants do not acquire the Heap writer lease. A participant may
-upgrade Read → Write. Multiple read participants plus one writer are supported;
-requesting a different second writer returns a typed coordinator error before
-the second storage transaction can mutate data. Commit finishes read-only
-contexts first and then durably commits the unique writer. Rollback undoes the
-unique writer and releases every read participant. Physical commit/rollback
-failure leaves the database transaction pending for retry.
+upgrade Read → Write. Legacy create/open APIs permit multiple readers and one
+writer. Explicit coordinator-enabled APIs accept a separate coordinator-log
+path and permit several local write participants. One writer retains the direct
+physical commit fast path; two or more use:
+
+```text
+Prepare every participant (durable)
+    ↓
+CommitDecision(DatabaseTxnId, sorted StorageId + physical TxnId set) + sync
+    ↓                         GLOBAL COMMIT POINT
+Commit every prepared participant (durable)
+    ↓
+Complete(DatabaseTxnId) + sync
+```
+
+Before the global point, rollback durably aborts and undoes every participant.
+After it—or after a decision sync with an uncertain result—rollback is a typed
+error and only commit retry is legal. Append and sync retries reuse the same
+DatabaseTxnId and canonical participant set. Read-only and single-writer
+transactions never write the coordinator log.
 
 Every explicit query builds one `DatabaseReadView` owned by the database
 transaction and containing the `StorageReadView` adapters for all StorageIds
@@ -875,9 +891,19 @@ parallel vectors by position. Current Heap status stores have independent
 CommitSeq domains, so `DatabaseReadView` owns logical transaction/isolation
 context without inventing a false database-global timestamp.
 
-Atomic writes to multiple StorageIds, prepare/2PC, coordinator WAL, partitions,
-placement, remote storage, LSM, Columnar, Raft, and replication are not
-implemented. In particular, commit never loops over multiple writers.
+Coordinator-enabled startup scans and validates the independent log before
+opening any participant for recovery. Exact prepared mappings with a
+CommitDecision commit; prepared mappings without one abort under presumed
+abort. Missing decision participants, extra/mismatched prepared participants,
+and corrupt coordinator bytes fail the entire database open. A standalone Heap
+open never guesses an in-doubt outcome and returns a typed resolution-required
+error. Complete is appended only after every participant commit is durable.
+Checkpoint and close retain their quiescent rule, so prepared/in-doubt state is
+rejected rather than recycling required WAL.
+
+The coordinator log is append-only in this phase; GC/checkpoint is deferred.
+Partitions, placement, remote storage, LSM, Columnar, Raft, replication, and
+distributed transactions are not implemented.
 
 ## Storage boundary
 

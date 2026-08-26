@@ -1,9 +1,13 @@
 //! Native synchronous embedded API for NetbaDB.
 
+#[cfg(test)]
+mod coordinator_crash;
+mod coordinator_log;
 mod inspection;
 mod registry;
 mod transaction;
 
+use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,11 +24,17 @@ use netbadb_planner::{
     plan_statement_with_statistics,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
-use netbadb_storage::{StorageError, TableStorage};
-use netbadb_types::{ColumnId, DatabaseTxnId, ScalarValue, StorageId, TableId};
+use netbadb_storage::{
+    HeapRecoveryInspection, PreparedDecision, PreparedTransactionState, PreparedTxnResolution,
+    StorageError, TableStorage,
+};
+use netbadb_types::{ColumnId, DatabaseTxnId, ScalarValue, StorageId, TableId, TxnId};
 
+use coordinator_log::{CoordinatorDecision, CoordinatorLog};
 use registry::{PhysicalBindings, StorageRegistry};
+use transaction::SharedCoordinatorLog;
 
+pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_storage::{IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics};
 pub use registry::StorageRegistryError;
@@ -32,6 +42,34 @@ pub use transaction::{
     CoordinatorError, DatabaseReadView, DatabaseTransaction, ParticipantMode, TransactionState,
 };
 pub type Transaction = DatabaseTransaction;
+
+/// Exercises the strict coordinator decoder for the standalone fuzz target.
+///
+/// This is not a database recovery API. Normal callers must use
+/// [`Database::open_tables_with_coordinator`].
+#[doc(hidden)]
+pub fn fuzz_coordinator_log_file(path: &Path) {
+    let _ = CoordinatorLog::open(path);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseCoordinatorConfig {
+    log_path: PathBuf,
+}
+
+impl DatabaseCoordinatorConfig {
+    #[must_use]
+    pub fn new(log_path: impl Into<PathBuf>) -> Self {
+        Self {
+            log_path: log_path.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+}
 
 /// Canonical table identities read or written by one successfully compiled SQL
 /// statement. This exposes no syntax, compiler IR, plan, or storage details.
@@ -61,10 +99,22 @@ pub enum DatabaseError {
     Execution(ExecutionError),
     Registry(StorageRegistryError),
     Transaction(CoordinatorError),
+    CoordinatorLog(CoordinatorLogError),
     ExpectedQuery,
     EmptyCatalog,
     TableSelectionRequired,
     DuplicateStoragePath(PathBuf),
+    CoordinatorPathConflictsWithStorage(PathBuf),
+    MissingCommitParticipant {
+        database_txn_id: DatabaseTxnId,
+        storage_id: StorageId,
+        physical_txn_id: TxnId,
+    },
+    PreparedParticipantMismatch {
+        database_txn_id: DatabaseTxnId,
+        storage_id: StorageId,
+        physical_txn_id: TxnId,
+    },
     InspectionStorageMissing {
         table_id: TableId,
     },
@@ -92,6 +142,7 @@ impl fmt::Display for DatabaseError {
             Self::Execution(error) => error.fmt(formatter),
             Self::Registry(error) => error.fmt(formatter),
             Self::Transaction(error) => error.fmt(formatter),
+            Self::CoordinatorLog(error) => error.fmt(formatter),
             Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
             Self::EmptyCatalog => formatter.write_str("database requires at least one table"),
             Self::TableSelectionRequired => formatter
@@ -103,6 +154,29 @@ impl fmt::Display for DatabaseError {
                     path.display()
                 )
             }
+            Self::CoordinatorPathConflictsWithStorage(path) => write!(
+                formatter,
+                "coordinator log path `{}` conflicts with a table storage path",
+                path.display()
+            ),
+            Self::MissingCommitParticipant {
+                database_txn_id,
+                storage_id,
+                physical_txn_id,
+            } => write!(
+                formatter,
+                "database transaction {} commit decision requires missing storage {} physical transaction {}",
+                database_txn_id.0, storage_id.0, physical_txn_id.0
+            ),
+            Self::PreparedParticipantMismatch {
+                database_txn_id,
+                storage_id,
+                physical_txn_id,
+            } => write!(
+                formatter,
+                "storage {} physical transaction {} is inconsistent with database transaction {} commit decision",
+                storage_id.0, physical_txn_id.0, database_txn_id.0
+            ),
             Self::InspectionStorageMissing { table_id } => write!(
                 formatter,
                 "inspection found no storage for catalog table {}",
@@ -143,11 +217,15 @@ impl Error for DatabaseError {
             Self::Execution(error) => Some(error),
             Self::Registry(error) => Some(error),
             Self::Transaction(error) => Some(error),
+            Self::CoordinatorLog(error) => Some(error),
             Self::CreateTablesRollback { creation, .. } => Some(creation),
             Self::ExpectedQuery
             | Self::EmptyCatalog
             | Self::TableSelectionRequired
             | Self::DuplicateStoragePath(_)
+            | Self::CoordinatorPathConflictsWithStorage(_)
+            | Self::MissingCommitParticipant { .. }
+            | Self::PreparedParticipantMismatch { .. }
             | Self::InspectionStorageMissing { .. }
             | Self::InspectionIndexColumnMissing { .. }
             | Self::InspectionRegistrationOrderOverflow { .. } => None,
@@ -194,12 +272,19 @@ impl From<CoordinatorError> for DatabaseError {
     }
 }
 
+impl From<CoordinatorLogError> for DatabaseError {
+    fn from(error: CoordinatorLogError) -> Self {
+        Self::CoordinatorLog(error)
+    }
+}
+
 pub struct Database {
     schema: Schema,
     bindings: PhysicalBindings,
     registry: StorageRegistry,
     transaction_owner: Rc<()>,
     next_transaction_id: DatabaseTxnId,
+    coordinator: Option<SharedCoordinatorLog>,
 }
 
 impl Database {
@@ -222,8 +307,9 @@ impl Database {
         let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
         let mut created_paths = Vec::with_capacity(tables.len());
-        for (path, table) in tables {
-            match TableStorage::create_heap(&path, table) {
+        for (position, (path, table)) in tables.into_iter().enumerate() {
+            let storage_id = storage_id_for_position(position)?;
+            match TableStorage::create_heap_with_storage_id(&path, table, storage_id) {
                 Ok(storage) => {
                     storages.push(storage);
                     created_paths.push(path);
@@ -249,6 +335,50 @@ impl Database {
         Self::compose(schema, storages)
     }
 
+    /// Creates a catalog with an explicit durable database coordinator log.
+    /// Only databases opened through this API permit atomic multi-storage writes.
+    pub fn create_tables_with_coordinator(
+        tables: Vec<(PathBuf, TableDef)>,
+        config: DatabaseCoordinatorConfig,
+    ) -> Result<Self, DatabaseError> {
+        validate_catalog_paths(&tables)?;
+        validate_coordinator_path(&tables, &config)?;
+        let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
+        let mut storages = Vec::with_capacity(tables.len());
+        let mut created_paths = Vec::with_capacity(tables.len());
+        for (position, (path, table)) in tables.into_iter().enumerate() {
+            let storage_id = storage_id_for_position(position)?;
+            match TableStorage::create_heap_with_storage_id(&path, table, storage_id) {
+                Ok(storage) => {
+                    storages.push(storage);
+                    created_paths.push(path);
+                }
+                Err(creation) => {
+                    drop(storages);
+                    if let Some((cleanup_path, cleanup)) =
+                        cleanup_created_table_files(&created_paths)
+                    {
+                        return Err(DatabaseError::CreateTablesRollback {
+                            creation,
+                            cleanup_path,
+                            cleanup,
+                        });
+                    }
+                    return Err(creation.into());
+                }
+            }
+        }
+        let coordinator = match CoordinatorLog::create(config.log_path()) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                drop(storages);
+                let _ = cleanup_created_table_files(&created_paths);
+                return Err(error.into());
+            }
+        };
+        Self::compose_with_coordinator(schema, storages, coordinator, DatabaseTxnId(1))
+    }
+
     /// Opens one existing heap-format file per table as a single query catalog.
     pub fn open_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
@@ -260,6 +390,88 @@ impl Database {
         Self::compose(schema, storages)
     }
 
+    /// Opens a coordinator-enabled database after resolving every prepared
+    /// participant from the durable database decision log.
+    pub fn open_tables_with_coordinator(
+        tables: Vec<(PathBuf, TableDef)>,
+        config: DatabaseCoordinatorConfig,
+    ) -> Result<Self, DatabaseError> {
+        validate_catalog_paths(&tables)?;
+        validate_coordinator_path(&tables, &config)?;
+        let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
+        let mut coordinator = CoordinatorLog::open(config.log_path())?;
+        let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        let mut inspected = Vec::with_capacity(tables.len());
+        for (path, table) in &tables {
+            inspected.push(InspectedStorage {
+                path: path.clone(),
+                table: table.clone(),
+                recovery: TableStorage::inspect_heap_recovery(path, table)?,
+            });
+        }
+        validate_coordinator_recovery(&decisions, &inspected)?;
+
+        let mut maximum_database_txn_id = decisions
+            .iter()
+            .map(|decision| decision.database_txn_id.0)
+            .max()
+            .unwrap_or(0);
+        let mut storages = Vec::with_capacity(inspected.len());
+        for storage in inspected {
+            let mut resolutions = Vec::new();
+            for prepared in &storage.recovery.prepared_transactions {
+                maximum_database_txn_id = maximum_database_txn_id.max(prepared.database_txn_id.0);
+                let decision = decisions
+                    .iter()
+                    .find(|decision| decision.database_txn_id == prepared.database_txn_id);
+                let resolution = if let Some(decision) = decision {
+                    let participant_matches = decision.participants.iter().any(|participant| {
+                        participant.storage_id == storage.recovery.storage_id
+                            && participant.physical_txn_id == prepared.physical_txn_id
+                    });
+                    if !participant_matches {
+                        return Err(DatabaseError::PreparedParticipantMismatch {
+                            database_txn_id: prepared.database_txn_id,
+                            storage_id: storage.recovery.storage_id,
+                            physical_txn_id: prepared.physical_txn_id,
+                        });
+                    }
+                    if prepared.state == PreparedTransactionState::RolledBack {
+                        return Err(DatabaseError::PreparedParticipantMismatch {
+                            database_txn_id: prepared.database_txn_id,
+                            storage_id: storage.recovery.storage_id,
+                            physical_txn_id: prepared.physical_txn_id,
+                        });
+                    }
+                    PreparedDecision::Commit
+                } else {
+                    PreparedDecision::Abort
+                };
+                resolutions.push(PreparedTxnResolution {
+                    database_txn_id: prepared.database_txn_id,
+                    physical_txn_id: prepared.physical_txn_id,
+                    decision: resolution,
+                });
+            }
+            storages.push(TableStorage::open_heap_with_prepared_resolutions(
+                storage.path,
+                storage.table,
+                &resolutions,
+            )?);
+        }
+        for decision in &decisions {
+            if !decision.complete {
+                coordinator.complete(decision.database_txn_id)?;
+            }
+        }
+        let next_transaction_id = DatabaseTxnId(
+            maximum_database_txn_id
+                .checked_add(1)
+                .ok_or(CoordinatorError::TransactionIdExhausted)?,
+        );
+        Self::compose_with_coordinator(schema, storages, coordinator, next_transaction_id)
+    }
+
     fn compose(schema: Schema, storages: Vec<TableStorage>) -> Result<Self, DatabaseError> {
         let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
         Ok(Self {
@@ -268,6 +480,24 @@ impl Database {
             registry,
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
+            coordinator: None,
+        })
+    }
+
+    fn compose_with_coordinator(
+        schema: Schema,
+        storages: Vec<TableStorage>,
+        coordinator: CoordinatorLog,
+        next_transaction_id: DatabaseTxnId,
+    ) -> Result<Self, DatabaseError> {
+        let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
+        Ok(Self {
+            schema,
+            bindings,
+            registry,
+            transaction_owner: Rc::new(()),
+            next_transaction_id,
+            coordinator: Some(Rc::new(RefCell::new(coordinator))),
         })
     }
 
@@ -471,10 +701,10 @@ impl Database {
     }
 
     /// Executes a statement using an existing database transaction. Reads may
-    /// span physical storages; writes may target exactly one `StorageId`.
-    /// Until savepoints exist, an execution-time DML failure rolls back the
-    /// whole transaction, while second-writer preflight rejection leaves it
-    /// active for explicit rollback.
+    /// span physical storages. Writes may span storages only when the database
+    /// was opened with an explicit durable coordinator log. Until savepoints
+    /// exist, an execution-time DML failure rolls back the whole transaction;
+    /// legacy second-writer preflight rejection leaves it active for rollback.
     pub fn execute_in(
         &mut self,
         transaction: &mut Transaction,
@@ -581,6 +811,7 @@ impl Database {
             Rc::clone(&self.transaction_owner),
             id,
             isolation_level,
+            self.coordinator.as_ref().map(Rc::clone),
         ))
     }
 
@@ -736,6 +967,80 @@ fn validate_catalog_paths(entries: &[(PathBuf, TableDef)]) -> Result<(), Databas
     Ok(())
 }
 
+fn storage_id_for_position(position: usize) -> Result<StorageId, StorageRegistryError> {
+    let ordinal = position
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(StorageRegistryError::StorageIdExhausted)?;
+    Ok(StorageId(ordinal))
+}
+
+#[derive(Debug)]
+struct InspectedStorage {
+    path: PathBuf,
+    table: TableDef,
+    recovery: HeapRecoveryInspection,
+}
+
+fn validate_coordinator_path(
+    tables: &[(PathBuf, TableDef)],
+    config: &DatabaseCoordinatorConfig,
+) -> Result<(), DatabaseError> {
+    if tables.iter().any(|(path, _)| path == config.log_path()) {
+        return Err(DatabaseError::CoordinatorPathConflictsWithStorage(
+            config.log_path().to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coordinator_recovery(
+    decisions: &[CoordinatorDecision],
+    storages: &[InspectedStorage],
+) -> Result<(), DatabaseError> {
+    for (position, storage) in storages.iter().enumerate() {
+        if storages[..position]
+            .iter()
+            .any(|previous| previous.recovery.storage_id == storage.recovery.storage_id)
+        {
+            return Err(StorageRegistryError::DuplicateStorageId {
+                storage_id: storage.recovery.storage_id,
+            }
+            .into());
+        }
+    }
+    for decision in decisions {
+        for participant in &decision.participants {
+            let storage = storages
+                .iter()
+                .find(|storage| storage.recovery.storage_id == participant.storage_id)
+                .ok_or(DatabaseError::MissingCommitParticipant {
+                    database_txn_id: decision.database_txn_id,
+                    storage_id: participant.storage_id,
+                    physical_txn_id: participant.physical_txn_id,
+                })?;
+            if !decision.complete
+                && !storage
+                    .recovery
+                    .prepared_transactions
+                    .iter()
+                    .any(|prepared| {
+                        prepared.database_txn_id == decision.database_txn_id
+                            && prepared.physical_txn_id == participant.physical_txn_id
+                            && prepared.state != PreparedTransactionState::RolledBack
+                    })
+            {
+                return Err(DatabaseError::MissingCommitParticipant {
+                    database_txn_id: decision.database_txn_id,
+                    storage_id: participant.storage_id,
+                    physical_txn_id: participant.physical_txn_id,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::Error)> {
     let mut first_error = None;
     for database_path in paths.iter().rev() {
@@ -765,8 +1070,9 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        CoordinatorError, Database, DatabaseError, ExecutionResult, IsolationLevel,
-        ParticipantMode, PhysicalStatement, TransactionState, cleanup_created_table_files,
+        CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, ExecutionResult,
+        IsolationLevel, ParticipantMode, PhysicalStatement, TransactionState,
+        cleanup_created_table_files,
     };
     use crate::registry::{
         PhysicalBindings, PhysicalTableBinding, StorageRegistry, StorageRegistryEntry,
@@ -827,6 +1133,421 @@ mod tests {
                 TypeSpec::Physical(PhysicalType::Int64),
             )],
         )
+    }
+
+    fn projects_table() -> TableDef {
+        TableDef::new(
+            TableId(3),
+            "projects",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        )
+    }
+
+    fn coordinator_fixture_paths(
+        root: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        (
+            root.with_extension("users.db"),
+            root.with_extension("teams.db"),
+            root.with_extension("projects.db"),
+            root.with_extension("coordinator"),
+        )
+    }
+
+    fn coordinator_fixture_tables(
+        root: &std::path::Path,
+    ) -> (Vec<(std::path::PathBuf, TableDef)>, std::path::PathBuf) {
+        let (users, teams, projects, coordinator) = coordinator_fixture_paths(root);
+        (
+            vec![
+                (users, table()),
+                (teams, teams_table()),
+                (projects, projects_table()),
+            ],
+            coordinator,
+        )
+    }
+
+    fn cleanup_coordinator_fixture(root: &std::path::Path) {
+        let (users, teams, projects, coordinator) = coordinator_fixture_paths(root);
+        let _ = cleanup_created_table_files(&[users, teams, projects]);
+        let _ = std::fs::remove_file(coordinator);
+    }
+
+    #[test]
+    fn coordinator_crash_child_entrypoint() {
+        if std::env::var_os(crate::coordinator_crash::CHILD_ENV).is_none() {
+            return;
+        }
+        let root = std::env::var_os(crate::coordinator_crash::ROOT_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("coordinator crash root");
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let mut database = Database::open_tables_with_coordinator(
+            tables,
+            DatabaseCoordinatorConfig::new(coordinator_path),
+        )
+        .expect("open crash child database");
+        let mut transaction = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin crash child transaction");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("atomic".into())],
+            )
+            .expect("write users participant");
+        database
+            .insert_into_in(TableId(2), &mut transaction, &[ScalarValue::Int64(2)])
+            .expect("write teams participant");
+        database
+            .insert_into_in(TableId(3), &mut transaction, &[ScalarValue::Int64(3)])
+            .expect("write projects participant");
+        transaction.commit().expect("commit until crash point");
+        panic!("coordinator crash child returned without reaching its crash point");
+    }
+
+    fn assert_crash_outcome(root: &std::path::Path, committed: bool) {
+        for pass in 0..2 {
+            let (tables, coordinator_path) = coordinator_fixture_tables(root);
+            let mut database = Database::open_tables_with_coordinator(
+                tables,
+                DatabaseCoordinatorConfig::new(coordinator_path),
+            )
+            .expect("recover coordinator database");
+            for (table_name, expected_id) in [("users", 1), ("teams", 2), ("projects", 3)] {
+                let rows = database
+                    .query(&format!("SELECT id FROM {table_name}"))
+                    .expect("query recovered participant")
+                    .rows;
+                let expected = if committed {
+                    vec![vec![ScalarValue::Int64(expected_id)]]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(rows, expected, "pass {pass}, table {table_name}");
+            }
+            database.close().expect("close recovered database");
+        }
+    }
+
+    #[test]
+    fn subprocess_atomic_commit_crash_window_matrix_is_all_or_nothing() {
+        let cases = [
+            ("before-first-prepare", false),
+            ("after-prepare-1", false),
+            ("after-prepare-2", false),
+            ("after-all-prepares", false),
+            ("during-decision-append", false),
+            ("after-decision-append", true),
+            ("after-durable-decision", true),
+            ("after-commit-1", true),
+            ("after-commit-2", true),
+            ("after-all-commits", true),
+            ("during-complete-append", true),
+            ("after-complete-append", true),
+            ("after-durable-complete", true),
+        ];
+        for (case, committed) in cases {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-core-coordinator-crash-{case}-{}",
+                std::process::id()
+            ));
+            cleanup_coordinator_fixture(&root);
+            let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+            Database::create_tables_with_coordinator(
+                tables,
+                DatabaseCoordinatorConfig::new(coordinator_path),
+            )
+            .expect("create crash fixture")
+            .close()
+            .expect("close crash fixture");
+
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("current core test executable"),
+            );
+            command
+                .arg("--exact")
+                .arg("tests::coordinator_crash_child_entrypoint")
+                .arg("--nocapture");
+            crate::coordinator_crash::configure_child(&mut command, case, &root, case);
+            let status = command.status().expect("start coordinator crash child");
+            assert_eq!(
+                status.code(),
+                Some(crate::coordinator_crash::EXIT_CODE),
+                "case {case} did not terminate at its crash point: {status}"
+            );
+            assert_crash_outcome(&root, committed);
+            cleanup_coordinator_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn coordinator_database_commits_two_write_storages_and_reopens_in_reversed_order() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-core-atomic-two-write-{}",
+            std::process::id()
+        ));
+        let users_path = root.with_extension("users.db");
+        let teams_path = root.with_extension("teams.db");
+        let coordinator_path = root.with_extension("coordinator");
+        let table_paths = vec![users_path.clone(), teams_path.clone()];
+        let _ = cleanup_created_table_files(&table_paths);
+        let _ = std::fs::remove_file(&coordinator_path);
+
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path);
+        let mut database = Database::create_tables_with_coordinator(
+            vec![
+                (users_path.clone(), table()),
+                (teams_path.clone(), teams_table()),
+            ],
+            config.clone(),
+        )
+        .expect("create coordinator database");
+        let mut transaction = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin database transaction");
+        let committed_database_txn_id = transaction.id();
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())],
+            )
+            .expect("write first participant");
+        database
+            .insert_into_in(TableId(2), &mut transaction, &[ScalarValue::Int64(7)])
+            .expect("write second participant");
+        transaction.commit().expect("atomic commit");
+        assert_eq!(transaction.state(), TransactionState::Committed);
+        drop(transaction);
+        database.close().expect("close database");
+
+        let mut reopened = Database::open_tables_with_coordinator(
+            vec![
+                (teams_path.clone(), teams_table()),
+                (users_path.clone(), table()),
+            ],
+            config,
+        )
+        .expect("reopen in reversed catalog order");
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM users")
+                .expect("read users")
+                .rows,
+            vec![vec![ScalarValue::Int64(1)]]
+        );
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM teams")
+                .expect("read teams")
+                .rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        let mut later = reopened
+            .begin_transaction_for(TableId(1))
+            .expect("allocate transaction after restart");
+        assert!(later.id().0 > committed_database_txn_id.0);
+        later.rollback().expect("finish allocation check");
+        reopened.close().expect("close reopened database");
+        let _ = cleanup_created_table_files(&table_paths);
+        let _ = std::fs::remove_file(coordinator_path);
+    }
+
+    #[test]
+    fn coordinator_multi_write_rolls_back_before_the_global_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-core-atomic-rollback-{}",
+            std::process::id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let mut database = Database::create_tables_with_coordinator(
+            tables,
+            DatabaseCoordinatorConfig::new(coordinator_path),
+        )
+        .expect("create rollback fixture");
+        let mut transaction = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin multi-write transaction");
+        database
+            .execute_in(
+                &mut transaction,
+                "INSERT INTO users (id, name) VALUES (1, 'Ada')",
+            )
+            .expect("write first participant");
+        database
+            .execute_in(&mut transaction, "INSERT INTO teams (id) VALUES (2)")
+            .expect("write second participant");
+        assert!(
+            database
+                .execute_in(
+                    &mut transaction,
+                    "INSERT INTO projects (id) VALUES ('not an integer')",
+                )
+                .is_err()
+        );
+        transaction.rollback().expect("rollback before decision");
+        assert_eq!(transaction.state(), TransactionState::RolledBack);
+        drop(transaction);
+        assert!(
+            database
+                .query("SELECT id FROM users")
+                .expect("users")
+                .rows
+                .is_empty()
+        );
+        assert!(
+            database
+                .query("SELECT id FROM teams")
+                .expect("teams")
+                .rows
+                .is_empty()
+        );
+        database.close().expect("close rollback fixture");
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn uncertain_decision_and_complete_sync_failures_are_retryable_not_rollbackable() {
+        for failure in ["decision-sync", "complete-sync"] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-core-atomic-retry-{failure}-{}",
+                std::process::id()
+            ));
+            cleanup_coordinator_fixture(&root);
+            let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+            let mut database = Database::create_tables_with_coordinator(
+                tables,
+                DatabaseCoordinatorConfig::new(coordinator_path),
+            )
+            .expect("create retry fixture");
+            let mut transaction = database
+                .begin_transaction_for(TableId(1))
+                .expect("begin retry transaction");
+            let original_id = transaction.id();
+            database
+                .execute_in(
+                    &mut transaction,
+                    "INSERT INTO users (id, name) VALUES (1, 'Ada')",
+                )
+                .expect("write first participant");
+            database
+                .execute_in(&mut transaction, "INSERT INTO teams (id) VALUES (2)")
+                .expect("write second participant");
+            let coordinator = database.coordinator.as_ref().expect("coordinator");
+            if failure == "decision-sync" {
+                coordinator.borrow_mut().inject_decision_sync_failure();
+            } else {
+                coordinator.borrow_mut().inject_complete_sync_failure();
+            }
+            assert!(transaction.commit().is_err());
+            let expected_state = if failure == "decision-sync" {
+                TransactionState::DecisionPending
+            } else {
+                TransactionState::FinalizePending
+            };
+            assert_eq!(transaction.state(), expected_state);
+            assert!(matches!(
+                transaction.rollback(),
+                Err(CoordinatorError::CommitAlreadyDecided { .. })
+            ));
+            assert_eq!(transaction.id(), original_id);
+            transaction.commit().expect("retry the same transaction");
+            assert_eq!(transaction.state(), TransactionState::Committed);
+            drop(transaction);
+            assert_eq!(
+                database
+                    .query("SELECT id FROM users")
+                    .expect("users")
+                    .rows
+                    .len(),
+                1
+            );
+            assert_eq!(
+                database
+                    .query("SELECT id FROM teams")
+                    .expect("teams")
+                    .rows
+                    .len(),
+                1
+            );
+            database.close().expect("close retry fixture");
+            cleanup_coordinator_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn coordinator_open_rejects_missing_participants_and_corruption_before_recovery() {
+        for case in ["missing-participant", "corrupt-log"] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-core-atomic-open-{case}-{}",
+                std::process::id()
+            ));
+            cleanup_coordinator_fixture(&root);
+            let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+            let mut database = Database::create_tables_with_coordinator(
+                tables,
+                DatabaseCoordinatorConfig::new(&coordinator_path),
+            )
+            .expect("create open-validation fixture");
+            let mut transaction = database
+                .begin_transaction_for(TableId(1))
+                .expect("begin fixture transaction");
+            database
+                .execute_in(
+                    &mut transaction,
+                    "INSERT INTO users (id, name) VALUES (1, 'Ada')",
+                )
+                .expect("write users");
+            database
+                .execute_in(&mut transaction, "INSERT INTO teams (id) VALUES (2)")
+                .expect("write teams");
+            transaction.commit().expect("commit fixture transaction");
+            drop(transaction);
+            database.close().expect("close fixture database");
+
+            let error = if case == "missing-participant" {
+                let (users, _teams, projects, _) = coordinator_fixture_paths(&root);
+                Database::open_tables_with_coordinator(
+                    vec![(users, table()), (projects, projects_table())],
+                    DatabaseCoordinatorConfig::new(&coordinator_path),
+                )
+                .err()
+                .expect("missing participant must fail")
+            } else {
+                let mut bytes = std::fs::read(&coordinator_path).expect("read coordinator");
+                bytes[12] ^= 1;
+                std::fs::write(&coordinator_path, bytes).expect("corrupt coordinator");
+                let (tables, _) = coordinator_fixture_tables(&root);
+                Database::open_tables_with_coordinator(
+                    tables,
+                    DatabaseCoordinatorConfig::new(&coordinator_path),
+                )
+                .err()
+                .expect("corrupt coordinator must fail")
+            };
+            if case == "missing-participant" {
+                assert!(matches!(
+                    error,
+                    DatabaseError::MissingCommitParticipant { .. }
+                ));
+            } else {
+                assert!(matches!(error, DatabaseError::CoordinatorLog(_)));
+            }
+            cleanup_coordinator_fixture(&root);
+        }
     }
 
     fn planned_index(plan: &PhysicalPlan) -> Option<(AccessPathId, &ScalarValue)> {
@@ -973,6 +1694,7 @@ mod tests {
             registry,
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
+            coordinator: None,
         };
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")

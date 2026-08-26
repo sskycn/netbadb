@@ -20,6 +20,10 @@ or typed `IndexError` without panicking, unbounded allocation, or traversal.
 exercises the independent version-1 registry decoder. Arbitrary counts and
 bytes must remain bounded and return either a catalog node or typed error.
 
+`coordinator_log_decode` accepts at most 64 KiB and opens it through the
+version-1 coordinator scanner. Participant counts and record sizes are bounded;
+malformed records must return a typed error without panicking.
+
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 
 ```bash
@@ -28,11 +32,12 @@ cargo +nightly fuzz run wal_recovery -- -runs=1000
 cargo +nightly fuzz run page_decode -- -runs=1000
 cargo +nightly fuzz run btree_decode -- -runs=1000
 cargo +nightly fuzz run index_catalog_decode -- -runs=1000
+cargo +nightly fuzz run coordinator_log_decode -- -runs=1000
 ```
 
-The generated WAL corpus contains empty input, a valid v3 header, Begin,
-Begin+Commit, a PageUpdate carrying Page v5 images, and a structurally valid
-truncated final record. A separate legal Page v5 seed is generated for
+The generated WAL corpus contains empty input, a valid v4 header, Begin,
+Begin+Commit, Begin+Prepare, a PageUpdate carrying Page v5 images, and a
+structurally valid truncated final record. A separate legal Page v5 seed is generated for
 `page_decode`. The B+Tree corpus adds empty input, valid metadata,
 empty/one-entry leaves, one internal separator, and a truncated leaf. The
 index-catalog corpus covers an empty registry, one entry, a next-page link,

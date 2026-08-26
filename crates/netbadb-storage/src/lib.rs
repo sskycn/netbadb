@@ -15,14 +15,17 @@ mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
-pub use heap::{HeapStorage, PresenceCountSummary};
+pub use heap::{HeapRecoveryInspection, HeapStorage, PresenceCountSummary};
 pub use mvcc::{IsolationLevel, ReadView, Snapshot};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
 pub use page::{
     PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
     PageType, SLOT_SIZE, Slot, SlotRef, SlotState,
 };
-pub use recovery::RecoveryError;
+pub use recovery::{
+    PreparedDecision, PreparedTransaction, PreparedTransactionState, PreparedTxnResolution,
+    RecoveryError,
+};
 pub use table::{
     AccessPathCapabilities, StorageAccessPath, StorageReadView, StorageRowHandle,
     StorageTransaction, TableStorage,
@@ -313,6 +316,7 @@ pub enum MetadataError {
     InvalidMagic,
     UnsupportedVersion(u16),
     InvalidReservedBytes,
+    InvalidStorageId(netbadb_types::StorageId),
     InvalidColumnCount { stored: u16, expected: usize },
 }
 
@@ -326,6 +330,11 @@ impl fmt::Display for MetadataError {
             Self::InvalidReservedBytes => {
                 formatter.write_str("heap metadata reserved bytes are non-zero")
             }
+            Self::InvalidStorageId(storage_id) => write!(
+                formatter,
+                "heap metadata stores invalid physical storage ID {}",
+                storage_id.0
+            ),
             Self::InvalidColumnCount { stored, expected } => write!(
                 formatter,
                 "heap metadata stores {stored} columns but its schema fingerprint identifies {expected}"
@@ -348,6 +357,16 @@ pub enum TransactionError {
     WalBusy,
     StatusBusy,
     CommandIdExhausted,
+    InvalidDatabaseTxnId,
+    DatabaseTxnMismatch {
+        txn_id: netbadb_types::TxnId,
+        expected: Option<netbadb_types::DatabaseTxnId>,
+        actual: netbadb_types::DatabaseTxnId,
+    },
+    NotPrepared {
+        txn_id: netbadb_types::TxnId,
+        state: TransactionState,
+    },
     WriterBusy {
         txn_id: netbadb_types::TxnId,
     },
@@ -384,6 +403,23 @@ impl fmt::Display for TransactionError {
             Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
             Self::StatusBusy => formatter.write_str("transaction-status store is already borrowed"),
             Self::CommandIdExhausted => formatter.write_str("transaction command ID exhausted"),
+            Self::InvalidDatabaseTxnId => {
+                formatter.write_str("database transaction ID zero is invalid")
+            }
+            Self::DatabaseTxnMismatch {
+                txn_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "physical transaction {} is prepared for database transaction {expected:?}, not {}",
+                txn_id.0, actual.0
+            ),
+            Self::NotPrepared { txn_id, state } => write!(
+                formatter,
+                "physical transaction {} is {state:?}, not prepared",
+                txn_id.0
+            ),
             Self::WriterBusy { txn_id } => {
                 write!(formatter, "transaction {} is the active writer", txn_id.0)
             }
