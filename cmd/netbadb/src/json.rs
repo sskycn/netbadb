@@ -528,9 +528,7 @@ enum PartitionAccessJson<'a> {
     #[serde(rename = "seq_scan")]
     Seq,
     #[serde(rename = "index_scan")]
-    Index {
-        column: ColumnReferenceJson<'a>,
-    },
+    Index { column: ColumnReferenceJson<'a> },
     #[serde(rename = "range_index_scan")]
     RangeIndex {
         column: ColumnReferenceJson<'a>,
@@ -935,14 +933,15 @@ mod tests {
         AggregateInputInspection, AggregateOutputInspection, BinaryOpInspection, CatalogInspection,
         ColumnInspection, ColumnReferenceInspection, ExpressionInspection,
         ExpressionKindInspection, IndexInspection, IndexRangeInspection, IndexStatisticsInspection,
-        PlanNodeInspection, RangeBoundInspection, ResultFieldInspection, SourceColumnInspection,
-        StatementAccessInspection, StatementInspection, StatementKind, StatementPlanInspection,
-        StatementResultInspection, TableInspection, TablePlacementInspection,
-        TableStatisticsInspection,
+        PartitionAccessInspection, PartitionScanInspection, PlanNodeInspection,
+        RangeBoundInspection, RangePartitionInspection, ResultFieldInspection,
+        SourceColumnInspection, StatementAccessInspection, StatementInspection, StatementKind,
+        StatementPlanInspection, StatementResultInspection, TableInspection,
+        TablePlacementInspection, TableStatisticsInspection,
     };
     use netbadb_sdk::{
-        ColumnId, PhysicalType, RelationBindingId, ScalarValue, SchemaFingerprint, SemanticType,
-        TableId,
+        ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue, SchemaFingerprint,
+        SemanticType, TableId,
     };
 
     use super::{render_catalog, render_statement};
@@ -1047,6 +1046,72 @@ mod tests {
             render_catalog(&catalog).unwrap(),
             include_str!("../tests/golden/catalog-v3.json")
         );
+    }
+
+    #[test]
+    fn partition_catalog_and_plan_use_json_v4_without_changing_v3() {
+        let catalog = CatalogInspection {
+            tables: vec![TableInspection {
+                table_id: TableId(1),
+                name: "events".into(),
+                fingerprint: SchemaFingerprint::from_bytes([0xcd; 32]),
+                columns: vec![ColumnInspection {
+                    column_id: ColumnId(1),
+                    name: "key".into(),
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: false,
+                    primary_key: false,
+                }],
+                indexes: Vec::new(),
+                statistics: None,
+                placement: TablePlacementInspection::RangePartitioned {
+                    partition_key: ColumnId(1),
+                    partitions: vec![RangePartitionInspection {
+                        partition_id: PartitionId(7),
+                        lower: Some(ScalarValue::Int64(0)),
+                        upper: Some(ScalarValue::Int64(10)),
+                    }],
+                },
+            }],
+        };
+        let catalog_json: serde_json::Value =
+            serde_json::from_str(&render_catalog(&catalog).unwrap()).unwrap();
+        assert_eq!(catalog_json["version"], 4);
+        assert_eq!(
+            catalog_json["catalog"]["tables"][0]["placement"]["kind"],
+            "range_partitioned"
+        );
+        assert_eq!(
+            catalog_json["catalog"]["tables"][0]["placement"]["partitions"][0]["partition_id"],
+            7
+        );
+
+        let key = bound_column(0, 1, "events", 1, "key", PhysicalType::Int64);
+        let inspection = statement(
+            PlanNodeInspection::PartitionedScan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "events".into(),
+                columns: vec![key.clone()],
+                partition_key: ColumnId(1),
+                total_partitions: 3,
+                partitions: vec![PartitionScanInspection {
+                    partition_id: PartitionId(7),
+                    access: PartitionAccessInspection::IndexScan {
+                        column: key.clone(),
+                    },
+                }],
+            },
+            vec![result(&key)],
+        );
+        let statement_json: serde_json::Value =
+            serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
+        assert_eq!(statement_json["version"], 4);
+        let root = &statement_json["statement"]["plan"]["root"];
+        assert_eq!(root["operator"], "partitioned_scan");
+        assert_eq!(root["total_partitions"], 3);
+        assert_eq!(root["partitions"][0]["partition_id"], 7);
+        assert_eq!(root["partitions"][0]["access"]["kind"], "index_scan");
     }
 
     #[test]
