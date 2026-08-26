@@ -26,8 +26,8 @@ use netbadb_planner::{
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
-    HeapRecoveryInspection, PreparedDecision, PreparedTransactionState, PreparedTxnResolution,
-    StorageError, TableStorage,
+    HeapRecoveryInspection, PreparedDecision, PreparedTransaction, PreparedTransactionState,
+    PreparedTxnResolution, StorageError, TableStorage,
 };
 use netbadb_types::{
     ColumnId, DatabaseTxnId, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
@@ -42,7 +42,9 @@ use transaction::SharedCoordinatorLog;
 
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
-pub use netbadb_storage::{IndexDefinition, IndexStatistics, IsolationLevel, TableStatistics};
+pub use netbadb_storage::{
+    IndexDefinition, IndexStatistics, IsolationLevel, LsmInspection, StorageKind, TableStatistics,
+};
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
 };
@@ -83,6 +85,95 @@ impl DatabaseCoordinatorConfig {
     #[must_use]
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+}
+
+/// Explicit physical layout used when creating a single-table storage.
+/// Paths never imply an engine kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableStorageCreateSpec {
+    Heap {
+        path: PathBuf,
+        table: TableDef,
+    },
+    Lsm {
+        directory: PathBuf,
+        table: TableDef,
+        clustering_column: ColumnId,
+    },
+}
+
+impl TableStorageCreateSpec {
+    #[must_use]
+    pub fn heap(path: impl Into<PathBuf>, table: TableDef) -> Self {
+        Self::Heap {
+            path: path.into(),
+            table,
+        }
+    }
+
+    #[must_use]
+    pub fn lsm(
+        directory: impl Into<PathBuf>,
+        table: TableDef,
+        clustering_column: ColumnId,
+    ) -> Self {
+        Self::Lsm {
+            directory: directory.into(),
+            table,
+            clustering_column,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Heap { path, .. } => path,
+            Self::Lsm { directory, .. } => directory,
+        }
+    }
+
+    fn table(&self) -> &TableDef {
+        match self {
+            Self::Heap { table, .. } | Self::Lsm { table, .. } => table,
+        }
+    }
+}
+
+/// Explicit physical layout used when opening an existing storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableStorageOpenSpec {
+    Heap { path: PathBuf, table: TableDef },
+    Lsm { directory: PathBuf, table: TableDef },
+}
+
+impl TableStorageOpenSpec {
+    #[must_use]
+    pub fn heap(path: impl Into<PathBuf>, table: TableDef) -> Self {
+        Self::Heap {
+            path: path.into(),
+            table,
+        }
+    }
+
+    #[must_use]
+    pub fn lsm(directory: impl Into<PathBuf>, table: TableDef) -> Self {
+        Self::Lsm {
+            directory: directory.into(),
+            table,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Heap { path, .. } => path,
+            Self::Lsm { directory, .. } => directory,
+        }
+    }
+
+    fn table(&self) -> &TableDef {
+        match self {
+            Self::Heap { table, .. } | Self::Lsm { table, .. } => table,
+        }
     }
 }
 
@@ -322,6 +413,131 @@ impl Database {
         let schema = Schema::new(vec![table.clone()])?;
         let storage = TableStorage::open_heap(path, table)?;
         Self::compose(schema, vec![storage])
+    }
+
+    /// Creates an explicit mixed Heap/LSM catalog without a durable database
+    /// coordinator. As with the legacy API, at most one storage may be written
+    /// by a transaction.
+    pub fn create_storages(specs: Vec<TableStorageCreateSpec>) -> Result<Self, DatabaseError> {
+        let (schema, storages) = create_explicit_storages(specs)?;
+        Self::compose(schema, storages)
+    }
+
+    /// Creates an explicit mixed Heap/LSM catalog whose multi-storage writes
+    /// use the shared durable coordinator.
+    pub fn create_storages_with_coordinator(
+        specs: Vec<TableStorageCreateSpec>,
+        config: DatabaseCoordinatorConfig,
+    ) -> Result<Self, DatabaseError> {
+        validate_explicit_coordinator_path_create(&specs, &config)?;
+        let cleanup_specs = specs.clone();
+        let (schema, storages) = create_explicit_storages(specs)?;
+        let coordinator = match CoordinatorLog::create(config.log_path()) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                drop(storages);
+                cleanup_explicit_specs(&cleanup_specs);
+                return Err(error.into());
+            }
+        };
+        Self::compose_with_coordinator(schema, storages, coordinator, DatabaseTxnId(1))
+    }
+
+    /// Opens an explicit mixed Heap/LSM catalog without coordinator recovery.
+    /// Any prepared participant is therefore a typed in-doubt error.
+    pub fn open_storages(specs: Vec<TableStorageOpenSpec>) -> Result<Self, DatabaseError> {
+        validate_open_specs(&specs)?;
+        let schema = Schema::new(specs.iter().map(|spec| spec.table().clone()).collect())?;
+        let mut storages = Vec::with_capacity(specs.len());
+        for spec in specs {
+            storages.push(match spec {
+                TableStorageOpenSpec::Heap { path, table } => TableStorage::open_heap(path, table)?,
+                TableStorageOpenSpec::Lsm { directory, table } => {
+                    TableStorage::open_lsm(directory, table)?
+                }
+            });
+        }
+        Self::compose(schema, storages)
+    }
+
+    /// Opens an explicit mixed Heap/LSM catalog, validates every durable
+    /// participant identity before mutation, and resolves prepared work from
+    /// the coordinator decision log.
+    pub fn open_storages_with_coordinator(
+        specs: Vec<TableStorageOpenSpec>,
+        config: DatabaseCoordinatorConfig,
+    ) -> Result<Self, DatabaseError> {
+        validate_open_specs(&specs)?;
+        if specs.iter().any(|spec| spec.path() == config.log_path()) {
+            return Err(DatabaseError::CoordinatorPathConflictsWithStorage(
+                config.log_path().to_owned(),
+            ));
+        }
+        let schema = Schema::new(specs.iter().map(|spec| spec.table().clone()).collect())?;
+        let mut coordinator = CoordinatorLog::open(config.log_path())?;
+        let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        let mut inspected = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let recovery = match spec {
+                TableStorageOpenSpec::Heap { path, table } => {
+                    let recovery = TableStorage::inspect_heap_recovery(path, table)?;
+                    GenericRecoveryInspection {
+                        storage_id: recovery.storage_id,
+                        prepared_transactions: recovery.prepared_transactions,
+                    }
+                }
+                TableStorageOpenSpec::Lsm { directory, table } => {
+                    let recovery = TableStorage::inspect_lsm_recovery(directory, table)?;
+                    GenericRecoveryInspection {
+                        storage_id: recovery.storage_id,
+                        prepared_transactions: recovery.prepared_transactions,
+                    }
+                }
+            };
+            inspected.push(GenericInspectedStorage { recovery });
+        }
+        validate_generic_coordinator_recovery(&decisions, &inspected)?;
+
+        let mut maximum_database_txn_id = decisions
+            .iter()
+            .map(|decision| decision.database_txn_id.0)
+            .max()
+            .unwrap_or(0);
+        let mut storages = Vec::with_capacity(specs.len());
+        for (spec, inspected_storage) in specs.into_iter().zip(&inspected) {
+            let mut resolutions = Vec::new();
+            for prepared in &inspected_storage.recovery.prepared_transactions {
+                maximum_database_txn_id = maximum_database_txn_id.max(prepared.database_txn_id.0);
+                resolutions.push(resolution_for_prepared(
+                    prepared,
+                    inspected_storage.recovery.storage_id,
+                    &decisions,
+                )?);
+            }
+            storages.push(match spec {
+                TableStorageOpenSpec::Heap { path, table } => {
+                    TableStorage::open_heap_with_prepared_resolutions(path, table, &resolutions)?
+                }
+                TableStorageOpenSpec::Lsm { directory, table } => {
+                    TableStorage::open_lsm_with_prepared_resolutions(
+                        directory,
+                        table,
+                        &resolutions,
+                    )?
+                }
+            });
+        }
+        for decision in &decisions {
+            if !decision.complete {
+                coordinator.complete(decision.database_txn_id)?;
+            }
+        }
+        let next_transaction_id = DatabaseTxnId(
+            maximum_database_txn_id
+                .checked_add(1)
+                .ok_or(CoordinatorError::TransactionIdExhausted)?,
+        );
+        Self::compose_with_coordinator(schema, storages, coordinator, next_transaction_id)
     }
 
     /// Creates one heap file per validated table and composes them into one
@@ -901,6 +1117,24 @@ impl Database {
         Ok(())
     }
 
+    /// Runs synchronous quiescent LSM full compaction for a single physical
+    /// table. Heap and partitioned layouts return a typed unsupported error.
+    pub fn compact(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .compact()
+                .map_err(Into::into),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
+    }
+
     /// Atomically backfills and registers one non-unique single-column index.
     /// Subsequent heap and SQL DML maintain the index in the same transaction.
     pub fn create_index(
@@ -1033,6 +1267,39 @@ impl Database {
     /// refreshing statistics.
     pub fn inspect_catalog(&self) -> Result<CatalogInspection, DatabaseError> {
         inspection::catalog(&self.schema, &self.bindings, &self.registry)
+    }
+
+    /// Reports the explicit physical storage kind for a non-partitioned table.
+    pub fn storage_kind(&self, table_id: TableId) -> Result<StorageKind, DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(self
+                .registry
+                .get(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .kind()),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
+    }
+
+    /// Returns LSM physical inspection without exposing mutable handles.
+    pub fn inspect_lsm_storage(
+        &self,
+        table_id: TableId,
+    ) -> Result<Option<LsmInspection>, DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(self
+                .registry
+                .get(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .lsm_inspection()),
+            TablePlacement::RangePartitioned { .. } => Ok(None),
+        }
     }
 
     /// Compiles and physically plans one statement, then converts that exact
@@ -1175,6 +1442,7 @@ impl Database {
                 capabilities: AccessPathCapabilities {
                     point_lookup: path.capabilities.point_lookup,
                     range_lookup: path.capabilities.range_lookup,
+                    ordered: path.capabilities.ordered,
                 },
                 statistics: path.statistics,
             }));
@@ -1218,6 +1486,7 @@ impl Database {
                                         capabilities: AccessPathCapabilities {
                                             point_lookup: path.capabilities.point_lookup,
                                             range_lookup: path.capabilities.range_lookup,
+                                            ordered: path.capabilities.ordered,
                                         },
                                         statistics: path.statistics,
                                     })
@@ -1729,6 +1998,186 @@ struct InspectedStorage {
     recovery: HeapRecoveryInspection,
 }
 
+#[derive(Debug)]
+struct GenericRecoveryInspection {
+    storage_id: StorageId,
+    prepared_transactions: Vec<PreparedTransaction>,
+}
+
+#[derive(Debug)]
+struct GenericInspectedStorage {
+    recovery: GenericRecoveryInspection,
+}
+
+fn create_explicit_storages(
+    specs: Vec<TableStorageCreateSpec>,
+) -> Result<(Schema, Vec<TableStorage>), DatabaseError> {
+    if specs.is_empty() {
+        return Err(DatabaseError::EmptyCatalog);
+    }
+    validate_create_specs(&specs)?;
+    let schema = Schema::new(specs.iter().map(|spec| spec.table().clone()).collect())?;
+    let mut storages = Vec::with_capacity(specs.len());
+    let mut created = Vec::new();
+    for (position, spec) in specs.into_iter().enumerate() {
+        let storage_id = storage_id_for_position(position)?;
+        let result = match &spec {
+            TableStorageCreateSpec::Heap { path, table } => {
+                TableStorage::create_heap_with_storage_id(path, table.clone(), storage_id)
+            }
+            TableStorageCreateSpec::Lsm {
+                directory,
+                table,
+                clustering_column,
+            } => TableStorage::create_lsm_with_storage_id(
+                directory,
+                table.clone(),
+                *clustering_column,
+                storage_id,
+            ),
+        };
+        match result {
+            Ok(storage) => {
+                storages.push(storage);
+                created.push(spec);
+            }
+            Err(error) => {
+                drop(storages);
+                cleanup_explicit_specs(&created);
+                return Err(error.into());
+            }
+        }
+    }
+    Ok((schema, storages))
+}
+
+fn validate_create_specs(specs: &[TableStorageCreateSpec]) -> Result<(), DatabaseError> {
+    validate_unique_paths(specs.iter().map(TableStorageCreateSpec::path))
+}
+
+fn validate_open_specs(specs: &[TableStorageOpenSpec]) -> Result<(), DatabaseError> {
+    if specs.is_empty() {
+        return Err(DatabaseError::EmptyCatalog);
+    }
+    validate_unique_paths(specs.iter().map(TableStorageOpenSpec::path))
+}
+
+fn validate_unique_paths<'a>(paths: impl Iterator<Item = &'a Path>) -> Result<(), DatabaseError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for path in paths {
+        if !seen.insert(path.to_path_buf()) {
+            return Err(DatabaseError::DuplicateStoragePath(path.to_path_buf()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_explicit_coordinator_path_create(
+    specs: &[TableStorageCreateSpec],
+    config: &DatabaseCoordinatorConfig,
+) -> Result<(), DatabaseError> {
+    validate_create_specs(specs)?;
+    if specs.iter().any(|spec| spec.path() == config.log_path()) {
+        return Err(DatabaseError::CoordinatorPathConflictsWithStorage(
+            config.log_path().to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_explicit_specs(specs: &[TableStorageCreateSpec]) {
+    for spec in specs.iter().rev() {
+        match spec {
+            TableStorageCreateSpec::Heap { path, .. } => {
+                let _ = cleanup_created_table_files(std::slice::from_ref(path));
+            }
+            TableStorageCreateSpec::Lsm { directory, .. } => {
+                if directory.exists() {
+                    let _ = std::fs::remove_dir_all(directory);
+                }
+            }
+        }
+    }
+}
+
+fn resolution_for_prepared(
+    prepared: &PreparedTransaction,
+    storage_id: StorageId,
+    decisions: &[CoordinatorDecision],
+) -> Result<PreparedTxnResolution, DatabaseError> {
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.database_txn_id == prepared.database_txn_id);
+    let resolution = if let Some(decision) = decision {
+        if !decision.participants.iter().any(|participant| {
+            participant.storage_id == storage_id
+                && participant.physical_txn_id == prepared.physical_txn_id
+        }) || prepared.state == PreparedTransactionState::RolledBack
+        {
+            return Err(DatabaseError::PreparedParticipantMismatch {
+                database_txn_id: prepared.database_txn_id,
+                storage_id,
+                physical_txn_id: prepared.physical_txn_id,
+            });
+        }
+        PreparedDecision::Commit
+    } else {
+        PreparedDecision::Abort
+    };
+    Ok(PreparedTxnResolution {
+        database_txn_id: prepared.database_txn_id,
+        physical_txn_id: prepared.physical_txn_id,
+        decision: resolution,
+    })
+}
+
+fn validate_generic_coordinator_recovery(
+    decisions: &[CoordinatorDecision],
+    storages: &[GenericInspectedStorage],
+) -> Result<(), DatabaseError> {
+    for (position, storage) in storages.iter().enumerate() {
+        if storages[..position]
+            .iter()
+            .any(|previous| previous.recovery.storage_id == storage.recovery.storage_id)
+        {
+            return Err(StorageRegistryError::DuplicateStorageId {
+                storage_id: storage.recovery.storage_id,
+            }
+            .into());
+        }
+    }
+    for decision in decisions {
+        for participant in &decision.participants {
+            let storage = storages
+                .iter()
+                .find(|storage| storage.recovery.storage_id == participant.storage_id)
+                .ok_or(DatabaseError::MissingCommitParticipant {
+                    database_txn_id: decision.database_txn_id,
+                    storage_id: participant.storage_id,
+                    physical_txn_id: participant.physical_txn_id,
+                })?;
+            if !decision.complete
+                && !storage
+                    .recovery
+                    .prepared_transactions
+                    .iter()
+                    .any(|prepared| {
+                        prepared.database_txn_id == decision.database_txn_id
+                            && prepared.physical_txn_id == participant.physical_txn_id
+                            && prepared.state != PreparedTransactionState::RolledBack
+                    })
+            {
+                return Err(DatabaseError::MissingCommitParticipant {
+                    database_txn_id: decision.database_txn_id,
+                    storage_id: participant.storage_id,
+                    physical_txn_id: participant.physical_txn_id,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_coordinator_path(
     tables: &[(PathBuf, TableDef)],
     config: &DatabaseCoordinatorConfig,
@@ -1819,7 +2268,8 @@ mod tests {
     use super::{
         CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, ExecutionResult,
         IsolationLevel, ParticipantMode, PartitionCatalogConfig, PhysicalStatement,
-        RangePartitionSpec, TablePlacementSpec, TransactionState, cleanup_created_table_files,
+        RangePartitionSpec, TablePlacementSpec, TableStorageCreateSpec, TableStorageOpenSpec,
+        TransactionState, cleanup_created_table_files,
     };
     use crate::registry::{
         PhysicalBindings, StorageRegistry, StorageRegistryEntry, StorageRegistryError,
@@ -1940,6 +2390,10 @@ mod tests {
             .map(std::path::PathBuf::from)
             .expect("coordinator crash root");
         let case = std::env::var(crate::coordinator_crash::CASE_ENV).expect("crash case");
+        if case.starts_with("mixed:") {
+            mixed_crash_child(&root);
+            panic!("mixed crash child returned without reaching its crash point");
+        }
         if let Some(operation) = case.strip_prefix("partition-") {
             partition_crash_child(&root, operation);
             panic!("partition crash child returned without reaching its crash point");
@@ -1991,6 +2445,238 @@ mod tests {
                 assert_eq!(rows, expected, "pass {pass}, table {table_name}");
             }
             database.close().expect("close recovered database");
+        }
+    }
+
+    fn mixed_crash_paths(
+        root: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        (
+            root.with_extension("mixed-heap"),
+            root.with_extension("mixed-lsm"),
+            root.with_extension("mixed-coordinator"),
+        )
+    }
+
+    fn mixed_lsm_table() -> TableDef {
+        TableDef::new(
+            TableId(2),
+            "lsm_items",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        )
+    }
+
+    fn mixed_create_specs(root: &std::path::Path) -> Vec<TableStorageCreateSpec> {
+        let (heap, lsm, _) = mixed_crash_paths(root);
+        vec![
+            TableStorageCreateSpec::heap(heap, table()),
+            TableStorageCreateSpec::lsm(lsm, mixed_lsm_table(), ColumnId(1)),
+        ]
+    }
+
+    fn mixed_open_specs(root: &std::path::Path) -> Vec<TableStorageOpenSpec> {
+        let (heap, lsm, _) = mixed_crash_paths(root);
+        vec![
+            TableStorageOpenSpec::heap(heap, table()),
+            TableStorageOpenSpec::lsm(lsm, mixed_lsm_table()),
+        ]
+    }
+
+    fn cleanup_mixed_crash_fixture(root: &std::path::Path) {
+        let (heap, lsm, coordinator) = mixed_crash_paths(root);
+        let _ = cleanup_created_table_files(&[heap]);
+        let _ = std::fs::remove_dir_all(lsm);
+        let _ = std::fs::remove_file(coordinator);
+    }
+
+    fn mixed_crash_child(root: &std::path::Path) {
+        let (_, _, coordinator) = mixed_crash_paths(root);
+        let mut database = Database::open_storages_with_coordinator(
+            mixed_open_specs(root),
+            DatabaseCoordinatorConfig::new(coordinator),
+        )
+        .expect("open mixed crash child database");
+        let mut transaction = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin mixed crash transaction");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("heap".into())],
+            )
+            .expect("write Heap participant");
+        database
+            .insert_into_in(TableId(2), &mut transaction, &[ScalarValue::Int64(2)])
+            .expect("write LSM participant");
+        transaction
+            .commit()
+            .expect("commit until mixed crash point");
+    }
+
+    fn assert_mixed_crash_outcome(root: &std::path::Path, committed: bool) {
+        for pass in 0..2 {
+            let (_, _, coordinator) = mixed_crash_paths(root);
+            let mut database = Database::open_storages_with_coordinator(
+                mixed_open_specs(root),
+                DatabaseCoordinatorConfig::new(coordinator),
+            )
+            .expect("recover mixed database");
+            let heap = database
+                .query("SELECT id FROM users")
+                .expect("Heap query")
+                .rows;
+            let lsm = database
+                .query("SELECT id FROM lsm_items")
+                .expect("LSM query")
+                .rows;
+            if committed {
+                assert_eq!(heap, vec![vec![ScalarValue::Int64(1)]], "pass {pass}");
+                assert_eq!(lsm, vec![vec![ScalarValue::Int64(2)]], "pass {pass}");
+            } else {
+                assert!(heap.is_empty(), "pass {pass}");
+                assert!(lsm.is_empty(), "pass {pass}");
+            }
+            database.close().expect("close recovered mixed database");
+        }
+    }
+
+    #[test]
+    fn subprocess_heap_lsm_atomic_commit_crash_matrix_is_all_or_nothing() {
+        let cases = [
+            ("before-first-prepare", false),
+            ("after-prepare-1", false),
+            ("after-all-prepares", false),
+            ("after-durable-decision", true),
+            ("after-commit-1", true),
+            ("after-all-commits", true),
+            ("before-complete", true),
+            ("after-durable-complete", true),
+        ];
+        for lsm_first in [false, true] {
+            for (point, committed) in cases {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-core-mixed-crash-{lsm_first}-{point}-{}",
+                    std::process::id()
+                ));
+                cleanup_mixed_crash_fixture(&root);
+                let (heap, lsm, coordinator) = mixed_crash_paths(&root);
+                let specs = if lsm_first {
+                    vec![
+                        TableStorageCreateSpec::lsm(&lsm, mixed_lsm_table(), ColumnId(1)),
+                        TableStorageCreateSpec::heap(&heap, table()),
+                    ]
+                } else {
+                    mixed_create_specs(&root)
+                };
+                Database::create_storages_with_coordinator(
+                    specs,
+                    DatabaseCoordinatorConfig::new(coordinator),
+                )
+                .expect("create mixed crash fixture")
+                .close()
+                .expect("close mixed crash fixture");
+                let actual_point = if point == "before-complete" {
+                    "during-complete-append"
+                } else {
+                    point
+                };
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("current core test executable"),
+                );
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                crate::coordinator_crash::configure_child(
+                    &mut command,
+                    &format!("mixed:{point}"),
+                    &root,
+                    actual_point,
+                );
+                let status = command.status().expect("start mixed crash child");
+                assert_eq!(
+                    status.code(),
+                    Some(crate::coordinator_crash::EXIT_CODE),
+                    "LSM first {lsm_first}, point {point}"
+                );
+                assert_mixed_crash_outcome(&root, committed);
+                cleanup_mixed_crash_fixture(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn heap_lsm_prepare_failure_in_either_order_rolls_back_without_a_decision() {
+        for lsm_first in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-core-mixed-prepare-failure-{lsm_first}-{}",
+                std::process::id()
+            ));
+            cleanup_mixed_crash_fixture(&root);
+            let (heap, lsm, coordinator) = mixed_crash_paths(&root);
+            let specs = if lsm_first {
+                vec![
+                    TableStorageCreateSpec::lsm(&lsm, mixed_lsm_table(), ColumnId(1)),
+                    TableStorageCreateSpec::heap(&heap, table()),
+                ]
+            } else {
+                vec![
+                    TableStorageCreateSpec::heap(&heap, table()),
+                    TableStorageCreateSpec::lsm(&lsm, mixed_lsm_table(), ColumnId(1)),
+                ]
+            };
+            let mut database = Database::create_storages_with_coordinator(
+                specs,
+                DatabaseCoordinatorConfig::new(&coordinator),
+            )
+            .expect("create prepare-failure fixture");
+            let mut transaction = database
+                .begin_transaction_for(TableId(1))
+                .expect("begin transaction");
+            database
+                .execute_in(
+                    &mut transaction,
+                    "INSERT INTO users (id, name) VALUES (1, 'heap')",
+                )
+                .expect("write Heap");
+            database
+                .execute_in(&mut transaction, "INSERT INTO lsm_items (id) VALUES (2)")
+                .expect("write LSM");
+            let failing_table = if lsm_first { TableId(1) } else { TableId(2) };
+            let failing_storage = database
+                .bindings
+                .resolve_single(failing_table)
+                .expect("failing storage identity");
+            transaction
+                .force_participant_rollback_for_prepare_failure(failing_storage)
+                .expect("inject terminal participant state");
+            assert!(matches!(
+                transaction.commit(),
+                Err(CoordinatorError::PrepareFailed { storage_id, .. })
+                    if storage_id == failing_storage
+            ));
+            assert_eq!(transaction.state(), TransactionState::RolledBack);
+            assert!(
+                database
+                    .query("SELECT id FROM users")
+                    .expect("Heap query")
+                    .rows
+                    .is_empty()
+            );
+            assert!(
+                database
+                    .query("SELECT id FROM lsm_items")
+                    .expect("LSM query")
+                    .rows
+                    .is_empty()
+            );
+            database.close().expect("close prepare-failure fixture");
+            cleanup_mixed_crash_fixture(&root);
         }
     }
 
@@ -2514,6 +3200,7 @@ mod tests {
     fn heap_storage(storage: &mut TableStorage) -> &mut HeapStorage {
         match storage {
             TableStorage::Heap(storage) => storage,
+            TableStorage::Lsm(_) => panic!("test fixture expected Heap storage"),
         }
     }
 

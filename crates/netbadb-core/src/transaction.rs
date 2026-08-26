@@ -147,6 +147,21 @@ impl DatabaseTransaction {
         self.participants.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_participant_rollback_for_prepare_failure(
+        &mut self,
+        storage_id: StorageId,
+    ) -> Result<(), CoordinatorError> {
+        let participant = self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?;
+        participant
+            .context
+            .rollback()
+            .map_err(CoordinatorError::from)
+    }
+
     pub(crate) fn validate_owner(&self, owner: &Rc<()>) -> Result<(), CoordinatorError> {
         if !Rc::ptr_eq(&self.owner, owner) {
             return Err(CoordinatorError::ForeignDatabaseTransaction {

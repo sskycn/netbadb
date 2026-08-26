@@ -3615,6 +3615,7 @@ mod tests {
                 capabilities: AccessPathCapabilities {
                     point_lookup: true,
                     range_lookup: true,
+                    ordered: true,
                 },
                 statistics: Some(IndexStatistics {
                     distinct_non_null_keys: 10_000,

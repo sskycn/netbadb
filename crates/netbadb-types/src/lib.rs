@@ -44,6 +44,17 @@ id_type!(PageId, u64);
 id_type!(FrameId, u32);
 id_type!(TxnId, u64);
 id_type!(Lsn, u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Stable logical row identity inside one LSM physical storage.
+///
+/// Zero is reserved. Allocators are monotonic, durable, and never reuse an
+/// identity after deletion or compaction.
+pub struct LsmRowId(pub u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Storage-local committed-version order for one LSM physical storage.
+///
+/// This is deliberately not a database-global timestamp domain.
+pub struct LsmCommitSeq(pub u64);
 // Monotonic MVCC commit order, currently derived from a durable Commit LSN.
 id_type!(CommitSeq, u64);
 // Transaction-local statement order used for own-write visibility.

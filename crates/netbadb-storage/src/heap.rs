@@ -2317,46 +2317,11 @@ fn validate_catalog_root_bounds(catalog_root: PageId, page_count: u64) -> Result
 }
 
 fn encode_row(values: &[ScalarValue]) -> Result<Vec<u8>, StorageError> {
-    let mut encoded = Vec::new();
-    for value in values {
-        match value {
-            ScalarValue::Bool(value) => {
-                encoded.push(0);
-                encoded.push(u8::from(*value));
-            }
-            ScalarValue::Int64(value) => {
-                encoded.push(1);
-                encoded.extend_from_slice(&value.to_le_bytes());
-            }
-            ScalarValue::UInt64(value) => {
-                encoded.push(2);
-                encoded.extend_from_slice(&value.to_le_bytes());
-            }
-            ScalarValue::Text(value) => {
-                encoded.push(3);
-                let length = u32::try_from(value.len()).map_err(|_| StorageError::RowTooLarge {
-                    size: value.len(),
-                    capacity: PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE,
-                })?;
-                encoded.extend_from_slice(&length.to_le_bytes());
-                encoded.extend_from_slice(value.as_bytes());
-            }
-            ScalarValue::Null => encoded.push(4),
-        }
-    }
-    Ok(encoded)
+    crate::row_codec::encode_row(values)
 }
 
 fn decode_row(payload: &[u8], table: &TableDef) -> Result<Vec<ScalarValue>, StorageError> {
-    let mut offset = 0;
-    let mut values = Vec::with_capacity(table.columns.len());
-    for column in &table.columns {
-        let value = decode_value(payload, &mut offset)?;
-        validate_decoded_scalar(value, column)?;
-        values.push(value.to_owned());
-    }
-    ensure_row_consumed(offset, payload.len())?;
-    Ok(values)
+    crate::row_codec::decode_row(payload, table)
 }
 
 fn decode_row_columns(
@@ -2364,47 +2329,7 @@ fn decode_row_columns(
     table: &TableDef,
     positions: &[usize],
 ) -> Result<Vec<ScalarValue>, StorageError> {
-    if positions.is_empty() {
-        let mut offset = 0;
-        for column in &table.columns {
-            let value = decode_value(payload, &mut offset)?;
-            validate_decoded_scalar(value, column)?;
-        }
-        ensure_row_consumed(offset, payload.len())?;
-        return Ok(Vec::new());
-    }
-    if positions.len() == table.columns.len()
-        && positions.iter().copied().eq(0..table.columns.len())
-    {
-        return decode_row(payload, table);
-    }
-    if positions.windows(2).all(|pair| pair[0] < pair[1]) {
-        let mut offset = 0;
-        let mut selected = Vec::with_capacity(positions.len());
-        let mut next_position = 0;
-        for (schema_position, column) in table.columns.iter().enumerate() {
-            let value = decode_value(payload, &mut offset)?;
-            validate_decoded_scalar(value, column)?;
-            if positions.get(next_position) == Some(&schema_position) {
-                selected.push(value.to_owned());
-                next_position += 1;
-            }
-        }
-        ensure_row_consumed(offset, payload.len())?;
-        return Ok(selected);
-    }
-    let mut offset = 0;
-    let mut decoded = Vec::with_capacity(table.columns.len());
-    for column in &table.columns {
-        let value = decode_value(payload, &mut offset)?;
-        validate_decoded_scalar(value, column)?;
-        decoded.push(value);
-    }
-    ensure_row_consumed(offset, payload.len())?;
-    Ok(positions
-        .iter()
-        .map(|position| decoded[*position].to_owned())
-        .collect())
+    crate::row_codec::decode_row_positions(payload, table, positions)
 }
 
 fn ensure_row_consumed(offset: usize, payload_length: usize) -> Result<(), StorageError> {

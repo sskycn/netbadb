@@ -5,9 +5,11 @@ mod buffer;
 #[cfg(test)]
 mod crash_test;
 mod heap;
+mod lsm;
 mod mvcc;
 mod page;
 mod recovery;
+mod row_codec;
 mod table;
 mod transaction;
 mod txn_status;
@@ -16,6 +18,13 @@ mod wal;
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::{HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, PresenceCountSummary};
+pub(crate) use lsm::LsmRowHandle;
+pub use lsm::{
+    DEFAULT_LSM_MEMTABLE_FLUSH_BYTES, LSM_MANIFEST_FORMAT_VERSION, LSM_MAX_PENDING_MUTATIONS,
+    LSM_MAX_PENDING_TRANSACTION_BYTES, LSM_SSTABLE_FORMAT_VERSION, LSM_WAL_FORMAT_VERSION,
+    LsmError, LsmIdentityInspection, LsmInspection, LsmReadView, LsmRecoveryInspection, LsmStorage,
+    LsmTransaction, fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes, fuzz_lsm_wal_bytes,
+};
 pub use mvcc::{IsolationLevel, ReadView, Snapshot};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
 pub use page::{
@@ -27,7 +36,7 @@ pub use recovery::{
     RecoveryError,
 };
 pub use table::{
-    AccessPathCapabilities, StorageAccessPath, StorageReadView, StorageRowHandle,
+    AccessPathCapabilities, StorageAccessPath, StorageKind, StorageReadView, StorageRowHandle,
     StorageTransaction, TableStorage,
 };
 pub use transaction::{Transaction, TransactionState};
@@ -497,6 +506,7 @@ pub enum StorageError {
     Transaction(TransactionError),
     TxnStatus(TxnStatusError),
     Checkpoint(CheckpointError),
+    Lsm(LsmError),
     TableIdMismatch {
         expected: TableId,
         actual: TableId,
@@ -548,6 +558,14 @@ pub enum StorageError {
         table_id: TableId,
         access_path: AccessPathId,
     },
+    ResourceLimit {
+        resource: &'static str,
+        limit: u64,
+    },
+    UnsupportedOperation {
+        operation: &'static str,
+        storage_kind: &'static str,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -566,6 +584,7 @@ impl fmt::Display for StorageError {
             Self::Transaction(error) => write!(formatter, "transaction error: {error}"),
             Self::TxnStatus(error) => write!(formatter, "transaction-status error: {error}"),
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
+            Self::Lsm(error) => write!(formatter, "LSM error: {error}"),
             Self::TableIdMismatch { expected, actual } => write!(
                 formatter,
                 "table ID mismatch: expected {}, found {}",
@@ -641,6 +660,18 @@ impl fmt::Display for StorageError {
                 "table {} has no registered access path {}",
                 table_id.0, access_path.0
             ),
+            Self::ResourceLimit { resource, limit } => {
+                write!(formatter, "{resource} exceeds configured limit {limit}")
+            }
+            Self::UnsupportedOperation {
+                operation,
+                storage_kind,
+            } => {
+                write!(
+                    formatter,
+                    "{operation} is unsupported for {storage_kind} storage"
+                )
+            }
         }
     }
 }
@@ -660,6 +691,7 @@ impl Error for StorageError {
             Self::Transaction(error) => Some(error),
             Self::TxnStatus(error) => Some(error),
             Self::Checkpoint(error) => Some(error),
+            Self::Lsm(error) => Some(error),
             _ => None,
         }
     }
@@ -716,6 +748,12 @@ impl From<RecoveryError> for StorageError {
 impl From<WalError> for StorageError {
     fn from(error: WalError) -> Self {
         Self::Wal(error)
+    }
+}
+
+impl From<LsmError> for StorageError {
+    fn from(error: LsmError) -> Self {
+        Self::Lsm(error)
     }
 }
 

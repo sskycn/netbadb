@@ -29,6 +29,11 @@ PartitionCatalog v1 decoder directly. Header, checksum, bounded table and
 partition counts, typed integer bounds, identities, ordering, and overlap
 validation must reject corrupt input without panic or unbounded allocation.
 
+`lsm_manifest_decode`, `lsm_wal_decode`, and `lsm_sstable_decode` exercise the
+three independent LSM v1 codecs. Inputs and persistent counts/lengths are
+bounded before allocation; malformed checksums, keys, versions, tombstones,
+and block boundaries return typed errors.
+
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 
 ```bash
@@ -39,6 +44,9 @@ cargo +nightly fuzz run btree_decode -- -runs=1000
 cargo +nightly fuzz run index_catalog_decode -- -runs=1000
 cargo +nightly fuzz run coordinator_log_decode -- -runs=1000
 cargo +nightly fuzz run partition_catalog_decode -- -runs=1000
+cargo +nightly fuzz run lsm_manifest_decode -- -runs=1000
+cargo +nightly fuzz run lsm_wal_decode -- -runs=1000
+cargo +nightly fuzz run lsm_sstable_decode -- -runs=1000
 ```
 
 The generated WAL corpus contains empty input, a valid v4 header, Begin,

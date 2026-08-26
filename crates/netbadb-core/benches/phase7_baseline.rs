@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use netbadb_core::{
-    Database, ExecutionResult, PartitionCatalogConfig, QueryResult, RangePartitionSpec,
-    TablePlacementSpec,
+    Database, DatabaseCoordinatorConfig, ExecutionResult, PartitionCatalogConfig, QueryResult,
+    RangePartitionSpec, TablePlacementSpec, TableStorageCreateSpec,
 };
 use netbadb_inspect::{PlanNodeInspection, StatementInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
@@ -259,9 +259,187 @@ fn main() -> BenchResult<()> {
     run_update_scenario(settings, &mut measurements)?;
     run_planner_scenario(settings, &mut measurements)?;
     run_partition_correctness_scenarios()?;
+    run_lsm_correctness_scenarios(settings, &mut measurements)?;
 
     print_report(profile, settings, &measurements)?;
     Ok(())
+}
+
+fn run_lsm_correctness_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let rows = settings.small_rows.max(8);
+    let fixture = FixturePaths::new("lsm-correctness", 1);
+    let mut database = Database::create_storages(vec![TableStorageCreateSpec::lsm(
+        fixture.path(0),
+        items_table(),
+        ID_COLUMN_ID,
+    )])?;
+
+    let started = Instant::now();
+    load_item_rows(&mut database, rows, 4, NullDistribution::Low)?;
+    measurements.push(Measurement {
+        scenario: "lsm_insert".into(),
+        rows: rows.to_string(),
+        plan: "LSM transaction overlay → WAL".into(),
+        operations_per_iteration: rows,
+        durations: vec![started.elapsed()],
+    });
+    database.analyze(ITEMS_TABLE_ID)?;
+
+    let expected_all = Observation {
+        rows,
+        checksum: arithmetic_sum(rows),
+    };
+    for (scenario, sql, expected, required) in [
+        (
+            "lsm_sequential_scan_memtable",
+            "SELECT id FROM items",
+            expected_all,
+            Operator::SeqScan,
+        ),
+        (
+            "lsm_point",
+            "SELECT id FROM items WHERE id = 1",
+            Observation {
+                rows: 1,
+                checksum: 1,
+            },
+            Operator::IndexScan,
+        ),
+        (
+            "lsm_narrow_range",
+            "SELECT id FROM items WHERE id >= 1 AND id <= 3",
+            Observation {
+                rows: 3,
+                checksum: 6,
+            },
+            Operator::RangeIndexScan,
+        ),
+        (
+            "lsm_wide_range",
+            "SELECT id FROM items WHERE id >= 0",
+            expected_all,
+            Operator::SeqScan,
+        ),
+    ] {
+        let plan = inspect_plan(&database, scenario, sql, &[required], &[])?;
+        let durations = measure_checked(
+            scenario,
+            settings.query_warmup,
+            settings.query_iterations,
+            expected,
+            || database.query(sql).map_err(Into::into),
+            ids_observation,
+        )?;
+        measurements.push(Measurement {
+            scenario: scenario.into(),
+            rows: rows.to_string(),
+            plan,
+            operations_per_iteration: 1,
+            durations,
+        });
+    }
+
+    for (scenario, sql) in [
+        (
+            "lsm_update",
+            "UPDATE items SET payload = 'updated' WHERE id = 1",
+        ),
+        (
+            "lsm_key_changing_update",
+            "UPDATE items SET id = 1000000 WHERE id = 2",
+        ),
+        ("lsm_delete", "DELETE FROM items WHERE id = 3"),
+    ] {
+        let started = Instant::now();
+        let result = database.execute(sql)?;
+        let elapsed = started.elapsed();
+        if result != ExecutionResult::AffectedRows(1) {
+            return Err(message_error(format!(
+                "scenario `{scenario}` affected-row count mismatch"
+            )));
+        }
+        measurements.push(Measurement {
+            scenario: scenario.into(),
+            rows: "1".into(),
+            plan: "LSM version/tombstone mutation".into(),
+            operations_per_iteration: 1,
+            durations: vec![elapsed],
+        });
+    }
+    require_observation(
+        "lsm_memtable_only_read",
+        Observation {
+            rows: rows - 1,
+            checksum: arithmetic_sum(rows) - 2 - 3 + 1_000_000,
+        },
+        ids_observation(&database.query("SELECT id FROM items")?)?,
+    )?;
+    database.checkpoint()?;
+    require_observation(
+        "lsm_post_flush_read",
+        Observation {
+            rows: rows - 1,
+            checksum: arithmetic_sum(rows) - 2 - 3 + 1_000_000,
+        },
+        ids_observation(&database.query("SELECT id FROM items")?)?,
+    )?;
+    database.compact(ITEMS_TABLE_ID)?;
+    require_observation(
+        "lsm_post_compaction_read",
+        Observation {
+            rows: rows - 1,
+            checksum: arithmetic_sum(rows) - 2 - 3 + 1_000_000,
+        },
+        ids_observation(&database.query("SELECT id FROM items")?)?,
+    )?;
+    database.close()?;
+    fixture.cleanup()?;
+
+    let mixed = FixturePaths::new("heap-lsm-atomic", 3);
+    let heap_table = join_table(TableId(91), "heap_atomic");
+    let lsm_table = join_table(TableId(92), "lsm_atomic");
+    let mut database = Database::create_storages_with_coordinator(
+        vec![
+            TableStorageCreateSpec::heap(mixed.path(0), heap_table),
+            TableStorageCreateSpec::lsm(mixed.path(1), lsm_table, ID_COLUMN_ID),
+        ],
+        DatabaseCoordinatorConfig::new(mixed.path(2)),
+    )?;
+    let started = Instant::now();
+    let mut transaction = database.begin_transaction_for(TableId(91))?;
+    database.execute_in(
+        &mut transaction,
+        "INSERT INTO heap_atomic (id, join_key) VALUES (1, 7)",
+    )?;
+    database.execute_in(
+        &mut transaction,
+        "INSERT INTO lsm_atomic (id, join_key) VALUES (1, 7)",
+    )?;
+    transaction.commit()?;
+    let elapsed = started.elapsed();
+    for name in ["heap_atomic", "lsm_atomic"] {
+        let result = database.query(&format!("SELECT id FROM {name}"))?;
+        require_observation(
+            "heap_lsm_atomic_transaction",
+            Observation {
+                rows: 1,
+                checksum: 1,
+            },
+            ids_observation(&result)?,
+        )?;
+    }
+    measurements.push(Measurement {
+        scenario: "heap_lsm_atomic_transaction".into(),
+        rows: "2 participant writes".into(),
+        plan: "Prepare → CommitDecision → engine commits".into(),
+        operations_per_iteration: 2,
+        durations: vec![elapsed],
+    });
+    database.close()?;
+    mixed.cleanup()
 }
 
 fn run_partition_correctness_scenarios() -> BenchResult<()> {
@@ -2697,6 +2875,14 @@ fn cleanup_paths(paths: &[PathBuf]) -> BenchResult<()> {
 }
 
 fn remove_if_present(path: &Path) -> BenchResult<()> {
+    if path.is_dir() {
+        return std::fs::remove_dir_all(path).map_err(|error| {
+            message_error(format!(
+                "failed to remove benchmark fixture directory `{}`: {error}",
+                path.display()
+            ))
+        });
+    }
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

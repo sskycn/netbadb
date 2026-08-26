@@ -67,6 +67,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "lsm_manifest_decode"
+path = "fuzz_targets/lsm_manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsm_wal_decode"
+path = "fuzz_targets/lsm_wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsm_sstable_decode"
+path = "fuzz_targets/lsm_sstable_decode.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
 

@@ -59,7 +59,7 @@ Canonical Schema + source SQL               netbadb-inspect DTOs
         ↓                                           ↓
 netbadb-compiler                             embedded SDK / offline CLI
         ↓                                           ↓
-ToolingDiagnostic                           text / Inspection JSON v3
+ToolingDiagnostic                           text / Inspection JSON v4
         ↓
 netbadb-lsp UTF-16 adapter
 ```
@@ -92,7 +92,7 @@ compiler / planner / storage internal state
                     ↓
              embedded SDK
                     ↓
-       offline CLI text / explicit JSON v3
+       offline CLI text / explicit JSON v4
 ```
 
 `netbadb-inspect` depends only on canonical schema and type domains. Its DTOs
@@ -120,14 +120,14 @@ netbadb-sdk embedded Database
           ↓
 netbadb-inspect DTOs
        ↙       ↘
-human text   Inspection JSON v3
+human text   Inspection JSON v4
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
 obtain table bootstrap paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
-filesystem access. JSON v3 is the current explicit external CLI contract,
-converted exhaustively from inspection DTOs; v1 and v2 remain historical
+filesystem access. JSON v4 is the current explicit external CLI contract,
+converted exhaustively from inspection DTOs; v1, v2, and v3 remain historical
 contracts and the DTOs themselves remain serde-free.
 Future runtime-inspection tooling, including MCP, consumes those DTOs directly
 rather than spawning the CLI. The diagnostics-only LSP does not use this path.
@@ -936,8 +936,8 @@ rejected rather than recycling required WAL.
 
 The coordinator log is append-only in this phase; GC/checkpoint is deferred.
 HASH/LIST/DEFAULT partitioning, partition DDL/split/merge, global indexes,
-remote placement, LSM, Columnar, Raft, replication, and distributed
-transactions are not implemented.
+remote placement, Columnar, Raft, replication, and distributed transactions
+are not implemented.
 
 ## Storage boundary
 
@@ -955,30 +955,45 @@ PhysicalBindings: TableId → TablePlacement
 StorageRegistry
     ↓
 TableStorage capability API
-    ↓
-TableStorage::Heap(HeapStorage)
-    ↘ registered BTree access methods
-    ↓
-TransactionManager + WAL
-    ↓
-BufferPool + PageGuards
-    ↓
-PageManager
-    ↓
-Database file
+    ├─ TableStorage::Heap(HeapStorage)
+    │      ├─ registered BTree access methods
+    │      └─ TransactionManager + Heap WAL
+    │             ↓
+    │         BufferPool + PageGuards → PageManager → database file
+    └─ TableStorage::Lsm(LsmStorage)
+           ├─ ordered MemTable + transaction-local overlay
+           ├─ LSM WAL v1
+           └─ immutable L0/L1 SSTables selected by Manifest v1
 ```
 
 `netbadb-storage` keeps the boundaries concrete and small:
 
-- `TableStorage` is the database composition boundary and currently has one
-  real variant, `Heap`. It uses static enum dispatch; there is no empty LSM or
+```text
+                 DatabaseTransaction
+                        │
+                 CoordinatorLog
+                  /           \
+             Heap Txn        LSM Txn
+                │              │
+            Heap WAL        LSM WAL
+```
+
+- `TableStorage` is the database composition boundary and has two real
+  variants, `Heap` and `Lsm`. It uses static enum dispatch; there is no empty
   Columnar placeholder and no giant `dyn StorageEngine` interface. B+Tree is
-  an access method owned by Heap, not a table-storage variant.
-- `StorageRowHandle` is an opaque, table-scoped executor mutation identity.
-  Its current private Heap representation contains the generation-safe RowId,
-  but executor, planner, Rel IR, and SQL cannot inspect PageId or SlotId.
-  `StorageReadView` and `StorageTransaction` similarly keep current Heap MVCC
-  and WAL transaction state below the table-storage boundary.
+  an access method owned by Heap, while the LSM clustering order is its native
+  point/range access path and is not represented by a fake BTree handle.
+- `StorageRowHandle` is an opaque, storage-scoped executor mutation identity.
+  Heap carries its generation-safe RowId. LSM carries a stable `LsmRowId`, the
+  observed visible version, and current clustering key for stale-handle and
+  key-moving UPDATE validation. Executor, planner, Rel IR, and SQL inspect
+  neither representation. `StorageReadView` and `StorageTransaction` likewise
+  keep each engine's MVCC and durability state below the boundary.
+- `Database::storage_kind` and `Database::inspect_lsm_storage` expose embedded,
+  read-only physical inspection including clustering identity, MemTable/SSTable
+  entries, L0/L1 counts, and last-`ANALYZE` row/min/max statistics. Deployment
+  manifest v4 still bootstraps Heap only, so the offline CLI and Inspection JSON
+  v4 remain unchanged; LSM CLI/server bootstrap is deliberately deferred.
 - The capability API covers projected scans, point/range access, borrowed
   row visitors, presence summaries, and mutation. Heap dispatch delegates
   directly to its validated-once selective/borrowed implementations, so direct

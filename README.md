@@ -57,6 +57,7 @@ deterministic StorageRegistry
 TableStorage capability boundary
     ↓
 Heap row layout + registered B+Tree access methods
+or LSM MemTable + LSM WAL + immutable L0/L1 SSTables
     ↓
 Database coordinator + physical transaction lifecycle + versioned WAL
     ↓
@@ -180,6 +181,10 @@ The current code genuinely supports:
   left-major/right-minor nested-loop join physical planning;
 - enum-dispatched `TableStorage` composition, opaque executor row/read/transaction
   contexts, and access-path-neutral planner identities and capabilities;
+- a real synchronous LSM table-storage variant with a NOT NULL Int64/UInt64
+  clustering column, duplicate-preserving `(clustering key, LsmRowId)` order,
+  storage-local MVCC, tombstones, an engine-specific WAL, immutable SSTables,
+  synchronous flush, and quiescent full compaction;
 - synchronous heap storage with fixed 4 KiB pages;
 - version 5 slotted heap pages with persistent pageLSNs, PageId-bound full-page
   CRC32C, generation-bearing reusable tombstones, and checked bounds;
@@ -235,7 +240,7 @@ The current code genuinely supports:
   handles and never drives execution;
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
-  current versioned Inspection JSON v3 output (with v1/v2 retained historically);
+  current versioned Inspection JSON v4 output (with v1/v2/v3 retained historically);
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
@@ -669,7 +674,7 @@ The implementation sequence is intentionally vertical:
     complete.
 27. Structured inspection and offline local CLI (Phases 6D1 and 6D2) — stable
     DTOs, deterministic text, manifest-v4 bootstrap, and historical Inspection
-    JSON v1. Complete; the current CLI contract is v3 after Phase 7D.
+    JSON v1. Complete; the current CLI contract is v4 after Range Partition.
     Complete.
 28. Shared SQL diagnostics and diagnostics-only LSP (Phase 6E1) — complete.
 29. MCP and additional tooling adapters (Phase 6E2) — future work.
@@ -744,8 +749,10 @@ The implementation sequence is intentionally vertical:
     PartitionId→StorageId mapping, exact typed pruning, partition-local access
     paths, routing, atomic row movement, multi-partition DML, inspection v4,
     reordered-path reopen, and subprocess recovery proofs.
-53. LSM Storage MVP — next; add one concrete second `TableStorage` layout while
-    retaining the partition/router, transaction, and recovery boundaries.
+53. LSM Storage MVP — complete; `TableStorage::Lsm` provides persistent
+    Manifest/WAL/SSTable v1 formats, MVCC and read-your-writes, ordered
+    point/range access, synchronous flush and L0/L1 compaction, and mixed
+    Heap+LSM atomic recovery through the existing coordinator boundary.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items.
@@ -755,6 +762,8 @@ durable coordinator byte layout is specified in
 [`docs/coordinator-log-v1.md`](docs/coordinator-log-v1.md).
 The range metadata layout is specified in
 [`docs/partition-catalog-v1.md`](docs/partition-catalog-v1.md).
+The LSM persistent formats and recovery rules are specified in
+[`docs/lsm-format-v1.md`](docs/lsm-format-v1.md).
 
 ## License
 

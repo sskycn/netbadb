@@ -16,6 +16,8 @@ use netbadb_types::{
 pub struct AccessPathCapabilities {
     pub point_lookup: bool,
     pub range_lookup: bool,
+    /// Results are ordered by the access column and stable row identity.
+    pub ordered: bool,
 }
 
 /// One registered single-column access capability available to physical planning.
@@ -2158,6 +2160,7 @@ mod tests {
             capabilities: AccessPathCapabilities {
                 point_lookup: true,
                 range_lookup: true,
+                ordered: true,
             },
             statistics: None,
         }

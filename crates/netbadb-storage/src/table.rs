@@ -9,8 +9,9 @@ use netbadb_types::{
 
 use crate::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IsolationLevel,
-    PreparedTxnResolution, PresenceCountSummary, ReadView, StorageError, Transaction,
-    TransactionError, TransactionState,
+    LsmIdentityInspection, LsmInspection, LsmReadView, LsmRecoveryInspection, LsmRowHandle,
+    LsmStorage, LsmTransaction, PreparedTxnResolution, PresenceCountSummary, ReadView,
+    StorageError, Transaction, TransactionError, TransactionState,
 };
 
 /// Executable capabilities advertised by one table-scoped access path.
@@ -21,6 +22,8 @@ use crate::{
 pub struct AccessPathCapabilities {
     pub point_lookup: bool,
     pub range_lookup: bool,
+    /// Results are deterministic in access-key then storage row-identity order.
+    pub ordered: bool,
 }
 
 /// Storage-owned optimizer snapshot for one registered access method.
@@ -30,6 +33,12 @@ pub struct StorageAccessPath {
     pub column_id: ColumnId,
     pub capabilities: AccessPathCapabilities,
     pub statistics: Option<IndexStatistics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKind {
+    Heap,
+    Lsm,
 }
 
 /// Opaque executor identity for a physical row version.
@@ -47,6 +56,7 @@ pub struct StorageRowHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StorageRowHandleKind {
     Heap(RowId),
+    Lsm(LsmRowHandle),
 }
 
 impl StorageRowHandle {
@@ -67,6 +77,38 @@ impl StorageRowHandle {
         }
         match self.inner {
             StorageRowHandleKind::Heap(row_id) => Ok(row_id),
+            StorageRowHandleKind::Lsm(_) => Err(StorageError::StorageContextMismatch {
+                expected: table_id,
+                actual: self.table_id,
+            }),
+        }
+    }
+
+    fn lsm(table_id: TableId, storage_id: StorageId, row: LsmRowHandle) -> Self {
+        Self {
+            table_id,
+            storage_id,
+            inner: StorageRowHandleKind::Lsm(row),
+        }
+    }
+
+    fn lsm_handle(
+        self,
+        table_id: TableId,
+        storage_id: StorageId,
+    ) -> Result<LsmRowHandle, StorageError> {
+        if self.table_id != table_id || self.storage_id != storage_id {
+            return Err(StorageError::StorageContextMismatch {
+                expected: table_id,
+                actual: self.table_id,
+            });
+        }
+        match self.inner {
+            StorageRowHandleKind::Lsm(row) => Ok(row),
+            StorageRowHandleKind::Heap(_) => Err(StorageError::StorageContextMismatch {
+                expected: table_id,
+                actual: self.table_id,
+            }),
         }
     }
 
@@ -87,6 +129,7 @@ pub struct StorageReadView {
 #[derive(Debug)]
 enum StorageReadViewKind {
     Heap(ReadView),
+    Lsm(LsmReadView),
 }
 
 impl StorageReadView {
@@ -106,6 +149,33 @@ impl StorageReadView {
         }
         match &self.inner {
             StorageReadViewKind::Heap(view) => Ok(view),
+            StorageReadViewKind::Lsm(_) => Err(StorageError::StorageContextMismatch {
+                expected: table_id,
+                actual: self.table_id,
+            }),
+        }
+    }
+
+    fn lsm(table_id: TableId, view: LsmReadView) -> Self {
+        Self {
+            table_id,
+            inner: StorageReadViewKind::Lsm(view),
+        }
+    }
+
+    fn lsm_view(&self, table_id: TableId) -> Result<&LsmReadView, StorageError> {
+        if self.table_id != table_id {
+            return Err(StorageError::StorageContextMismatch {
+                expected: table_id,
+                actual: self.table_id,
+            });
+        }
+        match &self.inner {
+            StorageReadViewKind::Lsm(view) => Ok(view),
+            StorageReadViewKind::Heap(_) => Err(StorageError::StorageContextMismatch {
+                expected: table_id,
+                actual: self.table_id,
+            }),
         }
     }
 }
@@ -121,6 +191,7 @@ pub struct StorageTransaction {
 #[derive(Debug)]
 enum StorageTransactionKind {
     Heap(Transaction),
+    Lsm(LsmTransaction),
 }
 
 impl StorageTransaction {
@@ -139,6 +210,9 @@ impl StorageTransaction {
         }
         match &self.inner {
             StorageTransactionKind::Heap(transaction) => Ok(transaction),
+            StorageTransactionKind::Lsm(_) => Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction { txn_id: self.id() },
+            )),
         }
     }
 
@@ -153,6 +227,53 @@ impl StorageTransaction {
         }
         match &mut self.inner {
             StorageTransactionKind::Heap(transaction) => Ok(transaction),
+            StorageTransactionKind::Lsm(transaction) => Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction {
+                    txn_id: transaction.id(),
+                },
+            )),
+        }
+    }
+
+    fn lsm(table_id: TableId, transaction: LsmTransaction) -> Self {
+        Self {
+            table_id,
+            inner: StorageTransactionKind::Lsm(transaction),
+        }
+    }
+
+    fn lsm_transaction(&self, table_id: TableId) -> Result<&LsmTransaction, StorageError> {
+        if self.table_id != table_id {
+            return Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction { txn_id: self.id() },
+            ));
+        }
+        match &self.inner {
+            StorageTransactionKind::Lsm(transaction) => Ok(transaction),
+            StorageTransactionKind::Heap(transaction) => Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction {
+                    txn_id: transaction.id(),
+                },
+            )),
+        }
+    }
+
+    fn lsm_transaction_mut(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<&mut LsmTransaction, StorageError> {
+        if self.table_id != table_id {
+            return Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction { txn_id: self.id() },
+            ));
+        }
+        match &mut self.inner {
+            StorageTransactionKind::Lsm(transaction) => Ok(transaction),
+            StorageTransactionKind::Heap(transaction) => Err(StorageError::Transaction(
+                TransactionError::ForeignTransaction {
+                    txn_id: transaction.id(),
+                },
+            )),
         }
     }
 
@@ -160,6 +281,7 @@ impl StorageTransaction {
     pub fn id(&self) -> TxnId {
         match &self.inner {
             StorageTransactionKind::Heap(transaction) => transaction.id(),
+            StorageTransactionKind::Lsm(transaction) => transaction.id(),
         }
     }
 
@@ -167,6 +289,7 @@ impl StorageTransaction {
     pub fn state(&self) -> TransactionState {
         match &self.inner {
             StorageTransactionKind::Heap(transaction) => transaction.state(),
+            StorageTransactionKind::Lsm(transaction) => transaction.state(),
         }
     }
 
@@ -174,6 +297,7 @@ impl StorageTransaction {
     pub fn last_lsn(&self) -> Lsn {
         match &self.inner {
             StorageTransactionKind::Heap(transaction) => transaction.last_lsn(),
+            StorageTransactionKind::Lsm(transaction) => transaction.last_lsn(),
         }
     }
 
@@ -181,44 +305,60 @@ impl StorageTransaction {
     pub fn isolation_level(&self) -> IsolationLevel {
         match &self.inner {
             StorageTransactionKind::Heap(transaction) => transaction.isolation_level(),
+            StorageTransactionKind::Lsm(transaction) => transaction.isolation_level(),
         }
     }
 
     pub fn begin_statement(&mut self) -> Result<StorageReadView, StorageError> {
         let table_id = self.table_id;
-        let view = self.heap_transaction_mut(table_id)?.begin_statement()?;
-        Ok(StorageReadView::heap(table_id, view))
+        match &mut self.inner {
+            StorageTransactionKind::Heap(transaction) => Ok(StorageReadView::heap(
+                table_id,
+                transaction.begin_statement()?,
+            )),
+            StorageTransactionKind::Lsm(transaction) => Ok(StorageReadView::lsm(
+                table_id,
+                transaction.begin_statement()?,
+            )),
+        }
     }
 
     pub fn commit(&mut self) -> Result<(), StorageError> {
-        let table_id = self.table_id;
-        self.heap_transaction_mut(table_id)?.commit()
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.commit(),
+            StorageTransactionKind::Lsm(txn) => txn.commit(),
+        }
     }
 
     pub fn prepare(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
-        let table_id = self.table_id;
-        self.heap_transaction_mut(table_id)?
-            .prepare(database_txn_id)
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.prepare(database_txn_id),
+            StorageTransactionKind::Lsm(txn) => txn.prepare(database_txn_id),
+        }
     }
 
     pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
-        let table_id = self.table_id;
-        self.heap_transaction_mut(table_id)?
-            .commit_prepared(database_txn_id)
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.commit_prepared(database_txn_id),
+            StorageTransactionKind::Lsm(txn) => txn.commit_prepared(database_txn_id),
+        }
     }
 
     pub fn rollback_prepared(
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
-        let table_id = self.table_id;
-        self.heap_transaction_mut(table_id)?
-            .rollback_prepared(database_txn_id)
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.rollback_prepared(database_txn_id),
+            StorageTransactionKind::Lsm(txn) => txn.rollback_prepared(database_txn_id),
+        }
     }
 
     pub fn rollback(&mut self) -> Result<(), StorageError> {
-        let table_id = self.table_id;
-        self.heap_transaction_mut(table_id)?.rollback()
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.rollback(),
+            StorageTransactionKind::Lsm(txn) => txn.rollback(),
+        }
     }
 
     pub fn abort(&mut self) -> Result<(), StorageError> {
@@ -233,18 +373,42 @@ impl StorageTransaction {
 /// enum without changing planner or executor storage interfaces.
 #[derive(Debug)]
 pub enum TableStorage {
-    Heap(HeapStorage),
+    Heap(Box<HeapStorage>),
+    Lsm(LsmStorage),
 }
 
 impl From<HeapStorage> for TableStorage {
     fn from(storage: HeapStorage) -> Self {
-        Self::Heap(storage)
+        Self::Heap(Box::new(storage))
+    }
+}
+
+impl From<LsmStorage> for TableStorage {
+    fn from(storage: LsmStorage) -> Self {
+        Self::Lsm(storage)
     }
 }
 
 impl TableStorage {
+    #[must_use]
+    pub const fn kind(&self) -> StorageKind {
+        match self {
+            Self::Heap(_) => StorageKind::Heap,
+            Self::Lsm(_) => StorageKind::Lsm,
+        }
+    }
+
+    #[must_use]
+    pub fn lsm_inspection(&self) -> Option<LsmInspection> {
+        match self {
+            Self::Heap(_) => None,
+            Self::Lsm(storage) => Some(storage.inspection()),
+        }
+    }
     pub fn create_heap(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        HeapStorage::create(path, table).map(Self::Heap)
+        HeapStorage::create(path, table)
+            .map(Box::new)
+            .map(Self::Heap)
     }
 
     pub fn create_heap_with_storage_id(
@@ -252,11 +416,13 @@ impl TableStorage {
         table: TableDef,
         storage_id: StorageId,
     ) -> Result<Self, StorageError> {
-        HeapStorage::create_with_storage_id(path, table, storage_id).map(Self::Heap)
+        HeapStorage::create_with_storage_id(path, table, storage_id)
+            .map(Box::new)
+            .map(Self::Heap)
     }
 
     pub fn open_heap(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        HeapStorage::open(path, table).map(Self::Heap)
+        HeapStorage::open(path, table).map(Box::new).map(Self::Heap)
     }
 
     pub fn open_heap_with_prepared_resolutions(
@@ -264,7 +430,9 @@ impl TableStorage {
         table: TableDef,
         resolutions: &[PreparedTxnResolution],
     ) -> Result<Self, StorageError> {
-        HeapStorage::open_with_prepared_resolutions(path, table, resolutions).map(Self::Heap)
+        HeapStorage::open_with_prepared_resolutions(path, table, resolutions)
+            .map(Box::new)
+            .map(Self::Heap)
     }
 
     pub fn inspect_heap_recovery(
@@ -280,10 +448,54 @@ impl TableStorage {
         HeapStorage::inspect_identity(path)
     }
 
+    pub fn create_lsm(
+        root: impl AsRef<Path>,
+        table: TableDef,
+        clustering_column: ColumnId,
+    ) -> Result<Self, StorageError> {
+        LsmStorage::create(root, table, clustering_column).map(Self::Lsm)
+    }
+
+    pub fn create_lsm_with_storage_id(
+        root: impl AsRef<Path>,
+        table: TableDef,
+        clustering_column: ColumnId,
+        storage_id: StorageId,
+    ) -> Result<Self, StorageError> {
+        LsmStorage::create_with_storage_id(root, table, clustering_column, storage_id)
+            .map(Self::Lsm)
+    }
+
+    pub fn open_lsm(root: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
+        LsmStorage::open(root, table).map(Self::Lsm)
+    }
+
+    pub fn open_lsm_with_prepared_resolutions(
+        root: impl AsRef<Path>,
+        table: TableDef,
+        resolutions: &[PreparedTxnResolution],
+    ) -> Result<Self, StorageError> {
+        LsmStorage::open_with_prepared_resolutions(root, table, resolutions).map(Self::Lsm)
+    }
+
+    pub fn inspect_lsm_recovery(
+        root: impl AsRef<Path>,
+        table: &TableDef,
+    ) -> Result<LsmRecoveryInspection, StorageError> {
+        LsmStorage::inspect_recovery(root, table)
+    }
+
+    pub fn inspect_lsm_identity(
+        root: impl AsRef<Path>,
+    ) -> Result<LsmIdentityInspection, StorageError> {
+        LsmStorage::inspect_identity(root)
+    }
+
     #[must_use]
     pub fn storage_id(&self) -> StorageId {
         match self {
             Self::Heap(storage) => storage.storage_id(),
+            Self::Lsm(storage) => storage.storage_id(),
         }
     }
 
@@ -291,12 +503,17 @@ impl TableStorage {
     pub fn table(&self) -> &TableDef {
         match self {
             Self::Heap(storage) => storage.table(),
+            Self::Lsm(storage) => storage.table(),
         }
     }
 
     pub fn read_view(&self) -> Result<StorageReadView, StorageError> {
         match self {
             Self::Heap(storage) => Ok(StorageReadView::heap(
+                storage.table().id,
+                storage.read_view()?,
+            )),
+            Self::Lsm(storage) => Ok(StorageReadView::lsm(
                 storage.table().id,
                 storage.read_view()?,
             )),
@@ -317,6 +534,13 @@ impl TableStorage {
                 let transaction = storage.begin_transaction_with_isolation(isolation_level)?;
                 Ok(StorageTransaction::heap(table_id, transaction))
             }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                Ok(StorageTransaction::lsm(
+                    table_id,
+                    storage.begin_transaction_with_isolation(isolation_level)?,
+                ))
+            }
         }
     }
 
@@ -328,6 +552,9 @@ impl TableStorage {
             Self::Heap(storage) => {
                 storage.validate_transaction(transaction.heap_transaction(storage.table().id)?)
             }
+            Self::Lsm(storage) => {
+                storage.validate_transaction(transaction.lsm_transaction(storage.table().id)?)
+            }
         }
     }
 
@@ -338,6 +565,12 @@ impl TableStorage {
                 storage
                     .insert(values)
                     .map(|row_id| StorageRowHandle::heap(table_id, storage.storage_id(), row_id))
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                storage
+                    .insert(values)
+                    .map(|row| StorageRowHandle::lsm(table_id, storage.storage_id(), row))
             }
         }
     }
@@ -358,6 +591,16 @@ impl TableStorage {
                     current,
                 ))
             }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let updated =
+                    storage.update(row.lsm_handle(table_id, storage.storage_id())?, values)?;
+                Ok(StorageRowHandle::lsm(
+                    table_id,
+                    storage.storage_id(),
+                    updated,
+                ))
+            }
         }
     }
 
@@ -366,6 +609,10 @@ impl TableStorage {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
                 storage.delete(row.heap_row_id(table_id, storage.storage_id())?)
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                storage.delete(row.lsm_handle(table_id, storage.storage_id())?)
             }
         }
     }
@@ -385,6 +632,11 @@ impl TableStorage {
                     storage.storage_id(),
                     row_id,
                 ))
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let row = storage.insert_in(transaction.lsm_transaction_mut(table_id)?, values)?;
+                Ok(StorageRowHandle::lsm(table_id, storage.storage_id(), row))
             }
         }
     }
@@ -410,6 +662,17 @@ impl TableStorage {
                     current,
                 ))
             }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let row = row.lsm_handle(table_id, storage.storage_id())?;
+                let updated =
+                    storage.update_in(transaction.lsm_transaction_mut(table_id)?, row, values)?;
+                Ok(StorageRowHandle::lsm(
+                    table_id,
+                    storage.storage_id(),
+                    updated,
+                ))
+            }
         }
     }
 
@@ -425,6 +688,11 @@ impl TableStorage {
                     transaction.heap_transaction_mut(table_id)?,
                     row.heap_row_id(table_id, storage.storage_id())?,
                 )
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let row = row.lsm_handle(table_id, storage.storage_id())?;
+                storage.delete_in(transaction.lsm_transaction_mut(table_id)?, row)
             }
         }
     }
@@ -444,6 +712,19 @@ impl TableStorage {
                     .map(|(row_id, values)| {
                         (
                             StorageRowHandle::heap(table_id, storage.storage_id(), row_id),
+                            values,
+                        )
+                    })
+                    .collect())
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                Ok(storage
+                    .scan_columns_with_view(columns, view.lsm_view(table_id)?)?
+                    .into_iter()
+                    .map(|(row, values)| {
+                        (
+                            StorageRowHandle::lsm(table_id, storage.storage_id(), row),
                             values,
                         )
                     })
@@ -478,6 +759,25 @@ impl TableStorage {
                 }
                 Ok(rows)
             }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                if access_path != storage.access_path_id() {
+                    return Err(StorageError::UnknownAccessPath {
+                        table_id,
+                        access_path,
+                    });
+                }
+                Ok(storage
+                    .point_lookup_columns_with_view(key, columns, view.lsm_view(table_id)?)?
+                    .into_iter()
+                    .map(|(row, values)| {
+                        (
+                            StorageRowHandle::lsm(table_id, storage.storage_id(), row),
+                            values,
+                        )
+                    })
+                    .collect())
+            }
         }
     }
 
@@ -507,6 +807,25 @@ impl TableStorage {
                 }
                 Ok(rows)
             }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                if access_path != storage.access_path_id() {
+                    return Err(StorageError::UnknownAccessPath {
+                        table_id,
+                        access_path,
+                    });
+                }
+                Ok(storage
+                    .range_lookup_columns_with_view(range, columns, view.lsm_view(table_id)?)?
+                    .into_iter()
+                    .map(|(row, values)| {
+                        (
+                            StorageRowHandle::lsm(table_id, storage.storage_id(), row),
+                            values,
+                        )
+                    })
+                    .collect())
+            }
         }
     }
 
@@ -519,6 +838,9 @@ impl TableStorage {
             Self::Heap(storage) => {
                 storage.scan_presence_counts_with_view(columns, view.heap_view(storage.table().id)?)
             }
+            Self::Lsm(storage) => {
+                storage.scan_presence_counts_with_view(columns, view.lsm_view(storage.table().id)?)
+            }
         }
     }
 
@@ -527,7 +849,7 @@ impl TableStorage {
         value_columns: &[ColumnId],
         presence_columns: &[ColumnId],
         view: &StorageReadView,
-        visitor: F,
+        mut visitor: F,
     ) -> Result<(), E>
     where
         E: From<StorageError>,
@@ -542,6 +864,31 @@ impl TableStorage {
                     view,
                     visitor,
                 )
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let view = view.lsm_view(table_id).map_err(E::from)?;
+                let requested = value_columns
+                    .iter()
+                    .chain(presence_columns)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let rows = storage
+                    .scan_columns_with_view(&requested, view)
+                    .map_err(E::from)?;
+                for (_, values) in rows {
+                    let split = value_columns.len();
+                    let scalar_refs = values[..split]
+                        .iter()
+                        .map(ScalarRef::from)
+                        .collect::<Vec<_>>();
+                    let presence = values[split..]
+                        .iter()
+                        .map(|value| !matches!(value, ScalarValue::Null))
+                        .collect::<Vec<_>>();
+                    visitor(&scalar_refs, &presence)?;
+                }
+                Ok(())
             }
         }
     }
@@ -575,6 +922,36 @@ impl TableStorage {
                     },
                 )
             }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let storage_id = storage.storage_id();
+                let view = view.lsm_view(table_id).map_err(E::from)?;
+                let requested = value_columns
+                    .iter()
+                    .chain(presence_columns)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let rows = storage
+                    .scan_columns_with_view(&requested, view)
+                    .map_err(E::from)?;
+                for (row, values) in rows {
+                    let split = value_columns.len();
+                    let scalar_refs = values[..split]
+                        .iter()
+                        .map(ScalarRef::from)
+                        .collect::<Vec<_>>();
+                    let presence = values[split..]
+                        .iter()
+                        .map(|value| !matches!(value, ScalarValue::Null))
+                        .collect::<Vec<_>>();
+                    visitor(
+                        StorageRowHandle::lsm(table_id, storage_id, row),
+                        &scalar_refs,
+                        &presence,
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -582,6 +959,7 @@ impl TableStorage {
     pub fn indexes(&self) -> &[IndexDefinition] {
         match self {
             Self::Heap(storage) => storage.indexes(),
+            Self::Lsm(_) => &[],
         }
     }
 
@@ -597,10 +975,21 @@ impl TableStorage {
                     capabilities: AccessPathCapabilities {
                         point_lookup: true,
                         range_lookup: true,
+                        ordered: true,
                     },
                     statistics: storage.index_statistics(definition.column_id),
                 })
                 .collect(),
+            Self::Lsm(storage) => vec![StorageAccessPath {
+                id: storage.access_path_id(),
+                column_id: storage.clustering_column(),
+                capabilities: AccessPathCapabilities {
+                    point_lookup: true,
+                    range_lookup: true,
+                    ordered: true,
+                },
+                statistics: storage.access_statistics(),
+            }],
         }
     }
 
@@ -608,6 +997,7 @@ impl TableStorage {
     pub fn table_statistics(&self) -> Option<TableStatistics> {
         match self {
             Self::Heap(storage) => storage.table_statistics(),
+            Self::Lsm(storage) => storage.table_statistics(),
         }
     }
 
@@ -615,42 +1005,68 @@ impl TableStorage {
     pub fn index_statistics(&self, column_id: ColumnId) -> Option<IndexStatistics> {
         match self {
             Self::Heap(storage) => storage.index_statistics(column_id),
+            Self::Lsm(storage) if storage.clustering_column() == column_id => {
+                storage.access_statistics()
+            }
+            Self::Lsm(_) => None,
         }
     }
 
     pub fn create_index(&mut self, column_id: ColumnId) -> Result<IndexDefinition, StorageError> {
         match self {
             Self::Heap(storage) => storage.create_index(column_id),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "create B+Tree access method",
+                storage_kind: "LSM",
+            }),
         }
     }
 
     pub fn analyze(&mut self) -> Result<(), StorageError> {
         match self {
             Self::Heap(storage) => storage.analyze(),
+            Self::Lsm(storage) => storage.analyze(),
         }
     }
 
     pub fn vacuum(&mut self) -> Result<u64, StorageError> {
         match self {
             Self::Heap(storage) => storage.vacuum(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "Heap vacuum",
+                storage_kind: "LSM",
+            }),
         }
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
         match self {
             Self::Heap(storage) => storage.flush(),
+            Self::Lsm(storage) => storage.flush(),
         }
     }
 
     pub fn checkpoint(&mut self) -> Result<(), StorageError> {
         match self {
             Self::Heap(storage) => storage.checkpoint(),
+            Self::Lsm(storage) => storage.checkpoint(),
         }
     }
 
     pub fn close(self) -> Result<(), StorageError> {
         match self {
             Self::Heap(storage) => storage.close(),
+            Self::Lsm(storage) => storage.close(),
+        }
+    }
+
+    pub fn compact(&mut self) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(_) => Err(StorageError::UnsupportedOperation {
+                operation: "LSM compaction",
+                storage_kind: "Heap",
+            }),
+            Self::Lsm(storage) => storage.compact(),
         }
     }
 }

@@ -1156,6 +1156,31 @@ partitions and local indexes. Gaps are legal and have no DEFAULT fallback.
 There is no SQL partition DDL, global index/uniqueness, split/merge, HASH/LIST,
 heterogeneous storage, placement/sharding, replication, or distributed commit.
 
-The next recommended phase is **LSM Storage MVP**. Partition routing now uses
-only PartitionId→StorageId→TableStorage and is therefore ready for one real
-second storage layout without introducing sharding or Raft prematurely.
+## LSM Storage MVP (complete)
+
+- added `TableStorage::Lsm` without changing the executor/coordinator into
+  storage-kind switches;
+- added stable `LsmRowId` and storage-local `LsmCommitSeq`, duplicate-preserving
+  clustering order, version visibility, tombstones, read-your-writes, and
+  bounded single-writer transaction overlays;
+- added checksummed little-endian Manifest v1, LSM WAL v1, and block-oriented
+  immutable SSTable v1 formats with strict bounded decoding;
+- added synchronous MemTable flush/WAL rotation and quiescent all-L0-plus-L1
+  compaction with manifest-authoritative crash recovery and orphan cleanup;
+- registered native LSM point/range capability metadata, projected reads,
+  counts, persisted ANALYZE row/cardinality/min/max statistics, and SQL DML
+  through the existing storage boundary;
+- proved Heap+LSM prepare/commit/recovery through CoordinatorLog with reordered
+  reopen and subprocess crash matrices.
+
+The MVP intentionally remains one NOT NULL Int64/UInt64 clustering column,
+duplicates ordered by `(clustering key, LsmRowId)`, one writer, synchronous
+flush, L0 plus one L1, and quiescent compaction. It has no Bloom filter,
+compression, background work, secondary LSM index, or LSM range partitions.
+Range partition physical layout remains Heap-only; heterogeneous partitions
+remain unsupported.
+
+The next recommended phase is **LSM Hardening — Bloom Filters + Multi-Level
+Compaction**. The new block/sparse-index and manifest boundaries now provide
+the concrete measured surface for reducing negative point-read work and write
+amplification before expanding executor architecture.
