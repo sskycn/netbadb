@@ -762,8 +762,9 @@ The implementation sequence is intentionally vertical:
     runtime streams validated SeqScan rows through prebound Filter,
     move-aware Project, and early-stopping Limit above one storage-neutral
     `ControlFlow` consumer shared by Heap and LSM. QueryResult remains fully
-    owned, existing borrowed Text and direct COUNT specializations remain, and
-    unsupported physical shapes use the authoritative materialized executor.
+    owned, existing borrowed streaming Filter and direct COUNT specializations
+    remain, and unsupported physical shapes use the authoritative materialized
+    executor.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

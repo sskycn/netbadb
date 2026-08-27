@@ -1222,11 +1222,12 @@ paths and exposed a shared bottleneck above their boundary.
 - QueryResult remains fully owned. PhysicalPlan, logical/typed IR, inspection,
   protocol, SDK, and every persistent format remain unchanged. Executor code
   does not branch on Heap versus LSM;
-- exact predicate-only Text Project/Filter retains the measured borrowed Phase
-  7U specialization, and direct COUNT specializations remain. Sort, grouped
-  Aggregate, SUM/MIN/MAX, joins, index/range scans, partition scans, and DML
-  deterministically use the legacy materialized implementation for the full
-  tree;
+- exact standalone Filter and predicate-only Project/Filter shapes retain the
+  measured borrowed Phase 7 streaming specialization for every scalar type;
+  Filter pipelines with Limit use the bounded batch runtime. Direct COUNT
+  specializations remain. Sort, grouped Aggregate, SUM/MIN/MAX, joins,
+  index/range scans, partition scans, and DML deterministically use the legacy
+  materialized implementation for the full tree;
 - deterministic tests cover 0, 1, BATCH_SIZE−1, BATCH_SIZE, BATCH_SIZE+1,
   2×BATCH_SIZE, and 2×BATCH_SIZE+1 rows; zero-width scans/projects; Bool,
   Int64, UInt64, Text, NULL, nullable and duplicate values; Filter truth

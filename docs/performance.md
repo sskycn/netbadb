@@ -1033,37 +1033,36 @@ LSM. Each uses the existing exact row-count, checksum/value, PhysicalPlan,
 base-column, `black_box`, warm-process, and no-timing-assertion gates.
 
 One serial quick pre run was saved outside the repository at
-`/tmp/netbadb-phase55-pre.txt`. After implementation, the
-same target produced `/tmp/netbadb-phase55-post-final.txt`. Medians are
-machine-local nanoseconds per query:
+`/tmp/netbadb-phase55-pre.txt`. After implementation and the final dispatch
+review, the same target produced `/tmp/netbadb-phase55-post-review.txt`.
+Medians are machine-local nanoseconds per query:
 
 | scenario | pre median | post median | change |
 | --- | ---: | ---: | ---: |
-| Heap full projected scan | 358,250 | 451,208 | +26.0% |
-| Heap Bool Filter+Project | 409,917 | 649,084 | +58.3% |
-| Heap Text Filter+Project control | 393,292 | 477,000 | +21.3% |
-| Heap early Limit | 353,084 | 24,000 | -93.2% |
-| Heap Filter+Limit | 345,000 | 166,250 | -51.8% |
-| LSM Filter+Project+Limit | 119,667 | 115,875 | -3.2% |
+| Heap full projected scan | 358,250 | 416,334 | +16.2% |
+| Heap Bool Filter+Project | 409,917 | 338,000 | -17.5% |
+| Heap Text Filter+Project control | 393,292 | 326,708 | -16.9% |
+| Heap early Limit | 353,084 | 15,125 | -95.7% |
+| Heap Filter+Limit | 345,000 | 128,125 | -62.9% |
+| LSM Filter+Project+Limit | 119,667 | 77,292 | -35.4% |
 
-Early Limit supplied the clear target reduction, while this particular post
-run was broadly slower in unrelated controls: direct Heap item scan changed
-from 354,917 to 426,958 ns and direct COUNT(*) from 239,625 to 311,583 ns. The
-retained borrowed Text scenario also ran 21.3% slower despite using the same
-production specialization. Earlier post runs during development put the full
-scan near flat and the Bool/Text controls below their pre medians, so these
-quick runs are not a controlled throughput claim. The final code is retained
-for its bounded memory and decisive early-stop behavior, not a claim that every
-full-result query became faster.
+Early Limit supplied the clearest target reduction. Restoring the existing
+borrowed streaming Filter dispatch also moved the Bool and Text Filter+Project
+controls below their pre medians. The remaining full projected-scan increase
+was smaller than contemporaneous unrelated-control movement: direct Heap item
+scan changed from 354,917 to 431,375 ns and direct COUNT(*) from 239,625 to
+303,625 ns. These quick runs are not a controlled throughput claim. The final
+code is retained for bounded memory, decisive early-stop behavior, and reuse of
+the measured streaming specialization where batch ownership is unnecessary.
 
 An intermediate post run also exposed the architectural reason an owned batch
-can regress selective hidden Text when it acquires every predicate string
-before filtering. The final dispatch therefore retains the existing borrowed
-Phase 7U specialization for that exact shape; the Text control is not evidence
-that owned Text batch materialization became cheaper. Bool predicates and
-Filter+Limit continue through the position-bound batch runtime. These are
-attribution results, not a latency or speedup contract, and no wall-clock
-threshold was added.
+can regress selective predicates when it acquires output and predicate values
+for every row before filtering. The final dispatch therefore retains the
+existing borrowed Phase 7 streaming specialization for exact standalone Filter
+and predicate-only Project/Filter shapes across scalar types. Filter+Limit
+continues through the position-bound batch runtime to gain bounded early stop.
+These are attribution results, not a latency or speedup contract, and no
+wall-clock threshold was added.
 
 ## CI and compatibility
 

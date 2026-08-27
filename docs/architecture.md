@@ -1028,12 +1028,15 @@ type, NULL, and UTF-8 validation.
 
 The public `QueryResult` remains fully owned and may contain the complete final
 result. Intermediate SeqScan, Filter, and Project results no longer require a
-full base-scan vector. Exact predicate-only Text Project/Filter retains the
-measured borrowed Phase 7U specialization so rejected strings are not owned.
-Direct COUNT specializations also remain. Sort, Aggregate, joins, index/range
-scans, partition scans, and DML deterministically use the authoritative legacy
-executor for the complete tree. PhysicalPlan and Inspection JSON are unchanged,
-and executor dispatch contains no Heap/LSM branch.
+full base-scan vector. Exact standalone Filter and predicate-only
+Project/Filter shapes retain the measured borrowed Phase 7 streaming
+specializations for every scalar type, avoiding owned values for rejected
+rows; Filter pipelines with Limit use the bounded batch runtime so they can
+stop upstream. Direct COUNT specializations also remain. Sort, Aggregate,
+joins, index/range scans, partition scans, and DML deterministically use the
+authoritative legacy executor for the complete tree. PhysicalPlan and
+Inspection JSON are unchanged, and executor dispatch contains no Heap/LSM
+branch.
 
 - `PageManager` owns fixed-size file I/O, page allocation, checked page-offset
   arithmetic, and file sync. It does not interpret heap or index semantics.

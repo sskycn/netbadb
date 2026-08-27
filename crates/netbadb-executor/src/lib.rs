@@ -15,9 +15,7 @@ use netbadb_storage::{
     PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
     TableStorage,
 };
-use netbadb_types::{
-    ColumnId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
-};
+use netbadb_types::{ColumnId, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId};
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
 ///
@@ -607,7 +605,7 @@ fn execute_rows_with_views(
     read_views: &[ExecutionReadView<'_>],
 ) -> Result<ExecutionRows, ExecutionError> {
     if let Some(result) =
-        try_execute_borrowed_text_filter_pipeline(plan, bindings, storages, read_views)?
+        try_execute_streaming_filter_pipeline(plan, bindings, storages, read_views)?
     {
         return Ok(result);
     }
@@ -617,41 +615,25 @@ fn execute_rows_with_views(
     execute_rows_legacy_with_views(plan, bindings, storages, read_views)
 }
 
-fn try_execute_borrowed_text_filter_pipeline(
+fn try_execute_streaming_filter_pipeline(
     plan: &PhysicalPlan,
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     match plan {
-        PhysicalPlan::Filter { input, predicate } if expression_uses_text_column(predicate) => {
+        PhysicalPlan::Filter { input, predicate } => {
             try_execute_streaming_seq_filter(input, predicate, bindings, storages, read_views)
         }
         PhysicalPlan::Project { input, columns } => {
-            let PhysicalPlan::Filter { predicate, .. } = input.as_ref() else {
+            let PhysicalPlan::Filter { .. } = input.as_ref() else {
                 return Ok(None);
             };
-            if !expression_uses_text_column(predicate) {
-                return Ok(None);
-            }
             try_execute_projected_streaming_seq_filter(
                 input, columns, bindings, storages, read_views,
             )
         }
         _ => Ok(None),
-    }
-}
-
-fn expression_uses_text_column(expression: &Expr) -> bool {
-    match &expression.kind {
-        ExprKind::Column(column) => column.data_type.physical == PhysicalType::Text,
-        ExprKind::Literal(_) => false,
-        ExprKind::Binary { left, right, .. } => {
-            expression_uses_text_column(left) || expression_uses_text_column(right)
-        }
-        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
-            expression_uses_text_column(expression)
-        }
     }
 }
 
