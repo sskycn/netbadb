@@ -1162,6 +1162,61 @@ and no timing assertion or CI performance threshold was added. Group-key
 ownership/hash attribution is the leading next measurement; Text comparison
 and generic Filter prebinding follow.
 
+## Phase 58 borrowed group-key lookup attribution
+
+Phase 58 added deterministic one-key cardinality 1, 4, 1%, 50%, and 100%
+sweeps, plus `(Int64, Bool)` and unique Text group keys before changing
+production lookup. Every query retains exact physical-plan, base-column,
+first-seen result/value, `black_box`, warm-process, and no-timing-threshold
+gates. The quick raw runs are stored outside the repository at
+`/tmp/netbadb-phase58-pre.txt` and `/tmp/netbadb-phase58-post.txt`.
+
+Medians are machine-local nanoseconds per query:
+
+| scenario | cardinality | key shape | pre median | post median | change |
+| --- | ---: | --- | ---: | ---: | ---: |
+| one group | 1/1,000 | Int64 | 469,167 | 390,958 | -16.7% |
+| four groups | 4/1,000 | Int64 | 541,791 | 604,500 | +11.6% |
+| one-percent groups | 10/1,000 | Int64 | 572,208 | 580,167 | +1.4% |
+| half unique | 500/1,000 | Int64 | 772,792 | 502,166 | -35.0% |
+| all unique | 1,000/1,000 | Int64 | 550,459 | 885,416 | +60.9% |
+| two primitive keys | 8/1,000 | Int64 + Bool | 730,125 | 520,750 | -28.7% |
+| all-unique Text | 1,000/1,000 | Text | 1,183,208 | 880,708 | -25.6% |
+
+Raw timing is noisy and not monotonic by cardinality. The hit/miss-shaped
+within-run ratios are more useful: one-group/unique changed from 0.852x to
+0.442x, four-group/unique from 0.984x to 0.683x, and two-key/four-group from
+1.348x to 0.861x. This supports removal of the previous per-hit owned key,
+while unique Int64 grouping identifies the remaining miss/hash path as the
+leading residual. Test-only counters provide the stronger structural result:
+513 rows over four groups perform 509 allocation-free, clone-free hits and four
+durable key materializations; 513 equal Text keys materialize one durable
+String-bearing key.
+
+Controls confirm that the machine moved broadly between serial runs:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| Phase 57 Text MIN | 409,209 | 487,083 | +19.0% |
+| Phase 57 Text MAX | 455,792 | 386,792 | -15.1% |
+| Phase 57 Text MIN+MAX | 521,667 | 626,167 | +20.0% |
+| Phase 57 duplicate Text MAX | 521,250 | 652,083 | +25.1% |
+| global SUM | 377,000 | 604,708 | +60.4% |
+| grouped mixed aggregate | 478,125 | 625,125 | +30.7% |
+| filtered grouped aggregate | 425,375 | 404,084 | -5.0% |
+| prior low-cardinality GROUP BY | 644,875 | 584,875 | -9.3% |
+| prior higher-cardinality GROUP BY | 442,542 | 590,709 | +33.5% |
+| direct COUNT(*) | 453,208 | 613,708 | +35.4% |
+| filtered COUNT(payload) | 238,959 | 447,542 | +87.3% |
+| early Limit | 8,541 | 39,875 | +366.9% |
+| full projected scan | 361,791 | 508,791 | +40.6% |
+| LSM SUM | 44,541 | 74,333 | +66.9% |
+
+The implementation is retained for the exact structural ownership reduction,
+not as a claim of stable throughput improvement. Global aggregation bypasses
+group lookup, direct/filtered COUNT priority is unchanged, and no timing
+assertion or CI threshold was introduced.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on

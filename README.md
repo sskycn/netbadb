@@ -778,6 +778,11 @@ The implementation sequence is intentionally vertical:
     actual owners. Finalization reuses the move-aware projection last-use plan,
     while COUNT/SUM keep borrowed inspection and group-key HashMap ownership is
     deliberately unchanged.
+58. Borrowed Group-Key Lookup — complete; grouped Aggregate hashes borrowed row
+    keys with randomized hashing, resolves collisions by exact comparison
+    against `GroupState`, and creates one durable owned key only on a miss.
+    Existing-group hits allocate no temporary key and clone no key values;
+    first-seen output order remains owned by the group-state vector.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

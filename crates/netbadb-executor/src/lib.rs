@@ -1,9 +1,11 @@
 //! Synchronous execution of typed query and DML physical statements.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::ControlFlow;
 
 use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
@@ -1411,6 +1413,181 @@ struct GroupState {
     aggregate_states: Vec<AggregateState>,
 }
 
+struct GroupLookup {
+    key_hasher: RandomState,
+    bucket_heads: HashMap<u64, usize>,
+    collision_next: Vec<Option<usize>>,
+    #[cfg(test)]
+    stats: GroupLookupStats,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GroupLookupStats {
+    lookups: usize,
+    hits: usize,
+    misses: usize,
+    owned_key_materializations: usize,
+    exact_collision_checks: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupLookupProbe {
+    hash: u64,
+    group_index: Option<usize>,
+}
+
+impl GroupLookup {
+    fn new() -> Self {
+        Self {
+            key_hasher: RandomState::new(),
+            bucket_heads: HashMap::new(),
+            collision_next: Vec::new(),
+            #[cfg(test)]
+            stats: GroupLookupStats::default(),
+        }
+    }
+
+    fn probe(
+        &mut self,
+        row: &ExecutionRow,
+        positions: &[usize],
+        group_keys: &[ColumnRef],
+        groups: &[GroupState],
+    ) -> Result<GroupLookupProbe, ExecutionError> {
+        let hash = hash_group_key(&self.key_hasher, row, positions, group_keys)?;
+        #[cfg(test)]
+        {
+            self.stats.lookups += 1;
+        }
+        let head = self.bucket_heads.get(&hash).copied();
+        let group_index = self.find_in_bucket(row, positions, group_keys, groups, head)?;
+        #[cfg(test)]
+        if group_index.is_some() {
+            self.stats.hits += 1;
+        } else {
+            self.stats.misses += 1;
+        }
+        Ok(GroupLookupProbe { hash, group_index })
+    }
+
+    fn find_in_bucket(
+        &mut self,
+        row: &ExecutionRow,
+        positions: &[usize],
+        group_keys: &[ColumnRef],
+        groups: &[GroupState],
+        mut candidate: Option<usize>,
+    ) -> Result<Option<usize>, ExecutionError> {
+        while let Some(index) = candidate {
+            let group = groups.get(index).ok_or(ExecutionError::TypeMismatch)?;
+            #[cfg(test)]
+            {
+                self.stats.exact_collision_checks += 1;
+            }
+            if group_key_matches(row, positions, group_keys, &group.key_values)? {
+                return Ok(Some(index));
+            }
+            candidate = self
+                .collision_next
+                .get(index)
+                .copied()
+                .ok_or(ExecutionError::TypeMismatch)?;
+        }
+        Ok(None)
+    }
+
+    fn register_group(&mut self, hash: u64, group_index: usize) -> Result<(), ExecutionError> {
+        if self.collision_next.len() != group_index {
+            return Err(ExecutionError::TypeMismatch);
+        }
+        let previous_head = self.bucket_heads.insert(hash, group_index);
+        self.collision_next.push(previous_head);
+        Ok(())
+    }
+
+    fn record_owned_key_materialization(&mut self) {
+        #[cfg(test)]
+        {
+            self.stats.owned_key_materializations += 1;
+        }
+    }
+
+    #[cfg(test)]
+    const fn stats(&self) -> GroupLookupStats {
+        self.stats
+    }
+}
+
+fn hash_group_key(
+    build_hasher: &RandomState,
+    row: &ExecutionRow,
+    positions: &[usize],
+    group_keys: &[ColumnRef],
+) -> Result<u64, ExecutionError> {
+    if positions.len() != group_keys.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    let mut hasher = build_hasher.build_hasher();
+    positions.len().hash(&mut hasher);
+    for (position, column) in positions.iter().zip(group_keys) {
+        let value = row
+            .values
+            .get(*position)
+            .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+        value.hash(&mut hasher);
+    }
+    Ok(hasher.finish())
+}
+
+fn group_key_matches(
+    row: &ExecutionRow,
+    positions: &[usize],
+    group_keys: &[ColumnRef],
+    owned_key: &[ScalarValue],
+) -> Result<bool, ExecutionError> {
+    if positions.len() != group_keys.len() || positions.len() != owned_key.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    for ((position, column), expected) in positions.iter().zip(group_keys).zip(owned_key) {
+        let value = row
+            .values
+            .get(*position)
+            .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+        if !value.matches_type(&column.data_type) {
+            return Err(ExecutionError::TypeMismatch);
+        }
+        if value != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn materialize_group_key(
+    row: &ExecutionRow,
+    positions: &[usize],
+    group_keys: &[ColumnRef],
+) -> Result<Vec<ScalarValue>, ExecutionError> {
+    if positions.len() != group_keys.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    positions
+        .iter()
+        .zip(group_keys)
+        .map(|(position, column)| {
+            let value = row
+                .values
+                .get(*position)
+                .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+            if !value.matches_type(&column.data_type) {
+                return Err(ExecutionError::TypeMismatch);
+            }
+            Ok(value.clone())
+        })
+        .collect()
+}
+
 struct AggregateAccumulator<'a> {
     group_keys: &'a [ColumnRef],
     aggregates: Vec<&'a AggregateExpr>,
@@ -1420,7 +1597,7 @@ struct AggregateAccumulator<'a> {
     replacement_targets: Vec<Vec<usize>>,
     output_projection: ProjectionPlan,
     output_fields: Vec<OutputField>,
-    group_lookup: HashMap<Vec<ScalarValue>, usize>,
+    group_lookup: GroupLookup,
     groups: Vec<GroupState>,
 }
 
@@ -2158,14 +2335,13 @@ impl<'a> AggregateAccumulator<'a> {
             replacement_targets: (0..input_fields.len()).map(|_| Vec::new()).collect(),
             output_projection,
             output_fields: outputs.iter().map(AggregateOutput::output_field).collect(),
-            group_lookup: HashMap::new(),
+            group_lookup: GroupLookup::new(),
             groups: Vec::new(),
         };
         if group_keys.is_empty() {
             accumulator
                 .groups
                 .push(new_group_state(Vec::new(), &accumulator.aggregates)?);
-            accumulator.group_lookup.insert(Vec::new(), 0);
         }
         Ok(accumulator)
     }
@@ -2275,31 +2451,26 @@ impl<'a> AggregateAccumulator<'a> {
     }
 
     fn group_index(&mut self, row: &ExecutionRow) -> Result<usize, ExecutionError> {
-        let key_values = self
-            .group_key_positions
-            .iter()
-            .zip(self.group_keys)
-            .map(|(position, column)| {
-                let value = row
-                    .values
-                    .get(*position)
-                    .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
-                if !value.matches_type(&column.data_type) {
-                    return Err(ExecutionError::TypeMismatch);
-                }
-                Ok(value.clone())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        match self.group_lookup.get(&key_values).copied() {
-            Some(index) => Ok(index),
-            None => {
-                let index = self.groups.len();
-                self.groups
-                    .push(new_group_state(key_values.clone(), &self.aggregates)?);
-                self.group_lookup.insert(key_values, index);
-                Ok(index)
-            }
+        if self.group_keys.is_empty() {
+            return Ok(0);
         }
+        let probe = self.group_lookup.probe(
+            row,
+            &self.group_key_positions,
+            self.group_keys,
+            &self.groups,
+        )?;
+        if let Some(index) = probe.group_index {
+            return Ok(index);
+        }
+
+        let key_values = materialize_group_key(row, &self.group_key_positions, self.group_keys)?;
+        let group = new_group_state(key_values, &self.aggregates)?;
+        let index = self.groups.len();
+        self.group_lookup.register_group(probe.hash, index)?;
+        self.group_lookup.record_owned_key_materialization();
+        self.groups.push(group);
+        Ok(index)
     }
 
     fn finish(self) -> Result<ExecutionRows, ExecutionError> {
@@ -3560,13 +3731,13 @@ mod tests {
     use super::{
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
-        ExecutionRow, ExecutionStorage, FilteredCountSummary, InequalityExecutionStrategy,
-        ProjectionPlan, QueryResult, TruthValue, bind_expression, build_batch_pipeline,
-        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
-        compatibility_bindings, count_to_sql_u64, direct_count_eligibility, evaluate,
-        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
-        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        ExecutionRow, ExecutionStorage, FilteredCountSummary, GroupLookup, GroupState,
+        InequalityExecutionStrategy, ProjectionPlan, QueryResult, TruthValue, bind_expression,
+        build_batch_pipeline, choose_inequality_strategy, collect_filter_columns,
+        collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
+        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
+        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
         evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
         evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
         execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
@@ -4005,6 +4176,336 @@ mod tests {
         let legacy =
             execute_rows_legacy(plan, std::slice::from_mut(storage)).expect("execute legacy path");
         assert_eq!(batch, legacy);
+    }
+
+    fn count_output() -> AggregateOutput {
+        batch_aggregate_expression(
+            AggregateFunction::Count,
+            AggregateInput::All,
+            "COUNT(*)",
+            PhysicalType::UInt64,
+            false,
+        )
+    }
+
+    fn consume_generated_batches(
+        accumulator: &mut AggregateAccumulator<'_>,
+        rows: usize,
+        mut values: impl FnMut(usize) -> Vec<ScalarValue>,
+    ) {
+        for start in (0..rows).step_by(EXECUTION_BATCH_CAPACITY) {
+            let end = rows.min(start + EXECUTION_BATCH_CAPACITY);
+            let mut batch = ExecutionBatch::with_capacity();
+            batch.rows.extend((start..end).map(|index| ExecutionRow {
+                row_id: None,
+                values: values(index),
+            }));
+            accumulator
+                .consume_batch(&mut batch)
+                .expect("consume generated aggregate batch");
+            assert!(batch.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn borrowed_group_lookup_materializes_only_distinct_int_and_text_keys() {
+        let columns = batch_columns();
+        let int_key = columns[1].clone();
+        let int_fields = [OutputField::Source(int_key.clone())];
+        let int_outputs = [AggregateOutput::GroupKey(int_key.clone()), count_output()];
+        let mut accumulator =
+            AggregateAccumulator::new(&int_fields, std::slice::from_ref(&int_key), &int_outputs)
+                .expect("build hit-heavy integer accumulator");
+        consume_generated_batches(&mut accumulator, 513, |index| {
+            vec![ScalarValue::UInt64((index % 4) as u64)]
+        });
+        let stats = accumulator.group_lookup.stats();
+        assert_eq!(stats.lookups, 513);
+        assert_eq!(stats.hits, 509);
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.owned_key_materializations, 4);
+        assert!(stats.exact_collision_checks >= stats.hits);
+        assert_eq!(
+            accumulator.finish().expect("finish integer groups").rows,
+            (0_u64..4)
+                .map(|key| super::ExecutionRow {
+                    row_id: None,
+                    values: vec![
+                        ScalarValue::UInt64(key),
+                        ScalarValue::UInt64(if key == 0 { 129 } else { 128 }),
+                    ],
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let text_key = columns[3].clone();
+        let text_fields = [OutputField::Source(text_key.clone())];
+        let text_outputs = [AggregateOutput::GroupKey(text_key.clone()), count_output()];
+        let mut accumulator =
+            AggregateAccumulator::new(&text_fields, std::slice::from_ref(&text_key), &text_outputs)
+                .expect("build hit-heavy Text accumulator");
+        let mut first_batch = ExecutionBatch::with_capacity();
+        first_batch.rows.push(ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Text("repeated-key".into())],
+        });
+        accumulator
+            .consume_batch(&mut first_batch)
+            .expect("materialize first Text group");
+        let durable_pointer = text_pointer(&accumulator.groups[0].key_values[0]);
+        consume_generated_batches(&mut accumulator, 512, |_| {
+            vec![ScalarValue::Text("repeated-key".into())]
+        });
+        assert_eq!(
+            accumulator.group_lookup.stats(),
+            super::GroupLookupStats {
+                lookups: 513,
+                hits: 512,
+                misses: 1,
+                owned_key_materializations: 1,
+                exact_collision_checks: 512,
+            }
+        );
+        assert_eq!(
+            text_pointer(&accumulator.groups[0].key_values[0]),
+            durable_pointer
+        );
+        assert_eq!(
+            accumulator.finish().expect("finish Text group").rows[0].values,
+            vec![
+                ScalarValue::Text("repeated-key".into()),
+                ScalarValue::UInt64(513),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_lookup_collision_chain_uses_exact_typed_key_equality() {
+        let columns = batch_columns();
+        let groups = vec![
+            GroupState {
+                key_values: vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::UInt64(2),
+                    ScalarValue::Bool(false),
+                    ScalarValue::Text("alpha".into()),
+                    ScalarValue::Null,
+                ],
+                aggregate_states: Vec::new(),
+            },
+            GroupState {
+                key_values: vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::UInt64(2),
+                    ScalarValue::Bool(false),
+                    ScalarValue::Text("beta".into()),
+                    ScalarValue::Null,
+                ],
+                aggregate_states: Vec::new(),
+            },
+        ];
+        let positions = [0, 1, 2, 3, 4];
+        let row = |text: &str, signed: i64, unsigned: u64| ExecutionRow {
+            row_id: None,
+            values: vec![
+                ScalarValue::Int64(signed),
+                ScalarValue::UInt64(unsigned),
+                ScalarValue::Bool(false),
+                ScalarValue::Text(text.into()),
+                ScalarValue::Null,
+            ],
+        };
+        let mut lookup = GroupLookup::new();
+        lookup.register_group(7, 0).expect("register collision A");
+        lookup.register_group(7, 1).expect("register collision B");
+        let head = lookup.bucket_heads.get(&7).copied();
+        assert_eq!(
+            lookup
+                .find_in_bucket(&row("alpha", 1, 2), &positions, &columns, &groups, head)
+                .expect("lookup collision A"),
+            Some(0)
+        );
+        assert_eq!(
+            lookup
+                .find_in_bucket(&row("beta", 1, 2), &positions, &columns, &groups, head)
+                .expect("lookup collision B"),
+            Some(1)
+        );
+        assert_eq!(
+            lookup
+                .find_in_bucket(&row("gamma", 2, 1), &positions, &columns, &groups, head)
+                .expect("lookup collision miss"),
+            None
+        );
+        assert_eq!(lookup.stats().exact_collision_checks, 5);
+    }
+
+    #[test]
+    fn borrowed_group_lookup_matches_legacy_across_cardinality_and_batch_boundaries() {
+        let key = batch_columns()[0].clone();
+        let input_fields = [OutputField::Source(key.clone())];
+        let outputs = [AggregateOutput::GroupKey(key.clone()), count_output()];
+        for rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let cardinalities = if rows == 0 {
+                vec![1]
+            } else {
+                vec![1, rows.min(4), (rows / 2).max(1), rows]
+            };
+            for cardinality in cardinalities {
+                let mut batch =
+                    AggregateAccumulator::new(&input_fields, std::slice::from_ref(&key), &outputs)
+                        .expect("build batch group accumulator");
+                consume_generated_batches(&mut batch, rows, |index| {
+                    vec![ScalarValue::Int64((index % cardinality) as i64)]
+                });
+
+                let materialized_rows = (0..rows)
+                    .map(|index| ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Int64((index % cardinality) as i64)],
+                    })
+                    .collect::<Vec<_>>();
+                let mut legacy =
+                    AggregateAccumulator::new(&input_fields, std::slice::from_ref(&key), &outputs)
+                        .expect("build legacy group accumulator");
+                legacy
+                    .consume_rows(&materialized_rows)
+                    .expect("consume legacy grouped rows");
+
+                let expected_groups = rows.min(cardinality);
+                let stats = batch.group_lookup.stats();
+                assert_eq!(stats.lookups, rows);
+                assert_eq!(stats.misses, expected_groups);
+                assert_eq!(stats.hits, rows - expected_groups);
+                assert_eq!(stats.owned_key_materializations, expected_groups);
+                let batch = batch.finish().expect("finish batch groups");
+                let legacy = legacy.finish().expect("finish legacy groups");
+                assert_eq!(batch, legacy);
+                assert_eq!(batch.rows.len(), expected_groups);
+                for (position, row) in batch.rows.iter().enumerate() {
+                    assert_eq!(row.values[0], ScalarValue::Int64(position as i64));
+                    assert_eq!(
+                        row.values[1],
+                        ScalarValue::UInt64(((rows - 1 - position) / cardinality + 1) as u64)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_multi_key_lookup_preserves_order_null_text_and_first_seen_groups() {
+        let columns = batch_columns();
+        let selected = [
+            columns[0].clone(),
+            columns[2].clone(),
+            columns[4].clone(),
+            columns[3].clone(),
+        ];
+        let input_fields = selected
+            .iter()
+            .cloned()
+            .map(OutputField::Source)
+            .collect::<Vec<_>>();
+        let rows = || {
+            [
+                (1, true, ScalarValue::Int64(2), "alpha"),
+                (2, false, ScalarValue::Int64(1), "beta"),
+                (1, true, ScalarValue::Int64(2), "alpha"),
+                (1, false, ScalarValue::Null, "gamma"),
+                (1, false, ScalarValue::Null, "gamma"),
+            ]
+            .into_iter()
+            .map(|(id, active, nullable, text)| ExecutionRow {
+                row_id: None,
+                values: vec![
+                    ScalarValue::Int64(id),
+                    ScalarValue::Bool(active),
+                    nullable,
+                    ScalarValue::Text(text.into()),
+                ],
+            })
+            .collect::<Vec<_>>()
+        };
+        for group_keys in [
+            vec![selected[0].clone(), selected[1].clone()],
+            vec![selected[0].clone(), selected[2].clone()],
+            vec![selected[0].clone(), selected[3].clone()],
+        ] {
+            let mut outputs = group_keys
+                .iter()
+                .cloned()
+                .map(AggregateOutput::GroupKey)
+                .collect::<Vec<_>>();
+            outputs.push(count_output());
+            let mut batch = AggregateAccumulator::new(&input_fields, &group_keys, &outputs)
+                .expect("build multi-key batch accumulator");
+            let mut execution_batch = ExecutionBatch { rows: rows() };
+            batch
+                .consume_batch(&mut execution_batch)
+                .expect("consume multi-key batch");
+            let mut legacy = AggregateAccumulator::new(&input_fields, &group_keys, &outputs)
+                .expect("build multi-key legacy accumulator");
+            legacy
+                .consume_rows(&rows())
+                .expect("consume multi-key legacy rows");
+            assert_eq!(
+                batch.finish().expect("finish multi-key batch"),
+                legacy.finish().expect("finish multi-key legacy")
+            );
+        }
+
+        let group_keys = vec![selected[0].clone(), selected[2].clone()];
+        let outputs = vec![
+            AggregateOutput::GroupKey(selected[0].clone()),
+            AggregateOutput::GroupKey(selected[2].clone()),
+            count_output(),
+        ];
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &group_keys, &outputs)
+            .expect("build ordered nullable-key accumulator");
+        accumulator
+            .consume_rows(&rows())
+            .expect("consume ordered nullable keys");
+        assert_eq!(
+            accumulator
+                .finish()
+                .expect("finish ordered nullable keys")
+                .rows,
+            vec![
+                super::ExecutionRow {
+                    row_id: None,
+                    values: vec![
+                        ScalarValue::Int64(1),
+                        ScalarValue::Int64(2),
+                        ScalarValue::UInt64(2),
+                    ],
+                },
+                super::ExecutionRow {
+                    row_id: None,
+                    values: vec![
+                        ScalarValue::Int64(2),
+                        ScalarValue::Int64(1),
+                        ScalarValue::UInt64(1),
+                    ],
+                },
+                super::ExecutionRow {
+                    row_id: None,
+                    values: vec![
+                        ScalarValue::Int64(1),
+                        ScalarValue::Null,
+                        ScalarValue::UInt64(2),
+                    ],
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1048,7 +1048,35 @@ group keys and finalized states, then applies the same last-use projection used
 by row Project: unique outputs move, while duplicate outputs clone before their
 last use and move the final owner. The group lookup remains
 `HashMap<Vec<ScalarValue>, usize>` and its per-row key ownership is explicitly
-outside this phase.
+outside Phase 57.
+
+Phase 58 replaces that owned-key lookup with an executor-private `GroupLookup`:
+
+```text
+borrowed row group-key values
+            ↓
+RandomState hash in source order, including key width
+            ↓
+HashMap<u64, bucket head> → collision index chain
+            ↓
+exact comparison against GroupState.key_values
+      ┌─────┴─────┐
+     hit         miss
+      ↓            ↓
+no key owner   materialize one durable Vec<ScalarValue>
+                   ↓
+               append GroupState
+```
+
+The hash is only candidate metadata: a hash collision never implies SQL group
+equality. Exact `ScalarValue` equality covers Bool, Int64, UInt64, Text, NULL,
+and ordered multi-column keys, so NULL keys group together without adopting
+predicate `UNKNOWN` semantics. `GroupState` is the sole durable key owner;
+lookup metadata stores only hashes and group indices. The `Vec<GroupState>`
+continues to define first-seen result order, and HashMap iteration never shapes
+query output. Existing-group hits allocate no temporary key and clone no key
+values. A miss conservatively clones each source key value once into its single
+durable group key; move-on-miss remains separate from MIN/MAX ownership.
 
 Exact standalone Filter and predicate-only Project/Filter shapes retain the
 measured borrowed Phase 7 streaming specializations for every scalar type,

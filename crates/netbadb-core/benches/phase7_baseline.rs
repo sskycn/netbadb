@@ -1033,6 +1033,56 @@ fn run_projection_attribution_scenarios(
         |result| grouped_aggregate_observation(result, rows, 4, true),
         measurements,
     )?;
+    for (scenario, cardinality) in [
+        ("group_lookup_int_cardinality_1", 1),
+        ("group_lookup_int_cardinality_4", 4),
+        (
+            "group_lookup_int_cardinality_1_percent",
+            (rows / 100).max(1),
+        ),
+        ("group_lookup_int_cardinality_half", (rows / 2).max(1)),
+        ("group_lookup_int_cardinality_unique", rows.max(1)),
+    ] {
+        run_group_lookup_attribution_query(
+            scenario,
+            rows,
+            cardinality,
+            "SELECT team_id, COUNT(*) FROM items GROUP BY team_id",
+            &[Operator::Aggregate, Operator::SeqScan],
+            &[TEAM_COLUMN_ID],
+            expected_groups(rows, cardinality),
+            settings,
+            |result| exact_group_observation(result, rows, cardinality),
+            measurements,
+        )?;
+    }
+    run_group_lookup_attribution_query(
+        "group_lookup_two_primitive_keys",
+        rows,
+        4,
+        "SELECT team_id, active, COUNT(*) FROM items GROUP BY team_id, active",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[TEAM_COLUMN_ID, ACTIVE_COLUMN_ID],
+        expected_two_key_groups(rows, 4),
+        settings,
+        |result| two_key_group_observation(result, rows, 4),
+        measurements,
+    )?;
+    run_group_lookup_attribution_query(
+        "group_lookup_text_unique",
+        rows,
+        4,
+        "SELECT payload, COUNT(*) FROM items GROUP BY payload",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        |result| unique_text_group_observation(result, rows),
+        measurements,
+    )?;
     run_attribution_query(
         "aggregate_count_star",
         rows,
@@ -1590,7 +1640,35 @@ fn run_attribution_query(
     observe: impl Fn(&QueryResult) -> BenchResult<Observation>,
     measurements: &mut Vec<Measurement>,
 ) -> BenchResult<()> {
-    let (mut database, paths) = items_fixture(scenario, rows, &[], NullDistribution::Low, 4)?;
+    run_group_lookup_attribution_query(
+        scenario,
+        rows,
+        4,
+        sql,
+        required,
+        expected_base_columns,
+        expected,
+        settings,
+        observe,
+        measurements,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_group_lookup_attribution_query(
+    scenario: &str,
+    rows: u64,
+    team_cardinality: u64,
+    sql: &str,
+    required: &[Operator],
+    expected_base_columns: &[ColumnId],
+    expected: Observation,
+    settings: ProfileSettings,
+    observe: impl Fn(&QueryResult) -> BenchResult<Observation>,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let (mut database, paths) =
+        items_fixture(scenario, rows, &[], NullDistribution::Low, team_cardinality)?;
     let plan = inspect_plan(&database, scenario, sql, required, &[])?;
     inspect_base_scan_columns(&database, scenario, sql, expected_base_columns)?;
     let durations = measure_checked(
@@ -3413,6 +3491,131 @@ fn group_observation(result: &QueryResult) -> BenchResult<Observation> {
         rows: u64::try_from(result.rows.len())
             .map_err(|_| message_error("group row count exceeds u64"))?,
         checksum,
+    })
+}
+
+fn exact_group_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    cardinality: u64,
+) -> BenchResult<Observation> {
+    let expected_group_count = fixture_rows.min(cardinality);
+    if result.rows.len() as u64 != expected_group_count {
+        return Err(message_error(format!(
+            "GROUP BY returned {} groups; expected {expected_group_count}",
+            result.rows.len()
+        )));
+    }
+    for (position, row) in result.rows.iter().enumerate() {
+        let [ScalarValue::Int64(key), ScalarValue::UInt64(count)] = row.as_slice() else {
+            return Err(message_error(
+                "GROUP BY cardinality query must return Int64 key and UInt64 count",
+            ));
+        };
+        let expected_key = position as u64;
+        let expected_count = (fixture_rows - 1 - expected_key) / cardinality + 1;
+        if *key != i64::try_from(expected_key)? || *count != expected_count {
+            return Err(message_error(format!(
+                "GROUP BY row {position} was ({key}, {count}); expected ({expected_key}, {expected_count})"
+            )));
+        }
+    }
+    Ok(expected_groups(fixture_rows, cardinality))
+}
+
+fn expected_two_key_group_values(rows: u64, cardinality: u64) -> Vec<(u64, bool, u64)> {
+    let mut groups = Vec::<(u64, bool, u64)>::new();
+    for id in 0..rows {
+        let key = (id % cardinality, id % 3 == 0);
+        if let Some((_, _, count)) = groups
+            .iter_mut()
+            .find(|(team, active, _)| (*team, *active) == key)
+        {
+            *count += 1;
+        } else {
+            groups.push((key.0, key.1, 1));
+        }
+    }
+    groups
+}
+
+fn two_key_group_checksum(team: u64, active: bool, count: u64) -> u128 {
+    u128::from(team) * CHECKSUM_FACTOR + u128::from(active) * 101 + u128::from(count)
+}
+
+fn expected_two_key_groups(rows: u64, cardinality: u64) -> Observation {
+    let groups = expected_two_key_group_values(rows, cardinality);
+    Observation {
+        rows: groups.len() as u64,
+        checksum: groups
+            .into_iter()
+            .map(|(team, active, count)| two_key_group_checksum(team, active, count))
+            .sum(),
+    }
+}
+
+fn two_key_group_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    cardinality: u64,
+) -> BenchResult<Observation> {
+    let expected = expected_two_key_group_values(fixture_rows, cardinality);
+    if result.rows.len() != expected.len() {
+        return Err(message_error(format!(
+            "two-key GROUP BY returned {} groups; expected {}",
+            result.rows.len(),
+            expected.len()
+        )));
+    }
+    let mut checksum = 0_u128;
+    for (position, (row, expected)) in result.rows.iter().zip(expected).enumerate() {
+        let [
+            ScalarValue::Int64(team),
+            ScalarValue::Bool(active),
+            ScalarValue::UInt64(count),
+        ] = row.as_slice()
+        else {
+            return Err(message_error(
+                "two-key GROUP BY must return Int64, Bool, and UInt64",
+            ));
+        };
+        let actual_team = u64::try_from(*team).map_err(|_| message_error("negative team key"))?;
+        if (actual_team, *active, *count) != expected {
+            return Err(message_error(format!(
+                "two-key GROUP BY row {position} was ({actual_team}, {active}, {count}); expected {expected:?}"
+            )));
+        }
+        checksum = checksum
+            .checked_add(two_key_group_checksum(expected.0, expected.1, expected.2))
+            .ok_or_else(|| message_error("two-key GROUP BY checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: result.rows.len() as u64,
+        checksum,
+    })
+}
+
+fn unique_text_group_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+) -> BenchResult<Observation> {
+    if result.rows.len() as u64 != fixture_rows {
+        return Err(message_error(format!(
+            "Text GROUP BY returned {} groups; expected {fixture_rows}",
+            result.rows.len()
+        )));
+    }
+    for (id, row) in result.rows.iter().enumerate() {
+        let [ScalarValue::Text(payload), ScalarValue::UInt64(1)] = row.as_slice() else {
+            return Err(message_error(
+                "Text GROUP BY must return a Text key with COUNT(*) = 1",
+            ));
+        };
+        validate_payload(id, payload)?;
+    }
+    Ok(Observation {
+        rows: fixture_rows,
+        checksum: arithmetic_sum(fixture_rows),
     })
 }
 

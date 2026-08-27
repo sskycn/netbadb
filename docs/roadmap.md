@@ -1288,6 +1288,33 @@ isolation, concurrent writers, and background execution.
 The quick attribution is noisy in absolute time, but the ascending Text
 MAX/MIN ratio contracted from 1.271x to 0.928x and duplicate-MAX/MAX from
 1.380x to 1.137x. That supports group-key ownership/hash attribution as the
-leading Phase 58 recommendation. Aggregate Text comparison and generic Filter
-prebinding follow; typed column-oriented batches, SIMD, batch HashJoin/Sort,
-and index/range/partition batch sources remain broader unselected candidates.
+Phase 58 target. Aggregate Text comparison and generic Filter prebinding follow;
+typed column-oriented batches, SIMD, batch HashJoin/Sort, and
+index/range/partition batch sources remain broader unselected candidates.
+
+## Borrowed Group-Key Lookup + Owned-Key-on-Miss (complete)
+
+- replaced `HashMap<Vec<ScalarValue>, usize>` with a private randomized
+  hash-to-head lookup and a group-index collision chain;
+- hashes group-key values directly from borrowed rows and exact-compares every
+  candidate against the one durable key owned by `GroupState`; hash equality
+  alone never merges SQL groups;
+- existing-group hits allocate no `Vec<ScalarValue>` and clone no group-key
+  values. A miss materializes exactly one durable key and stores only hash/index
+  metadata in the lookup;
+- preserved NULL grouping, ordered multi-key identity, deterministic first-seen
+  output, Phase 57 MIN/MAX movement, direct COUNT dispatch, and the Heap/LSM
+  storage boundary without dependencies or unsafe code;
+- test-only local statistics prove 513 rows over four groups produce 509 hits,
+  four misses, and four owned-key materializations; repeated Text produces 512
+  hits and one materialization. A forced same-hash chain proves exact A/B hits
+  and C miss independently of `RandomState` collisions.
+
+Quick wall-clock controls moved broadly, but within-run grouping ratios favor
+hit-heavy keys: one-group/unique changed from 0.852x to 0.442x and
+four-group/unique from 0.984x to 0.683x. Unique Int64 grouping remains the
+largest directly attributable miss-heavy residual. Phase 59 should therefore
+first measure remaining miss ownership/hash metadata, followed by Aggregate
+Text comparison and generic Filter prebinding. Typed column batches, HashJoin
+batch integration, Sort/Top-N, and index/range/partition batch sources remain
+lower-evidence candidates rather than selected work.
