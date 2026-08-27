@@ -765,10 +765,17 @@ The implementation sequence is intentionally vertical:
     owned, existing borrowed streaming Filter and direct COUNT specializations
     remain, and unsupported physical shapes use the authoritative materialized
     executor.
+56. Batch Pipeline Composition + Streaming Aggregate — complete; the bounded
+    SeqScan/Filter/Project producer now feeds either the existing owned result
+    collector or an incremental Aggregate accumulator. Global and grouped
+    COUNT/SUM/MIN/MAX retain exact NULL, overflow, type, output-order, and
+    first-seen group semantics on Heap and LSM without materializing the full
+    aggregate child. Aggregate remains a blocking finalization boundary, and
+    direct and filtered COUNT specializations keep priority.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and
-batch Aggregate, HashJoin, Sort, index, and partition execution are also
+batch HashJoin, Sort, index, and partition execution are also
 deferred.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The

@@ -1064,6 +1064,51 @@ continues through the position-bound batch runtime to gain bounded early stop.
 These are attribution results, not a latency or speedup contract, and no
 wall-clock threshold was added.
 
+## Phase 56 streaming Aggregate attribution
+
+Phase 56 added its benchmark cases before changing production execution. The
+targets cover global Int64 SUM, multiple mixed aggregates, Text MIN/MAX,
+low- and higher-cardinality grouping, filtered grouped aggregation, and LSM
+global SUM. Existing direct/filtered COUNT, full projected scan, early Limit,
+and LSM batch-limit cases remain observational regression controls. Every case
+keeps exact row/value/checksum, PhysicalPlan, base-column, `black_box`,
+warm-process, and no-timing-assertion gates.
+
+One serial quick pre run was saved outside the repository at
+`/tmp/netbadb-phase56-pre.txt`; the same command after implementation produced
+`/tmp/netbadb-phase56-post.txt`. Medians are machine-local nanoseconds per
+query:
+
+| scenario | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| Heap global SUM | 381,500 | 158,667 | -58.4% |
+| Heap global mixed aggregates | 461,625 | 322,458 | -30.1% |
+| Heap Text MIN/MAX | 564,125 | 481,000 | -14.7% |
+| Heap grouped mixed aggregates | 556,042 | 221,375 | -60.2% |
+| Heap filtered grouped aggregate | 477,000 | 260,708 | -45.3% |
+| Heap low-cardinality GROUP BY target | 413,917 | 192,792 | -53.4% |
+| Heap higher-cardinality GROUP BY target | 547,709 | 419,250 | -23.5% |
+| LSM global SUM | 108,917 | 36,875 | -66.1% |
+| direct COUNT(*) control | 310,125 | 168,750 | -45.6% |
+| direct COUNT(id) control | 240,375 | 171,291 | -28.7% |
+| filtered COUNT(payload) control | 317,250 | 137,125 | -56.8% |
+| early Limit control | 19,042 | 17,167 | -9.8% |
+| full projected scan control | 414,666 | 319,958 | -22.8% |
+| LSM Filter+Project+Limit control | 99,583 | 40,125 | -59.7% |
+
+The target reductions are consistent with removing the full materialized child
+`ExecutionRows` before Aggregate, while the broad contemporaneous control
+movement shows that these quick wall-clock deltas are attribution evidence,
+not a stable throughput claim. The retained design decision is therefore the
+bounded producer/consumer composition and its explicit memory bound, not a
+latency guarantee. Direct and filtered COUNT controls still take their prior
+specialized paths; no timing threshold was added.
+
+Global Aggregate now retains at most one 256-row input batch plus its state.
+Grouped Aggregate additionally retains one key and state set per distinct
+group and preserves first-seen order. Both Heap and LSM use the same executor
+callback, and no storage interface or persistent representation changed.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on

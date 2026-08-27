@@ -1234,6 +1234,42 @@ paths and exposed a shared bottleneck above their boundary.
   outcomes; move-aware projections; Limit boundaries; Heap/LSM equality; and
   test-only batch-versus-legacy result equality.
 
-Deferred work remains typed column-oriented batches, SIMD, vectorized
-Aggregate, HashJoin, Sort, index/range scans and partition scans, Columnar
+Deferred work remains typed column-oriented batches, SIMD, batch HashJoin,
+Sort, index/range scans and partition scans, Columnar storage, Serializable
+isolation, concurrent writers, and background execution.
+
+## Batch Pipeline Composition + Streaming Aggregate (complete)
+
+- refactored the Phase 55 batch loop into one executor-private bounded
+  producer with a typed callback; the existing result path is now one consumer
+  and preserves fully owned `QueryResult` rows;
+- added an incremental Aggregate consumer for eligible SeqScan, Filter, and
+  Project children. Group-key and aggregate-input positions bind once, while
+  the existing COUNT/SUM/MIN/MAX transition and finalization logic remains the
+  single semantic implementation for streaming and materialized fallback;
+- preserved SQL NULL behavior, checked Int64/UInt64 SUM overflow attribution,
+  runtime type errors, output-column order, repeated aggregate outputs, empty
+  global/grouped results, first-seen group order, and multiple group keys;
+- bounded global aggregate memory by one 256-row batch plus one state set.
+  Grouped aggregate additionally retains one owned key and state set per
+  distinct group; it never retains the full child `ExecutionRows`;
+- Aggregate remains blocking and a Limit above it is applied only after all
+  child batches are consumed. Existing direct and filtered COUNT
+  specializations remain higher-priority dispatch paths;
+- Heap and LSM continue through the same storage-neutral row consumer. No
+  storage API, persistent format, PhysicalPlan, inspection, protocol, schema,
+  SDK, or dependency changed;
+- deterministic tests cover 0, 1, 255, 256, 257, 512, and 513 input rows;
+  empty and all-NULL inputs; Int64, UInt64, Bool, Text, and NULL values;
+  Project/Filter/SeqScan children; global, low/high-cardinality and multi-key
+  grouping; cross-batch groups; output order; overflow/error attribution;
+  Heap/LSM equality; fallback; and independent legacy-result equivalence.
+
+Measured Phase 57 candidates, in current evidence order, are MIN/MAX Text
+ownership (the smallest target improvement), group-key ownership/hash
+attribution (higher-cardinality grouping improved less than low-cardinality
+grouping), and the already-recorded generic borrowed Filter position prebinding.
+Broader candidates remain typed column-oriented batches and SIMD,
+batch HashJoin and Sort, index/range and partition batch sources, Columnar
 storage, Serializable isolation, concurrent writers, and background execution.
+Phase 56 does not select one of them.

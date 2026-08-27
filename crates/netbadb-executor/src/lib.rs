@@ -595,7 +595,35 @@ fn execute_rows_legacy(
             view,
         })
         .collect::<Vec<_>>();
-    execute_rows_legacy_with_views(plan, &bindings, &mut execution_storages, &execution_views)
+    execute_rows_test_legacy_with_views(plan, &bindings, &mut execution_storages, &execution_views)
+}
+
+#[cfg(test)]
+fn execute_rows_test_legacy_with_views(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<ExecutionRows, ExecutionError> {
+    match plan {
+        PhysicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } => {
+            let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            execute_aggregate(input, group_keys, outputs)
+        }
+        PhysicalPlan::Limit { input, limit } => {
+            let mut result =
+                execute_rows_test_legacy_with_views(input, bindings, storages, read_views)?;
+            result
+                .rows
+                .truncate(usize::try_from(*limit).unwrap_or(usize::MAX));
+            Ok(result)
+        }
+        _ => execute_rows_legacy_with_views(plan, bindings, storages, read_views),
+    }
 }
 
 fn execute_rows_with_views(
@@ -696,18 +724,35 @@ fn try_execute_batch_pipeline(
     let Some(mut pipeline) = build_batch_pipeline(plan)? else {
         return Ok(None);
     };
+    let mut result_rows = Vec::new();
+    let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
+        result_rows.append(&mut batch.rows);
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(Some(ExecutionRows {
+        fields: pipeline.fields,
+        rows: result_rows,
+    }))
+}
+
+fn visit_batch_pipeline<F>(
+    pipeline: &mut BatchPipeline<'_>,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    mut consumer: F,
+) -> Result<ControlFlow<()>, ExecutionError>
+where
+    F: FnMut(&mut ExecutionBatch) -> Result<ControlFlow<()>, ExecutionError>,
+{
     let view = read_view_for_table(bindings, read_views, pipeline.table_id)?;
     let storage = storage_for_table(bindings, storages, pipeline.table_id)?;
-    let mut result_rows = Vec::new();
     if pipeline
         .operators
         .iter()
         .any(|operator| matches!(operator, BatchOperator::Limit { remaining: 0 }))
     {
-        return Ok(Some(ExecutionRows {
-            fields: pipeline.fields,
-            rows: result_rows,
-        }));
+        return Ok(ControlFlow::Continue(()));
     }
 
     let mut batch = ExecutionBatch::with_capacity();
@@ -727,9 +772,8 @@ fn try_execute_batch_pipeline(
             if !batch.is_full_at(batch_capacity) {
                 return Ok(ControlFlow::Continue(()));
             }
-            match consume_execution_batch(&mut batch, &mut pipeline.operators, &mut result_rows) {
-                Ok(true) => Ok(ControlFlow::Break(())),
-                Ok(false) => Ok(ControlFlow::Continue(())),
+            match deliver_execution_batch(&mut batch, &mut pipeline.operators, &mut consumer) {
+                Ok(flow) => Ok(flow),
                 Err(error) => {
                     pending_operator_error = Some(error);
                     batch.rows.clear();
@@ -742,13 +786,9 @@ fn try_execute_batch_pipeline(
         return Err(error);
     }
     if flow.is_continue() && !batch.rows.is_empty() {
-        let _stopped =
-            consume_execution_batch(&mut batch, &mut pipeline.operators, &mut result_rows)?;
+        return deliver_execution_batch(&mut batch, &mut pipeline.operators, &mut consumer);
     }
-    Ok(Some(ExecutionRows {
-        fields: pipeline.fields,
-        rows: result_rows,
-    }))
+    Ok(flow)
 }
 
 fn batch_input_capacity(operators: &[BatchOperator<'_>]) -> usize {
@@ -764,10 +804,27 @@ fn batch_input_capacity(operators: &[BatchOperator<'_>]) -> usize {
     EXECUTION_BATCH_CAPACITY
 }
 
-fn consume_execution_batch(
+fn deliver_execution_batch<F>(
     batch: &mut ExecutionBatch,
     operators: &mut [BatchOperator<'_>],
-    result_rows: &mut Vec<ExecutionRow>,
+    consumer: &mut F,
+) -> Result<ControlFlow<()>, ExecutionError>
+where
+    F: FnMut(&mut ExecutionBatch) -> Result<ControlFlow<()>, ExecutionError>,
+{
+    let upstream_exhausted = process_execution_batch(batch, operators)?;
+    let downstream = consumer(batch)?;
+    batch.rows.clear();
+    if upstream_exhausted || downstream.is_break() {
+        Ok(ControlFlow::Break(()))
+    } else {
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
+fn process_execution_batch(
+    batch: &mut ExecutionBatch,
+    operators: &mut [BatchOperator<'_>],
 ) -> Result<bool, ExecutionError> {
     let mut upstream_exhausted = false;
     for operator in operators {
@@ -815,7 +872,6 @@ fn consume_execution_batch(
             }
         }
     }
-    result_rows.append(&mut batch.rows);
     Ok(upstream_exhausted)
 }
 
@@ -1214,6 +1270,10 @@ fn execute_rows_legacy_with_views(
                 input, group_keys, outputs, bindings, storages, read_views,
             )? {
                 Ok(result)
+            } else if let Some(result) = try_execute_batch_aggregate(
+                input, group_keys, outputs, bindings, storages, read_views,
+            )? {
+                Ok(result)
             } else {
                 let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
                 execute_aggregate(input, group_keys, outputs)
@@ -1355,6 +1415,17 @@ struct GroupState {
 enum AggregateOutputPosition {
     GroupKey(usize),
     Aggregate(usize),
+}
+
+struct AggregateAccumulator<'a> {
+    group_keys: &'a [ColumnRef],
+    aggregates: Vec<&'a AggregateExpr>,
+    group_key_positions: Vec<usize>,
+    aggregate_positions: Vec<Option<usize>>,
+    output_positions: Vec<AggregateOutputPosition>,
+    output_fields: Vec<OutputField>,
+    group_lookup: HashMap<Vec<ScalarValue>, usize>,
+    groups: Vec<GroupState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1990,149 +2061,213 @@ fn count_to_sql_u64(count: u128, aggregate: &AggregateExpr) -> Result<u64, Execu
     u64::try_from(count).map_err(|_| aggregate_overflow(aggregate))
 }
 
+fn try_execute_batch_aggregate(
+    input: &PhysicalPlan,
+    group_keys: &[ColumnRef],
+    outputs: &[AggregateOutput],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let mut pipeline = match build_batch_pipeline(input) {
+        Ok(Some(pipeline)) => pipeline,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let mut accumulator = match AggregateAccumulator::new(&pipeline.fields, group_keys, outputs) {
+        Ok(accumulator) => accumulator,
+        Err(_) => return Ok(None),
+    };
+    let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
+        accumulator.consume_batch(batch)?;
+        Ok(ControlFlow::Continue(()))
+    })?;
+    accumulator.finish().map(Some)
+}
+
 fn execute_aggregate(
     input: ExecutionRows,
     group_keys: &[ColumnRef],
     outputs: &[AggregateOutput],
 ) -> Result<ExecutionRows, ExecutionError> {
-    let aggregates = outputs
-        .iter()
-        .filter_map(|output| match output {
-            AggregateOutput::GroupKey(_) => None,
-            AggregateOutput::Aggregate(aggregate) => Some(aggregate),
-        })
-        .collect::<Vec<_>>();
-    for aggregate in &aggregates {
-        if matches!(aggregate.input, AggregateInput::All)
-            && aggregate.function != AggregateFunction::Count
-        {
-            return Err(ExecutionError::InvalidAggregateInput {
-                function: aggregate.function,
-            });
-        }
-    }
-    let group_key_positions = group_keys
-        .iter()
-        .map(|column| find_source_position(&input.fields, column))
-        .collect::<Result<Vec<_>, _>>()?;
-    let aggregate_positions = aggregates
-        .iter()
-        .map(|aggregate| match &aggregate.input {
-            AggregateInput::All => Ok(None),
-            AggregateInput::Column(column) => find_source_position(&input.fields, column).map(Some),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut aggregate_index = 0;
-    let output_positions = outputs
-        .iter()
-        .map(|output| match output {
-            AggregateOutput::GroupKey(column) => group_keys
-                .iter()
-                .position(|group_key| same_source_column(group_key, column))
-                .map(AggregateOutputPosition::GroupKey)
-                .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone())),
-            AggregateOutput::Aggregate(_) => {
-                let position = AggregateOutputPosition::Aggregate(aggregate_index);
-                aggregate_index += 1;
-                Ok(position)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut accumulator = AggregateAccumulator::new(&input.fields, group_keys, outputs)?;
+    accumulator.consume_rows(&input.rows)?;
+    accumulator.finish()
+}
 
-    let mut group_lookup = HashMap::<Vec<ScalarValue>, usize>::new();
-    let mut groups = Vec::<GroupState>::new();
-    if group_keys.is_empty() {
-        groups.push(new_group_state(Vec::new(), &aggregates)?);
-        group_lookup.insert(Vec::new(), 0);
-    }
-
-    for row in &input.rows {
-        let key_values = group_key_positions
+impl<'a> AggregateAccumulator<'a> {
+    fn new(
+        input_fields: &[OutputField],
+        group_keys: &'a [ColumnRef],
+        outputs: &'a [AggregateOutput],
+    ) -> Result<Self, ExecutionError> {
+        let aggregates = outputs
             .iter()
-            .zip(group_keys)
-            .map(|(position, column)| {
-                let value = row
-                    .values
-                    .get(*position)
-                    .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
-                if !value.matches_type(&column.data_type) {
-                    return Err(ExecutionError::TypeMismatch);
+            .filter_map(|output| match output {
+                AggregateOutput::GroupKey(_) => None,
+                AggregateOutput::Aggregate(aggregate) => Some(aggregate),
+            })
+            .collect::<Vec<_>>();
+        for aggregate in &aggregates {
+            if matches!(aggregate.input, AggregateInput::All)
+                && aggregate.function != AggregateFunction::Count
+            {
+                return Err(ExecutionError::InvalidAggregateInput {
+                    function: aggregate.function,
+                });
+            }
+        }
+        let group_key_positions = group_keys
+            .iter()
+            .map(|column| find_source_position(input_fields, column))
+            .collect::<Result<Vec<_>, _>>()?;
+        let aggregate_positions = aggregates
+            .iter()
+            .map(|aggregate| match &aggregate.input {
+                AggregateInput::All => Ok(None),
+                AggregateInput::Column(column) => {
+                    find_source_position(input_fields, column).map(Some)
                 }
-                Ok(value.clone())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let group_index = match group_lookup.get(&key_values).copied() {
-            Some(index) => index,
-            None => {
-                let index = groups.len();
-                groups.push(new_group_state(key_values.clone(), &aggregates)?);
-                group_lookup.insert(key_values, index);
-                index
-            }
-        };
-        let group = groups
-            .get_mut(group_index)
-            .ok_or(ExecutionError::TypeMismatch)?;
-        for ((aggregate, position), state) in aggregates
+        let mut aggregate_index = 0;
+        let output_positions = outputs
             .iter()
-            .zip(&aggregate_positions)
-            .zip(&mut group.aggregate_states)
-        {
-            let value = match position {
-                Some(position) => {
-                    let value = row.values.get(*position).ok_or_else(|| {
-                        let name = match &aggregate.input {
-                            AggregateInput::Column(column) => column.name.clone(),
-                            AggregateInput::All => aggregate.output.name.clone(),
-                        };
-                        ExecutionError::MissingColumn(name)
-                    })?;
-                    let AggregateInput::Column(column) = &aggregate.input else {
-                        return Err(ExecutionError::TypeMismatch);
-                    };
+            .map(|output| match output {
+                AggregateOutput::GroupKey(column) => group_keys
+                    .iter()
+                    .position(|group_key| same_source_column(group_key, column))
+                    .map(AggregateOutputPosition::GroupKey)
+                    .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone())),
+                AggregateOutput::Aggregate(_) => {
+                    let position = AggregateOutputPosition::Aggregate(aggregate_index);
+                    aggregate_index += 1;
+                    Ok(position)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut accumulator = Self {
+            group_keys,
+            aggregates,
+            group_key_positions,
+            aggregate_positions,
+            output_positions,
+            output_fields: outputs.iter().map(AggregateOutput::output_field).collect(),
+            group_lookup: HashMap::new(),
+            groups: Vec::new(),
+        };
+        if group_keys.is_empty() {
+            accumulator
+                .groups
+                .push(new_group_state(Vec::new(), &accumulator.aggregates)?);
+            accumulator.group_lookup.insert(Vec::new(), 0);
+        }
+        Ok(accumulator)
+    }
+
+    fn consume_batch(&mut self, batch: &ExecutionBatch) -> Result<(), ExecutionError> {
+        debug_assert!(batch.rows.len() <= EXECUTION_BATCH_CAPACITY);
+        self.consume_rows(&batch.rows)
+    }
+
+    fn consume_rows(&mut self, rows: &[ExecutionRow]) -> Result<(), ExecutionError> {
+        for row in rows {
+            let key_values = self
+                .group_key_positions
+                .iter()
+                .zip(self.group_keys)
+                .map(|(position, column)| {
+                    let value = row
+                        .values
+                        .get(*position)
+                        .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
                     if !value.matches_type(&column.data_type) {
                         return Err(ExecutionError::TypeMismatch);
                     }
-                    Some(value)
-                }
-                None => None,
-            };
-            update_aggregate_state(state, aggregate, value)?;
-        }
-    }
-
-    let rows = groups
-        .into_iter()
-        .map(|group| {
-            let aggregate_values = group
-                .aggregate_states
-                .into_iter()
-                .map(finalize_aggregate_state)
-                .collect::<Vec<_>>();
-            let values = output_positions
-                .iter()
-                .map(|position| match position {
-                    AggregateOutputPosition::GroupKey(position) => group
-                        .key_values
-                        .get(*position)
-                        .cloned()
-                        .ok_or(ExecutionError::TypeMismatch),
-                    AggregateOutputPosition::Aggregate(position) => aggregate_values
-                        .get(*position)
-                        .cloned()
-                        .ok_or(ExecutionError::TypeMismatch),
+                    Ok(value.clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(ExecutionRow {
-                row_id: None,
-                values,
+            let group_index = match self.group_lookup.get(&key_values).copied() {
+                Some(index) => index,
+                None => {
+                    let index = self.groups.len();
+                    self.groups
+                        .push(new_group_state(key_values.clone(), &self.aggregates)?);
+                    self.group_lookup.insert(key_values, index);
+                    index
+                }
+            };
+            let group = self
+                .groups
+                .get_mut(group_index)
+                .ok_or(ExecutionError::TypeMismatch)?;
+            for ((aggregate, position), state) in self
+                .aggregates
+                .iter()
+                .zip(&self.aggregate_positions)
+                .zip(&mut group.aggregate_states)
+            {
+                let value = match position {
+                    Some(position) => {
+                        let value = row.values.get(*position).ok_or_else(|| {
+                            let name = match &aggregate.input {
+                                AggregateInput::Column(column) => column.name.clone(),
+                                AggregateInput::All => aggregate.output.name.clone(),
+                            };
+                            ExecutionError::MissingColumn(name)
+                        })?;
+                        let AggregateInput::Column(column) = &aggregate.input else {
+                            return Err(ExecutionError::TypeMismatch);
+                        };
+                        if !value.matches_type(&column.data_type) {
+                            return Err(ExecutionError::TypeMismatch);
+                        }
+                        Some(value)
+                    }
+                    None => None,
+                };
+                update_aggregate_state(state, aggregate, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ExecutionRows, ExecutionError> {
+        let rows = self
+            .groups
+            .into_iter()
+            .map(|group| {
+                let aggregate_values = group
+                    .aggregate_states
+                    .into_iter()
+                    .map(finalize_aggregate_state)
+                    .collect::<Vec<_>>();
+                let values = self
+                    .output_positions
+                    .iter()
+                    .map(|position| match position {
+                        AggregateOutputPosition::GroupKey(position) => group
+                            .key_values
+                            .get(*position)
+                            .cloned()
+                            .ok_or(ExecutionError::TypeMismatch),
+                        AggregateOutputPosition::Aggregate(position) => aggregate_values
+                            .get(*position)
+                            .cloned()
+                            .ok_or(ExecutionError::TypeMismatch),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(ExecutionRow {
+                    row_id: None,
+                    values,
+                })
             })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        Ok(ExecutionRows {
+            fields: self.output_fields,
+            rows,
         })
-        .collect::<Result<Vec<_>, ExecutionError>>()?;
-    Ok(ExecutionRows {
-        fields: outputs.iter().map(AggregateOutput::output_field).collect(),
-        rows,
-    })
+    }
 }
 
 fn new_group_state(
@@ -3317,11 +3452,14 @@ fn compare_scalar_refs(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
     use super::{
-        BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY, EvaluatedScalar,
-        EvaluationValues, ExecutionError, ExecutionRow, FilteredCountSummary,
-        InequalityExecutionStrategy, ProjectionPlan, QueryResult, TruthValue, bind_expression,
-        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
+        AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
+        EvaluatedScalar, EvaluationValues, ExecutionError, ExecutionReadView, ExecutionRow,
+        ExecutionStorage, FilteredCountSummary, InequalityExecutionStrategy, ProjectionPlan,
+        QueryResult, TruthValue, bind_expression, build_batch_pipeline, choose_inequality_strategy,
+        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
         count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
         evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
         evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
@@ -3333,7 +3471,7 @@ mod tests {
         inequality_can_match, materialize_count_values, materialize_direct_count_values,
         potential_left_indices, project_execution_row, projected_streaming_seq_filter_eligibility,
         required_right_extreme, sorted_non_null_indices, streaming_seq_filter_eligibility,
-        update_filtered_count_summary,
+        update_filtered_count_summary, visit_batch_pipeline,
     };
     use netbadb_planner::{
         AccessPath, AccessPathCapabilities, PhysicalPlan, TableAccessStatistics, plan,
@@ -3643,6 +3781,66 @@ mod tests {
         }
     }
 
+    fn batch_aggregate_expression(
+        function: AggregateFunction,
+        input: AggregateInput,
+        name: &str,
+        physical: PhysicalType,
+        nullable: bool,
+    ) -> AggregateOutput {
+        AggregateOutput::Aggregate(AggregateExpr {
+            function,
+            input,
+            output: DerivedField {
+                name: name.into(),
+                data_type: SemanticType::physical(physical),
+                nullable,
+            },
+        })
+    }
+
+    fn batch_aggregate(
+        input: PhysicalPlan,
+        group_keys: Vec<ColumnRef>,
+        outputs: Vec<AggregateOutput>,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Aggregate {
+            input: Box::new(input),
+            group_keys,
+            outputs,
+        }
+    }
+
+    fn produced_batch_sizes(plan: &PhysicalPlan, storage: &mut TableStorage) -> Vec<usize> {
+        let views = [storage.read_view().expect("create producer view")];
+        let bindings = compatibility_bindings(std::slice::from_ref(storage))
+            .expect("create producer bindings");
+        let mut execution_storages = [ExecutionStorage {
+            storage_id: bindings[0].storage_id,
+            storage,
+        }];
+        let execution_views = [ExecutionReadView {
+            storage_id: bindings[0].storage_id,
+            view: &views[0],
+        }];
+        let mut pipeline = build_batch_pipeline(plan)
+            .expect("build producer pipeline")
+            .expect("eligible producer pipeline");
+        let mut sizes = Vec::new();
+        let _ = visit_batch_pipeline(
+            &mut pipeline,
+            &bindings,
+            &mut execution_storages,
+            &execution_views,
+            |batch| {
+                sizes.push(batch.rows.len());
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .expect("visit producer batches");
+        sizes
+    }
+
     fn batch_test_path(case: &str, lsm: bool) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "netbadb-executor-batch-{case}-{}-{:?}-{}",
@@ -3872,6 +4070,510 @@ mod tests {
         lsm.close().expect("close equivalence LSM");
         remove_batch_test_path(&heap_path, false);
         remove_batch_test_path(&lsm_path, true);
+    }
+
+    #[test]
+    fn batch_aggregate_cardinalities_nulls_types_and_group_order_match_legacy() {
+        let columns = batch_columns();
+        for rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let (mut storage, path) =
+                batch_storage(&format!("aggregate-cardinality-{rows}"), false, rows);
+            let global = batch_aggregate(
+                batch_scan(columns.clone()),
+                Vec::new(),
+                vec![
+                    batch_aggregate_expression(
+                        AggregateFunction::Sum,
+                        AggregateInput::Column(columns[0].clone()),
+                        "SUM(id)",
+                        PhysicalType::Int64,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Count,
+                        AggregateInput::All,
+                        "COUNT(*)",
+                        PhysicalType::UInt64,
+                        false,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Sum,
+                        AggregateInput::Column(columns[1].clone()),
+                        "SUM(unsigned_key)",
+                        PhysicalType::UInt64,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Min,
+                        AggregateInput::Column(columns[0].clone()),
+                        "MIN(id)",
+                        PhysicalType::Int64,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Max,
+                        AggregateInput::Column(columns[0].clone()),
+                        "MAX(id)",
+                        PhysicalType::Int64,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Min,
+                        AggregateInput::Column(columns[3].clone()),
+                        "MIN(payload)",
+                        PhysicalType::Text,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Max,
+                        AggregateInput::Column(columns[3].clone()),
+                        "MAX(payload)",
+                        PhysicalType::Text,
+                        true,
+                    ),
+                ],
+            );
+            assert_batch_matches_legacy(&global, &mut storage);
+            let result = execute_rows(&global, std::slice::from_mut(&mut storage))
+                .expect("execute global batch aggregate");
+            let expected_sum =
+                i64::try_from(rows * rows.saturating_sub(1) / 2).expect("test SUM fits i64");
+            let expected_unsigned = (0..rows).map(|index| (index % 7) as u64).sum::<u64>();
+            let expected = if rows == 0 {
+                vec![
+                    ScalarValue::Null,
+                    ScalarValue::UInt64(0),
+                    ScalarValue::Null,
+                    ScalarValue::Null,
+                    ScalarValue::Null,
+                    ScalarValue::Null,
+                    ScalarValue::Null,
+                ]
+            } else {
+                vec![
+                    ScalarValue::Int64(expected_sum),
+                    ScalarValue::UInt64(rows as u64),
+                    ScalarValue::UInt64(expected_unsigned),
+                    ScalarValue::Int64(0),
+                    ScalarValue::Int64(i64::try_from(rows - 1).expect("MAX fits i64")),
+                    ScalarValue::Text("group-0".into()),
+                    ScalarValue::Text(format!("group-{}", (rows - 1).min(4))),
+                ]
+            };
+            assert_eq!(
+                result.rows,
+                vec![super::ExecutionRow {
+                    row_id: None,
+                    values: expected
+                }]
+            );
+
+            let grouped = batch_aggregate(
+                batch_scan(columns.clone()),
+                vec![columns[1].clone()],
+                vec![
+                    batch_aggregate_expression(
+                        AggregateFunction::Count,
+                        AggregateInput::All,
+                        "COUNT(*)",
+                        PhysicalType::UInt64,
+                        false,
+                    ),
+                    AggregateOutput::GroupKey(columns[1].clone()),
+                    batch_aggregate_expression(
+                        AggregateFunction::Sum,
+                        AggregateInput::Column(columns[0].clone()),
+                        "SUM(id)",
+                        PhysicalType::Int64,
+                        true,
+                    ),
+                ],
+            );
+            assert_batch_matches_legacy(&grouped, &mut storage);
+            let grouped_result = execute_rows(&grouped, std::slice::from_mut(&mut storage))
+                .expect("execute grouped batch aggregate");
+            assert_eq!(grouped_result.rows.len(), rows.min(7));
+            for (position, row) in grouped_result.rows.iter().enumerate() {
+                assert_eq!(
+                    row.values.get(1),
+                    Some(&ScalarValue::UInt64(position as u64))
+                );
+            }
+
+            if rows == 2 * EXECUTION_BATCH_CAPACITY + 1 {
+                assert_eq!(
+                    produced_batch_sizes(&batch_scan(columns.clone()), &mut storage),
+                    vec![EXECUTION_BATCH_CAPACITY, EXECUTION_BATCH_CAPACITY, 1]
+                );
+                let high_cardinality = batch_aggregate(
+                    batch_scan(columns.clone()),
+                    vec![columns[0].clone()],
+                    vec![
+                        AggregateOutput::GroupKey(columns[0].clone()),
+                        batch_aggregate_expression(
+                            AggregateFunction::Count,
+                            AggregateInput::All,
+                            "COUNT(*)",
+                            PhysicalType::UInt64,
+                            false,
+                        ),
+                    ],
+                );
+                assert_batch_matches_legacy(&high_cardinality, &mut storage);
+                let high_cardinality_result =
+                    execute_rows(&high_cardinality, std::slice::from_mut(&mut storage))
+                        .expect("execute high-cardinality aggregate");
+                assert_eq!(high_cardinality_result.rows.len(), rows);
+                assert_eq!(
+                    high_cardinality_result
+                        .rows
+                        .last()
+                        .expect("high-cardinality result has a final group")
+                        .values,
+                    vec![
+                        ScalarValue::Int64((rows - 1) as i64),
+                        ScalarValue::UInt64(1),
+                    ]
+                );
+            }
+            storage.close().expect("close aggregate cardinality Heap");
+            remove_batch_test_path(&path, false);
+        }
+    }
+
+    #[test]
+    fn batch_aggregate_filtered_children_limit_and_all_null_match_legacy() {
+        let columns = batch_columns();
+        let rows = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let (mut storage, path) = batch_storage("aggregate-filtered", false, rows);
+        let grouped_outputs = || {
+            vec![
+                AggregateOutput::GroupKey(columns[1].clone()),
+                batch_aggregate_expression(
+                    AggregateFunction::Count,
+                    AggregateInput::All,
+                    "COUNT(*)",
+                    PhysicalType::UInt64,
+                    false,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Sum,
+                    AggregateInput::Column(columns[0].clone()),
+                    "SUM(id)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+            ]
+        };
+        let predicates = [
+            batch_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            batch_literal(ScalarValue::Bool(false), PhysicalType::Bool),
+            batch_binary(
+                BinaryOp::Eq,
+                batch_column_expression(&columns[2]),
+                batch_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            ),
+            batch_binary(
+                BinaryOp::Eq,
+                batch_column_expression(&columns[4]),
+                batch_literal(ScalarValue::Int64(1), PhysicalType::Int64),
+            ),
+            batch_binary(
+                BinaryOp::Eq,
+                batch_column_expression(&columns[3]),
+                batch_literal(ScalarValue::Text("group-2".into()), PhysicalType::Text),
+            ),
+        ];
+        for predicate in predicates {
+            let plan = batch_aggregate(
+                batch_filter(batch_scan(columns.clone()), predicate),
+                vec![columns[1].clone()],
+                grouped_outputs(),
+            );
+            assert_batch_matches_legacy(&plan, &mut storage);
+        }
+        let projected_child = batch_aggregate(
+            batch_project(
+                batch_scan(columns.clone()),
+                vec![columns[1].clone(), columns[0].clone()],
+            ),
+            vec![columns[1].clone()],
+            grouped_outputs(),
+        );
+        assert_batch_matches_legacy(&projected_child, &mut storage);
+
+        let multiple_group_columns = batch_aggregate(
+            batch_scan(columns.clone()),
+            vec![columns[1].clone(), columns[2].clone()],
+            vec![
+                AggregateOutput::GroupKey(columns[2].clone()),
+                batch_aggregate_expression(
+                    AggregateFunction::Count,
+                    AggregateInput::All,
+                    "COUNT(*)",
+                    PhysicalType::UInt64,
+                    false,
+                ),
+                AggregateOutput::GroupKey(columns[1].clone()),
+            ],
+        );
+        assert_batch_matches_legacy(&multiple_group_columns, &mut storage);
+
+        let groups_after_first_batch = batch_aggregate(
+            batch_filter(
+                batch_scan(columns.clone()),
+                batch_binary(
+                    BinaryOp::GtEq,
+                    batch_column_expression(&columns[0]),
+                    batch_literal(
+                        ScalarValue::Int64(EXECUTION_BATCH_CAPACITY as i64),
+                        PhysicalType::Int64,
+                    ),
+                ),
+            ),
+            vec![columns[2].clone()],
+            vec![
+                AggregateOutput::GroupKey(columns[2].clone()),
+                batch_aggregate_expression(
+                    AggregateFunction::Sum,
+                    AggregateInput::Column(columns[0].clone()),
+                    "SUM(id)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+            ],
+        );
+        assert_batch_matches_legacy(&groups_after_first_batch, &mut storage);
+        let limited = batch_limit(
+            batch_aggregate(
+                batch_scan(columns.clone()),
+                vec![columns[1].clone()],
+                grouped_outputs(),
+            ),
+            3,
+        );
+        assert_batch_matches_legacy(&limited, &mut storage);
+        assert_eq!(
+            execute_rows(&limited, std::slice::from_mut(&mut storage))
+                .expect("execute Limit above Aggregate")
+                .rows
+                .len(),
+            3
+        );
+        storage.close().expect("close filtered aggregate Heap");
+        remove_batch_test_path(&path, false);
+
+        let (mut all_null, null_path) = batch_storage("aggregate-all-null", false, 0);
+        let mut transaction = all_null.begin_transaction().expect("begin all-NULL load");
+        for index in 0..=EXECUTION_BATCH_CAPACITY {
+            all_null
+                .insert_in(
+                    &mut transaction,
+                    &[
+                        ScalarValue::Int64(index as i64),
+                        ScalarValue::UInt64(0),
+                        ScalarValue::Bool(true),
+                        ScalarValue::Text("same".into()),
+                        ScalarValue::Null,
+                    ],
+                )
+                .expect("insert all-NULL row");
+        }
+        transaction.commit().expect("commit all-NULL load");
+        let all_null_plan = batch_aggregate(
+            batch_scan(columns.clone()),
+            Vec::new(),
+            vec![
+                batch_aggregate_expression(
+                    AggregateFunction::Count,
+                    AggregateInput::Column(columns[4].clone()),
+                    "COUNT(nullable_key)",
+                    PhysicalType::UInt64,
+                    false,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Sum,
+                    AggregateInput::Column(columns[4].clone()),
+                    "SUM(nullable_key)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Min,
+                    AggregateInput::Column(columns[4].clone()),
+                    "MIN(nullable_key)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Max,
+                    AggregateInput::Column(columns[4].clone()),
+                    "MAX(nullable_key)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+            ],
+        );
+        assert_batch_matches_legacy(&all_null_plan, &mut all_null);
+        assert_eq!(
+            execute_rows(&all_null_plan, std::slice::from_mut(&mut all_null))
+                .expect("execute all-NULL aggregate")
+                .rows[0]
+                .values,
+            vec![
+                ScalarValue::UInt64(0),
+                ScalarValue::Null,
+                ScalarValue::Null,
+                ScalarValue::Null,
+            ]
+        );
+        all_null.close().expect("close all-NULL Heap");
+        remove_batch_test_path(&null_path, false);
+    }
+
+    #[test]
+    fn batch_aggregates_are_equivalent_across_heap_lsm_and_legacy() {
+        let columns = batch_columns();
+        let rows = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let (mut heap, heap_path) = batch_storage("aggregate-engines", false, rows);
+        let (mut lsm, lsm_path) = batch_storage("aggregate-engines", true, rows);
+        let sum = || {
+            batch_aggregate_expression(
+                AggregateFunction::Sum,
+                AggregateInput::Column(columns[0].clone()),
+                "SUM(id)",
+                PhysicalType::Int64,
+                true,
+            )
+        };
+        let count = || {
+            batch_aggregate_expression(
+                AggregateFunction::Count,
+                AggregateInput::All,
+                "COUNT(*)",
+                PhysicalType::UInt64,
+                false,
+            )
+        };
+        let active = || {
+            batch_binary(
+                BinaryOp::Eq,
+                batch_column_expression(&columns[2]),
+                batch_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            )
+        };
+        let plans = [
+            batch_aggregate(batch_scan(columns.clone()), Vec::new(), vec![sum()]),
+            batch_aggregate(
+                batch_scan(columns.clone()),
+                vec![columns[1].clone()],
+                vec![AggregateOutput::GroupKey(columns[1].clone()), count()],
+            ),
+            batch_aggregate(
+                batch_filter(batch_scan(columns.clone()), active()),
+                vec![columns[1].clone()],
+                vec![AggregateOutput::GroupKey(columns[1].clone()), sum()],
+            ),
+        ];
+        for plan in plans {
+            let heap_result = execute_rows(&plan, std::slice::from_mut(&mut heap))
+                .expect("execute Heap batch aggregate");
+            let lsm_result = execute_rows(&plan, std::slice::from_mut(&mut lsm))
+                .expect("execute LSM batch aggregate");
+            assert_eq!(heap_result, lsm_result);
+            assert_batch_matches_legacy(&plan, &mut heap);
+            assert_batch_matches_legacy(&plan, &mut lsm);
+        }
+        heap.close().expect("close aggregate Heap");
+        lsm.close().expect("close aggregate LSM");
+        remove_batch_test_path(&heap_path, false);
+        remove_batch_test_path(&lsm_path, true);
+    }
+
+    #[test]
+    fn batch_aggregate_fallback_and_incremental_errors_keep_authoritative_details() {
+        let columns = batch_columns();
+        let (mut storage, path) = batch_storage("aggregate-errors", false, 0);
+        let mut missing = columns[0].clone();
+        missing.column_id = ColumnId(99);
+        missing.name = "missing".into();
+        let malformed = batch_aggregate(
+            batch_scan(vec![columns[0].clone()]),
+            Vec::new(),
+            vec![batch_aggregate_expression(
+                AggregateFunction::Sum,
+                AggregateInput::Column(missing),
+                "SUM(missing)",
+                PhysicalType::Int64,
+                true,
+            )],
+        );
+        for result in [
+            execute_rows(&malformed, std::slice::from_mut(&mut storage)),
+            execute_rows_legacy(&malformed, std::slice::from_mut(&mut storage)),
+        ] {
+            assert!(matches!(
+                result,
+                Err(ExecutionError::MissingColumn(name)) if name == "missing"
+            ));
+        }
+
+        let overflow_output = [batch_aggregate_expression(
+            AggregateFunction::Sum,
+            AggregateInput::Column(columns[0].clone()),
+            "precise_total",
+            PhysicalType::Int64,
+            true,
+        )];
+        let input_fields = [OutputField::Source(columns[0].clone())];
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &[], &overflow_output)
+            .expect("build overflow accumulator");
+        let error = accumulator
+            .consume_rows(&[
+                ExecutionRow {
+                    row_id: None,
+                    values: vec![ScalarValue::Int64(i64::MAX)],
+                },
+                ExecutionRow {
+                    row_id: None,
+                    values: vec![ScalarValue::Int64(1)],
+                },
+            ])
+            .expect_err("SUM must overflow");
+        assert!(matches!(
+            error,
+            ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Sum,
+                output,
+            } if output == "precise_total"
+        ));
+
+        let short_output = [batch_aggregate_expression(
+            AggregateFunction::Min,
+            AggregateInput::Column(columns[0].clone()),
+            "MIN(id)",
+            PhysicalType::Int64,
+            true,
+        )];
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &[], &short_output)
+            .expect("build short-row accumulator");
+        assert!(matches!(
+            accumulator.consume_rows(&[ExecutionRow {
+                row_id: None,
+                values: Vec::new(),
+            }]),
+            Err(ExecutionError::MissingColumn(name)) if name == "id"
+        ));
+        storage.close().expect("close aggregate error Heap");
+        remove_batch_test_path(&path, false);
     }
 
     #[test]
@@ -6626,7 +7328,9 @@ mod tests {
                 AggregateOutput::Aggregate(sum),
             ],
         };
-        let result = execute(&plan(&logical), &mut storage).expect("execute grouped aggregate");
+        let physical = plan(&logical);
+        assert_batch_matches_legacy(&physical, &mut storage);
+        let result = execute(&physical, &mut storage).expect("execute grouped aggregate");
         assert_eq!(
             result
                 .columns

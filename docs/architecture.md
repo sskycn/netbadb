@@ -1016,27 +1016,37 @@ a bounded block-at-a-time k-way merge.
   at a time. Neither engine constructs executor batches or knows Filter,
   Project, Limit, SQL expressions, or PhysicalPlan.
 
-Above that storage boundary, the executor recognizes only physical trees made
-from SeqScan plus Filter, Project, and Limit. It groups owned rows into a
-private 256-row `ExecutionBatch`, evaluates a position-bound `BoundExpr`,
-applies the existing move-aware `ProjectionPlan`, and tracks Limit state across
-batches. Limit cancellation stops the storage consumer after the current
-bounded batch; later physical rows are deliberately not requested. This is an
-execution behavior and not a whole-file integrity check: every row actually
-requested still receives the engine's complete MVCC, page/SSTable, codec,
-type, NULL, and UTF-8 validation.
+Above that storage boundary, one executor-private producer recognizes physical
+trees made from SeqScan plus Filter, Project, and Limit. It groups owned rows
+into a private 256-row `ExecutionBatch`, evaluates a position-bound
+`BoundExpr`, applies the existing move-aware `ProjectionPlan`, and tracks Limit
+state across batches. A callback consumes each bounded batch: the normal query
+path appends it to the fully owned result, while Aggregate updates incremental
+state and releases it. Limit cancellation stops the storage consumer after the
+current bounded batch; later physical rows are deliberately not requested.
+This is an execution behavior and not a whole-file integrity check: every row
+actually requested still receives the engine's complete MVCC, page/SSTable,
+codec, type, NULL, and UTF-8 validation.
 
 The public `QueryResult` remains fully owned and may contain the complete final
 result. Intermediate SeqScan, Filter, and Project results no longer require a
-full base-scan vector. Exact standalone Filter and predicate-only
-Project/Filter shapes retain the measured borrowed Phase 7 streaming
-specializations for every scalar type, avoiding owned values for rejected
-rows; Filter pipelines with Limit use the bounded batch runtime so they can
-stop upstream. Direct COUNT specializations also remain. Sort, Aggregate,
-joins, index/range scans, partition scans, and DML deterministically use the
-authoritative legacy executor for the complete tree. PhysicalPlan and
-Inspection JSON are unchanged, and executor dispatch contains no Heap/LSM
-branch.
+full base-scan vector. Aggregate over an eligible SeqScan/Filter/Project child
+binds group-key and aggregate-input positions once, then updates COUNT, checked
+SUM, MIN, and MAX state across batches. Global aggregation retains only one
+state set plus the current batch; grouped aggregation additionally retains one
+key and state set per distinct group in first-seen order. Aggregate is still a
+blocking boundary: it consumes its complete child before emitting rows, so a
+Limit above it truncates finalized groups and never stops aggregate input.
+
+Exact standalone Filter and predicate-only Project/Filter shapes retain the
+measured borrowed Phase 7 streaming specializations for every scalar type,
+avoiding owned values for rejected rows; Filter pipelines with Limit use the
+bounded batch runtime so they can stop upstream. Direct and filtered COUNT
+specializations remain ahead of generic streaming Aggregate dispatch. Sort,
+joins, index/range scans, partition scans, DML, and ineligible Aggregate
+children deterministically use the authoritative legacy executor for the
+complete tree. PhysicalPlan and Inspection JSON are unchanged, and executor
+dispatch contains no Heap/LSM branch.
 
 - `PageManager` owns fixed-size file I/O, page allocation, checked page-offset
   arithmetic, and file sync. It does not interpret heap or index semantics.

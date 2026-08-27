@@ -110,6 +110,15 @@ struct Observation {
     checksum: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupAggregateExpected {
+    key: u64,
+    count: u64,
+    sum: u64,
+    min: u64,
+    max: u64,
+}
+
 #[derive(Debug)]
 struct Measurement {
     scenario: String,
@@ -367,6 +376,35 @@ fn run_lsm_correctness_scenarios(
         expected,
         || database.query(sql).map_err(Into::into),
         ids_observation,
+    )?;
+    measurements.push(Measurement {
+        scenario: scenario.into(),
+        rows: expected.rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+
+    let scenario = "lsm_stream_aggregate_sum";
+    let sql = "SELECT SUM(id) FROM items";
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[],
+    )?;
+    let expected = Observation {
+        rows: 1,
+        checksum: arithmetic_sum(rows),
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        sum_observation,
     )?;
     measurements.push(Measurement {
         scenario: scenario.into(),
@@ -848,6 +886,67 @@ fn run_projection_attribution_scenarios(
         },
         settings,
         duplicate_payload_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_global_sum",
+        rows,
+        "SELECT SUM(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        sum_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_global_multi",
+        rows,
+        "SELECT SUM(id), MIN(id), MAX(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        expected_global_multi(rows),
+        settings,
+        |result| global_multi_observation(result, rows),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_text_min_max",
+        rows,
+        "SELECT MIN(payload), MAX(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows.saturating_sub(1)),
+        },
+        settings,
+        |result| text_min_max_observation(result, rows),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_grouped_multi",
+        rows,
+        "SELECT team_id, COUNT(*), SUM(id), MIN(id), MAX(id) FROM items GROUP BY team_id",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+        expected_grouped_aggregate(rows, 4, false),
+        settings,
+        |result| grouped_aggregate_observation(result, rows, 4, false),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_filtered_grouped",
+        rows,
+        "SELECT team_id, COUNT(*), SUM(id) FROM items WHERE active = true GROUP BY team_id",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID, ACTIVE_COLUMN_ID],
+        expected_grouped_aggregate(rows, 4, true),
+        settings,
+        |result| grouped_aggregate_observation(result, rows, 4, true),
         measurements,
     )?;
     run_attribution_query(
@@ -2876,6 +2975,196 @@ fn count_observation(result: &QueryResult) -> BenchResult<Observation> {
     Ok(Observation {
         rows: 1,
         checksum: u128::from(*count),
+    })
+}
+
+fn sum_observation(result: &QueryResult) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("SUM query must return one row"));
+    };
+    let [ScalarValue::Int64(sum)] = row.as_slice() else {
+        return Err(message_error(
+            "SUM query must return one non-NULL Int64 column",
+        ));
+    };
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::try_from(*sum).map_err(|_| message_error("negative SUM result"))?,
+    })
+}
+
+fn expected_global_multi(rows: u64) -> Observation {
+    Observation {
+        rows: 1,
+        checksum: arithmetic_sum(rows) + u128::from(rows.saturating_sub(1)),
+    }
+}
+
+fn global_multi_observation(result: &QueryResult, fixture_rows: u64) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("global multi aggregate must return one row"));
+    };
+    let [
+        ScalarValue::Int64(sum),
+        ScalarValue::Int64(min),
+        ScalarValue::Int64(max),
+    ] = row.as_slice()
+    else {
+        return Err(message_error(
+            "global multi aggregate must return three non-NULL Int64 columns",
+        ));
+    };
+    let expected_sum = i64::try_from(arithmetic_sum(fixture_rows))
+        .map_err(|_| message_error("fixture SUM exceeds i64"))?;
+    let expected_max = i64::try_from(fixture_rows.saturating_sub(1))
+        .map_err(|_| message_error("fixture MAX exceeds i64"))?;
+    if (*sum, *min, *max) != (expected_sum, 0, expected_max) {
+        return Err(message_error(format!(
+            "global multi aggregate returned ({sum}, {min}, {max}), expected ({expected_sum}, 0, {expected_max})"
+        )));
+    }
+    Ok(expected_global_multi(fixture_rows))
+}
+
+fn text_min_max_observation(result: &QueryResult, fixture_rows: u64) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("Text MIN/MAX must return one row"));
+    };
+    let [ScalarValue::Text(min), ScalarValue::Text(max)] = row.as_slice() else {
+        return Err(message_error(
+            "Text MIN/MAX must return two non-NULL Text columns",
+        ));
+    };
+    let expected_min = "payload-0000000000000000";
+    let expected_max = format!("payload-{:016}", fixture_rows.saturating_sub(1));
+    if min != expected_min || max != &expected_max {
+        return Err(message_error(format!(
+            "Text MIN/MAX returned ({min}, {max}), expected ({expected_min}, {expected_max})"
+        )));
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::from(fixture_rows.saturating_sub(1)),
+    })
+}
+
+fn expected_group_aggregate_values(
+    rows: u64,
+    cardinality: u64,
+    filtered: bool,
+) -> Vec<GroupAggregateExpected> {
+    let mut groups = Vec::<GroupAggregateExpected>::new();
+    for id in 0..rows {
+        if filtered && id % 3 != 0 {
+            continue;
+        }
+        let key = id % cardinality;
+        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+            group.count += 1;
+            group.sum += id;
+            group.min = group.min.min(id);
+            group.max = group.max.max(id);
+        } else {
+            groups.push(GroupAggregateExpected {
+                key,
+                count: 1,
+                sum: id,
+                min: id,
+                max: id,
+            });
+        }
+    }
+    groups
+}
+
+fn group_aggregate_checksum(group: GroupAggregateExpected, filtered: bool) -> u128 {
+    let base = u128::from(group.key) * CHECKSUM_FACTOR
+        + u128::from(group.count)
+        + u128::from(group.sum) * 17;
+    if filtered {
+        base
+    } else {
+        base + u128::from(group.min) * 31 + u128::from(group.max) * 47
+    }
+}
+
+fn expected_grouped_aggregate(rows: u64, cardinality: u64, filtered: bool) -> Observation {
+    let groups = expected_group_aggregate_values(rows, cardinality, filtered);
+    Observation {
+        rows: groups.len() as u64,
+        checksum: groups
+            .into_iter()
+            .map(|group| group_aggregate_checksum(group, filtered))
+            .sum(),
+    }
+}
+
+fn grouped_aggregate_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    cardinality: u64,
+    filtered: bool,
+) -> BenchResult<Observation> {
+    let expected = expected_group_aggregate_values(fixture_rows, cardinality, filtered);
+    if result.rows.len() != expected.len() {
+        return Err(message_error(format!(
+            "grouped aggregate returned {} groups; expected {}",
+            result.rows.len(),
+            expected.len()
+        )));
+    }
+    let mut checksum = 0_u128;
+    for (index, (row, expected)) in result.rows.iter().zip(expected).enumerate() {
+        let actual = if filtered {
+            let [
+                ScalarValue::Int64(key),
+                ScalarValue::UInt64(count),
+                ScalarValue::Int64(sum),
+            ] = row.as_slice()
+            else {
+                return Err(message_error(
+                    "filtered grouped aggregate result shape mismatch",
+                ));
+            };
+            (*key, *count, *sum, None, None)
+        } else {
+            let [
+                ScalarValue::Int64(key),
+                ScalarValue::UInt64(count),
+                ScalarValue::Int64(sum),
+                ScalarValue::Int64(min),
+                ScalarValue::Int64(max),
+            ] = row.as_slice()
+            else {
+                return Err(message_error("grouped aggregate result shape mismatch"));
+            };
+            (*key, *count, *sum, Some(*min), Some(*max))
+        };
+        let expected_tuple = (
+            i64::try_from(expected.key).map_err(|_| message_error("group key exceeds i64"))?,
+            expected.count,
+            i64::try_from(expected.sum).map_err(|_| message_error("group SUM exceeds i64"))?,
+            (!filtered)
+                .then(|| i64::try_from(expected.min))
+                .transpose()
+                .map_err(|_| message_error("group MIN exceeds i64"))?,
+            (!filtered)
+                .then(|| i64::try_from(expected.max))
+                .transpose()
+                .map_err(|_| message_error("group MAX exceeds i64"))?,
+        );
+        if actual != expected_tuple {
+            return Err(message_error(format!(
+                "grouped aggregate row {index} was {actual:?}; expected {expected_tuple:?}"
+            )));
+        }
+        checksum = checksum
+            .checked_add(group_aggregate_checksum(expected, filtered))
+            .ok_or_else(|| message_error("grouped aggregate checksum overflow"))?;
+    }
+    Ok(Observation {
+        rows: result.rows.len() as u64,
+        checksum,
     })
 }
 
