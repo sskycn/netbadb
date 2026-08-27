@@ -772,6 +772,12 @@ The implementation sequence is intentionally vertical:
     first-seen group semantics on Heap and LSM without materializing the full
     aggregate child. Aggregate remains a blocking finalization boundary, and
     direct and filtered COUNT specializations keep priority.
+57. Move-Aware Aggregate Ownership — complete; streaming Aggregate drains
+    owned batch rows, borrows MIN/MAX candidates for comparison, and moves the
+    final candidate into one replacing state while cloning only additional
+    actual owners. Finalization reuses the move-aware projection last-use plan,
+    while COUNT/SUM keep borrowed inspection and group-key HashMap ownership is
+    deliberately unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

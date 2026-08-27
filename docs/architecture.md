@@ -1038,6 +1038,18 @@ key and state set per distinct group in first-seen order. Aggregate is still a
 blocking boundary: it consumes its complete child before emitting rows, so a
 Limit above it truncates finalized groups and never stops aggregate input.
 
+For batches containing MIN or MAX, Aggregate drains owned rows while retaining
+the batch allocation. Each candidate is first borrowed for the existing typed
+comparison. Only states that actually replace on that row request ownership;
+one replacement receives the original `ScalarValue`, while additional
+replacements receive the necessary clones. COUNT and SUM continue to inspect
+borrowed values and use no ScalarValue ownership. Finalization combines owned
+group keys and finalized states, then applies the same last-use projection used
+by row Project: unique outputs move, while duplicate outputs clone before their
+last use and move the final owner. The group lookup remains
+`HashMap<Vec<ScalarValue>, usize>` and its per-row key ownership is explicitly
+outside this phase.
+
 Exact standalone Filter and predicate-only Project/Filter shapes retain the
 measured borrowed Phase 7 streaming specializations for every scalar type,
 avoiding owned values for rejected rows; Filter pipelines with Limit use the

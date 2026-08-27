@@ -1411,18 +1411,14 @@ struct GroupState {
     aggregate_states: Vec<AggregateState>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum AggregateOutputPosition {
-    GroupKey(usize),
-    Aggregate(usize),
-}
-
 struct AggregateAccumulator<'a> {
     group_keys: &'a [ColumnRef],
     aggregates: Vec<&'a AggregateExpr>,
+    has_extremes: bool,
     group_key_positions: Vec<usize>,
     aggregate_positions: Vec<Option<usize>>,
-    output_positions: Vec<AggregateOutputPosition>,
+    replacement_targets: Vec<Vec<usize>>,
+    output_projection: ProjectionPlan,
     output_fields: Vec<OutputField>,
     group_lookup: HashMap<Vec<ScalarValue>, usize>,
     groups: Vec<GroupState>,
@@ -2136,22 +2132,31 @@ impl<'a> AggregateAccumulator<'a> {
                 AggregateOutput::GroupKey(column) => group_keys
                     .iter()
                     .position(|group_key| same_source_column(group_key, column))
-                    .map(AggregateOutputPosition::GroupKey)
                     .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone())),
                 AggregateOutput::Aggregate(_) => {
-                    let position = AggregateOutputPosition::Aggregate(aggregate_index);
+                    let position = group_keys.len() + aggregate_index;
                     aggregate_index += 1;
                     Ok(position)
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let output_projection =
+            ProjectionPlan::from_positions(group_keys.len() + aggregates.len(), output_positions)?;
+        let has_extremes = aggregates.iter().any(|aggregate| {
+            matches!(
+                aggregate.function,
+                AggregateFunction::Min | AggregateFunction::Max
+            )
+        });
 
         let mut accumulator = Self {
             group_keys,
             aggregates,
+            has_extremes,
             group_key_positions,
             aggregate_positions,
-            output_positions,
+            replacement_targets: (0..input_fields.len()).map(|_| Vec::new()).collect(),
+            output_projection,
             output_fields: outputs.iter().map(AggregateOutput::output_field).collect(),
             group_lookup: HashMap::new(),
             groups: Vec::new(),
@@ -2165,38 +2170,22 @@ impl<'a> AggregateAccumulator<'a> {
         Ok(accumulator)
     }
 
-    fn consume_batch(&mut self, batch: &ExecutionBatch) -> Result<(), ExecutionError> {
+    fn consume_batch(&mut self, batch: &mut ExecutionBatch) -> Result<(), ExecutionError> {
         debug_assert!(batch.rows.len() <= EXECUTION_BATCH_CAPACITY);
-        self.consume_rows(&batch.rows)
+        if !self.has_extremes {
+            let result = self.consume_rows(&batch.rows);
+            batch.rows.clear();
+            return result;
+        }
+        for row in batch.rows.drain(..) {
+            self.consume_owned_row(row)?;
+        }
+        Ok(())
     }
 
     fn consume_rows(&mut self, rows: &[ExecutionRow]) -> Result<(), ExecutionError> {
         for row in rows {
-            let key_values = self
-                .group_key_positions
-                .iter()
-                .zip(self.group_keys)
-                .map(|(position, column)| {
-                    let value = row
-                        .values
-                        .get(*position)
-                        .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
-                    if !value.matches_type(&column.data_type) {
-                        return Err(ExecutionError::TypeMismatch);
-                    }
-                    Ok(value.clone())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let group_index = match self.group_lookup.get(&key_values).copied() {
-                Some(index) => index,
-                None => {
-                    let index = self.groups.len();
-                    self.groups
-                        .push(new_group_state(key_values.clone(), &self.aggregates)?);
-                    self.group_lookup.insert(key_values, index);
-                    index
-                }
-            };
+            let group_index = self.group_index(row)?;
             let group = self
                 .groups
                 .get_mut(group_index)
@@ -2207,29 +2196,110 @@ impl<'a> AggregateAccumulator<'a> {
                 .zip(&self.aggregate_positions)
                 .zip(&mut group.aggregate_states)
             {
-                let value = match position {
-                    Some(position) => {
-                        let value = row.values.get(*position).ok_or_else(|| {
-                            let name = match &aggregate.input {
-                                AggregateInput::Column(column) => column.name.clone(),
-                                AggregateInput::All => aggregate.output.name.clone(),
-                            };
-                            ExecutionError::MissingColumn(name)
-                        })?;
-                        let AggregateInput::Column(column) = &aggregate.input else {
-                            return Err(ExecutionError::TypeMismatch);
-                        };
-                        if !value.matches_type(&column.data_type) {
-                            return Err(ExecutionError::TypeMismatch);
-                        }
-                        Some(value)
-                    }
-                    None => None,
-                };
+                let value = aggregate_input_value(row, aggregate, *position)?;
                 update_aggregate_state(state, aggregate, value)?;
             }
         }
         Ok(())
+    }
+
+    fn consume_owned_row(&mut self, mut row: ExecutionRow) -> Result<(), ExecutionError> {
+        let group_index = self.group_index(&row)?;
+        for targets in &mut self.replacement_targets {
+            targets.clear();
+        }
+
+        let aggregates = &self.aggregates;
+        let aggregate_positions = &self.aggregate_positions;
+        let replacement_targets = &mut self.replacement_targets;
+        let group = self
+            .groups
+            .get_mut(group_index)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        for (aggregate_index, ((aggregate, position), state)) in aggregates
+            .iter()
+            .zip(aggregate_positions)
+            .zip(&mut group.aggregate_states)
+            .enumerate()
+        {
+            let value = aggregate_input_value(&row, aggregate, *position)?;
+            if matches!(
+                aggregate.function,
+                AggregateFunction::Min | AggregateFunction::Max
+            ) {
+                let Some(position) = position else {
+                    return Err(ExecutionError::InvalidAggregateInput {
+                        function: aggregate.function,
+                    });
+                };
+                let value = value.ok_or(ExecutionError::TypeMismatch)?;
+                if aggregate_extreme_replaces(state, value)? {
+                    replacement_targets
+                        .get_mut(*position)
+                        .ok_or(ExecutionError::TypeMismatch)?
+                        .push(aggregate_index);
+                }
+            } else {
+                update_aggregate_state(state, aggregate, value)?;
+            }
+        }
+
+        for (position, targets) in replacement_targets.iter().enumerate() {
+            let Some((&last_target, clone_targets)) = targets.split_last() else {
+                continue;
+            };
+            let candidate = std::mem::replace(
+                row.values
+                    .get_mut(position)
+                    .ok_or(ExecutionError::TypeMismatch)?,
+                ScalarValue::Null,
+            );
+            for target in clone_targets {
+                replace_aggregate_extreme(
+                    group
+                        .aggregate_states
+                        .get_mut(*target)
+                        .ok_or(ExecutionError::TypeMismatch)?,
+                    candidate.clone(),
+                )?;
+            }
+            replace_aggregate_extreme(
+                group
+                    .aggregate_states
+                    .get_mut(last_target)
+                    .ok_or(ExecutionError::TypeMismatch)?,
+                candidate,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn group_index(&mut self, row: &ExecutionRow) -> Result<usize, ExecutionError> {
+        let key_values = self
+            .group_key_positions
+            .iter()
+            .zip(self.group_keys)
+            .map(|(position, column)| {
+                let value = row
+                    .values
+                    .get(*position)
+                    .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+                if !value.matches_type(&column.data_type) {
+                    return Err(ExecutionError::TypeMismatch);
+                }
+                Ok(value.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match self.group_lookup.get(&key_values).copied() {
+            Some(index) => Ok(index),
+            None => {
+                let index = self.groups.len();
+                self.groups
+                    .push(new_group_state(key_values.clone(), &self.aggregates)?);
+                self.group_lookup.insert(key_values, index);
+                Ok(index)
+            }
+        }
     }
 
     fn finish(self) -> Result<ExecutionRows, ExecutionError> {
@@ -2237,30 +2307,20 @@ impl<'a> AggregateAccumulator<'a> {
             .groups
             .into_iter()
             .map(|group| {
-                let aggregate_values = group
-                    .aggregate_states
-                    .into_iter()
-                    .map(finalize_aggregate_state)
-                    .collect::<Vec<_>>();
-                let values = self
-                    .output_positions
-                    .iter()
-                    .map(|position| match position {
-                        AggregateOutputPosition::GroupKey(position) => group
-                            .key_values
-                            .get(*position)
-                            .cloned()
-                            .ok_or(ExecutionError::TypeMismatch),
-                        AggregateOutputPosition::Aggregate(position) => aggregate_values
-                            .get(*position)
-                            .cloned()
-                            .ok_or(ExecutionError::TypeMismatch),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(ExecutionRow {
-                    row_id: None,
-                    values,
-                })
+                let mut values = group.key_values;
+                values.extend(
+                    group
+                        .aggregate_states
+                        .into_iter()
+                        .map(finalize_aggregate_state),
+                );
+                project_execution_row(
+                    ExecutionRow {
+                        row_id: None,
+                        values,
+                    },
+                    &self.output_projection,
+                )
             })
             .collect::<Result<Vec<_>, ExecutionError>>()?;
         Ok(ExecutionRows {
@@ -2299,6 +2359,64 @@ fn initial_aggregate_state(aggregate: &AggregateExpr) -> Result<AggregateState, 
         },
         AggregateFunction::Min => Ok(AggregateState::Min(None)),
         AggregateFunction::Max => Ok(AggregateState::Max(None)),
+    }
+}
+
+fn aggregate_input_value<'a>(
+    row: &'a ExecutionRow,
+    aggregate: &AggregateExpr,
+    position: Option<usize>,
+) -> Result<Option<&'a ScalarValue>, ExecutionError> {
+    let Some(position) = position else {
+        return Ok(None);
+    };
+    let value = row.values.get(position).ok_or_else(|| {
+        let name = match &aggregate.input {
+            AggregateInput::Column(column) => column.name.clone(),
+            AggregateInput::All => aggregate.output.name.clone(),
+        };
+        ExecutionError::MissingColumn(name)
+    })?;
+    let AggregateInput::Column(column) = &aggregate.input else {
+        return Err(ExecutionError::TypeMismatch);
+    };
+    if !value.matches_type(&column.data_type) {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    Ok(Some(value))
+}
+
+fn aggregate_extreme_replaces(
+    state: &AggregateState,
+    value: &ScalarValue,
+) -> Result<bool, ExecutionError> {
+    if matches!(value, ScalarValue::Null) {
+        return Ok(false);
+    }
+    match state {
+        AggregateState::Min(None) | AggregateState::Max(None) => Ok(true),
+        AggregateState::Min(Some(current)) => Ok(compare_values(value, current)? == Ordering::Less),
+        AggregateState::Max(Some(current)) => {
+            Ok(compare_values(value, current)? == Ordering::Greater)
+        }
+        AggregateState::Count(_) | AggregateState::SumInt(_) | AggregateState::SumUInt(_) => {
+            Err(ExecutionError::TypeMismatch)
+        }
+    }
+}
+
+fn replace_aggregate_extreme(
+    state: &mut AggregateState,
+    value: ScalarValue,
+) -> Result<(), ExecutionError> {
+    match state {
+        AggregateState::Min(current) | AggregateState::Max(current) => {
+            *current = Some(value);
+            Ok(())
+        }
+        AggregateState::Count(_) | AggregateState::SumInt(_) | AggregateState::SumUInt(_) => {
+            Err(ExecutionError::TypeMismatch)
+        }
     }
 }
 
@@ -2341,25 +2459,10 @@ fn update_aggregate_state(
                 });
             }
         }
-        AggregateState::Min(current) => {
-            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
-                let replace = match current {
-                    None => true,
-                    Some(current) => compare_values(value, current)? == Ordering::Less,
-                };
-                if replace {
-                    *current = Some(value.clone());
-                }
-            }
-        }
-        AggregateState::Max(current) => {
-            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
-                let replace = match current {
-                    None => true,
-                    Some(current) => compare_values(value, current)? == Ordering::Greater,
-                };
-                if replace {
-                    *current = Some(value.clone());
+        AggregateState::Min(_) | AggregateState::Max(_) => {
+            if let Some(value) = value {
+                if aggregate_extreme_replaces(state, value)? {
+                    replace_aggregate_extreme(state, value.clone())?;
                 }
             }
         }
@@ -3456,22 +3559,23 @@ mod tests {
 
     use super::{
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
-        EvaluatedScalar, EvaluationValues, ExecutionError, ExecutionReadView, ExecutionRow,
-        ExecutionStorage, FilteredCountSummary, InequalityExecutionStrategy, ProjectionPlan,
-        QueryResult, TruthValue, bind_expression, build_batch_pipeline, choose_inequality_strategy,
-        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
-        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
-        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
-        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
-        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
-        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_truth,
-        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
-        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
-        execute_with_storages, filtered_count_eligibility, find_required_inequality,
-        inequality_can_match, materialize_count_values, materialize_direct_count_values,
-        potential_left_indices, project_execution_row, projected_streaming_seq_filter_eligibility,
-        required_right_extreme, sorted_non_null_indices, streaming_seq_filter_eligibility,
-        update_filtered_count_summary, visit_batch_pipeline,
+        EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
+        ExecutionRow, ExecutionStorage, FilteredCountSummary, InequalityExecutionStrategy,
+        ProjectionPlan, QueryResult, TruthValue, bind_expression, build_batch_pipeline,
+        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
+        compatibility_bindings, count_to_sql_u64, direct_count_eligibility, evaluate,
+        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
+        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
+        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
+        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
+        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
+        execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
+        find_required_inequality, inequality_can_match, materialize_count_values,
+        materialize_direct_count_values, potential_left_indices, project_execution_row,
+        projected_streaming_seq_filter_eligibility, required_right_extreme,
+        sorted_non_null_indices, streaming_seq_filter_eligibility, update_filtered_count_summary,
+        visit_batch_pipeline,
     };
     use netbadb_planner::{
         AccessPath, AccessPathCapabilities, PhysicalPlan, TableAccessStatistics, plan,
@@ -3904,6 +4008,238 @@ mod tests {
     }
 
     #[test]
+    fn move_aware_aggregate_moves_one_actual_replacement_and_clones_additional_owners() {
+        let payload = batch_columns()[3].clone();
+        let input_fields = [OutputField::Source(payload.clone())];
+        let extreme = |function, name: &str| {
+            batch_aggregate_expression(
+                function,
+                AggregateInput::Column(payload.clone()),
+                name,
+                PhysicalType::Text,
+                true,
+            )
+        };
+        let row = |value: String| ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Text(value)],
+        };
+
+        let final_max = String::from("z-final-max");
+        let final_max_pointer = final_max.as_ptr();
+        let outputs = [extreme(AggregateFunction::Max, "MAX(payload)")];
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &[], &outputs)
+            .expect("build single-MAX accumulator");
+        let mut batch = ExecutionBatch::with_capacity();
+        let capacity = batch.rows.capacity();
+        batch
+            .rows
+            .extend([row(String::from("a-first")), row(final_max)]);
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume owned MAX batch");
+        assert!(batch.rows.is_empty());
+        assert_eq!(batch.rows.capacity(), capacity);
+        let result = accumulator.finish().expect("finish single MAX");
+        assert_eq!(text_pointer(&result.rows[0].values[0]), final_max_pointer);
+
+        let duplicate_max = String::from("z-duplicate-max");
+        let duplicate_max_pointer = duplicate_max.as_ptr();
+        let outputs = [
+            extreme(AggregateFunction::Max, "MAX(payload)#1"),
+            extreme(AggregateFunction::Max, "MAX(payload)#2"),
+        ];
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &[], &outputs)
+            .expect("build duplicate-MAX accumulator");
+        let mut batch = ExecutionBatch::with_capacity();
+        batch.rows.push(row(duplicate_max));
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume duplicate MAX batch");
+        let result = accumulator.finish().expect("finish duplicate MAX");
+        assert_eq!(result.rows[0].values.len(), 2);
+        assert_eq!(
+            result.rows[0]
+                .values
+                .iter()
+                .filter(|value| text_pointer(value) == duplicate_max_pointer)
+                .count(),
+            1
+        );
+
+        let group_value = String::from("owned-group-key");
+        let group_outputs = [
+            AggregateOutput::GroupKey(payload.clone()),
+            AggregateOutput::GroupKey(payload.clone()),
+        ];
+        let mut accumulator = AggregateAccumulator::new(
+            &input_fields,
+            std::slice::from_ref(&payload),
+            &group_outputs,
+        )
+        .expect("build duplicate group-output accumulator");
+        let mut batch = ExecutionBatch::with_capacity();
+        batch.rows.push(row(group_value));
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume duplicate group-output batch");
+        let group_pointer = text_pointer(&accumulator.groups[0].key_values[0]);
+        let result = accumulator.finish().expect("finish duplicate group output");
+        assert_eq!(
+            result.rows[0]
+                .values
+                .iter()
+                .filter(|value| text_pointer(value) == group_pointer)
+                .count(),
+            1
+        );
+
+        let later_max = String::from("z-later-max");
+        let later_max_pointer = later_max.as_ptr();
+        let outputs = [
+            extreme(AggregateFunction::Min, "MIN(payload)"),
+            extreme(AggregateFunction::Max, "MAX(payload)"),
+        ];
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &[], &outputs)
+            .expect("build MIN/MAX accumulator");
+        let mut batch = ExecutionBatch::with_capacity();
+        batch
+            .rows
+            .extend([row(String::from("a-first-min")), row(later_max)]);
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume MIN/MAX batch");
+        let result = accumulator.finish().expect("finish MIN/MAX");
+        assert_eq!(
+            result.rows[0].values,
+            [
+                ScalarValue::Text(String::from("a-first-min")),
+                ScalarValue::Text(String::from("z-later-max")),
+            ]
+        );
+        assert_eq!(text_pointer(&result.rows[0].values[1]), later_max_pointer);
+    }
+
+    #[test]
+    fn move_aware_text_extremes_match_legacy_at_every_batch_boundary() {
+        let columns = batch_columns();
+        let extreme = |function, name: &str| {
+            batch_aggregate_expression(
+                function,
+                AggregateInput::Column(columns[3].clone()),
+                name,
+                PhysicalType::Text,
+                true,
+            )
+        };
+        for rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let (mut storage, path) =
+                batch_storage(&format!("move-aware-extremes-{rows}"), false, rows);
+            let plans = [
+                vec![extreme(AggregateFunction::Min, "MIN(payload)")],
+                vec![extreme(AggregateFunction::Max, "MAX(payload)")],
+                vec![
+                    extreme(AggregateFunction::Min, "MIN(payload)"),
+                    extreme(AggregateFunction::Max, "MAX(payload)"),
+                ],
+                vec![
+                    extreme(AggregateFunction::Min, "MIN(payload)#1"),
+                    extreme(AggregateFunction::Min, "MIN(payload)#2"),
+                ],
+                vec![
+                    extreme(AggregateFunction::Max, "MAX(payload)#1"),
+                    extreme(AggregateFunction::Max, "MAX(payload)#2"),
+                ],
+            ];
+            for outputs in plans {
+                assert_batch_matches_legacy(
+                    &batch_aggregate(batch_scan(columns.clone()), Vec::new(), outputs),
+                    &mut storage,
+                );
+            }
+            storage.close().expect("close move-aware boundary Heap");
+            remove_batch_test_path(&path, false);
+        }
+    }
+
+    #[test]
+    fn move_aware_text_extremes_preserve_null_repetition_and_alternation() {
+        let payload = batch_columns()[3].clone();
+        let input_fields = [OutputField::Source(payload.clone())];
+        let outputs = [
+            batch_aggregate_expression(
+                AggregateFunction::Min,
+                AggregateInput::Column(payload.clone()),
+                "MIN(payload)",
+                PhysicalType::Text,
+                true,
+            ),
+            batch_aggregate_expression(
+                AggregateFunction::Max,
+                AggregateInput::Column(payload),
+                "MAX(payload)",
+                PhysicalType::Text,
+                true,
+            ),
+        ];
+        for (values, expected) in [
+            (
+                vec![
+                    ScalarValue::Text(String::from("same")),
+                    ScalarValue::Text(String::from("same")),
+                ],
+                vec![
+                    ScalarValue::Text(String::from("same")),
+                    ScalarValue::Text(String::from("same")),
+                ],
+            ),
+            (
+                vec![
+                    ScalarValue::Text(String::from("middle")),
+                    ScalarValue::Null,
+                    ScalarValue::Text(String::from("high")),
+                    ScalarValue::Text(String::from("low")),
+                    ScalarValue::Text(String::from("high")),
+                ],
+                vec![
+                    ScalarValue::Text(String::from("high")),
+                    ScalarValue::Text(String::from("middle")),
+                ],
+            ),
+            (
+                vec![ScalarValue::Null, ScalarValue::Null],
+                vec![ScalarValue::Null, ScalarValue::Null],
+            ),
+        ] {
+            let rows = values
+                .into_iter()
+                .map(|value| ExecutionRow {
+                    row_id: None,
+                    values: vec![value],
+                })
+                .collect::<Vec<_>>();
+            let mut accumulator = AggregateAccumulator::new(&input_fields, &[], &outputs)
+                .expect("build Text pattern accumulator");
+            let mut batch = ExecutionBatch { rows };
+            accumulator
+                .consume_batch(&mut batch)
+                .expect("consume Text pattern");
+            assert_eq!(
+                accumulator.finish().expect("finish Text pattern").rows[0].values,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn batch_scan_cardinalities_cross_every_runtime_boundary() {
         let columns = batch_columns();
         for rows in [
@@ -4292,11 +4628,35 @@ mod tests {
                 batch_literal(ScalarValue::Text("group-2".into()), PhysicalType::Text),
             ),
         ];
+        for predicate in &predicates {
+            let plan = batch_aggregate(
+                batch_filter(batch_scan(columns.clone()), predicate.clone()),
+                vec![columns[1].clone()],
+                grouped_outputs(),
+            );
+            assert_batch_matches_legacy(&plan, &mut storage);
+        }
         for predicate in predicates {
             let plan = batch_aggregate(
                 batch_filter(batch_scan(columns.clone()), predicate),
                 vec![columns[1].clone()],
-                grouped_outputs(),
+                vec![
+                    AggregateOutput::GroupKey(columns[1].clone()),
+                    batch_aggregate_expression(
+                        AggregateFunction::Min,
+                        AggregateInput::Column(columns[3].clone()),
+                        "MIN(payload)",
+                        PhysicalType::Text,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Max,
+                        AggregateInput::Column(columns[3].clone()),
+                        "MAX(payload)",
+                        PhysicalType::Text,
+                        true,
+                    ),
+                ],
             );
             assert_batch_matches_legacy(&plan, &mut storage);
         }
@@ -4326,6 +4686,65 @@ mod tests {
             ],
         );
         assert_batch_matches_legacy(&multiple_group_columns, &mut storage);
+
+        let nullable_group_extremes = batch_aggregate(
+            batch_scan(columns.clone()),
+            vec![columns[4].clone()],
+            vec![
+                AggregateOutput::GroupKey(columns[4].clone()),
+                batch_aggregate_expression(
+                    AggregateFunction::Min,
+                    AggregateInput::Column(columns[3].clone()),
+                    "MIN(payload)",
+                    PhysicalType::Text,
+                    true,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Max,
+                    AggregateInput::Column(columns[3].clone()),
+                    "MAX(payload)",
+                    PhysicalType::Text,
+                    true,
+                ),
+            ],
+        );
+        assert_batch_matches_legacy(&nullable_group_extremes, &mut storage);
+
+        let primitive_extremes = batch_aggregate(
+            batch_scan(columns.clone()),
+            Vec::new(),
+            vec![
+                batch_aggregate_expression(
+                    AggregateFunction::Min,
+                    AggregateInput::Column(columns[0].clone()),
+                    "MIN(id)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Max,
+                    AggregateInput::Column(columns[1].clone()),
+                    "MAX(unsigned_key)",
+                    PhysicalType::UInt64,
+                    true,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Min,
+                    AggregateInput::Column(columns[2].clone()),
+                    "MIN(active)",
+                    PhysicalType::Bool,
+                    true,
+                ),
+                batch_aggregate_expression(
+                    AggregateFunction::Max,
+                    AggregateInput::Column(columns[2].clone()),
+                    "MAX(active)",
+                    PhysicalType::Bool,
+                    true,
+                ),
+            ],
+        );
+        assert_batch_matches_legacy(&primitive_extremes, &mut storage);
 
         let groups_after_first_batch = batch_aggregate(
             batch_filter(
@@ -4472,6 +4891,26 @@ mod tests {
         };
         let plans = [
             batch_aggregate(batch_scan(columns.clone()), Vec::new(), vec![sum()]),
+            batch_aggregate(
+                batch_scan(columns.clone()),
+                Vec::new(),
+                vec![
+                    batch_aggregate_expression(
+                        AggregateFunction::Min,
+                        AggregateInput::Column(columns[0].clone()),
+                        "MIN(id)",
+                        PhysicalType::Int64,
+                        true,
+                    ),
+                    batch_aggregate_expression(
+                        AggregateFunction::Max,
+                        AggregateInput::Column(columns[0].clone()),
+                        "MAX(id)",
+                        PhysicalType::Int64,
+                        true,
+                    ),
+                ],
+            ),
             batch_aggregate(
                 batch_scan(columns.clone()),
                 vec![columns[1].clone()],

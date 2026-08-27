@@ -914,6 +914,34 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     run_attribution_query(
+        "stream_aggregate_text_min",
+        rows,
+        "SELECT MIN(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: 0,
+        },
+        settings,
+        |result| text_extreme_observation(result, rows, false, 1),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_text_max",
+        rows,
+        "SELECT MAX(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows.saturating_sub(1)),
+        },
+        settings,
+        |result| text_extreme_observation(result, rows, true, 1),
+        measurements,
+    )?;
+    run_attribution_query(
         "stream_aggregate_text_min_max",
         rows,
         "SELECT MIN(payload), MAX(payload) FROM items",
@@ -925,6 +953,62 @@ fn run_projection_attribution_scenarios(
         },
         settings,
         |result| text_min_max_observation(result, rows),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_text_max_duplicate",
+        rows,
+        "SELECT MAX(payload), MAX(payload) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows.saturating_sub(1)) * 2,
+        },
+        settings,
+        |result| text_extreme_observation(result, rows, true, 2),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_int_min",
+        rows,
+        "SELECT MIN(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: 0,
+        },
+        settings,
+        |result| integer_extreme_observation(result, rows, false, 1),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_int_max",
+        rows,
+        "SELECT MAX(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows.saturating_sub(1)),
+        },
+        settings,
+        |result| integer_extreme_observation(result, rows, true, 1),
+        measurements,
+    )?;
+    run_attribution_query(
+        "stream_aggregate_int_min_max",
+        rows,
+        "SELECT MIN(id), MAX(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(rows.saturating_sub(1)),
+        },
+        settings,
+        |result| integer_min_max_observation(result, rows),
         measurements,
     )?;
     run_attribution_query(
@@ -3040,6 +3124,104 @@ fn text_min_max_observation(result: &QueryResult, fixture_rows: u64) -> BenchRes
     if min != expected_min || max != &expected_max {
         return Err(message_error(format!(
             "Text MIN/MAX returned ({min}, {max}), expected ({expected_min}, {expected_max})"
+        )));
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::from(fixture_rows.saturating_sub(1)),
+    })
+}
+
+fn text_extreme_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    maximum: bool,
+    copies: usize,
+) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("Text extreme query must return one row"));
+    };
+    if row.len() != copies {
+        return Err(message_error(format!(
+            "Text extreme query returned {} columns; expected {copies}",
+            row.len()
+        )));
+    }
+    let endpoint = if maximum {
+        fixture_rows.saturating_sub(1)
+    } else {
+        0
+    };
+    let expected = format!("payload-{endpoint:016}");
+    for (position, value) in row.iter().enumerate() {
+        let ScalarValue::Text(value) = value else {
+            return Err(message_error(format!(
+                "Text extreme column {position} was not Text"
+            )));
+        };
+        if value != &expected {
+            return Err(message_error(format!(
+                "Text extreme column {position} was {value}; expected {expected}"
+            )));
+        }
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::from(endpoint) * copies as u128,
+    })
+}
+
+fn integer_extreme_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    maximum: bool,
+    copies: usize,
+) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("integer extreme query must return one row"));
+    };
+    if row.len() != copies {
+        return Err(message_error(format!(
+            "integer extreme query returned {} columns; expected {copies}",
+            row.len()
+        )));
+    }
+    let endpoint = if maximum {
+        fixture_rows.saturating_sub(1)
+    } else {
+        0
+    };
+    let expected = i64::try_from(endpoint).map_err(|_| message_error("endpoint exceeds i64"))?;
+    for (position, value) in row.iter().enumerate() {
+        if value != &ScalarValue::Int64(expected) {
+            return Err(message_error(format!(
+                "integer extreme column {position} was {value:?}; expected {expected}"
+            )));
+        }
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::from(endpoint) * copies as u128,
+    })
+}
+
+fn integer_min_max_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("integer MIN/MAX must return one row"));
+    };
+    let [ScalarValue::Int64(min), ScalarValue::Int64(max)] = row.as_slice() else {
+        return Err(message_error(
+            "integer MIN/MAX must return two non-NULL Int64 columns",
+        ));
+    };
+    let expected_max = i64::try_from(fixture_rows.saturating_sub(1))
+        .map_err(|_| message_error("fixture MAX exceeds i64"))?;
+    if (*min, *max) != (0, expected_max) {
+        return Err(message_error(format!(
+            "integer MIN/MAX returned ({min}, {max}); expected (0, {expected_max})"
         )));
     }
     Ok(Observation {

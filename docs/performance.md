@@ -1109,6 +1109,59 @@ Grouped Aggregate additionally retains one key and state set per distinct
 group and preserves first-seen order. Both Heap and LSM use the same executor
 callback, and no storage interface or persistent representation changed.
 
+## Phase 57 move-aware Aggregate ownership attribution
+
+Phase 57 added separate ascending-fixture Text MIN, Text MAX, duplicate Text
+MAX, and Int64 MIN/MAX cases before production changes. MIN normally replaces
+once, MAX replaces on every row, and duplicate MAX requires two final owners.
+The existing Text MIN+MAX, SUM, grouped Aggregate, COUNT, Limit, projected scan,
+and LSM cases remain target or observational controls. Every scenario retains
+exact plan, result/value, base-column, `black_box`, warm-process, and
+no-timing-threshold gates.
+
+The serial quick runs are stored outside the repository at
+`/tmp/netbadb-phase57-pre.txt` and `/tmp/netbadb-phase57-post.txt`. Medians are
+machine-local nanoseconds per query:
+
+| scenario | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| Text MIN, one replacement | 426,375 | 593,417 | +39.2% |
+| Text MAX, frequent replacement | 541,834 | 550,542 | +1.6% |
+| Text MIN+MAX | 594,541 | 787,583 | +32.5% |
+| duplicate Text MAX | 747,625 | 626,208 | -16.2% |
+| Int64 MIN control | 367,042 | 467,833 | +27.5% |
+| Int64 MAX control | 424,458 | 481,083 | +13.3% |
+| Int64 MIN+MAX control | 382,458 | 457,583 | +19.6% |
+| global SUM control | 471,833 | 476,500 | +1.0% |
+| grouped mixed aggregate | 455,959 | 556,417 | +22.0% |
+| filtered grouped aggregate | 488,208 | 533,667 | +9.3% |
+| low-cardinality GROUP BY | 418,750 | 643,125 | +53.6% |
+| higher-cardinality GROUP BY | 490,334 | 637,042 | +29.9% |
+| direct COUNT(*) control | 260,417 | 254,792 | -2.2% |
+| direct COUNT(id) control | 380,333 | 312,917 | -17.7% |
+| filtered COUNT(payload) control | 327,125 | 366,791 | +12.1% |
+| early Limit control | 22,959 | 15,125 | -34.1% |
+| full projected scan control | 443,583 | 382,083 | -13.9% |
+| LSM SUM control | 72,708 | 98,458 | +35.4% |
+| LSM Filter+Project+Limit control | 76,292 | 98,584 | +29.2% |
+
+Absolute results are visibly noisy: unrelated controls range from -34.1% to
++35.4%, so the positive MIN and grouping deltas cannot be assigned solely to
+the implementation. Within each run, the ownership-sensitive ratios are more
+diagnostic. Text MAX/MIN contracted from 1.271x to 0.928x, duplicate MAX/MAX
+from 1.380x to 1.137x, and MIN+MAX/MIN from 1.394x to 1.327x. This matches the
+replacement hypothesis: high- and multi-owner replacement work improved
+relative to the low-replacement baseline. Structural pointer-identity tests
+independently prove that one actual owner receives the original String
+allocation and only additional owners clone it.
+
+The implementation is retained for that structural ownership guarantee and
+relative attribution, not as an absolute latency claim. Pure COUNT/SUM bypass
+replacement bookkeeping, direct/filtered COUNT dispatch remains unchanged,
+and no timing assertion or CI performance threshold was added. Group-key
+ownership/hash attribution is the leading next measurement; Text comparison
+and generic Filter prebinding follow.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on

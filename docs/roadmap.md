@@ -1265,11 +1265,29 @@ isolation, concurrent writers, and background execution.
   grouping; cross-batch groups; output order; overflow/error attribution;
   Heap/LSM equality; fallback; and independent legacy-result equivalence.
 
-Measured Phase 57 candidates, in current evidence order, are MIN/MAX Text
-ownership (the smallest target improvement), group-key ownership/hash
-attribution (higher-cardinality grouping improved less than low-cardinality
-grouping), and the already-recorded generic borrowed Filter position prebinding.
-Broader candidates remain typed column-oriented batches and SIMD,
-batch HashJoin and Sort, index/range and partition batch sources, Columnar
-storage, Serializable isolation, concurrent writers, and background execution.
-Phase 56 does not select one of them.
+## Move-Aware Aggregate Ownership (complete)
+
+- changed streaming Aggregate to drain owned rows from each batch while
+  retaining the batch allocation for reuse;
+- MIN/MAX borrow candidates for NULL/type/comparison decisions, collect only
+  states that actually replace, clone for all but one required owner, and move
+  the original candidate into the final replacing state;
+- retained the borrowed legacy Aggregate path and the existing authoritative
+  comparison, NULL, overflow, and finalization semantics. Pure COUNT/SUM
+  batches bypass replacement bookkeeping and continue borrowed inspection;
+- reused `ProjectionPlan` last-use ownership during finalization so unique
+  group/state values move, while duplicate outputs clone only before their
+  final use;
+- left `HashMap<Vec<ScalarValue>, usize>` and group-key lookup cloning intact;
+  no storage API, PhysicalPlan, persistent format, protocol, SDK, dependency,
+  unsafe code, or COUNT specialization changed;
+- added pointer-identity structural tests plus empty/1/255/256/257/512/513,
+  duplicate MIN/MAX, equal/alternating/NULL Text, Int64/UInt64/Bool,
+  grouped/filtered/NULL-key, Heap/LSM, error, and legacy-equivalence coverage.
+
+The quick attribution is noisy in absolute time, but the ascending Text
+MAX/MIN ratio contracted from 1.271x to 0.928x and duplicate-MAX/MAX from
+1.380x to 1.137x. That supports group-key ownership/hash attribution as the
+leading Phase 58 recommendation. Aggregate Text comparison and generic Filter
+prebinding follow; typed column-oriented batches, SIMD, batch HashJoin/Sort,
+and index/range/partition batch sources remain broader unselected candidates.
