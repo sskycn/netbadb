@@ -995,7 +995,7 @@ to 1.003125 ms and therefore did not share that target-level improvement.
 Every benchmark correctness gate passed; there is no timing threshold and no
 extra full run was performed.
 
-### Phase 7V — Generic Filter position prebinding (selected, not started)
+### Phase 7V — Generic Filter position prebinding (partially absorbed)
 
 Phase 7U ends the Filter ownership line: predicate-only all-TRUE Text is now
 close to the primitive control, while retained Text is necessary QueryResult
@@ -1003,10 +1003,14 @@ ownership. The wide/single Int64 dynamic-lookup ratio remains 2.241x after
 Phase 7U, so binding generic Filter Column identities to checked source
 positions once is the strongest next measured candidate.
 
-Phase 7V is not implemented here. Later candidates remain sequential
-PageManager traversal, BufferPool page snapshot cloning, AND/OR
-short-circuiting, MIN/MAX ownership, group-key ownership, covering/index-only
-reads, broader HashJoin eligibility, and multi-inequality intersection.
+The later Vectorized Execution Foundation binds every Filter position once for
+its eligible SeqScan batch pipeline. It does not replace the dynamic evaluator
+in every legacy fallback or the retained borrowed predicate-only Text fast
+path, so generic Filter prebinding is not complete repository-wide. Later
+candidates remain sequential PageManager traversal, BufferPool page snapshot
+cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
+covering/index-only reads, broader HashJoin eligibility, and multi-inequality
+intersection.
 
 ### Later Phase 7 work
 
@@ -1198,6 +1202,37 @@ remain unsupported.
 - retained manifest authority, canonical WAL retry, all-batch recovery
   validation, and truly read-only recovery inspection.
 
-The next recommended phase is **Vectorized Execution Foundation**. Heap and LSM
-now provide mature, distinct physical storage paths; the next shared bottleneck
-should be measured above the storage boundary before adding Columnar storage.
+LSM Hardening selected **Vectorized Execution Foundation** as the next measured
+phase because Heap and LSM then provided mature, distinct physical storage
+paths and exposed a shared bottleneck above their boundary.
+
+## Vectorized Execution Foundation (complete)
+
+- added an executor-private 256-row owned `ExecutionBatch`; the capacity is a
+  named bounded runtime starting point rather than an optimality claim;
+- added one storage-neutral synchronous owned-row consumer with typed
+  `ControlFlow` cancellation. Heap retains validated-once MVCC/page/codec
+  traversal; LSM streams its ordered committed merge plus bounded transaction
+  overlay without first materializing every visible base row;
+- eligible complete trees contain one SeqScan and any existing Filter,
+  Project, and Limit operators. Filter reuses `BoundExpr`, binds column
+  positions once, and preserves TRUE/FALSE/UNKNOWN semantics. Project reuses
+  move-aware identity/subset/reorder/duplicate behavior. Limit carries
+  remaining state across batches and cancels upstream;
+- QueryResult remains fully owned. PhysicalPlan, logical/typed IR, inspection,
+  protocol, SDK, and every persistent format remain unchanged. Executor code
+  does not branch on Heap versus LSM;
+- exact predicate-only Text Project/Filter retains the measured borrowed Phase
+  7U specialization, and direct COUNT specializations remain. Sort, grouped
+  Aggregate, SUM/MIN/MAX, joins, index/range scans, partition scans, and DML
+  deterministically use the legacy materialized implementation for the full
+  tree;
+- deterministic tests cover 0, 1, BATCH_SIZE−1, BATCH_SIZE, BATCH_SIZE+1,
+  2×BATCH_SIZE, and 2×BATCH_SIZE+1 rows; zero-width scans/projects; Bool,
+  Int64, UInt64, Text, NULL, nullable and duplicate values; Filter truth
+  outcomes; move-aware projections; Limit boundaries; Heap/LSM equality; and
+  test-only batch-versus-legacy result equality.
+
+Deferred work remains typed column-oriented batches, SIMD, vectorized
+Aggregate, HashJoin, Sort, index/range scans and partition scans, Columnar
+storage, Serializable isolation, concurrent writers, and background execution.

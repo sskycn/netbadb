@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -1805,6 +1806,33 @@ impl HeapStorage {
         E: From<StorageError>,
         F: for<'row> FnMut(RowId, &[ScalarRef<'row>], &[bool]) -> Result<(), E>,
     {
+        let _ = self.visit_row_scalar_refs_with_presence_view_control::<E, _>(
+            value_columns,
+            presence_columns,
+            view,
+            |row_id, values, presence| {
+                visitor(row_id, values, presence)?;
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Visits validated visible rows until the consumer explicitly breaks.
+    ///
+    /// `ControlFlow::Break` is successful cancellation, not a storage error;
+    /// no later page or row is requested after it is returned.
+    pub fn visit_row_scalar_refs_with_presence_view_control<E, F>(
+        &mut self,
+        value_columns: &[ColumnId],
+        presence_columns: &[ColumnId],
+        view: &ReadView,
+        mut visitor: F,
+    ) -> Result<ControlFlow<()>, E>
+    where
+        E: From<StorageError>,
+        F: for<'row> FnMut(RowId, &[ScalarRef<'row>], &[bool]) -> Result<ControlFlow<()>, E>,
+    {
         let projection = ConsumerProjection::resolve(&self.table, value_columns, presence_columns)
             .map_err(E::from)?;
         let mut presence = vec![false; projection.presence_count];
@@ -1840,7 +1868,7 @@ impl HeapStorage {
                         &mut presence,
                     )
                     .map_err(E::from)?;
-                    visitor(
+                    if visitor(
                         RowId {
                             page: page_id,
                             slot: slot.0,
@@ -1848,11 +1876,15 @@ impl HeapStorage {
                         },
                         &values,
                         &presence,
-                    )?;
+                    )?
+                    .is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Returns the exact number of current live rows whose requested column is

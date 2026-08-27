@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -20,7 +21,9 @@ use netbadb_types::{
     TableId, TxnId,
 };
 
-use crate::row_codec::{decode_row, decode_row_columns, encode_row, validate_row};
+use crate::row_codec::{
+    decode_row, decode_row_columns, decode_row_positions, encode_row, resolve_columns, validate_row,
+};
 use crate::{
     CheckpointError, IsolationLevel, PreparedDecision, PreparedTransaction,
     PreparedTransactionState, PreparedTxnResolution, PresenceCountSummary, RecoveryError,
@@ -1229,6 +1232,32 @@ impl LsmStorage {
         self.scan_range_columns_with_view(None, columns, view)
     }
 
+    pub(crate) fn visit_columns_with_view_control<E, F>(
+        &mut self,
+        columns: &[ColumnId],
+        view: &LsmReadView,
+        mut visitor: F,
+    ) -> Result<ControlFlow<()>, E>
+    where
+        E: From<StorageError>,
+        F: FnMut(LsmRowHandle, Vec<ScalarValue>) -> Result<ControlFlow<()>, E>,
+    {
+        let shared = self.shared.borrow();
+        validate_view(&shared, view).map_err(E::from)?;
+        let positions = resolve_columns(&shared.table, columns).map_err(E::from)?;
+        visit_visible_rows(&shared, view, None, |key, observed, row| {
+            let values = decode_row_positions(row, &shared.table, &positions).map_err(E::from)?;
+            visitor(
+                LsmRowHandle {
+                    row_id: key.row_id,
+                    observed,
+                    clustering_key: key.clustering.into(),
+                },
+                values,
+            )
+        })
+    }
+
     pub(crate) fn point_lookup_columns_with_view(
         &mut self,
         key: &ScalarValue,
@@ -2283,107 +2312,252 @@ fn collect_visible_rows(
     view: &LsmReadView,
     range: Option<&KeyRange>,
 ) -> Result<Vec<VisibleRow>, StorageError> {
-    let mut runs = Vec::new();
-    let memtable = shared
-        .memtable
+    let mut visible = Vec::new();
+    let _ = visit_visible_rows::<StorageError, _>(shared, view, range, |key, observed, row| {
+        visible.push(VisibleRow {
+            key,
+            observed,
+            row: row.to_vec(),
+        });
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(visible)
+}
+
+fn visit_visible_rows<E, F>(
+    shared: &LsmShared,
+    view: &LsmReadView,
+    range: Option<&KeyRange>,
+    mut visitor: F,
+) -> Result<ControlFlow<()>, E>
+where
+    E: From<StorageError>,
+    F: FnMut(PhysicalKey, LsmObservedVersion, &[u8]) -> Result<ControlFlow<()>, E>,
+{
+    let mut committed =
+        VisibleCommittedCursor::new(shared, view.horizon, range).map_err(E::from)?;
+    let mut pending = view
+        .pending
         .iter()
-        .filter(|(key, _)| range.is_none_or(|range| range.contains(key.clustering)))
-        .flat_map(|(key, versions)| {
-            versions.iter().map(move |(version, value)| VersionedEntry {
-                key: *key,
-                version: *version,
-                value: value.clone(),
-            })
-        })
-        .collect::<VecDeque<_>>();
-    if !memtable.is_empty() {
-        runs.push(MergeRun::new(EntryCursor::Memory(memtable))?);
-    }
-    for sstable in select_sstables_for_read(shared, range) {
-        runs.push(MergeRun::new(EntryCursor::Sstable(
-            SstableEntryCursor::new(
-                sstable,
-                &shared.table,
-                range,
-                Some(&shared.runtime.amplification),
-            )?,
-        ))?);
-    }
-    let mut visible = BTreeMap::<PhysicalKey, VisibleRow>::new();
-    let mut current_key = None;
-    let mut selected: Option<VersionedEntry> = None;
-    loop {
-        let entry = match next_merged_entry(&mut runs) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(error) => return Err(error),
-        };
-        if current_key.is_some_and(|key| key != entry.key) {
-            install_visible_entry(&mut visible, selected.take());
-        }
-        current_key = Some(entry.key);
-        if entry.version <= view.horizon {
-            selected = Some(entry);
-        }
-    }
-    install_visible_entry(&mut visible, selected);
-    for (row_id, pending) in &view.pending {
-        if let Some(original) = pending.original_key {
-            visible.remove(&PhysicalKey {
-                clustering: original,
-                row_id: *row_id,
-            });
-        }
-        if let Some(row) = &pending.row {
+        .filter_map(|(row_id, pending)| {
+            let row = pending.row.as_deref()?;
             let key = PhysicalKey {
                 clustering: pending.current_key,
                 row_id: *row_id,
             };
-            if range.is_none_or(|range| range.contains(key.clustering)) {
-                visible.insert(
-                    key,
-                    VisibleRow {
-                        key,
-                        observed: LsmObservedVersion::Pending(pending.revision),
-                        row: row.clone(),
-                    },
-                );
+            range
+                .is_none_or(|range| range.contains(key.clustering))
+                .then_some((key, pending.revision, row))
+        })
+        .collect::<Vec<_>>();
+    pending.sort_unstable_by_key(|(key, _, _)| *key);
+
+    let mut pending_position = 0;
+    let mut committed_row =
+        next_unshadowed_committed(&mut committed, &view.pending).map_err(E::from)?;
+    loop {
+        let pending_row = pending.get(pending_position).copied();
+        match (committed_row.as_ref(), pending_row) {
+            (None, None) => return Ok(ControlFlow::Continue(())),
+            (Some(row), None) => {
+                if visitor(row.key, row.observed, &row.row)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                committed_row =
+                    next_unshadowed_committed(&mut committed, &view.pending).map_err(E::from)?;
+            }
+            (None, Some((key, revision, row))) => {
+                if visitor(key, LsmObservedVersion::Pending(revision), row)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                pending_position += 1;
+            }
+            (Some(row), Some((key, revision, pending_values))) => match row.key.cmp(&key) {
+                std::cmp::Ordering::Less => {
+                    if visitor(row.key, row.observed, &row.row)?.is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    committed_row = next_unshadowed_committed(&mut committed, &view.pending)
+                        .map_err(E::from)?;
+                }
+                std::cmp::Ordering::Equal => {
+                    if visitor(key, LsmObservedVersion::Pending(revision), pending_values)?
+                        .is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    pending_position += 1;
+                    committed_row = next_unshadowed_committed(&mut committed, &view.pending)
+                        .map_err(E::from)?;
+                }
+                std::cmp::Ordering::Greater => {
+                    if visitor(key, LsmObservedVersion::Pending(revision), pending_values)?
+                        .is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    pending_position += 1;
+                }
+            },
+        }
+    }
+}
+
+fn next_unshadowed_committed(
+    cursor: &mut VisibleCommittedCursor<'_>,
+    pending: &BTreeMap<LsmRowId, PendingRow>,
+) -> Result<Option<VisibleRow>, StorageError> {
+    loop {
+        let Some(row) = cursor.next()? else {
+            return Ok(None);
+        };
+        let shadowed = pending
+            .get(&row.key.row_id)
+            .is_some_and(|pending| pending.original_key == Some(row.key.clustering));
+        if !shadowed {
+            return Ok(Some(row));
+        }
+    }
+}
+
+struct VisibleCommittedCursor<'a> {
+    runs: Vec<MergeRun<'a>>,
+    horizon: LsmCommitSeq,
+    current_key: Option<PhysicalKey>,
+    selected: Option<VersionedEntry>,
+    exhausted: bool,
+}
+
+impl<'a> VisibleCommittedCursor<'a> {
+    fn new(
+        shared: &'a LsmShared,
+        horizon: LsmCommitSeq,
+        range: Option<&'a KeyRange>,
+    ) -> Result<Self, StorageError> {
+        let mut runs = Vec::new();
+        let memory = MemoryEntryCursor::new(&shared.memtable, range);
+        if !shared.memtable.is_empty() {
+            runs.push(MergeRun::new(EntryCursor::Memory(memory))?);
+        }
+        for sstable in select_sstables_for_read(shared, range) {
+            runs.push(MergeRun::new(EntryCursor::Sstable(
+                SstableEntryCursor::new(
+                    sstable,
+                    &shared.table,
+                    range,
+                    Some(&shared.runtime.amplification),
+                )?,
+            ))?);
+        }
+        Ok(Self {
+            runs,
+            horizon,
+            current_key: None,
+            selected: None,
+            exhausted: false,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<VisibleRow>, StorageError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        loop {
+            let Some(entry) = next_merged_entry(&mut self.runs)? else {
+                self.exhausted = true;
+                return Ok(self.selected.take().and_then(visible_committed_row));
+            };
+            if self.current_key.is_some_and(|key| key != entry.key) {
+                let completed = self.selected.take().and_then(visible_committed_row);
+                self.current_key = Some(entry.key);
+                if entry.version <= self.horizon {
+                    self.selected = Some(entry);
+                }
+                if completed.is_some() {
+                    return Ok(completed);
+                }
+            } else {
+                self.current_key = Some(entry.key);
+                if entry.version <= self.horizon {
+                    self.selected = Some(entry);
+                }
             }
         }
     }
-    Ok(visible.into_values().collect())
 }
 
-fn install_visible_entry(
-    visible: &mut BTreeMap<PhysicalKey, VisibleRow>,
-    entry: Option<VersionedEntry>,
-) {
-    if let Some(VersionedEntry {
-        key,
-        version,
-        value: EntryValue::Put(row),
-    }) = entry
-    {
-        visible.insert(
+fn visible_committed_row(entry: VersionedEntry) -> Option<VisibleRow> {
+    match entry {
+        VersionedEntry {
             key,
-            VisibleRow {
-                key,
-                observed: LsmObservedVersion::Committed(version),
-                row,
-            },
-        );
+            version,
+            value: EntryValue::Put(row),
+        } => Some(VisibleRow {
+            key,
+            observed: LsmObservedVersion::Committed(version),
+            row,
+        }),
+        VersionedEntry {
+            value: EntryValue::Tombstone,
+            ..
+        } => None,
+    }
+}
+
+struct MemoryEntryCursor<'a> {
+    entries: std::collections::btree_map::Iter<'a, PhysicalKey, BTreeMap<LsmCommitSeq, EntryValue>>,
+    versions: Option<(
+        PhysicalKey,
+        std::collections::btree_map::Iter<'a, LsmCommitSeq, EntryValue>,
+    )>,
+    range: Option<&'a KeyRange>,
+}
+
+impl<'a> MemoryEntryCursor<'a> {
+    fn new(
+        memtable: &'a BTreeMap<PhysicalKey, BTreeMap<LsmCommitSeq, EntryValue>>,
+        range: Option<&'a KeyRange>,
+    ) -> Self {
+        Self {
+            entries: memtable.iter(),
+            versions: None,
+            range,
+        }
+    }
+
+    fn next(&mut self) -> Option<VersionedEntry> {
+        loop {
+            if let Some((key, versions)) = &mut self.versions {
+                if let Some((version, value)) = versions.next() {
+                    return Some(VersionedEntry {
+                        key: *key,
+                        version: *version,
+                        value: value.clone(),
+                    });
+                }
+                self.versions = None;
+            }
+            let (key, versions) = self.entries.next()?;
+            if self
+                .range
+                .is_some_and(|range| !range.contains(key.clustering))
+            {
+                continue;
+            }
+            self.versions = Some((*key, versions.iter()));
+        }
     }
 }
 
 enum EntryCursor<'a> {
-    Memory(VecDeque<VersionedEntry>),
+    Memory(MemoryEntryCursor<'a>),
     Sstable(SstableEntryCursor<'a>),
 }
 
 impl EntryCursor<'_> {
     fn next(&mut self) -> Result<Option<VersionedEntry>, StorageError> {
         match self {
-            Self::Memory(entries) => Ok(entries.pop_front()),
+            Self::Memory(entries) => Ok(entries.next()),
             Self::Sstable(cursor) => cursor.next(),
         }
     }

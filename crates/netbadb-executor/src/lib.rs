@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::ops::ControlFlow;
 
 use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
@@ -14,7 +15,15 @@ use netbadb_storage::{
     PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
     TableStorage,
 };
-use netbadb_types::{ColumnId, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId};
+use netbadb_types::{
+    ColumnId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
+};
+
+/// Runtime row capacity for the first owned batch-at-a-time execution path.
+///
+/// This is deliberately small and explicit so intermediate scan/operator work
+/// is bounded. It is a starting point for measurement, not an optimality claim.
+const EXECUTION_BATCH_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionStorageBinding {
@@ -294,7 +303,7 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows_with_views(
+            let input = execute_rows_legacy_with_views(
                 input,
                 &[ExecutionStorageBinding {
                     table_id: storage.table().id,
@@ -321,7 +330,7 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows_with_views(
+            let input = execute_rows_legacy_with_views(
                 input,
                 &[ExecutionStorageBinding {
                     table_id: storage.table().id,
@@ -374,7 +383,7 @@ pub fn prepare_mutation_with_storage_context(
             table_id,
             assignments,
         } => {
-            let input = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let rows = build_replacements(&input, assignments)?
                 .into_iter()
                 .map(|(row, values)| PreparedUpdateRow { row, values })
@@ -385,7 +394,7 @@ pub fn prepare_mutation_with_storage_context(
             })
         }
         PhysicalStatement::Delete { input, table_id } => {
-            let input = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let rows = input
                 .rows
                 .into_iter()
@@ -399,16 +408,46 @@ pub fn prepare_mutation_with_storage_context(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ExecutionRow {
     row_id: Option<StorageRowHandle>,
     values: Vec<ScalarValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ExecutionRows {
     fields: Vec<OutputField>,
     rows: Vec<ExecutionRow>,
+}
+
+#[derive(Debug)]
+struct ExecutionBatch {
+    rows: Vec<ExecutionRow>,
+}
+
+impl ExecutionBatch {
+    fn with_capacity() -> Self {
+        Self {
+            rows: Vec::with_capacity(EXECUTION_BATCH_CAPACITY),
+        }
+    }
+
+    fn is_full_at(&self, capacity: usize) -> bool {
+        self.rows.len() == capacity
+    }
+}
+
+struct BatchPipeline<'a> {
+    table_id: TableId,
+    scan_columns: Vec<ColumnId>,
+    fields: Vec<OutputField>,
+    operators: Vec<BatchOperator<'a>>,
+}
+
+enum BatchOperator<'a> {
+    Filter(BoundExpr<'a>),
+    Project(ProjectionPlan),
+    Limit { remaining: usize },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -532,7 +571,273 @@ fn execute_rows(
     execute_rows_with_views(plan, &bindings, &mut execution_storages, &execution_views)
 }
 
+#[cfg(test)]
+fn execute_rows_legacy(
+    plan: &PhysicalPlan,
+    storages: &mut [TableStorage],
+) -> Result<ExecutionRows, ExecutionError> {
+    let views = storages
+        .iter()
+        .map(TableStorage::read_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    let bindings = compatibility_bindings(storages)?;
+    let mut execution_storages = storages
+        .iter_mut()
+        .zip(&bindings)
+        .map(|(storage, binding)| ExecutionStorage {
+            storage_id: binding.storage_id,
+            storage,
+        })
+        .collect::<Vec<_>>();
+    let execution_views = views
+        .iter()
+        .zip(&bindings)
+        .map(|(view, binding)| ExecutionReadView {
+            storage_id: binding.storage_id,
+            view,
+        })
+        .collect::<Vec<_>>();
+    execute_rows_legacy_with_views(plan, &bindings, &mut execution_storages, &execution_views)
+}
+
 fn execute_rows_with_views(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<ExecutionRows, ExecutionError> {
+    if let Some(result) =
+        try_execute_borrowed_text_filter_pipeline(plan, bindings, storages, read_views)?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = try_execute_batch_pipeline(plan, bindings, storages, read_views)? {
+        return Ok(result);
+    }
+    execute_rows_legacy_with_views(plan, bindings, storages, read_views)
+}
+
+fn try_execute_borrowed_text_filter_pipeline(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    match plan {
+        PhysicalPlan::Filter { input, predicate } if expression_uses_text_column(predicate) => {
+            try_execute_streaming_seq_filter(input, predicate, bindings, storages, read_views)
+        }
+        PhysicalPlan::Project { input, columns } => {
+            let PhysicalPlan::Filter { predicate, .. } = input.as_ref() else {
+                return Ok(None);
+            };
+            if !expression_uses_text_column(predicate) {
+                return Ok(None);
+            }
+            try_execute_projected_streaming_seq_filter(
+                input, columns, bindings, storages, read_views,
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
+fn expression_uses_text_column(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::Column(column) => column.data_type.physical == PhysicalType::Text,
+        ExprKind::Literal(_) => false,
+        ExprKind::Binary { left, right, .. } => {
+            expression_uses_text_column(left) || expression_uses_text_column(right)
+        }
+        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+            expression_uses_text_column(expression)
+        }
+    }
+}
+
+fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>, ExecutionError> {
+    match plan {
+        PhysicalPlan::SeqScan {
+            table_id, columns, ..
+        } => Ok(Some(BatchPipeline {
+            table_id: *table_id,
+            scan_columns: columns.iter().map(|column| column.column_id).collect(),
+            fields: columns.iter().cloned().map(OutputField::Source).collect(),
+            operators: Vec::new(),
+        })),
+        PhysicalPlan::Filter { input, predicate } => {
+            let Some(mut pipeline) = build_batch_pipeline(input)? else {
+                return Ok(None);
+            };
+            let Ok(predicate) = bind_expression(predicate, &pipeline.fields) else {
+                // Malformed hand-built plans retain the legacy evaluator's
+                // row-dependent error behavior (including an empty input).
+                return Ok(None);
+            };
+            pipeline.operators.push(BatchOperator::Filter(predicate));
+            Ok(Some(pipeline))
+        }
+        PhysicalPlan::Project { input, columns } => {
+            let Some(mut pipeline) = build_batch_pipeline(input)? else {
+                return Ok(None);
+            };
+            let projection = build_projection_plan(&pipeline.fields, columns)?;
+            pipeline.operators.push(BatchOperator::Project(projection));
+            pipeline.fields = columns.iter().cloned().map(OutputField::Source).collect();
+            Ok(Some(pipeline))
+        }
+        PhysicalPlan::Limit { input, limit } => {
+            let Some(mut pipeline) = build_batch_pipeline(input)? else {
+                return Ok(None);
+            };
+            pipeline.operators.push(BatchOperator::Limit {
+                remaining: usize::try_from(*limit).unwrap_or(usize::MAX),
+            });
+            Ok(Some(pipeline))
+        }
+        PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::RangeIndexScan { .. }
+        | PhysicalPlan::PartitionedScan { .. }
+        | PhysicalPlan::NestedLoopJoin { .. }
+        | PhysicalPlan::HashJoin { .. }
+        | PhysicalPlan::Sort { .. }
+        | PhysicalPlan::Aggregate { .. } => Ok(None),
+    }
+}
+
+fn try_execute_batch_pipeline(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let Some(mut pipeline) = build_batch_pipeline(plan)? else {
+        return Ok(None);
+    };
+    let view = read_view_for_table(bindings, read_views, pipeline.table_id)?;
+    let storage = storage_for_table(bindings, storages, pipeline.table_id)?;
+    let mut result_rows = Vec::new();
+    if pipeline
+        .operators
+        .iter()
+        .any(|operator| matches!(operator, BatchOperator::Limit { remaining: 0 }))
+    {
+        return Ok(Some(ExecutionRows {
+            fields: pipeline.fields,
+            rows: result_rows,
+        }));
+    }
+
+    let mut batch = ExecutionBatch::with_capacity();
+    let batch_capacity = batch_input_capacity(&pipeline.operators);
+    let mut pending_operator_error = None;
+    let flow = storage.visit_rows_with_view_control::<ExecutionError, _>(
+        &pipeline.scan_columns,
+        view,
+        |row_id, values| {
+            if pending_operator_error.is_some() {
+                return Ok(ControlFlow::Continue(()));
+            }
+            batch.rows.push(ExecutionRow {
+                row_id: Some(row_id),
+                values,
+            });
+            if !batch.is_full_at(batch_capacity) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            match consume_execution_batch(&mut batch, &mut pipeline.operators, &mut result_rows) {
+                Ok(true) => Ok(ControlFlow::Break(())),
+                Ok(false) => Ok(ControlFlow::Continue(())),
+                Err(error) => {
+                    pending_operator_error = Some(error);
+                    batch.rows.clear();
+                    Ok(ControlFlow::Continue(()))
+                }
+            }
+        },
+    )?;
+    if let Some(error) = pending_operator_error {
+        return Err(error);
+    }
+    if flow.is_continue() && !batch.rows.is_empty() {
+        let _stopped =
+            consume_execution_batch(&mut batch, &mut pipeline.operators, &mut result_rows)?;
+    }
+    Ok(Some(ExecutionRows {
+        fields: pipeline.fields,
+        rows: result_rows,
+    }))
+}
+
+fn batch_input_capacity(operators: &[BatchOperator<'_>]) -> usize {
+    for operator in operators {
+        match operator {
+            BatchOperator::Project(_) => {}
+            BatchOperator::Filter(_) => return EXECUTION_BATCH_CAPACITY,
+            BatchOperator::Limit { remaining } => {
+                return EXECUTION_BATCH_CAPACITY.min(*remaining);
+            }
+        }
+    }
+    EXECUTION_BATCH_CAPACITY
+}
+
+fn consume_execution_batch(
+    batch: &mut ExecutionBatch,
+    operators: &mut [BatchOperator<'_>],
+    result_rows: &mut Vec<ExecutionRow>,
+) -> Result<bool, ExecutionError> {
+    let mut upstream_exhausted = false;
+    for operator in operators {
+        match operator {
+            BatchOperator::Filter(predicate) => {
+                let mut evaluation_error = None;
+                batch.rows.retain(|row| {
+                    if evaluation_error.is_some() {
+                        return false;
+                    }
+                    match evaluate_bound_truth(predicate, EvaluationValues::Contiguous(&row.values))
+                    {
+                        Ok(TruthValue::True) => true,
+                        Ok(TruthValue::False | TruthValue::Unknown) => false,
+                        Err(error) => {
+                            evaluation_error = Some(error);
+                            false
+                        }
+                    }
+                });
+                if let Some(error) = evaluation_error {
+                    return Err(error);
+                }
+            }
+            BatchOperator::Project(projection) => {
+                if !projection.identity {
+                    for row in &mut batch.rows {
+                        let owned = std::mem::replace(
+                            row,
+                            ExecutionRow {
+                                row_id: None,
+                                values: Vec::new(),
+                            },
+                        );
+                        *row = project_execution_row(owned, projection)?;
+                    }
+                }
+            }
+            BatchOperator::Limit { remaining } => {
+                if batch.rows.len() > *remaining {
+                    batch.rows.truncate(*remaining);
+                }
+                *remaining -= batch.rows.len();
+                upstream_exhausted |= *remaining == 0;
+            }
+        }
+    }
+    result_rows.append(&mut batch.rows);
+    Ok(upstream_exhausted)
+}
+
+fn execute_rows_legacy_with_views(
     plan: &PhysicalPlan,
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
@@ -670,8 +975,8 @@ fn execute_rows_with_views(
             columns,
             ..
         } => {
-            let left = execute_rows_with_views(left, bindings, storages, read_views)?;
-            let right = execute_rows_with_views(right, bindings, storages, read_views)?;
+            let left = execute_rows_legacy_with_views(left, bindings, storages, read_views)?;
+            let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
             let mut joined_fields = left.fields.clone();
             joined_fields.extend(right.fields.clone());
             let output_positions = columns
@@ -785,8 +1090,8 @@ fn execute_rows_with_views(
             if !left_key.data_type.is_compatible_with(&right_key.data_type) {
                 return Err(ExecutionError::TypeMismatch);
             }
-            let left = execute_rows_with_views(left, bindings, storages, read_views)?;
-            let right = execute_rows_with_views(right, bindings, storages, read_views)?;
+            let left = execute_rows_legacy_with_views(left, bindings, storages, read_views)?;
+            let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
             let left_key_position = find_source_position(&left.fields, left_key)?;
             let right_key_position = find_source_position(&right.fields, right_key)?;
             let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
@@ -849,7 +1154,7 @@ fn execute_rows_with_views(
             {
                 return Ok(result);
             }
-            let mut result = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let fields = result.fields.clone();
             result.rows = result
                 .rows
@@ -869,7 +1174,7 @@ fn execute_rows_with_views(
             Ok(result)
         }
         PhysicalPlan::Sort { input, keys } => {
-            let mut result = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let positions = resolve_sort_positions(&result.fields, keys)?;
             validate_sort_values(&result.rows, &positions, keys)?;
 
@@ -897,7 +1202,8 @@ fn execute_rows_with_views(
             )? {
                 return Ok(result);
             }
-            let input_result = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let input_result =
+                execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let projection = build_projection_plan(&input_result.fields, columns)?;
             let rows = if projection.identity {
                 input_result.rows
@@ -927,12 +1233,12 @@ fn execute_rows_with_views(
             )? {
                 Ok(result)
             } else {
-                let input = execute_rows_with_views(input, bindings, storages, read_views)?;
+                let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
                 execute_aggregate(input, group_keys, outputs)
             }
         }
         PhysicalPlan::Limit { input, limit } => {
-            let mut result = execute_rows_with_views(input, bindings, storages, read_views)?;
+            let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
@@ -3030,16 +3336,17 @@ fn compare_scalar_refs(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundExpr, BoundExprKind, BoundInequality, EvaluatedScalar, EvaluationValues,
-        ExecutionError, ExecutionRow, FilteredCountSummary, InequalityExecutionStrategy,
-        ProjectionPlan, QueryResult, TruthValue, bind_expression, choose_inequality_strategy,
-        collect_filter_columns, collect_streaming_filter_row, count_to_sql_u64,
-        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
-        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
-        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
-        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
-        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
-        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
+        BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY, EvaluatedScalar,
+        EvaluationValues, ExecutionError, ExecutionRow, FilteredCountSummary,
+        InequalityExecutionStrategy, ProjectionPlan, QueryResult, TruthValue, bind_expression,
+        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
+        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
+        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
+        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
+        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
+        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
         execute_with_storages, filtered_count_eligibility, find_required_inequality,
         inequality_can_match, materialize_count_values, materialize_direct_count_values,
         potential_left_indices, project_execution_row, projected_streaming_seq_filter_eligibility,
@@ -3236,6 +3543,353 @@ mod tests {
             ),
             Err(ExecutionError::TypeMismatch)
         ));
+    }
+
+    fn batch_table() -> TableDef {
+        TableDef::new(
+            TableId(55),
+            "batch_items",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "unsigned_key",
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                ),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "active",
+                    TypeSpec::Physical(PhysicalType::Bool),
+                ),
+                ColumnDef::new(
+                    ColumnId(4),
+                    "payload",
+                    TypeSpec::Physical(PhysicalType::Text),
+                ),
+                ColumnDef::new(
+                    ColumnId(5),
+                    "nullable_key",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+            ],
+        )
+    }
+
+    fn batch_columns() -> Vec<ColumnRef> {
+        [
+            (1, "id", PhysicalType::Int64, false),
+            (2, "unsigned_key", PhysicalType::UInt64, false),
+            (3, "active", PhysicalType::Bool, false),
+            (4, "payload", PhysicalType::Text, false),
+            (5, "nullable_key", PhysicalType::Int64, true),
+        ]
+        .into_iter()
+        .map(|(id, name, physical, nullable)| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(55),
+            column_id: ColumnId(id),
+            relation_name: "batch_items".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable,
+        })
+        .collect()
+    }
+
+    fn batch_scan(columns: Vec<ColumnRef>) -> PhysicalPlan {
+        PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(55),
+            table_name: "batch_items".into(),
+            columns,
+        }
+    }
+
+    fn batch_column_expression(column: &ColumnRef) -> Expr {
+        Expr {
+            expr_type: ExprType {
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            },
+            kind: ExprKind::Column(column.clone()),
+        }
+    }
+
+    fn batch_literal(value: ScalarValue, physical: PhysicalType) -> Expr {
+        Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(physical),
+                nullable: matches!(value, ScalarValue::Null),
+            },
+            kind: ExprKind::Literal(value),
+        }
+    }
+
+    fn batch_binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+        Expr {
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: left.expr_type.nullable || right.expr_type.nullable,
+            },
+            kind: ExprKind::Binary {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        }
+    }
+
+    fn batch_filter(input: PhysicalPlan, predicate: Expr) -> PhysicalPlan {
+        PhysicalPlan::Filter {
+            input: Box::new(input),
+            predicate,
+        }
+    }
+
+    fn batch_project(input: PhysicalPlan, columns: Vec<ColumnRef>) -> PhysicalPlan {
+        PhysicalPlan::Project {
+            input: Box::new(input),
+            columns,
+        }
+    }
+
+    fn batch_limit(input: PhysicalPlan, limit: u64) -> PhysicalPlan {
+        PhysicalPlan::Limit {
+            input: Box::new(input),
+            limit,
+        }
+    }
+
+    fn batch_test_path(case: &str, lsm: bool) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "netbadb-executor-batch-{case}-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            if lsm { "lsm" } else { "heap" }
+        ))
+    }
+
+    fn remove_batch_test_path(path: &std::path::Path, lsm: bool) {
+        if lsm {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let wal = netbadb_storage::wal_path(path);
+            let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+            let _ = std::fs::remove_file(wal);
+            let _ = std::fs::remove_file(netbadb_storage::txn_status_path(path));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn batch_storage(case: &str, lsm: bool, rows: usize) -> (TableStorage, std::path::PathBuf) {
+        let path = batch_test_path(case, lsm);
+        remove_batch_test_path(&path, lsm);
+        let mut storage = if lsm {
+            TableStorage::create_lsm(&path, batch_table(), ColumnId(1)).expect("create batch LSM")
+        } else {
+            TableStorage::create_heap(&path, batch_table()).expect("create batch Heap")
+        };
+        if rows != 0 {
+            let mut transaction = storage.begin_transaction().expect("begin batch load");
+            for index in 0..rows {
+                let id = i64::try_from(index).expect("batch test row ID fits i64");
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::Int64(id),
+                            ScalarValue::UInt64((index % 7) as u64),
+                            ScalarValue::Bool(index % 3 == 0),
+                            ScalarValue::Text(format!("group-{}", index % 5)),
+                            if index % 4 == 0 {
+                                ScalarValue::Null
+                            } else {
+                                ScalarValue::Int64(id)
+                            },
+                        ],
+                    )
+                    .expect("insert batch row");
+            }
+            transaction.commit().expect("commit batch load");
+        }
+        (storage, path)
+    }
+
+    fn assert_batch_matches_legacy(plan: &PhysicalPlan, storage: &mut TableStorage) {
+        let batch = execute_rows(plan, std::slice::from_mut(storage)).expect("execute batch path");
+        let legacy =
+            execute_rows_legacy(plan, std::slice::from_mut(storage)).expect("execute legacy path");
+        assert_eq!(batch, legacy);
+    }
+
+    #[test]
+    fn batch_scan_cardinalities_cross_every_runtime_boundary() {
+        let columns = batch_columns();
+        for rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let (mut storage, path) = batch_storage(&format!("cardinality-{rows}"), false, rows);
+            let plan = batch_scan(vec![columns[0].clone(), columns[3].clone()]);
+            assert_batch_matches_legacy(&plan, &mut storage);
+            let result = execute(&plan, &mut storage).expect("materialize owned query result");
+            assert_eq!(result.rows.len(), rows);
+            assert!(result.rows.iter().all(|row| row.len() == 2));
+
+            let zero_width = batch_scan(Vec::new());
+            assert_batch_matches_legacy(&zero_width, &mut storage);
+            assert!(
+                execute(&zero_width, &mut storage)
+                    .expect("zero-width scan")
+                    .rows
+                    .iter()
+                    .all(Vec::is_empty)
+            );
+            storage.close().expect("close cardinality Heap");
+            remove_batch_test_path(&path, false);
+        }
+    }
+
+    #[test]
+    fn batch_filter_project_and_limit_match_authoritative_semantics() {
+        let columns = batch_columns();
+        let (mut storage, path) =
+            batch_storage("operators", false, 2 * EXECUTION_BATCH_CAPACITY + 1);
+        let scan = || batch_scan(columns.clone());
+        let true_literal = batch_literal(ScalarValue::Bool(true), PhysicalType::Bool);
+        let false_literal = batch_literal(ScalarValue::Bool(false), PhysicalType::Bool);
+        let active = batch_binary(
+            BinaryOp::Eq,
+            batch_column_expression(&columns[2]),
+            batch_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+        );
+        let text = batch_binary(
+            BinaryOp::Eq,
+            batch_column_expression(&columns[3]),
+            batch_literal(ScalarValue::Text("group-2".into()), PhysicalType::Text),
+        );
+        let nullable = batch_binary(
+            BinaryOp::Eq,
+            batch_column_expression(&columns[4]),
+            batch_literal(ScalarValue::Int64(1), PhysicalType::Int64),
+        );
+        let repeated_id = batch_binary(
+            BinaryOp::And,
+            batch_binary(
+                BinaryOp::GtEq,
+                batch_column_expression(&columns[0]),
+                batch_literal(ScalarValue::Int64(10), PhysicalType::Int64),
+            ),
+            batch_binary(
+                BinaryOp::LtEq,
+                batch_column_expression(&columns[0]),
+                batch_literal(ScalarValue::Int64(20), PhysicalType::Int64),
+            ),
+        );
+        let multiple_columns = batch_binary(BinaryOp::And, active.clone(), text.clone());
+
+        // Retaining the Text predicate column is intentionally not eligible
+        // for the predicate-only borrowed specialization, so this exercises
+        // Text comparison inside the position-bound owned batch Filter.
+        assert_batch_matches_legacy(
+            &batch_project(batch_filter(scan(), text.clone()), vec![columns[3].clone()]),
+            &mut storage,
+        );
+
+        for predicate in [
+            true_literal,
+            false_literal,
+            active.clone(),
+            text,
+            nullable,
+            repeated_id,
+            multiple_columns,
+        ] {
+            assert_batch_matches_legacy(&batch_filter(scan(), predicate), &mut storage);
+        }
+
+        for projected in [
+            columns.clone(),
+            vec![columns[0].clone()],
+            vec![columns[3].clone(), columns[0].clone()],
+            vec![columns[3].clone(), columns[3].clone()],
+            Vec::new(),
+        ] {
+            assert_batch_matches_legacy(&batch_project(scan(), projected), &mut storage);
+        }
+
+        for limit in [
+            0,
+            1,
+            (EXECUTION_BATCH_CAPACITY - 1) as u64,
+            EXECUTION_BATCH_CAPACITY as u64,
+            (EXECUTION_BATCH_CAPACITY + 1) as u64,
+            (2 * EXECUTION_BATCH_CAPACITY) as u64,
+            (2 * EXECUTION_BATCH_CAPACITY + 2) as u64,
+        ] {
+            assert_batch_matches_legacy(&batch_limit(scan(), limit), &mut storage);
+        }
+
+        let filtered_limit = batch_limit(batch_filter(scan(), active.clone()), 20);
+        assert_batch_matches_legacy(&filtered_limit, &mut storage);
+        let complete = batch_limit(
+            batch_project(
+                batch_filter(scan(), active),
+                vec![columns[3].clone(), columns[0].clone(), columns[3].clone()],
+            ),
+            20,
+        );
+        assert_batch_matches_legacy(&complete, &mut storage);
+        storage.close().expect("close operator Heap");
+        remove_batch_test_path(&path, false);
+    }
+
+    #[test]
+    fn batch_queries_are_equivalent_across_heap_and_lsm() {
+        let columns = batch_columns();
+        let rows = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let (mut heap, heap_path) = batch_storage("engine-equivalence", false, rows);
+        let (mut lsm, lsm_path) = batch_storage("engine-equivalence", true, rows);
+        let scan = || batch_scan(columns.clone());
+        let active = || {
+            batch_binary(
+                BinaryOp::Eq,
+                batch_column_expression(&columns[2]),
+                batch_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            )
+        };
+        let plans = [
+            batch_project(scan(), vec![columns[3].clone(), columns[0].clone()]),
+            batch_project(
+                batch_filter(scan(), active()),
+                vec![columns[0].clone(), columns[3].clone()],
+            ),
+            batch_limit(batch_project(scan(), vec![columns[0].clone()]), 20),
+            batch_limit(
+                batch_project(
+                    batch_filter(scan(), active()),
+                    vec![columns[0].clone(), columns[3].clone()],
+                ),
+                20,
+            ),
+        ];
+        for plan in plans {
+            let heap_result = execute(&plan, &mut heap).expect("execute Heap batch query");
+            let lsm_result = execute(&plan, &mut lsm).expect("execute LSM batch query");
+            assert_eq!(heap_result, lsm_result);
+            assert_batch_matches_legacy(&plan, &mut heap);
+            assert_batch_matches_legacy(&plan, &mut lsm);
+        }
+        heap.close().expect("close equivalence Heap");
+        lsm.close().expect("close equivalence LSM");
+        remove_batch_test_path(&heap_path, false);
+        remove_batch_test_path(&lsm_path, true);
     }
 
     #[test]

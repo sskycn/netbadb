@@ -758,9 +758,17 @@ The implementation sequence is intentionally vertical:
     overlap-closure compaction, split outputs, streaming multi-level reads,
     quiescent full-history GC, amplification counters, and storage-neutral
     access cost hints. LSM WAL v1 remains unchanged.
+55. Vectorized Execution Foundation — complete; a private 256-row owned batch
+    runtime streams validated SeqScan rows through prebound Filter,
+    move-aware Project, and early-stopping Limit above one storage-neutral
+    `ControlFlow` consumer shared by Heap and LSM. QueryResult remains fully
+    owned, existing borrowed Text and direct COUNT specializations remain, and
+    unsupported physical shapes use the authoritative materialized executor.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
-index-join planning remain roadmap items.
+index-join planning remain roadmap items. Column-oriented batches, SIMD, and
+batch Aggregate, HashJoin, Sort, index, and partition execution are also
+deferred.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in

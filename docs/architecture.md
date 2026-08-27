@@ -1008,12 +1008,32 @@ that removes superseded history or tombstones. Per-SSTable Bloom filters index
 all represented clustering keys, including tombstones; point reads use range
 routing then Bloom, while range reads use range/block metadata only. Both feed
 a bounded block-at-a-time k-way merge.
-- The capability API covers projected scans, point/range access, borrowed
-  row visitors, presence summaries, and mutation. Heap dispatch delegates
-  directly to its validated-once selective/borrowed implementations, so direct
-  COUNT and streaming Filter do not fall back to `Vec<Vec<ScalarValue>>`.
-  A future batch/chunk producer can be added as another capability without
-  replacing the current row visitor.
+- The capability API covers projected scans, point/range access, borrowed row
+  visitors, an owned row consumer with typed `ControlFlow` cancellation,
+  presence summaries, and mutation. Heap dispatch delegates to its
+  validated-once row traversal. LSM merges MemTable, SSTable, and bounded
+  transaction-overlay state in physical-key order and decodes one visible row
+  at a time. Neither engine constructs executor batches or knows Filter,
+  Project, Limit, SQL expressions, or PhysicalPlan.
+
+Above that storage boundary, the executor recognizes only physical trees made
+from SeqScan plus Filter, Project, and Limit. It groups owned rows into a
+private 256-row `ExecutionBatch`, evaluates a position-bound `BoundExpr`,
+applies the existing move-aware `ProjectionPlan`, and tracks Limit state across
+batches. Limit cancellation stops the storage consumer after the current
+bounded batch; later physical rows are deliberately not requested. This is an
+execution behavior and not a whole-file integrity check: every row actually
+requested still receives the engine's complete MVCC, page/SSTable, codec,
+type, NULL, and UTF-8 validation.
+
+The public `QueryResult` remains fully owned and may contain the complete final
+result. Intermediate SeqScan, Filter, and Project results no longer require a
+full base-scan vector. Exact predicate-only Text Project/Filter retains the
+measured borrowed Phase 7U specialization so rejected strings are not owned.
+Direct COUNT specializations also remain. Sort, Aggregate, joins, index/range
+scans, partition scans, and DML deterministically use the authoritative legacy
+executor for the complete tree. PhysicalPlan and Inspection JSON are unchanged,
+and executor dispatch contains no Heap/LSM branch.
 
 - `PageManager` owns fixed-size file I/O, page allocation, checked page-offset
   arithmetic, and file sync. It does not interpret heap or index semantics.

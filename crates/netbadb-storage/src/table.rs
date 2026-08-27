@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, TableStatistics};
@@ -743,6 +744,50 @@ impl TableStorage {
         }
     }
 
+    /// Produces validated visible rows synchronously until the consumer breaks.
+    ///
+    /// Requested columns retain order and duplicates, including an empty
+    /// projection. Values and the opaque row handle are owned so callers may
+    /// retain a bounded group after the callback returns. `Break` is successful
+    /// cancellation and prevents storage from requesting later rows.
+    pub fn visit_rows_with_view_control<E, F>(
+        &mut self,
+        columns: &[ColumnId],
+        view: &StorageReadView,
+        mut visitor: F,
+    ) -> Result<ControlFlow<()>, E>
+    where
+        E: From<StorageError>,
+        F: FnMut(StorageRowHandle, Vec<ScalarValue>) -> Result<ControlFlow<()>, E>,
+    {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                let storage_id = storage.storage_id();
+                let view = view.heap_view(table_id).map_err(E::from)?;
+                storage.visit_row_scalar_refs_with_presence_view_control(
+                    columns,
+                    &[],
+                    view,
+                    |row_id, values, _presence| {
+                        visitor(
+                            StorageRowHandle::heap(table_id, storage_id, row_id),
+                            values.iter().copied().map(ScalarRef::to_owned).collect(),
+                        )
+                    },
+                )
+            }
+            Self::Lsm(storage) => {
+                let table_id = storage.table().id;
+                let storage_id = storage.storage_id();
+                let view = view.lsm_view(table_id).map_err(E::from)?;
+                storage.visit_columns_with_view_control(columns, view, |row, values| {
+                    visitor(StorageRowHandle::lsm(table_id, storage_id, row), values)
+                })
+            }
+        }
+    }
+
     pub fn point_lookup_columns_with_view(
         &mut self,
         access_path: AccessPathId,
@@ -1114,6 +1159,8 @@ fn registered_handle(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
     use netbadb_index::{IndexBound, IndexRange};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
@@ -1153,6 +1200,81 @@ mod tests {
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(txn_status_path(path));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_row_consumer_stops_identically_for_heap_and_lsm() {
+        let heap_path = path("bounded-consumer-heap");
+        let lsm_path = path("bounded-consumer-lsm");
+        cleanup(&heap_path);
+        let _ = std::fs::remove_dir_all(&lsm_path);
+        let heap = TableStorage::create_heap(&heap_path, table(80)).expect("create Heap");
+        let lsm = TableStorage::create_lsm(&lsm_path, table(80), ColumnId(1)).expect("create LSM");
+
+        for (kind, mut storage) in [("Heap", heap), ("LSM", lsm)] {
+            let mut transaction = storage.begin_transaction().expect("begin load");
+            for id in 0..300 {
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::Int64(id),
+                            ScalarValue::Text(format!("value-{id}")),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            transaction.commit().expect("commit load");
+            let view = storage.read_view().expect("create read view");
+            let mut visited = Vec::new();
+            let flow = storage
+                .visit_rows_with_view_control::<StorageError, _>(
+                    &[ColumnId(2), ColumnId(1), ColumnId(2)],
+                    &view,
+                    |_row, values| {
+                        visited.push(values);
+                        if visited.len() == 7 {
+                            Ok(ControlFlow::Break(()))
+                        } else {
+                            Ok(ControlFlow::Continue(()))
+                        }
+                    },
+                )
+                .expect("visit bounded rows");
+            assert!(flow.is_break(), "{kind} must propagate typed cancellation");
+            assert_eq!(visited.len(), 7, "{kind} must not visit later rows");
+            for (id, values) in visited.into_iter().enumerate() {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Text(format!("value-{id}")),
+                        ScalarValue::Int64(id as i64),
+                        ScalarValue::Text(format!("value-{id}")),
+                    ]
+                );
+            }
+            drop(view);
+
+            let view = storage.read_view().expect("create zero-width view");
+            let mut zero_width = 0;
+            let flow = storage
+                .visit_rows_with_view_control::<StorageError, _>(&[], &view, |_row, values| {
+                    assert!(values.is_empty());
+                    zero_width += 1;
+                    if zero_width == 1 {
+                        Ok(ControlFlow::Break(()))
+                    } else {
+                        Ok(ControlFlow::Continue(()))
+                    }
+                })
+                .expect("visit zero-width row");
+            assert!(flow.is_break());
+            assert_eq!(zero_width, 1);
+            drop(view);
+            storage.close().expect("close bounded storage");
+        }
+        cleanup(&heap_path);
+        let _ = std::fs::remove_dir_all(lsm_path);
     }
 
     #[test]

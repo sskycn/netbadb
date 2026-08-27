@@ -342,6 +342,40 @@ fn run_lsm_correctness_scenarios(
         });
     }
 
+    let scenario = "lsm_batch_filter_project_limit";
+    let sql = "SELECT id FROM items WHERE active = true LIMIT 20";
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[
+            Operator::Limit,
+            Operator::Filter,
+            Operator::Project,
+            Operator::SeqScan,
+        ],
+        &[],
+    )?;
+    let expected = Observation {
+        rows: 20,
+        checksum: 570,
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        ids_observation,
+    )?;
+    measurements.push(Measurement {
+        scenario: scenario.into(),
+        rows: expected.rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+
     for (scenario, sql) in [
         (
             "lsm_update",
@@ -673,6 +707,79 @@ fn run_projection_attribution_scenarios(
     measurements: &mut Vec<Measurement>,
 ) -> BenchResult<()> {
     let rows = settings.medium_rows;
+    run_attribution_query(
+        "batch_full_projected_scan",
+        rows,
+        "SELECT id, payload FROM items",
+        &[Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        id_payload_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "batch_filter_project_bool",
+        rows,
+        "SELECT id FROM items WHERE active = true",
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, ACTIVE_COLUMN_ID],
+        expected_modulo_ids(rows, 3, 0),
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    let middle = rows / 2;
+    run_attribution_query(
+        "batch_filter_project_text",
+        rows,
+        &format!("SELECT id FROM items WHERE payload = 'payload-{middle:016}'"),
+        &[Operator::Filter, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "batch_early_limit",
+        rows,
+        "SELECT id FROM items LIMIT 20",
+        &[Operator::Limit, Operator::Project, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        Observation {
+            rows: 20,
+            checksum: arithmetic_sum(20),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_attribution_query(
+        "batch_filter_limit",
+        rows,
+        "SELECT id FROM items WHERE active = true LIMIT 20",
+        &[
+            Operator::Limit,
+            Operator::Filter,
+            Operator::Project,
+            Operator::SeqScan,
+        ],
+        &[ID_COLUMN_ID, ACTIVE_COLUMN_ID],
+        Observation {
+            rows: 20,
+            checksum: 570,
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
     run_attribution_query(
         "projection_id_only",
         rows,
