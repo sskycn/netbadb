@@ -1491,6 +1491,76 @@ single-predicate attribution showed a clearer residual. Typed column batches,
 HashJoin batch integration, Sort/Top-N, and index/range/partition batch sources
 remain later candidates.
 
+## Phase 63 generic Filter position prebinding
+
+Phase 63 adds a deterministic pair in which both queries return
+`id, team_id, bucket_id, active`, scan those same four primitive columns, and
+produce one middle row through exact `Project>Filter>SeqScan`. Both predicates
+contain five comparisons and four AND nodes. The narrow control resolves every
+identity leaf at the first `id` position; the wide target uses id, team, bucket,
+and active positions before the same final selective id comparison. Plan shape,
+base scan columns, row values, and result cardinality are hard benchmark gates.
+Raw serial quick runs are stored outside the repository at
+`/tmp/netbadb-phase63-pre.txt` and `/tmp/netbadb-phase63-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | lookup shape | pre median | post median | change |
+| --- | --- | ---: | ---: | ---: |
+| narrow-position repeated primitive | first position | 626,958 | 651,292 | +3.9% |
+| wide-position primitive | first/middle/last | 556,417 | 552,791 | -0.7% |
+| hidden Int64 equality | one primitive leaf | 330,459 | 366,917 | +11.0% |
+| hidden Text equality | one Text leaf | 368,875 | 347,625 | -5.8% |
+| hidden repeated Int64 | repeated primitive leaf | 456,333 | 540,541 | +18.5% |
+| hidden repeated Text | repeated Text leaf | 341,625 | 452,750 | +32.5% |
+| point IndexScan Filter | legacy materialized child | 29,500 | 22,834 | -22.6% |
+
+The required wide/narrow ratio changed from 0.887x pre to 0.849x post. The
+ratio contracted slightly but remained below 1.0, and narrow/wide timing moved
+in opposite directions. This single quick run therefore does not demonstrate a
+stable position-search cost curve and supports no throughput claim or timing
+threshold. The structural result is authoritative: valid borrowed streaming
+callbacks receive a prebound expression and scalar slice with no fields, while
+valid legacy Filter binds once after materializing its child.
+
+Existing generic Filter controls also moved inconsistently:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| hidden payload IS NULL | 362,125 | 284,958 | -21.3% |
+| hidden payload IS NOT NULL | 358,542 | 445,250 | +24.2% |
+| hidden owned Text output | 367,042 | 446,042 | +21.5% |
+| hidden wide lookup control | 555,458 | 565,375 | +1.8% |
+
+Non-target controls show still broader machine/code-layout variance:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| global SUM | 350,542 | 317,125 | -9.5% |
+| global Text MIN | 568,583 | 382,667 | -32.7% |
+| global Text MAX | 392,292 | 278,875 | -28.9% |
+| one-group GROUP BY | 399,583 | 435,917 | +9.1% |
+| direct COUNT(*) | 237,959 | 237,292 | -0.3% |
+| prebound filtered COUNT(payload) | 366,750 | 431,833 | +17.7% |
+| early Limit | 19,041 | 19,583 | +2.8% |
+| full projected scan | 454,792 | 449,250 | -1.2% |
+| LSM SUM | 97,208 | 28,000 | -71.2% |
+
+The executor reuses its existing `BoundExpr`: streaming setup binds against the
+source-order predicate fields before storage traversal and evaluates borrowed
+`ScalarRef` rows by position; legacy Filter binds once against materialized
+child fields. Binding failure deliberately retains dynamic row-dependent
+evaluation for malformed plans, so an empty malformed child remains empty and
+a nonempty child reports the prior error. Bool, Int64, UInt64, Text, NULL,
+nullable, comparison, AND/OR/NOT, and IS NULL semantics remain equivalent;
+AND/OR still evaluate both operands. Batch Filter, filtered COUNT, and Join
+prebinding are unchanged.
+
+Leaf-lookup micro-optimization ends here. Phase 64 should remeasure typed
+column-oriented batches, HashJoin batch integration, Sort/Top-N, and
+index/range/partition batch sources before selection. AND/OR short-circuiting
+remains separate work; Phase 62's Text comparator line is not reopened.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -1508,5 +1578,7 @@ encoding unchanged. Phases 7P through 7T retain those contracts as well as
 Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owned
 QueryResult rows. Phase 7U retains those contracts as well. The later MVCC
 phase deliberately advances Heap metadata to v4 and adds tuple/status formats;
-it does not invalidate these performance-path results. These phases add no
-dependency and no unsafe code.
+it does not invalidate these performance-path results. Phase 63 changes only
+executor-private predicate setup/evaluation and benchmark coverage, retaining
+the current Heap metadata v4 and every public, inspection, protocol, SDK, and
+persistent contract. These phases add no dependency and no unsafe code.

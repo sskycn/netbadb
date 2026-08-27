@@ -727,9 +727,61 @@ specialization deliberately does not apply. UPDATE and DELETE continue to use
 the Phase 7T direct Filter path and mutate only after `execute_rows` succeeds.
 Assignment evaluation, index maintenance, transactions, INSERT, Join
 algorithms, Phase 7N filtered-count precedence, planner, compiler, Rel IR,
-PhysicalPlan, protocol, and inspection behavior are unchanged. There is no
-generic Filter prebinding, predicate pushdown, expression bytecode/compiler,
-planner rewrite, dependency, or unsafe code.
+PhysicalPlan, protocol, and inspection behavior are unchanged. Phase 7U itself
+added no generic Filter prebinding, predicate pushdown, expression
+bytecode/compiler, planner rewrite, dependency, or unsafe code.
+
+Phase 63 completes generic Filter position prebinding without adding another
+expression representation. Both borrowed streaming shapes build their complete
+source-order fields before entering the storage visitor, then reuse the
+executor-private expression binder:
+
+```text
+Expr + source-order OutputFields
+        ↓
+bind_expression once per Filter execution
+        ↓
+BoundExpr with checked source positions
+        ↓
+validated borrowed ScalarRef row
+        ↓
+evaluate_bound_scalar_ref_truth by direct position
+        ↓
+TruthValue
+       / \
+ TRUE     FALSE/UNKNOWN
+  ↓             ↓
+own retained    own nothing
+output values
+```
+
+The valid per-row callback receives only `BoundExpr`, the borrowed scalar
+slice, output positions, and result/error state; it has no `Expr` or
+`OutputField` slice and therefore cannot repeat identity lookup. Qualified Text
+still becomes owned only at the fully owned result boundary. Rejected Text
+remains a storage-backed `ScalarRef` for the callback lifetime.
+
+The authoritative materialized fallback uses the same binding boundary after
+its child has executed:
+
+```text
+materialized child ExecutionRows
+        ↓
+bind_expression once against child fields
+        ↓
+evaluate_bound_truth for each owned row
+        ↓
+move TRUE rows; drop FALSE/UNKNOWN rows
+```
+
+Binding is an optimization, not an eager validation contract. If a hand-built
+malformed predicate cannot bind, both streaming setup and legacy Filter retain
+the dynamic evaluator's row-dependent behavior: an empty child remains empty,
+while a nonempty child reports the same predicate error. Dynamic evaluators
+also remain for UPDATE/assignment and other unbound expression boundaries.
+AND/OR still evaluate both operands, and all existing NULL and three-valued
+semantics are shared by the bound evaluator. Batch Filter, filtered COUNT, and
+Join were already bound and are not reordered or rewritten by Phase 63.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.

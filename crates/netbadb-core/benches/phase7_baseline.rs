@@ -1752,6 +1752,26 @@ fn run_projection_attribution_scenarios(
         ids_observation,
         measurements,
     )?;
+    run_filter_position_attribution_query(
+        "generic_filter_position_narrow",
+        rows,
+        &format!(
+            "SELECT id, team_id, bucket_id, active FROM items WHERE id = id AND id = id AND id = id AND id = id AND id = {middle}"
+        ),
+        middle,
+        settings,
+        measurements,
+    )?;
+    run_filter_position_attribution_query(
+        "generic_filter_position_wide",
+        rows,
+        &format!(
+            "SELECT id, team_id, bucket_id, active FROM items WHERE id = id AND team_id = team_id AND bucket_id = bucket_id AND active = active AND id = {middle}"
+        ),
+        middle,
+        settings,
+        measurements,
+    )?;
     run_attribution_query(
         "hidden_filter_lookup_wide_control",
         rows,
@@ -1773,6 +1793,62 @@ fn run_projection_attribution_scenarios(
         ids_observation,
         measurements,
     )
+}
+
+fn run_filter_position_attribution_query(
+    scenario: &str,
+    rows: u64,
+    sql: &str,
+    expected_id: u64,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let (mut database, paths) = items_fixture(scenario, rows, &[], NullDistribution::Low, 4)?;
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[Operator::Project, Operator::Filter, Operator::SeqScan],
+        &[],
+    )?;
+    if plan != "Project>Filter>SeqScan" {
+        return Err(message_error(format!(
+            "scenario `{scenario}` plan was `{plan}`; expected `Project>Filter>SeqScan`"
+        )));
+    }
+    inspect_base_scan_columns(
+        &database,
+        scenario,
+        sql,
+        &[
+            ID_COLUMN_ID,
+            TEAM_COLUMN_ID,
+            BUCKET_COLUMN_ID,
+            ACTIVE_COLUMN_ID,
+        ],
+    )?;
+    let expected = Observation {
+        rows: 1,
+        checksum: u128::from(expected_id),
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        |result| primitive_item_observation(result, expected_id),
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3131,6 +3207,39 @@ fn ids_observation(result: &QueryResult) -> BenchResult<Observation> {
         rows: u64::try_from(result.rows.len())
             .map_err(|_| message_error("result row count exceeds u64"))?,
         checksum,
+    })
+}
+
+fn primitive_item_observation(result: &QueryResult, expected_id: u64) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("expected exactly one primitive item row"));
+    };
+    let [
+        ScalarValue::Int64(id),
+        ScalarValue::Int64(team_id),
+        ScalarValue::Int64(bucket_id),
+        ScalarValue::Bool(active),
+    ] = row.as_slice()
+    else {
+        return Err(message_error(
+            "primitive item query must return Int64, Int64, Int64, and Bool columns",
+        ));
+    };
+    let expected_id = i64::try_from(expected_id)
+        .map_err(|_| message_error("expected primitive item ID exceeds i64"))?;
+    let expected_team_id = expected_id % 4;
+    let expected_active = expected_id % 3 == 0;
+    if (*id, *team_id, *bucket_id, *active)
+        != (expected_id, expected_team_id, expected_id, expected_active)
+    {
+        return Err(message_error(
+            "primitive item row values did not match fixture",
+        ));
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::try_from(expected_id)
+            .map_err(|_| message_error("negative primitive item ID"))?,
     })
 }
 

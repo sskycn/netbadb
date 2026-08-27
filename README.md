@@ -738,9 +738,9 @@ The implementation sequence is intentionally vertical:
     — complete; exact `Project → Filter → SeqScan` evaluates over the complete
     validated borrowed scan row but owns only Project-retained values for TRUE,
     with conservative fallback for every other shape.
-50. Generic Filter position prebinding (Phase 7V) — selected, not started;
-    post-7U predicate-only all-TRUE Text is within 1.031x of the primitive
-    control while wide/single Int64 dynamic lookup remains 2.241x.
+50. Generic Filter position prebinding (Phase 7V) — complete in Phase 63;
+    generic streaming and legacy Filter bind column identities once per
+    execution and evaluate rows through checked positions.
 51. Atomic Multi-Storage Commit Foundation — complete; persistent StorageIds,
     WAL Prepare, an independent coordinator CommitDecision/Complete log,
     presumed-abort startup resolution, retry-safe commit, and 13 abrupt-process
@@ -803,11 +803,18 @@ The implementation sequence is intentionally vertical:
     construction. MIN/MAX candidates compare directly against that physical
     state, Text uses borrowed `str::cmp`, and existing move/clone, NULL, grouped,
     batch, and legacy semantics remain unchanged.
+63. Generic Filter Position Prebinding — complete; valid borrowed streaming
+    and materialized legacy Filter paths reuse the executor-private `BoundExpr`
+    and resolve column identities once before row evaluation. Streaming FALSE
+    and UNKNOWN rows remain borrowed, malformed binding failures retain the
+    dynamic row-dependent fallback, and batch Filter, filtered COUNT, Join,
+    plans, public APIs, and persistent contracts are unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
-index-join planning remain roadmap items. Column-oriented batches, SIMD, and
-batch HashJoin, Sort, index, and partition execution are also
-deferred.
+index-join planning remain roadmap items. Phase 64 should select among typed
+column-oriented batches, HashJoin batch integration, Sort/Top-N, and
+index/range/partition batch sources from new measurements; leaf-lookup
+micro-optimization stops with Phase 63.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in

@@ -1198,21 +1198,37 @@ fn execute_rows_legacy_with_views(
             }
             let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let fields = result.fields.clone();
-            result.rows = result
-                .rows
-                .into_iter()
-                .filter_map(|row| {
-                    match evaluate_dynamic_borrowed_truth_values(
-                        predicate,
-                        EvaluationValues::Contiguous(&row.values),
-                        &fields,
-                    ) {
-                        Ok(TruthValue::True) => Some(Ok(row)),
-                        Ok(TruthValue::False | TruthValue::Unknown) => None,
-                        Err(error) => Some(Err(error)),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            result.rows = match bind_expression(predicate, &fields) {
+                Ok(bound_predicate) => result
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        match evaluate_bound_truth(
+                            &bound_predicate,
+                            EvaluationValues::Contiguous(&row.values),
+                        ) {
+                            Ok(TruthValue::True) => Some(Ok(row)),
+                            Ok(TruthValue::False | TruthValue::Unknown) => None,
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                Err(_) => result
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        match evaluate_dynamic_borrowed_truth_values(
+                            predicate,
+                            EvaluationValues::Contiguous(&row.values),
+                            &fields,
+                        ) {
+                            Ok(TruthValue::True) => Some(Ok(row)),
+                            Ok(TruthValue::False | TruthValue::Unknown) => None,
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
             Ok(result)
         }
         PhysicalPlan::Sort { input, keys } => {
@@ -1986,23 +2002,47 @@ fn execute_streaming_seq_filter_with_projection(
     let storage = storage_for_table(bindings, storages, plan.table_id)?;
     let mut rows = Vec::new();
     let mut pending_predicate_error = None;
-    storage.visit_row_scalar_refs_with_presence_view::<ExecutionError, _>(
-        &column_ids,
-        &[],
-        view,
-        |row_id, values, _presence| {
-            collect_streaming_filter_row(
-                plan.predicate,
-                &predicate_fields,
-                output_positions,
-                Some(row_id),
-                values,
-                &mut rows,
-                &mut pending_predicate_error,
-            );
-            Ok(())
-        },
-    )?;
+    match bind_expression(plan.predicate, &predicate_fields) {
+        Ok(bound_predicate) => {
+            storage.visit_row_scalar_refs_with_presence_view::<ExecutionError, _>(
+                &column_ids,
+                &[],
+                view,
+                |row_id, values, _presence| {
+                    collect_streaming_filter_row(
+                        &bound_predicate,
+                        output_positions,
+                        Some(row_id),
+                        values,
+                        &mut rows,
+                        &mut pending_predicate_error,
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        Err(_) => {
+            // Hand-built malformed plans keep the row-dependent error timing
+            // of the authoritative dynamic evaluator, including empty scans.
+            storage.visit_row_scalar_refs_with_presence_view::<ExecutionError, _>(
+                &column_ids,
+                &[],
+                view,
+                |row_id, values, _presence| {
+                    collect_dynamic_streaming_filter_row(
+                        plan.predicate,
+                        &predicate_fields,
+                        output_positions,
+                        Some(row_id),
+                        values,
+                        &mut rows,
+                        &mut pending_predicate_error,
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+    }
     if let Some(error) = pending_predicate_error {
         return Err(error);
     }
@@ -2013,6 +2053,27 @@ fn execute_streaming_seq_filter_with_projection(
 }
 
 fn collect_streaming_filter_row(
+    predicate: &BoundExpr<'_>,
+    output_positions: &[usize],
+    row_id: Option<StorageRowHandle>,
+    values: &[ScalarRef<'_>],
+    rows: &mut Vec<ExecutionRow>,
+    pending_predicate_error: &mut Option<ExecutionError>,
+) {
+    if pending_predicate_error.is_some() {
+        return;
+    }
+    collect_evaluated_streaming_filter_row(
+        evaluate_bound_scalar_ref_truth(predicate, values),
+        output_positions,
+        row_id,
+        values,
+        rows,
+        pending_predicate_error,
+    );
+}
+
+fn collect_dynamic_streaming_filter_row(
     predicate: &Expr,
     predicate_fields: &[OutputField],
     output_positions: &[usize],
@@ -2024,7 +2085,25 @@ fn collect_streaming_filter_row(
     if pending_predicate_error.is_some() {
         return;
     }
-    match evaluate_dynamic_scalar_ref_truth(predicate, values, predicate_fields) {
+    collect_evaluated_streaming_filter_row(
+        evaluate_dynamic_scalar_ref_truth(predicate, values, predicate_fields),
+        output_positions,
+        row_id,
+        values,
+        rows,
+        pending_predicate_error,
+    );
+}
+
+fn collect_evaluated_streaming_filter_row(
+    truth: Result<TruthValue, ExecutionError>,
+    output_positions: &[usize],
+    row_id: Option<StorageRowHandle>,
+    values: &[ScalarRef<'_>],
+    rows: &mut Vec<ExecutionRow>,
+    pending_predicate_error: &mut Option<ExecutionError>,
+) {
+    match truth {
         Ok(TruthValue::True) => {
             let projected_values = output_positions
                 .iter()
@@ -6793,7 +6872,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_generic_filter_does_not_evaluate_its_predicate() {
+    fn generic_filter_preserves_row_dependent_binding_and_evaluation_errors() {
         let table = TableDef::new(
             TableId(1),
             "items",
@@ -6825,7 +6904,7 @@ mod tests {
                 binding_id: RelationBindingId(0),
                 table_id: TableId(1),
                 table_name: "items".into(),
-                columns: vec![id],
+                columns: vec![id.clone()],
             }),
             predicate: Expr {
                 expr_type: ExprType {
@@ -6838,6 +6917,65 @@ mod tests {
 
         let result = execute(&filter, &mut storage).expect("empty filter skips predicate");
         assert!(result.rows.is_empty());
+        storage
+            .insert(&[ScalarValue::Int64(1)])
+            .expect("insert malformed-plan input");
+        assert!(matches!(
+            execute(&filter, &mut storage),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
+
+        let scan = || PhysicalPlan::SeqScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            table_name: "items".into(),
+            columns: vec![id.clone()],
+        };
+        let type_mismatch = PhysicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+                kind: ExprKind::Binary {
+                    operator: BinaryOp::Eq,
+                    left: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: id.data_type.clone(),
+                            nullable: false,
+                        },
+                        kind: ExprKind::Column(id.clone()),
+                    }),
+                    right: Box::new(Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Text),
+                            nullable: false,
+                        },
+                        kind: ExprKind::Literal(ScalarValue::Text("wrong".into())),
+                    }),
+                },
+            },
+        };
+        assert!(matches!(
+            execute(&type_mismatch, &mut storage),
+            Err(ExecutionError::TypeMismatch)
+        ));
+
+        let non_boolean = PhysicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: false,
+                },
+                kind: ExprKind::Literal(ScalarValue::Int64(1)),
+            },
+        };
+        assert!(matches!(
+            execute(&non_boolean, &mut storage),
+            Err(ExecutionError::ExpectedBoolean)
+        ));
         let malformed_project = PhysicalPlan::Project {
             input: Box::new(filter),
             columns: vec![missing],
@@ -8369,6 +8507,151 @@ mod tests {
     }
 
     #[test]
+    fn generic_filter_binding_resolves_wide_positions_once_and_matches_dynamic_rows() {
+        fn column(column_id: u32) -> ColumnRef {
+            ColumnRef {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(7),
+                column_id: ColumnId(column_id),
+                relation_name: "wide".into(),
+                name: format!("c{column_id}"),
+                data_type: SemanticType::physical(PhysicalType::Int64),
+                nullable: true,
+            }
+        }
+
+        fn column_expr(column: &ColumnRef) -> Expr {
+            Expr {
+                kind: ExprKind::Column(column.clone()),
+                expr_type: ExprType {
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+            }
+        }
+
+        fn literal(value: i64) -> Expr {
+            Expr {
+                kind: ExprKind::Literal(ScalarValue::Int64(value)),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: false,
+                },
+            }
+        }
+
+        fn binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+            Expr {
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+            }
+        }
+
+        fn collect_positions(expression: &BoundExpr<'_>, positions: &mut Vec<usize>) {
+            match &expression.kind {
+                BoundExprKind::Column { position, .. } => positions.push(*position),
+                BoundExprKind::Literal(_) => {}
+                BoundExprKind::Binary { left, right, .. } => {
+                    collect_positions(left, positions);
+                    collect_positions(right, positions);
+                }
+                BoundExprKind::Unary { expression, .. }
+                | BoundExprKind::IsNull { expression, .. } => {
+                    collect_positions(expression, positions);
+                }
+            }
+        }
+
+        let columns = (1..=7).map(column).collect::<Vec<_>>();
+        let fields = columns
+            .iter()
+            .cloned()
+            .map(OutputField::Source)
+            .collect::<Vec<_>>();
+        let expression = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Eq, column_expr(&columns[0]), literal(1)),
+            binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&columns[3]),
+                    column_expr(&columns[3]),
+                ),
+                binary(
+                    BinaryOp::And,
+                    binary(BinaryOp::Eq, column_expr(&columns[6]), literal(7)),
+                    binary(
+                        BinaryOp::Eq,
+                        column_expr(&columns[6]),
+                        column_expr(&columns[6]),
+                    ),
+                ),
+            ),
+        );
+        let bound = bind_expression(&expression, &fields).expect("bind wide generic filter");
+        let mut positions = Vec::new();
+        collect_positions(&bound, &mut positions);
+        assert_eq!(positions, [0, 3, 3, 6, 6, 6]);
+
+        for values in [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(2),
+                ScalarValue::Int64(3),
+                ScalarValue::Int64(4),
+                ScalarValue::Int64(5),
+                ScalarValue::Int64(6),
+                ScalarValue::Int64(7),
+            ],
+            vec![
+                ScalarValue::Int64(0),
+                ScalarValue::Int64(2),
+                ScalarValue::Int64(3),
+                ScalarValue::Int64(4),
+                ScalarValue::Int64(5),
+                ScalarValue::Int64(6),
+                ScalarValue::Int64(7),
+            ],
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(2),
+                ScalarValue::Int64(3),
+                ScalarValue::Int64(4),
+                ScalarValue::Int64(5),
+                ScalarValue::Int64(6),
+                ScalarValue::Null,
+            ],
+        ] {
+            let dynamic = evaluate_dynamic_borrowed_truth_values(
+                &expression,
+                EvaluationValues::Contiguous(&values),
+                &fields,
+            )
+            .expect("evaluate dynamic wide row");
+            assert_eq!(
+                evaluate_bound_truth(&bound, EvaluationValues::Contiguous(&values))
+                    .expect("evaluate bound wide row"),
+                dynamic
+            );
+            let scalar_refs = values.iter().map(ScalarRef::from).collect::<Vec<_>>();
+            assert_eq!(
+                evaluate_bound_scalar_ref_truth(&bound, &scalar_refs)
+                    .expect("evaluate bound wide scalar refs"),
+                evaluate_dynamic_scalar_ref_truth(&expression, &scalar_refs, &fields)
+                    .expect("evaluate dynamic wide scalar refs")
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_borrowed_leaf_values_preserve_identity_and_computed_values_are_owned() {
         let column = |binding_id: u32, name: &str, physical: PhysicalType| ColumnRef {
             binding_id: RelationBindingId(binding_id),
@@ -9534,9 +9817,11 @@ mod tests {
             data_type: SemanticType::physical(physical),
             nullable: false,
         };
+        let id = column(1, "id", PhysicalType::Int64);
+        let payload = column(2, "payload", PhysicalType::Text);
         let fields = vec![
-            OutputField::Source(column(1, "id", PhysicalType::Int64)),
-            OutputField::Source(column(2, "payload", PhysicalType::Text)),
+            OutputField::Source(id),
+            OutputField::Source(payload.clone()),
         ];
         let predicate = |value, nullable| Expr {
             kind: ExprKind::Literal(value),
@@ -9545,6 +9830,21 @@ mod tests {
                 nullable,
             },
         };
+        let false_predicate = predicate(ScalarValue::Bool(false), false);
+        let unknown_predicate = predicate(ScalarValue::Null, true);
+        let true_predicate = predicate(ScalarValue::Bool(true), false);
+        let invalid_predicate = Expr {
+            kind: ExprKind::Literal(ScalarValue::Int64(1)),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Int64),
+                nullable: false,
+            },
+        };
+        let false_predicate = bind_expression(&false_predicate, &fields).expect("bind false");
+        let unknown_predicate = bind_expression(&unknown_predicate, &fields).expect("bind unknown");
+        let true_predicate = bind_expression(&true_predicate, &fields).expect("bind true");
+        let invalid_predicate =
+            bind_expression(&invalid_predicate, &fields).expect("bind invalid scalar");
         let text = String::from("qualified");
         let original_pointer = text.as_ptr();
         let values = [ScalarRef::Int64(7), ScalarRef::Text(&text)];
@@ -9552,9 +9852,45 @@ mod tests {
         let mut rows = Vec::new();
         let mut pending = None;
 
+        let rejected_text_predicate = Expr {
+            kind: ExprKind::Binary {
+                operator: BinaryOp::Eq,
+                left: Box::new(Expr {
+                    kind: ExprKind::Column(payload),
+                    expr_type: ExprType {
+                        data_type: SemanticType::physical(PhysicalType::Text),
+                        nullable: false,
+                    },
+                }),
+                right: Box::new(Expr {
+                    kind: ExprKind::Literal(ScalarValue::Text("rejected".into())),
+                    expr_type: ExprType {
+                        data_type: SemanticType::physical(PhysicalType::Text),
+                        nullable: false,
+                    },
+                }),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let rejected_text_predicate =
+            bind_expression(&rejected_text_predicate, &fields).expect("bind rejected Text");
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Bool(false), false),
-            &fields,
+            &rejected_text_predicate,
+            &[1],
+            Some(row_id),
+            &values,
+            &mut rows,
+            &mut pending,
+        );
+        assert!(rows.is_empty());
+        assert!(pending.is_none());
+        assert_eq!(text.as_ptr(), original_pointer);
+
+        collect_streaming_filter_row(
+            &false_predicate,
             &[0, 1],
             Some(row_id),
             &values,
@@ -9562,8 +9898,7 @@ mod tests {
             &mut pending,
         );
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Null, true),
-            &fields,
+            &unknown_predicate,
             &[0, 1],
             Some(row_id),
             &values,
@@ -9574,8 +9909,7 @@ mod tests {
         assert!(pending.is_none());
 
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Bool(true), false),
-            &fields,
+            &true_predicate,
             &[0, 1],
             Some(row_id),
             &values,
@@ -9592,8 +9926,7 @@ mod tests {
 
         rows.clear();
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Bool(true), false),
-            &fields,
+            &true_predicate,
             &[0],
             Some(row_id),
             &values,
@@ -9605,8 +9938,7 @@ mod tests {
 
         rows.clear();
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Bool(true), false),
-            &fields,
+            &true_predicate,
             &[1, 0, 1],
             Some(row_id),
             &values,
@@ -9630,8 +9962,7 @@ mod tests {
 
         rows.clear();
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Bool(true), false),
-            &fields,
+            &true_predicate,
             &[],
             Some(row_id),
             &values,
@@ -9643,14 +9974,7 @@ mod tests {
 
         rows.clear();
         collect_streaming_filter_row(
-            &Expr {
-                kind: ExprKind::Literal(ScalarValue::Int64(1)),
-                expr_type: ExprType {
-                    data_type: SemanticType::physical(PhysicalType::Int64),
-                    nullable: false,
-                },
-            },
-            &fields,
+            &invalid_predicate,
             &[0, 1],
             Some(row_id),
             &values,
@@ -9659,8 +9983,7 @@ mod tests {
         );
         assert!(matches!(pending, Some(ExecutionError::ExpectedBoolean)));
         collect_streaming_filter_row(
-            &predicate(ScalarValue::Bool(true), false),
-            &[],
+            &true_predicate,
             &[],
             Some(row_id),
             &[],

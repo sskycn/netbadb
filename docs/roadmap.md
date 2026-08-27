@@ -995,22 +995,29 @@ to 1.003125 ms and therefore did not share that target-level improvement.
 Every benchmark correctness gate passed; there is no timing threshold and no
 extra full run was performed.
 
-### Phase 7V — Generic Filter position prebinding (partially absorbed)
+### Phase 7V — Generic Filter position prebinding (complete in Phase 63)
 
-Phase 7U ends the Filter ownership line: predicate-only all-TRUE Text is now
-close to the primitive control, while retained Text is necessary QueryResult
-ownership. The wide/single Int64 dynamic-lookup ratio remains 2.241x after
-Phase 7U, so binding generic Filter Column identities to checked source
-positions once is the strongest next measured candidate.
+- exact `Filter → SeqScan` and retained-column-aware
+  `Project → Filter → SeqScan` build source-order fields and bind the existing
+  `BoundExpr` once before borrowed storage traversal;
+- their valid row callback evaluates `&BoundExpr + &[ScalarRef]` by checked
+  position and receives no `Expr` or field slice. FALSE/UNKNOWN Text rows stay
+  borrowed, while only selected output values become owned;
+- the materialized legacy Filter binds once after child execution, covering
+  IndexScan, RangeIndexScan, PartitionedScan, Join, and other ineligible
+  streaming/batch children;
+- binding failure keeps the dynamic evaluator as a malformed-plan compatibility
+  fallback, preserving empty-child and row-dependent error timing. Existing
+  three-valued logic and non-short-circuit AND/OR behavior remain shared;
+- batch Filter, filtered COUNT, Join predicates, dispatch priority, plans,
+  public APIs, dependencies, and persistent contracts are unchanged.
 
-The later Vectorized Execution Foundation binds every Filter position once for
-its eligible SeqScan batch pipeline. It does not replace the dynamic evaluator
-in every legacy fallback or the retained borrowed predicate-only Text fast
-path, so generic Filter prebinding is not complete repository-wide. Later
-candidates remain sequential PageManager traversal, BufferPool page snapshot
-cloning, AND/OR short-circuiting, MIN/MAX ownership, group-key ownership,
-covering/index-only reads, broader HashJoin eligibility, and multi-inequality
-intersection.
+The Phase 63 narrow/wide pair holds output, scan columns, comparison count, AND
+count, and result cardinality constant. Its quick wide/narrow ratio changed
+only from 0.887x to 0.849x and remained below 1.0, while unrelated controls
+moved from -71.2% to +17.7%. This does not establish a stable timing curve; the
+structural removal of per-row identity lookup and the semantic tests are the
+authoritative result.
 
 ### Later Phase 7 work
 
@@ -1442,7 +1449,29 @@ conflicting directions. The implementation is retained for its stronger
 typed-state invariant and removal of generic Aggregate dispatch, not as a
 throughput claim.
 
-Phase 63 should implement Generic Filter position prebinding. Aggregate
-ownership and comparison micro-tuning stops here unless a new structural issue
-is measured. Typed column-oriented batches remain behind that work; HashJoin
-batch integration, Sort/Top-N, and index/range/partition batch sources follow.
+Aggregate ownership and comparison micro-tuning stops here unless a new
+structural issue is measured. Phase 63 follows with generic Filter position
+prebinding.
+
+## Generic Filter Position Prebinding (Phase 63, complete)
+
+- reuses the sole executor-private `BoundExpr` for valid generic streaming and
+  legacy materialized Filter paths, resolving every Column identity once per
+  execution;
+- keeps borrowed scalar evaluation and owns values only for qualified output;
+- retains the dynamic evaluator only for malformed binding compatibility and
+  other execution boundaries that have not selected prebinding;
+- proves wide first/middle/last/repeated positions, bound/dynamic evaluation
+  equivalence, projected streaming retention, batch Filter+Limit stability,
+  and unchanged missing-column/type/boolean error behavior;
+- adds a gated same-output, same-scan, five-comparison narrow/wide attribution
+  pair and retains IndexScan Filter plus primitive/Text controls.
+
+The quick pair did not reveal a stable position-cost signal: narrow moved
+626,958→651,292 ns and wide moved 556,417→552,791 ns, changing wide/narrow from
+0.887x to 0.849x. Broad non-target movement prevents a throughput claim or
+timing gate. Phase 64 should not continue leaf-lookup micro-optimization.
+Typed column-oriented batch representation, HashJoin batch producer/consumer
+integration, Sort/Top-N, and index/range/partition batch sources should be
+remeasured against current workloads before one is selected; AND/OR
+short-circuiting remains a separate measured candidate.
