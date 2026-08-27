@@ -1677,6 +1677,18 @@ struct AggregateAccumulator<'a> {
     output_fields: Vec<OutputField>,
     group_lookup: GroupLookup,
     groups: Vec<GroupState>,
+    #[cfg(test)]
+    grouped_batch_stats: GroupedBatchStats,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GroupedBatchStats {
+    grouped_rows: usize,
+    borrow_only_hits: usize,
+    miss_rows: usize,
+    rows_with_scalar_transfer: usize,
+    extrema_replacement_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2425,6 +2437,8 @@ impl<'a> AggregateAccumulator<'a> {
             output_fields: outputs.iter().map(AggregateOutput::output_field).collect(),
             group_lookup: GroupLookup::new(),
             groups: Vec::new(),
+            #[cfg(test)]
+            grouped_batch_stats: GroupedBatchStats::default(),
         };
         if group_keys.is_empty() {
             accumulator
@@ -2436,15 +2450,120 @@ impl<'a> AggregateAccumulator<'a> {
 
     fn consume_batch(&mut self, batch: &mut ExecutionBatch) -> Result<(), ExecutionError> {
         debug_assert!(batch.rows.len() <= EXECUTION_BATCH_CAPACITY);
-        if self.group_keys.is_empty() && !self.has_extremes {
-            let result = self.consume_rows(&batch.rows);
-            batch.rows.clear();
-            return result;
+        if self.group_keys.is_empty() {
+            if !self.has_extremes {
+                let result = self.consume_rows(&batch.rows);
+                batch.rows.clear();
+                return result;
+            }
+            for row in batch.rows.drain(..) {
+                self.consume_owned_row(row)?;
+            }
+            return Ok(());
         }
-        for row in batch.rows.drain(..) {
-            self.consume_owned_row(row)?;
+
+        let result = self.consume_grouped_rows_mut(&mut batch.rows);
+        batch.rows.clear();
+        result
+    }
+
+    fn consume_grouped_rows_mut(
+        &mut self,
+        rows: &mut [ExecutionRow],
+    ) -> Result<(), ExecutionError> {
+        debug_assert!(!self.group_keys.is_empty());
+        for row in rows {
+            self.consume_grouped_row_mut(row)?;
         }
         Ok(())
+    }
+
+    fn consume_grouped_row_mut(&mut self, row: &mut ExecutionRow) -> Result<(), ExecutionError> {
+        debug_assert!(!self.group_keys.is_empty());
+        #[cfg(test)]
+        {
+            self.grouped_batch_stats.grouped_rows += 1;
+        }
+        let probe = self.probe_group(row)?;
+        if self.has_extremes {
+            for targets in &mut self.replacement_targets {
+                targets.clear();
+            }
+        }
+
+        if let Some(group_index) = probe.group_index {
+            let group = self
+                .groups
+                .get_mut(group_index)
+                .ok_or(ExecutionError::TypeMismatch)?;
+            let has_actual_replacements = collect_owned_aggregate_updates(
+                row,
+                &self.aggregates,
+                &self.aggregate_positions,
+                &mut self.replacement_targets,
+                group,
+            )?;
+            if has_actual_replacements {
+                transfer_owned_row_values(
+                    row,
+                    false,
+                    &self.group_key_targets,
+                    &self.replacement_targets,
+                    group,
+                    &mut self.group_lookup,
+                )?;
+                #[cfg(test)]
+                {
+                    self.grouped_batch_stats.rows_with_scalar_transfer += 1;
+                    self.grouped_batch_stats.extrema_replacement_rows += 1;
+                }
+            } else {
+                #[cfg(test)]
+                {
+                    self.grouped_batch_stats.borrow_only_hits += 1;
+                }
+            }
+            return Ok(());
+        }
+
+        validate_group_key(row, &self.group_key_positions, self.group_keys)?;
+        let mut group = new_group_state(
+            vec![ScalarValue::Null; self.group_keys.len()],
+            &self.aggregates,
+        )?;
+        let _has_actual_replacements = collect_owned_aggregate_updates(
+            row,
+            &self.aggregates,
+            &self.aggregate_positions,
+            &mut self.replacement_targets,
+            &mut group,
+        )?;
+        transfer_owned_row_values(
+            row,
+            true,
+            &self.group_key_targets,
+            &self.replacement_targets,
+            &mut group,
+            &mut self.group_lookup,
+        )?;
+        let group_index = self.groups.len();
+        self.group_lookup.register_group(probe.hash, group_index)?;
+        self.group_lookup.record_owned_key_materialization();
+        self.groups.push(group);
+        #[cfg(test)]
+        {
+            self.grouped_batch_stats.miss_rows += 1;
+            self.grouped_batch_stats.rows_with_scalar_transfer += 1;
+            if _has_actual_replacements {
+                self.grouped_batch_stats.extrema_replacement_rows += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    const fn grouped_batch_stats(&self) -> GroupedBatchStats {
+        self.grouped_batch_stats
     }
 
     fn consume_rows(&mut self, rows: &[ExecutionRow]) -> Result<(), ExecutionError> {
@@ -2591,12 +2710,13 @@ fn collect_owned_aggregate_updates(
     aggregate_positions: &[Option<usize>],
     replacement_targets: &mut [Vec<usize>],
     group: &mut GroupState,
-) -> Result<(), ExecutionError> {
+) -> Result<bool, ExecutionError> {
     if aggregates.len() != aggregate_positions.len()
         || aggregates.len() != group.aggregate_states.len()
     {
         return Err(ExecutionError::TypeMismatch);
     }
+    let mut has_actual_replacements = false;
     for (aggregate_index, ((aggregate, position), state)) in aggregates
         .iter()
         .zip(aggregate_positions)
@@ -2615,6 +2735,7 @@ fn collect_owned_aggregate_updates(
             };
             let value = value.ok_or(ExecutionError::TypeMismatch)?;
             if aggregate_extreme_replaces(state, value)? {
+                has_actual_replacements = true;
                 replacement_targets
                     .get_mut(*position)
                     .ok_or(ExecutionError::TypeMismatch)?
@@ -2624,7 +2745,7 @@ fn collect_owned_aggregate_updates(
             update_aggregate_state(state, aggregate, value)?;
         }
     }
-    Ok(())
+    Ok(has_actual_replacements)
 }
 
 fn transfer_owned_row_values(
@@ -4436,6 +4557,16 @@ mod tests {
         assert_eq!(stats.owned_key_clones, 0);
         assert!(stats.exact_collision_checks >= stats.hits);
         assert_eq!(
+            accumulator.grouped_batch_stats(),
+            super::GroupedBatchStats {
+                grouped_rows: 513,
+                borrow_only_hits: 509,
+                miss_rows: 4,
+                rows_with_scalar_transfer: 4,
+                extrema_replacement_rows: 0,
+            }
+        );
+        assert_eq!(
             accumulator.finish().expect("finish integer groups").rows,
             (0_u64..4)
                 .map(|key| super::ExecutionRow {
@@ -4482,6 +4613,16 @@ mod tests {
             }
         );
         assert_eq!(
+            accumulator.grouped_batch_stats(),
+            super::GroupedBatchStats {
+                grouped_rows: 513,
+                borrow_only_hits: 512,
+                miss_rows: 1,
+                rows_with_scalar_transfer: 1,
+                extrema_replacement_rows: 0,
+            }
+        );
+        assert_eq!(
             text_pointer(&accumulator.groups[0].key_values[0]),
             durable_pointer
         );
@@ -4519,7 +4660,148 @@ mod tests {
             assert_eq!(stats.owned_key_moves, 513);
             assert_eq!(stats.owned_key_clones, 0);
             assert_eq!(accumulator.groups.len(), 513);
+            assert_eq!(
+                accumulator.grouped_batch_stats(),
+                super::GroupedBatchStats {
+                    grouped_rows: 513,
+                    borrow_only_hits: 0,
+                    miss_rows: 513,
+                    rows_with_scalar_transfer: 513,
+                    extrema_replacement_rows: 0,
+                }
+            );
         }
+    }
+
+    #[test]
+    fn grouped_borrow_first_extrema_transfer_only_on_actual_replacement() {
+        let columns = batch_columns();
+        let team = columns[1].clone();
+        let payload = columns[3].clone();
+        let input_fields = [
+            OutputField::Source(team.clone()),
+            OutputField::Source(payload.clone()),
+        ];
+        let extreme = |function, name: &str| {
+            batch_aggregate_expression(
+                function,
+                AggregateInput::Column(payload.clone()),
+                name,
+                PhysicalType::Text,
+                false,
+            )
+        };
+
+        for (function, expected) in [
+            (
+                AggregateFunction::Min,
+                super::GroupedBatchStats {
+                    grouped_rows: 513,
+                    borrow_only_hits: 512,
+                    miss_rows: 1,
+                    rows_with_scalar_transfer: 1,
+                    extrema_replacement_rows: 1,
+                },
+            ),
+            (
+                AggregateFunction::Max,
+                super::GroupedBatchStats {
+                    grouped_rows: 513,
+                    borrow_only_hits: 0,
+                    miss_rows: 1,
+                    rows_with_scalar_transfer: 513,
+                    extrema_replacement_rows: 513,
+                },
+            ),
+        ] {
+            let outputs = [
+                AggregateOutput::GroupKey(team.clone()),
+                extreme(function, function.as_str()),
+            ];
+            let mut accumulator =
+                AggregateAccumulator::new(&input_fields, std::slice::from_ref(&team), &outputs)
+                    .expect("build grouped Text extreme accumulator");
+            consume_generated_batches(&mut accumulator, 513, |index| {
+                vec![
+                    ScalarValue::UInt64(0),
+                    ScalarValue::Text(format!("value-{index:04}")),
+                ]
+            });
+            assert_eq!(accumulator.grouped_batch_stats(), expected);
+            assert_eq!(accumulator.group_lookup.stats().owned_key_moves, 1);
+            assert_eq!(accumulator.group_lookup.stats().owned_key_clones, 0);
+        }
+    }
+
+    #[test]
+    fn grouped_duplicate_max_keeps_clone_one_move_one_on_replacement() {
+        let columns = batch_columns();
+        let team = columns[1].clone();
+        let payload = columns[3].clone();
+        let input_fields = [
+            OutputField::Source(team.clone()),
+            OutputField::Source(payload.clone()),
+        ];
+        let maximum = |name: &str| {
+            batch_aggregate_expression(
+                AggregateFunction::Max,
+                AggregateInput::Column(payload.clone()),
+                name,
+                PhysicalType::Text,
+                false,
+            )
+        };
+        let outputs = [
+            AggregateOutput::GroupKey(team.clone()),
+            maximum("MAX(payload)#1"),
+            maximum("MAX(payload)#2"),
+        ];
+        let final_value = String::from("z-final");
+        let final_pointer = final_value.as_ptr();
+        let mut accumulator =
+            AggregateAccumulator::new(&input_fields, std::slice::from_ref(&team), &outputs)
+                .expect("build grouped duplicate MAX accumulator");
+        let mut batch = ExecutionBatch::with_capacity();
+        batch.rows.extend([
+            ExecutionRow {
+                row_id: None,
+                values: vec![
+                    ScalarValue::UInt64(0),
+                    ScalarValue::Text(String::from("a-first")),
+                ],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::UInt64(0), ScalarValue::Text(final_value)],
+            },
+        ]);
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume grouped duplicate MAX batch");
+        assert_eq!(
+            accumulator.grouped_batch_stats(),
+            super::GroupedBatchStats {
+                grouped_rows: 2,
+                borrow_only_hits: 0,
+                miss_rows: 1,
+                rows_with_scalar_transfer: 2,
+                extrema_replacement_rows: 2,
+            }
+        );
+        assert_eq!(
+            accumulator.groups[0]
+                .aggregate_states
+                .iter()
+                .filter(|state| {
+                    matches!(
+                        state,
+                        super::AggregateState::Max(Some(value))
+                            if text_pointer(value) == final_pointer
+                    )
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4792,6 +5074,66 @@ mod tests {
     }
 
     #[test]
+    fn forced_collision_group_hit_keeps_mutable_batch_row_borrowed() {
+        let key = batch_columns()[3].clone();
+        let input_fields = [OutputField::Source(key.clone())];
+        let outputs = [AggregateOutput::GroupKey(key.clone()), count_output()];
+        let mut accumulator =
+            AggregateAccumulator::new(&input_fields, std::slice::from_ref(&key), &outputs)
+                .expect("build forced-collision accumulator");
+        accumulator.groups.extend([
+            super::new_group_state(
+                vec![ScalarValue::Text(String::from("alpha"))],
+                &accumulator.aggregates,
+            )
+            .expect("build collision group A"),
+            super::new_group_state(
+                vec![ScalarValue::Text(String::from("beta"))],
+                &accumulator.aggregates,
+            )
+            .expect("build collision group B"),
+        ]);
+        let text = String::from("alpha");
+        let original_pointer = text.as_ptr();
+        let mut row = ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Text(text)],
+        };
+        let hash = hash_group_key(
+            &accumulator.group_lookup.key_hasher,
+            &row,
+            &accumulator.group_key_positions,
+            accumulator.group_keys,
+        )
+        .expect("hash forced-collision row");
+        accumulator
+            .group_lookup
+            .register_group(hash, 0)
+            .expect("register collision group A");
+        accumulator
+            .group_lookup
+            .register_group(hash, 1)
+            .expect("register collision group B");
+
+        accumulator
+            .consume_grouped_row_mut(&mut row)
+            .expect("consume forced-collision hit");
+        assert_eq!(text_pointer(&row.values[0]), original_pointer);
+        assert_eq!(row.values[0], ScalarValue::Text(String::from("alpha")));
+        assert_eq!(
+            accumulator.grouped_batch_stats(),
+            super::GroupedBatchStats {
+                grouped_rows: 1,
+                borrow_only_hits: 1,
+                miss_rows: 0,
+                rows_with_scalar_transfer: 0,
+                extrema_replacement_rows: 0,
+            }
+        );
+        assert_eq!(accumulator.group_lookup.stats().exact_collision_checks, 2);
+    }
+
+    #[test]
     fn borrowed_group_lookup_matches_legacy_across_cardinality_and_batch_boundaries() {
         let key = batch_columns()[0].clone();
         let input_fields = [OutputField::Source(key.clone())];
@@ -4839,6 +5181,16 @@ mod tests {
                 assert_eq!(stats.owned_key_materializations, expected_groups);
                 assert_eq!(stats.owned_key_moves, expected_groups);
                 assert_eq!(stats.owned_key_clones, 0);
+                assert_eq!(
+                    batch.grouped_batch_stats(),
+                    super::GroupedBatchStats {
+                        grouped_rows: rows,
+                        borrow_only_hits: rows - expected_groups,
+                        miss_rows: expected_groups,
+                        rows_with_scalar_transfer: expected_groups,
+                        extrema_replacement_rows: 0,
+                    }
+                );
                 let batch = batch.finish().expect("finish batch groups");
                 let legacy = legacy.finish().expect("finish legacy groups");
                 assert_eq!(batch, legacy);
@@ -5970,6 +6322,59 @@ mod tests {
         ));
         storage.close().expect("close aggregate error Heap");
         remove_batch_test_path(&path, false);
+    }
+
+    #[test]
+    fn grouped_batch_error_clears_rows_and_retains_capacity() {
+        let columns = batch_columns();
+        let team = columns[1].clone();
+        let id = columns[0].clone();
+        let input_fields = [
+            OutputField::Source(team.clone()),
+            OutputField::Source(id.clone()),
+        ];
+        let outputs = [
+            AggregateOutput::GroupKey(team.clone()),
+            batch_aggregate_expression(
+                AggregateFunction::Sum,
+                AggregateInput::Column(id),
+                "SUM(id)",
+                PhysicalType::Int64,
+                true,
+            ),
+        ];
+        let mut accumulator =
+            AggregateAccumulator::new(&input_fields, std::slice::from_ref(&team), &outputs)
+                .expect("build grouped overflow accumulator");
+        let mut batch = ExecutionBatch::with_capacity();
+        let capacity = batch.rows.capacity();
+        batch.rows.extend([
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::UInt64(0), ScalarValue::Int64(i64::MAX)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::UInt64(0), ScalarValue::Int64(1)],
+            },
+            ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::UInt64(0), ScalarValue::Int64(2)],
+            },
+        ]);
+
+        let error = accumulator
+            .consume_batch(&mut batch)
+            .expect_err("grouped SUM must overflow");
+        assert!(matches!(
+            error,
+            ExecutionError::AggregateOverflow {
+                function: AggregateFunction::Sum,
+                output,
+            } if output == "SUM(id)"
+        ));
+        assert!(batch.rows.is_empty());
+        assert_eq!(batch.rows.capacity(), capacity);
     }
 
     #[test]

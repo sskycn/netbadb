@@ -793,6 +793,11 @@ The implementation sequence is intentionally vertical:
     now passes that opaque `u64` prehash directly to bucket indexing. Exact
     `GroupState` key comparison still resolves collisions, and the pass-through
     map never hashes raw user values.
+61. Borrowed-First Grouped Batch Consumption — complete; grouped Aggregate now
+    probes and applies borrowed transitions through mutable in-place batch rows.
+    Ordinary hits and extrema hits without a replacement move no scalar slots;
+    misses and actual extrema replacements move only their selected values, then
+    the complete batch is cleared while retaining its allocation.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

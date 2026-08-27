@@ -1138,6 +1138,41 @@ candidate metadata only: the collision chain and authoritative exact
 defines first-seen order, including NULL and multi-key groups, and the Phase 59
 probe-to-register path reuses its already computed prehash on a miss.
 
+Phase 61 keeps `ExecutionBatch` as the owner of grouped rows and consumes each
+row through a mutable borrow in place:
+
+```text
+ExecutionBatch owns rows
+        ↓
+grouped consumer borrows &mut ExecutionRow
+        ↓
+borrowed GroupLookup probe
+        ↓
+borrowed COUNT/SUM transitions and MIN/MAX comparison
+        ↓
+actual durable owner required?
+      ┌────────────┴────────────┐
+     no                        yes
+      ↓                         ↓
+leave row intact       move selected ScalarValue slots
+      └────────────┬────────────┘
+                   ↓
+          clear complete batch
+                   ↓
+             retain Vec capacity
+```
+
+Whole `ExecutionRow` ownership is no longer required for ordinary grouped hits.
+A hit without extrema never enters replacement-owner planning, and an extrema
+hit enters scalar transfer only when the borrowed comparison selects an actual
+replacement. A miss still combines Phase 59 group-key targets with extrema
+targets and performs clone `N - 1` plus one move per source slot. Errors stop
+processing but the outer grouped consumer clears every remaining row before
+returning while preserving the batch allocation. Global COUNT/SUM remains on
+its borrowed path, and global MIN/MAX still drains owned rows through the Phase
+57 path. Phase 60 randomized prehashing, exact collision chains, NULL grouping,
+and first-seen `Vec<GroupState>` order are unchanged.
+
 Exact standalone Filter and predicate-only Project/Filter shapes retain the
 measured borrowed Phase 7 streaming specializations for every scalar type,
 avoiding owned values for rejected rows; Filter pipelines with Limit use the

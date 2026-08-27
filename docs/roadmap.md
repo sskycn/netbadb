@@ -1376,3 +1376,45 @@ MIN/MAX ownership transfer is needed. Aggregate Text comparison and generic
 Filter position prebinding remain later focused candidates; typed
 column-oriented batches, batch HashJoin, Sort/Top-N, and index/range/partition
 batch sources remain unselected.
+
+## Borrowed-First Grouped Batch Consumption (complete)
+
+- keeps grouped rows inside `ExecutionBatch` and iterates them by mutable borrow;
+  whole `ExecutionRow` values are no longer drained from the batch;
+- lets group-only and COUNT/SUM hits perform only borrowed probe and transition
+  work, and skips the scalar-transfer helper for MIN/MAX hits without an actual
+  replacement;
+- preserves Phase 59 miss ownership and actual extrema replacement behavior:
+  group-key and replacement owners still share clone `N - 1` plus one move per
+  selected source slot;
+- clears the complete batch after success or error and retains its `Vec`
+  capacity; global COUNT/SUM and the Phase 57 global MIN/MAX drain path remain
+  unchanged;
+- retains Phase 60 keyed prehashing, exact forced-collision comparison, NULL and
+  multi-key grouping, first-seen order, Heap/LSM neutrality, safe Rust, and all
+  public and persistent contracts.
+
+Test-only accumulator counters give the structural result for 513 rows:
+
+| workload | borrow-only hits | miss rows | transfer rows |
+| --- | ---: | ---: | ---: |
+| one-group COUNT | 512 | 1 | 1 |
+| four-group COUNT | 509 | 4 | 4 |
+| unique-group COUNT | 0 | 513 | 513 |
+| one-group ascending Text MIN | 512 | 1 | 1 |
+| one-group ascending Text MAX | 0 | 1 | 513 |
+
+One serial quick pre/post run moved one-group group-only/COUNT/SUM by -34.4%,
+-26.1%, and -7.1%. Mostly-borrowed Text MIN moved -50.2%, while transfer-heavy
+Text MAX moved +15.3%, which is the clearest selective-bookkeeping-shaped signal.
+Four-group group-only/COUNT moved +16.8%/+0.5%, unique Int64/Text moved
+-8.6%/-8.2%, and unrelated controls ranged from -37.3% to +48.1%. Timings are
+therefore directional; structural counters, cleanup tests, pointer identity,
+and legacy equivalence are authoritative.
+
+Phase 62 should investigate Aggregate Text comparison rather than continue
+ownership micro-tuning. Primitive grouping did not show a consistent remaining
+hash/lookup curve across one group, four groups, and two primitive keys, while
+Phase 61 has now removed the identifiable whole-row bookkeeping. Generic Filter
+position prebinding follows; typed column batches, HashJoin integration,
+Sort/Top-N, and index/range/partition batch sources remain unselected.

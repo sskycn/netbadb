@@ -1034,6 +1034,61 @@ fn run_projection_attribution_scenarios(
         measurements,
     )?;
     for (scenario, cardinality) in [
+        ("group_borrow_group_only_cardinality_1", 1),
+        ("group_borrow_group_only_cardinality_4", 4),
+    ] {
+        run_group_lookup_attribution_query(
+            scenario,
+            rows,
+            cardinality,
+            "SELECT team_id FROM items GROUP BY team_id",
+            &[Operator::Aggregate, Operator::SeqScan],
+            &[TEAM_COLUMN_ID],
+            Observation {
+                rows: rows.min(cardinality),
+                checksum: arithmetic_sum(rows.min(cardinality)),
+            },
+            settings,
+            |result| group_only_observation(result, rows, cardinality),
+            measurements,
+        )?;
+    }
+    run_group_lookup_attribution_query(
+        "group_borrow_sum_cardinality_1",
+        rows,
+        1,
+        "SELECT team_id, SUM(id) FROM items GROUP BY team_id",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+        Observation {
+            rows: 1,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        |result| one_group_sum_observation(result, rows),
+        measurements,
+    )?;
+    for (scenario, function, maximum) in [
+        ("group_borrow_text_min_cardinality_1", "MIN", false),
+        ("group_borrow_text_max_cardinality_1", "MAX", true),
+    ] {
+        run_group_lookup_attribution_query(
+            scenario,
+            rows,
+            1,
+            &format!("SELECT team_id, {function}(payload) FROM items GROUP BY team_id"),
+            &[Operator::Aggregate, Operator::SeqScan],
+            &[TEAM_COLUMN_ID, PAYLOAD_COLUMN_ID],
+            Observation {
+                rows: 1,
+                checksum: u128::from(if maximum { rows.saturating_sub(1) } else { 0 }),
+            },
+            settings,
+            |result| one_group_text_extreme_observation(result, rows, maximum),
+            measurements,
+        )?;
+    }
+    for (scenario, cardinality) in [
         ("group_lookup_int_cardinality_1", 1),
         ("group_lookup_int_cardinality_4", 4),
         (
@@ -3539,6 +3594,83 @@ fn group_observation(result: &QueryResult) -> BenchResult<Observation> {
         rows: u64::try_from(result.rows.len())
             .map_err(|_| message_error("group row count exceeds u64"))?,
         checksum,
+    })
+}
+
+fn group_only_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    cardinality: u64,
+) -> BenchResult<Observation> {
+    let expected_groups = fixture_rows.min(cardinality);
+    if result.rows.len() as u64 != expected_groups {
+        return Err(message_error(format!(
+            "group-only query returned {} groups; expected {expected_groups}",
+            result.rows.len()
+        )));
+    }
+    for (position, row) in result.rows.iter().enumerate() {
+        let [ScalarValue::Int64(key)] = row.as_slice() else {
+            return Err(message_error(
+                "group-only query must return one non-NULL Int64 key",
+            ));
+        };
+        if *key != i64::try_from(position)? {
+            return Err(message_error(format!(
+                "group-only row {position} returned key {key}"
+            )));
+        }
+    }
+    Ok(Observation {
+        rows: expected_groups,
+        checksum: arithmetic_sum(expected_groups),
+    })
+}
+
+fn one_group_sum_observation(result: &QueryResult, fixture_rows: u64) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("one-group SUM must return one row"));
+    };
+    let [ScalarValue::Int64(0), ScalarValue::Int64(sum)] = row.as_slice() else {
+        return Err(message_error(
+            "one-group SUM must return Int64 key and Int64 SUM",
+        ));
+    };
+    let expected = i64::try_from(arithmetic_sum(fixture_rows))
+        .map_err(|_| message_error("fixture SUM exceeds i64"))?;
+    if *sum != expected {
+        return Err(message_error(format!(
+            "one-group SUM returned {sum}; expected {expected}"
+        )));
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: arithmetic_sum(fixture_rows),
+    })
+}
+
+fn one_group_text_extreme_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    maximum: bool,
+) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("one-group Text extreme must return one row"));
+    };
+    let [ScalarValue::Int64(0), ScalarValue::Text(payload)] = row.as_slice() else {
+        return Err(message_error(
+            "one-group Text extreme must return Int64 key and Text value",
+        ));
+    };
+    let endpoint = if maximum {
+        fixture_rows.saturating_sub(1)
+    } else {
+        0
+    };
+    validate_payload(usize::try_from(endpoint)?, payload)?;
+    Ok(Observation {
+        rows: 1,
+        checksum: u128::from(endpoint),
     })
 }
 

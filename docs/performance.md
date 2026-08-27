@@ -1345,6 +1345,73 @@ unchanged. The remaining hit-heavy grouped cost selects selective owned-row
 bookkeeping as Phase 61; Aggregate Text comparison, generic Filter prebinding,
 and broader column-oriented execution remain separate candidates.
 
+## Phase 61 borrowed-first grouped batch attribution
+
+Phase 61 added group-only cardinality 1/4, one-group SUM, and one-group ascending
+Text MIN/MAX scenarios before changing production consumption. Existing Phase
+60 cardinality, primitive-width, unique Text, and wide unique cases remain exact
+controls. The same quick command ran serially before and after, with raw output
+stored outside the repository at `/tmp/netbadb-phase61-pre.txt` and
+`/tmp/netbadb-phase61-post.txt`.
+
+Medians are machine-local nanoseconds per query:
+
+| scenario | groups | transfer shape | pre median | post median | change |
+| --- | ---: | --- | ---: | ---: | ---: |
+| group-only | 1 | one miss transfer | 550,000 | 360,625 | -34.4% |
+| group-only | 4 | four miss transfers | 463,875 | 541,625 | +16.8% |
+| COUNT(*) | 1 | one miss transfer | 500,791 | 369,875 | -26.1% |
+| SUM(id) | 1 | one miss transfer | 464,750 | 431,667 | -7.1% |
+| Text MIN | 1 | one miss/replacement transfer | 578,125 | 287,667 | -50.2% |
+| Text MAX | 1 | every row transfers | 511,583 | 589,750 | +15.3% |
+
+The MIN/MAX pair is the strongest attribution signal: both hash and exact-probe
+the same one-group Text shape, but ascending MIN has 999 borrow-only hits while
+ascending MAX transfers its candidate on every row. MIN improved materially and
+MAX did not. One-group group-only and COUNT also improved, while SUM improved
+more modestly. Four-group group-only regressed and four-group COUNT was flat, so
+the quick run does not support a uniform absolute latency claim.
+
+Phase 60 grouped controls were:
+
+| scenario | groups | key shape | pre median | post median | change |
+| --- | ---: | --- | ---: | ---: | ---: |
+| one-group Int64 COUNT | 1 | Int64 | 500,791 | 369,875 | -26.1% |
+| four-group Int64 COUNT | 4 | Int64 | 422,958 | 424,875 | +0.5% |
+| unique Int64 COUNT | 1,000 | Int64 | 722,042 | 659,916 | -8.6% |
+| two primitive keys | 8 | Int64 + Bool | 389,166 | 386,875 | -0.6% |
+| unique Text COUNT | 1,000 | Text | 871,417 | 799,666 | -8.2% |
+| wide unique COUNT | 1,000 | Int64 + Text | 913,625 | 887,792 | -2.8% |
+
+Non-target controls again moved in both directions:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| global SUM | 325,167 | 481,708 | +48.1% |
+| global Text MIN | 494,625 | 392,458 | -20.7% |
+| global Text MAX | 475,708 | 397,708 | -16.4% |
+| direct COUNT(*) | 389,250 | 244,208 | -37.3% |
+| filtered COUNT(payload) | 439,125 | 442,083 | +0.7% |
+| early Limit | 21,333 | 16,792 | -21.3% |
+| full projected scan | 352,208 | 355,208 | +0.9% |
+| LSM SUM | 95,542 | 82,292 | -13.9% |
+
+Structural counters are the authoritative Phase 61 result. Across 513 rows,
+one/four/unique COUNT report 512/509/0 borrow-only hits and 1/4/513 transfer
+rows. One-group ascending Text MIN reports 512 borrow-only hits and one transfer
+row; MAX reports zero borrow-only hits and 513 transfer rows. Duplicate MAX
+pointer identity still proves clone `N - 1` plus one move, and a forced
+same-prehash hit performs exact collision comparisons without moving its row.
+A mid-batch grouped SUM overflow returns the same domain error, clears every row,
+and retains batch capacity. Batch/legacy and Heap/LSM equivalence remain the
+semantic gates.
+
+The ownership/bookkeeping line ends here: the implementation structurally
+removes whole-row drain work from ordinary grouped hits, but control variance
+prevents a stronger throughput claim. Phase 62 should investigate Aggregate
+Text comparison; generic Filter position prebinding remains next, while typed
+column batches are still premature.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
