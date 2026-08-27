@@ -1428,6 +1428,8 @@ struct GroupLookupStats {
     hits: usize,
     misses: usize,
     owned_key_materializations: usize,
+    owned_key_moves: usize,
+    owned_key_clones: usize,
     exact_collision_checks: usize,
 }
 
@@ -1514,6 +1516,14 @@ impl GroupLookup {
     }
 
     #[cfg(test)]
+    fn record_owned_key_transfer(&mut self, key_owners: usize, durable_owners: usize) {
+        if key_owners != 0 {
+            self.stats.owned_key_moves += 1;
+            self.stats.owned_key_clones += durable_owners.saturating_sub(1);
+        }
+    }
+
+    #[cfg(test)]
     const fn stats(&self) -> GroupLookupStats {
         self.stats
     }
@@ -1588,11 +1598,32 @@ fn materialize_group_key(
         .collect()
 }
 
+fn validate_group_key(
+    row: &ExecutionRow,
+    positions: &[usize],
+    group_keys: &[ColumnRef],
+) -> Result<(), ExecutionError> {
+    if positions.len() != group_keys.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    for (position, column) in positions.iter().zip(group_keys) {
+        let value = row
+            .values
+            .get(*position)
+            .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))?;
+        if !value.matches_type(&column.data_type) {
+            return Err(ExecutionError::TypeMismatch);
+        }
+    }
+    Ok(())
+}
+
 struct AggregateAccumulator<'a> {
     group_keys: &'a [ColumnRef],
     aggregates: Vec<&'a AggregateExpr>,
     has_extremes: bool,
     group_key_positions: Vec<usize>,
+    group_key_targets: Vec<Vec<usize>>,
     aggregate_positions: Vec<Option<usize>>,
     replacement_targets: Vec<Vec<usize>>,
     output_projection: ProjectionPlan,
@@ -2293,6 +2324,15 @@ impl<'a> AggregateAccumulator<'a> {
             .iter()
             .map(|column| find_source_position(input_fields, column))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut group_key_targets = (0..input_fields.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        for (key_target, source_position) in group_key_positions.iter().copied().enumerate() {
+            group_key_targets
+                .get_mut(source_position)
+                .ok_or(ExecutionError::TypeMismatch)?
+                .push(key_target);
+        }
         let aggregate_positions = aggregates
             .iter()
             .map(|aggregate| match &aggregate.input {
@@ -2331,6 +2371,7 @@ impl<'a> AggregateAccumulator<'a> {
             aggregates,
             has_extremes,
             group_key_positions,
+            group_key_targets,
             aggregate_positions,
             replacement_targets: (0..input_fields.len()).map(|_| Vec::new()).collect(),
             output_projection,
@@ -2348,7 +2389,7 @@ impl<'a> AggregateAccumulator<'a> {
 
     fn consume_batch(&mut self, batch: &mut ExecutionBatch) -> Result<(), ExecutionError> {
         debug_assert!(batch.rows.len() <= EXECUTION_BATCH_CAPACITY);
-        if !self.has_extremes {
+        if self.group_keys.is_empty() && !self.has_extremes {
             let result = self.consume_rows(&batch.rows);
             batch.rows.clear();
             return result;
@@ -2361,7 +2402,7 @@ impl<'a> AggregateAccumulator<'a> {
 
     fn consume_rows(&mut self, rows: &[ExecutionRow]) -> Result<(), ExecutionError> {
         for row in rows {
-            let group_index = self.group_index(row)?;
+            let group_index = self.borrowed_group_index(row)?;
             let group = self
                 .groups
                 .get_mut(group_index)
@@ -2380,86 +2421,82 @@ impl<'a> AggregateAccumulator<'a> {
     }
 
     fn consume_owned_row(&mut self, mut row: ExecutionRow) -> Result<(), ExecutionError> {
-        let group_index = self.group_index(&row)?;
-        for targets in &mut self.replacement_targets {
-            targets.clear();
-        }
-
-        let aggregates = &self.aggregates;
-        let aggregate_positions = &self.aggregate_positions;
-        let replacement_targets = &mut self.replacement_targets;
-        let group = self
-            .groups
-            .get_mut(group_index)
-            .ok_or(ExecutionError::TypeMismatch)?;
-        for (aggregate_index, ((aggregate, position), state)) in aggregates
-            .iter()
-            .zip(aggregate_positions)
-            .zip(&mut group.aggregate_states)
-            .enumerate()
-        {
-            let value = aggregate_input_value(&row, aggregate, *position)?;
-            if matches!(
-                aggregate.function,
-                AggregateFunction::Min | AggregateFunction::Max
-            ) {
-                let Some(position) = position else {
-                    return Err(ExecutionError::InvalidAggregateInput {
-                        function: aggregate.function,
-                    });
-                };
-                let value = value.ok_or(ExecutionError::TypeMismatch)?;
-                if aggregate_extreme_replaces(state, value)? {
-                    replacement_targets
-                        .get_mut(*position)
-                        .ok_or(ExecutionError::TypeMismatch)?
-                        .push(aggregate_index);
-                }
-            } else {
-                update_aggregate_state(state, aggregate, value)?;
+        let probe = self.probe_group(&row)?;
+        if self.has_extremes {
+            for targets in &mut self.replacement_targets {
+                targets.clear();
             }
         }
 
-        for (position, targets) in replacement_targets.iter().enumerate() {
-            let Some((&last_target, clone_targets)) = targets.split_last() else {
-                continue;
-            };
-            let candidate = std::mem::replace(
-                row.values
-                    .get_mut(position)
-                    .ok_or(ExecutionError::TypeMismatch)?,
-                ScalarValue::Null,
-            );
-            for target in clone_targets {
-                replace_aggregate_extreme(
-                    group
-                        .aggregate_states
-                        .get_mut(*target)
-                        .ok_or(ExecutionError::TypeMismatch)?,
-                    candidate.clone(),
+        if let Some(group_index) = probe.group_index {
+            let group = self
+                .groups
+                .get_mut(group_index)
+                .ok_or(ExecutionError::TypeMismatch)?;
+            collect_owned_aggregate_updates(
+                &row,
+                &self.aggregates,
+                &self.aggregate_positions,
+                &mut self.replacement_targets,
+                group,
+            )?;
+            if self.has_extremes {
+                transfer_owned_row_values(
+                    &mut row,
+                    false,
+                    &self.group_key_targets,
+                    &self.replacement_targets,
+                    group,
+                    &mut self.group_lookup,
                 )?;
             }
-            replace_aggregate_extreme(
-                group
-                    .aggregate_states
-                    .get_mut(last_target)
-                    .ok_or(ExecutionError::TypeMismatch)?,
-                candidate,
-            )?;
+            return Ok(());
         }
+
+        validate_group_key(&row, &self.group_key_positions, self.group_keys)?;
+        let mut group = new_group_state(
+            vec![ScalarValue::Null; self.group_keys.len()],
+            &self.aggregates,
+        )?;
+        collect_owned_aggregate_updates(
+            &row,
+            &self.aggregates,
+            &self.aggregate_positions,
+            &mut self.replacement_targets,
+            &mut group,
+        )?;
+        transfer_owned_row_values(
+            &mut row,
+            true,
+            &self.group_key_targets,
+            &self.replacement_targets,
+            &mut group,
+            &mut self.group_lookup,
+        )?;
+        let group_index = self.groups.len();
+        self.group_lookup.register_group(probe.hash, group_index)?;
+        self.group_lookup.record_owned_key_materialization();
+        self.groups.push(group);
         Ok(())
     }
 
-    fn group_index(&mut self, row: &ExecutionRow) -> Result<usize, ExecutionError> {
+    fn probe_group(&mut self, row: &ExecutionRow) -> Result<GroupLookupProbe, ExecutionError> {
         if self.group_keys.is_empty() {
-            return Ok(0);
+            return Ok(GroupLookupProbe {
+                hash: 0,
+                group_index: Some(0),
+            });
         }
-        let probe = self.group_lookup.probe(
+        self.group_lookup.probe(
             row,
             &self.group_key_positions,
             self.group_keys,
             &self.groups,
-        )?;
+        )
+    }
+
+    fn borrowed_group_index(&mut self, row: &ExecutionRow) -> Result<usize, ExecutionError> {
+        let probe = self.probe_group(row)?;
         if let Some(index) = probe.group_index {
             return Ok(index);
         }
@@ -2498,6 +2535,127 @@ impl<'a> AggregateAccumulator<'a> {
             fields: self.output_fields,
             rows,
         })
+    }
+}
+
+fn collect_owned_aggregate_updates(
+    row: &ExecutionRow,
+    aggregates: &[&AggregateExpr],
+    aggregate_positions: &[Option<usize>],
+    replacement_targets: &mut [Vec<usize>],
+    group: &mut GroupState,
+) -> Result<(), ExecutionError> {
+    if aggregates.len() != aggregate_positions.len()
+        || aggregates.len() != group.aggregate_states.len()
+    {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    for (aggregate_index, ((aggregate, position), state)) in aggregates
+        .iter()
+        .zip(aggregate_positions)
+        .zip(&mut group.aggregate_states)
+        .enumerate()
+    {
+        let value = aggregate_input_value(row, aggregate, *position)?;
+        if matches!(
+            aggregate.function,
+            AggregateFunction::Min | AggregateFunction::Max
+        ) {
+            let Some(position) = position else {
+                return Err(ExecutionError::InvalidAggregateInput {
+                    function: aggregate.function,
+                });
+            };
+            let value = value.ok_or(ExecutionError::TypeMismatch)?;
+            if aggregate_extreme_replaces(state, value)? {
+                replacement_targets
+                    .get_mut(*position)
+                    .ok_or(ExecutionError::TypeMismatch)?
+                    .push(aggregate_index);
+            }
+        } else {
+            update_aggregate_state(state, aggregate, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn transfer_owned_row_values(
+    row: &mut ExecutionRow,
+    include_group_keys: bool,
+    group_key_targets: &[Vec<usize>],
+    replacement_targets: &[Vec<usize>],
+    group: &mut GroupState,
+    group_lookup: &mut GroupLookup,
+) -> Result<(), ExecutionError> {
+    if group_key_targets.len() != replacement_targets.len() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    #[cfg(not(test))]
+    let _ = group_lookup;
+    for (position, (all_key_targets, aggregate_targets)) in group_key_targets
+        .iter()
+        .zip(replacement_targets)
+        .enumerate()
+    {
+        let key_targets = if include_group_keys {
+            all_key_targets.as_slice()
+        } else {
+            &[]
+        };
+        let durable_owners = key_targets.len() + aggregate_targets.len();
+        if durable_owners == 0 {
+            continue;
+        }
+
+        let candidate = std::mem::replace(
+            row.values
+                .get_mut(position)
+                .ok_or(ExecutionError::TypeMismatch)?,
+            ScalarValue::Null,
+        );
+        let mut candidate = Some(candidate);
+        let mut remaining = durable_owners;
+        for target in key_targets {
+            let value = next_owned_value(&mut candidate, &mut remaining)?;
+            *group
+                .key_values
+                .get_mut(*target)
+                .ok_or(ExecutionError::TypeMismatch)? = value;
+        }
+        for target in aggregate_targets {
+            let value = next_owned_value(&mut candidate, &mut remaining)?;
+            replace_aggregate_extreme(
+                group
+                    .aggregate_states
+                    .get_mut(*target)
+                    .ok_or(ExecutionError::TypeMismatch)?,
+                value,
+            )?;
+        }
+        if remaining != 0 || candidate.is_some() {
+            return Err(ExecutionError::TypeMismatch);
+        }
+        #[cfg(test)]
+        group_lookup.record_owned_key_transfer(key_targets.len(), durable_owners);
+    }
+    Ok(())
+}
+
+fn next_owned_value(
+    candidate: &mut Option<ScalarValue>,
+    remaining: &mut usize,
+) -> Result<ScalarValue, ExecutionError> {
+    *remaining = remaining
+        .checked_sub(1)
+        .ok_or(ExecutionError::TypeMismatch)?;
+    if *remaining == 0 {
+        candidate.take().ok_or(ExecutionError::TypeMismatch)
+    } else {
+        candidate
+            .as_ref()
+            .cloned()
+            .ok_or(ExecutionError::TypeMismatch)
     }
 }
 
@@ -4224,6 +4382,8 @@ mod tests {
         assert_eq!(stats.hits, 509);
         assert_eq!(stats.misses, 4);
         assert_eq!(stats.owned_key_materializations, 4);
+        assert_eq!(stats.owned_key_moves, 4);
+        assert_eq!(stats.owned_key_clones, 0);
         assert!(stats.exact_collision_checks >= stats.hits);
         assert_eq!(
             accumulator.finish().expect("finish integer groups").rows,
@@ -4244,15 +4404,18 @@ mod tests {
         let mut accumulator =
             AggregateAccumulator::new(&text_fields, std::slice::from_ref(&text_key), &text_outputs)
                 .expect("build hit-heavy Text accumulator");
+        let first_text = String::from("repeated-key");
+        let original_pointer = first_text.as_ptr();
         let mut first_batch = ExecutionBatch::with_capacity();
         first_batch.rows.push(ExecutionRow {
             row_id: None,
-            values: vec![ScalarValue::Text("repeated-key".into())],
+            values: vec![ScalarValue::Text(first_text)],
         });
         accumulator
             .consume_batch(&mut first_batch)
             .expect("materialize first Text group");
         let durable_pointer = text_pointer(&accumulator.groups[0].key_values[0]);
+        assert_eq!(durable_pointer, original_pointer);
         consume_generated_batches(&mut accumulator, 512, |_| {
             vec![ScalarValue::Text("repeated-key".into())]
         });
@@ -4263,6 +4426,8 @@ mod tests {
                 hits: 512,
                 misses: 1,
                 owned_key_materializations: 1,
+                owned_key_moves: 1,
+                owned_key_clones: 0,
                 exact_collision_checks: 512,
             }
         );
@@ -4276,6 +4441,196 @@ mod tests {
                 ScalarValue::Text("repeated-key".into()),
                 ScalarValue::UInt64(513),
             ]
+        );
+    }
+
+    #[test]
+    fn owned_group_misses_move_every_unique_int_and_text_key_without_cloning() {
+        let columns = batch_columns();
+        for text_key in [false, true] {
+            let key = columns[if text_key { 3 } else { 0 }].clone();
+            let input_fields = [OutputField::Source(key.clone())];
+            let outputs = [AggregateOutput::GroupKey(key.clone()), count_output()];
+            let mut accumulator =
+                AggregateAccumulator::new(&input_fields, std::slice::from_ref(&key), &outputs)
+                    .expect("build unique-key accumulator");
+            consume_generated_batches(&mut accumulator, 513, |index| {
+                vec![if text_key {
+                    ScalarValue::Text(format!("unique-{index:04}"))
+                } else {
+                    ScalarValue::Int64(index as i64)
+                }]
+            });
+            let stats = accumulator.group_lookup.stats();
+            assert_eq!(stats.lookups, 513);
+            assert_eq!(stats.hits, 0);
+            assert_eq!(stats.misses, 513);
+            assert_eq!(stats.owned_key_materializations, 513);
+            assert_eq!(stats.owned_key_moves, 513);
+            assert_eq!(stats.owned_key_clones, 0);
+            assert_eq!(accumulator.groups.len(), 513);
+        }
+    }
+
+    #[test]
+    fn owned_group_miss_clones_only_additional_text_and_primitive_owners() {
+        let columns = batch_columns();
+        let payload = columns[3].clone();
+        let payload_fields = [OutputField::Source(payload.clone())];
+        let extreme = |function, name: &str| {
+            batch_aggregate_expression(
+                function,
+                AggregateInput::Column(payload.clone()),
+                name,
+                PhysicalType::Text,
+                false,
+            )
+        };
+        for max_owners in [1, 2] {
+            let mut outputs = vec![AggregateOutput::GroupKey(payload.clone())];
+            outputs.extend(
+                (0..max_owners)
+                    .map(|index| extreme(AggregateFunction::Max, &format!("MAX#{index}"))),
+            );
+            let text = String::from("unique-owned-text");
+            let original_pointer = text.as_ptr();
+            let hit_text = String::from("unique-owned-text");
+            let hit_pointer = hit_text.as_ptr();
+            let mut accumulator = AggregateAccumulator::new(
+                &payload_fields,
+                std::slice::from_ref(&payload),
+                &outputs,
+            )
+            .expect("build overlapping Text owners");
+            let mut batch = ExecutionBatch {
+                rows: vec![
+                    ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Text(text)],
+                    },
+                    ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Text(hit_text)],
+                    },
+                ],
+            };
+            accumulator
+                .consume_batch(&mut batch)
+                .expect("consume overlapping Text owners");
+
+            let stats = accumulator.group_lookup.stats();
+            assert_eq!(stats.misses, 1);
+            assert_eq!(stats.hits, 1);
+            assert_eq!(stats.owned_key_moves, 1);
+            assert_eq!(stats.owned_key_clones, max_owners);
+            let group = &accumulator.groups[0];
+            let original_owners = std::iter::once(&group.key_values[0])
+                .chain(group.aggregate_states.iter().map(|state| match state {
+                    super::AggregateState::Max(Some(value)) => value,
+                    _ => panic!("expected initialized MAX state"),
+                }))
+                .filter(|value| text_pointer(value) == original_pointer)
+                .count();
+            assert_eq!(original_owners, 1);
+            assert!(
+                std::iter::once(&group.key_values[0])
+                    .chain(group.aggregate_states.iter().map(|state| match state {
+                        super::AggregateState::Max(Some(value)) => value,
+                        _ => panic!("expected initialized MAX state"),
+                    }))
+                    .all(|value| text_pointer(value) != hit_pointer)
+            );
+
+            let result = accumulator
+                .finish()
+                .expect("finish overlapping Text owners");
+            assert_eq!(result.rows[0].values.len(), max_owners + 1);
+            assert!(
+                result.rows[0]
+                    .values
+                    .iter()
+                    .all(|value| value == &ScalarValue::Text("unique-owned-text".into()))
+            );
+        }
+
+        let id = columns[0].clone();
+        let id_fields = [OutputField::Source(id.clone())];
+        let id_extreme = |function, name: &str| {
+            batch_aggregate_expression(
+                function,
+                AggregateInput::Column(id.clone()),
+                name,
+                PhysicalType::Int64,
+                false,
+            )
+        };
+        let outputs = [
+            AggregateOutput::GroupKey(id.clone()),
+            id_extreme(AggregateFunction::Min, "MIN(id)"),
+            id_extreme(AggregateFunction::Max, "MAX(id)"),
+        ];
+        let mut accumulator =
+            AggregateAccumulator::new(&id_fields, std::slice::from_ref(&id), &outputs)
+                .expect("build primitive overlapping owners");
+        let mut batch = ExecutionBatch {
+            rows: vec![ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Int64(17)],
+            }],
+        };
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume primitive overlapping owners");
+        let stats = accumulator.group_lookup.stats();
+        assert_eq!(stats.owned_key_moves, 1);
+        assert_eq!(stats.owned_key_clones, 2);
+        assert_eq!(
+            accumulator
+                .finish()
+                .expect("finish primitive overlapping owners")
+                .rows[0]
+                .values,
+            vec![
+                ScalarValue::Int64(17),
+                ScalarValue::Int64(17),
+                ScalarValue::Int64(17),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_group_key_slots_share_one_move_and_only_required_clones() {
+        let payload = batch_columns()[3].clone();
+        let input_fields = [OutputField::Source(payload.clone())];
+        let group_keys = [payload.clone(), payload.clone()];
+        let outputs = [
+            AggregateOutput::GroupKey(payload.clone()),
+            AggregateOutput::GroupKey(payload),
+        ];
+        let text = String::from("duplicate-group-key");
+        let original_pointer = text.as_ptr();
+        let mut accumulator = AggregateAccumulator::new(&input_fields, &group_keys, &outputs)
+            .expect("build duplicate group-key owners");
+        let mut batch = ExecutionBatch {
+            rows: vec![ExecutionRow {
+                row_id: None,
+                values: vec![ScalarValue::Text(text)],
+            }],
+        };
+        accumulator
+            .consume_batch(&mut batch)
+            .expect("consume duplicate group-key owners");
+        let stats = accumulator.group_lookup.stats();
+        assert_eq!(stats.owned_key_moves, 1);
+        assert_eq!(stats.owned_key_clones, 1);
+        assert_eq!(accumulator.groups[0].key_values.len(), 2);
+        assert_eq!(
+            accumulator.groups[0]
+                .key_values
+                .iter()
+                .filter(|value| text_pointer(value) == original_pointer)
+                .count(),
+            1
         );
     }
 
@@ -4386,6 +4741,8 @@ mod tests {
                 assert_eq!(stats.misses, expected_groups);
                 assert_eq!(stats.hits, rows - expected_groups);
                 assert_eq!(stats.owned_key_materializations, expected_groups);
+                assert_eq!(stats.owned_key_moves, expected_groups);
+                assert_eq!(stats.owned_key_clones, 0);
                 let batch = batch.finish().expect("finish batch groups");
                 let legacy = legacy.finish().expect("finish legacy groups");
                 assert_eq!(batch, legacy);
@@ -4452,6 +4809,9 @@ mod tests {
             batch
                 .consume_batch(&mut execution_batch)
                 .expect("consume multi-key batch");
+            let stats = batch.group_lookup.stats();
+            assert_eq!(stats.owned_key_moves, stats.misses * group_keys.len());
+            assert_eq!(stats.owned_key_clones, 0);
             let mut legacy = AggregateAccumulator::new(&input_fields, &group_keys, &outputs)
                 .expect("build multi-key legacy accumulator");
             legacy

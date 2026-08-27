@@ -1083,6 +1083,54 @@ fn run_projection_attribution_scenarios(
         |result| unique_text_group_observation(result, rows),
         measurements,
     )?;
+    for (scenario, sql, owners) in [
+        (
+            "group_move_text_key_only",
+            "SELECT payload FROM items GROUP BY payload",
+            1,
+        ),
+        (
+            "group_move_text_max_overlap",
+            "SELECT payload, MAX(payload) FROM items GROUP BY payload",
+            2,
+        ),
+        (
+            "group_move_text_duplicate_max_overlap",
+            "SELECT payload, MAX(payload), MAX(payload) FROM items GROUP BY payload",
+            3,
+        ),
+    ] {
+        run_group_lookup_attribution_query(
+            scenario,
+            rows,
+            4,
+            sql,
+            &[Operator::Aggregate, Operator::SeqScan],
+            &[PAYLOAD_COLUMN_ID],
+            Observation {
+                rows,
+                checksum: arithmetic_sum(rows),
+            },
+            settings,
+            |result| unique_text_owner_observation(result, rows, owners),
+            measurements,
+        )?;
+    }
+    run_group_lookup_attribution_query(
+        "group_move_wide_unique",
+        rows,
+        4,
+        "SELECT id, payload, COUNT(*) FROM items GROUP BY id, payload",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        Observation {
+            rows,
+            checksum: arithmetic_sum(rows),
+        },
+        settings,
+        |result| unique_wide_group_observation(result, rows),
+        measurements,
+    )?;
     run_attribution_query(
         "aggregate_count_star",
         rows,
@@ -3611,6 +3659,80 @@ fn unique_text_group_observation(
                 "Text GROUP BY must return a Text key with COUNT(*) = 1",
             ));
         };
+        validate_payload(id, payload)?;
+    }
+    Ok(Observation {
+        rows: fixture_rows,
+        checksum: arithmetic_sum(fixture_rows),
+    })
+}
+
+fn unique_text_owner_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+    owners: usize,
+) -> BenchResult<Observation> {
+    if result.rows.len() as u64 != fixture_rows {
+        return Err(message_error(format!(
+            "Text ownership GROUP BY returned {} groups; expected {fixture_rows}",
+            result.rows.len()
+        )));
+    }
+    for (id, row) in result.rows.iter().enumerate() {
+        if row.len() != owners {
+            return Err(message_error(format!(
+                "Text ownership GROUP BY returned {} values; expected {owners}",
+                row.len()
+            )));
+        }
+        let Some(ScalarValue::Text(payload)) = row.first() else {
+            return Err(message_error(
+                "Text ownership GROUP BY key must be non-NULL Text",
+            ));
+        };
+        validate_payload(id, payload)?;
+        if row
+            .iter()
+            .skip(1)
+            .any(|value| !matches!(value, ScalarValue::Text(candidate) if candidate == payload))
+        {
+            return Err(message_error(
+                "Text ownership GROUP BY aggregate owner differs from its unique key",
+            ));
+        }
+    }
+    Ok(Observation {
+        rows: fixture_rows,
+        checksum: arithmetic_sum(fixture_rows),
+    })
+}
+
+fn unique_wide_group_observation(
+    result: &QueryResult,
+    fixture_rows: u64,
+) -> BenchResult<Observation> {
+    if result.rows.len() as u64 != fixture_rows {
+        return Err(message_error(format!(
+            "wide GROUP BY returned {} groups; expected {fixture_rows}",
+            result.rows.len()
+        )));
+    }
+    for (id, row) in result.rows.iter().enumerate() {
+        let [
+            ScalarValue::Int64(actual_id),
+            ScalarValue::Text(payload),
+            ScalarValue::UInt64(1),
+        ] = row.as_slice()
+        else {
+            return Err(message_error(
+                "wide GROUP BY must return Int64, Text, and COUNT(*) = 1",
+            ));
+        };
+        if *actual_id != i64::try_from(id)? {
+            return Err(message_error(format!(
+                "wide GROUP BY row {id} returned ID {actual_id}"
+            )));
+        }
         validate_payload(id, payload)?;
     }
     Ok(Observation {

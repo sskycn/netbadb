@@ -783,6 +783,11 @@ The implementation sequence is intentionally vertical:
     against `GroupState`, and creates one durable owned key only on a miss.
     Existing-group hits allocate no temporary key and clone no key values;
     first-seen output order remains owned by the group-state vector.
+59. Move-on-Miss Group-Key Ownership — complete; grouped batch Aggregate probes
+    before taking ownership, then on a miss combines group-key slots with actual
+    MIN/MAX replacement owners per source position. Each required source value
+    is cloned for all but one durable owner and moved once, so unique Int64 and
+    Text keys reach `GroupState` without a key clone while hits remain unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

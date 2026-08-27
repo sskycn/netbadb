@@ -1318,3 +1318,29 @@ first measure remaining miss ownership/hash metadata, followed by Aggregate
 Text comparison and generic Filter prebinding. Typed column batches, HashJoin
 batch integration, Sort/Top-N, and index/range/partition batch sources remain
 lower-evidence candidates rather than selected work.
+
+## Move-on-Miss Group-Key Ownership (complete)
+
+- grouped batch Aggregate now drains owned rows even without MIN/MAX, while
+  global COUNT/SUM retains its simpler borrowed batch path;
+- separates the borrowed Phase 58 group probe from miss materialization, so
+  hits still allocate, clone, and transfer no group key;
+- prebinds group-key owner slots by source position, combines them on a miss
+  with the current row's actual MIN/MAX replacement targets, and performs
+  exactly `clone N-1 + move original once` for each owned source value;
+- keeps borrowed legacy miss materialization, randomized hashing, exact
+  collision checks, NULL grouping, multi-key order, first-seen output, direct
+  COUNT priority, Heap/LSM boundaries, dependencies, and safe Rust unchanged;
+- test-only counters prove 513 four-group rows perform four key moves and zero
+  key clones, while 513 unique Int64 and Text groups perform 513 moves and zero
+  clones. Pointer identity proves the original Text allocation reaches
+  `GroupState`; key+MAX and key+duplicate-MAX require one and two clones.
+
+Quick attribution moved pure unique Text key-only by -10.1%, unique Text+COUNT
+by -11.2%, and unique `(Int64, Text)` by -17.9%, while Text key+MAX moved +1.8%
+and unique Int64 +8.2%. Unrelated controls ranged from -27.1% to +23.5%, so the
+structural ownership result is authoritative and the timings are directional.
+Phase 60 should first isolate primitive group hashing and owned-row bookkeeping,
+then compare Aggregate Text comparison and generic Filter prebinding. Column
+batches, HashJoin integration, Sort/Top-N, and index/range/partition batch
+sources remain unselected until those residuals are measured.

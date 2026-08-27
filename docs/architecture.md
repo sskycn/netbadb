@@ -515,11 +515,13 @@ ordered `AggregateOutput` items (result shape). A group-key output remains a
 Source field and an aggregate remains Derived, so SELECT order is preserved
 without disguising aggregation as projection or inventing identifiers.
 
-The aggregate executor materializes its input once and updates every aggregate
-state in one pass. It uses `HashMap<Vec<ScalarValue>, usize>` only for group
-lookup and a `Vec<GroupState>` for deterministic first-seen output order;
-randomized hash iteration never shapes results. Grouping is currently fully in
-memory. With no group keys, zero input rows still form one implicit group:
+The aggregate executor updates every aggregate state in one pass. Eligible
+batch children stream bounded owned rows; the authoritative legacy fallback
+materializes its input. Group lookup uses randomized hash-to-index metadata and
+exact comparison against keys owned only by a `Vec<GroupState>`, whose insertion
+order defines deterministic first-seen output; randomized hash iteration never
+shapes results. Grouping is currently fully in memory. With no group keys, zero
+input rows still form one implicit group:
 COUNT returns zero, while SUM/MIN/MAX return NULL. With one or more keys, groups
 are created only when rows arrive, so empty input produces zero rows. LIMIT is
 above Aggregate and therefore limits complete result groups, never input rows.
@@ -1077,6 +1079,36 @@ continues to define first-seen result order, and HashMap iteration never shapes
 query output. Existing-group hits allocate no temporary key and clone no key
 values. A miss conservatively clones each source key value once into its single
 durable group key; move-on-miss remains separate from MIN/MAX ownership.
+
+Phase 59 gives every grouped batch to Aggregate as owned rows while preserving
+the Phase 58 borrowed probe:
+
+```text
+owned row → borrowed GroupLookup probe
+                  ├─ hit → existing GroupState; no key transfer
+                  └─ miss
+                       ↓
+              validate key and update borrowed COUNT/SUM
+                       ↓
+              decide actual MIN/MAX replacements
+                       ↓
+              durable owners by source position
+              (group-key slots + replacements)
+                       ↓
+                 clone N - 1 + move once
+                       ↓
+              append GroupState and register probe hash
+```
+
+The per-position plan supports repeated group-key slots and overlap such as
+`GROUP BY payload` with one or more `MAX(payload)` outputs. COUNT/SUM consume
+borrowed values and MIN/MAX decide replacement before any source value moves.
+For a unique key with no other durable owner, the original `ScalarValue` and
+its String allocation move directly into `GroupState`; additional real owners
+alone cause clones. The materialized legacy Aggregate retains its borrowed-row
+fallback and clones a miss key because it does not own the input row. Hashing,
+collision chains, exact equality, NULL grouping, first-seen order, and the
+precomputed Phase 58 probe hash are unchanged.
 
 Exact standalone Filter and predicate-only Project/Filter shapes retain the
 measured borrowed Phase 7 streaming specializations for every scalar type,

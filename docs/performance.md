@@ -1217,6 +1217,75 @@ not as a claim of stable throughput improvement. Global aggregation bypasses
 group lookup, direct/filtered COUNT priority is unchanged, and no timing
 assertion or CI threshold was introduced.
 
+## Phase 59 move-on-miss group-key ownership attribution
+
+Phase 59 added all-unique Text key-only, Text key plus one/two MAX owners, and
+all-unique `(Int64, Text)` cases before changing production ownership. The
+existing unique Text+COUNT, primitive cardinality sweep, plan/base-column
+checks, first-seen value validation, warm-process execution, `black_box`, and
+no-timing-threshold policy remain unchanged. Raw quick runs are stored outside
+the repository at `/tmp/netbadb-phase59-pre.txt` and
+`/tmp/netbadb-phase59-post.txt`.
+
+Medians are machine-local nanoseconds per query. “Durable owners” counts the
+values that must survive one miss; COUNT is borrowed and adds no scalar owner.
+
+| scenario | cardinality | key shape | durable owners | pre median | post median | change |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Text key only | 1,000/1,000 | Text | 1 | 827,250 | 743,542 | -10.1% |
+| Text key + COUNT | 1,000/1,000 | Text | 1 | 933,792 | 829,292 | -11.2% |
+| Text key + MAX | 1,000/1,000 | Text | 2 | 798,542 | 812,750 | +1.8% |
+| Text key + duplicate MAX | 1,000/1,000 | Text | 3 | 988,583 | 830,584 | -16.0% |
+| primitive key + COUNT | 1,000/1,000 | Int64 | 1 | 718,709 | 777,458 | +8.2% |
+| wide key + COUNT | 1,000/1,000 | Int64 + Text | 2 | 937,875 | 770,416 | -17.9% |
+
+The key-only versus key+MAX pair provides the clearest ownership-shaped signal:
+the no-clone target improved 10.1%, while the mandatory-clone control moved
+1.8% slower. Unique Text+COUNT and the wide unique key also improved, whereas
+unique Int64 regressed despite eliminating its cheap clone. Duplicate MAX's
+large improvement conflicts with a simple owner-count curve and is treated as
+noise, not as evidence that mandatory clones disappeared.
+
+Structural tests are the primary result. Test-only accumulator counters report:
+
+| workload | key moves | key clones |
+| --- | ---: | ---: |
+| 513 rows / 4 Int64 groups | 4 | 0 |
+| 513 unique Int64 groups | 513 | 0 |
+| 513 unique Text groups | 513 | 0 |
+| Text key + MAX(Text) | 1 | 1 |
+| Text key + MAX(Text) + MAX(Text) | 1 | 2 |
+
+A pointer-identity test additionally proves that the original unique Text
+allocation moves into `GroupState`. Repeated group-key slots and `(Int64,
+Bool)`, `(Int64, nullable Int64)`, and `(Int64, Text)` keys preserve source
+order, NULL grouping, legacy-result equality, and one move per uniquely owned
+source value.
+
+Controls again show substantial machine movement:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| Phase 57 Text MIN | 460,250 | 469,125 | +1.9% |
+| Phase 57 Text MAX | 467,000 | 458,042 | -1.9% |
+| Phase 57 Text MIN+MAX | 398,875 | 492,541 | +23.5% |
+| Phase 57 duplicate Text MAX | 567,125 | 447,625 | -21.1% |
+| global SUM | 395,375 | 425,000 | +7.5% |
+| Phase 58 one group | 394,125 | 403,250 | +2.3% |
+| Phase 58 four groups | 453,583 | 409,250 | -9.8% |
+| Phase 58 half unique | 685,792 | 558,583 | -18.5% |
+| direct COUNT(*) | 241,417 | 252,708 | +4.7% |
+| filtered COUNT(payload) | 372,375 | 286,167 | -23.2% |
+| early Limit | 20,583 | 15,000 | -27.1% |
+| full projected scan | 364,458 | 351,042 | -3.7% |
+| LSM SUM | 63,500 | 64,750 | +2.0% |
+
+The implementation is retained for exact move-on-miss ownership, not as a
+stable throughput claim. The primitive unique regression and broad control
+spread make group hashing plus owned-row bookkeeping the leading Phase 60
+measurement, followed by Aggregate Text comparison and generic Filter
+prebinding. Column-oriented batches remain unselected.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
