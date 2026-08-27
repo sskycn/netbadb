@@ -798,6 +798,11 @@ The implementation sequence is intentionally vertical:
     Ordinary hits and extrema hits without a replacement move no scalar slots;
     misses and actual extrema replacements move only their selected values, then
     the complete batch is cleared while retaining its allocation.
+62. Typed MIN/MAX Extreme State + Direct Text Comparison — complete; Aggregate
+    binds Bool, Int64, UInt64, or Text extrema state from typed plan metadata at
+    construction. MIN/MAX candidates compare directly against that physical
+    state, Text uses borrowed `str::cmp`, and existing move/clone, NULL, grouped,
+    batch, and legacy semantics remain unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

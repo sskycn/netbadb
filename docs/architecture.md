@@ -1173,6 +1173,34 @@ its borrowed path, and global MIN/MAX still drains owned rows through the Phase
 57 path. Phase 60 randomized prehashing, exact collision chains, NULL grouping,
 and first-seen `Vec<GroupState>` order are unchanged.
 
+Phase 62 binds each MIN/MAX state to its resolved physical type once when the
+Aggregate accumulator is created:
+
+```text
+typed Aggregate metadata
+        ↓
+ExtremeState::{Bool, Int64, UInt64, Text}(None)
+        ↓
+borrow candidate of the same physical type
+        ↓
+direct bool/integer comparison or borrowed str::cmp
+        ↓
+actual replacement?
+        ↓
+existing Phase 57/59 selected-value ownership transfer
+```
+
+The `Option<T>` inside an extrema state means that no non-NULL candidate has
+been observed; SQL NULL remains the explicit `ScalarValue::Null` result at
+finalization. Runtime values that disagree with the bound physical type return
+`ExecutionError::TypeMismatch`. Text comparison borrows both the candidate and
+current `String` as `&str`, then uses the same standard-library lexical ordering
+as the generic scalar comparator. No locale collation, cached sort key, custom
+string algorithm, or new allocation is introduced. Filter, Join, Sort, and
+ordinary expression comparison continue through the authoritative generic
+`compare_values` / `compare_scalar_refs` path. Phase 61 grouped lookup and
+borrowed-first ownership decisions are unchanged.
+
 Exact standalone Filter and predicate-only Project/Filter shapes retain the
 measured borrowed Phase 7 streaming specializations for every scalar type,
 avoiding owned values for rejected rows; Filter pipelines with Limit use the

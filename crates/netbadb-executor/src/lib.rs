@@ -17,7 +17,9 @@ use netbadb_storage::{
     PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
     TableStorage,
 };
-use netbadb_types::{ColumnId, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId};
+use netbadb_types::{
+    ColumnId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
+};
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
 ///
@@ -1403,8 +1405,72 @@ enum AggregateState {
     Count(u64),
     SumInt(Option<i64>),
     SumUInt(Option<u64>),
-    Min(Option<ScalarValue>),
-    Max(Option<ScalarValue>),
+    Min(ExtremeState),
+    Max(ExtremeState),
+}
+
+#[derive(Debug)]
+enum ExtremeState {
+    Bool(Option<bool>),
+    Int64(Option<i64>),
+    UInt64(Option<u64>),
+    Text(Option<String>),
+}
+
+impl ExtremeState {
+    const fn empty(physical: PhysicalType) -> Self {
+        match physical {
+            PhysicalType::Bool => Self::Bool(None),
+            PhysicalType::Int64 => Self::Int64(None),
+            PhysicalType::UInt64 => Self::UInt64(None),
+            PhysicalType::Text => Self::Text(None),
+        }
+    }
+
+    fn compare_candidate(
+        &self,
+        candidate: &ScalarValue,
+    ) -> Result<Option<Ordering>, ExecutionError> {
+        match (self, candidate) {
+            (Self::Bool(None), ScalarValue::Bool(_))
+            | (Self::Int64(None), ScalarValue::Int64(_))
+            | (Self::UInt64(None), ScalarValue::UInt64(_))
+            | (Self::Text(None), ScalarValue::Text(_)) => Ok(None),
+            (Self::Bool(Some(current)), ScalarValue::Bool(candidate)) => {
+                Ok(Some(candidate.cmp(current)))
+            }
+            (Self::Int64(Some(current)), ScalarValue::Int64(candidate)) => {
+                Ok(Some(candidate.cmp(current)))
+            }
+            (Self::UInt64(Some(current)), ScalarValue::UInt64(candidate)) => {
+                Ok(Some(candidate.cmp(current)))
+            }
+            (Self::Text(Some(current)), ScalarValue::Text(candidate)) => {
+                Ok(Some(candidate.as_str().cmp(current.as_str())))
+            }
+            _ => Err(ExecutionError::TypeMismatch),
+        }
+    }
+
+    fn replace(&mut self, candidate: ScalarValue) -> Result<(), ExecutionError> {
+        match (self, candidate) {
+            (Self::Bool(current), ScalarValue::Bool(candidate)) => *current = Some(candidate),
+            (Self::Int64(current), ScalarValue::Int64(candidate)) => *current = Some(candidate),
+            (Self::UInt64(current), ScalarValue::UInt64(candidate)) => *current = Some(candidate),
+            (Self::Text(current), ScalarValue::Text(candidate)) => *current = Some(candidate),
+            _ => return Err(ExecutionError::TypeMismatch),
+        }
+        Ok(())
+    }
+
+    fn into_scalar(self) -> ScalarValue {
+        match self {
+            Self::Bool(value) => value.map_or(ScalarValue::Null, ScalarValue::Bool),
+            Self::Int64(value) => value.map_or(ScalarValue::Null, ScalarValue::Int64),
+            Self::UInt64(value) => value.map_or(ScalarValue::Null, ScalarValue::UInt64),
+            Self::Text(value) => value.map_or(ScalarValue::Null, ScalarValue::Text),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2854,8 +2920,12 @@ fn initial_aggregate_state(aggregate: &AggregateExpr) -> Result<AggregateState, 
                 Err(ExecutionError::TypeMismatch)
             }
         },
-        AggregateFunction::Min => Ok(AggregateState::Min(None)),
-        AggregateFunction::Max => Ok(AggregateState::Max(None)),
+        AggregateFunction::Min => Ok(AggregateState::Min(ExtremeState::empty(
+            aggregate.output.data_type.physical,
+        ))),
+        AggregateFunction::Max => Ok(AggregateState::Max(ExtremeState::empty(
+            aggregate.output.data_type.physical,
+        ))),
     }
 }
 
@@ -2891,11 +2961,12 @@ fn aggregate_extreme_replaces(
         return Ok(false);
     }
     match state {
-        AggregateState::Min(None) | AggregateState::Max(None) => Ok(true),
-        AggregateState::Min(Some(current)) => Ok(compare_values(value, current)? == Ordering::Less),
-        AggregateState::Max(Some(current)) => {
-            Ok(compare_values(value, current)? == Ordering::Greater)
-        }
+        AggregateState::Min(current) => Ok(current
+            .compare_candidate(value)?
+            .is_none_or(|ordering| ordering == Ordering::Less)),
+        AggregateState::Max(current) => Ok(current
+            .compare_candidate(value)?
+            .is_none_or(|ordering| ordering == Ordering::Greater)),
         AggregateState::Count(_) | AggregateState::SumInt(_) | AggregateState::SumUInt(_) => {
             Err(ExecutionError::TypeMismatch)
         }
@@ -2907,10 +2978,7 @@ fn replace_aggregate_extreme(
     value: ScalarValue,
 ) -> Result<(), ExecutionError> {
     match state {
-        AggregateState::Min(current) | AggregateState::Max(current) => {
-            *current = Some(value);
-            Ok(())
-        }
+        AggregateState::Min(current) | AggregateState::Max(current) => current.replace(value),
         AggregateState::Count(_) | AggregateState::SumInt(_) | AggregateState::SumUInt(_) => {
             Err(ExecutionError::TypeMismatch)
         }
@@ -2979,9 +3047,7 @@ fn finalize_aggregate_state(state: AggregateState) -> ScalarValue {
         AggregateState::Count(value) => ScalarValue::UInt64(value),
         AggregateState::SumInt(value) => value.map_or(ScalarValue::Null, ScalarValue::Int64),
         AggregateState::SumUInt(value) => value.map_or(ScalarValue::Null, ScalarValue::UInt64),
-        AggregateState::Min(value) | AggregateState::Max(value) => {
-            value.unwrap_or(ScalarValue::Null)
-        }
+        AggregateState::Min(value) | AggregateState::Max(value) => value.into_scalar(),
     }
 }
 
@@ -4537,6 +4603,185 @@ mod tests {
     }
 
     #[test]
+    fn typed_extreme_state_binds_plan_physical_type_and_rejects_mismatches() {
+        let aggregate = |physical| AggregateExpr {
+            function: AggregateFunction::Min,
+            input: AggregateInput::All,
+            output: DerivedField {
+                name: "typed MIN".into(),
+                data_type: SemanticType::physical(physical),
+                nullable: true,
+            },
+        };
+        assert!(matches!(
+            super::initial_aggregate_state(&aggregate(PhysicalType::Bool)),
+            Ok(super::AggregateState::Min(super::ExtremeState::Bool(None)))
+        ));
+        assert!(matches!(
+            super::initial_aggregate_state(&aggregate(PhysicalType::Int64)),
+            Ok(super::AggregateState::Min(super::ExtremeState::Int64(None)))
+        ));
+        assert!(matches!(
+            super::initial_aggregate_state(&aggregate(PhysicalType::UInt64)),
+            Ok(super::AggregateState::Min(super::ExtremeState::UInt64(
+                None
+            )))
+        ));
+        assert!(matches!(
+            super::initial_aggregate_state(&aggregate(PhysicalType::Text)),
+            Ok(super::AggregateState::Min(super::ExtremeState::Text(None)))
+        ));
+
+        let mut text_min = super::AggregateState::Min(super::ExtremeState::Text(None));
+        assert!(
+            !super::aggregate_extreme_replaces(&text_min, &ScalarValue::Null)
+                .expect("NULL candidate is ignored")
+        );
+        assert!(matches!(
+            super::aggregate_extreme_replaces(&text_min, &ScalarValue::Int64(1)),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert!(matches!(
+            super::replace_aggregate_extreme(&mut text_min, ScalarValue::Int64(1)),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert_eq!(super::finalize_aggregate_state(text_min), ScalarValue::Null);
+
+        let invalid_output = [AggregateOutput::Aggregate(aggregate(PhysicalType::Text))];
+        assert!(matches!(
+            AggregateAccumulator::new(&[], &[], &invalid_output),
+            Err(ExecutionError::InvalidAggregateInput {
+                function: AggregateFunction::Min
+            })
+        ));
+    }
+
+    #[test]
+    fn typed_extreme_replacement_matches_generic_comparison_for_all_physical_types() {
+        fn assert_pair(physical: PhysicalType, candidate: ScalarValue, current: ScalarValue) {
+            let ordering = super::compare_values(&candidate, &current)
+                .expect("generic comparison accepts same physical types");
+            for (function, expected) in [
+                (AggregateFunction::Min, ordering == std::cmp::Ordering::Less),
+                (
+                    AggregateFunction::Max,
+                    ordering == std::cmp::Ordering::Greater,
+                ),
+            ] {
+                let extreme = super::ExtremeState::empty(physical);
+                let mut state = if function == AggregateFunction::Min {
+                    super::AggregateState::Min(extreme)
+                } else {
+                    super::AggregateState::Max(extreme)
+                };
+                super::replace_aggregate_extreme(&mut state, current.clone())
+                    .expect("seed typed extreme");
+                assert_eq!(
+                    super::aggregate_extreme_replaces(&state, &candidate)
+                        .expect("compare typed extreme"),
+                    expected,
+                    "typed {function:?} comparison disagreed for {candidate:?} and {current:?}"
+                );
+            }
+        }
+
+        for candidate in [false, true] {
+            for current in [false, true] {
+                assert_pair(
+                    PhysicalType::Bool,
+                    ScalarValue::Bool(candidate),
+                    ScalarValue::Bool(current),
+                );
+            }
+        }
+        for candidate in [-9_i64, 0, 17] {
+            for current in [-9_i64, 0, 17] {
+                assert_pair(
+                    PhysicalType::Int64,
+                    ScalarValue::Int64(candidate),
+                    ScalarValue::Int64(current),
+                );
+            }
+        }
+        for candidate in [0_u64, 1, u64::MAX] {
+            for current in [0_u64, 1, u64::MAX] {
+                assert_pair(
+                    PhysicalType::UInt64,
+                    ScalarValue::UInt64(candidate),
+                    ScalarValue::UInt64(current),
+                );
+            }
+        }
+
+        let mut common_prefix_a = "p".repeat(63);
+        common_prefix_a.push('a');
+        let mut common_prefix_z = "p".repeat(63);
+        common_prefix_z.push('z');
+        let text_values = [
+            String::new(),
+            String::from("a"),
+            String::from("aa"),
+            String::from("ab"),
+            String::from("b"),
+            String::from("é"),
+            String::from("中"),
+            String::from("😀"),
+            "x".repeat(64),
+            common_prefix_a,
+            common_prefix_z,
+        ];
+        for candidate in &text_values {
+            for current in &text_values {
+                assert_pair(
+                    PhysicalType::Text,
+                    ScalarValue::Text(candidate.clone()),
+                    ScalarValue::Text(current.clone()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_text_extremes_replace_once_and_keep_the_first_allocation() {
+        for function in [AggregateFunction::Min, AggregateFunction::Max] {
+            let extreme = super::ExtremeState::empty(PhysicalType::Text);
+            let mut state = if function == AggregateFunction::Min {
+                super::AggregateState::Min(extreme)
+            } else {
+                super::AggregateState::Max(extreme)
+            };
+            let mut first = Some(String::from("equal-value-with-a-complete-shared-prefix"));
+            let first_pointer = first.as_ref().expect("first Text candidate").as_ptr();
+            let mut replacements = 0;
+            let mut non_replacements = 0;
+            for index in 0..513 {
+                let candidate = ScalarValue::Text(if index == 0 {
+                    first.take().expect("move first Text candidate")
+                } else {
+                    String::from("equal-value-with-a-complete-shared-prefix")
+                });
+                if super::aggregate_extreme_replaces(&state, &candidate)
+                    .expect("compare equal Text candidate")
+                {
+                    replacements += 1;
+                    super::replace_aggregate_extreme(&mut state, candidate)
+                        .expect("replace initial Text extreme");
+                } else {
+                    non_replacements += 1;
+                }
+            }
+            assert_eq!(replacements, 1);
+            assert_eq!(non_replacements, 512);
+            let result = super::finalize_aggregate_state(state);
+            assert_eq!(
+                result,
+                ScalarValue::Text(String::from("equal-value-with-a-complete-shared-prefix"))
+            );
+            assert_eq!(text_pointer(&result), first_pointer);
+        }
+    }
+
+    #[test]
     fn borrowed_group_lookup_materializes_only_distinct_int_and_text_keys() {
         let columns = batch_columns();
         let int_key = columns[1].clone();
@@ -4795,8 +5040,8 @@ mod tests {
                 .filter(|state| {
                     matches!(
                         state,
-                        super::AggregateState::Max(Some(value))
-                            if text_pointer(value) == final_pointer
+                        super::AggregateState::Max(super::ExtremeState::Text(Some(value)))
+                            if value.as_ptr() == final_pointer
                     )
                 })
                 .count(),
@@ -4856,21 +5101,27 @@ mod tests {
             assert_eq!(stats.owned_key_moves, 1);
             assert_eq!(stats.owned_key_clones, max_owners);
             let group = &accumulator.groups[0];
-            let original_owners = std::iter::once(&group.key_values[0])
-                .chain(group.aggregate_states.iter().map(|state| match state {
-                    super::AggregateState::Max(Some(value)) => value,
-                    _ => panic!("expected initialized MAX state"),
-                }))
-                .filter(|value| text_pointer(value) == original_pointer)
-                .count();
+            let original_owners =
+                usize::from(text_pointer(&group.key_values[0]) == original_pointer)
+                    + group
+                        .aggregate_states
+                        .iter()
+                        .filter(|state| {
+                            matches!(
+                                state,
+                                super::AggregateState::Max(super::ExtremeState::Text(Some(value)))
+                                    if value.as_ptr() == original_pointer
+                            )
+                        })
+                        .count();
             assert_eq!(original_owners, 1);
             assert!(
-                std::iter::once(&group.key_values[0])
-                    .chain(group.aggregate_states.iter().map(|state| match state {
-                        super::AggregateState::Max(Some(value)) => value,
-                        _ => panic!("expected initialized MAX state"),
-                    }))
-                    .all(|value| text_pointer(value) != hit_pointer)
+                text_pointer(&group.key_values[0]) != hit_pointer
+                    && group.aggregate_states.iter().all(|state| matches!(
+                        state,
+                        super::AggregateState::Max(super::ExtremeState::Text(Some(value)))
+                            if value.as_ptr() != hit_pointer
+                    ))
             );
 
             let result = accumulator

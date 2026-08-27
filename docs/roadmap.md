@@ -1418,3 +1418,31 @@ hash/lookup curve across one group, four groups, and two primitive keys, while
 Phase 61 has now removed the identifiable whole-row bookkeeping. Generic Filter
 position prebinding follows; typed column batches, HashJoin integration,
 Sort/Top-N, and index/range/partition batch sources remain unselected.
+
+## Typed MIN/MAX Extreme State + Direct Text Comparison (complete)
+
+- binds every executor-private MIN/MAX state to Bool, Int64, UInt64, or Text
+  from typed Aggregate output metadata during accumulator construction;
+- compares candidates directly against the matching physical state, with Text
+  borrowing `String` values as `&str` and using standard `str::cmp` ordering;
+- preserves NULL-as-no-non-NULL-extreme state, defensive runtime type errors,
+  and move-only finalization without changing the generic scalar comparator;
+- retains Phase 57 clone `N - 1` plus one move, Phase 59 overlapping group/extreme
+  ownership, and the complete Phase 61 grouped mutable-row path;
+- adds same-length 64-byte early-difference, long-common-prefix, and all-equal
+  Text MIN attribution fixtures plus typed/generic equivalence coverage for
+  Bool, Int64, UInt64, ASCII, Unicode, empty, and long Text values.
+
+The quick pre/post medians moved +3.1%, -46.0%, and +23.5% for early-difference,
+long-common-prefix, and all-equal Text MIN. Their equal/early ratio changed from
+0.834x to 1.000x and common-prefix/early from 0.841x to 0.441x. That is not a
+credible monotonic lexical-cost curve: non-target controls ranged from -16.4%
+to +49.4%, global Text MIN+MAX moved +100.3%, and primitive extrema moved in
+conflicting directions. The implementation is retained for its stronger
+typed-state invariant and removal of generic Aggregate dispatch, not as a
+throughput claim.
+
+Phase 63 should implement Generic Filter position prebinding. Aggregate
+ownership and comparison micro-tuning stops here unless a new structural issue
+is measured. Typed column-oriented batches remain behind that work; HashJoin
+batch integration, Sort/Top-N, and index/range/partition batch sources follow.

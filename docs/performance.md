@@ -1412,6 +1412,85 @@ prevents a stronger throughput claim. Phase 62 should investigate Aggregate
 Text comparison; generic Filter position prebinding remains next, while typed
 column batches are still premature.
 
+## Phase 62 typed MIN/MAX comparison attribution
+
+Phase 62 first added three deterministic global `MIN(payload)` fixtures with
+1,000 rows and exactly 64 bytes per Text value. Each shape replaces only the
+initial state: early-difference candidates diverge at byte 0, long-common-prefix
+candidates diverge at byte 63, and all-equal candidates compare all 64 bytes.
+The existing ascending Text MIN/MAX, one-group Text MIN/MAX, Int64 extrema, and
+non-Aggregate scenarios remain controls. Raw serial quick runs are stored
+outside the repository at `/tmp/netbadb-phase62-pre.txt` and
+`/tmp/netbadb-phase62-post.txt`.
+
+Medians are machine-local nanoseconds per query:
+
+| scenario | Text comparison shape | replacement shape | pre median | post median | change |
+| --- | --- | --- | ---: | ---: | ---: |
+| early-difference MIN | differs at byte 0 | first row only | 506,208 | 521,666 | +3.1% |
+| long-common-prefix MIN | differs at byte 63 | first row only | 425,500 | 229,958 | -46.0% |
+| all-equal MIN | equal across 64 bytes | first row only | 422,333 | 521,791 | +23.5% |
+
+The requested within-run comparison ratios were:
+
+| ratio | pre | post |
+| --- | ---: | ---: |
+| all-equal / early-difference | 0.834x | 1.000x |
+| common-prefix / early-difference | 0.841x | 0.441x |
+
+These measurements do not form a credible lexical-comparison curve: the
+common-prefix case was unexpectedly faster than early-difference in both runs,
+and its relative movement conflicts with the all-equal case. The result cannot
+separate `str::cmp` cost from machine and code-layout variance. Phase 62
+therefore makes no stable latency claim and does not add a timing threshold or
+custom Text comparator.
+
+Extrema controls also moved in conflicting directions:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| global Int64 MIN | 335,375 | 425,208 | +26.8% |
+| global Int64 MAX | 420,667 | 439,625 | +4.5% |
+| global Int64 MIN+MAX | 450,083 | 447,000 | -0.7% |
+| global ascending Text MIN | 396,292 | 493,333 | +24.5% |
+| global ascending Text MAX | 400,541 | 504,292 | +25.9% |
+| global Text MIN+MAX | 502,459 | 1,006,584 | +100.3% |
+| one-group Text MIN | 525,625 | 555,041 | +5.6% |
+| one-group Text MAX | 473,750 | 675,083 | +42.5% |
+| grouped primitive mixed Aggregate | 553,459 | 535,625 | -3.2% |
+
+Non-target controls confirm broad run variance:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| global SUM | 353,250 | 412,875 | +16.9% |
+| Phase 61 one-group group-only | 370,791 | 461,875 | +24.6% |
+| Phase 61 one-group COUNT | 445,708 | 537,917 | +20.7% |
+| direct COUNT(*) | 303,333 | 431,625 | +42.3% |
+| filtered COUNT(payload) | 291,750 | 321,167 | +10.1% |
+| early Limit | 18,542 | 15,500 | -16.4% |
+| full projected scan | 420,458 | 498,625 | +18.6% |
+| LSM SUM | 64,917 | 96,959 | +49.4% |
+
+The authoritative result is structural. Aggregate construction now selects a
+private Bool, Int64, UInt64, or Text extrema state from typed metadata. Candidate
+comparison directly matches that state; Text borrows both `String` values and
+calls `str::cmp`, without `ScalarValue` to `ScalarRef` pair dispatch or a new
+allocation. Deterministic pair tests prove the replacement decision matches the
+generic comparator for primitive values, empty/ASCII/Unicode Text, equal Text,
+and long common prefixes. Across 513 equal Text candidates, MIN and MAX each
+replace once, reject 512 equal candidates, and retain the first String allocation.
+Existing pointer tests still prove one move for one owner and clone `N - 1`
+plus one move for duplicate/global/group-overlap owners. Empty, all-NULL,
+nullable mixed, wrong-type, invalid-input, batch/legacy, and Heap/LSM tests
+remain semantic gates.
+
+Aggregate ownership and comparison micro-tuning ends with Phase 62. Phase 63
+should implement Generic Filter position prebinding, where prior wide-versus-
+single-predicate attribution showed a clearer residual. Typed column batches,
+HashJoin batch integration, Sort/Top-N, and index/range/partition batch sources
+remain later candidates.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on

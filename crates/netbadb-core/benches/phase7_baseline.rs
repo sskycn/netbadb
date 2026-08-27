@@ -224,6 +224,34 @@ impl NullDistribution {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TextComparisonShape {
+    EarlyDifference,
+    LongCommonPrefix,
+    AllEqual,
+}
+
+impl TextComparisonShape {
+    fn payload(self, id: u64) -> String {
+        let payload = match self {
+            Self::EarlyDifference => {
+                let mut value = String::with_capacity(64);
+                value.push(if id == 0 { 'a' } else { 'z' });
+                value.push_str(&".".repeat(63));
+                value
+            }
+            Self::LongCommonPrefix => {
+                let mut value = "m".repeat(63);
+                value.push(if id == 0 { 'a' } else { 'z' });
+                value
+            }
+            Self::AllEqual => "m".repeat(64),
+        };
+        debug_assert_eq!(payload.len(), 64);
+        payload
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operator {
     SeqScan,
@@ -913,6 +941,22 @@ fn run_projection_attribution_scenarios(
         |result| global_multi_observation(result, rows),
         measurements,
     )?;
+    for (scenario, shape) in [
+        (
+            "text_compare_min_early_difference_64",
+            TextComparisonShape::EarlyDifference,
+        ),
+        (
+            "text_compare_min_long_common_prefix_64",
+            TextComparisonShape::LongCommonPrefix,
+        ),
+        (
+            "text_compare_min_all_equal_64",
+            TextComparisonShape::AllEqual,
+        ),
+    ] {
+        run_text_comparison_attribution_query(scenario, rows, shape, settings, measurements)?;
+    }
     run_attribution_query(
         "stream_aggregate_text_min",
         rows,
@@ -1794,6 +1838,48 @@ fn run_group_lookup_attribution_query(
     Ok(())
 }
 
+fn run_text_comparison_attribution_query(
+    scenario: &str,
+    rows: u64,
+    shape: TextComparisonShape,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let (mut database, paths) = text_comparison_fixture(scenario, rows, shape)?;
+    let sql = "SELECT MIN(payload) FROM items";
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[],
+    )?;
+    inspect_base_scan_columns(&database, scenario, sql, &[PAYLOAD_COLUMN_ID])?;
+    let expected_payload = shape.payload(0);
+    let expected = Observation {
+        rows: 1,
+        checksum: 0,
+    };
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        |result| exact_text_extreme_observation(result, &expected_payload),
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
 fn run_direct_heap_scan_scenarios(
     settings: ProfileSettings,
     measurements: &mut Vec<Measurement>,
@@ -2658,6 +2744,23 @@ fn items_fixture(
     Ok((database, paths))
 }
 
+fn text_comparison_fixture(
+    scenario: &str,
+    rows: u64,
+    shape: TextComparisonShape,
+) -> BenchResult<(Database, FixturePaths)> {
+    let paths = FixturePaths::new(scenario, 1);
+    let mut database = Database::create(paths.path(0), items_table())?;
+    let mut transaction = database.begin_transaction_for(ITEMS_TABLE_ID)?;
+    for id in 0..rows {
+        let mut row = item_row(id, 4, NullDistribution::Low)?;
+        row[5] = ScalarValue::Text(shape.payload(id));
+        database.insert_into_in(ITEMS_TABLE_ID, &mut transaction, &row)?;
+    }
+    transaction.commit()?;
+    Ok((database, paths))
+}
+
 fn items_table() -> TableDef {
     TableDef::new(
         ITEMS_TABLE_ID,
@@ -3310,6 +3413,29 @@ fn text_min_max_observation(result: &QueryResult, fixture_rows: u64) -> BenchRes
     Ok(Observation {
         rows: 1,
         checksum: u128::from(fixture_rows.saturating_sub(1)),
+    })
+}
+
+fn exact_text_extreme_observation(
+    result: &QueryResult,
+    expected: &str,
+) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error("Text comparison MIN must return one row"));
+    };
+    let [ScalarValue::Text(actual)] = row.as_slice() else {
+        return Err(message_error(
+            "Text comparison MIN must return one non-NULL Text column",
+        ));
+    };
+    if actual != expected {
+        return Err(message_error(format!(
+            "Text comparison MIN returned {actual}; expected {expected}"
+        )));
+    }
+    Ok(Observation {
+        rows: 1,
+        checksum: 0,
     })
 }
 
