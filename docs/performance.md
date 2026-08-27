@@ -1561,6 +1561,54 @@ column-oriented batches, HashJoin batch integration, Sort/Top-N, and
 index/range/partition batch sources before selection. AND/OR short-circuiting
 remains separate work; Phase 62's Text comparator line is not reopened.
 
+## Phase 64 bounded Top-N over the batch producer
+
+Phase 64 adds an order-sensitive K sweep over one shared 1,000-row fixture.
+Every observer checks the complete ordered ID sequence, exact
+`Limit>Project>Sort>...` tree, and exact base-scan ColumnIds. Coverage includes
+the target `ORDER BY team_id, id LIMIT 1`, duplicate-heavy K values 1, 20, 256,
+257, N/2, and N, unique descending and multi-key ordering, Filter, Text, all
+four explicit nullable direction/placement combinations, a full Sort without
+Limit, and an LSM multi-key Top-N. The existing `order_by_limit` case remains
+unchanged. Raw serial quick runs are stored outside the repository at
+`/tmp/netbadb-phase64-pre.txt` and `/tmp/netbadb-phase64-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| duplicate K=1 | 362,584 | 394,000 | +8.7% |
+| duplicate K=20 | 360,292 | 367,958 | +2.1% |
+| duplicate K=256 | 320,125 | 459,709 | +43.6% |
+| duplicate K=257 | 322,000 | 411,875 | +27.9% |
+| duplicate K=N/2 | 299,875 | 398,709 | +33.0% |
+| duplicate K=N | 310,250 | 432,291 | +39.3% |
+| unique descending K=20 | 217,791 | 304,583 | +39.9% |
+| multi-key K=20 | 390,167 | 284,166 | -27.2% |
+| filtered K=20 | 231,917 | 267,250 | +15.2% |
+| Text descending K=20 | 270,833 | 344,708 | +27.3% |
+| nullable ascending, NULLS FIRST | 256,750 | 221,833 | -13.6% |
+| full duplicate Sort without Limit | 241,417 | 263,042 | +9.0% |
+| existing `order_by_limit` control | 455,500 | 342,833 | -24.7% |
+
+The requested duplicate-key ratios changed as follows: K=20/full Sort moved
+from 1.492x to 1.399x; K=1/K=N moved from 1.169x to 0.911x; and K=20/K=N moved
+from 1.161x to 0.851x. The final expanded post run measured the exact Target A
+at 360,291 ns and LSM multi-key K=20 at 100,084 ns; those two cases were added
+after the initial pre capture and therefore have no claimed pre/post delta.
+
+This quick run supports no general throughput claim or timing gate. Some small
+K shapes improved, some regressed, K near N pays expected heap maintenance, and
+non-target controls again moved widely. The authoritative Phase 64 result is
+structural: the eligible executor retains at most `min(K, rows_seen)` candidate
+rows plus one 256-row batch instead of materializing and sorting the complete
+input. Test-only counters prove all 513 rows are consumed even for K=0/1, the
+maximum retained count never exceeds K, and equal keys preserve input order.
+Full Sort, malformed and unsupported shapes, physical plans, public APIs,
+storage, and persistent formats remain unchanged. A costed K/N crossover,
+spilling, full batch Sort, and upstream cancellation remain future measured
+work.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -1579,6 +1627,8 @@ Protocol v1, SDK Schema Spec v1, manifest v4, Inspection JSON v3, and fully owne
 QueryResult rows. Phase 7U retains those contracts as well. The later MVCC
 phase deliberately advances Heap metadata to v4 and adds tuple/status formats;
 it does not invalidate these performance-path results. Phase 63 changes only
-executor-private predicate setup/evaluation and benchmark coverage, retaining
-the current Heap metadata v4 and every public, inspection, protocol, SDK, and
-persistent contract. These phases add no dependency and no unsafe code.
+executor-private predicate setup/evaluation and benchmark coverage. Phase 64
+adds only an executor-private consumer of the existing physical tree and more
+benchmark coverage. Both retain the current Heap metadata v4 and every public,
+inspection, protocol, SDK, and persistent contract. These phases add no
+dependency and no unsafe code.

@@ -290,6 +290,7 @@ fn main() -> BenchResult<()> {
 
     run_direct_heap_scan_scenarios(settings, &mut measurements)?;
     run_projection_attribution_scenarios(settings, &mut measurements)?;
+    run_top_n_attribution_scenarios(settings, &mut measurements)?;
     run_point_and_shape_scenarios(settings, &mut measurements)?;
     run_join_scenarios(settings, &mut measurements)?;
     run_insert_scenarios(settings, &mut measurements)?;
@@ -408,6 +409,46 @@ fn run_lsm_correctness_scenarios(
     measurements.push(Measurement {
         scenario: scenario.into(),
         rows: expected.rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+
+    let scenario = "lsm_top_n_multi_key_k_20";
+    let sql = "SELECT id FROM items ORDER BY team_id ASC, id DESC LIMIT 20";
+    let mut expected_ids = (0..rows).collect::<Vec<_>>();
+    expected_ids.sort_by(|left, right| (left % 4).cmp(&(right % 4)).then_with(|| right.cmp(left)));
+    expected_ids.truncate(usize::try_from(rows.min(20))?);
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[
+            Operator::Limit,
+            Operator::Project,
+            Operator::Sort,
+            Operator::SeqScan,
+        ],
+        &[],
+    )?;
+    if plan != "Limit>Project>Sort>SeqScan" {
+        return Err(message_error(format!(
+            "scenario `{scenario}` plan was `{plan}`; expected `Limit>Project>Sort>SeqScan`"
+        )));
+    }
+    inspect_base_scan_columns(&database, scenario, sql, &[ID_COLUMN_ID, TEAM_COLUMN_ID])?;
+    let expected = expected_ids_observation(&expected_ids)?;
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        |result| ordered_ids_observation(result, &expected_ids),
+    )?;
+    measurements.push(Measurement {
+        scenario: scenario.into(),
+        rows: format!("{rows}/k={}", expected_ids.len()),
         plan,
         operations_per_iteration: 1,
         durations,
@@ -1793,6 +1834,213 @@ fn run_projection_attribution_scenarios(
         ids_observation,
         measurements,
     )
+}
+
+fn run_top_n_attribution_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let rows = settings.medium_rows;
+    let (mut database, paths) =
+        items_fixture("top-n-attribution", rows, &[], NullDistribution::Low, 4)?;
+
+    let mut expected = (0..rows).collect::<Vec<_>>();
+    expected.sort_by_key(|id| (id % 4, *id));
+    expected.truncate(usize::try_from(rows.min(1))?);
+    measure_top_n_query(
+        &mut database,
+        "top_n_target_a_k_1",
+        rows,
+        "SELECT id FROM items ORDER BY team_id, id LIMIT 1",
+        "Limit>Project>Sort>SeqScan",
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+        &expected,
+        settings,
+        measurements,
+    )?;
+
+    for limit in [1, 20, 256, 257, rows / 2, rows] {
+        let mut expected = (0..rows).collect::<Vec<_>>();
+        expected.sort_by_key(|id| id % 4);
+        expected.truncate(usize::try_from(limit.min(rows))?);
+        measure_top_n_query(
+            &mut database,
+            &format!("top_n_duplicate_k_{limit}"),
+            rows,
+            &format!("SELECT id FROM items ORDER BY team_id LIMIT {limit}"),
+            "Limit>Project>Sort>SeqScan",
+            &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+            &expected,
+            settings,
+            measurements,
+        )?;
+    }
+
+    let mut expected = (0..rows).rev().collect::<Vec<_>>();
+    expected.truncate(usize::try_from(rows.min(20))?);
+    measure_top_n_query(
+        &mut database,
+        "top_n_unique_desc_k_20",
+        rows,
+        "SELECT id FROM items ORDER BY id DESC LIMIT 20",
+        "Limit>Project>Sort>SeqScan",
+        &[ID_COLUMN_ID],
+        &expected,
+        settings,
+        measurements,
+    )?;
+
+    let mut expected = (0..rows).collect::<Vec<_>>();
+    expected.sort_by(|left, right| (left % 4).cmp(&(right % 4)).then_with(|| right.cmp(left)));
+    expected.truncate(usize::try_from(rows.min(20))?);
+    measure_top_n_query(
+        &mut database,
+        "top_n_multi_key_k_20",
+        rows,
+        "SELECT id FROM items ORDER BY team_id ASC, id DESC LIMIT 20",
+        "Limit>Project>Sort>SeqScan",
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+        &expected,
+        settings,
+        measurements,
+    )?;
+
+    let mut expected = (0..rows).filter(|id| id % 3 == 0).collect::<Vec<_>>();
+    expected.sort_by_key(|id| id % 4);
+    expected.truncate(usize::try_from(rows.min(20))?);
+    measure_top_n_query(
+        &mut database,
+        "top_n_filtered_k_20",
+        rows,
+        "SELECT id FROM items WHERE active = true ORDER BY team_id LIMIT 20",
+        "Limit>Project>Sort>Filter>SeqScan",
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID, ACTIVE_COLUMN_ID],
+        &expected,
+        settings,
+        measurements,
+    )?;
+
+    let mut expected = (0..rows).rev().collect::<Vec<_>>();
+    expected.truncate(usize::try_from(rows.min(20))?);
+    measure_top_n_query(
+        &mut database,
+        "top_n_text_desc_k_20",
+        rows,
+        "SELECT id FROM items ORDER BY payload DESC LIMIT 20",
+        "Limit>Project>Sort>SeqScan",
+        &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+        &expected,
+        settings,
+        measurements,
+    )?;
+
+    for (scenario, direction, null_order, nulls_first) in [
+        ("top_n_nullable_asc_first", "ASC", "FIRST", true),
+        ("top_n_nullable_asc_last", "ASC", "LAST", false),
+        ("top_n_nullable_desc_first", "DESC", "FIRST", true),
+        ("top_n_nullable_desc_last", "DESC", "LAST", false),
+    ] {
+        let descending = direction == "DESC";
+        let mut expected = (0..rows).collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            let left_null = NullDistribution::Low.is_null(*left);
+            let right_null = NullDistribution::Low.is_null(*right);
+            match (left_null, right_null) {
+                (true, true) => left.cmp(right),
+                (true, false) => {
+                    if nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                (false, false) if descending => right.cmp(left),
+                (false, false) => left.cmp(right),
+            }
+        });
+        expected.truncate(usize::try_from(rows.min(20))?);
+        measure_top_n_query(
+            &mut database,
+            scenario,
+            rows,
+            &format!(
+                "SELECT id FROM items ORDER BY nullable_key {direction} NULLS {null_order} LIMIT 20"
+            ),
+            "Limit>Project>Sort>SeqScan",
+            &[ID_COLUMN_ID, NULLABLE_COLUMN_ID],
+            &expected,
+            settings,
+            measurements,
+        )?;
+    }
+
+    let mut expected = (0..rows).collect::<Vec<_>>();
+    expected.sort_by_key(|id| id % 4);
+    measure_top_n_query(
+        &mut database,
+        "full_sort_duplicate_control",
+        rows,
+        "SELECT id FROM items ORDER BY team_id",
+        "Project>Sort>SeqScan",
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+        &expected,
+        settings,
+        measurements,
+    )?;
+
+    database.close()?;
+    paths.cleanup()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_top_n_query(
+    database: &mut Database,
+    scenario: &str,
+    fixture_rows: u64,
+    sql: &str,
+    expected_plan: &str,
+    expected_base_columns: &[ColumnId],
+    expected_ids: &[u64],
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let plan = inspect_plan(
+        database,
+        scenario,
+        sql,
+        &[Operator::Project, Operator::Sort, Operator::SeqScan],
+        &[],
+    )?;
+    if plan != expected_plan {
+        return Err(message_error(format!(
+            "scenario `{scenario}` plan was `{plan}`; expected `{expected_plan}`"
+        )));
+    }
+    inspect_base_scan_columns(database, scenario, sql, expected_base_columns)?;
+    let expected = expected_ids_observation(expected_ids)?;
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        |result| ordered_ids_observation(result, expected_ids),
+    )?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: format!("{fixture_rows}/k={}", expected_ids.len()),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
 }
 
 fn run_filter_position_attribution_query(
@@ -3208,6 +3456,46 @@ fn ids_observation(result: &QueryResult) -> BenchResult<Observation> {
             .map_err(|_| message_error("result row count exceeds u64"))?,
         checksum,
     })
+}
+
+fn expected_ids_observation(ids: &[u64]) -> BenchResult<Observation> {
+    Ok(Observation {
+        rows: u64::try_from(ids.len())
+            .map_err(|_| message_error("expected result row count exceeds u64"))?,
+        checksum: ids.iter().try_fold(0_u128, |checksum, id| {
+            checksum
+                .checked_add(u128::from(*id))
+                .ok_or_else(|| message_error("expected ID checksum overflow"))
+        })?,
+    })
+}
+
+fn ordered_ids_observation(result: &QueryResult, expected_ids: &[u64]) -> BenchResult<Observation> {
+    let actual = result
+        .rows
+        .iter()
+        .map(|row| {
+            let [ScalarValue::Int64(id)] = row.as_slice() else {
+                return Err(message_error(
+                    "ordered query must return one non-NULL Int64 ID column",
+                ));
+            };
+            u64::try_from(*id).map_err(|_| message_error("ordered query returned a negative ID"))
+        })
+        .collect::<BenchResult<Vec<_>>>()?;
+    if actual != expected_ids {
+        let mismatch = actual
+            .iter()
+            .zip(expected_ids)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or(actual.len().min(expected_ids.len()));
+        return Err(message_error(format!(
+            "ordered query diverged at row {mismatch}: actual={:?}, expected={:?}",
+            actual.get(mismatch),
+            expected_ids.get(mismatch)
+        )));
+    }
+    expected_ids_observation(&actual)
 }
 
 fn primitive_item_observation(result: &QueryResult, expected_id: u64) -> BenchResult<Observation> {

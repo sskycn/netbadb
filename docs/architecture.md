@@ -486,6 +486,21 @@ preserves input order among equal keys for the current plan, but does not
 promise a permanent tie order if future access paths change. A caller that
 requires a total order must provide enough keys.
 
+The executor privately specializes the existing
+`Limit -> Project -> Sort -> batch-capable child` tree as bounded Top-N. It
+resolves sort and projection positions before traversal, then consumes every
+produced row without sending Limit cancellation upstream. Each row receives
+the same runtime sort-value validation as full Sort. A fallible maximum heap
+keeps the worst retained candidate at its root, so intermediate ownership is
+bounded by one 256-row input batch plus at most K complete rows. Key equality
+is broken by a monotonic input ordinal; final key-plus-ordinal sorting therefore
+matches stable Sort before Limit. Hidden sort columns remain in candidates
+until the existing move-aware ProjectionPlan produces the final owned rows.
+K=0 still consumes and validates the complete logical input while retaining no
+candidate. Setup failures, unsupported producers, full Sort without Limit, and
+other plan shapes use the authoritative legacy executor. There is no new
+PhysicalPlan variant, cost model, spill path, or storage-facing ordering API.
+
 ## Typed global and grouped aggregates
 
 Aggregate function names are contextual only in SELECT projection. A plain
@@ -1076,8 +1091,12 @@ into a private 256-row `ExecutionBatch`, evaluates a position-bound
 `BoundExpr`, applies the existing move-aware `ProjectionPlan`, and tracks Limit
 state across batches. A callback consumes each bounded batch: the normal query
 path appends it to the fully owned result, while Aggregate updates incremental
-state and releases it. Limit cancellation stops the storage consumer after the
-current bounded batch; later physical rows are deliberately not requested.
+state and releases it. Bounded Top-N is a third consumer for the existing
+`Limit -> Project -> Sort` shape: it drains complete owned rows into a
+worst-first heap of at most K candidates and never cancels its child, because
+later rows may rank earlier. Ordinary batch Limit cancellation stops the
+storage consumer after the current bounded batch; later physical rows are
+deliberately not requested.
 This is an execution behavior and not a whole-file integrity check: every row
 actually requested still receives the engine's complete MVCC, page/SSTable,
 codec, type, NULL, and UTF-8 validation.

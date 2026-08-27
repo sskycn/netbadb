@@ -534,6 +534,11 @@ positions once, validates runtime physical types, and performs a stable
 in-memory lexicographic sort. Stability makes ties repeatable for the current
 input order, but it is not a permanent ordering guarantee across future plan
 changes; callers that need a total order must include sufficient keys.
+For the existing `Limit -> Project -> Sort` shape over a batch-capable scan
+child, the executor privately retains only the best `K` rows in a bounded
+worst-first heap, using input order to preserve stable ties, and applies the
+same move-aware Project only after selection. This changes no physical plan;
+Sort without Limit and unsupported children retain the full stable sort.
 
 Aggregates accept `COUNT(*)` or source-column arguments to `COUNT`,
 `SUM`, `MIN`, and `MAX`. Aggregate names are contextual in projection, so a
@@ -809,12 +814,19 @@ The implementation sequence is intentionally vertical:
     and UNKNOWN rows remain borrowed, malformed binding failures retain the
     dynamic row-dependent fallback, and batch Filter, filtered COUNT, Join,
     plans, public APIs, and persistent contracts are unchanged.
+64. Bounded Top-N over Batch Producer — complete; the existing
+    `Limit -> Project -> Sort` plan over SeqScan/Filter/Project batch children
+    consumes all input through the shared producer while retaining at most K
+    candidates, validates every sort value, preserves stable ties with an input
+    ordinal, and reuses move-aware final projection. Full Sort, unsupported and
+    malformed shapes, plans, public APIs, and persistent contracts are
+    unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
-index-join planning remain roadmap items. Phase 64 should select among typed
-column-oriented batches, HashJoin batch integration, Sort/Top-N, and
-index/range/partition batch sources from new measurements; leaf-lookup
-micro-optimization stops with Phase 63.
+index-join planning remain roadmap items. Typed column-oriented batches,
+HashJoin batch integration, and index/range/partition batch sources remain
+measurement-led candidates; full batch Sort and upstream Top-N cancellation
+are not implemented. Leaf-lookup micro-optimization stops with Phase 63.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in

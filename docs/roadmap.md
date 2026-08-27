@@ -1475,3 +1475,26 @@ Typed column-oriented batch representation, HashJoin batch producer/consumer
 integration, Sort/Top-N, and index/range/partition batch sources should be
 remeasured against current workloads before one is selected; AND/OR
 short-circuiting remains a separate measured candidate.
+
+## Bounded Top-N over Batch Producer (Phase 64, complete)
+
+- recognizes only the existing `Limit -> Project -> Sort` physical tree when
+  Sort's child is accepted by the SeqScan/Filter/Project batch producer;
+- resolves sort and final projection positions once, consumes every child
+  batch, validates every row even when K is zero or the candidate is discarded,
+  and retains no more than `min(K, rows_seen)` complete candidates;
+- uses a fallible worst-first heap and an input ordinal tie-break, then sorts
+  the retained candidates by keys plus ordinal before reusing the move-aware
+  ProjectionPlan, preserving hidden keys, duplicate outputs, NULL placement,
+  direction, multi-key ordering, Text ordering, and stable ties;
+- keeps malformed setup and unsupported sources on the legacy executor, and
+  leaves full Sort without Limit unchanged;
+- proves K and 256-row batch boundaries, all-equal ties, type/error behavior,
+  full legacy result equivalence, and Heap/LSM equivalence; the benchmark adds
+  exact-plan/base-column/order gates for K sweep, unique/duplicate/multi-key,
+  Filter, Text, nullable, full-Sort control, and an LSM Top-N case.
+
+Phase 64 adds no PhysicalPlan variant, public API, dependency, unsafe code,
+storage format, or upstream cancellation. Typed column-oriented batches, batch
+HashJoin, index/range/partition batch sources, full batch Sort, spilling, and a
+costed K/N crossover remain future measured work.

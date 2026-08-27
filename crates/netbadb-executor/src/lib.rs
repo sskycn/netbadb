@@ -446,6 +446,119 @@ struct BatchPipeline<'a> {
     operators: Vec<BatchOperator<'a>>,
 }
 
+struct TopNPlan<'a> {
+    pipeline: BatchPipeline<'a>,
+    keys: &'a [SortKey],
+    sort_positions: Vec<usize>,
+    projection: ProjectionPlan,
+    fields: Vec<OutputField>,
+    limit: usize,
+}
+
+#[derive(Debug)]
+struct TopNCandidate {
+    input_ordinal: usize,
+    row: ExecutionRow,
+}
+
+struct TopNState<'a> {
+    limit: usize,
+    keys: &'a [SortKey],
+    sort_positions: &'a [usize],
+    candidates: Vec<TopNCandidate>,
+    rows_seen: usize,
+    #[cfg(test)]
+    candidates_inserted: usize,
+    #[cfg(test)]
+    max_retained: usize,
+}
+
+impl<'a> TopNState<'a> {
+    fn new(limit: usize, keys: &'a [SortKey], sort_positions: &'a [usize]) -> Self {
+        Self {
+            limit,
+            keys,
+            sort_positions,
+            candidates: Vec::with_capacity(limit.min(EXECUTION_BATCH_CAPACITY)),
+            rows_seen: 0,
+            #[cfg(test)]
+            candidates_inserted: 0,
+            #[cfg(test)]
+            max_retained: 0,
+        }
+    }
+
+    fn consider(&mut self, row: ExecutionRow) -> Result<(), ExecutionError> {
+        validate_sort_row(&row, self.sort_positions, self.keys)?;
+        let input_ordinal = self.rows_seen;
+        self.rows_seen = self
+            .rows_seen
+            .checked_add(1)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        if self.limit == 0 {
+            return Ok(());
+        }
+
+        let candidate = TopNCandidate { input_ordinal, row };
+        if self.candidates.len() < self.limit {
+            self.candidates.push(candidate);
+            let position = self.candidates.len() - 1;
+            sift_top_n_candidate_up(
+                &mut self.candidates,
+                position,
+                self.sort_positions,
+                self.keys,
+            )?;
+            #[cfg(test)]
+            {
+                self.candidates_inserted += 1;
+                self.max_retained = self.max_retained.max(self.candidates.len());
+            }
+            return Ok(());
+        }
+
+        if compare_top_n_candidates(
+            &candidate,
+            &self.candidates[0],
+            self.sort_positions,
+            self.keys,
+        )? == Ordering::Less
+        {
+            self.candidates[0] = candidate;
+            sift_top_n_candidate_down(&mut self.candidates, 0, self.sort_positions, self.keys)?;
+            #[cfg(test)]
+            {
+                self.candidates_inserted += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn into_sorted_rows(mut self) -> Result<Vec<ExecutionRow>, ExecutionError> {
+        let mut comparison_error = None;
+        self.candidates.sort_by(|left, right| {
+            if comparison_error.is_some() {
+                return Ordering::Equal;
+            }
+            match compare_top_n_candidates(left, right, self.sort_positions, self.keys) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    comparison_error = Some(error);
+                    Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = comparison_error {
+            return Err(error);
+        }
+        Ok(self
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.row)
+            .collect())
+    }
+}
+
 enum BatchOperator<'a> {
     Filter(BoundExpr<'a>),
     Project(ProjectionPlan),
@@ -636,6 +749,9 @@ fn execute_rows_with_views(
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
 ) -> Result<ExecutionRows, ExecutionError> {
+    if let Some(result) = try_execute_top_n(plan, bindings, storages, read_views)? {
+        return Ok(result);
+    }
     if let Some(result) =
         try_execute_streaming_filter_pipeline(plan, bindings, storages, read_views)?
     {
@@ -645,6 +761,64 @@ fn execute_rows_with_views(
         return Ok(result);
     }
     execute_rows_legacy_with_views(plan, bindings, storages, read_views)
+}
+
+fn try_execute_top_n(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let Some(TopNPlan {
+        mut pipeline,
+        keys,
+        sort_positions,
+        projection,
+        fields,
+        limit,
+    }) = build_top_n_plan(plan)
+    else {
+        return Ok(None);
+    };
+    let mut state = TopNState::new(limit, keys, &sort_positions);
+    let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
+        for row in batch.rows.drain(..) {
+            state.consider(row)?;
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    let rows = state
+        .into_sorted_rows()?
+        .into_iter()
+        .map(|row| project_execution_row(row, &projection))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(ExecutionRows { fields, rows }))
+}
+
+fn build_top_n_plan(plan: &PhysicalPlan) -> Option<TopNPlan<'_>> {
+    let PhysicalPlan::Limit { input, limit } = plan else {
+        return None;
+    };
+    let PhysicalPlan::Project { input, columns } = input.as_ref() else {
+        return None;
+    };
+    let PhysicalPlan::Sort { input, keys } = input.as_ref() else {
+        return None;
+    };
+    let pipeline = match build_batch_pipeline(input) {
+        Ok(Some(pipeline)) => pipeline,
+        Ok(None) | Err(_) => return None,
+    };
+    let sort_positions = resolve_sort_positions(&pipeline.fields, keys).ok()?;
+    let projection = build_projection_plan(&pipeline.fields, columns).ok()?;
+    Some(TopNPlan {
+        pipeline,
+        keys,
+        sort_positions,
+        projection,
+        fields: columns.iter().cloned().map(OutputField::Source).collect(),
+        limit: usize::try_from(*limit).unwrap_or(usize::MAX),
+    })
 }
 
 fn try_execute_streaming_filter_pipeline(
@@ -1341,14 +1515,23 @@ fn validate_sort_values(
     keys: &[SortKey],
 ) -> Result<(), ExecutionError> {
     for row in rows {
-        for (position, key) in positions.iter().zip(keys) {
-            let value = row
-                .values
-                .get(*position)
-                .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))?;
-            if !value.matches_type(&key.column.data_type) {
-                return Err(ExecutionError::TypeMismatch);
-            }
+        validate_sort_row(row, positions, keys)?;
+    }
+    Ok(())
+}
+
+fn validate_sort_row(
+    row: &ExecutionRow,
+    positions: &[usize],
+    keys: &[SortKey],
+) -> Result<(), ExecutionError> {
+    for (position, key) in positions.iter().zip(keys) {
+        let value = row
+            .values
+            .get(*position)
+            .ok_or_else(|| ExecutionError::MissingColumn(key.column.name.clone()))?;
+        if !value.matches_type(&key.column.data_type) {
+            return Err(ExecutionError::TypeMismatch);
         }
     }
     Ok(())
@@ -1399,6 +1582,80 @@ fn compare_sort_values(
                 SortDirection::Desc => ordering.reverse(),
             })
         }
+    }
+}
+
+fn compare_top_n_candidates(
+    left: &TopNCandidate,
+    right: &TopNCandidate,
+    positions: &[usize],
+    keys: &[SortKey],
+) -> Result<Ordering, ExecutionError> {
+    let ordering = compare_sort_rows(&left.row, &right.row, positions, keys)?;
+    Ok(if ordering == Ordering::Equal {
+        left.input_ordinal.cmp(&right.input_ordinal)
+    } else {
+        ordering
+    })
+}
+
+fn sift_top_n_candidate_up(
+    candidates: &mut [TopNCandidate],
+    mut position: usize,
+    sort_positions: &[usize],
+    keys: &[SortKey],
+) -> Result<(), ExecutionError> {
+    while position > 0 {
+        let parent = (position - 1) / 2;
+        if compare_top_n_candidates(
+            &candidates[parent],
+            &candidates[position],
+            sort_positions,
+            keys,
+        )? != Ordering::Less
+        {
+            break;
+        }
+        candidates.swap(parent, position);
+        position = parent;
+    }
+    Ok(())
+}
+
+fn sift_top_n_candidate_down(
+    candidates: &mut [TopNCandidate],
+    mut position: usize,
+    sort_positions: &[usize],
+    keys: &[SortKey],
+) -> Result<(), ExecutionError> {
+    loop {
+        let left = position * 2 + 1;
+        if left >= candidates.len() {
+            return Ok(());
+        }
+        let right = left + 1;
+        let mut worse = left;
+        if right < candidates.len()
+            && compare_top_n_candidates(
+                &candidates[left],
+                &candidates[right],
+                sort_positions,
+                keys,
+            )? == Ordering::Less
+        {
+            worse = right;
+        }
+        if compare_top_n_candidates(
+            &candidates[position],
+            &candidates[worse],
+            sort_positions,
+            keys,
+        )? != Ordering::Less
+        {
+            return Ok(());
+        }
+        candidates.swap(position, worse);
+        position = worse;
     }
 }
 
@@ -4206,17 +4463,17 @@ mod tests {
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
         ExecutionRow, ExecutionStorage, FilteredCountSummary, GroupLookup, GroupState,
         InequalityExecutionStrategy, PrehashedBuildHasher, PrehashedKey, ProjectionPlan,
-        QueryResult, TruthValue, bind_expression, build_batch_pipeline, choose_inequality_strategy,
-        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
-        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
-        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
-        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
-        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
-        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_truth,
-        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
-        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
-        execute_with_storages, filtered_count_eligibility, find_required_inequality,
-        hash_group_key, inequality_can_match, materialize_count_values,
+        QueryResult, TopNState, TruthValue, bind_expression, build_batch_pipeline,
+        build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
+        collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
+        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
+        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
+        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
+        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
+        execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
+        find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme,
         sorted_non_null_indices, streaming_seq_filter_eligibility, update_filtered_count_summary,
@@ -4528,6 +4785,22 @@ mod tests {
             input: Box::new(input),
             limit,
         }
+    }
+
+    fn batch_sort(input: PhysicalPlan, keys: Vec<SortKey>) -> PhysicalPlan {
+        PhysicalPlan::Sort {
+            input: Box::new(input),
+            keys,
+        }
+    }
+
+    fn batch_top_n(
+        input: PhysicalPlan,
+        keys: Vec<SortKey>,
+        columns: Vec<ColumnRef>,
+        limit: u64,
+    ) -> PhysicalPlan {
+        batch_limit(batch_project(batch_sort(input, keys), columns), limit)
     }
 
     fn batch_aggregate_expression(
@@ -6003,6 +6276,277 @@ mod tests {
         assert_batch_matches_legacy(&complete, &mut storage);
         storage.close().expect("close operator Heap");
         remove_batch_test_path(&path, false);
+    }
+
+    #[test]
+    fn top_n_state_bounds_retention_and_preserves_equal_key_input_order() {
+        let key_column = batch_columns()[1].clone();
+        for direction in [SortDirection::Asc, SortDirection::Desc] {
+            let keys = [SortKey {
+                column: key_column.clone(),
+                direction,
+                null_order: NullOrder::Last,
+            }];
+            for limit in [0, 1, 20, 256, 257, 600] {
+                let mut state = TopNState::new(limit, &keys, &[0]);
+                for index in 0..513 {
+                    state
+                        .consider(ExecutionRow {
+                            row_id: None,
+                            values: vec![ScalarValue::UInt64(7), ScalarValue::Int64(index as i64)],
+                        })
+                        .expect("consume equal-key Top-N candidate");
+                }
+                assert_eq!(state.rows_seen, 513);
+                assert_eq!(state.max_retained, limit.min(513));
+                assert!(state.candidates.len() <= limit.min(513));
+                assert!(state.candidates_inserted <= 513);
+                let rows = state.into_sorted_rows().expect("finish equal-key Top-N");
+                assert_eq!(rows.len(), limit.min(513));
+                assert_eq!(
+                    rows.into_iter()
+                        .map(|row| row.values[1].clone())
+                        .collect::<Vec<_>>(),
+                    (0..limit.min(513))
+                        .map(|index| ScalarValue::Int64(index as i64))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn top_n_matches_legacy_at_every_batch_and_limit_boundary() {
+        let columns = batch_columns();
+        let key = SortKey {
+            column: columns[1].clone(),
+            direction: SortDirection::Asc,
+            null_order: NullOrder::Last,
+        };
+        for rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let (mut storage, path) = batch_storage(&format!("top-n-boundary-{rows}"), false, rows);
+            for limit in [0, 1, 20, 255, 256, 257] {
+                let plan = batch_top_n(
+                    batch_scan(columns.clone()),
+                    vec![key.clone()],
+                    vec![columns[0].clone()],
+                    limit,
+                );
+                assert!(build_top_n_plan(&plan).is_some());
+                assert_batch_matches_legacy(&plan, &mut storage);
+            }
+            storage.close().expect("close Top-N boundary Heap");
+            remove_batch_test_path(&path, false);
+        }
+    }
+
+    #[test]
+    fn top_n_matches_legacy_for_filters_types_nulls_and_duplicate_projection() {
+        let columns = batch_columns();
+        let rows = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let (mut storage, path) = batch_storage("top-n-semantics", false, rows);
+        let sort_key = |column: ColumnRef, direction, null_order| SortKey {
+            column,
+            direction,
+            null_order,
+        };
+        let scan = || batch_scan(columns.clone());
+        let active = || {
+            batch_binary(
+                BinaryOp::Eq,
+                batch_column_expression(&columns[2]),
+                batch_literal(ScalarValue::Bool(true), PhysicalType::Bool),
+            )
+        };
+
+        let mut plans = vec![
+            batch_top_n(
+                scan(),
+                vec![sort_key(
+                    columns[1].clone(),
+                    SortDirection::Asc,
+                    NullOrder::Last,
+                )],
+                vec![columns[0].clone()],
+                20,
+            ),
+            batch_top_n(
+                scan(),
+                vec![sort_key(
+                    columns[1].clone(),
+                    SortDirection::Desc,
+                    NullOrder::First,
+                )],
+                vec![columns[0].clone()],
+                20,
+            ),
+            batch_top_n(
+                scan(),
+                vec![
+                    sort_key(columns[1].clone(), SortDirection::Asc, NullOrder::Last),
+                    sort_key(columns[0].clone(), SortDirection::Desc, NullOrder::First),
+                ],
+                vec![columns[0].clone()],
+                20,
+            ),
+            batch_top_n(
+                batch_filter(scan(), active()),
+                vec![sort_key(
+                    columns[1].clone(),
+                    SortDirection::Asc,
+                    NullOrder::Last,
+                )],
+                vec![columns[0].clone()],
+                20,
+            ),
+            batch_top_n(
+                scan(),
+                vec![sort_key(
+                    columns[3].clone(),
+                    SortDirection::Desc,
+                    NullOrder::First,
+                )],
+                vec![columns[0].clone()],
+                20,
+            ),
+            batch_top_n(
+                batch_project(
+                    scan(),
+                    vec![columns[3].clone(), columns[0].clone(), columns[4].clone()],
+                ),
+                vec![sort_key(
+                    columns[4].clone(),
+                    SortDirection::Asc,
+                    NullOrder::First,
+                )],
+                vec![columns[3].clone(), columns[0].clone(), columns[3].clone()],
+                20,
+            ),
+        ];
+        for direction in [SortDirection::Asc, SortDirection::Desc] {
+            for null_order in [NullOrder::First, NullOrder::Last] {
+                plans.push(batch_top_n(
+                    scan(),
+                    vec![sort_key(columns[4].clone(), direction, null_order)],
+                    vec![columns[0].clone()],
+                    20,
+                ));
+            }
+        }
+        for plan in plans {
+            assert_batch_matches_legacy(&plan, &mut storage);
+        }
+        storage.close().expect("close Top-N semantics Heap");
+        remove_batch_test_path(&path, false);
+    }
+
+    #[test]
+    fn top_n_falls_back_for_ineligible_or_malformed_setup_and_keeps_runtime_errors() {
+        let columns = batch_columns();
+        let key = SortKey {
+            column: columns[0].clone(),
+            direction: SortDirection::Asc,
+            null_order: NullOrder::Last,
+        };
+        let full_sort = batch_project(
+            batch_sort(batch_scan(columns.clone()), vec![key.clone()]),
+            vec![columns[0].clone()],
+        );
+        assert!(build_top_n_plan(&full_sort).is_none());
+
+        let mut missing = columns[0].clone();
+        missing.column_id = ColumnId(99);
+        missing.name = "missing".into();
+        let missing_plan = batch_top_n(
+            batch_scan(columns.clone()),
+            vec![SortKey {
+                column: missing,
+                direction: SortDirection::Asc,
+                null_order: NullOrder::Last,
+            }],
+            vec![columns[0].clone()],
+            1,
+        );
+        assert!(build_top_n_plan(&missing_plan).is_none());
+
+        let (mut empty, empty_path) = batch_storage("top-n-malformed-empty", false, 0);
+        assert!(matches!(
+            execute_rows(&missing_plan, std::slice::from_mut(&mut empty)),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
+        assert!(matches!(
+            execute_rows_legacy(&missing_plan, std::slice::from_mut(&mut empty)),
+            Err(ExecutionError::MissingColumn(name)) if name == "missing"
+        ));
+        empty.close().expect("close malformed empty Heap");
+        remove_batch_test_path(&empty_path, false);
+
+        let mut mismatched = columns[0].clone();
+        mismatched.data_type = SemanticType::physical(PhysicalType::UInt64);
+        let mismatched_plan = batch_top_n(
+            batch_scan(columns),
+            vec![SortKey {
+                column: mismatched,
+                direction: SortDirection::Asc,
+                null_order: NullOrder::Last,
+            }],
+            vec![key.column],
+            0,
+        );
+        assert!(build_top_n_plan(&mismatched_plan).is_some());
+        let (mut storage, path) = batch_storage("top-n-runtime-error", false, 513);
+        assert!(matches!(
+            execute_rows(&mismatched_plan, std::slice::from_mut(&mut storage)),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert!(matches!(
+            execute_rows_legacy(&mismatched_plan, std::slice::from_mut(&mut storage)),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        storage.close().expect("close Top-N runtime-error Heap");
+        remove_batch_test_path(&path, false);
+    }
+
+    #[test]
+    fn top_n_results_are_equivalent_across_heap_lsm_and_legacy() {
+        let columns = batch_columns();
+        let rows = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let (mut heap, heap_path) = batch_storage("top-n-engine", false, rows);
+        let (mut lsm, lsm_path) = batch_storage("top-n-engine", true, rows);
+        let plan = batch_top_n(
+            batch_scan(columns.clone()),
+            vec![
+                SortKey {
+                    column: columns[1].clone(),
+                    direction: SortDirection::Asc,
+                    null_order: NullOrder::Last,
+                },
+                SortKey {
+                    column: columns[0].clone(),
+                    direction: SortDirection::Desc,
+                    null_order: NullOrder::First,
+                },
+            ],
+            vec![columns[3].clone(), columns[0].clone()],
+            20,
+        );
+        let heap_result = execute(&plan, &mut heap).expect("execute Heap Top-N");
+        let lsm_result = execute(&plan, &mut lsm).expect("execute LSM Top-N");
+        assert_eq!(heap_result, lsm_result);
+        assert_batch_matches_legacy(&plan, &mut heap);
+        assert_batch_matches_legacy(&plan, &mut lsm);
+        heap.close().expect("close Top-N Heap");
+        lsm.close().expect("close Top-N LSM");
+        remove_batch_test_path(&heap_path, false);
+        remove_batch_test_path(&lsm_path, true);
     }
 
     #[test]
