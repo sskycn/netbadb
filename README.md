@@ -788,6 +788,11 @@ The implementation sequence is intentionally vertical:
     MIN/MAX replacement owners per source position. Each required source value
     is cloned for all but one durable owner and moved once, so unique Int64 and
     Text keys reach `GroupState` without a key clone while hits remain unchanged.
+60. Prehashed Group Bucket Lookup — complete; group values still receive one
+    keyed, randomized `RandomState` hash, while the executor-private bucket map
+    now passes that opaque `u64` prehash directly to bucket indexing. Exact
+    `GroupState` key comparison still resolves collisions, and the pass-through
+    map never hashes raw user values.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Column-oriented batches, SIMD, and

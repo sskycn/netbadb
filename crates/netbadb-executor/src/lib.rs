@@ -1413,9 +1413,56 @@ struct GroupState {
     aggregate_states: Vec<AggregateState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrehashedKey(u64);
+
+impl Hash for PrehashedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PrehashedBuildHasher;
+
+impl BuildHasher for PrehashedBuildHasher {
+    type Hasher = PrehashedHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PrehashedHasher {
+            value: 0,
+            written: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrehashedHasher {
+    value: u64,
+    written: bool,
+}
+
+impl Hasher for PrehashedHasher {
+    fn finish(&self) -> u64 {
+        self.value
+    }
+
+    fn write(&mut self, _bytes: &[u8]) {
+        panic!("PrehashedHasher accepts only one opaque u64 prehash")
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        if self.written {
+            panic!("PrehashedHasher accepts only one opaque u64 prehash");
+        }
+        self.value = value;
+        self.written = true;
+    }
+}
+
 struct GroupLookup {
     key_hasher: RandomState,
-    bucket_heads: HashMap<u64, usize>,
+    bucket_heads: HashMap<PrehashedKey, usize, PrehashedBuildHasher>,
     collision_next: Vec<Option<usize>>,
     #[cfg(test)]
     stats: GroupLookupStats,
@@ -1443,7 +1490,7 @@ impl GroupLookup {
     fn new() -> Self {
         Self {
             key_hasher: RandomState::new(),
-            bucket_heads: HashMap::new(),
+            bucket_heads: HashMap::with_hasher(PrehashedBuildHasher),
             collision_next: Vec::new(),
             #[cfg(test)]
             stats: GroupLookupStats::default(),
@@ -1462,7 +1509,7 @@ impl GroupLookup {
         {
             self.stats.lookups += 1;
         }
-        let head = self.bucket_heads.get(&hash).copied();
+        let head = self.bucket_heads.get(&PrehashedKey(hash)).copied();
         let group_index = self.find_in_bucket(row, positions, group_keys, groups, head)?;
         #[cfg(test)]
         if group_index.is_some() {
@@ -1503,7 +1550,7 @@ impl GroupLookup {
         if self.collision_next.len() != group_index {
             return Err(ExecutionError::TypeMismatch);
         }
-        let previous_head = self.bucket_heads.insert(hash, group_index);
+        let previous_head = self.bucket_heads.insert(PrehashedKey(hash), group_index);
         self.collision_next.push(previous_head);
         Ok(())
     }
@@ -3884,23 +3931,26 @@ fn compare_scalar_refs(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
     use std::ops::ControlFlow;
 
     use super::{
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
         ExecutionRow, ExecutionStorage, FilteredCountSummary, GroupLookup, GroupState,
-        InequalityExecutionStrategy, ProjectionPlan, QueryResult, TruthValue, bind_expression,
-        build_batch_pipeline, choose_inequality_strategy, collect_filter_columns,
-        collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
-        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
-        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
-        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
-        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
-        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
-        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
-        execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
-        find_required_inequality, inequality_can_match, materialize_count_values,
+        InequalityExecutionStrategy, PrehashedBuildHasher, PrehashedKey, ProjectionPlan,
+        QueryResult, TruthValue, bind_expression, build_batch_pipeline, choose_inequality_strategy,
+        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
+        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
+        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
+        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
+        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
+        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
+        execute_with_storages, filtered_count_eligibility, find_required_inequality,
+        hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme,
         sorted_non_null_indices, streaming_seq_filter_eligibility, update_filtered_count_summary,
@@ -4635,6 +4685,52 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::manual_hash_one,
+        reason = "this structural test verifies the Hasher::finish contract directly"
+    )]
+    fn prehashed_bucket_hasher_passes_through_u64_values() {
+        for value in [0, 1, u64::MAX, 0x0123_4567_89ab_cdef, 0xa5a5_5a5a_f0f0_0f0f] {
+            let mut hasher = PrehashedBuildHasher.build_hasher();
+            PrehashedKey(value).hash(&mut hasher);
+            assert_eq!(hasher.finish(), value);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "accepts only one opaque u64 prehash")]
+    fn prehashed_bucket_hasher_rejects_generic_bytes() {
+        let mut hasher = PrehashedBuildHasher.build_hasher();
+        hasher.write(b"not a prehash");
+    }
+
+    #[test]
+    fn prehashed_bucket_map_looks_up_distinct_hashes() {
+        let mut lookup = GroupLookup::new();
+        lookup.register_group(11, 0).expect("register hash A");
+        lookup.register_group(29, 1).expect("register hash B");
+
+        assert_eq!(lookup.bucket_heads.get(&PrehashedKey(11)).copied(), Some(0));
+        assert_eq!(lookup.bucket_heads.get(&PrehashedKey(29)).copied(), Some(1));
+    }
+
+    #[test]
+    fn group_key_hash_remains_random_state_keyed() {
+        let key = batch_columns()[0].clone();
+        let row = ExecutionRow {
+            row_id: None,
+            values: vec![ScalarValue::Int64(17)],
+        };
+        let random_state = RandomState::new();
+
+        let first = hash_group_key(&random_state, &row, &[0], std::slice::from_ref(&key))
+            .expect("hash group key");
+        let second = hash_group_key(&random_state, &row, &[0], std::slice::from_ref(&key))
+            .expect("rehash group key");
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn group_lookup_collision_chain_uses_exact_typed_key_equality() {
         let columns = batch_columns();
         let groups = vec![
@@ -4673,7 +4769,7 @@ mod tests {
         let mut lookup = GroupLookup::new();
         lookup.register_group(7, 0).expect("register collision A");
         lookup.register_group(7, 1).expect("register collision B");
-        let head = lookup.bucket_heads.get(&7).copied();
+        let head = lookup.bucket_heads.get(&PrehashedKey(7)).copied();
         assert_eq!(
             lookup
                 .find_in_bucket(&row("alpha", 1, 2), &positions, &columns, &groups, head)

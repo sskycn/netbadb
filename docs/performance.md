@@ -1286,6 +1286,65 @@ spread make group hashing plus owned-row bookkeeping the leading Phase 60
 measurement, followed by Aggregate Text comparison and generic Filter
 prebinding. Column-oriented batches remain unselected.
 
+## Phase 60 prehashed group bucket lookup attribution
+
+Phase 60 reused the existing one-group, four-group, unique Int64, two primitive
+key, unique Text, and wide unique scenarios before changing production code.
+The same quick command ran serially before and after the change, with raw output
+stored outside the repository at `/tmp/netbadb-phase60-pre.txt` and
+`/tmp/netbadb-phase60-post.txt`. Plans, base-column gates, exact first-seen
+results, warm-process execution, `black_box`, and the no-timing-threshold policy
+remain unchanged.
+
+Medians are machine-local nanoseconds per query:
+
+| scenario | cardinality | key shape | pre median | post median | change |
+| --- | ---: | --- | ---: | ---: | ---: |
+| one group | 1/1,000 | Int64 | 588,667 | 460,875 | -21.7% |
+| four groups | 4/1,000 | Int64 | 523,708 | 370,125 | -29.3% |
+| all unique | 1,000/1,000 | Int64 | 900,333 | 632,750 | -29.7% |
+| two primitive keys | 8/1,000 | Int64 + Bool | 631,875 | 387,333 | -38.7% |
+| all-unique Text | 1,000/1,000 | Text | 959,500 | 919,166 | -4.2% |
+| wide unique | 1,000/1,000 | Int64 + Text | 980,083 | 720,917 | -26.4% |
+
+The cheap primitive cases improved more than the expensive unique-Text control,
+which is the expected shape when the removed second `u64` hash is fixed work
+and first-level Text hashing remains. Unique Int64 and wide unique also improved
+materially, so the result is not a clean width curve and must be read alongside
+the noisy controls. Structurally, the executor still hashes key width and
+ordered group values through a keyed `RandomState`; only the resulting opaque
+`u64` enters a private pass-through bucket map. Exact `ScalarValue` collision
+comparison, NULL grouping, and first-seen `Vec<GroupState>` order are unchanged.
+
+Controls moved broadly in both directions:
+
+| control | pre median | post median | change |
+| --- | ---: | ---: | ---: |
+| global SUM | 380,833 | 542,833 | +42.5% |
+| Phase 57 Text MIN | 599,666 | 401,333 | -33.1% |
+| Phase 57 Text MAX | 401,125 | 402,250 | +0.3% |
+| Phase 57 Text MIN+MAX | 600,791 | 535,084 | -10.9% |
+| Phase 57 duplicate Text MAX | 778,209 | 717,667 | -7.8% |
+| Phase 59 Text key-only | 800,166 | 539,958 | -32.5% |
+| Phase 59 Text + MAX | 950,167 | 906,959 | -4.5% |
+| Phase 59 duplicate MAX | 1,023,959 | 756,500 | -26.1% |
+| direct COUNT(*) | 352,667 | 469,209 | +33.0% |
+| filtered COUNT(payload) | 435,958 | 324,291 | -25.6% |
+| early Limit | 15,750 | 15,208 | -3.4% |
+| full projected scan | 363,375 | 540,000 | +48.6% |
+| LSM SUM | 65,208 | 163,709 | +151.1% |
+
+The control spread demonstrates significant machine/code-layout variance, so
+the single quick comparison is directional rather than a stable throughput
+claim. The implementation is retained because structural tests prove that
+bucket hashing returns the exact prehash for `0`, `1`, `u64::MAX`, and
+representative mixed-bit values, distinct prehashes retrieve distinct heads,
+generic byte hashing is rejected, and a forced same-prehash chain still uses
+exact typed key equality. Ownership counters and legacy-equivalence tests remain
+unchanged. The remaining hit-heavy grouped cost selects selective owned-row
+bookkeeping as Phase 61; Aggregate Text comparison, generic Filter prebinding,
+and broader column-oriented execution remain separate candidates.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on

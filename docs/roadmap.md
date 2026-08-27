@@ -1344,3 +1344,35 @@ Phase 60 should first isolate primitive group hashing and owned-row bookkeeping,
 then compare Aggregate Text comparison and generic Filter prebinding. Column
 batches, HashJoin integration, Sort/Top-N, and index/range/partition batch
 sources remain unselected until those residuals are measured.
+
+## Prehashed Group Bucket Lookup (complete)
+
+- retained the executor-private `RandomState` as the only hash of SQL group-key
+  width and ordered `ScalarValue` values;
+- changed only `GroupLookup.bucket_heads` to use a private `PrehashedKey` and
+  pass-through `BuildHasher`, so its already keyed/randomized `u64` selects the
+  bucket without a second randomized hash;
+- kept `GroupState.key_values` authoritative and traverses the unchanged exact
+  collision chain before declaring a hit; equal prehashes never imply equal SQL
+  groups;
+- preserved Phase 58 allocation-free hits, Phase 59 move-on-miss ownership,
+  NULL grouping, multi-key order, first-seen output, error timing, Heap/LSM
+  neutrality, safe Rust, and all public and persistent contracts;
+- added structural tests for exact pass-through boundary values, distinct
+  bucket lookup, rejection of generic byte hashing, the `RandomState` outer
+  boundary, and forced same-prehash/exact-key collisions.
+
+One serial quick pre/post run moved one-group, four-group, unique Int64, two
+primitive keys, unique Text, and wide unique by -21.7%, -29.3%, -29.7%, -38.7%,
+-4.2%, and -26.4%. The much smaller unique-Text change relative to the cheap
+primitive shapes supports the intended fixed-second-hash attribution, but the
+wide result and unrelated controls ranging from -33.1% to +151.1% demonstrate
+substantial machine/code-layout variance. The structural removal is therefore
+authoritative; no stable throughput claim or timing gate is added.
+
+Phase 61 should isolate selective owned-row bookkeeping. The grouped batch path
+still drains every hit row into owned-row machinery even when no group-key or
+MIN/MAX ownership transfer is needed. Aggregate Text comparison and generic
+Filter position prebinding remain later focused candidates; typed
+column-oriented batches, batch HashJoin, Sort/Top-N, and index/range/partition
+batch sources remain unselected.

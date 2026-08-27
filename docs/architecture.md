@@ -1110,6 +1110,34 @@ fallback and clones a miss key because it does not own the input row. Hashing,
 collision chains, exact equality, NULL grouping, first-seen order, and the
 precomputed Phase 58 probe hash are unchanged.
 
+Phase 60 removes the redundant second randomized hash of that precomputed
+group hash without changing the group-key or ownership paths:
+
+```text
+SQL group-key values
+        ↓
+RandomState keyed hash (key width + ordered ScalarValues)
+        ↓
+opaque u64 prehash
+        ↓
+pass-through executor-private bucket map
+        ↓
+group-index collision chain
+        ↓
+exact GroupState.key_values equality
+```
+
+The pass-through bucket hasher is not the user-data hash. User-controlled group
+values are still hashed by `RandomState` first; the internal map receives only
+the resulting keyed, randomized `u64`. A private key wrapper explicitly invokes
+`Hasher::write_u64`, and its private hasher returns that value unchanged for
+bucket indexing. Unsupported generic byte hashing is an internal programming
+error rather than a second generic hash implementation. Equal prehashes remain
+candidate metadata only: the collision chain and authoritative exact
+`ScalarValue` comparison still distinguish SQL groups. `Vec<GroupState>` still
+defines first-seen order, including NULL and multi-key groups, and the Phase 59
+probe-to-register path reuses its already computed prehash on a miss.
+
 Exact standalone Filter and predicate-only Project/Filter shapes retain the
 measured borrowed Phase 7 streaming specializations for every scalar type,
 avoiding owned values for rejected rows; Filter pipelines with Limit use the
