@@ -12,7 +12,9 @@ use netbadb_core::{
     Database, DatabaseCoordinatorConfig, ExecutionResult, PartitionCatalogConfig, QueryResult,
     RangePartitionSpec, TablePlacementSpec, TableStorageCreateSpec,
 };
-use netbadb_inspect::{PlanNodeInspection, StatementInspection, StatementPlanInspection};
+use netbadb_inspect::{
+    PartitionAccessInspection, PlanNodeInspection, StatementInspection, StatementPlanInspection,
+};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::HeapStorage;
 use netbadb_types::{ColumnId, PartitionId, PhysicalType, RowId, ScalarValue, TableId};
@@ -28,6 +30,7 @@ const ACTIVE_COLUMN_ID: ColumnId = ColumnId(5);
 const PAYLOAD_COLUMN_ID: ColumnId = ColumnId(6);
 const LEFT_TABLE_ID: TableId = TableId(11);
 const RIGHT_TABLE_ID: TableId = TableId(12);
+const PARTITIONED_ITEMS_TABLE_ID: TableId = TableId(70);
 const CHECKSUM_FACTOR: u128 = 1_000_003;
 
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -74,6 +77,7 @@ impl BenchProfile {
                 join_iterations: 3,
                 phase65_probe_rows: 4_096,
                 phase65_build_rows: 64,
+                phase66_partition_rows: 1_024,
                 update_rows: 100,
             },
             Self::Full => ProfileSettings {
@@ -88,6 +92,7 @@ impl BenchProfile {
                 join_iterations: 5,
                 phase65_probe_rows: 16_384,
                 phase65_build_rows: 256,
+                phase66_partition_rows: 2_048,
                 update_rows: 500,
             },
         }
@@ -107,6 +112,7 @@ struct ProfileSettings {
     join_iterations: usize,
     phase65_probe_rows: u64,
     phase65_build_rows: u64,
+    phase66_partition_rows: u64,
     update_rows: u64,
 }
 
@@ -302,6 +308,7 @@ fn main() -> BenchResult<()> {
     run_insert_scenarios(settings, &mut measurements)?;
     run_update_scenario(settings, &mut measurements)?;
     run_planner_scenario(settings, &mut measurements)?;
+    run_phase66_partitioned_scenarios(settings, &mut measurements)?;
     run_partition_correctness_scenarios()?;
     run_lsm_correctness_scenarios(settings, &mut measurements)?;
 
@@ -719,6 +726,283 @@ fn run_lsm_correctness_scenarios(
     });
     database.close()?;
     mixed.cleanup()
+}
+
+fn run_phase66_partitioned_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let rows = settings.phase66_partition_rows;
+    for partition_count in [1_usize, 2, 4, 8] {
+        let fixture_name = format!("phase66-partitioned-p{partition_count}");
+        let (mut database, paths) =
+            partitioned_items_fixture(&fixture_name, rows, partition_count)?;
+        let all_ids = (0..rows).collect::<Vec<_>>();
+        measure_phase66_partition_query(
+            &mut database,
+            &format!("partition_full_projection_p{partition_count}"),
+            rows,
+            partition_count,
+            "SELECT id FROM partitioned_items",
+            &[Operator::Project, Operator::SeqScan],
+            expected_ids_observation(&all_ids)?,
+            settings,
+            |result| ordered_ids_observation(result, &all_ids),
+            measurements,
+        )?;
+
+        if partition_count == 4 {
+            let limited_ids = (0..rows.min(20)).collect::<Vec<_>>();
+            measure_phase66_partition_query(
+                &mut database,
+                "partition_limit_20",
+                rows,
+                partition_count,
+                "SELECT id FROM partitioned_items LIMIT 20",
+                &[Operator::Limit, Operator::Project, Operator::SeqScan],
+                expected_ids_observation(&limited_ids)?,
+                settings,
+                |result| ordered_ids_observation(result, &limited_ids),
+                measurements,
+            )?;
+            measure_phase66_partition_query(
+                &mut database,
+                "partition_sum",
+                rows,
+                partition_count,
+                "SELECT SUM(id) FROM partitioned_items",
+                &[Operator::Aggregate, Operator::SeqScan],
+                Observation {
+                    rows: 1,
+                    checksum: arithmetic_sum(rows),
+                },
+                settings,
+                sum_observation,
+                measurements,
+            )?;
+            measure_phase66_partition_query(
+                &mut database,
+                "partition_grouped_count",
+                rows,
+                partition_count,
+                "SELECT team_id, COUNT(*) FROM partitioned_items GROUP BY team_id",
+                &[Operator::Aggregate, Operator::SeqScan],
+                expected_groups(rows, 4),
+                settings,
+                group_observation,
+                measurements,
+            )?;
+
+            let mut top_n_ids = (0..rows).collect::<Vec<_>>();
+            top_n_ids.sort_by_key(|id| (id % 4, *id));
+            top_n_ids.truncate(usize::try_from(rows.min(20))?);
+            measure_phase66_partition_query(
+                &mut database,
+                "partition_top_n_20",
+                rows,
+                partition_count,
+                "SELECT id FROM partitioned_items ORDER BY team_id, id LIMIT 20",
+                &[
+                    Operator::Limit,
+                    Operator::Project,
+                    Operator::Sort,
+                    Operator::SeqScan,
+                ],
+                expected_ids_observation(&top_n_ids)?,
+                settings,
+                |result| ordered_ids_observation(result, &top_n_ids),
+                measurements,
+            )?;
+
+            let filtered_ids = (0..rows)
+                .filter(|id| id % 3 == 0)
+                .take(20)
+                .collect::<Vec<_>>();
+            measure_phase66_partition_query(
+                &mut database,
+                "partition_filter_limit_20",
+                rows,
+                partition_count,
+                "SELECT id FROM partitioned_items WHERE active = true LIMIT 20",
+                &[
+                    Operator::Limit,
+                    Operator::Project,
+                    Operator::Filter,
+                    Operator::SeqScan,
+                ],
+                expected_ids_observation(&filtered_ids)?,
+                settings,
+                |result| ordered_ids_observation(result, &filtered_ids),
+                measurements,
+            )?;
+        }
+        database.close()?;
+        paths.cleanup()?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_phase66_partition_query(
+    database: &mut Database,
+    scenario: &str,
+    source_rows: u64,
+    expected_partitions: usize,
+    sql: &str,
+    required: &[Operator],
+    expected: Observation,
+    settings: ProfileSettings,
+    observe: impl FnMut(&QueryResult) -> BenchResult<Observation>,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    for operator in required {
+        if !contains_operator(root, *operator) {
+            return Err(message_error(format!(
+                "scenario `{scenario}` plan is missing required operator {}: {}",
+                operator.name(),
+                plan_label(root)
+            )));
+        }
+    }
+    let partitions = partitioned_scan_partitions(root)
+        .ok_or_else(|| message_error(format!("scenario `{scenario}` is not PartitionedScan")))?;
+    if partitions.len() != expected_partitions {
+        return Err(message_error(format!(
+            "scenario `{scenario}` selected {} partitions; expected {expected_partitions}",
+            partitions.len()
+        )));
+    }
+    if partitions
+        .iter()
+        .any(|partition| !matches!(partition.access, PartitionAccessInspection::SeqScan))
+    {
+        return Err(message_error(format!(
+            "scenario `{scenario}` did not select all-SeqScan partition access: {partitions:?}"
+        )));
+    }
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        observe,
+    )?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: format!("{source_rows}/p{expected_partitions}"),
+        plan: format!(
+            "{} [PartitionedScan partitions={expected_partitions} access=all-SeqScan]",
+            plan_label(root)
+        ),
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+fn partitioned_scan_partitions(
+    plan: &PlanNodeInspection,
+) -> Option<&[netbadb_inspect::PartitionScanInspection]> {
+    match plan {
+        PlanNodeInspection::PartitionedScan { partitions, .. } => Some(partitions),
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => partitioned_scan_partitions(input),
+        PlanNodeInspection::NestedLoopJoin { .. }
+        | PlanNodeInspection::HashJoin { .. }
+        | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. } => None,
+    }
+}
+
+fn partitioned_items_fixture(
+    scenario: &str,
+    rows: u64,
+    partition_count: usize,
+) -> BenchResult<(Database, FixturePaths)> {
+    let paths = FixturePaths::new(scenario, partition_count + 2);
+    let partition_count_u64 = u64::try_from(partition_count)?;
+    let partitions = (0..partition_count)
+        .map(|position| {
+            let position_u64 = u64::try_from(position)?;
+            let next_position_u64 = position_u64
+                .checked_add(1)
+                .ok_or_else(|| message_error("partition position overflow"))?;
+            let lower = if position == 0 {
+                None
+            } else {
+                Some(ScalarValue::Int64(i64::try_from(
+                    rows.checked_mul(position_u64)
+                        .ok_or_else(|| message_error("partition lower bound overflow"))?
+                        / partition_count_u64,
+                )?))
+            };
+            let upper = if position + 1 == partition_count {
+                None
+            } else {
+                Some(ScalarValue::Int64(i64::try_from(
+                    rows.checked_mul(next_position_u64)
+                        .ok_or_else(|| message_error("partition upper bound overflow"))?
+                        / partition_count_u64,
+                )?))
+            };
+            Ok(RangePartitionSpec::new(
+                PartitionId(u64::try_from(position + 1)?),
+                paths.path(position),
+                lower,
+                upper,
+            ))
+        })
+        .collect::<BenchResult<Vec<_>>>()?;
+    let config =
+        PartitionCatalogConfig::new(paths.path(partition_count), paths.path(partition_count + 1));
+    let placements = vec![TablePlacementSpec::range_partitioned(
+        partitioned_items_table(),
+        ID_COLUMN_ID,
+        partitions,
+    )];
+    let mut database = Database::create_with_placements(placements, config)?;
+    let mut transaction = database.begin_transaction_for(PARTITIONED_ITEMS_TABLE_ID)?;
+    for id in 0..rows {
+        let id_value = i64::try_from(id)?;
+        database.insert_into_in(
+            PARTITIONED_ITEMS_TABLE_ID,
+            &mut transaction,
+            &[
+                ScalarValue::Int64(id_value),
+                ScalarValue::Int64(i64::try_from(id % 4)?),
+                ScalarValue::Bool(id % 3 == 0),
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok((database, paths))
+}
+
+fn partitioned_items_table() -> TableDef {
+    TableDef::new(
+        PARTITIONED_ITEMS_TABLE_ID,
+        "partitioned_items",
+        vec![
+            ColumnDef::new(ID_COLUMN_ID, "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                TEAM_COLUMN_ID,
+                "team_id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            ),
+            ColumnDef::new(
+                ACTIVE_COLUMN_ID,
+                "active",
+                TypeSpec::Physical(PhysicalType::Bool),
+            ),
+        ],
+    )
 }
 
 fn run_partition_correctness_scenarios() -> BenchResult<()> {
@@ -2496,7 +2780,114 @@ fn run_point_and_shape_scenarios(
         settings,
         measurements,
     )?;
+    run_phase66_range_attribution(settings, measurements)?;
     Ok(())
+}
+
+fn run_phase66_range_attribution(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let rows = settings.medium_rows;
+    let (mut database, paths) = items_fixture(
+        "phase66-range-attribution",
+        rows,
+        &[ID_COLUMN_ID],
+        NullDistribution::Low,
+        4,
+    )?;
+    let start = rows / 3;
+    for requested_rows in [1_u64, 20, 255, 256, 257] {
+        let end = start
+            .checked_add(requested_rows)
+            .ok_or_else(|| message_error("range attribution endpoint overflow"))?;
+        if end > rows {
+            continue;
+        }
+        let scenario = format!("range_cardinality_{requested_rows}");
+        let sql = format!("SELECT id FROM items WHERE id >= {start} AND id < {end}");
+        let plan = inspect_range_attribution_plan(&database, &scenario, &sql, requested_rows)?;
+        let expected = expected_range_ids(start, end);
+        let durations = measure_checked(
+            &scenario,
+            settings.query_warmup,
+            settings.query_iterations,
+            expected,
+            || database.query(&sql).map_err(Into::into),
+            ids_observation,
+        )?;
+        measurements.push(Measurement {
+            scenario,
+            rows: requested_rows.to_string(),
+            plan,
+            operations_per_iteration: 1,
+            durations,
+        });
+    }
+
+    let aggregate_rows = 257_u64.min(rows.saturating_sub(start));
+    if aggregate_rows > 0 {
+        let end = start
+            .checked_add(aggregate_rows)
+            .ok_or_else(|| message_error("range aggregate endpoint overflow"))?;
+        let scenario = "range_aggregate_cardinality_257";
+        let sql = format!("SELECT SUM(id) FROM items WHERE id >= {start} AND id < {end}");
+        let plan = inspect_range_attribution_plan(&database, scenario, &sql, aggregate_rows)?;
+        let expected = Observation {
+            rows: 1,
+            checksum: arithmetic_sum(end) - arithmetic_sum(start),
+        };
+        let durations = measure_checked(
+            scenario,
+            settings.query_warmup,
+            settings.query_iterations,
+            expected,
+            || database.query(&sql).map_err(Into::into),
+            sum_observation,
+        )?;
+        measurements.push(Measurement {
+            scenario: scenario.to_owned(),
+            rows: aggregate_rows.to_string(),
+            plan,
+            operations_per_iteration: 1,
+            durations,
+        });
+    }
+    database.close()?;
+    paths.cleanup()
+}
+
+fn inspect_range_attribution_plan(
+    database: &Database,
+    scenario: &str,
+    sql: &str,
+    expected_rows: u64,
+) -> BenchResult<String> {
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    if !contains_operator(root, Operator::Filter) {
+        return Err(message_error(format!(
+            "scenario `{scenario}` is missing its residual Filter: {}",
+            plan_label(root)
+        )));
+    }
+    let range = contains_operator(root, Operator::RangeIndexScan);
+    let sequence = contains_operator(root, Operator::SeqScan);
+    if range == sequence || contains_operator(root, Operator::IndexScan) {
+        return Err(message_error(format!(
+            "scenario `{scenario}` expected exactly one RangeIndexScan/SeqScan source: {}",
+            plan_label(root)
+        )));
+    }
+    let access = if range {
+        "RangeIndexScan"
+    } else {
+        "SeqScan transition"
+    };
+    Ok(format!(
+        "{} [planned result rows={expected_rows} access={access}]",
+        plan_label(root)
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

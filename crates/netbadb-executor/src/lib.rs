@@ -8,7 +8,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::ControlFlow;
 
-use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
+use netbadb_planner::{PartitionAccessPlan, PartitionScanPlan, PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, Expr, ExprKind, JoinKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
@@ -438,6 +438,15 @@ struct StreamingHashJoinStats {
     output_rows: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PartitionedBatchStats {
+    partitions_visited: usize,
+    rows_seen: usize,
+    batches_delivered: usize,
+    max_batch_rows: usize,
+}
+
 impl ExecutionBatch {
     fn with_capacity() -> Self {
         Self {
@@ -450,9 +459,20 @@ impl ExecutionBatch {
     }
 }
 
+enum BatchSource<'a> {
+    SeqScan {
+        table_id: TableId,
+        columns: Vec<ColumnId>,
+    },
+    PartitionedSeqScan {
+        table_id: TableId,
+        columns: Vec<ColumnId>,
+        partitions: &'a [PartitionScanPlan],
+    },
+}
+
 struct BatchPipeline<'a> {
-    table_id: TableId,
-    scan_columns: Vec<ColumnId>,
+    source: BatchSource<'a>,
     fields: Vec<OutputField>,
     operators: Vec<BatchOperator<'a>>,
 }
@@ -870,11 +890,35 @@ fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>
         PhysicalPlan::SeqScan {
             table_id, columns, ..
         } => Ok(Some(BatchPipeline {
-            table_id: *table_id,
-            scan_columns: columns.iter().map(|column| column.column_id).collect(),
+            source: BatchSource::SeqScan {
+                table_id: *table_id,
+                columns: columns.iter().map(|column| column.column_id).collect(),
+            },
             fields: columns.iter().cloned().map(OutputField::Source).collect(),
             operators: Vec::new(),
         })),
+        PhysicalPlan::PartitionedScan {
+            table_id,
+            columns,
+            partitions,
+            ..
+        } => {
+            if partitions
+                .iter()
+                .any(|partition| !matches!(partition.access, PartitionAccessPlan::SeqScan))
+            {
+                return Ok(None);
+            }
+            Ok(Some(BatchPipeline {
+                source: BatchSource::PartitionedSeqScan {
+                    table_id: *table_id,
+                    columns: columns.iter().map(|column| column.column_id).collect(),
+                    partitions,
+                },
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
+                operators: Vec::new(),
+            }))
+        }
         PhysicalPlan::Filter { input, predicate } => {
             let Some(mut pipeline) = build_batch_pipeline(input)? else {
                 return Ok(None);
@@ -907,7 +951,6 @@ fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>
         }
         PhysicalPlan::IndexScan { .. }
         | PhysicalPlan::RangeIndexScan { .. }
-        | PhysicalPlan::PartitionedScan { .. }
         | PhysicalPlan::NestedLoopJoin { .. }
         | PhysicalPlan::HashJoin { .. }
         | PhysicalPlan::Sort { .. }
@@ -940,55 +983,179 @@ fn visit_batch_pipeline<F>(
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
+    consumer: F,
+) -> Result<ControlFlow<()>, ExecutionError>
+where
+    F: FnMut(&mut ExecutionBatch) -> Result<ControlFlow<()>, ExecutionError>,
+{
+    visit_batch_pipeline_with_stats(
+        pipeline,
+        bindings,
+        storages,
+        read_views,
+        #[cfg(test)]
+        None,
+        consumer,
+    )
+}
+
+fn visit_batch_pipeline_with_stats<F>(
+    pipeline: &mut BatchPipeline<'_>,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    #[cfg(test)] mut stats: Option<&mut PartitionedBatchStats>,
     mut consumer: F,
 ) -> Result<ControlFlow<()>, ExecutionError>
 where
     F: FnMut(&mut ExecutionBatch) -> Result<ControlFlow<()>, ExecutionError>,
 {
-    let view = read_view_for_table(bindings, read_views, pipeline.table_id)?;
-    let storage = storage_for_table(bindings, storages, pipeline.table_id)?;
     if pipeline
         .operators
         .iter()
         .any(|operator| matches!(operator, BatchOperator::Limit { remaining: 0 }))
     {
+        match &pipeline.source {
+            BatchSource::SeqScan { table_id, .. } => {
+                read_view_for_table(bindings, read_views, *table_id)?;
+                storage_for_table(bindings, storages, *table_id)?;
+            }
+            BatchSource::PartitionedSeqScan {
+                table_id,
+                partitions,
+                ..
+            } => {
+                for partition in *partitions {
+                    read_view_for_storage(read_views, partition.storage_id)?;
+                    let storage = storage_for_id(storages, partition.storage_id)?;
+                    ensure_table(*table_id, storage)?;
+                }
+            }
+        }
         return Ok(ControlFlow::Continue(()));
     }
 
     let mut batch = ExecutionBatch::with_capacity();
     let batch_capacity = batch_input_capacity(&pipeline.operators);
     let mut pending_operator_error = None;
-    let flow = storage.visit_rows_with_view_control::<ExecutionError, _>(
-        &pipeline.scan_columns,
-        view,
-        |row_id, values| {
-            if pending_operator_error.is_some() {
-                return Ok(ControlFlow::Continue(()));
-            }
-            batch.rows.push(ExecutionRow {
-                row_id: Some(row_id),
-                values,
-            });
-            if !batch.is_full_at(batch_capacity) {
-                return Ok(ControlFlow::Continue(()));
-            }
-            match deliver_execution_batch(&mut batch, &mut pipeline.operators, &mut consumer) {
-                Ok(flow) => Ok(flow),
-                Err(error) => {
-                    pending_operator_error = Some(error);
-                    batch.rows.clear();
-                    Ok(ControlFlow::Continue(()))
+    let flow = match &pipeline.source {
+        BatchSource::SeqScan { table_id, columns } => {
+            let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage = storage_for_table(bindings, storages, *table_id)?;
+            visit_batch_storage(
+                storage,
+                columns,
+                view,
+                BatchStorageState {
+                    batch: &mut batch,
+                    capacity: batch_capacity,
+                    #[cfg(test)]
+                    stats: None,
+                },
+                &mut pipeline.operators,
+                &mut consumer,
+                &mut pending_operator_error,
+            )?
+        }
+        BatchSource::PartitionedSeqScan {
+            table_id,
+            columns,
+            partitions,
+        } => {
+            let mut flow = ControlFlow::Continue(());
+            for partition in *partitions {
+                #[cfg(test)]
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.partitions_visited += 1;
+                }
+                let view = read_view_for_storage(read_views, partition.storage_id)?;
+                let storage = storage_for_id(storages, partition.storage_id)?;
+                ensure_table(*table_id, storage)?;
+                flow = visit_batch_storage(
+                    storage,
+                    columns,
+                    view,
+                    BatchStorageState {
+                        batch: &mut batch,
+                        capacity: batch_capacity,
+                        #[cfg(test)]
+                        stats: stats.as_deref_mut(),
+                    },
+                    &mut pipeline.operators,
+                    &mut consumer,
+                    &mut pending_operator_error,
+                )?;
+                if pending_operator_error.is_some() || flow.is_break() {
+                    break;
                 }
             }
-        },
-    )?;
+            flow
+        }
+    };
     if let Some(error) = pending_operator_error {
         return Err(error);
     }
     if flow.is_continue() && !batch.rows.is_empty() {
+        #[cfg(test)]
+        if let Some(stats) = stats {
+            stats.batches_delivered += 1;
+            stats.max_batch_rows = stats.max_batch_rows.max(batch.rows.len());
+        }
         return deliver_execution_batch(&mut batch, &mut pipeline.operators, &mut consumer);
     }
     Ok(flow)
+}
+
+struct BatchStorageState<'a> {
+    batch: &'a mut ExecutionBatch,
+    capacity: usize,
+    #[cfg(test)]
+    stats: Option<&'a mut PartitionedBatchStats>,
+}
+
+fn visit_batch_storage<F>(
+    storage: &mut TableStorage,
+    columns: &[ColumnId],
+    view: &StorageReadView,
+    state: BatchStorageState<'_>,
+    operators: &mut [BatchOperator<'_>],
+    consumer: &mut F,
+    pending_operator_error: &mut Option<ExecutionError>,
+) -> Result<ControlFlow<()>, ExecutionError>
+where
+    F: FnMut(&mut ExecutionBatch) -> Result<ControlFlow<()>, ExecutionError>,
+{
+    #[cfg(test)]
+    let mut state = state;
+    storage.visit_rows_with_view_control::<ExecutionError, _>(columns, view, |row_id, values| {
+        #[cfg(test)]
+        if let Some(stats) = state.stats.as_deref_mut() {
+            stats.rows_seen += 1;
+        }
+        if pending_operator_error.is_some() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        state.batch.rows.push(ExecutionRow {
+            row_id: Some(row_id),
+            values,
+        });
+        if !state.batch.is_full_at(state.capacity) {
+            return Ok(ControlFlow::Continue(()));
+        }
+        #[cfg(test)]
+        if let Some(stats) = state.stats.as_deref_mut() {
+            stats.batches_delivered += 1;
+            stats.max_batch_rows = stats.max_batch_rows.max(state.batch.rows.len());
+        }
+        match deliver_execution_batch(state.batch, operators, consumer) {
+            Ok(flow) => Ok(flow),
+            Err(error) => {
+                *pending_operator_error = Some(error);
+                state.batch.rows.clear();
+                Ok(ControlFlow::Continue(()))
+            }
+        }
+    })
 }
 
 fn batch_input_capacity(operators: &[BatchOperator<'_>]) -> usize {
@@ -4685,26 +4852,28 @@ mod tests {
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
         ExecutionRow, ExecutionStorage, FilteredCountSummary, GroupLookup, GroupState,
-        InequalityExecutionStrategy, PrehashedBuildHasher, PrehashedKey, ProjectionPlan,
-        QueryResult, StreamingHashJoinStats, TopNState, TruthValue, bind_expression,
-        build_batch_pipeline, build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
-        collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
-        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
-        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
-        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
-        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
-        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
-        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
-        execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
-        find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
+        InequalityExecutionStrategy, PartitionedBatchStats, PrehashedBuildHasher, PrehashedKey,
+        ProjectionPlan, QueryResult, StreamingHashJoinStats, TopNState, TruthValue,
+        bind_expression, build_batch_pipeline, build_top_n_plan, choose_inequality_strategy,
+        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
+        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
+        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
+        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
+        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
+        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
+        execute_with_storages, filtered_count_eligibility, find_required_inequality,
+        hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme,
         sorted_non_null_indices, streaming_seq_filter_eligibility,
         try_execute_streaming_hash_join_probe, update_filtered_count_summary, visit_batch_pipeline,
+        visit_batch_pipeline_with_stats,
     };
     use netbadb_planner::{
-        AccessPath, AccessPathCapabilities, PhysicalPlan, TableAccessStatistics, plan,
-        plan_with_statistics,
+        AccessPath, AccessPathCapabilities, PartitionAccessPlan, PartitionScanPlan, PhysicalPlan,
+        TableAccessStatistics, plan, plan_with_statistics,
     };
     use netbadb_rel::{
         AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, BinaryOp, ColumnRef,
@@ -4716,8 +4885,8 @@ mod tests {
         IndexStatistics, PresenceCountSummary, StorageRowHandle, TableStatistics, TableStorage,
     };
     use netbadb_types::{
-        ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, SemanticType,
-        TableId,
+        ColumnId, ExprType, PartitionId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue,
+        SemanticType, StorageId, TableId,
     };
 
     fn text_pointer(value: &ScalarValue) -> *const u8 {
@@ -5139,6 +5308,149 @@ mod tests {
             transaction.commit().expect("commit batch load");
         }
         (storage, path)
+    }
+
+    fn partitioned_batch_storage(
+        case: &str,
+        partition: usize,
+        lsm: bool,
+        start: usize,
+        rows: usize,
+    ) -> (TableStorage, std::path::PathBuf) {
+        let path = batch_test_path(&format!("partitioned-{case}-{partition}"), lsm);
+        remove_batch_test_path(&path, lsm);
+        let mut storage = if lsm {
+            TableStorage::create_lsm(&path, batch_table(), ColumnId(1))
+                .expect("create partitioned batch LSM")
+        } else {
+            TableStorage::create_heap(&path, batch_table()).expect("create partitioned batch Heap")
+        };
+        if rows != 0 {
+            let mut transaction = storage
+                .begin_transaction()
+                .expect("begin partitioned batch load");
+            for offset in 0..rows {
+                let index = start + offset;
+                let id = i64::try_from(index).expect("partitioned batch row ID fits i64");
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::Int64(id),
+                            ScalarValue::UInt64((index % 7) as u64),
+                            ScalarValue::Bool(index % 3 == 0),
+                            ScalarValue::Text(format!("group-{}", index % 5)),
+                            if index % 4 == 0 {
+                                ScalarValue::Null
+                            } else {
+                                ScalarValue::Int64(id)
+                            },
+                        ],
+                    )
+                    .expect("insert partitioned batch row");
+            }
+            transaction.commit().expect("commit partitioned batch load");
+        }
+        (storage, path)
+    }
+
+    fn partitioned_batch_scan(
+        columns: Vec<ColumnRef>,
+        accesses: Vec<PartitionAccessPlan>,
+    ) -> PhysicalPlan {
+        let total_partitions = accesses.len();
+        PhysicalPlan::PartitionedScan {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(55),
+            table_name: "batch_items".into(),
+            columns,
+            partition_key: ColumnId(1),
+            total_partitions,
+            partitions: accesses
+                .into_iter()
+                .enumerate()
+                .map(|(position, access)| PartitionScanPlan {
+                    partition_id: PartitionId(
+                        u64::try_from(position + 1).expect("partition position fits u64"),
+                    ),
+                    storage_id: StorageId(
+                        u64::try_from(position + 1).expect("storage position fits u64"),
+                    ),
+                    access,
+                })
+                .collect(),
+        }
+    }
+
+    fn visit_partitioned_plan_with_stats<F>(
+        plan: &PhysicalPlan,
+        storages: &mut [TableStorage],
+        stats: &mut PartitionedBatchStats,
+        consumer: F,
+    ) -> Result<ControlFlow<()>, ExecutionError>
+    where
+        F: FnMut(&mut ExecutionBatch) -> Result<ControlFlow<()>, ExecutionError>,
+    {
+        let views = storages
+            .iter()
+            .map(TableStorage::read_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        let bindings = compatibility_bindings(storages)?;
+        let mut execution_storages = storages
+            .iter_mut()
+            .zip(&bindings)
+            .map(|(storage, binding)| ExecutionStorage {
+                storage_id: binding.storage_id,
+                storage,
+            })
+            .collect::<Vec<_>>();
+        let execution_views = views
+            .iter()
+            .zip(&bindings)
+            .map(|(view, binding)| ExecutionReadView {
+                storage_id: binding.storage_id,
+                view,
+            })
+            .collect::<Vec<_>>();
+        let mut pipeline = build_batch_pipeline(plan)?.ok_or(ExecutionError::TypeMismatch)?;
+        visit_batch_pipeline_with_stats(
+            &mut pipeline,
+            &bindings,
+            &mut execution_storages,
+            &execution_views,
+            Some(stats),
+            consumer,
+        )
+    }
+
+    fn close_partitioned_batch_storages(
+        storages: Vec<TableStorage>,
+        paths: Vec<(std::path::PathBuf, bool)>,
+    ) {
+        for storage in storages {
+            storage.close().expect("close partitioned batch storage");
+        }
+        for (path, lsm) in paths {
+            remove_batch_test_path(&path, lsm);
+        }
+    }
+
+    fn partitioned_batch_storages(
+        case: &str,
+        sizes: &[usize],
+        engines: &[bool],
+    ) -> (Vec<TableStorage>, Vec<(std::path::PathBuf, bool)>) {
+        assert_eq!(sizes.len(), engines.len());
+        let mut start = 0;
+        let mut storages = Vec::with_capacity(sizes.len());
+        let mut paths = Vec::with_capacity(sizes.len());
+        for (partition, (&rows, &lsm)) in sizes.iter().zip(engines).enumerate() {
+            let (storage, path) = partitioned_batch_storage(case, partition, lsm, start, rows);
+            storages.push(storage);
+            paths.push((path, lsm));
+            start += rows;
+        }
+        (storages, paths)
     }
 
     fn assert_batch_matches_legacy(plan: &PhysicalPlan, storage: &mut TableStorage) {
@@ -6405,6 +6717,447 @@ mod tests {
             storage.close().expect("close cardinality Heap");
             remove_batch_test_path(&path, false);
         }
+    }
+
+    #[test]
+    fn partitioned_seq_scan_batches_cross_partitions_and_match_legacy_boundaries() {
+        let columns = batch_columns();
+        let cases = [
+            ("p4-0", vec![0, 0, 0, 0], vec![false; 4]),
+            ("p1-255", vec![255], vec![false]),
+            ("p2-256", vec![1, 255], vec![false, true]),
+            ("p4-257", vec![0, 1, 100, 156], vec![false; 4]),
+            (
+                "p8-512",
+                vec![0, 1, 63, 64, 64, 64, 128, 128],
+                vec![false; 8],
+            ),
+            ("p4-513", vec![100, 100, 100, 213], vec![false; 4]),
+        ];
+        for (case, sizes, engines) in cases {
+            let total = sizes.iter().sum::<usize>();
+            let (mut storages, paths) = partitioned_batch_storages(case, &sizes, &engines);
+            let plan = partitioned_batch_scan(
+                vec![columns[0].clone()],
+                (0..sizes.len())
+                    .map(|_| PartitionAccessPlan::SeqScan)
+                    .collect(),
+            );
+            assert!(
+                build_batch_pipeline(&plan)
+                    .expect("build partitioned batch pipeline")
+                    .is_some()
+            );
+            let batch = execute_rows(&plan, &mut storages).expect("execute partitioned batch");
+            let legacy =
+                execute_rows_legacy(&plan, &mut storages).expect("execute partitioned legacy");
+            assert_eq!(batch, legacy);
+            assert_eq!(batch.rows.len(), total);
+            for (expected, row) in batch.rows.iter().enumerate() {
+                assert_eq!(
+                    row.values,
+                    [ScalarValue::Int64(
+                        i64::try_from(expected).expect("expected ID fits i64")
+                    )]
+                );
+            }
+
+            let mut stats = PartitionedBatchStats::default();
+            let mut batch_sizes = Vec::new();
+            let flow =
+                visit_partitioned_plan_with_stats(&plan, &mut storages, &mut stats, |batch| {
+                    batch_sizes.push(batch.rows.len());
+                    Ok(ControlFlow::Continue(()))
+                })
+                .expect("visit partitioned batches");
+            assert_eq!(flow, ControlFlow::Continue(()));
+            assert_eq!(stats.partitions_visited, sizes.len());
+            assert_eq!(stats.rows_seen, total);
+            assert_eq!(
+                stats.batches_delivered,
+                total.div_ceil(EXECUTION_BATCH_CAPACITY)
+            );
+            assert_eq!(stats.max_batch_rows, total.min(EXECUTION_BATCH_CAPACITY));
+            assert_eq!(
+                batch_sizes,
+                (0..total)
+                    .step_by(EXECUTION_BATCH_CAPACITY)
+                    .map(|start| (total - start).min(EXECUTION_BATCH_CAPACITY))
+                    .collect::<Vec<_>>()
+            );
+            if total == 513 {
+                assert_eq!(batch_sizes, [256, 256, 1]);
+                assert_eq!(stats.rows_seen, 513);
+                assert_eq!(stats.max_batch_rows, 256);
+            }
+            close_partitioned_batch_storages(storages, paths);
+        }
+    }
+
+    #[test]
+    fn partitioned_limit_break_skips_later_partitions_and_preserves_first_rows() {
+        let columns = batch_columns();
+        let sizes = [100, 100, 100, 100];
+        let (mut storages, paths) = partitioned_batch_storages("limit-break", &sizes, &[false; 4]);
+        let scan = partitioned_batch_scan(
+            columns.clone(),
+            (0..sizes.len())
+                .map(|_| PartitionAccessPlan::SeqScan)
+                .collect(),
+        );
+        let plan = batch_limit(batch_project(scan, vec![columns[0].clone()]), 20);
+        let batch = execute_rows(&plan, &mut storages).expect("execute partitioned Limit batch");
+        let legacy =
+            execute_rows_legacy(&plan, &mut storages).expect("execute partitioned Limit legacy");
+        assert_eq!(batch, legacy);
+        assert_eq!(batch.rows.len(), 20);
+        assert_eq!(
+            batch
+                .rows
+                .iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            (0..20).map(ScalarValue::Int64).collect::<Vec<_>>()
+        );
+
+        let mut stats = PartitionedBatchStats::default();
+        let mut delivered = Vec::new();
+        let flow = visit_partitioned_plan_with_stats(&plan, &mut storages, &mut stats, |batch| {
+            delivered.push(batch.rows.len());
+            Ok(ControlFlow::Continue(()))
+        })
+        .expect("visit partitioned Limit");
+        assert_eq!(flow, ControlFlow::Break(()));
+        assert_eq!(delivered, [20]);
+        assert_eq!(stats.partitions_visited, 1);
+        assert_eq!(stats.rows_seen, 20);
+        assert_eq!(stats.batches_delivered, 1);
+        assert_eq!(stats.max_batch_rows, 20);
+
+        let mut malformed_scan = partitioned_batch_scan(
+            vec![columns[0].clone()],
+            (0..sizes.len())
+                .map(|_| PartitionAccessPlan::SeqScan)
+                .collect(),
+        );
+        let PhysicalPlan::PartitionedScan { table_id, .. } = &mut malformed_scan else {
+            unreachable!("helper must build PartitionedScan")
+        };
+        *table_id = TableId(999);
+        assert!(matches!(
+            execute_rows(&batch_limit(malformed_scan, 0), &mut storages),
+            Err(ExecutionError::TableMismatch {
+                planned: TableId(999),
+                storage: TableId(55),
+            })
+        ));
+        close_partitioned_batch_storages(storages, paths);
+    }
+
+    #[test]
+    fn partitioned_batch_error_is_not_swallowed_or_repeated_across_partitions() {
+        let columns = batch_columns();
+        let sizes = [100, 100, 100, 100];
+        let (mut storages, paths) =
+            partitioned_batch_storages("pending-error", &sizes, &[false; 4]);
+        let scan = partitioned_batch_scan(
+            vec![columns[0].clone()],
+            (0..sizes.len())
+                .map(|_| PartitionAccessPlan::SeqScan)
+                .collect(),
+        );
+        let mut stats = PartitionedBatchStats::default();
+        let mut deliveries = 0;
+        assert!(matches!(
+            visit_partitioned_plan_with_stats(&scan, &mut storages, &mut stats, |_batch| {
+                deliveries += 1;
+                Err(ExecutionError::TypeMismatch)
+            },),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert_eq!(deliveries, 1);
+        assert_eq!(stats.partitions_visited, 3);
+        assert_eq!(stats.rows_seen, 300);
+        assert_eq!(stats.batches_delivered, 1);
+        assert_eq!(stats.max_batch_rows, 256);
+        close_partitioned_batch_storages(storages, paths);
+    }
+
+    #[test]
+    fn partitioned_aggregate_and_top_n_continue_through_every_partition() {
+        let columns = batch_columns();
+        let sizes = [0, 1, 255, 257];
+        let (mut storages, paths) =
+            partitioned_batch_storages("aggregate-top-n", &sizes, &[false, true, false, true]);
+        let scan = partitioned_batch_scan(
+            vec![columns[0].clone(), columns[1].clone()],
+            (0..sizes.len())
+                .map(|_| PartitionAccessPlan::SeqScan)
+                .collect(),
+        );
+        let sum_output = batch_aggregate_expression(
+            AggregateFunction::Sum,
+            AggregateInput::Column(columns[0].clone()),
+            "SUM(id)",
+            PhysicalType::Int64,
+            true,
+        );
+        let aggregate_plan = batch_aggregate(scan.clone(), Vec::new(), vec![sum_output.clone()]);
+        let batch =
+            execute_rows(&aggregate_plan, &mut storages).expect("execute partitioned Aggregate");
+        let legacy = execute_rows_legacy(&aggregate_plan, &mut storages)
+            .expect("execute legacy partitioned Aggregate");
+        assert_eq!(batch, legacy);
+
+        let input_fields = [
+            OutputField::Source(columns[0].clone()),
+            OutputField::Source(columns[1].clone()),
+        ];
+        let mut accumulator =
+            AggregateAccumulator::new(&input_fields, &[], std::slice::from_ref(&sum_output))
+                .expect("build partitioned SUM accumulator");
+        let mut aggregate_stats = PartitionedBatchStats::default();
+        let aggregate_flow = visit_partitioned_plan_with_stats(
+            &scan,
+            &mut storages,
+            &mut aggregate_stats,
+            |batch| {
+                accumulator.consume_batch(batch)?;
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .expect("stream partitioned SUM input");
+        assert_eq!(aggregate_flow, ControlFlow::Continue(()));
+        assert_eq!(aggregate_stats.partitions_visited, 4);
+        assert_eq!(aggregate_stats.rows_seen, 513);
+        assert_eq!(aggregate_stats.batches_delivered, 3);
+        assert_eq!(aggregate_stats.max_batch_rows, 256);
+        assert_eq!(
+            accumulator.finish().expect("finish partitioned SUM").rows[0].values,
+            [ScalarValue::Int64(131_328)]
+        );
+
+        let keys = [SortKey {
+            column: columns[1].clone(),
+            direction: SortDirection::Asc,
+            null_order: NullOrder::Last,
+        }];
+        let top_n_plan = batch_top_n(scan.clone(), keys.to_vec(), vec![columns[0].clone()], 20);
+        let batch = execute_rows(&top_n_plan, &mut storages).expect("execute partitioned Top-N");
+        let legacy = execute_rows_legacy(&top_n_plan, &mut storages)
+            .expect("execute legacy partitioned Top-N");
+        assert_eq!(batch, legacy);
+
+        let mut state = TopNState::new(20, &keys, &[1]);
+        let mut top_n_stats = PartitionedBatchStats::default();
+        let top_n_flow =
+            visit_partitioned_plan_with_stats(&scan, &mut storages, &mut top_n_stats, |batch| {
+                for row in batch.rows.drain(..) {
+                    state.consider(row)?;
+                }
+                Ok(ControlFlow::Continue(()))
+            })
+            .expect("stream partitioned Top-N input");
+        assert_eq!(top_n_flow, ControlFlow::Continue(()));
+        assert_eq!(top_n_stats.partitions_visited, 4);
+        assert_eq!(top_n_stats.rows_seen, 513);
+        assert_eq!(top_n_stats.batches_delivered, 3);
+        assert_eq!(top_n_stats.max_batch_rows, 256);
+        assert_eq!(
+            state
+                .into_sorted_rows()
+                .expect("finish partitioned Top-N")
+                .len(),
+            20
+        );
+        close_partitioned_batch_storages(storages, paths);
+    }
+
+    #[test]
+    fn partitioned_empty_input_preserves_aggregate_and_top_n_semantics() {
+        let columns = batch_columns();
+        let (mut storages, paths) =
+            partitioned_batch_storages("empty-consumers", &[0; 4], &[false; 4]);
+        let scan = partitioned_batch_scan(
+            vec![columns[0].clone(), columns[1].clone()],
+            (0..4).map(|_| PartitionAccessPlan::SeqScan).collect(),
+        );
+        let aggregate = batch_aggregate(
+            scan.clone(),
+            Vec::new(),
+            vec![
+                count_output(),
+                batch_aggregate_expression(
+                    AggregateFunction::Sum,
+                    AggregateInput::Column(columns[0].clone()),
+                    "SUM(id)",
+                    PhysicalType::Int64,
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(
+            execute_rows(&aggregate, &mut storages).expect("execute empty partition Aggregate"),
+            execute_rows_legacy(&aggregate, &mut storages)
+                .expect("execute legacy empty partition Aggregate")
+        );
+        let top_n = batch_top_n(
+            scan,
+            vec![SortKey {
+                column: columns[1].clone(),
+                direction: SortDirection::Asc,
+                null_order: NullOrder::Last,
+            }],
+            vec![columns[0].clone()],
+            20,
+        );
+        assert_eq!(
+            execute_rows(&top_n, &mut storages).expect("execute empty partition Top-N"),
+            execute_rows_legacy(&top_n, &mut storages)
+                .expect("execute legacy empty partition Top-N")
+        );
+        close_partitioned_batch_storages(storages, paths);
+    }
+
+    #[test]
+    fn mixed_partition_accesses_retain_materialized_fallback() {
+        let columns = batch_columns();
+        let sizes = [3, 3];
+        let (mut storages, paths) =
+            partitioned_batch_storages("mixed-fallback", &sizes, &[false; 2]);
+        storages[1]
+            .create_index(ColumnId(1))
+            .expect("create mixed partition index");
+        let access_path = storages[1].access_paths()[0].id;
+
+        let point = partitioned_batch_scan(
+            vec![columns[0].clone()],
+            vec![
+                PartitionAccessPlan::SeqScan,
+                PartitionAccessPlan::IndexScan {
+                    index_column: columns[0].clone(),
+                    access_path,
+                    key: ScalarValue::Int64(3),
+                },
+            ],
+        );
+        assert!(
+            build_batch_pipeline(&point)
+                .expect("check mixed point eligibility")
+                .is_none()
+        );
+        let point_result =
+            execute_rows(&point, &mut storages).expect("execute mixed point fallback");
+        assert_eq!(
+            point_result,
+            execute_rows_legacy(&point, &mut storages).expect("execute mixed point legacy")
+        );
+        assert_eq!(
+            point_result
+                .rows
+                .iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            (0..4).map(ScalarValue::Int64).collect::<Vec<_>>()
+        );
+
+        let range_logical = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(55),
+                table_name: "batch_items".into(),
+                columns: columns.clone(),
+            }),
+            predicate: batch_binary(
+                BinaryOp::And,
+                batch_binary(
+                    BinaryOp::GtEq,
+                    batch_column_expression(&columns[0]),
+                    batch_literal(ScalarValue::Int64(4), PhysicalType::Int64),
+                ),
+                batch_binary(
+                    BinaryOp::LtEq,
+                    batch_column_expression(&columns[0]),
+                    batch_literal(ScalarValue::Int64(5), PhysicalType::Int64),
+                ),
+            ),
+        };
+        let range_plan = plan_with_statistics(
+            &range_logical,
+            &[TableAccessStatistics {
+                table_id: TableId(55),
+                statistics: Some(TableStatistics {
+                    row_count: 10_000,
+                    managed_page_count: 100,
+                }),
+            }],
+            &[AccessPath {
+                table_id: TableId(55),
+                column_id: ColumnId(1),
+                id: access_path,
+                capabilities: AccessPathCapabilities {
+                    point_lookup: true,
+                    range_lookup: true,
+                    ordered: true,
+                },
+                statistics: Some(IndexStatistics {
+                    distinct_non_null_keys: 10_000,
+                    null_count: 0,
+                    tree_height: 2,
+                }),
+                cost_hints: None,
+            }],
+        );
+        let PhysicalPlan::Filter { input, .. } = range_plan else {
+            panic!("range planner must retain the residual Filter")
+        };
+        let PhysicalPlan::RangeIndexScan {
+            index_column,
+            access_path,
+            range,
+            ..
+        } = *input
+        else {
+            panic!("range planner must select RangeIndexScan")
+        };
+        let range = partitioned_batch_scan(
+            vec![columns[0].clone()],
+            vec![
+                PartitionAccessPlan::SeqScan,
+                PartitionAccessPlan::RangeIndexScan {
+                    index_column,
+                    access_path,
+                    range,
+                },
+            ],
+        );
+        assert!(
+            build_batch_pipeline(&range)
+                .expect("check mixed range eligibility")
+                .is_none()
+        );
+        let range_result =
+            execute_rows(&range, &mut storages).expect("execute mixed range fallback");
+        assert_eq!(
+            range_result,
+            execute_rows_legacy(&range, &mut storages).expect("execute mixed range legacy")
+        );
+        assert_eq!(
+            range_result
+                .rows
+                .iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            [
+                ScalarValue::Int64(0),
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(2),
+                ScalarValue::Int64(4),
+                ScalarValue::Int64(5),
+            ]
+        );
+
+        close_partitioned_batch_storages(storages, paths);
     }
 
     #[test]

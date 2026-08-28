@@ -1686,6 +1686,74 @@ show a shared row-layout or `ScalarValue` dispatch residual. Build-side HashJoin
 ownership/hash work, full batch Sort, spilling, and AND/OR short-circuiting
 remain separate candidates.
 
+## Phase 66 partitioned SeqScan batch source
+
+Phase 66 first added attribution without changing production. The benchmark
+creates real range-partitioned tables through the public Database API, loads a
+fixed 1,024-row quick fixture, and requires StatementInspection to report a
+PartitionedScan whose every selected partition access is SeqScan. Full
+projection covers 1, 2, 4, and 8 partitions. The four-partition fixture also
+gates `LIMIT 20`, SUM, grouped COUNT, bounded Top-N, and Filter+Limit physical
+trees and exact ordered results. The pre gate passed, so no hand-built plan was
+used to justify implementation. Raw serial quick output is stored outside the
+repository at `/tmp/netbadb-phase66-pre.txt` and
+`/tmp/netbadb-phase66-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | partitions | source rows | access mix | pre | post | change |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| full projection | 1 | 1,024 | all SeqScan | 298,333 | 109,375 | -63.3% |
+| full projection | 2 | 1,024 | all SeqScan | 389,833 | 155,417 | -60.1% |
+| full projection | 4 | 1,024 | all SeqScan | 140,167 | 103,208 | -26.4% |
+| full projection | 8 | 1,024 | all SeqScan | 284,042 | 134,042 | -52.8% |
+| LIMIT 20 | 4 | 1,024 | all SeqScan | 151,625 | 6,583 | -95.7% |
+| SUM | 4 | 1,024 | all SeqScan | 157,917 | 116,084 | -26.5% |
+| grouped COUNT | 4 | 1,024 | all SeqScan | 168,625 | 136,333 | -19.2% |
+| Top-N K=20 | 4 | 1,024 | all SeqScan | 272,333 | 134,167 | -50.7% |
+| Filter+Limit 20 | 4 | 1,024 | all SeqScan | 172,834 | 37,875 | -78.1% |
+
+This single quick pair supports no general throughput threshold. Full
+projection still owns all final QueryResult rows and is primarily an order and
+producer-overhead control. The authoritative result is structural: selected
+partition storages are visited in planner order and feed one shared batch.
+Test-only statistics for sizes 100/100/100/213 report 513 rows seen, three
+deliveries, and a maximum batch of 256. The first full batch crosses partition
+boundaries. A four-by-100-row `LIMIT 20` visits one partition, requests 20
+rows, delivers one 20-row batch, and skips the other three partitions. SUM and
+Top-N over 0/1/255/257 partitions both visit all four partitions, see 513 rows,
+deliver three batches, and report a 256-row maximum. Empty total input,
+individual empty partitions, 1/2/4/8 partition counts, 255/256/257/512/513
+boundaries, Heap/LSM combinations, and exact materialized-legacy order are
+covered.
+
+The source intermediate for eligible LIMIT and collectors is bounded by 256
+rows; Aggregate adds its group/state ownership and Top-N adds at most K
+candidates. A query returning all N rows still owns `O(N)` final output, so
+Phase 66 does not claim total `O(256)` memory for full projection.
+
+Point/range attribution deliberately remains outside the new source. A unique
+point IndexScan returned one row. The duplicate secondary-key control selected
+SeqScan at 250 of 1,000 rows rather than materializing a large point result.
+The exact bounded range sweep selected RangeIndexScan for 1 and 20 rows, then
+selected SeqScan for 255, 256, and 257 rows; the 257-row SUM likewise used
+SeqScan. No timed Phase 66 partition fixture produced mixed access, while the
+correctness suite retains partition-local index planning and executor tests
+prove SeqScan+IndexScan and SeqScan+RangeIndexScan plans reject batch
+eligibility and execute through the materialized fallback. These measurements
+do not show planned IndexScan/RangeIndexScan cardinalities commonly exceeding
+256, so executor-side Vec chunking is not justified.
+
+Phase 67 should therefore prefer typed column-oriented batch attribution, or
+another measured large residual, before adding storage-level point/range
+visitors. If a future workload shows frequent RangeIndexScan results above 256
+or large duplicate point candidates, the follow-up should add a real
+storage-level range or point visitor first and only then expand mixed
+PartitionedScan. Phase 66 changes no TableStorage API, storage engine,
+PhysicalPlan, planner cost, public contract, dependency, unsafe code, or
+persistent format. The Phase 65 HashJoin probe control changed from 735,291 to
+721,458 ns (-1.9%); its direct SeqScan source remains unchanged.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -1707,6 +1775,8 @@ it does not invalidate these performance-path results. Phase 63 changes only
 executor-private predicate setup/evaluation and benchmark coverage. Phase 64
 adds an executor-private Top-N consumer of the existing physical tree. Phase 65
 adds an executor-private HashJoin probe consumer and retains the materialized
-fallback. All three retain the current Heap metadata v4 and every public,
-inspection, protocol, SDK, and persistent contract. These phases add no
-dependency and no unsafe code.
+fallback. Phase 66 adds the second executor-private BatchSource variant for the
+existing all-SeqScan PartitionedScan and retains mixed-access materialization.
+All four retain the current Heap metadata v4 and every public, inspection,
+protocol, SDK, and persistent contract. These phases add no dependency and no
+unsafe code.

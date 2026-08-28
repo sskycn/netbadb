@@ -828,10 +828,17 @@ The implementation sequence is intentionally vertical:
     Full residual predicates, NULL handling, left-major/right-minor order,
     self-join read views, output ownership, and the materialized fallback are
     unchanged.
+66. Partitioned SeqScan Batch Source — complete; an executor-private
+    `BatchSource` now accepts either one SeqScan or an all-SeqScan
+    PartitionedScan. Partition visitors in planner order feed one shared
+    at-most-256-row batch across partition boundaries, so Limit can skip later
+    partitions while Aggregate and Top-N still consume every partition.
+    Mixed IndexScan/RangeIndexScan access retains the authoritative materialized
+    fallback, and point/range storage APIs remain unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Typed column-oriented batches,
-build-side HashJoin ownership/hash work, and index/range/partition batch sources
+build-side HashJoin ownership/hash work, and storage-level index/range visitors
 remain measurement-led candidates; full batch Sort and upstream Top-N
 cancellation are not implemented. Leaf-lookup micro-optimization stops with
 Phase 63.

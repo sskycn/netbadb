@@ -1533,3 +1533,42 @@ concrete index/range/partition batch-source fallback gap before considering the
 larger typed column-oriented representation; build-side HashJoin ownership,
 full batch Sort, spilling, and AND/OR short-circuiting remain separate measured
 candidates.
+
+## Partitioned SeqScan Batch Source (Phase 66, complete)
+
+- added plan-gated benchmark attribution for one logical range-partitioned
+  table with 1, 2, 4, and 8 partitions. The real planner must produce
+  PartitionedScan and every selected `PartitionAccessPlan` must be SeqScan;
+  hand-built plans do not satisfy the benchmark gate;
+- replaced the executor-private BatchPipeline's implicit single-table fields
+  with a two-variant `BatchSource`: one SeqScan or one all-SeqScan
+  PartitionedScan. No trait, boxed iterator, public API, or new physical plan
+  was introduced;
+- visits selected partitions in planner order through each storage's existing
+  read view and `visit_rows_with_view_control`, validates the logical TableId,
+  and carries one partial ExecutionBatch across partition boundaries. Only the
+  final source exhaustion flushes a partial batch;
+- propagates downstream `Break` through the current storage visitor and outer
+  partition loop. Early Limit therefore skips later partitions, while the
+  existing Aggregate and bounded Top-N consumers continue through every
+  partition;
+- accepts no mixed source. Any local IndexScan or RangeIndexScan makes the
+  whole PartitionedScan use the retained materialized executor. Point/range
+  storage capabilities still return owned vectors and are not pseudo-streamed
+  by executor chunking;
+- proves exact legacy row/order equivalence at 255/256/257/512/513 total rows,
+  1/2/4/8 partitions, empty/single/unequal partitions, Heap and LSM, shared
+  cross-partition batches, pending-error behavior, mixed point/range fallback,
+  early Limit cancellation, and complete Aggregate/Top-N traversal;
+- test-only statistics for 513 rows report every row seen, three delivered
+  batches, and a maximum source batch of 256. A four-by-100-row `LIMIT 20`
+  reports one partition visited and 20 rows seen; later partitions are not
+  visited.
+
+For eligible batch consumers, the PartitionedScan input intermediate changes
+from `O(total partition rows)` to `O(256)` plus consumer state. Aggregate adds
+group/state ownership and Top-N adds `O(K)` candidates. A full-output collector
+still owns `O(N)` final QueryResult rows; Phase 66 removes only the extra source
+intermediate. PhysicalPlan, planner policy, storage APIs and engines,
+persistent formats, protocol, SDKs, dependencies, and unsafe-code usage remain
+unchanged.

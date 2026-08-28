@@ -953,8 +953,11 @@ operands) produce an exact integer interval. OR/NOT conservatively select every
 partition. A contradiction produces an empty `PartitionedScan` with the normal
 output schema. Each selected partition then chooses its own local SeqScan,
 IndexScan, or RangeIndexScan; the complete residual Filter remains above the
-scan. Execution concatenates partitions in canonical range order and retains
-required-column propagation. Global indexes do not exist.
+scan. The authoritative materialized executor concatenates partitions in
+canonical range order and retains required-column propagation. When every
+selected access is a SeqScan, the executor may instead visit those same
+storages in that same order through the bounded batch source described below.
+Global indexes do not exist.
 
 INSERT evaluates and validates its typed row before routing. UPDATE and DELETE
 materialize every original target first; UPDATE also evaluates every
@@ -1101,10 +1104,36 @@ a bounded block-at-a-time k-way merge.
   Project, Limit, SQL expressions, or PhysicalPlan.
 
 Above that storage boundary, one executor-private producer recognizes physical
-trees made from SeqScan plus Filter, Project, and Limit. It groups owned rows
-into a private 256-row `ExecutionBatch`, evaluates a position-bound
-`BoundExpr`, applies the existing move-aware `ProjectionPlan`, and tracks Limit
-state across batches. A callback consumes each bounded batch: the normal query
+trees made from either a single SeqScan or an all-SeqScan PartitionedScan plus
+Filter, Project, and Limit:
+
+```text
+BatchSource
+├── SeqScan ───────────────────────────────┐
+└── PartitionedSeqScan                     │
+      P0 visitor ─┐                        │
+      P1 visitor ─┼─ planner order ────────┤
+      PN visitor ─┘                        │
+                                           ↓
+                         one shared ExecutionBatch (<= 256 rows)
+                                           ↓
+                              Filter / Project / Limit
+                                           ↓
+                 collector / Aggregate / Top-N / HashJoin probe (SeqScan only)
+```
+
+Partition visitors reuse the statement's existing StorageReadView for each
+StorageId, validate every storage's logical TableId, and retain a partial batch
+across partition boundaries. They do not create a batch per partition. A full
+batch can therefore contain one partition's tail and rows from later
+partitions. Downstream `Break` stops both the current storage visitor and the
+outer partition loop, so Limit skips every unvisited partition. Aggregate and
+Top-N return `Continue` and necessarily visit them all.
+
+The producer groups owned rows into a private 256-row `ExecutionBatch`,
+evaluates a position-bound `BoundExpr`, applies the existing move-aware
+`ProjectionPlan`, and tracks Limit state across batches. A callback consumes
+each bounded batch: the normal query
 path appends it to the fully owned result, while Aggregate updates incremental
 state and releases it. Bounded Top-N is a third consumer for the existing
 `Limit -> Project -> Sort` shape: it drains complete owned rows into a
@@ -1119,6 +1148,14 @@ deliberately not requested.
 This is an execution behavior and not a whole-file integrity check: every row
 actually requested still receives the engine's complete MVCC, page/SSTable,
 codec, type, NULL, and UTF-8 validation.
+
+Partitioned batch eligibility is deliberately all-or-nothing. If any selected
+partition uses IndexScan or RangeIndexScan, the complete PartitionedScan stays
+on the materialized path; there is no mixture of streamed and owned partition
+sources. `point_lookup_columns_with_view` and
+`range_lookup_columns_with_view` still return owned vectors, so slicing those
+vectors in the executor would not remove their `O(N)` storage materialization
+and is not presented as streaming.
 
 The public `QueryResult` remains fully owned and may contain the complete final
 result. Intermediate SeqScan, Filter, and Project results no longer require a
