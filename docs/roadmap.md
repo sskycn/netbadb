@@ -1498,3 +1498,38 @@ Phase 64 adds no PhysicalPlan variant, public API, dependency, unsafe code,
 storage format, or upstream cancellation. Typed column-oriented batches, batch
 HashJoin, index/range/partition batch sources, full batch Sort, spilling, and a
 costed K/N crossover remain future measured work.
+
+## Streaming HashJoin Probe over Batch Producer (Phase 65, complete)
+
+- recognizes only the planner's existing direct SeqScan × SeqScan INNER
+  HashJoin shape; setup resolves compatible key positions, joined predicate
+  positions, and output positions before child execution, while unsupported or
+  malformed shapes retain the authoritative materialized fallback;
+- leaves the right child as the fixed, fully materialized build side and keeps
+  the existing `HashMap<ScalarValue, Vec<right index>>`, key cloning, right input
+  order, and bucket insertion order unchanged;
+- visits the left child through the shared 256-row producer, borrows each probe
+  row for `hash_join_key`, evaluates the complete bound residual predicate for
+  every bucket candidate, and owns values only for TRUE projected outputs;
+- preserves NULL non-matching behavior, duplicates, left-major/right-minor
+  order across batch boundaries, reordered and repeated outputs, zero-width
+  output, runtime errors, self-join statement read views, and fully owned final
+  `QueryResult` rows;
+- proves 0/1/255/256/257/512/513 probe boundaries, a 17-row materialized build
+  control, exact candidate/output counts, materialized legacy equivalence,
+  Heap/LSM behavior, self joins, residuals, all physical key types, and
+  conservative fallback/error behavior;
+- adds plan-gated asymmetric no-match, unique, duplicate, and residual
+  benchmarks while retaining all historical symmetric HashJoin and non-target
+  controls.
+
+The eligible input-side intermediate boundary is now
+`O(right build input + hash metadata + probe batch)` instead of
+`O(left input + right input + hash metadata)`, plus the unchanged fully owned
+final output. Phase 65 adds no PhysicalPlan variant, planner policy, dynamic
+build-side choice, public API, dependency, unsafe code, protocol change, or
+persistent-format change. The next attribution work should prioritize the
+concrete index/range/partition batch-source fallback gap before considering the
+larger typed column-oriented representation; build-side HashJoin ownership,
+full batch Sort, spilling, and AND/OR short-circuiting remain separate measured
+candidates.

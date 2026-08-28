@@ -72,6 +72,8 @@ impl BenchProfile {
                 join_small: 100,
                 join_large: 300,
                 join_iterations: 3,
+                phase65_probe_rows: 4_096,
+                phase65_build_rows: 64,
                 update_rows: 100,
             },
             Self::Full => ProfileSettings {
@@ -84,6 +86,8 @@ impl BenchProfile {
                 join_small: 500,
                 join_large: 1_000,
                 join_iterations: 5,
+                phase65_probe_rows: 16_384,
+                phase65_build_rows: 256,
                 update_rows: 500,
             },
         }
@@ -101,6 +105,8 @@ struct ProfileSettings {
     join_small: u64,
     join_large: u64,
     join_iterations: usize,
+    phase65_probe_rows: u64,
+    phase65_build_rows: u64,
     update_rows: u64,
 }
 
@@ -2720,6 +2726,158 @@ fn run_join_scenarios(
             measurements,
         )?;
     }
+    run_phase65_hash_join_scenarios(settings, measurements)?;
+    Ok(())
+}
+
+fn run_phase65_hash_join_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let probe_rows = settings.phase65_probe_rows;
+    let build_rows = settings.phase65_build_rows;
+    let unique_ids = (0..build_rows).collect::<Vec<_>>();
+    let duplicate_cardinality = (build_rows / 4).max(1);
+    let duplicate_ids = (0..duplicate_cardinality)
+        .flat_map(|id| std::iter::repeat_n(id, 4))
+        .collect::<Vec<_>>();
+    let residual_ids = (build_rows..build_rows * 2).collect::<Vec<_>>();
+    let residual_sql = format!(
+        "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key AND l.id > r.id AND l.id < {}",
+        build_rows * 2
+    );
+
+    for scenario in [
+        AsymmetricHashJoinScenario {
+            name: "hash_join_probe_large_build_small_none",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: build_rows,
+            left_key_offset: 0,
+            right_key_offset: probe_rows,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+        AsymmetricHashJoinScenario {
+            name: "hash_join_probe_small_build_large_none",
+            left_rows: build_rows,
+            right_rows: probe_rows,
+            left_cardinality: build_rows,
+            right_cardinality: probe_rows,
+            left_key_offset: 0,
+            right_key_offset: build_rows,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+        AsymmetricHashJoinScenario {
+            name: "hash_join_probe_large_build_small_unique",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: build_rows,
+            left_key_offset: 0,
+            right_key_offset: 0,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &unique_ids,
+        },
+        AsymmetricHashJoinScenario {
+            name: "hash_join_probe_large_build_small_duplicate",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: duplicate_cardinality,
+            left_key_offset: 0,
+            right_key_offset: 0,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &duplicate_ids,
+        },
+        AsymmetricHashJoinScenario {
+            name: "hash_join_probe_large_build_small_residual",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: build_rows,
+            right_cardinality: build_rows,
+            left_key_offset: 0,
+            right_key_offset: 0,
+            sql: &residual_sql,
+            expected_ids: &residual_ids,
+        },
+    ] {
+        run_asymmetric_hash_join_query(scenario, settings, measurements)?;
+    }
+    Ok(())
+}
+
+struct AsymmetricHashJoinScenario<'a> {
+    name: &'a str,
+    left_rows: u64,
+    right_rows: u64,
+    left_cardinality: u64,
+    right_cardinality: u64,
+    left_key_offset: u64,
+    right_key_offset: u64,
+    sql: &'a str,
+    expected_ids: &'a [u64],
+}
+
+fn run_asymmetric_hash_join_query(
+    scenario: AsymmetricHashJoinScenario<'_>,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let paths = FixturePaths::new(scenario.name, 2);
+    let mut database = Database::create_tables(vec![
+        (
+            paths.path(0).to_path_buf(),
+            join_table(LEFT_TABLE_ID, "left_rows"),
+        ),
+        (
+            paths.path(1).to_path_buf(),
+            join_table(RIGHT_TABLE_ID, "right_rows"),
+        ),
+    ])?;
+    load_join_rows(
+        &mut database,
+        LEFT_TABLE_ID,
+        scenario.left_rows,
+        scenario.left_cardinality,
+        scenario.left_key_offset,
+    )?;
+    load_join_rows(
+        &mut database,
+        RIGHT_TABLE_ID,
+        scenario.right_rows,
+        scenario.right_cardinality,
+        scenario.right_key_offset,
+    )?;
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    let plan = inspect_plan(
+        &database,
+        scenario.name,
+        scenario.sql,
+        &[Operator::HashJoin, Operator::SeqScan],
+        &[Operator::NestedLoopJoin, Operator::IndexScan],
+    )?;
+    let expected = expected_ids_observation(scenario.expected_ids)?;
+    let durations = measure_checked(
+        scenario.name,
+        settings.query_warmup,
+        settings.join_iterations,
+        expected,
+        || database.query(scenario.sql).map_err(Into::into),
+        |result| ordered_ids_observation(result, scenario.expected_ids),
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.name.to_owned(),
+        rows: format!("{}x{}", scenario.left_rows, scenario.right_rows),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
     Ok(())
 }
 

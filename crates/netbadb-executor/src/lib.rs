@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
-    ColumnRef, Expr, ExprKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
+    ColumnRef, Expr, ExprKind, JoinKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_storage::{
     PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
@@ -427,6 +427,17 @@ struct ExecutionBatch {
     rows: Vec<ExecutionRow>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StreamingHashJoinStats {
+    probe_rows_seen: usize,
+    probe_batches_seen: usize,
+    max_probe_batch_rows: usize,
+    build_rows_materialized: usize,
+    candidate_pairs_checked: usize,
+    output_rows: usize,
+}
+
 impl ExecutionBatch {
     fn with_capacity() -> Self {
         Self {
@@ -739,6 +750,17 @@ fn execute_rows_test_legacy_with_views(
                 .truncate(usize::try_from(*limit).unwrap_or(usize::MAX));
             Ok(result)
         }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+            ..
+        } => execute_hash_join_materialized(
+            left, right, left_key, right_key, predicate, columns, bindings, storages, read_views,
+        ),
         _ => execute_rows_legacy_with_views(plan, bindings, storages, read_views),
     }
 }
@@ -1297,72 +1319,33 @@ fn execute_rows_legacy_with_views(
         PhysicalPlan::HashJoin {
             left,
             right,
+            kind,
             left_key,
             right_key,
             predicate,
             columns,
             ..
         } => {
-            if !left_key.data_type.is_compatible_with(&right_key.data_type) {
-                return Err(ExecutionError::TypeMismatch);
+            if let Some(result) = try_execute_streaming_hash_join_probe(
+                left,
+                right,
+                *kind,
+                left_key,
+                right_key,
+                predicate,
+                columns,
+                bindings,
+                storages,
+                read_views,
+                #[cfg(test)]
+                None,
+            )? {
+                return Ok(result);
             }
-            let left = execute_rows_legacy_with_views(left, bindings, storages, read_views)?;
-            let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
-            let left_key_position = find_source_position(&left.fields, left_key)?;
-            let right_key_position = find_source_position(&right.fields, right_key)?;
-            let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
-            for (right_index, right_row) in right.rows.iter().enumerate() {
-                let key = hash_join_key(right_row, right_key_position, right_key)?;
-                if let Some(key) = key {
-                    buckets.entry(key.clone()).or_default().push(right_index);
-                }
-            }
-
-            let mut joined_fields = left.fields.clone();
-            joined_fields.extend(right.fields.clone());
-            let output_positions = columns
-                .iter()
-                .map(|column| find_source_position(&joined_fields, column))
-                .collect::<Result<Vec<_>, _>>()?;
-            let fields = columns
-                .iter()
-                .cloned()
-                .map(OutputField::Source)
-                .collect::<Vec<_>>();
-            let bound_predicate = bind_expression(predicate, &joined_fields)?;
-            let mut rows = Vec::new();
-            for left_row in left.rows {
-                let Some(key) = hash_join_key(&left_row, left_key_position, left_key)? else {
-                    continue;
-                };
-                let Some(right_indices) = buckets.get(key) else {
-                    continue;
-                };
-                for right_index in right_indices {
-                    let Some(right_row) = right.rows.get(*right_index) else {
-                        return Err(ExecutionError::TypeMismatch);
-                    };
-                    if evaluate_bound_truth(
-                        &bound_predicate,
-                        EvaluationValues::Joined {
-                            left: &left_row.values,
-                            right: &right_row.values,
-                        },
-                    )? == TruthValue::True
-                    {
-                        let values = project_join_values(
-                            &left_row.values,
-                            &right_row.values,
-                            &output_positions,
-                        )?;
-                        rows.push(ExecutionRow {
-                            row_id: None,
-                            values,
-                        });
-                    }
-                }
-            }
-            Ok(ExecutionRows { fields, rows })
+            execute_hash_join_materialized(
+                left, right, left_key, right_key, predicate, columns, bindings, storages,
+                read_views,
+            )
         }
         PhysicalPlan::Filter { input, predicate } => {
             if let Some(result) =
@@ -1480,6 +1463,246 @@ fn execute_rows_legacy_with_views(
             Ok(result)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_execute_streaming_hash_join_probe(
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+    kind: JoinKind,
+    left_key: &ColumnRef,
+    right_key: &ColumnRef,
+    predicate: &Expr,
+    columns: &[ColumnRef],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    #[cfg(test)] mut stats: Option<&mut StreamingHashJoinStats>,
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    if !matches!(kind, JoinKind::Inner)
+        || !left_key.data_type.is_compatible_with(&right_key.data_type)
+    {
+        return Ok(None);
+    }
+    let PhysicalPlan::SeqScan { .. } = left else {
+        return Ok(None);
+    };
+    let PhysicalPlan::SeqScan {
+        columns: right_columns,
+        ..
+    } = right
+    else {
+        return Ok(None);
+    };
+    let Some(mut pipeline) = build_batch_pipeline(left).ok().flatten() else {
+        return Ok(None);
+    };
+    let Ok(left_key_position) = find_exact_source_position(&pipeline.fields, left_key) else {
+        return Ok(None);
+    };
+    let right_fields = right_columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    let Ok(right_key_position) = find_exact_source_position(&right_fields, right_key) else {
+        return Ok(None);
+    };
+    let mut joined_fields = pipeline.fields.clone();
+    joined_fields.extend(right_fields);
+    let Ok(output_positions) = columns
+        .iter()
+        .map(|column| find_exact_source_position(&joined_fields, column))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return Ok(None);
+    };
+    if !expression_sources_match_fields(predicate, &joined_fields) {
+        return Ok(None);
+    }
+    let Ok(bound_predicate) = bind_expression(predicate, &joined_fields) else {
+        return Ok(None);
+    };
+    let fields = columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+
+    let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
+    #[cfg(test)]
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.build_rows_materialized = right.rows.len();
+    }
+    let buckets = build_hash_join_buckets(&right, right_key_position, right_key)?;
+    let mut rows = Vec::new();
+    let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
+        #[cfg(test)]
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.probe_batches_seen += 1;
+            stats.max_probe_batch_rows = stats.max_probe_batch_rows.max(batch.rows.len());
+        }
+        for left_row in &batch.rows {
+            #[cfg(test)]
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.probe_rows_seen += 1;
+            }
+            probe_hash_join_row(
+                left_row,
+                left_key_position,
+                left_key,
+                &right,
+                &buckets,
+                &bound_predicate,
+                &output_positions,
+                &mut rows,
+                #[cfg(test)]
+                stats.as_deref_mut(),
+            )?;
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(Some(ExecutionRows { fields, rows }))
+}
+
+fn find_exact_source_position(
+    fields: &[OutputField],
+    column: &ColumnRef,
+) -> Result<usize, ExecutionError> {
+    let position = find_source_position(fields, column)?;
+    if fields.get(position).and_then(OutputField::source_column) == Some(column) {
+        Ok(position)
+    } else {
+        Err(ExecutionError::TypeMismatch)
+    }
+}
+
+fn expression_sources_match_fields(expression: &Expr, fields: &[OutputField]) -> bool {
+    match &expression.kind {
+        ExprKind::Column(column) => find_exact_source_position(fields, column).is_ok(),
+        ExprKind::Literal(_) => true,
+        ExprKind::Binary { left, right, .. } => {
+            expression_sources_match_fields(left, fields)
+                && expression_sources_match_fields(right, fields)
+        }
+        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+            expression_sources_match_fields(expression, fields)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_hash_join_materialized(
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+    left_key: &ColumnRef,
+    right_key: &ColumnRef,
+    predicate: &Expr,
+    columns: &[ColumnRef],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<ExecutionRows, ExecutionError> {
+    if !left_key.data_type.is_compatible_with(&right_key.data_type) {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    let left = execute_rows_legacy_with_views(left, bindings, storages, read_views)?;
+    let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
+    let left_key_position = find_source_position(&left.fields, left_key)?;
+    let right_key_position = find_source_position(&right.fields, right_key)?;
+    let buckets = build_hash_join_buckets(&right, right_key_position, right_key)?;
+    let mut joined_fields = left.fields.clone();
+    joined_fields.extend(right.fields.clone());
+    let output_positions = columns
+        .iter()
+        .map(|column| find_source_position(&joined_fields, column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    let bound_predicate = bind_expression(predicate, &joined_fields)?;
+    let mut rows = Vec::new();
+    for left_row in &left.rows {
+        probe_hash_join_row(
+            left_row,
+            left_key_position,
+            left_key,
+            &right,
+            &buckets,
+            &bound_predicate,
+            &output_positions,
+            &mut rows,
+            #[cfg(test)]
+            None,
+        )?;
+    }
+    Ok(ExecutionRows { fields, rows })
+}
+
+fn build_hash_join_buckets(
+    right: &ExecutionRows,
+    right_key_position: usize,
+    right_key: &ColumnRef,
+) -> Result<HashMap<ScalarValue, Vec<usize>>, ExecutionError> {
+    let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
+    for (right_index, right_row) in right.rows.iter().enumerate() {
+        let key = hash_join_key(right_row, right_key_position, right_key)?;
+        if let Some(key) = key {
+            buckets.entry(key.clone()).or_default().push(right_index);
+        }
+    }
+    Ok(buckets)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_hash_join_row(
+    left_row: &ExecutionRow,
+    left_key_position: usize,
+    left_key: &ColumnRef,
+    right: &ExecutionRows,
+    buckets: &HashMap<ScalarValue, Vec<usize>>,
+    bound_predicate: &BoundExpr<'_>,
+    output_positions: &[usize],
+    rows: &mut Vec<ExecutionRow>,
+    #[cfg(test)] mut stats: Option<&mut StreamingHashJoinStats>,
+) -> Result<(), ExecutionError> {
+    let Some(key) = hash_join_key(left_row, left_key_position, left_key)? else {
+        return Ok(());
+    };
+    let Some(right_indices) = buckets.get(key) else {
+        return Ok(());
+    };
+    for right_index in right_indices {
+        #[cfg(test)]
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.candidate_pairs_checked += 1;
+        }
+        let Some(right_row) = right.rows.get(*right_index) else {
+            return Err(ExecutionError::TypeMismatch);
+        };
+        if evaluate_bound_truth(
+            bound_predicate,
+            EvaluationValues::Joined {
+                left: &left_row.values,
+                right: &right_row.values,
+            },
+        )? == TruthValue::True
+        {
+            let values =
+                project_join_values(&left_row.values, &right_row.values, output_positions)?;
+            rows.push(ExecutionRow {
+                row_id: None,
+                values,
+            });
+            #[cfg(test)]
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.output_rows += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hash_join_key<'a>(
@@ -4463,8 +4686,8 @@ mod tests {
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
         ExecutionRow, ExecutionStorage, FilteredCountSummary, GroupLookup, GroupState,
         InequalityExecutionStrategy, PrehashedBuildHasher, PrehashedKey, ProjectionPlan,
-        QueryResult, TopNState, TruthValue, bind_expression, build_batch_pipeline,
-        build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
+        QueryResult, StreamingHashJoinStats, TopNState, TruthValue, bind_expression,
+        build_batch_pipeline, build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
         collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
         direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
         evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
@@ -4476,8 +4699,8 @@ mod tests {
         find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme,
-        sorted_non_null_indices, streaming_seq_filter_eligibility, update_filtered_count_summary,
-        visit_batch_pipeline,
+        sorted_non_null_indices, streaming_seq_filter_eligibility,
+        try_execute_streaming_hash_join_probe, update_filtered_count_summary, visit_batch_pipeline,
     };
     use netbadb_planner::{
         AccessPath, AccessPathCapabilities, PhysicalPlan, TableAccessStatistics, plan,
@@ -9632,6 +9855,593 @@ mod tests {
         }
     }
 
+    fn streaming_join_table(table_id: TableId, name: &str) -> TableDef {
+        TableDef::new(
+            table_id,
+            name,
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "join_key",
+                    TypeSpec::Physical(PhysicalType::Int64),
+                )
+                .nullable(true),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "payload",
+                    TypeSpec::Physical(PhysicalType::Text),
+                ),
+            ],
+        )
+    }
+
+    fn streaming_join_columns(
+        binding_id: u32,
+        table_id: TableId,
+        relation_name: &str,
+    ) -> Vec<ColumnRef> {
+        [
+            (1, "id", PhysicalType::Int64, false),
+            (2, "join_key", PhysicalType::Int64, true),
+            (3, "payload", PhysicalType::Text, false),
+        ]
+        .into_iter()
+        .map(|(column_id, name, physical, nullable)| ColumnRef {
+            binding_id: RelationBindingId(binding_id),
+            table_id,
+            column_id: ColumnId(column_id),
+            relation_name: relation_name.into(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable,
+        })
+        .collect()
+    }
+
+    fn streaming_join_expression(column: &ColumnRef) -> Expr {
+        Expr {
+            kind: ExprKind::Column(column.clone()),
+            expr_type: ExprType {
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            },
+        }
+    }
+
+    fn streaming_join_binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+        Expr {
+            kind: ExprKind::Binary {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: true,
+            },
+        }
+    }
+
+    fn streaming_join_plan(
+        left_columns: &[ColumnRef],
+        right_columns: &[ColumnRef],
+        predicate: Expr,
+        columns: Vec<ColumnRef>,
+    ) -> PhysicalPlan {
+        PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::SeqScan {
+                binding_id: left_columns[0].binding_id,
+                table_id: left_columns[0].table_id,
+                table_name: "left_rows".into(),
+                columns: left_columns.to_vec(),
+            }),
+            right: Box::new(PhysicalPlan::SeqScan {
+                binding_id: right_columns[0].binding_id,
+                table_id: right_columns[0].table_id,
+                table_name: "right_rows".into(),
+                columns: right_columns.to_vec(),
+            }),
+            kind: JoinKind::Inner,
+            left_key: left_columns[1].clone(),
+            right_key: right_columns[1].clone(),
+            predicate,
+            columns,
+        }
+    }
+
+    fn streaming_join_storage(
+        case: &str,
+        side: &str,
+        table_id: TableId,
+        rows: usize,
+        lsm: bool,
+        mut key: impl FnMut(usize) -> ScalarValue,
+    ) -> (TableStorage, std::path::PathBuf) {
+        let path = batch_test_path(&format!("hash-{case}-{side}"), lsm);
+        remove_batch_test_path(&path, lsm);
+        let table = streaming_join_table(table_id, &format!("{side}_rows"));
+        let mut storage = if lsm {
+            TableStorage::create_lsm(&path, table, ColumnId(1)).expect("create streaming join LSM")
+        } else {
+            TableStorage::create_heap(&path, table).expect("create streaming join Heap")
+        };
+        if rows != 0 {
+            let mut transaction = storage
+                .begin_transaction()
+                .expect("begin streaming join load");
+            for index in 0..rows {
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::Int64(
+                                i64::try_from(index).expect("streaming join ID fits i64"),
+                            ),
+                            key(index),
+                            ScalarValue::Text(format!("{side}-{index}")),
+                        ],
+                    )
+                    .expect("insert streaming join row");
+            }
+            transaction.commit().expect("commit streaming join load");
+        }
+        (storage, path)
+    }
+
+    fn execute_streaming_hash_join_with_stats(
+        plan: &PhysicalPlan,
+        storages: &mut [TableStorage],
+        stats: &mut StreamingHashJoinStats,
+    ) -> Result<Option<super::ExecutionRows>, ExecutionError> {
+        let views = storages
+            .iter()
+            .map(TableStorage::read_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        let bindings = compatibility_bindings(storages)?;
+        let mut execution_storages = storages
+            .iter_mut()
+            .zip(&bindings)
+            .map(|(storage, binding)| ExecutionStorage {
+                storage_id: binding.storage_id,
+                storage,
+            })
+            .collect::<Vec<_>>();
+        let execution_views = views
+            .iter()
+            .zip(&bindings)
+            .map(|(view, binding)| ExecutionReadView {
+                storage_id: binding.storage_id,
+                view,
+            })
+            .collect::<Vec<_>>();
+        let PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+        } = plan
+        else {
+            panic!("expected HashJoin")
+        };
+        try_execute_streaming_hash_join_probe(
+            left,
+            right,
+            *kind,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+            &bindings,
+            &mut execution_storages,
+            &execution_views,
+            Some(stats),
+        )
+    }
+
+    #[test]
+    fn streaming_hash_join_probe_batches_bound_left_input_and_materialize_right() {
+        for probe_rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let case = format!("boundary-{probe_rows}");
+            let left_table_id = TableId(700);
+            let right_table_id = TableId(701);
+            let (left_storage, left_path) =
+                streaming_join_storage(&case, "left", left_table_id, probe_rows, false, |index| {
+                    ScalarValue::Int64(i64::try_from(index).expect("left key fits i64"))
+                });
+            let (right_storage, right_path) =
+                streaming_join_storage(&case, "right", right_table_id, 17, false, |index| {
+                    ScalarValue::Int64(i64::try_from(index + 10_000).expect("right key fits i64"))
+                });
+            let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+            let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+            let predicate = streaming_join_binary(
+                BinaryOp::Eq,
+                streaming_join_expression(&left_columns[1]),
+                streaming_join_expression(&right_columns[1]),
+            );
+            let plan = streaming_join_plan(
+                &left_columns,
+                &right_columns,
+                predicate,
+                vec![left_columns[0].clone()],
+            );
+            let mut storages = [left_storage, right_storage];
+            let mut stats = StreamingHashJoinStats::default();
+            let streaming =
+                execute_streaming_hash_join_with_stats(&plan, &mut storages, &mut stats)
+                    .expect("execute streaming HashJoin")
+                    .expect("eligible streaming HashJoin");
+            let materialized =
+                execute_rows_legacy(&plan, &mut storages).expect("execute materialized HashJoin");
+            assert_eq!(streaming, materialized);
+            assert_eq!(stats.probe_rows_seen, probe_rows);
+            assert_eq!(
+                stats.probe_batches_seen,
+                probe_rows.div_ceil(EXECUTION_BATCH_CAPACITY)
+            );
+            assert_eq!(
+                stats.max_probe_batch_rows,
+                probe_rows.min(EXECUTION_BATCH_CAPACITY)
+            );
+            assert_eq!(stats.build_rows_materialized, 17);
+            assert_eq!(stats.candidate_pairs_checked, 0);
+            assert_eq!(stats.output_rows, 0);
+            for storage in storages {
+                storage.close().expect("close streaming join storage");
+            }
+            remove_batch_test_path(&left_path, false);
+            remove_batch_test_path(&right_path, false);
+        }
+    }
+
+    #[test]
+    fn streaming_hash_join_preserves_cross_batch_left_major_right_minor_projection() {
+        let probe_rows = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let left_table_id = TableId(710);
+        let right_table_id = TableId(711);
+        let (left_storage, left_path) =
+            streaming_join_storage("ordering", "left", left_table_id, probe_rows, false, |_| {
+                ScalarValue::Int64(7)
+            });
+        let (right_storage, right_path) =
+            streaming_join_storage("ordering", "right", right_table_id, 3, false, |_| {
+                ScalarValue::Int64(7)
+            });
+        let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+        let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+        let predicate = streaming_join_binary(
+            BinaryOp::Eq,
+            streaming_join_expression(&left_columns[1]),
+            streaming_join_expression(&right_columns[1]),
+        );
+        let plan = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            predicate,
+            vec![
+                right_columns[2].clone(),
+                left_columns[0].clone(),
+                right_columns[2].clone(),
+            ],
+        );
+        let mut storages = [left_storage, right_storage];
+        let mut stats = StreamingHashJoinStats::default();
+        let streaming = execute_streaming_hash_join_with_stats(&plan, &mut storages, &mut stats)
+            .expect("execute ordered streaming HashJoin")
+            .expect("eligible ordered streaming HashJoin");
+        let materialized = execute_rows_legacy(&plan, &mut storages)
+            .expect("execute ordered materialized HashJoin");
+        assert_eq!(streaming, materialized);
+        assert_eq!(stats.probe_rows_seen, probe_rows);
+        assert_eq!(stats.probe_batches_seen, 3);
+        assert_eq!(stats.max_probe_batch_rows, EXECUTION_BATCH_CAPACITY);
+        assert_eq!(stats.build_rows_materialized, 3);
+        assert_eq!(stats.candidate_pairs_checked, probe_rows * 3);
+        assert_eq!(stats.output_rows, probe_rows * 3);
+        let expected = (0..probe_rows)
+            .flat_map(|left_id| {
+                (0..3).map(move |right_id| super::ExecutionRow {
+                    row_id: None,
+                    values: vec![
+                        ScalarValue::Text(format!("right-{right_id}")),
+                        ScalarValue::Int64(i64::try_from(left_id).expect("left ID fits i64")),
+                        ScalarValue::Text(format!("right-{right_id}")),
+                    ],
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(streaming.rows, expected);
+        for storage in storages {
+            storage.close().expect("close ordered join storage");
+        }
+        remove_batch_test_path(&left_path, false);
+        remove_batch_test_path(&right_path, false);
+    }
+
+    #[test]
+    fn streaming_hash_join_matches_materialized_on_heap_and_lsm() {
+        for lsm in [false, true] {
+            let backend = if lsm { "lsm" } else { "heap" };
+            let left_table_id = TableId(720);
+            let right_table_id = TableId(721);
+            let (left_storage, left_path) = streaming_join_storage(
+                backend,
+                "left",
+                left_table_id,
+                EXECUTION_BATCH_CAPACITY + 1,
+                lsm,
+                |index| ScalarValue::Int64(i64::try_from(index % 17).expect("left key fits")),
+            );
+            let (right_storage, right_path) =
+                streaming_join_storage(backend, "right", right_table_id, 17, lsm, |index| {
+                    ScalarValue::Int64(i64::try_from(index).expect("right key fits"))
+                });
+            let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+            let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+            let predicate = streaming_join_binary(
+                BinaryOp::Eq,
+                streaming_join_expression(&left_columns[1]),
+                streaming_join_expression(&right_columns[1]),
+            );
+            let plan = streaming_join_plan(
+                &left_columns,
+                &right_columns,
+                predicate,
+                vec![left_columns[0].clone(), right_columns[2].clone()],
+            );
+            let mut storages = [left_storage, right_storage];
+            let mut stats = StreamingHashJoinStats::default();
+            let streaming =
+                execute_streaming_hash_join_with_stats(&plan, &mut storages, &mut stats)
+                    .expect("execute backend streaming HashJoin")
+                    .expect("eligible backend streaming HashJoin");
+            let materialized = execute_rows_legacy(&plan, &mut storages)
+                .expect("execute backend materialized HashJoin");
+            assert_eq!(streaming, materialized);
+            assert_eq!(stats.probe_rows_seen, EXECUTION_BATCH_CAPACITY + 1);
+            assert_eq!(stats.probe_batches_seen, 2);
+            assert_eq!(stats.max_probe_batch_rows, EXECUTION_BATCH_CAPACITY);
+            assert_eq!(stats.build_rows_materialized, 17);
+            assert_eq!(stats.candidate_pairs_checked, EXECUTION_BATCH_CAPACITY + 1);
+            assert_eq!(stats.output_rows, EXECUTION_BATCH_CAPACITY + 1);
+            for storage in storages {
+                storage.close().expect("close backend join storage");
+            }
+            remove_batch_test_path(&left_path, lsm);
+            remove_batch_test_path(&right_path, lsm);
+        }
+    }
+
+    #[test]
+    fn streaming_hash_join_self_join_reuses_one_read_view_and_matches_materialized() {
+        let table_id = TableId(725);
+        let (storage, path) =
+            streaming_join_storage("self", "employees", table_id, 3, false, |index| {
+                if index == 0 {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Int64(1)
+                }
+            });
+        let left_columns = streaming_join_columns(10, table_id, "employees");
+        let right_columns = streaming_join_columns(20, table_id, "employees");
+        let predicate = streaming_join_binary(
+            BinaryOp::Eq,
+            streaming_join_expression(&left_columns[1]),
+            streaming_join_expression(&right_columns[1]),
+        );
+        let plan = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            predicate,
+            vec![left_columns[0].clone(), right_columns[0].clone()],
+        );
+        let mut storages = [storage];
+        let mut stats = StreamingHashJoinStats::default();
+        let streaming = execute_streaming_hash_join_with_stats(&plan, &mut storages, &mut stats)
+            .expect("execute streaming self HashJoin")
+            .expect("eligible streaming self HashJoin");
+        let materialized =
+            execute_rows_legacy(&plan, &mut storages).expect("execute materialized self HashJoin");
+        assert_eq!(streaming, materialized);
+        assert_eq!(stats.probe_rows_seen, 3);
+        assert_eq!(stats.build_rows_materialized, 3);
+        assert_eq!(stats.candidate_pairs_checked, 4);
+        assert_eq!(stats.output_rows, 4);
+        assert_eq!(
+            streaming
+                .rows
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![ScalarValue::Int64(1), ScalarValue::Int64(1)],
+                vec![ScalarValue::Int64(1), ScalarValue::Int64(2)],
+                vec![ScalarValue::Int64(2), ScalarValue::Int64(1)],
+                vec![ScalarValue::Int64(2), ScalarValue::Int64(2)],
+            ]
+        );
+        let [storage] = storages;
+        storage.close().expect("close self join storage");
+        remove_batch_test_path(&path, false);
+    }
+
+    #[test]
+    fn streaming_hash_join_setup_rejects_non_scan_probe_and_preserves_fallback_errors() {
+        let left_table_id = TableId(730);
+        let right_table_id = TableId(731);
+        let (left_storage, left_path) =
+            streaming_join_storage("fallback", "left", left_table_id, 3, false, |index| {
+                ScalarValue::Int64(i64::try_from(index).expect("left key fits"))
+            });
+        let (right_storage, right_path) =
+            streaming_join_storage("fallback", "right", right_table_id, 3, false, |index| {
+                ScalarValue::Int64(i64::try_from(index).expect("right key fits"))
+            });
+        let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+        let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+        let equality = streaming_join_binary(
+            BinaryOp::Eq,
+            streaming_join_expression(&left_columns[1]),
+            streaming_join_expression(&right_columns[1]),
+        );
+        let mut filtered_left = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            equality.clone(),
+            vec![left_columns[0].clone()],
+        );
+        let PhysicalPlan::HashJoin { left, .. } = &mut filtered_left else {
+            panic!("expected HashJoin")
+        };
+        let scan = left.clone();
+        **left = PhysicalPlan::Filter {
+            input: scan,
+            predicate: Expr {
+                kind: ExprKind::Literal(ScalarValue::Bool(true)),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            },
+        };
+        let mut storages = [left_storage, right_storage];
+        let mut stats = StreamingHashJoinStats::default();
+        assert!(
+            execute_streaming_hash_join_with_stats(&filtered_left, &mut storages, &mut stats)
+                .expect("reject unsupported probe")
+                .is_none()
+        );
+        assert_eq!(stats, StreamingHashJoinStats::default());
+        assert_eq!(
+            execute_rows(&filtered_left, &mut storages).expect("fallback filtered HashJoin"),
+            execute_rows_legacy(&filtered_left, &mut storages)
+                .expect("materialized filtered HashJoin")
+        );
+
+        let mut missing_key = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            equality.clone(),
+            vec![left_columns[0].clone()],
+        );
+        let PhysicalPlan::HashJoin { left_key, .. } = &mut missing_key else {
+            panic!("expected HashJoin")
+        };
+        left_key.column_id = ColumnId(99);
+        left_key.name = "missing_key".into();
+        for result in [
+            execute_rows(&missing_key, &mut storages),
+            execute_rows_legacy(&missing_key, &mut storages),
+        ] {
+            assert!(matches!(
+                result,
+                Err(ExecutionError::MissingColumn(name)) if name == "missing_key"
+            ));
+        }
+
+        let mut incompatible = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            equality.clone(),
+            vec![left_columns[0].clone()],
+        );
+        let PhysicalPlan::HashJoin { right_key, .. } = &mut incompatible else {
+            panic!("expected HashJoin")
+        };
+        right_key.data_type = SemanticType::physical(PhysicalType::UInt64);
+        assert!(matches!(
+            execute_rows(&incompatible, &mut storages),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert!(matches!(
+            execute_rows_legacy(&incompatible, &mut storages),
+            Err(ExecutionError::TypeMismatch)
+        ));
+
+        let mut runtime_key_mismatch = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            equality.clone(),
+            vec![left_columns[0].clone()],
+        );
+        let PhysicalPlan::HashJoin {
+            left_key,
+            right_key,
+            ..
+        } = &mut runtime_key_mismatch
+        else {
+            panic!("expected HashJoin")
+        };
+        left_key.data_type = SemanticType::physical(PhysicalType::UInt64);
+        right_key.data_type = SemanticType::physical(PhysicalType::UInt64);
+        let mut stats = StreamingHashJoinStats::default();
+        assert!(
+            execute_streaming_hash_join_with_stats(
+                &runtime_key_mismatch,
+                &mut storages,
+                &mut stats,
+            )
+            .expect("reject runtime key mismatch during setup")
+            .is_none()
+        );
+        assert_eq!(stats, StreamingHashJoinStats::default());
+        assert!(matches!(
+            execute_rows(&runtime_key_mismatch, &mut storages),
+            Err(ExecutionError::TypeMismatch)
+        ));
+        assert!(matches!(
+            execute_rows_legacy(&runtime_key_mismatch, &mut storages),
+            Err(ExecutionError::TypeMismatch)
+        ));
+
+        let mut malformed_predicate = streaming_join_plan(
+            &left_columns,
+            &right_columns,
+            equality,
+            vec![left_columns[0].clone()],
+        );
+        let missing_predicate_column = ColumnRef {
+            binding_id: RelationBindingId(10),
+            table_id: left_table_id,
+            column_id: ColumnId(98),
+            relation_name: "left_rows".into(),
+            name: "missing_predicate".into(),
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable: false,
+        };
+        let PhysicalPlan::HashJoin { predicate, .. } = &mut malformed_predicate else {
+            panic!("expected HashJoin")
+        };
+        *predicate = streaming_join_expression(&missing_predicate_column);
+        for result in [
+            execute_rows(&malformed_predicate, &mut storages),
+            execute_rows_legacy(&malformed_predicate, &mut storages),
+        ] {
+            assert!(matches!(
+                result,
+                Err(ExecutionError::MissingColumn(name)) if name == "missing_predicate"
+            ));
+        }
+        for storage in storages {
+            storage.close().expect("close fallback join storage");
+        }
+        remove_batch_test_path(&left_path, false);
+        remove_batch_test_path(&right_path, false);
+    }
+
     #[test]
     fn hash_join_matches_nested_loop_for_all_key_types_nulls_duplicates_and_residuals() {
         fn column(
@@ -9861,6 +10671,25 @@ mod tests {
                 columns: columns.clone(),
             };
             let mut storages = [left_storage, right_storage];
+            assert_eq!(
+                execute_rows(&hash, &mut storages).expect("streaming HashJoin rows"),
+                execute_rows_legacy(&hash, &mut storages).expect("materialized HashJoin rows")
+            );
+            let zero_width_hash = PhysicalPlan::HashJoin {
+                left: Box::new(left_scan.clone()),
+                right: Box::new(right_scan.clone()),
+                kind: JoinKind::Inner,
+                left_key: left_columns[1].clone(),
+                right_key: right_columns[1].clone(),
+                predicate: equality.clone(),
+                columns: Vec::new(),
+            };
+            assert_eq!(
+                execute_rows(&zero_width_hash, &mut storages)
+                    .expect("streaming zero-width HashJoin"),
+                execute_rows_legacy(&zero_width_hash, &mut storages)
+                    .expect("materialized zero-width HashJoin")
+            );
             let nested_result =
                 execute_with_storages(&nested, &mut storages).expect("nested-loop execution");
             let hash_result = execute_with_storages(&hash, &mut storages).expect("hash execution");
@@ -9897,6 +10726,10 @@ mod tests {
                 };
                 assert!(matches!(
                     execute_with_storages(&invalid_runtime_key, &mut storages),
+                    Err(ExecutionError::TypeMismatch)
+                ));
+                assert!(matches!(
+                    execute_rows_legacy(&invalid_runtime_key, &mut storages),
                     Err(ExecutionError::TypeMismatch)
                 ));
 
@@ -9938,6 +10771,12 @@ mod tests {
                     predicate: residual,
                     columns,
                 };
+                assert_eq!(
+                    execute_rows(&hash_residual, &mut storages)
+                        .expect("streaming hash residual rows"),
+                    execute_rows_legacy(&hash_residual, &mut storages)
+                        .expect("materialized hash residual rows")
+                );
                 assert_eq!(
                     execute_with_storages(&hash_residual, &mut storages)
                         .expect("hash residual execution"),

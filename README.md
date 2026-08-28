@@ -821,12 +821,20 @@ The implementation sequence is intentionally vertical:
     ordinal, and reuses move-aware final projection. Full Sort, unsupported and
     malformed shapes, plans, public APIs, and persistent contracts are
     unchanged.
+65. Streaming HashJoin Probe over Batch Producer — complete; eligible direct
+    SeqScan × SeqScan INNER HashJoin plans still fully materialize the fixed
+    right build side and retain the existing ordered hash buckets, while the
+    left probe side is consumed as borrowed rows from at most 256-row batches.
+    Full residual predicates, NULL handling, left-major/right-minor order,
+    self-join read views, output ownership, and the materialized fallback are
+    unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. Typed column-oriented batches,
-HashJoin batch integration, and index/range/partition batch sources remain
-measurement-led candidates; full batch Sort and upstream Top-N cancellation
-are not implemented. Leaf-lookup micro-optimization stops with Phase 63.
+build-side HashJoin ownership/hash work, and index/range/partition batch sources
+remain measurement-led candidates; full batch Sort and upstream Top-N
+cancellation are not implemented. Leaf-lookup micro-optimization stops with
+Phase 63.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in

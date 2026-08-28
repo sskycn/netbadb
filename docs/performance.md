@@ -1575,27 +1575,31 @@ unchanged. Raw serial quick runs are stored outside the repository at
 
 Machine-local medians are nanoseconds per query:
 
-| scenario | pre median | post median | change |
-| --- | ---: | ---: | ---: |
-| duplicate K=1 | 362,584 | 394,000 | +8.7% |
-| duplicate K=20 | 360,292 | 367,958 | +2.1% |
-| duplicate K=256 | 320,125 | 459,709 | +43.6% |
-| duplicate K=257 | 322,000 | 411,875 | +27.9% |
-| duplicate K=N/2 | 299,875 | 398,709 | +33.0% |
-| duplicate K=N | 310,250 | 432,291 | +39.3% |
-| unique descending K=20 | 217,791 | 304,583 | +39.9% |
-| multi-key K=20 | 390,167 | 284,166 | -27.2% |
-| filtered K=20 | 231,917 | 267,250 | +15.2% |
-| Text descending K=20 | 270,833 | 344,708 | +27.3% |
-| nullable ascending, NULLS FIRST | 256,750 | 221,833 | -13.6% |
-| full duplicate Sort without Limit | 241,417 | 263,042 | +9.0% |
-| existing `order_by_limit` control | 455,500 | 342,833 | -24.7% |
+| scenario | N | K | key shape | pre | post | change |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| target A | 1,000 | 1 | duplicate team + unique ID | 683,916 | 360,291 | -47.3% |
+| duplicate sweep | 1,000 | 1 | four team values | 546,833 | 394,000 | -27.9% |
+| duplicate sweep | 1,000 | 20 | four team values | 503,750 | 367,958 | -27.0% |
+| duplicate sweep | 1,000 | 256 | four team values | 558,500 | 459,709 | -17.7% |
+| duplicate sweep | 1,000 | 257 | four team values | 461,791 | 411,875 | -10.8% |
+| duplicate sweep | 1,000 | 500 | four team values | 404,375 | 398,709 | -1.4% |
+| duplicate sweep | 1,000 | 1,000 | four team values | 391,167 | 432,291 | +10.5% |
+| unique descending | 1,000 | 20 | unique ID | 270,625 | 304,583 | +12.5% |
+| multi-key | 1,000 | 20 | team ASC, ID DESC | 475,667 | 284,166 | -40.3% |
+| filtered | 1,000 | 20 | four team values | 310,625 | 267,250 | -14.0% |
+| Text descending | 1,000 | 20 | unique fixed-width payload | 318,500 | 344,708 | +8.2% |
+| nullable ASC FIRST | 1,000 | 20 | 1% NULL Int64 | 303,000 | 221,833 | -26.8% |
+| nullable ASC LAST | 1,000 | 20 | 1% NULL Int64 | 308,875 | 222,166 | -28.1% |
+| nullable DESC FIRST | 1,000 | 20 | 1% NULL Int64 | 293,083 | 280,875 | -4.2% |
+| nullable DESC LAST | 1,000 | 20 | 1% NULL Int64 | 283,667 | 261,542 | -7.8% |
+| full Sort control | 1,000 | none | four team values | 281,833 | 263,042 | -6.7% |
+| existing `order_by_limit` | 1,000 | 20 | four team values | 255,958 | 342,833 | +33.9% |
+| LSM multi-key | 250 | 20 | team ASC, ID DESC | 185,834 | 100,084 | -46.1% |
 
 The requested duplicate-key ratios changed as follows: K=20/full Sort moved
-from 1.492x to 1.399x; K=1/K=N moved from 1.169x to 0.911x; and K=20/K=N moved
-from 1.161x to 0.851x. The final expanded post run measured the exact Target A
-at 360,291 ns and LSM multi-key K=20 at 100,084 ns; those two cases were added
-after the initial pre capture and therefore have no claimed pre/post delta.
+from 1.787x to 1.399x; K=1/K=N moved from 1.398x to 0.911x; and K=20/K=N moved
+from 1.288x to 0.851x. Target A improved from 683,916 ns to 360,291 ns, while
+the LSM multi-key case improved from 185,834 ns to 100,084 ns.
 
 This quick run supports no general throughput claim or timing gate. Some small
 K shapes improved, some regressed, K near N pays expected heap maintenance, and
@@ -1608,6 +1612,79 @@ Full Sort, malformed and unsupported shapes, physical plans, public APIs,
 storage, and persistent formats remain unchanged. A costed K/N crossover,
 spilling, full batch Sort, and upstream cancellation remain future measured
 work.
+
+## Phase 65 streaming HashJoin probe over the batch producer
+
+Phase 65 adds five plan-gated asymmetric HashJoin scenarios. Every target
+requires `HashJoin`, forbids `NestedLoopJoin` and index access, checks the exact
+ordered projected IDs, and retains the historical unique, duplicate, and
+no-match controls at both symmetric scales. Quick pre/post output is stored
+outside the repository at `/tmp/netbadb-phase65-pre.txt` and
+`/tmp/netbadb-phase65-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | probe rows | build rows | result rows | pre | post | change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| large probe / small build, no match | 4,096 | 64 | 0 | 807,375 | 743,000 | -8.0% |
+| small probe / large build, no match | 64 | 4,096 | 0 | 1,039,583 | 910,666 | -12.4% |
+| large probe / small build, unique subset | 4,096 | 64 | 64 | 794,000 | 838,292 | +5.6% |
+| large probe / small build, ordered duplicate bucket | 4,096 | 64 | 64 | 805,208 | 734,875 | -8.7% |
+| large probe / small build, residual predicate | 4,096 | 64 | 64 | 1,026,834 | 1,026,500 | -0.0% |
+| existing symmetric unique small | 100 | 100 | 100 | 130,250 | 109,709 | -15.8% |
+| existing symmetric unique large | 300 | 300 | 300 | 138,416 | 191,375 | +38.3% |
+| existing symmetric duplicate large | 300 | 300 | 3,000 | 307,125 | 304,250 | -0.9% |
+| existing symmetric no-match large | 300 | 300 | 0 | 103,958 | 95,792 | -7.9% |
+
+The requested large-probe/small-build divided by
+small-probe/large-build no-match ratio moved from 0.777x to 0.816x. Both
+absolute cases improved in this serial pair, but the reverse control improved
+more, the unique-subset target regressed, and the residual target was flat.
+This run therefore supports no general latency or throughput claim. The authoritative result is
+structural: the eligible left input no longer has a full `ExecutionRows`
+intermediate. Test-only statistics for 513 probe rows report 513 rows seen,
+three batches, and a maximum batch of 256; a separate build control reports all
+17 right rows materialized. Input-side intermediate memory changes from
+`O(left input + right input + hash metadata)` to
+`O(right build input + hash metadata + probe batch)`, plus the unchanged fully
+owned `O(result rows)` output.
+
+The right child remains the fixed build side. Its owned rows, cloned hash keys,
+`HashMap<ScalarValue, Vec<usize>>`, and right insertion order are unchanged.
+The probe callback borrows left rows, reuses `hash_join_key`, checks the full
+once-bound residual predicate for every candidate, and reuses
+`project_join_values` only for TRUE output. NULL keys still do not match;
+left-major/right-minor duplicate order remains exact across batch boundaries.
+Only direct SeqScan × SeqScan INNER HashJoin enters the specialization.
+Metadata setup failures and unsupported children use the retained
+materialized implementation, while runtime build/probe errors propagate
+without replay. Heap, LSM, self-join read views, zero-width and repeated
+projection, and legacy result/error equivalence are covered by executor and
+core tests.
+
+Non-target medians again show machine/code-layout variance:
+
+| control | pre | post | change |
+| --- | ---: | ---: | ---: |
+| Phase 64 Top-N target K=1 | 514,083 | 875,500 | +70.3% |
+| Phase 64 full Sort | 280,209 | 242,500 | -13.5% |
+| full projected scan | 437,291 | 865,292 | +97.9% |
+| generic Bool Filter | 441,417 | 477,375 | +8.1% |
+| global SUM | 418,250 | 480,042 | +14.8% |
+| low-cardinality GROUP BY | 973,917 | 553,083 | -43.2% |
+| direct COUNT(*) | 365,542 | 418,334 | +14.4% |
+| filtered COUNT(payload) | 427,125 | 740,875 | +73.5% |
+| early LIMIT | 22,666 | 38,542 | +70.0% |
+| LSM SUM | 95,959 | 82,541 | -14.0% |
+
+Phase 65 completes row-batch consumption for the current direct-scan HashJoin
+probe without changing planner policy. The next attribution work should first
+measure the concrete IndexScan, RangeIndexScan, and PartitionedScan producer
+coverage gap; typed column-oriented batches become the broader alternative if
+primitive-heavy SeqScan, Filter, Aggregate, Top-N, and HashJoin probe workloads
+show a shared row-layout or `ScalarValue` dispatch residual. Build-side HashJoin
+ownership/hash work, full batch Sort, spilling, and AND/OR short-circuiting
+remain separate candidates.
 
 ## CI and compatibility
 
@@ -1628,7 +1705,8 @@ QueryResult rows. Phase 7U retains those contracts as well. The later MVCC
 phase deliberately advances Heap metadata to v4 and adds tuple/status formats;
 it does not invalidate these performance-path results. Phase 63 changes only
 executor-private predicate setup/evaluation and benchmark coverage. Phase 64
-adds only an executor-private consumer of the existing physical tree and more
-benchmark coverage. Both retain the current Heap metadata v4 and every public,
+adds an executor-private Top-N consumer of the existing physical tree. Phase 65
+adds an executor-private HashJoin probe consumer and retains the materialized
+fallback. All three retain the current Heap metadata v4 and every public,
 inspection, protocol, SDK, and persistent contract. These phases add no
 dependency and no unsafe code.

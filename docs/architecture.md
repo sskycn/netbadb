@@ -437,16 +437,20 @@ The existing expression checker requires BOOL while allowing nullable BOOL,
 and nominal compatibility prevents JOIN from comparing distinct semantic types
 with the same physical encoding. Text still becomes owned once per decoded
 storage row; only repeated candidate-level Text cloning is removed.
-HashJoin also materializes both children but fixes the right child as the build
-side:
+For the planner-produced direct SeqScan × SeqScan INNER shape, HashJoin fixes
+the right child as the build side and streams only the left probe side:
 
 ```text
-right rows
+right/build SeqScan
+   -> full materialized rows
    -> HashMap<ScalarValue, Vec<right-row index>>
-                 ^
-left key probes -+
+
+left/probe SeqScan
+   -> ExecutionBatch, at most 256 rows
+   -> borrow each probe row
+   -> ordered bucket candidates
    -> complete typed residual predicate
-   -> TRUE only: materialize left + right with row_id None
+   -> TRUE only: owned projected output with row_id None
 ```
 
 Build and probe NULL keys are skipped because SQL `NULL = NULL` is UNKNOWN.
@@ -457,6 +461,17 @@ order never determines results. This is executor behavior, not an unordered SQL
 result-order guarantee. Bool, Int64, UInt64, and Text use exact ScalarValue
 identity, while semantic compatibility protects nominal types and self joins
 use binding plus column IDs to identify sides.
+
+HashJoin setup resolves both key positions, joined predicate positions, and
+output positions from physical metadata before executing the right child. Only
+the current direct-scan INNER shape enters this path. Unsupported or malformed
+setup retains the authoritative left-then-right materialized implementation;
+once build or probe execution starts, runtime and storage errors propagate
+without replay. Both sides use the statement's existing read views, including
+self joins. The input-side intermediate boundary changes from
+`O(left input + right input + hash metadata)` to
+`O(right build input + hash metadata + 256-row probe batch)`. HashJoin does not
+yet bound the fully owned final output or right/build-side memory.
 
 Query operators are arranged as
 `Scan/Join -> Filter -> Sort -> Project -> Limit`, allowing sorting by source
@@ -1094,7 +1109,11 @@ path appends it to the fully owned result, while Aggregate updates incremental
 state and releases it. Bounded Top-N is a third consumer for the existing
 `Limit -> Project -> Sort` shape: it drains complete owned rows into a
 worst-first heap of at most K candidates and never cancels its child, because
-later rows may rank earlier. Ordinary batch Limit cancellation stops the
+later rows may rank earlier. Eligible direct-scan HashJoin is a fourth consumer:
+it materializes and hashes the fixed right build child, then borrows left rows
+from each batch for key lookup, complete residual evaluation, and owned output
+projection before the producer clears the batch. Ordinary batch Limit
+cancellation stops the
 storage consumer after the current bounded batch; later physical rows are
 deliberately not requested.
 This is an execution behavior and not a whole-file integrity check: every row
