@@ -305,7 +305,7 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows_legacy_with_views(
+            let input = execute_rows_legacy_eager_filter_with_views(
                 input,
                 &[ExecutionStorageBinding {
                     table_id: storage.table().id,
@@ -332,7 +332,7 @@ pub fn execute_statement(
             let transaction = transaction.ok_or(ExecutionError::TransactionRequired)?;
             storage.validate_transaction(transaction)?;
             ensure_table(*table_id, storage)?;
-            let input = execute_rows_legacy_with_views(
+            let input = execute_rows_legacy_eager_filter_with_views(
                 input,
                 &[ExecutionStorageBinding {
                     table_id: storage.table().id,
@@ -385,7 +385,8 @@ pub fn prepare_mutation_with_storage_context(
             table_id,
             assignments,
         } => {
-            let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            let input =
+                execute_rows_legacy_eager_filter_with_views(input, bindings, storages, read_views)?;
             let rows = build_replacements(&input, assignments)?
                 .into_iter()
                 .map(|(row, values)| PreparedUpdateRow { row, values })
@@ -396,7 +397,8 @@ pub fn prepare_mutation_with_storage_context(
             })
         }
         PhysicalStatement::Delete { input, table_id } => {
-            let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            let input =
+                execute_rows_legacy_eager_filter_with_views(input, bindings, storages, read_views)?;
             let rows = input
                 .rows
                 .into_iter()
@@ -425,6 +427,12 @@ struct ExecutionRows {
 #[derive(Debug)]
 struct ExecutionBatch {
     rows: Vec<ExecutionRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterEvaluationMode {
+    Eager,
+    ShortCircuitWhenSafe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1269,6 +1277,37 @@ fn execute_rows_legacy_with_views(
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
 ) -> Result<ExecutionRows, ExecutionError> {
+    execute_rows_legacy_with_filter_mode(
+        plan,
+        bindings,
+        storages,
+        read_views,
+        FilterEvaluationMode::ShortCircuitWhenSafe,
+    )
+}
+
+fn execute_rows_legacy_eager_filter_with_views(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+) -> Result<ExecutionRows, ExecutionError> {
+    execute_rows_legacy_with_filter_mode(
+        plan,
+        bindings,
+        storages,
+        read_views,
+        FilterEvaluationMode::Eager,
+    )
+}
+
+fn execute_rows_legacy_with_filter_mode(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    filter_mode: FilterEvaluationMode,
+) -> Result<ExecutionRows, ExecutionError> {
     match plan {
         PhysicalPlan::SeqScan {
             table_id, columns, ..
@@ -1401,8 +1440,20 @@ fn execute_rows_legacy_with_views(
             columns,
             ..
         } => {
-            let left = execute_rows_legacy_with_views(left, bindings, storages, read_views)?;
-            let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
+            let left = execute_rows_legacy_with_filter_mode(
+                left,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
+            let right = execute_rows_legacy_with_filter_mode(
+                right,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
             let mut joined_fields = left.fields.clone();
             joined_fields.extend(right.fields.clone());
             let output_positions = columns
@@ -1530,26 +1581,44 @@ fn execute_rows_legacy_with_views(
             )? {
                 return Ok(result);
             }
-            execute_hash_join_materialized(
-                left, right, left_key, right_key, predicate, columns, bindings, storages,
+            execute_hash_join_materialized_with_filter_mode(
+                left,
+                right,
+                left_key,
+                right_key,
+                predicate,
+                columns,
+                bindings,
+                storages,
                 read_views,
+                filter_mode,
             )
         }
         PhysicalPlan::Filter { input, predicate } => {
-            if let Some(result) =
-                try_execute_streaming_seq_filter(input, predicate, bindings, storages, read_views)?
-            {
-                return Ok(result);
+            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+                if let Some(result) = try_execute_streaming_seq_filter(
+                    input, predicate, bindings, storages, read_views,
+                )? {
+                    return Ok(result);
+                }
             }
-            let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            let mut result = execute_rows_legacy_with_filter_mode(
+                input,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
             let fields = result.fields.clone();
             result.rows = match bind_filter_predicate(predicate, &fields) {
                 Ok(mut bound_predicate) => {
-                    qualify_filter_predicate_source_schema(
-                        &mut bound_predicate,
-                        bindings,
-                        storages,
-                    );
+                    if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+                        qualify_filter_predicate_source_schema(
+                            &mut bound_predicate,
+                            bindings,
+                            storages,
+                        );
+                    }
                     result
                         .rows
                         .into_iter()
@@ -1584,7 +1653,13 @@ fn execute_rows_legacy_with_views(
             Ok(result)
         }
         PhysicalPlan::Sort { input, keys } => {
-            let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            let mut result = execute_rows_legacy_with_filter_mode(
+                input,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
             let positions = resolve_sort_positions(&result.fields, keys)?;
             validate_sort_values(&result.rows, &positions, keys)?;
 
@@ -1607,13 +1682,20 @@ fn execute_rows_legacy_with_views(
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
-            if let Some(result) = try_execute_projected_streaming_seq_filter(
-                input, columns, bindings, storages, read_views,
-            )? {
-                return Ok(result);
+            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+                if let Some(result) = try_execute_projected_streaming_seq_filter(
+                    input, columns, bindings, storages, read_views,
+                )? {
+                    return Ok(result);
+                }
             }
-            let input_result =
-                execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            let input_result = execute_rows_legacy_with_filter_mode(
+                input,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
             let projection = build_projection_plan(&input_result.fields, columns)?;
             let rows = if projection.identity {
                 input_result.rows
@@ -1634,25 +1716,42 @@ fn execute_rows_legacy_with_views(
             group_keys,
             outputs,
         } => {
-            if let Some(result) = try_execute_filtered_counts(
-                input, group_keys, outputs, bindings, storages, read_views,
-            )? {
-                Ok(result)
-            } else if let Some(result) = try_execute_direct_counts(
-                input, group_keys, outputs, bindings, storages, read_views,
-            )? {
-                Ok(result)
-            } else if let Some(result) = try_execute_batch_aggregate(
-                input, group_keys, outputs, bindings, storages, read_views,
-            )? {
-                Ok(result)
-            } else {
-                let input = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
-                execute_aggregate(input, group_keys, outputs)
+            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+                if let Some(result) = try_execute_filtered_counts(
+                    input, group_keys, outputs, bindings, storages, read_views,
+                )? {
+                    return Ok(result);
+                }
             }
+            if let Some(result) = try_execute_direct_counts(
+                input, group_keys, outputs, bindings, storages, read_views,
+            )? {
+                return Ok(result);
+            }
+            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+                if let Some(result) = try_execute_batch_aggregate(
+                    input, group_keys, outputs, bindings, storages, read_views,
+                )? {
+                    return Ok(result);
+                }
+            }
+            let input = execute_rows_legacy_with_filter_mode(
+                input,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
+            execute_aggregate(input, group_keys, outputs)
         }
         PhysicalPlan::Limit { input, limit } => {
-            let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
+            let mut result = execute_rows_legacy_with_filter_mode(
+                input,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
             Ok(result)
@@ -1916,6 +2015,7 @@ fn expression_sources_match_fields(expression: &Expr, fields: &[OutputField]) ->
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_hash_join_materialized(
     left: &PhysicalPlan,
@@ -1928,11 +2028,40 @@ fn execute_hash_join_materialized(
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
 ) -> Result<ExecutionRows, ExecutionError> {
+    execute_hash_join_materialized_with_filter_mode(
+        left,
+        right,
+        left_key,
+        right_key,
+        predicate,
+        columns,
+        bindings,
+        storages,
+        read_views,
+        FilterEvaluationMode::ShortCircuitWhenSafe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_hash_join_materialized_with_filter_mode(
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+    left_key: &ColumnRef,
+    right_key: &ColumnRef,
+    predicate: &Expr,
+    columns: &[ColumnRef],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    filter_mode: FilterEvaluationMode,
+) -> Result<ExecutionRows, ExecutionError> {
     if !left_key.data_type.is_compatible_with(&right_key.data_type) {
         return Err(ExecutionError::TypeMismatch);
     }
-    let left = execute_rows_legacy_with_views(left, bindings, storages, read_views)?;
-    let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
+    let left =
+        execute_rows_legacy_with_filter_mode(left, bindings, storages, read_views, filter_mode)?;
+    let right =
+        execute_rows_legacy_with_filter_mode(right, bindings, storages, read_views, filter_mode)?;
     let left_key_position = find_source_position(&left.fields, left_key)?;
     let right_key_position = find_source_position(&right.fields, right_key)?;
     let buckets = build_hash_join_buckets(
