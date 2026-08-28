@@ -168,14 +168,15 @@ for NestedLoopJoin and `left_rows + right_rows` for HashJoin, using checked
 statistics, ties, non-equality predicates, unsupported boolean shapes, and
 non-scan children retain NestedLoopJoin.
 
-HashJoin materializes both children, builds the right child into buckets of
-right-row indices, probes in left input order, and evaluates the complete typed
-predicate for every bucket candidate before materializing TRUE rows. NULL keys
-are excluded from both build and probe. Right indices retain input order, so
-the current deterministic left-major/right-minor behavior is preserved without
-turning unordered SQL output into a language guarantee. There is no join
-reordering, dynamic build-side choice, composite key, index coupling, spilling,
-or global cost model.
+Phase 7D's initial HashJoin materialized both children, built the right child
+into buckets of right-row indices, probed in left input order, and evaluated the
+complete typed predicate for every bucket candidate before materializing TRUE
+rows. NULL keys were excluded from both build and probe. Right indices retained
+input order, preserving deterministic left-major/right-minor behavior without
+turning unordered SQL output into a language guarantee. At that phase there
+was no join reordering, dynamic build-side choice, composite key, index
+coupling, spilling, or global cost model; Phase 70 later adds only the private
+build-side choice.
 
 The post-7D full-profile comparison shows approximately input-linear scaling
 for unique, duplicate, and no-match HashJoin scenarios, with those three shapes
@@ -1919,21 +1920,91 @@ decisive left value.
 Eligibility is conservative. `bind_expression` still runs first. Complete
 column identity/type/nullability, literal metadata, Bool logical/NOT/IS NULL
 metadata, and comparison compatibility are validated privately by the
-executor. Binding failures keep the dynamic row-dependent fallback, including
-empty malformed scans. Binding success with unsafe metadata keeps eager bound
-evaluation; explicit FALSE-AND and TRUE-OR malformed-right tests still return
-the old `ExpectedBoolean` error. Batch, borrowed and projected streaming,
-legacy materialized Filter, and filtered COUNT share the new predicate wrapper.
+executor. Every predicate source column is then checked against the attached
+storage schema before evaluation. Binding failures keep the dynamic
+row-dependent fallback, including empty malformed scans. Binding success with
+unsafe or schema-unproven metadata keeps eager bound evaluation; explicit
+FALSE-AND and TRUE-OR malformed-right tests, including a plan and predicate that
+consistently mislabel an `Int64` storage column as Bool, still return the old
+`ExpectedBoolean` error. Batch, borrowed and projected streaming, legacy
+materialized Filter, and filtered COUNT share the new predicate wrapper.
 Dynamic evaluation, DML, NestedLoopJoin, HashJoin residual predicates, and the
 general bound scalar evaluator remain eager.
 
-The decision is **KEEP**. The skipped-work invariant is exact, the metadata gate
-preserves malformed/error behavior, all executor tests and benchmark gates
-pass, and the order pairs do not systematically contradict the hypothesis even
-though the noisy Aggregate Text AND result prevents a general speedup claim.
+The decision is **KEEP**. The skipped-work invariant is exact, the expression
+and storage-schema gates preserve malformed/error behavior, all executor tests
+and benchmark gates pass, and the order pairs do not systematically contradict
+the hypothesis even though the noisy Aggregate Text AND result prevents a
+general speedup claim.
 Phase 70 should prioritize measured dynamic HashJoin build-side selection, a
 full Sort/spill boundary, or a storage-level range visitor rather than reopening
 the rejected column-batch pilot.
+
+## Phase 70 statistics-guided smaller-side HashJoin build
+
+Phase 70 added attribution before production changes. The existing asymmetric
+Int64 and Text fixtures now require exact last-ANALYZE row counts as well as a
+planner-produced direct SeqScan × SeqScan INNER HashJoin, exact logical key and
+scan-column provenance, no index access, and exact ordered results. Separate
+64×512 and 512×64 Int64 no-match controls make the side asymmetry observable at
+a smaller scale. Raw quick output is stored outside the repository at
+`/tmp/netbadb-phase70-pre.txt` and `/tmp/netbadb-phase70-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | logical rows | selected build post | pre | post | change |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Int64 no match, small left | 64×4,096 | left/64 | 815,917 | 646,375 | -20.8% |
+| Int64 no match, small right | 4,096×64 | right/64 | 639,458 | 759,875 | +18.8% |
+| Int64 no match, small left | 64×512 | left/64 | 314,042 | 222,000 | -29.3% |
+| Int64 no match, small right | 512×64 | right/64 | 212,209 | 194,417 | -8.4% |
+| Text unique short, no match | 64×4,096 | left/64 | 1,065,833 | 657,292 | -38.3% |
+| Text unique long, no match | 64×4,096 | left/64 | 2,059,917 | 1,205,208 | -41.5% |
+| Text duplicate long, no match | 64×4,096 | left/64 | 1,354,917 | 1,446,167 | +6.7% |
+| Text unique long, matching | 64×4,096 | left/64 | 2,081,208 | 1,193,791 | -42.6% |
+| Text duplicate ordered matches | 4×64 | left/4 | 68,334 | 40,041 | -41.4% |
+
+The 64×4,096/4,096×64 Int64 ratio moved from 1.276x to 0.851x; the
+64×512/512×64 ratio moved from 1.480x to 1.142x. The unchanged large-left,
+small-right production branch moved in opposite directions at the two scales,
+and duplicate Text no-match regressed while the other targeted Text cases
+improved materially. With only three samples per Join target, these quick
+results are evidence rather than a stable throughput guarantee or a reason to
+add a ratio threshold.
+
+The authoritative evidence is structural. Eligible execution reads both
+sides' last ANALYZE `TableStatistics::row_count` and builds left only for a
+strictly smaller left estimate. Tests report BuildLeft with estimates
+64/4,096, 64 materialized build rows, 4,096 streamed rows in 16 batches of at
+most 256, and zero owned build-key clones. The inverse 4,096/64 case reports
+BuildRight with 64 build rows and 4,096 streamed rows; 513/513 ties and either
+missing statistic preserve BuildRight.
+
+BuildLeft uses the same `HashMap<&ScalarValue, Vec<usize>>`, ScalarValue value
+Hash/Eq, and standard-library RandomState as BuildRight. It appends complete
+owned matches to one vector per logical left row while streaming right, then
+move-flattens those vectors in left order. Exact legacy left-major/right-minor
+results hold across batch boundaries, Bool/Int64/UInt64/Text keys, NULL,
+duplicates, eager residuals, reordered/repeated/zero-width projections, self
+joins, Heap/LSM, and stale-statistics fixtures. No output is replayed after a
+runtime error, and the fixed-right materialized fallback is unchanged.
+
+Before Phase 70, eligible streaming HashJoin input memory was
+`O(right build + left batch + output)`. It is now
+`O(selected build + streamed batch + output)`, approximately
+`O(min(left, right) + batch + output)` when ANALYZE correctly ranks the sides.
+BuildLeft adds `O(left build rows)` outer output-bucket metadata, which stays
+within the selected build scale; final owned QueryResult memory remains
+unbounded. The choice follows the last ANALYZE snapshot rather than an exact
+runtime count, so stale statistics can choose the actually larger side but
+cannot affect correctness.
+
+The decision is **KEEP**. The implementation remains executor-private, reduces
+the targeted build from 4,096 owned rows to 64, preserves exact semantics, and
+does not change PhysicalPlan, planning, inspection, hashing, storage, public
+APIs, dependencies, or persistent contracts. Phase 71 should move to full
+Sort/spill attribution, a storage-level range visitor only with new workload
+evidence, or larger algorithmic work; HashJoin micro-tuning closes here.
 
 ## CI and compatibility
 
@@ -1961,6 +2032,7 @@ existing all-SeqScan PartitionedScan and retains mixed-access materialization.
 Phase 67 retains only benchmark attribution after rejecting its private pilot.
 Phase 68 changes only executor-private HashJoin key ownership and benchmark
 coverage. Phase 69 adds only executor-private Filter predicate validation and
-evaluation plus benchmark coverage. All seven retain the current Heap metadata
-v4 and every public, inspection, protocol, SDK, and persistent contract. These
-phases add no dependency and no unsafe code.
+evaluation plus benchmark coverage. Phase 70 adds only executor-private
+HashJoin build-side selection and benchmark coverage. All eight retain the
+current Heap metadata v4 and every public, inspection, protocol, SDK, and
+persistent contract. These phases add no dependency and no unsafe code.

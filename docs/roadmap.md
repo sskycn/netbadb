@@ -1648,8 +1648,10 @@ evidence.
 - introduced the executor-private `BoundFilterPredicate`, which first reuses
   `bind_expression` and then conservatively validates column identity and
   field metadata, literal type/nullability, logical/NOT/IS NULL Bool metadata,
-  and comparison compatibility. Successful binding with unsafe metadata stays
-  on eager bound evaluation; binding failure retains the dynamic row-dependent
+  and comparison compatibility. Referenced source columns must additionally
+  agree with the attached storage schema by identity, semantic type, and
+  nullability. Successful binding with unsafe or unproven metadata stays on
+  eager bound evaluation; binding failure retains the dynamic row-dependent
   fallback;
 - recursively skips only the right side of `FALSE AND right` and
   `TRUE OR right`. TRUE AND, FALSE OR, and both UNKNOWN-left cases evaluate the
@@ -1660,7 +1662,8 @@ evidence.
   residual predicates remain eager;
 - proves all 18 AND/OR three-valued combinations against eager evaluation,
   exact right-branch access counts, recursive nested/NOT/IS NULL behavior,
-  metadata-ineligible eager errors, missing-column timing, wrong runtime types,
+  metadata-ineligible eager errors, missing-column timing, coordinated
+  plan/predicate type lies against the runtime schema, wrong runtime types,
   Heap/LSM execution equivalence, and unchanged Join behavior;
 - retains no public API, dependency, unsafe code, planner/compiler rewrite,
   PhysicalPlan or inspection change, protocol/SDK change, or persistent-format
@@ -1676,6 +1679,43 @@ the projected streaming pair was neutral at 1.017x. The mixed absolute movement
 precludes a throughput claim but does not systematically contradict the exact
 skipped-work result.
 
-Phase 70 should prioritize measured dynamic HashJoin build-side selection, a
-full Sort/spill boundary, or a storage-level range visitor. The rejected Phase
-67 column-sidecar design should not be reopened without new evidence.
+## Statistics-Guided Smaller-Side HashJoin Build (Phase 70, complete)
+
+- added exact ANALYZE and direct-plan gates to the asymmetric Int64 and Text
+  HashJoin benchmarks before changing production, plus explicit 64×512 and
+  512×64 no-match controls;
+- added the executor-private `HashJoinBuildSide`. Eligible direct SeqScan ×
+  SeqScan INNER HashJoin builds left only when both last-ANALYZE row counts
+  exist and `left < right`; ties and either missing statistic build right;
+- preserves logical PhysicalPlan left/right and the existing fixed-right
+  materialized fallback. Unsupported metadata rejects specialization before
+  execution, while errors after execution begins propagate without replay;
+- BuildRight retains the historical materialized-right/stream-left output
+  path. BuildLeft materializes left with the same borrowed-key RandomState
+  buckets, streams right in at-most-256-row batches, evaluates the complete
+  eager logical-left/logical-right predicate, and move-flattens per-left output
+  buckets to preserve exact left-major/right-minor order;
+- structural tests prove 64×4096 selects BuildLeft, 4096×64 and the 513×513 tie
+  select BuildRight, missing statistics select BuildRight, and build keys still
+  own zero clones. Equivalence covers batch boundaries, Bool/Int64/UInt64/Text,
+  NULL, duplicates, residuals, projections, self joins, Heap/LSM, and stale
+  statistics;
+- retains PhysicalPlan, planner join-algorithm selection, inspection v3,
+  public/storage/protocol/SDK APIs, persistent formats, dependencies, and safe
+  Rust boundaries.
+
+The decision is **KEEP**. The 64×4096 Int64 no-match median improved 20.8% and
+the corresponding short/long Text cases improved 38.3%/41.5%. The asymmetric
+4096-row ratio moved from 1.276x to 0.851x. Quick-run noise remains visible:
+the unchanged 4096×64 right-build control moved +18.8% while its 512×64 control
+moved -8.4%, and duplicate Text no-match moved +6.7%. The exact reduction from
+4,096 owned build rows to 64 in the targeted orientation and broad semantic
+coverage support KEEP without inventing a ratio threshold.
+
+The choice follows the last ANALYZE `row_count`, not an exact runtime count;
+stale statistics may choose the actually larger side without changing results.
+HashJoin build-side structure closes here. Phase 71 should measure the full
+Sort/spill boundary, or a storage-level range visitor only if new workloads
+justify it, before selecting larger algorithmic work. Do not continue HashJoin
+micro-tuning or reopen the rejected Phase 67 column-sidecar without new
+evidence.

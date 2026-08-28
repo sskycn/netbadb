@@ -3435,6 +3435,7 @@ fn run_join_scenarios(
     }
     run_phase65_hash_join_scenarios(settings, measurements)?;
     run_phase68_hash_join_scenarios(settings, measurements)?;
+    run_phase70_hash_join_scenarios(settings, measurements)?;
     Ok(())
 }
 
@@ -3464,6 +3465,7 @@ fn run_phase65_hash_join_scenarios(
             right_cardinality: build_rows,
             left_key_offset: 0,
             right_key_offset: probe_rows,
+            right_id_required: false,
             sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             expected_ids: &[],
         },
@@ -3475,6 +3477,7 @@ fn run_phase65_hash_join_scenarios(
             right_cardinality: probe_rows,
             left_key_offset: 0,
             right_key_offset: build_rows,
+            right_id_required: false,
             sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             expected_ids: &[],
         },
@@ -3486,6 +3489,7 @@ fn run_phase65_hash_join_scenarios(
             right_cardinality: build_rows,
             left_key_offset: 0,
             right_key_offset: 0,
+            right_id_required: false,
             sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             expected_ids: &unique_ids,
         },
@@ -3497,6 +3501,7 @@ fn run_phase65_hash_join_scenarios(
             right_cardinality: duplicate_cardinality,
             left_key_offset: 0,
             right_key_offset: 0,
+            right_id_required: false,
             sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             expected_ids: &duplicate_ids,
         },
@@ -3508,6 +3513,7 @@ fn run_phase65_hash_join_scenarios(
             right_cardinality: build_rows,
             left_key_offset: 0,
             right_key_offset: 0,
+            right_id_required: true,
             sql: &residual_sql,
             expected_ids: &residual_ids,
         },
@@ -3525,6 +3531,7 @@ struct AsymmetricHashJoinScenario<'a> {
     right_cardinality: u64,
     left_key_offset: u64,
     right_key_offset: u64,
+    right_id_required: bool,
     sql: &'a str,
     expected_ids: &'a [u64],
 }
@@ -3561,12 +3568,25 @@ fn run_asymmetric_hash_join_query(
     )?;
     database.analyze(LEFT_TABLE_ID)?;
     database.analyze(RIGHT_TABLE_ID)?;
+    inspect_analyzed_row_counts(
+        &database,
+        scenario.name,
+        scenario.left_rows,
+        scenario.right_rows,
+    )?;
     let plan = inspect_plan(
         &database,
         scenario.name,
         scenario.sql,
         &[Operator::HashJoin, Operator::SeqScan],
         &[Operator::NestedLoopJoin, Operator::IndexScan],
+    )?;
+    inspect_phase70_hash_join_shape(
+        &database,
+        scenario.name,
+        scenario.sql,
+        PhysicalType::Int64,
+        scenario.right_id_required,
     )?;
     let expected = expected_ids_observation(scenario.expected_ids)?;
     let durations = measure_checked(
@@ -3586,6 +3606,43 @@ fn run_asymmetric_hash_join_query(
         operations_per_iteration: 1,
         durations,
     });
+    Ok(())
+}
+
+fn run_phase70_hash_join_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let small_rows = 64;
+    let large_rows = 512;
+    for scenario in [
+        AsymmetricHashJoinScenario {
+            name: "phase70_hash_join_int_small_left_large_right_none_512",
+            left_rows: small_rows,
+            right_rows: large_rows,
+            left_cardinality: small_rows,
+            right_cardinality: large_rows,
+            left_key_offset: 0,
+            right_key_offset: small_rows,
+            right_id_required: false,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+        AsymmetricHashJoinScenario {
+            name: "phase70_hash_join_int_large_left_small_right_none_512",
+            left_rows: large_rows,
+            right_rows: small_rows,
+            left_cardinality: large_rows,
+            right_cardinality: small_rows,
+            left_key_offset: 0,
+            right_key_offset: large_rows,
+            right_id_required: false,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+    ] {
+        run_asymmetric_hash_join_query(scenario, settings, measurements)?;
+    }
     Ok(())
 }
 
@@ -3724,6 +3781,12 @@ fn run_phase68_text_hash_join_query(
     )?;
     database.analyze(LEFT_TABLE_ID)?;
     database.analyze(RIGHT_TABLE_ID)?;
+    inspect_analyzed_row_counts(
+        &database,
+        scenario.name,
+        scenario.left_rows,
+        scenario.right_rows,
+    )?;
     let plan = inspect_plan(
         &database,
         scenario.name,
@@ -3751,7 +3814,7 @@ fn run_phase68_text_hash_join_query(
     measurements.push(Measurement {
         scenario: scenario.name.to_owned(),
         rows: format!("{}x{}", scenario.left_rows, scenario.right_rows),
-        plan: format!("{plan} [right-build Text/{}]", scenario.key_width),
+        plan: format!("{plan} [logical Text/{}]", scenario.key_width),
         operations_per_iteration: 1,
         durations,
     });
@@ -4432,6 +4495,91 @@ fn inspect_phase68_hash_join_shape(
         return Err(message_error(format!(
             "scenario `{scenario}` does not use the expected direct left-probe/right-build SeqScan columns"
         )));
+    }
+    Ok(())
+}
+
+fn inspect_phase70_hash_join_shape(
+    database: &Database,
+    scenario: &str,
+    sql: &str,
+    key_type: PhysicalType,
+    right_id_required: bool,
+) -> BenchResult<()> {
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    let join = find_hash_join(root)
+        .ok_or_else(|| message_error(format!("scenario `{scenario}` is not HashJoin")))?;
+    let PlanNodeInspection::HashJoin {
+        left_key,
+        right_key,
+        left,
+        right,
+        ..
+    } = join
+    else {
+        return Err(message_error(format!(
+            "scenario `{scenario}` is not HashJoin"
+        )));
+    };
+    let join_key_column = ColumnId(2);
+    let key_type = netbadb_types::SemanticType::physical(key_type);
+    if left_key.table_id != LEFT_TABLE_ID
+        || left_key.column_id != join_key_column
+        || left_key.data_type != key_type
+        || right_key.table_id != RIGHT_TABLE_ID
+        || right_key.column_id != join_key_column
+        || right_key.data_type != key_type
+    {
+        return Err(message_error(format!(
+            "scenario `{scenario}` HashJoin keys do not preserve logical left/right provenance"
+        )));
+    }
+    let expected_left_columns = [ID_COLUMN_ID, join_key_column];
+    let expected_right_columns = if right_id_required {
+        vec![ID_COLUMN_ID, join_key_column]
+    } else {
+        vec![join_key_column]
+    };
+    if !direct_seq_scan_matches(left, LEFT_TABLE_ID, &expected_left_columns)
+        || !direct_seq_scan_matches(right, RIGHT_TABLE_ID, &expected_right_columns)
+    {
+        return Err(message_error(format!(
+            "scenario `{scenario}` does not use the expected direct logical left/right SeqScan columns"
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_analyzed_row_counts(
+    database: &Database,
+    scenario: &str,
+    expected_left_rows: u64,
+    expected_right_rows: u64,
+) -> BenchResult<()> {
+    let catalog = database.inspect_catalog()?;
+    for (table_id, expected_rows) in [
+        (LEFT_TABLE_ID, expected_left_rows),
+        (RIGHT_TABLE_ID, expected_right_rows),
+    ] {
+        let rows = catalog
+            .tables
+            .iter()
+            .find(|table| table.table_id == table_id)
+            .and_then(|table| table.statistics.as_ref())
+            .map(|statistics| statistics.row_count)
+            .ok_or_else(|| {
+                message_error(format!(
+                    "scenario `{scenario}` is missing ANALYZE row_count for table {}",
+                    table_id.0
+                ))
+            })?;
+        if rows != expected_rows {
+            return Err(message_error(format!(
+                "scenario `{scenario}` ANALYZE row_count for table {} was {rows}; expected {expected_rows}",
+                table_id.0
+            )));
+        }
     }
     Ok(())
 }

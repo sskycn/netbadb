@@ -847,20 +847,29 @@ The implementation sequence is intentionally vertical:
     owners while their shared hash buckets borrow `&ScalarValue`. Text build
     keys therefore allocate no second String, NULL remains excluded, and
     ordered right-row index buckets preserve value equality and join order.
-69. Safe Filter AND/OR Short-Circuit — complete; only metadata-validated bound
-    Filter predicates evaluate left to right and skip the right branch for
-    `FALSE AND right` or `TRUE OR right`. UNKNOWN never decides a branch.
-    Metadata-unsafe bound predicates remain eager, binding failures retain the
-    dynamic row-dependent fallback, and Join predicates remain eager.
+69. Safe Filter AND/OR Short-Circuit — complete; only bound Filter predicates
+    whose expression metadata and source columns agree with the attached
+    storage schema evaluate left to right and skip the right branch for `FALSE
+    AND right` or `TRUE OR right`. UNKNOWN never decides a branch. Unproven
+    predicates remain eager, binding failures retain the dynamic row-dependent
+    fallback, and Join predicates remain eager.
+70. Statistics-Guided Smaller-Side HashJoin Build — complete; eligible direct
+    SeqScan × SeqScan INNER HashJoin execution privately reads both sides' last
+    ANALYZE `row_count` and builds the left side only when its estimate is
+    strictly smaller. Ties, either missing statistic, and unsupported metadata
+    preserve the fixed-right behavior. PhysicalPlan keeps logical left/right;
+    BuildLeft buffers owned matches by logical left row before move-flattening,
+    so exact left-major/right-minor order, eager residuals, NULL behavior,
+    borrowed build keys, and the materialized fallback remain unchanged.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. A general typed column-oriented batch
-is not justified by Phase 67. Dynamic HashJoin build-side
-choice/materialization, full batch Sort, spilling, and storage-level
+is not justified by Phase 67. Full batch Sort, spilling, and storage-level
 index/range visitors remain measurement-led candidates. Upstream Top-N
-cancellation is not implemented. HashJoin build-key ownership stops with Phase
-68; general lazy expression semantics are not implemented beyond the
-metadata-gated Phase 69 Filter boundary.
+cancellation is not implemented. HashJoin build-side structure closes with
+Phase 70 rather than continuing into micro-tuning; general lazy expression
+semantics are not implemented beyond the metadata-gated Phase 69 Filter
+boundary.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in

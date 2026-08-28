@@ -438,54 +438,74 @@ and nominal compatibility prevents JOIN from comparing distinct semantic types
 with the same physical encoding. Text still becomes owned once per decoded
 storage row; repeated candidate-level cloning and the separate HashJoin bucket
 key allocation are removed.
-For the planner-produced direct SeqScan × SeqScan INNER shape, HashJoin fixes
-the right child as the build side and streams only the left probe side:
+For the planner-produced direct SeqScan × SeqScan INNER shape, PhysicalPlan
+continues to preserve logical left and right. The executor privately reads each
+table's last ANALYZE `row_count` and chooses the build side without rewriting
+the plan:
 
 ```text
-right/build SeqScan
-   -> full materialized rows
-   -> HashMap<&ScalarValue, Vec<right-row index>>
-
-left/probe SeqScan
-   -> ExecutionBatch, at most 256 rows
-   -> borrow each probe row
-   -> ordered bucket candidates
-   -> complete typed residual predicate
-   -> TRUE only: owned projected output with row_id None
+HashJoin
+   -> read left/right ANALYZE row_count
+   -> left < right?
+      yes                              no / tie / missing statistics
+       |                                |
+       v                                v
+   build left                       build right
+   stream right                     stream left
+       |                                |
+       v                                v
+   outputs_by_left                  direct outputs
+       |                                |
+       +----------> left-major/right-minor result <----------+
 ```
 
-Build and probe NULL keys are skipped because SQL `NULL = NULL` is UNKNOWN.
-The bucket map borrows each logical key directly from the immutable, fully
-materialized right rows and stores ordered indices rather than cloned rows or
-owned keys. Equal values from different Text allocations therefore share one
-logical bucket through `ScalarValue` value Hash/Eq, not pointer identity; the
-first inserted right value remains the borrowed map key. Indices are appended
-in right input order. Probing in left input order therefore preserves
-duplicates and the current deterministic left-major/right-minor behavior. Hash
-iteration order never determines results. This is executor behavior, not an
-unordered SQL result-order guarantee. Bool, Int64, UInt64, and Text use exact
-ScalarValue equality, while semantic compatibility protects nominal types and
-self joins use binding plus column IDs to identify sides.
+The choice follows the last persisted ANALYZE snapshot; it is not an exact
+runtime cardinality measurement. A stale estimate may select the actually
+larger side but cannot change results. Strict comparison deliberately makes
+ties build right, and either missing statistic also preserves the historical
+right-build path. No ratio threshold, planner field, join reorder, or
+inspection contract participates in the choice.
 
-The right rows and borrowed map are separate local variables rather than a
-self-referential owner. Right rows remain immobile and immutable from bucket
-construction through the complete probe and output projection. QueryResult
-values remain fully owned; projecting a right Text value still clones or moves
+Build and streamed NULL keys are skipped because SQL `NULL = NULL` is UNKNOWN.
+The bucket map borrows each logical key directly from the immutable, fully
+materialized selected build rows and stores ordered indices rather than cloned
+rows or owned keys. Equal values from different Text allocations therefore
+share one logical bucket through `ScalarValue` value Hash/Eq, not pointer
+identity; the first inserted build value remains the borrowed map key. Hash
+iteration order never determines results. Bool, Int64, UInt64, and Text use
+exact ScalarValue equality, while semantic compatibility protects nominal
+types and self joins use binding plus column IDs to identify sides.
+
+BuildRight retains the existing direct output path: left rows stream in input
+order and ordered right indices produce right-minor order. BuildLeft streams
+right rows in at-most-256-row batches and appends each owned match to a private
+bucket for its materialized logical-left row. Moving those buckets out in left
+row order restores the same exact left-major/right-minor output, including
+duplicates, reordered or repeated projections, and zero-width output. This is
+executor behavior, not an unordered SQL result-order guarantee.
+
+The selected build rows and borrowed map are separate local variables rather
+than a self-referential owner. Build rows remain immobile and immutable from
+bucket construction through the complete stream and output projection.
+QueryResult values remain fully owned; projecting a Text value still creates
 the required output owner independently of the borrowed lookup key.
 
-HashJoin setup resolves both key positions, joined predicate positions, and
-output positions from physical metadata before executing the right child. Only
-the current direct-scan INNER shape enters this path. Unsupported or malformed
-setup retains the authoritative left-then-right materialized implementation;
-once build or probe execution starts, runtime and storage errors propagate
-without replay. Both sides use the statement's existing read views, including
-self joins. The input-side intermediate boundary changes from
-`O(left input + right input + hash metadata)` to
-`O(right build input + hash metadata + 256-row probe batch)`. HashJoin does not
-yet bound the fully owned final output or right/build-side memory. Phase 68
-removes only the map-owned `ScalarValue` key and, for Text, its second String
-allocation. Expected build/probe complexity remains `O(right)`/`O(left)` and
-the standard-library RandomState hashing algorithm is unchanged.
+HashJoin setup resolves both key positions, joined predicate positions, output
+positions, storage schema identity, and available row-count snapshots before
+executing either selected side. Only the current direct-scan INNER shape enters
+this path. Unsupported or malformed setup retains the authoritative
+left-then-right, fixed-right materialized implementation; once build or stream
+execution starts, runtime and storage errors propagate without replay. Both
+sides use the statement's existing read views, including self joins.
+
+The input-side intermediate boundary is
+`O(selected build + hash metadata + 256-row streamed batch + output)`, or
+approximately `O(min(left, right) + batch + output)` when ANALYZE correctly
+ranks the sides. BuildLeft additionally owns one outer output bucket per
+materialized left row; that `O(left build rows)` metadata is within the selected
+build scale, while the fully owned final output remains unbounded. Phase 68's
+borrowed keys, standard-library RandomState HashMap, complete eager residual,
+and expected linear build/stream work are unchanged.
 
 Query operators are arranged as
 `Scan/Join -> Filter -> Sort -> Project -> Limit`, allowing sorting by source
@@ -838,6 +858,7 @@ Filter Expr + source-order OutputFields
 bind positions once
         ↓
 conservatively validate expression metadata
+and source columns against attached storage schemas
         ↓
 BoundFilterPredicate
        safe?
@@ -852,11 +873,15 @@ right 3VL
 The validator checks resolved source identity, column and output-field type and
 nullability agreement, literal type/nullability, Bool operands and results for
 AND/OR and NOT, non-null Bool results for IS NULL, and compatible comparison
-operands with Bool result metadata. Any uncertainty makes the predicate
-ineligible; it does not make binding fail. Consequently the three existing
-states remain distinct: binding failure uses the dynamic row-dependent
-fallback, successful but metadata-unsafe binding uses the existing eager bound
-evaluator, and only metadata-safe binding uses the short-circuit evaluator.
+operands with Bool result metadata. Before evaluation, every referenced source
+column must also match the attached `TableStorage` schema by table and column
+identity, semantic type, and nullability. This separate proof prevents a
+hand-built plan and predicate from consistently misdescribing the same runtime
+value. Any uncertainty makes the predicate ineligible; it does not make binding
+fail. Consequently the three existing states remain distinct: binding failure
+uses the dynamic row-dependent fallback, successful but unproven binding uses
+the existing eager bound evaluator, and only fully qualified binding uses the
+short-circuit evaluator.
 
 The short-circuit evaluator is recursive through nested logical expressions,
 NOT, and IS NULL. It skips only `FALSE AND right` and `TRUE OR right`.
@@ -1199,9 +1224,11 @@ state and releases it. Bounded Top-N is a third consumer for the existing
 `Limit -> Project -> Sort` shape: it drains complete owned rows into a
 worst-first heap of at most K candidates and never cancels its child, because
 later rows may rank earlier. Eligible direct-scan HashJoin is a fourth consumer:
-it materializes and hashes the fixed right build child, then borrows left rows
-from each batch for key lookup, complete residual evaluation, and owned output
-projection before the producer clears the batch. Ordinary batch Limit
+it materializes and hashes the strictly smaller ANALYZE-estimated side, or the
+right side on ties or missing statistics, then borrows the other side from each
+batch for key lookup and complete residual evaluation. BuildRight emits owned
+output directly; BuildLeft buffers owned matches by logical left row and
+move-flattens them after the producer clears the last batch. Ordinary batch Limit
 cancellation stops the
 storage consumer after the current bounded batch; later physical rows are
 deliberately not requested.
