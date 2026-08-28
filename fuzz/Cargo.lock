@@ -170,6 +170,7 @@ dependencies = [
  "libfuzzer-sys",
  "netbadb-core",
  "netbadb-index",
+ "netbadb-pgwire",
  "netbadb-protocol",
  "netbadb-schema",
  "netbadb-storage",
@@ -203,6 +204,13 @@ dependencies = [
 [[package]]
 name = "netbadb-parser"
 version = "0.1.0"
+
+[[package]]
+name = "netbadb-pgwire"
+version = "0.1.0"
+dependencies = [
+ "netbadb-types",
+]
 
 [[package]]
 name = "netbadb-planner"

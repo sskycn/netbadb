@@ -367,6 +367,32 @@ TLS establishes identity before Hello.
 Protocol v1 remains byte-for-byte unchanged and maps operation denials to its
 generic Database error code.
 
+### PostgreSQL Compatibility Foundation — phase 1 (experimental)
+
+- added a real `netbadb-pgwire` boundary with bounded PostgreSQL v3 startup and
+  frontend codecs, typed backend messages, centralized OID/format adaptation,
+  malformed/truncated input rejection, and no execution dependency;
+- added `netbadbd --postgres` as an exclusive loopback listener mode without
+  changing deployment manifest v4 or native Protocol v1;
+- shared synchronous transaction execution and disconnect cleanup between the
+  native and PostgreSQL session adapters while keeping PostgreSQL prepared,
+  portal, Sync-recovery, and failed-transaction behavior in the adapter;
+- completed Simple Query for the existing NetbaDB SQL subset, multi-statement
+  transaction batches, RowDescription/DataRow/CommandComplete/ErrorResponse,
+  text BOOL/INT8/TEXT/NULL, stable SQLSTATE mapping, and a small explicit set
+  of connection compatibility SHOW/functions;
+- completed named and unnamed zero-parameter Parse/Bind/Describe/Execute/Sync/
+  Close/Flush lifecycle, including bounded portal suspension and replacement
+  rules. Compiler-level typed `$n` parameters and all binary formats remain
+  rejected explicitly rather than being implemented with SQL text replacement;
+- added raw real-TCP startup, simple CRUD, transactions, failed transactions,
+  extended query, portal/statement close, SSL refusal, CancelRequest, and
+  compatibility-query integration coverage.
+
+The phase is a foundation, not a general compatibility claim. P1 typed
+parameters, simultaneous listeners, and TLS; P2 catalog-derived `pg_catalog`
+and `information_schema`; and P3 broader PostgreSQL SQL remain open.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

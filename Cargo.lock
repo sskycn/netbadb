@@ -303,6 +303,13 @@ name = "netbadb-parser"
 version = "0.1.0"
 
 [[package]]
+name = "netbadb-pgwire"
+version = "0.1.0"
+dependencies = [
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-planner"
 version = "0.1.0"
 dependencies = [
@@ -358,7 +365,10 @@ dependencies = [
 name = "netbadb-server"
 version = "0.1.0"
 dependencies = [
+ "netbadb-compiler",
  "netbadb-core",
+ "netbadb-parser",
+ "netbadb-pgwire",
  "netbadb-protocol",
  "netbadb-schema",
  "netbadb-storage",

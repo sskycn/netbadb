@@ -114,6 +114,7 @@ netbadb/
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
+│   ├── netbadb-pgwire/      bounded PostgreSQL v3 codecs and OID adaptation
 │   ├── netbadb-client/      synchronous Protocol v1 remote client
 │   ├── netbadb-inspect/     stable inspection DTOs and deterministic text
 │   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
@@ -148,8 +149,9 @@ storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + inspect + planner + rel + executor + storage + schema + types
 protocol -> types
+pgwire -> types
 client -> protocol + schema + types
-server -> core + protocol + schema + types
+server -> core + protocol + pgwire + schema + types
 netbadbd -> server
 netbadb CLI -> Rust SDK embedded + server + serde + serde_json
 netbadb-lsp -> tooling + schema-spec + lsp-server + lsp-types
@@ -226,6 +228,10 @@ The current code genuinely supports:
   three-valued boolean logic, and NULL comparisons;
 - versioned protocol v1 framing, schema-fingerprint handshake, streamed query
   response messages, bounded synchronous codecs, and stable wire errors;
+- experimental PostgreSQL v3 wire framing with bounded Startup, SSLRequest,
+  CancelRequest, Simple Query, and zero-parameter Extended Query codecs,
+  centralized OID/text-value adaptation, SQLSTATE mapping, named statement and
+  portal lifecycles, and PostgreSQL failed-transaction session behavior;
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
@@ -260,6 +266,14 @@ input contract is documented in
 retained as historical documentation and rejected by current
 `netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
 database worker authorizes compiler-resolved TableIds before execution.
+
+Experimental PostgreSQL wire mode is documented in
+[`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
+`netbadbd --manifest server.json --postgres` to use the manifest's listen
+address as a loopback PostgreSQL endpoint. This first foundation is not a
+claim of general PostgreSQL compatibility: typed `$n` parameters, binary
+formats, TLS, `pg_catalog`, `information_schema`, and simultaneous native plus
+PostgreSQL listeners remain unsupported.
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

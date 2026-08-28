@@ -15,6 +15,7 @@ members = [
     "crates/netbadb-executor",
     "crates/netbadb-core",
     "crates/netbadb-protocol",
+    "crates/netbadb-pgwire",
     "crates/netbadb-client",
     "crates/netbadb-inspect",
     "crates/netbadb-server",

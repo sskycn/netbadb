@@ -34,6 +34,11 @@ three independent LSM v1 codecs. Inputs and persistent counts/lengths are
 bounded before allocation; malformed checksums, keys, versions, tombstones,
 and block boundaries return typed errors.
 
+`pgwire_decode` uses one selector byte to exercise either bounded PostgreSQL v3
+startup decoding or tagged frontend-message decoding. Arbitrary lengths,
+counts, C strings, UTF-8, format codes, parameters, and message tags must return
+a typed error without panic or unbounded allocation.
+
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 
 ```bash
@@ -42,6 +47,7 @@ cargo +nightly fuzz run wal_recovery -- -runs=1000
 cargo +nightly fuzz run page_decode -- -runs=1000
 cargo +nightly fuzz run btree_decode -- -runs=1000
 cargo +nightly fuzz run index_catalog_decode -- -runs=1000
+cargo +nightly fuzz run pgwire_decode -- -runs=1000
 cargo +nightly fuzz run coordinator_log_decode -- -runs=1000
 cargo +nightly fuzz run partition_catalog_decode -- -runs=1000
 cargo +nightly fuzz run lsm_manifest_decode -- -runs=1000

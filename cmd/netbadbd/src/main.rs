@@ -5,10 +5,9 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use netbadb_server::{ServerConfig, TcpServer};
+use netbadb_server::{PostgresTcpServer, ServerConfig, TcpServer};
 
-const HELP: &str =
-    "Usage: netbadbd --manifest <path>\n\nStarts the manifest-configured NetbaDB TCP server.";
+const HELP: &str = "Usage: netbadbd --manifest <path> [--postgres]\n\nStarts the manifest-configured native server, or the experimental PostgreSQL wire listener with --postgres.";
 
 fn main() -> ExitCode {
     match parse_args(env::args_os().skip(1)) {
@@ -20,7 +19,7 @@ fn main() -> ExitCode {
             println!("netbadbd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(Action::Run { manifest }) => match run_server(manifest) {
+        Ok(Action::Run { manifest, postgres }) => match run_server(manifest, postgres) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("netbadbd: {error}");
@@ -34,9 +33,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_server(manifest: PathBuf) -> Result<(), Box<dyn Error>> {
+fn run_server(manifest: PathBuf, postgres: bool) -> Result<(), Box<dyn Error>> {
     let config = ServerConfig::from_manifest_path(manifest)?;
     let max_connections = config.limits().max_connections();
+    if postgres {
+        let server = PostgresTcpServer::new(config).start()?;
+        eprintln!(
+            "netbadbd experimental PostgreSQL listener on {}, max {} connections, transport plaintext-loopback",
+            server.local_addr(),
+            max_connections,
+        );
+        server.wait()?;
+        return Ok(());
+    }
     let server = TcpServer::new(config).start()?;
     eprintln!(
         "netbadbd listening on {} with {} table(s), max {} connections, transport {}",
@@ -51,32 +60,44 @@ fn run_server(manifest: PathBuf) -> Result<(), Box<dyn Error>> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Run { manifest: PathBuf },
+    Run { manifest: PathBuf, postgres: bool },
     Help,
     Version,
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, CliError> {
-    let mut arguments = arguments.into_iter();
-    let Some(first) = arguments.next() else {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let Some(first) = arguments.first() else {
         return Err(CliError::ManifestRequired);
     };
     if first == "--help" || first == "-h" {
-        return no_extra_arguments(arguments, Action::Help);
+        return no_extra_arguments(arguments.into_iter().skip(1), Action::Help);
     }
     if first == "--version" || first == "-V" {
-        return no_extra_arguments(arguments, Action::Version);
+        return no_extra_arguments(arguments.into_iter().skip(1), Action::Version);
     }
-    if first != "--manifest" {
-        return Err(CliError::UnknownArgument(first));
+    let mut manifest = None;
+    let mut postgres = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].to_str() {
+            Some("--manifest") => {
+                if manifest.is_some() {
+                    return Err(CliError::UnexpectedArgument(arguments[index].clone()));
+                }
+                index += 1;
+                let value = arguments.get(index).ok_or(CliError::ManifestPathRequired)?;
+                manifest = Some(PathBuf::from(value));
+            }
+            Some("--postgres") if !postgres => postgres = true,
+            _ => return Err(CliError::UnknownArgument(arguments[index].clone())),
+        }
+        index += 1;
     }
-    let manifest = arguments.next().ok_or(CliError::ManifestPathRequired)?;
-    no_extra_arguments(
-        arguments,
-        Action::Run {
-            manifest: PathBuf::from(manifest),
-        },
-    )
+    Ok(Action::Run {
+        manifest: manifest.ok_or(CliError::ManifestRequired)?,
+        postgres,
+    })
 }
 
 fn no_extra_arguments(
@@ -133,7 +154,15 @@ mod tests {
         assert_eq!(
             parse_args(args(&["--manifest", "server.json"])).unwrap(),
             Action::Run {
-                manifest: PathBuf::from("server.json")
+                manifest: PathBuf::from("server.json"),
+                postgres: false,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["--postgres", "--manifest", "server.json"])).unwrap(),
+            Action::Run {
+                manifest: PathBuf::from("server.json"),
+                postgres: true,
             }
         );
     }
@@ -152,7 +181,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_args(args(&["--manifest", "a", "b"])),
-            Err(CliError::UnexpectedArgument(_))
+            Err(CliError::UnknownArgument(_))
         ));
     }
 }

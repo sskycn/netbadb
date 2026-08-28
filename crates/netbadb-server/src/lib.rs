@@ -4,6 +4,7 @@ mod authorization;
 mod limits;
 mod manifest;
 mod metrics;
+mod postgres;
 mod runtime;
 mod tls;
 
@@ -27,6 +28,7 @@ pub use limits::{
 };
 pub use manifest::{ManifestError, ServerConfig, TableBootstrap};
 pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
+pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
 pub use tls::{AuthenticatedClientIdentity, ClientIdentity, TlsConfigError, TransportKind};
 
@@ -126,10 +128,103 @@ impl From<ProtocolError> for ServerError {
 }
 
 #[derive(Debug, Default)]
-pub struct SessionState {
-    handshaken: bool,
+pub(crate) struct DatabaseSession {
     transaction: Option<DatabaseTransaction>,
     policy: SessionPolicy,
+}
+
+impl DatabaseSession {
+    fn with_policy(policy: SessionPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    fn transaction_state(&self) -> WireTransactionState {
+        self.transaction
+            .as_ref()
+            .map_or(WireTransactionState::None, |transaction| {
+                wire_transaction_state(transaction.state())
+            })
+    }
+
+    fn execute(
+        &mut self,
+        database: &mut Database,
+        sql: &str,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        let result = match self.transaction.as_mut() {
+            Some(transaction) => database.execute_in(transaction, sql),
+            None => database.execute(sql),
+        };
+        if self.transaction.as_ref().is_some_and(|transaction| {
+            matches!(
+                transaction.state(),
+                TransactionState::Committed | TransactionState::RolledBack
+            )
+        }) {
+            self.transaction = None;
+        }
+        result
+    }
+
+    fn begin(
+        &mut self,
+        database: &mut Database,
+        table_id: Option<netbadb_types::TableId>,
+    ) -> Result<(), DatabaseError> {
+        let transaction = match table_id {
+            Some(table_id) => database.begin_transaction_for(table_id)?,
+            None => database.begin_transaction()?,
+        };
+        self.transaction = Some(transaction);
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<(), DatabaseError> {
+        let transaction = self
+            .transaction
+            .as_mut()
+            .ok_or(DatabaseError::ExpectedQuery)?;
+        transaction.commit().map_err(DatabaseError::from)?;
+        self.transaction = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), DatabaseError> {
+        let transaction = self
+            .transaction
+            .as_mut()
+            .ok_or(DatabaseError::ExpectedQuery)?;
+        transaction.rollback().map_err(DatabaseError::from)?;
+        self.transaction = None;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), ServerError> {
+        let Some(transaction) = self.transaction.as_mut() else {
+            return Ok(());
+        };
+        if matches!(
+            transaction.state(),
+            TransactionState::Committed | TransactionState::RolledBack
+        ) {
+            self.transaction = None;
+            return Ok(());
+        }
+        transaction
+            .rollback()
+            .map_err(|error| ServerError::Database(DatabaseError::from(error)))?;
+        self.transaction = None;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SessionState {
+    handshaken: bool,
+    execution: DatabaseSession,
 }
 
 impl SessionState {
@@ -141,7 +236,7 @@ impl SessionState {
     #[must_use]
     pub fn with_policy(policy: SessionPolicy) -> Self {
         Self {
-            policy,
+            execution: DatabaseSession::with_policy(policy),
             ..Self::default()
         }
     }
@@ -153,11 +248,7 @@ impl SessionState {
 
     #[must_use]
     pub fn transaction_state(&self) -> WireTransactionState {
-        self.transaction
-            .as_ref()
-            .map_or(WireTransactionState::None, |transaction| {
-                wire_transaction_state(transaction.state())
-            })
+        self.execution.transaction_state()
     }
 
     /// Processes exactly one request. Every response message in the batch uses
@@ -220,7 +311,7 @@ impl SessionState {
             ClientMessage::Commit => self.commit(),
             ClientMessage::Rollback => self.rollback(),
             ClientMessage::Analyze { table_id } => {
-                if self.transaction.is_some() {
+                if self.execution.transaction.is_some() {
                     Err(SessionFailure::fixed(
                         ProtocolErrorCode::OperationNotAllowedInTransaction,
                         "ANALYZE is not allowed while the session owns a transaction",
@@ -251,21 +342,7 @@ impl SessionState {
     /// Resolves a session-owned transaction before a transport disconnect.
     /// A failed rollback leaves the transaction available for retry.
     pub fn close(&mut self) -> Result<(), ServerError> {
-        let Some(transaction) = self.transaction.as_mut() else {
-            return Ok(());
-        };
-        if matches!(
-            transaction.state(),
-            TransactionState::Committed | TransactionState::RolledBack
-        ) {
-            self.transaction = None;
-            return Ok(());
-        }
-        transaction
-            .rollback()
-            .map_err(|error| ServerError::Database(DatabaseError::from(error)))?;
-        self.transaction = None;
-        Ok(())
+        self.execution.close()
     }
 
     fn execute(
@@ -273,22 +350,13 @@ impl SessionState {
         database: &mut Database,
         sql: &str,
     ) -> Result<Vec<ServerMessage>, SessionFailure> {
-        let result = match self.transaction.as_mut() {
-            Some(transaction) => database.execute_in(transaction, sql),
-            None => database.execute(sql),
-        };
-        if self.transaction.as_ref().is_some_and(|transaction| {
-            matches!(
-                transaction.state(),
-                TransactionState::Committed | TransactionState::RolledBack
-            )
-        }) {
-            self.transaction = None;
-        }
-        let result = result.map_err(SessionFailure::Database)?;
+        let result = self
+            .execution
+            .execute(database, sql)
+            .map_err(SessionFailure::Database)?;
         match result {
             ExecutionResult::Query(query) => {
-                build_query_messages(query, self.policy.max_result_rows())
+                build_query_messages(query, self.execution.policy.max_result_rows())
                     .map_err(SessionFailure::Server)
             }
             ExecutionResult::AffectedRows(count) => Ok(vec![ServerMessage::AffectedRows { count }]),
@@ -300,44 +368,39 @@ impl SessionState {
         database: &mut Database,
         table_id: netbadb_types::TableId,
     ) -> Result<Vec<ServerMessage>, SessionFailure> {
-        if self.transaction.is_some() {
+        if self.execution.transaction.is_some() {
             return Err(SessionFailure::fixed(
                 ProtocolErrorCode::TransactionAlreadyActive,
                 "session already owns a transaction",
             ));
         }
-        let transaction = database
-            .begin_transaction_for(table_id)
+        self.execution
+            .begin(database, Some(table_id))
             .map_err(SessionFailure::Database)?;
-        self.transaction = Some(transaction);
         Ok(vec![ServerMessage::TransactionStarted])
     }
 
     fn commit(&mut self) -> Result<Vec<ServerMessage>, SessionFailure> {
-        let Some(transaction) = self.transaction.as_mut() else {
+        if self.execution.transaction.is_none() {
             return Err(SessionFailure::fixed(
                 ProtocolErrorCode::NoActiveTransaction,
                 "session has no active transaction to commit",
             ));
-        };
-        transaction
-            .commit()
-            .map_err(|error| SessionFailure::Database(DatabaseError::from(error)))?;
-        self.transaction = None;
+        }
+        self.execution.commit().map_err(SessionFailure::Database)?;
         Ok(vec![ServerMessage::TransactionCommitted])
     }
 
     fn rollback(&mut self) -> Result<Vec<ServerMessage>, SessionFailure> {
-        let Some(transaction) = self.transaction.as_mut() else {
+        if self.execution.transaction.is_none() {
             return Err(SessionFailure::fixed(
                 ProtocolErrorCode::NoActiveTransaction,
                 "session has no active transaction to roll back",
             ));
-        };
-        transaction
+        }
+        self.execution
             .rollback()
-            .map_err(|error| SessionFailure::Database(DatabaseError::from(error)))?;
-        self.transaction = None;
+            .map_err(SessionFailure::Database)?;
         Ok(vec![ServerMessage::TransactionRolledBack])
     }
 

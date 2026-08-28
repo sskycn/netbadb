@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use netbadb_compiler::{CompileError, CompiledStatement, compile_statement};
+use netbadb_compiler::{CompileError, CompileErrorKind, CompiledStatement, compile_statement};
 use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
     execute_with_storage_context, prepare_mutation_with_storage_context,
@@ -187,6 +187,13 @@ pub struct StatementAccess {
     write_tables: Vec<TableId>,
 }
 
+/// Typed output metadata obtained without executing a statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementDescription {
+    pub columns: Vec<ResultColumn>,
+    pub is_query: bool,
+}
+
 impl StatementAccess {
     #[must_use]
     pub fn read_tables(&self) -> &[TableId] {
@@ -240,6 +247,71 @@ pub enum DatabaseError {
         cleanup_path: PathBuf,
         cleanup: std::io::Error,
     },
+}
+
+/// Transport-neutral diagnostic categories exposed at the database boundary.
+///
+/// Frontends use these stable semantic categories to map errors into their own
+/// protocol without inspecting compiler enums or parsing human messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseErrorKind {
+    Syntax,
+    UndefinedTable,
+    UndefinedColumn,
+    AmbiguousColumn,
+    DatatypeMismatch,
+    NotNullViolation,
+    FeatureNotSupported,
+    TransactionState,
+    Operational,
+    Internal,
+}
+
+impl DatabaseError {
+    #[must_use]
+    pub const fn kind(&self) -> DatabaseErrorKind {
+        match self {
+            Self::Compile(error) => match error.kind() {
+                CompileErrorKind::Syntax => DatabaseErrorKind::Syntax,
+                CompileErrorKind::UndefinedTable => DatabaseErrorKind::UndefinedTable,
+                CompileErrorKind::UndefinedColumn => DatabaseErrorKind::UndefinedColumn,
+                CompileErrorKind::AmbiguousColumn => DatabaseErrorKind::AmbiguousColumn,
+                CompileErrorKind::DatatypeMismatch => DatabaseErrorKind::DatatypeMismatch,
+                CompileErrorKind::NotNullViolation => DatabaseErrorKind::NotNullViolation,
+                CompileErrorKind::FeatureNotSupported => DatabaseErrorKind::FeatureNotSupported,
+            },
+            Self::Transaction(_) => DatabaseErrorKind::TransactionState,
+            Self::Schema(_)
+            | Self::Storage(_)
+            | Self::Registry(_)
+            | Self::CoordinatorLog(_)
+            | Self::Partition(_)
+            | Self::DuplicateStoragePath(_)
+            | Self::CoordinatorPathConflictsWithStorage(_)
+            | Self::CreateTablesRollback { .. } => DatabaseErrorKind::Operational,
+            Self::ExpectedQuery | Self::TableSelectionRequired => {
+                DatabaseErrorKind::FeatureNotSupported
+            }
+            Self::Execution(_)
+            | Self::EmptyCatalog
+            | Self::MissingCommitParticipant { .. }
+            | Self::PreparedParticipantMismatch { .. }
+            | Self::InspectionStorageMissing { .. }
+            | Self::InspectionIndexColumnMissing { .. }
+            | Self::InspectionRegistrationOrderOverflow { .. } => DatabaseErrorKind::Internal,
+        }
+    }
+
+    /// Returns a one-based source byte position when the compiler identified
+    /// an exact failing syntax or semantic node.
+    #[must_use]
+    pub fn source_position(&self) -> Option<u32> {
+        let zero_based = match self {
+            Self::Compile(error) => error.span().start,
+            _ => return None,
+        };
+        u32::try_from(zero_based).ok()?.checked_add(1)
+    }
 }
 
 impl fmt::Display for DatabaseError {
@@ -1278,6 +1350,31 @@ impl Database {
         Ok(StatementAccess {
             read_tables: compiled.logical_statement.read_tables(),
             write_tables: compiled.logical_statement.write_tables(),
+        })
+    }
+
+    /// Compiles and plans a statement and exposes only transport-neutral output
+    /// metadata. No transaction starts and no storage row is read or written.
+    pub fn describe_statement(&self, source: &str) -> Result<StatementDescription, DatabaseError> {
+        let (_, physical) = self.compile_and_plan(source)?;
+        let PhysicalStatement::Query(plan) = physical else {
+            return Ok(StatementDescription {
+                columns: Vec::new(),
+                is_query: false,
+            });
+        };
+        let columns = plan
+            .output_fields()
+            .into_iter()
+            .map(|field| ResultColumn {
+                name: field.name().to_owned(),
+                data_type: field.data_type().clone(),
+                nullable: field.nullable(),
+            })
+            .collect();
+        Ok(StatementDescription {
+            columns,
+            is_query: true,
         })
     }
 

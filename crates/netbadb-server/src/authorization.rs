@@ -122,6 +122,12 @@ impl PrincipalAuthorization {
             .iter()
             .any(|permissions| permissions.table_id == table_id)
     }
+
+    pub(crate) fn can_start_transaction(&self) -> bool {
+        self.tables
+            .iter()
+            .any(|permissions| permissions.allows(AuthorizationAction::Transaction))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

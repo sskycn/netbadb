@@ -35,6 +35,61 @@ pub enum CompileError {
     Hir(HirError),
 }
 
+/// Frontend-neutral semantic category for a failed compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileErrorKind {
+    Syntax,
+    UndefinedTable,
+    UndefinedColumn,
+    AmbiguousColumn,
+    DatatypeMismatch,
+    NotNullViolation,
+    FeatureNotSupported,
+}
+
+impl CompileError {
+    #[must_use]
+    pub const fn kind(&self) -> CompileErrorKind {
+        match self {
+            Self::Parse(_) => CompileErrorKind::Syntax,
+            Self::Hir(error) => match error {
+                HirError::UnknownTable { .. } => CompileErrorKind::UndefinedTable,
+                HirError::UnknownColumn { .. } | HirError::UnknownRelationQualifier { .. } => {
+                    CompileErrorKind::UndefinedColumn
+                }
+                HirError::AmbiguousColumn { .. } | HirError::DuplicateRelationName { .. } => {
+                    CompileErrorKind::AmbiguousColumn
+                }
+                HirError::NullNotAllowed { .. } | HirError::MissingRequiredColumn { .. } => {
+                    CompileErrorKind::NotNullViolation
+                }
+                HirError::WildcardNotSupportedWithGroupBy { .. }
+                | HirError::OrderByNotSupportedWithGrouping { .. } => {
+                    CompileErrorKind::FeatureNotSupported
+                }
+                HirError::TooManyRelations { .. }
+                | HirError::TypeMismatch { .. }
+                | HirError::IncompatibleComparison { .. }
+                | HirError::CannotInferNullType { .. }
+                | HirError::DuplicateColumn { .. }
+                | HirError::ValueCountMismatch { .. }
+                | HirError::InsertValueReferencesColumn { .. }
+                | HirError::UngroupedColumn { .. }
+                | HirError::InvalidAggregateArgument { .. }
+                | HirError::InvalidAggregateType { .. } => CompileErrorKind::DatatypeMismatch,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> netbadb_parser::Span {
+        match self {
+            Self::Parse(error) => error.span,
+            Self::Hir(error) => error.span(),
+        }
+    }
+}
+
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
