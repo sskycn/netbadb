@@ -1624,9 +1624,9 @@ fn execute_hash_join_materialized(
         .collect::<Vec<_>>();
     let bound_predicate = bind_expression(predicate, &joined_fields)?;
     let mut rows = Vec::new();
-    for left_row in &left.rows {
+    for left_row in left.rows {
         probe_hash_join_row(
-            left_row,
+            &left_row,
             left_key_position,
             left_key,
             &right,
