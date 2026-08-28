@@ -595,7 +595,7 @@ impl<'a> TopNState<'a> {
 }
 
 enum BatchOperator<'a> {
-    Filter(BoundExpr<'a>),
+    Filter(BoundFilterPredicate<'a>),
     Project(ProjectionPlan),
     Limit { remaining: usize },
 }
@@ -927,7 +927,7 @@ fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>
             let Some(mut pipeline) = build_batch_pipeline(input)? else {
                 return Ok(None);
             };
-            let Ok(predicate) = bind_expression(predicate, &pipeline.fields) else {
+            let Ok(predicate) = bind_filter_predicate(predicate, &pipeline.fields) else {
                 // Malformed hand-built plans retain the legacy evaluator's
                 // row-dependent error behavior (including an empty input).
                 return Ok(None);
@@ -1206,8 +1206,10 @@ fn process_execution_batch(
                     if evaluation_error.is_some() {
                         return false;
                     }
-                    match evaluate_bound_truth(predicate, EvaluationValues::Contiguous(&row.values))
-                    {
+                    match evaluate_filter_bound_truth(
+                        predicate,
+                        EvaluationValues::Contiguous(&row.values),
+                    ) {
                         Ok(TruthValue::True) => true,
                         Ok(TruthValue::False | TruthValue::Unknown) => false,
                         Err(error) => {
@@ -1526,12 +1528,12 @@ fn execute_rows_legacy_with_views(
             }
             let mut result = execute_rows_legacy_with_views(input, bindings, storages, read_views)?;
             let fields = result.fields.clone();
-            result.rows = match bind_expression(predicate, &fields) {
+            result.rows = match bind_filter_predicate(predicate, &fields) {
                 Ok(bound_predicate) => result
                     .rows
                     .into_iter()
                     .filter_map(|row| {
-                        match evaluate_bound_truth(
+                        match evaluate_filter_bound_truth(
                             &bound_predicate,
                             EvaluationValues::Contiguous(&row.values),
                         ) {
@@ -2676,7 +2678,7 @@ fn execute_streaming_seq_filter_with_projection(
     let storage = storage_for_table(bindings, storages, plan.table_id)?;
     let mut rows = Vec::new();
     let mut pending_predicate_error = None;
-    match bind_expression(plan.predicate, &predicate_fields) {
+    match bind_filter_predicate(plan.predicate, &predicate_fields) {
         Ok(bound_predicate) => {
             storage.visit_row_scalar_refs_with_presence_view::<ExecutionError, _>(
                 &column_ids,
@@ -2727,7 +2729,7 @@ fn execute_streaming_seq_filter_with_projection(
 }
 
 fn collect_streaming_filter_row(
-    predicate: &BoundExpr<'_>,
+    predicate: &BoundFilterPredicate<'_>,
     output_positions: &[usize],
     row_id: Option<StorageRowHandle>,
     values: &[ScalarRef<'_>],
@@ -2738,7 +2740,7 @@ fn collect_streaming_filter_row(
         return;
     }
     collect_evaluated_streaming_filter_row(
-        evaluate_bound_scalar_ref_truth(predicate, values),
+        evaluate_filter_bound_scalar_ref_truth(predicate, values),
         output_positions,
         row_id,
         values,
@@ -3015,7 +3017,7 @@ fn try_execute_filtered_counts(
         .iter()
         .map(|column| OutputField::Source((*column).clone()))
         .collect::<Vec<_>>();
-    let bound_predicate = bind_expression(plan.predicate, &predicate_fields)?;
+    let bound_predicate = bind_filter_predicate(plan.predicate, &predicate_fields)?;
     let mut summary = FilteredCountSummary {
         qualified_rows: 0,
         non_null_counts: vec![0; plan.presence_columns.len()],
@@ -3027,7 +3029,9 @@ fn try_execute_filtered_counts(
             &presence_column_ids,
             view,
             |values, presence| {
-                if evaluate_bound_scalar_ref_truth(&bound_predicate, values)? == TruthValue::True {
+                if evaluate_filter_bound_scalar_ref_truth(&bound_predicate, values)?
+                    == TruthValue::True
+                {
                     update_filtered_count_summary(&plan, &mut summary, presence)?;
                 }
                 Ok(())
@@ -3903,6 +3907,11 @@ struct BoundExpr<'a> {
     kind: BoundExprKind<'a>,
 }
 
+struct BoundFilterPredicate<'a> {
+    expression: BoundExpr<'a>,
+    short_circuit_safe: bool,
+}
+
 enum BoundExprKind<'a> {
     Column {
         position: usize,
@@ -3959,6 +3968,96 @@ fn bind_expression<'a>(
         },
     };
     Ok(BoundExpr { kind })
+}
+
+fn bind_filter_predicate<'a>(
+    expression: &'a Expr,
+    fields: &[OutputField],
+) -> Result<BoundFilterPredicate<'a>, ExecutionError> {
+    let bound = bind_expression(expression, fields)?;
+    Ok(BoundFilterPredicate {
+        expression: bound,
+        short_circuit_safe: filter_expression_metadata_is_safe(expression, fields)
+            && expression_type_is_plain_bool(expression),
+    })
+}
+
+fn filter_expression_metadata_is_safe(expression: &Expr, fields: &[OutputField]) -> bool {
+    match &expression.kind {
+        ExprKind::Column(column) => {
+            let Ok(position) = find_source_position(fields, column) else {
+                return false;
+            };
+            let Some(candidate) = fields.get(position).and_then(OutputField::source_column) else {
+                return false;
+            };
+            candidate.binding_id == column.binding_id
+                && candidate.table_id == column.table_id
+                && candidate.column_id == column.column_id
+                && candidate.data_type == column.data_type
+                && candidate.nullable == column.nullable
+                && expression.expr_type.data_type == column.data_type
+                && expression.expr_type.nullable == column.nullable
+        }
+        ExprKind::Literal(value) => {
+            value
+                .physical_type()
+                .is_none_or(|physical| physical == expression.expr_type.data_type.physical)
+                && expression.expr_type.nullable == matches!(value, ScalarValue::Null)
+        }
+        ExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            if !filter_expression_metadata_is_safe(left, fields)
+                || !filter_expression_metadata_is_safe(right, fields)
+                || !expression_type_is_plain_bool(expression)
+                || expression.expr_type.nullable
+                    != (left.expr_type.nullable || right.expr_type.nullable)
+            {
+                return false;
+            }
+            match operator {
+                BinaryOp::And | BinaryOp::Or => {
+                    expression_type_is_bool(left) && expression_type_is_bool(right)
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => left
+                    .expr_type
+                    .data_type
+                    .is_compatible_with(&right.expr_type.data_type),
+            }
+        }
+        ExprKind::Unary {
+            operator: UnaryOp::Not,
+            expression: child,
+        } => {
+            filter_expression_metadata_is_safe(child, fields)
+                && expression_type_is_bool(child)
+                && expression_type_is_plain_bool(expression)
+                && expression.expr_type.nullable == child.expr_type.nullable
+        }
+        ExprKind::IsNull {
+            expression: child, ..
+        } => {
+            filter_expression_metadata_is_safe(child, fields)
+                && expression_type_is_plain_bool(expression)
+                && !expression.expr_type.nullable
+        }
+    }
+}
+
+fn expression_type_is_bool(expression: &Expr) -> bool {
+    expression.expr_type.data_type.physical == PhysicalType::Bool
+}
+
+fn expression_type_is_plain_bool(expression: &Expr) -> bool {
+    expression_type_is_bool(expression) && expression.expr_type.data_type.name.is_none()
 }
 
 #[derive(Clone, Copy)]
@@ -4564,6 +4663,75 @@ where
     }
 }
 
+fn evaluate_filter_bound_with<'a, G>(
+    predicate: &'a BoundFilterPredicate<'_>,
+    value_at: &G,
+) -> Result<EvaluatedScalar<'a>, ExecutionError>
+where
+    G: Fn(usize) -> Option<ScalarRef<'a>>,
+{
+    if predicate.short_circuit_safe {
+        evaluate_short_circuit_bound_with(&predicate.expression, value_at)
+    } else {
+        evaluate_bound_with(&predicate.expression, value_at)
+    }
+}
+
+fn evaluate_short_circuit_bound_with<'a, G>(
+    expression: &'a BoundExpr<'_>,
+    value_at: &G,
+) -> Result<EvaluatedScalar<'a>, ExecutionError>
+where
+    G: Fn(usize) -> Option<ScalarRef<'a>>,
+{
+    match &expression.kind {
+        BoundExprKind::Column { position, name } => value_at(*position)
+            .map(EvaluatedScalar::Borrowed)
+            .ok_or_else(|| ExecutionError::MissingColumn((*name).to_owned())),
+        BoundExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(*value))),
+        BoundExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = evaluate_short_circuit_bound_with(left, value_at)?;
+            if matches!(operator, BinaryOp::And | BinaryOp::Or) {
+                let left_truth = TruthValue::from_scalar_view(left.as_scalar_ref())?;
+                if (*operator == BinaryOp::And && left_truth == TruthValue::False)
+                    || (*operator == BinaryOp::Or && left_truth == TruthValue::True)
+                {
+                    return Ok(EvaluatedScalar::Owned(left_truth.into_scalar()));
+                }
+            }
+            let right = evaluate_short_circuit_bound_with(right, value_at)?;
+            evaluate_binary_scalar_refs(*operator, left.as_scalar_ref(), right.as_scalar_ref())
+                .map(EvaluatedScalar::Owned)
+        }
+        BoundExprKind::Unary {
+            operator: UnaryOp::Not,
+            expression,
+        } => Ok(EvaluatedScalar::Owned(
+            TruthValue::from_scalar_view(
+                evaluate_short_circuit_bound_with(expression, value_at)?.as_scalar_ref(),
+            )?
+            .not()
+            .into_scalar(),
+        )),
+        BoundExprKind::IsNull {
+            expression,
+            negated,
+        } => {
+            let value = evaluate_short_circuit_bound_with(expression, value_at)?;
+            let is_null = value.as_scalar_ref().is_null();
+            Ok(EvaluatedScalar::Owned(ScalarValue::Bool(if *negated {
+                !is_null
+            } else {
+                is_null
+            })))
+        }
+    }
+}
+
 fn evaluate_bound_values<'a>(
     expression: &'a BoundExpr<'_>,
     values: EvaluationValues<'a>,
@@ -4581,11 +4749,30 @@ fn evaluate_bound_truth<'a>(
     TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
+fn evaluate_filter_bound_truth<'a>(
+    predicate: &'a BoundFilterPredicate<'_>,
+    values: EvaluationValues<'a>,
+) -> Result<TruthValue, ExecutionError> {
+    let value = evaluate_filter_bound_with(predicate, &|position| {
+        values.get(position).map(ScalarRef::from)
+    })?;
+    TruthValue::from_scalar_view(value.as_scalar_ref())
+}
+
+#[cfg(test)]
 fn evaluate_bound_scalar_ref_truth<'a>(
     expression: &'a BoundExpr<'_>,
     values: &[ScalarRef<'a>],
 ) -> Result<TruthValue, ExecutionError> {
     let value = evaluate_bound_with(expression, &|position| values.get(position).copied())?;
+    TruthValue::from_scalar_view(value.as_scalar_ref())
+}
+
+fn evaluate_filter_bound_scalar_ref_truth<'a>(
+    predicate: &'a BoundFilterPredicate<'_>,
+    values: &[ScalarRef<'a>],
+) -> Result<TruthValue, ExecutionError> {
+    let value = evaluate_filter_bound_with(predicate, &|position| values.get(position).copied())?;
     TruthValue::from_scalar_view(value.as_scalar_ref())
 }
 
@@ -4871,6 +5058,7 @@ fn compare_scalar_refs(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hash, Hasher};
     use std::ops::ControlFlow;
@@ -4881,17 +5069,18 @@ mod tests {
         ExecutionRow, ExecutionRows, ExecutionStorage, FilteredCountSummary, GroupLookup,
         GroupState, InequalityExecutionStrategy, PartitionedBatchStats, PrehashedBuildHasher,
         PrehashedKey, ProjectionPlan, QueryResult, StreamingHashJoinStats, TopNState, TruthValue,
-        bind_expression, build_batch_pipeline, build_hash_join_buckets, build_top_n_plan,
-        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
-        compatibility_bindings, count_to_sql_u64, direct_count_eligibility, evaluate,
-        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
-        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        bind_expression, bind_filter_predicate, build_batch_pipeline, build_hash_join_buckets,
+        build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
+        collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
+        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
+        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
         evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
-        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
-        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
-        execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
-        find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
+        evaluate_filter_bound_truth, evaluate_filter_bound_with, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
+        execute_with_storages, filtered_count_eligibility, find_required_inequality,
+        hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme,
         sorted_non_null_indices, streaming_seq_filter_eligibility,
@@ -8803,6 +8992,299 @@ mod tests {
     }
 
     #[test]
+    fn safe_filter_short_circuit_matches_complete_three_valued_truth_tables() {
+        use TruthValue::{False, True, Unknown};
+
+        fn literal(value: TruthValue) -> Expr {
+            Expr {
+                kind: ExprKind::Literal(value.into_scalar()),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: value == TruthValue::Unknown,
+                },
+            }
+        }
+
+        let values = [True, False, Unknown];
+        let expected_and = [
+            [True, False, Unknown],
+            [False, False, False],
+            [Unknown, False, Unknown],
+        ];
+        let expected_or = [
+            [True, True, True],
+            [True, False, Unknown],
+            [True, Unknown, Unknown],
+        ];
+        for (operator, expected) in [(BinaryOp::And, expected_and), (BinaryOp::Or, expected_or)] {
+            for (left_index, left) in values.iter().copied().enumerate() {
+                for (right_index, right) in values.iter().copied().enumerate() {
+                    let left = literal(left);
+                    let right = literal(right);
+                    let expression = Expr {
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: left.expr_type.nullable || right.expr_type.nullable,
+                        },
+                        kind: ExprKind::Binary {
+                            operator,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        },
+                    };
+                    let filter = bind_filter_predicate(&expression, &[]).expect("bind filter");
+                    assert!(filter.short_circuit_safe);
+                    let eager = bind_expression(&expression, &[]).expect("bind eager");
+                    assert_eq!(
+                        evaluate_filter_bound_truth(&filter, EvaluationValues::Contiguous(&[]))
+                            .expect("evaluate short-circuit truth"),
+                        expected[left_index][right_index]
+                    );
+                    assert_eq!(
+                        evaluate_filter_bound_truth(&filter, EvaluationValues::Contiguous(&[]))
+                            .expect("evaluate short-circuit result"),
+                        evaluate_bound_truth(&eager, EvaluationValues::Contiguous(&[]))
+                            .expect("evaluate eager result")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn safe_filter_short_circuit_accesses_only_required_right_branches() {
+        let column = |column_id, name: &str, nullable| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(column_id),
+            relation_name: "items".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable,
+        };
+        let left_column = column(1, "left", true);
+        let right_column = column(2, "right", false);
+        let fields = vec![
+            OutputField::Source(left_column.clone()),
+            OutputField::Source(right_column.clone()),
+        ];
+        let column_expression = |column: &ColumnRef| Expr {
+            kind: ExprKind::Column(column.clone()),
+            expr_type: ExprType {
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            },
+        };
+
+        for (operator, left, expected_right_accesses) in [
+            (BinaryOp::And, ScalarValue::Bool(false), 0),
+            (BinaryOp::And, ScalarValue::Bool(true), 1),
+            (BinaryOp::And, ScalarValue::Null, 1),
+            (BinaryOp::Or, ScalarValue::Bool(true), 0),
+            (BinaryOp::Or, ScalarValue::Bool(false), 1),
+            (BinaryOp::Or, ScalarValue::Null, 1),
+        ] {
+            let left_expression = column_expression(&left_column);
+            let right_expression = column_expression(&right_column);
+            let expression = Expr {
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: true,
+                },
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(left_expression),
+                    right: Box::new(right_expression),
+                },
+            };
+            let predicate =
+                bind_filter_predicate(&expression, &fields).expect("bind safe predicate");
+            assert!(predicate.short_circuit_safe);
+            let values = [left, ScalarValue::Bool(true)];
+            let right_accesses = Cell::new(0);
+            evaluate_filter_bound_with(&predicate, &|position| {
+                if position == 1 {
+                    right_accesses.set(right_accesses.get() + 1);
+                }
+                values.get(position).map(ScalarRef::from)
+            })
+            .expect("evaluate safe predicate");
+            assert_eq!(right_accesses.get(), expected_right_accesses);
+        }
+    }
+
+    #[test]
+    fn safe_filter_short_circuit_is_recursive_through_nested_not_and_is_null() {
+        fn bool_literal(value: bool) -> Expr {
+            Expr {
+                kind: ExprKind::Literal(ScalarValue::Bool(value)),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            }
+        }
+
+        fn bool_column(column: &ColumnRef) -> Expr {
+            Expr {
+                kind: ExprKind::Column(column.clone()),
+                expr_type: ExprType {
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+            }
+        }
+
+        fn logical(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
+            let nullable = left.expr_type.nullable || right.expr_type.nullable;
+            Expr {
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable,
+                },
+            }
+        }
+
+        let expensive = |column_id, name: &str| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(column_id),
+            relation_name: "items".into(),
+            name: name.into(),
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable: false,
+        };
+        let first = expensive(1, "expensive_1");
+        let second = expensive(2, "expensive_2");
+        let fields = vec![
+            OutputField::Source(first.clone()),
+            OutputField::Source(second.clone()),
+        ];
+
+        let nested_and = logical(
+            BinaryOp::And,
+            logical(BinaryOp::And, bool_literal(false), bool_column(&first)),
+            bool_column(&second),
+        );
+        let not_nested_and = Expr {
+            kind: ExprKind::Unary {
+                operator: UnaryOp::Not,
+                expression: Box::new(nested_and),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let predicate =
+            bind_filter_predicate(&not_nested_and, &fields).expect("bind nested AND under NOT");
+        let accesses = [Cell::new(0), Cell::new(0)];
+        let values = [ScalarValue::Bool(true), ScalarValue::Bool(true)];
+        assert_eq!(
+            evaluate_filter_bound_with(&predicate, &|position| {
+                accesses[position].set(accesses[position].get() + 1);
+                values.get(position).map(ScalarRef::from)
+            })
+            .expect("evaluate nested AND under NOT")
+            .as_scalar_ref(),
+            ScalarRef::Bool(true)
+        );
+        assert_eq!([accesses[0].get(), accesses[1].get()], [0, 0]);
+
+        let nested_or = logical(
+            BinaryOp::Or,
+            logical(BinaryOp::Or, bool_literal(true), bool_column(&first)),
+            bool_column(&second),
+        );
+        let is_null_nested_or = Expr {
+            kind: ExprKind::IsNull {
+                expression: Box::new(nested_or),
+                negated: false,
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+        let predicate = bind_filter_predicate(&is_null_nested_or, &fields)
+            .expect("bind nested OR under IS NULL");
+        for access in &accesses {
+            access.set(0);
+        }
+        assert_eq!(
+            evaluate_filter_bound_with(&predicate, &|position| {
+                accesses[position].set(accesses[position].get() + 1);
+                values.get(position).map(ScalarRef::from)
+            })
+            .expect("evaluate nested OR under IS NULL")
+            .as_scalar_ref(),
+            ScalarRef::Bool(false)
+        );
+        assert_eq!([accesses[0].get(), accesses[1].get()], [0, 0]);
+    }
+
+    #[test]
+    fn metadata_unsafe_filter_predicates_preserve_eager_errors() {
+        let field_column = ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: TableId(1),
+            column_id: ColumnId(1),
+            relation_name: "items".into(),
+            name: "malformed_right".into(),
+            data_type: SemanticType::physical(PhysicalType::Int64),
+            nullable: false,
+        };
+        let malformed_column = ColumnRef {
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            ..field_column.clone()
+        };
+        let fields = [OutputField::Source(field_column)];
+
+        for (operator, decisive_left) in [(BinaryOp::And, false), (BinaryOp::Or, true)] {
+            let expression = Expr {
+                kind: ExprKind::Binary {
+                    operator,
+                    left: Box::new(Expr {
+                        kind: ExprKind::Literal(ScalarValue::Bool(decisive_left)),
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: false,
+                        },
+                    }),
+                    right: Box::new(Expr {
+                        kind: ExprKind::Column(malformed_column.clone()),
+                        expr_type: ExprType {
+                            data_type: SemanticType::physical(PhysicalType::Bool),
+                            nullable: false,
+                        },
+                    }),
+                },
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Bool),
+                    nullable: false,
+                },
+            };
+            let predicate =
+                bind_filter_predicate(&expression, &fields).expect("binding still succeeds");
+            assert!(!predicate.short_circuit_safe);
+            let values = [ScalarValue::Int64(7)];
+            assert!(matches!(
+                evaluate_filter_bound_truth(&predicate, EvaluationValues::Contiguous(&values)),
+                Err(ExecutionError::ExpectedBoolean)
+            ));
+            assert!(matches!(
+                evaluate_bound_truth(&predicate.expression, EvaluationValues::Contiguous(&values)),
+                Err(ExecutionError::ExpectedBoolean)
+            ));
+        }
+    }
+
+    #[test]
     fn every_comparison_with_null_is_unknown() {
         for operator in [
             BinaryOp::Eq,
@@ -12116,11 +12598,12 @@ mod tests {
                 nullable: false,
             },
         };
-        let false_predicate = bind_expression(&false_predicate, &fields).expect("bind false");
-        let unknown_predicate = bind_expression(&unknown_predicate, &fields).expect("bind unknown");
-        let true_predicate = bind_expression(&true_predicate, &fields).expect("bind true");
+        let false_predicate = bind_filter_predicate(&false_predicate, &fields).expect("bind false");
+        let unknown_predicate =
+            bind_filter_predicate(&unknown_predicate, &fields).expect("bind unknown");
+        let true_predicate = bind_filter_predicate(&true_predicate, &fields).expect("bind true");
         let invalid_predicate =
-            bind_expression(&invalid_predicate, &fields).expect("bind invalid scalar");
+            bind_filter_predicate(&invalid_predicate, &fields).expect("bind invalid scalar");
         let text = String::from("qualified");
         let original_pointer = text.as_ptr();
         let values = [ScalarRef::Int64(7), ScalarRef::Text(&text)];
@@ -12152,7 +12635,7 @@ mod tests {
             },
         };
         let rejected_text_predicate =
-            bind_expression(&rejected_text_predicate, &fields).expect("bind rejected Text");
+            bind_filter_predicate(&rejected_text_predicate, &fields).expect("bind rejected Text");
         collect_streaming_filter_row(
             &rejected_text_predicate,
             &[1],

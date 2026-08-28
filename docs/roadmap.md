@@ -1637,3 +1637,45 @@ substantial machine noise. HashJoin build-key ownership is closed here. Phase
 audited first, or measure full Sort/spill and dynamic HashJoin build-side
 materialization/choice. General column batches remain rejected absent new
 evidence.
+
+## Safe Filter AND/OR Short-Circuit (Phase 69, complete)
+
+- added plan-, base-column-, and result-gated predicate-order pairs for
+  Aggregate Filter, projected borrowed streaming Filter, filtered COUNT, and a
+  primitive control. Equivalent pairs scan the same columns and return the
+  same result while moving a selective primitive branch before or after
+  repeated Text or primitive comparisons;
+- introduced the executor-private `BoundFilterPredicate`, which first reuses
+  `bind_expression` and then conservatively validates column identity and
+  field metadata, literal type/nullability, logical/NOT/IS NULL Bool metadata,
+  and comparison compatibility. Successful binding with unsafe metadata stays
+  on eager bound evaluation; binding failure retains the dynamic row-dependent
+  fallback;
+- recursively skips only the right side of `FALSE AND right` and
+  `TRUE OR right`. TRUE AND, FALSE OR, and both UNKNOWN-left cases evaluate the
+  right side and reuse the existing SQL `TruthValue` combination semantics;
+- shares that boundary across batch Filter, direct and projected borrowed
+  streaming Filter, materialized legacy Filter, and filtered COUNT. General
+  scalar evaluation, DML, dynamic evaluation, NestedLoopJoin, and HashJoin
+  residual predicates remain eager;
+- proves all 18 AND/OR three-valued combinations against eager evaluation,
+  exact right-branch access counts, recursive nested/NOT/IS NULL behavior,
+  metadata-ineligible eager errors, missing-column timing, wrong runtime types,
+  Heap/LSM execution equivalence, and unchanged Join behavior;
+- retains no public API, dependency, unsafe code, planner/compiler rewrite,
+  PhysicalPlan or inspection change, protocol/SDK change, or persistent-format
+  change.
+
+The decision is **KEEP**. Deterministic structure reports zero right accesses
+for FALSE AND and TRUE OR, one for TRUE AND, FALSE OR, UNKNOWN AND, and UNKNOWN
+OR, and zero accesses to both right branches in nested decisive expressions.
+Quick timing remains noisy: the Aggregate Text AND cheap/expensive median ratio
+moved from 1.715x to 1.159x but remained inverse; Text OR moved from 1.713x to
+0.397x, filtered COUNT AND was 0.723x post, primitive AND was 0.408x post, and
+the projected streaming pair was neutral at 1.017x. The mixed absolute movement
+precludes a throughput claim but does not systematically contradict the exact
+skipped-work result.
+
+Phase 70 should prioritize measured dynamic HashJoin build-side selection, a
+full Sort/spill boundary, or a storage-level range visitor. The rejected Phase
+67 column-sidecar design should not be reopened without new evidence.

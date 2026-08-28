@@ -689,7 +689,9 @@ filtered-count wrapper adapts the callback slice with `get(position).copied()`.
 The hot bound evaluator receives no fields and cannot call
 `find_source_position`. Binding remains identity-aware by
 `RelationBindingId + ColumnId`, missing fields and short rows remain typed
-errors, and AND/OR still evaluate both sides.
+errors. Phase 7Q originally evaluated both AND/OR operands; the Phase 69
+Filter-only boundary below now adds conservative short-circuiting without
+changing the general bound evaluator.
 
 Phase 7T makes the row-aware borrowed storage visitor authoritative. The older
 borrowed visitor is a thin wrapper that ignores mutation identity, and the
@@ -823,9 +825,53 @@ malformed predicate cannot bind, both streaming setup and legacy Filter retain
 the dynamic evaluator's row-dependent behavior: an empty child remains empty,
 while a nonempty child reports the same predicate error. Dynamic evaluators
 also remain for UPDATE/assignment and other unbound expression boundaries.
-AND/OR still evaluate both operands, and all existing NULL and three-valued
-semantics are shared by the bound evaluator. Batch Filter, filtered COUNT, and
-Join were already bound and are not reordered or rewritten by Phase 63.
+All existing NULL and three-valued semantics are shared by the bound evaluator.
+Batch Filter, filtered COUNT, and Join were already bound and were not reordered
+or rewritten by Phase 63.
+
+Phase 69 adds one executor-private qualification between successful Filter
+binding and row evaluation:
+
+```text
+Filter Expr + source-order OutputFields
+        ↓
+bind positions once
+        ↓
+conservatively validate expression metadata
+        ↓
+BoundFilterPredicate
+       safe?
+      /     \
+    yes      no
+     ↓        ↓
+recursive   eager bound
+left-to-    evaluation
+right 3VL
+```
+
+The validator checks resolved source identity, column and output-field type and
+nullability agreement, literal type/nullability, Bool operands and results for
+AND/OR and NOT, non-null Bool results for IS NULL, and compatible comparison
+operands with Bool result metadata. Any uncertainty makes the predicate
+ineligible; it does not make binding fail. Consequently the three existing
+states remain distinct: binding failure uses the dynamic row-dependent
+fallback, successful but metadata-unsafe binding uses the existing eager bound
+evaluator, and only metadata-safe binding uses the short-circuit evaluator.
+
+The short-circuit evaluator is recursive through nested logical expressions,
+NOT, and IS NULL. It skips only `FALSE AND right` and `TRUE OR right`.
+`TRUE AND`, `FALSE OR`, `UNKNOWN AND`, and `UNKNOWN OR` evaluate the right
+branch and combine it through the existing `TruthValue::and` or
+`TruthValue::or` semantics. SQL three-valued results therefore do not change.
+
+`BatchOperator::Filter`, direct and projected borrowed streaming Filter,
+materialized legacy Filter, and filtered COUNT all reuse the same
+`BoundFilterPredicate`. FALSE and UNKNOWN streaming rows still own nothing;
+only TRUE outputs cross the existing owned result boundary. The general bound
+scalar evaluator, dynamic evaluator, DML evaluation, NestedLoopJoin, and
+HashJoin residual evaluation remain eager. Phase 69 adds no public API,
+PhysicalPlan variant, planner/compiler rewrite, dependency, unsafe code,
+protocol change, or persistent-format change.
 
 Grouped, mixed-function, all-star-only, nested, join, sort, and index-backed
 shapes retain the generic aggregate path.

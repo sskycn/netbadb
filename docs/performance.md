@@ -1874,6 +1874,67 @@ error timing before benchmarking it, or measure full Sort/spill and dynamic
 HashJoin build-side materialization/choice. This result does not justify String
 interning, dictionary encoding, custom hashing, or reopening column batches.
 
+## Phase 69 safe Filter AND/OR short-circuit
+
+Phase 69 added attribution before production changes. Each order pair is
+logically equivalent, scans the same source-order columns, checks the exact
+result, and requires either `Aggregate>Filter>SeqScan` or
+`Project>Filter>SeqScan` without index access. Text pairs use two repeated
+comparisons that are true for the AND fixture or false for the OR fixture; a
+selective `id` comparison moves from first to last. Primitive, borrowed
+streaming, and filtered COUNT pairs provide separate controls. Raw serial quick
+output is stored outside the repository at `/tmp/netbadb-phase69-pre.txt` and
+`/tmp/netbadb-phase69-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | pre | post | cheap/expensive pre | cheap/expensive post |
+| --- | ---: | ---: | ---: | ---: |
+| Aggregate AND Text, cheap first | 485,458 | 474,041 | 1.715x | 1.159x |
+| Aggregate AND Text, expensive first | 283,083 | 409,083 | — | — |
+| Aggregate OR Text, cheap first | 447,959 | 209,209 | 1.713x | 0.397x |
+| Aggregate OR Text, expensive first | 261,542 | 526,334 | — | — |
+| Projected streaming AND Text, cheap first | 390,333 | 459,458 | 0.805x | 1.017x |
+| Projected streaming AND Text, expensive first | 484,625 | 451,916 | — | — |
+| Filtered COUNT AND Text, cheap first | 180,333 | 283,417 | 0.362x | 0.723x |
+| Filtered COUNT AND Text, expensive first | 498,500 | 392,250 | — | — |
+| Aggregate AND primitive, cheap first | 259,792 | 226,000 | 0.492x | 0.408x |
+| Aggregate AND primitive, expensive first | 528,500 | 553,750 | — | — |
+
+The Text-cheap/primitive-cheap ratio moved from 1.869x to 2.098x. That control
+does not isolate a generic evaluator win, and the Aggregate Text AND pair
+remained inverse despite moving materially toward parity. The projected
+streaming pair was neutral post. In contrast, OR, filtered COUNT, and primitive
+pairs had the expected cheap-first direction. Broad non-target movement in the
+same runs was substantial, so these quick measurements are attribution signals,
+not stable throughput estimates or performance thresholds.
+
+The authoritative evidence is structural and semantic. A metadata-validated
+predicate reports zero right-column accesses for FALSE AND and TRUE OR, and one
+for TRUE AND, FALSE OR, UNKNOWN AND, and UNKNOWN OR. Nested decisive AND and OR
+skip both later branches even under NOT or IS NULL. All 18 SQL three-valued
+AND/OR combinations equal the existing eager evaluator. UNKNOWN is never a
+decisive left value.
+
+Eligibility is conservative. `bind_expression` still runs first. Complete
+column identity/type/nullability, literal metadata, Bool logical/NOT/IS NULL
+metadata, and comparison compatibility are validated privately by the
+executor. Binding failures keep the dynamic row-dependent fallback, including
+empty malformed scans. Binding success with unsafe metadata keeps eager bound
+evaluation; explicit FALSE-AND and TRUE-OR malformed-right tests still return
+the old `ExpectedBoolean` error. Batch, borrowed and projected streaming,
+legacy materialized Filter, and filtered COUNT share the new predicate wrapper.
+Dynamic evaluation, DML, NestedLoopJoin, HashJoin residual predicates, and the
+general bound scalar evaluator remain eager.
+
+The decision is **KEEP**. The skipped-work invariant is exact, the metadata gate
+preserves malformed/error behavior, all executor tests and benchmark gates
+pass, and the order pairs do not systematically contradict the hypothesis even
+though the noisy Aggregate Text AND result prevents a general speedup claim.
+Phase 70 should prioritize measured dynamic HashJoin build-side selection, a
+full Sort/spill boundary, or a storage-level range visitor rather than reopening
+the rejected column-batch pilot.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -1899,6 +1960,7 @@ fallback. Phase 66 adds the second executor-private BatchSource variant for the
 existing all-SeqScan PartitionedScan and retains mixed-access materialization.
 Phase 67 retains only benchmark attribution after rejecting its private pilot.
 Phase 68 changes only executor-private HashJoin key ownership and benchmark
-coverage. All six retain the current Heap metadata v4 and every public, inspection,
-protocol, SDK, and persistent contract. These phases add no dependency and no
-unsafe code.
+coverage. Phase 69 adds only executor-private Filter predicate validation and
+evaluation plus benchmark coverage. All seven retain the current Heap metadata
+v4 and every public, inspection, protocol, SDK, and persistent contract. These
+phases add no dependency and no unsafe code.

@@ -302,6 +302,7 @@ fn main() -> BenchResult<()> {
 
     run_direct_heap_scan_scenarios(settings, &mut measurements)?;
     run_projection_attribution_scenarios(settings, &mut measurements)?;
+    run_phase69_filter_short_circuit_scenarios(settings, &mut measurements)?;
     run_top_n_attribution_scenarios(settings, &mut measurements)?;
     run_point_and_shape_scenarios(settings, &mut measurements)?;
     run_join_scenarios(settings, &mut measurements)?;
@@ -2547,6 +2548,187 @@ fn run_attribution_query(
         observe,
         measurements,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_phase69_filter_query(
+    scenario: &str,
+    rows: u64,
+    sql: &str,
+    expected_plan: &str,
+    expected_base_columns: &[ColumnId],
+    expected: Observation,
+    settings: ProfileSettings,
+    observe: impl Fn(&QueryResult) -> BenchResult<Observation>,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let (mut database, paths) = items_fixture(scenario, rows, &[], NullDistribution::Low, 4)?;
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[Operator::Filter, Operator::SeqScan],
+        &[Operator::IndexScan, Operator::RangeIndexScan],
+    )?;
+    if plan != expected_plan {
+        return Err(message_error(format!(
+            "scenario `{scenario}` plan was `{plan}`; expected `{expected_plan}`"
+        )));
+    }
+    inspect_base_scan_columns(&database, scenario, sql, expected_base_columns)?;
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        observe,
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.to_owned(),
+        rows: rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+fn run_phase69_filter_short_circuit_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let rows = settings.medium_rows;
+    let cutoff = (rows / 100).max(1);
+    let selected_sum = arithmetic_sum(cutoff);
+    let trailing_sum = arithmetic_sum(rows) - selected_sum;
+    let low = "payload-0000000000000000";
+    let high = "payload-9999999999999999";
+
+    for (scenario, sql, expected_sum) in [
+        (
+            "phase69_filter_and_text_cheap_first",
+            format!(
+                "SELECT SUM(id) FROM items WHERE id < {cutoff} AND payload >= '{low}' AND payload <= '{high}'"
+            ),
+            selected_sum,
+        ),
+        (
+            "phase69_filter_and_text_expensive_first",
+            format!(
+                "SELECT SUM(id) FROM items WHERE payload >= '{low}' AND payload <= '{high}' AND id < {cutoff}"
+            ),
+            selected_sum,
+        ),
+        (
+            "phase69_filter_or_text_cheap_first",
+            format!(
+                "SELECT SUM(id) FROM items WHERE id >= {cutoff} OR payload = '__phase69-never-1__' OR payload = '__phase69-never-2__'"
+            ),
+            trailing_sum,
+        ),
+        (
+            "phase69_filter_or_text_expensive_first",
+            format!(
+                "SELECT SUM(id) FROM items WHERE payload = '__phase69-never-1__' OR payload = '__phase69-never-2__' OR id >= {cutoff}"
+            ),
+            trailing_sum,
+        ),
+        (
+            "phase69_filter_and_primitive_cheap_first",
+            format!(
+                "SELECT SUM(id) FROM items WHERE id < {cutoff} AND team_id = team_id AND bucket_id = bucket_id"
+            ),
+            selected_sum,
+        ),
+        (
+            "phase69_filter_and_primitive_expensive_first",
+            format!(
+                "SELECT SUM(id) FROM items WHERE team_id = team_id AND bucket_id = bucket_id AND id < {cutoff}"
+            ),
+            selected_sum,
+        ),
+    ] {
+        let columns = if scenario.contains("primitive") {
+            &[ID_COLUMN_ID, TEAM_COLUMN_ID, BUCKET_COLUMN_ID][..]
+        } else {
+            &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID][..]
+        };
+        run_phase69_filter_query(
+            scenario,
+            rows,
+            &sql,
+            "Aggregate>Filter>SeqScan",
+            columns,
+            Observation {
+                rows: 1,
+                checksum: expected_sum,
+            },
+            settings,
+            sum_observation,
+            measurements,
+        )?;
+    }
+
+    for (scenario, sql) in [
+        (
+            "phase69_stream_filter_and_text_cheap_first",
+            format!(
+                "SELECT id FROM items WHERE id < {cutoff} AND payload >= '{low}' AND payload <= '{high}'"
+            ),
+        ),
+        (
+            "phase69_stream_filter_and_text_expensive_first",
+            format!(
+                "SELECT id FROM items WHERE payload >= '{low}' AND payload <= '{high}' AND id < {cutoff}"
+            ),
+        ),
+    ] {
+        run_phase69_filter_query(
+            scenario,
+            rows,
+            &sql,
+            "Project>Filter>SeqScan",
+            &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+            expected_range_ids(0, cutoff),
+            settings,
+            ids_observation,
+            measurements,
+        )?;
+    }
+
+    for (scenario, sql) in [
+        (
+            "phase69_filtered_count_and_text_cheap_first",
+            format!(
+                "SELECT COUNT(payload) FROM items WHERE id < {cutoff} AND payload >= '{low}' AND payload <= '{high}'"
+            ),
+        ),
+        (
+            "phase69_filtered_count_and_text_expensive_first",
+            format!(
+                "SELECT COUNT(payload) FROM items WHERE payload >= '{low}' AND payload <= '{high}' AND id < {cutoff}"
+            ),
+        ),
+    ] {
+        run_phase69_filter_query(
+            scenario,
+            rows,
+            &sql,
+            "Aggregate>Filter>SeqScan",
+            &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+            Observation {
+                rows: 1,
+                checksum: u128::from(cutoff),
+            },
+            settings,
+            count_observation,
+            measurements,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
