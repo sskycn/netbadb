@@ -169,6 +169,27 @@ impl DatabaseSession {
         result
     }
 
+    fn execute_prepared(
+        &mut self,
+        database: &mut Database,
+        prepared: &netbadb_core::PreparedStatement,
+        values: &[netbadb_types::ScalarValue],
+    ) -> Result<ExecutionResult, DatabaseError> {
+        let result = match self.transaction.as_mut() {
+            Some(transaction) => database.execute_prepared_in(transaction, prepared, values),
+            None => database.execute_prepared(prepared, values),
+        };
+        if self.transaction.as_ref().is_some_and(|transaction| {
+            matches!(
+                transaction.state(),
+                TransactionState::Committed | TransactionState::RolledBack
+            )
+        }) {
+            self.transaction = None;
+        }
+        result
+    }
+
     fn begin(
         &mut self,
         database: &mut Database,
@@ -575,7 +596,7 @@ fn validate_messages(messages: &[ServerMessage]) -> Result<(), ServerError> {
 
 fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
     match error {
-        DatabaseError::Compile(_) => ProtocolErrorCode::Compile,
+        DatabaseError::Compile(_) | DatabaseError::Bind(_) => ProtocolErrorCode::Compile,
         DatabaseError::Schema(_) => ProtocolErrorCode::Schema,
         DatabaseError::Storage(_) => ProtocolErrorCode::Storage,
         DatabaseError::Execution(_) => ProtocolErrorCode::Execution,

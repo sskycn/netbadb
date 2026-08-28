@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics, compare_values};
 use netbadb_rel::{
     AggregateInput, AggregateOutput, Assignment, BinaryOp, ColumnRef, Expr, ExprKind, JoinKind,
-    LogicalPlan, LogicalStatement, OutputField, SortKey,
+    LogicalPlan, LogicalStatement, OutputField, ProjectedExpr, SortKey,
 };
 use netbadb_types::{
     AccessPathId, ColumnId, PartitionId, RelationBindingId, ScalarValue, StorageId, TableId,
@@ -98,6 +98,7 @@ pub struct PartitionScanPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhysicalPlan {
+    OneRow,
     SeqScan {
         binding_id: RelationBindingId,
         table_id: TableId,
@@ -159,6 +160,10 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         columns: Vec<ColumnRef>,
     },
+    ScalarProject {
+        input: Box<PhysicalPlan>,
+        expressions: Vec<ProjectedExpr>,
+    },
     Aggregate {
         input: Box<PhysicalPlan>,
         group_keys: Vec<ColumnRef>,
@@ -193,6 +198,7 @@ impl PhysicalPlan {
     #[must_use]
     pub fn output_fields(&self) -> Vec<OutputField> {
         match self {
+            Self::OneRow => Vec::new(),
             Self::SeqScan { columns, .. }
             | Self::IndexScan { columns, .. }
             | Self::RangeIndexScan { columns, .. }
@@ -205,6 +211,10 @@ impl PhysicalPlan {
             Self::Aggregate { outputs, .. } => {
                 outputs.iter().map(AggregateOutput::output_field).collect()
             }
+            Self::ScalarProject { expressions, .. } => expressions
+                .iter()
+                .map(|expression| OutputField::Derived(expression.output.clone()))
+                .collect(),
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.output_fields()
             }
@@ -261,6 +271,7 @@ fn plan_raw_with_statistics(
     range_tables: &[RangeTablePlanningSnapshot],
 ) -> PhysicalPlan {
     match logical {
+        LogicalPlan::OneRow => PhysicalPlan::OneRow,
         LogicalPlan::Scan {
             binding_id,
             table_id,
@@ -383,6 +394,15 @@ fn plan_raw_with_statistics(
             )),
             columns: columns.clone(),
         },
+        LogicalPlan::ScalarProject { input, expressions } => PhysicalPlan::ScalarProject {
+            input: Box::new(plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+                range_tables,
+            )),
+            expressions: expressions.clone(),
+        },
         LogicalPlan::Aggregate {
             input,
             group_keys,
@@ -434,7 +454,7 @@ fn add_required(required: &mut Vec<SourceIdentity>, column: &ColumnRef) {
 fn collect_expression_columns(expression: &Expr, required: &mut Vec<SourceIdentity>) {
     match &expression.kind {
         ExprKind::Column(column) => add_required(required, column),
-        ExprKind::Literal(_) => {}
+        ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
         ExprKind::Binary { left, right, .. } => {
             collect_expression_columns(left, required);
             collect_expression_columns(right, required);
@@ -447,6 +467,7 @@ fn collect_expression_columns(expression: &Expr, required: &mut Vec<SourceIdenti
 
 fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]) -> PhysicalPlan {
     match plan {
+        PhysicalPlan::OneRow => PhysicalPlan::OneRow,
         PhysicalPlan::SeqScan {
             binding_id,
             table_id,
@@ -535,6 +556,16 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             PhysicalPlan::Project {
                 input: Box::new(prune_required_columns(*input, &required)),
                 columns,
+            }
+        }
+        PhysicalPlan::ScalarProject { input, expressions } => {
+            let mut required = Vec::new();
+            for expression in &expressions {
+                collect_expression_columns(&expression.expression, &mut required);
+            }
+            PhysicalPlan::ScalarProject {
+                input: Box::new(prune_required_columns(*input, &required)),
+                expressions,
             }
         }
         PhysicalPlan::Aggregate {
@@ -3020,9 +3051,12 @@ mod tests {
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::ScalarProject { input, .. }
             | PhysicalPlan::Aggregate { input, .. }
             | PhysicalPlan::Limit { input, .. } => base_columns(input),
-            PhysicalPlan::NestedLoopJoin { .. } | PhysicalPlan::HashJoin { .. } => {
+            PhysicalPlan::OneRow
+            | PhysicalPlan::NestedLoopJoin { .. }
+            | PhysicalPlan::HashJoin { .. } => {
                 panic!("expected one base scan")
             }
         }

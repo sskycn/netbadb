@@ -12,7 +12,8 @@ use netbadb_parser::{
 };
 use netbadb_schema::{Schema, TableDef};
 use netbadb_types::{
-    ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+    ColumnId, ExprType, ParameterId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
+    TableId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +107,10 @@ pub struct TypedAggregate {
 pub enum TypedProjectionItem {
     Column(ColumnRef),
     Aggregate(TypedAggregate),
+    Expression {
+        expression: TypedExpr,
+        output_name: String,
+    },
 }
 
 impl TypedProjectionItem {
@@ -113,7 +118,7 @@ impl TypedProjectionItem {
     pub const fn source_column(&self) -> Option<&ColumnRef> {
         match self {
             Self::Column(column) => Some(column),
-            Self::Aggregate(_) => None,
+            Self::Aggregate(_) | Self::Expression { .. } => None,
         }
     }
 }
@@ -146,6 +151,7 @@ pub struct TypedExpr {
 pub enum TypedExprKind {
     Column(ColumnRef),
     Literal(ScalarValue),
+    Parameter(ParameterId),
     Binary {
         operator: BinaryOp,
         left: Box<TypedExpr>,
@@ -163,7 +169,7 @@ pub enum TypedExprKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedQuery {
-    pub from: TypedRelation,
+    pub from: Option<TypedRelation>,
     pub joins: Vec<TypedJoin>,
     pub columns: Vec<ColumnRef>,
     pub projection: Vec<TypedProjectionItem>,
@@ -251,6 +257,16 @@ pub enum HirError {
     CannotInferNullType {
         span: Span,
     },
+    CannotInferParameterType {
+        id: ParameterId,
+        span: Span,
+    },
+    ParameterTypeConflict {
+        id: ParameterId,
+        previous: SemanticType,
+        required: SemanticType,
+        span: Span,
+    },
     DuplicateColumn {
         name: String,
         span: Span,
@@ -306,6 +322,8 @@ impl HirError {
             | Self::TypeMismatch { span, .. }
             | Self::IncompatibleComparison { span, .. }
             | Self::CannotInferNullType { span }
+            | Self::CannotInferParameterType { span, .. }
+            | Self::ParameterTypeConflict { span, .. }
             | Self::DuplicateColumn { span, .. }
             | Self::ValueCountMismatch { span, .. }
             | Self::MissingRequiredColumn { span, .. }
@@ -351,6 +369,23 @@ impl fmt::Display for HirError {
             Self::CannotInferNullType { .. } => {
                 formatter.write_str("cannot infer the type of NULL in this expression")
             }
+            Self::CannotInferParameterType { id, .. } => {
+                write!(
+                    formatter,
+                    "cannot infer the type of parameter ${}",
+                    id.0 + 1
+                )
+            }
+            Self::ParameterTypeConflict {
+                id,
+                previous,
+                required,
+                ..
+            } => write!(
+                formatter,
+                "parameter ${} is constrained as both {previous} and {required}",
+                id.0 + 1
+            ),
             Self::DuplicateColumn { name, .. } => {
                 write!(formatter, "column `{name}` is specified more than once")
             }
@@ -391,26 +426,143 @@ impl fmt::Display for HirError {
 
 impl Error for HirError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterMetadata {
+    pub id: ParameterId,
+    pub data_type: SemanticType,
+}
+
+struct ParameterContext {
+    declared: Vec<Option<PhysicalType>>,
+    inferred: Vec<Option<SemanticType>>,
+    spans: Vec<Option<Span>>,
+}
+
+impl ParameterContext {
+    fn new(declared: &[Option<PhysicalType>]) -> Self {
+        Self {
+            declared: declared.to_vec(),
+            inferred: vec![None; declared.len()],
+            spans: vec![None; declared.len()],
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        id: ParameterId,
+        expected: Option<&SemanticType>,
+        span: Span,
+    ) -> Result<SemanticType, HirError> {
+        let index =
+            usize::try_from(id.0).map_err(|_| HirError::CannotInferParameterType { id, span })?;
+        if self.inferred.len() <= index {
+            self.inferred.resize(index + 1, None);
+            self.declared.resize(index + 1, None);
+            self.spans.resize(index + 1, None);
+        }
+        self.spans[index].get_or_insert(span);
+        let declared = self.declared[index].map(SemanticType::physical);
+        let required = match (expected, declared.as_ref()) {
+            (Some(expected), Some(declared)) if expected.physical != declared.physical => {
+                return Err(HirError::ParameterTypeConflict {
+                    id,
+                    previous: declared.clone(),
+                    required: expected.clone(),
+                    span,
+                });
+            }
+            (Some(expected), _) => expected.clone(),
+            (None, Some(declared)) => declared.clone(),
+            (None, None) => self.inferred[index]
+                .clone()
+                .ok_or(HirError::CannotInferParameterType { id, span })?,
+        };
+        if let Some(previous) = &self.inferred[index] {
+            if !previous.is_compatible_with(&required) {
+                return Err(HirError::ParameterTypeConflict {
+                    id,
+                    previous: previous.clone(),
+                    required,
+                    span,
+                });
+            }
+            return Ok(previous.clone());
+        }
+        self.inferred[index] = Some(required.clone());
+        Ok(required)
+    }
+
+    fn finish(self) -> Result<Vec<ParameterMetadata>, HirError> {
+        self.inferred
+            .into_iter()
+            .enumerate()
+            .map(|(index, data_type)| {
+                let id = ParameterId(u32::try_from(index).unwrap_or(u32::MAX));
+                Ok(ParameterMetadata {
+                    id,
+                    data_type: data_type.ok_or(HirError::CannotInferParameterType {
+                        id,
+                        span: self.spans[index].unwrap_or(Span { start: 0, end: 0 }),
+                    })?,
+                })
+            })
+            .collect()
+    }
+}
+
 pub fn lower_statement(
     schema: &Schema,
     statement: &AstStatement,
 ) -> Result<TypedStatement, HirError> {
-    match statement {
-        AstStatement::Select(query) => lower_query(schema, query).map(TypedStatement::Select),
-        AstStatement::Insert(insert) => lower_insert(schema, insert).map(TypedStatement::Insert),
-        AstStatement::Update(update) => lower_update(schema, update).map(TypedStatement::Update),
-        AstStatement::Delete(delete) => lower_delete(schema, delete).map(TypedStatement::Delete),
-    }
+    lower_statement_with_parameters(schema, statement, &[]).map(|(statement, _)| statement)
+}
+
+pub fn lower_statement_with_parameters(
+    schema: &Schema,
+    statement: &AstStatement,
+    declared: &[Option<PhysicalType>],
+) -> Result<(TypedStatement, Vec<ParameterMetadata>), HirError> {
+    let mut parameters = ParameterContext::new(declared);
+    let statement = match statement {
+        AstStatement::Select(query) => {
+            lower_query_with_context(schema, query, &mut parameters).map(TypedStatement::Select)
+        }
+        AstStatement::Insert(insert) => {
+            lower_insert(schema, insert, &mut parameters).map(TypedStatement::Insert)
+        }
+        AstStatement::Update(update) => {
+            lower_update(schema, update, &mut parameters).map(TypedStatement::Update)
+        }
+        AstStatement::Delete(delete) => {
+            lower_delete(schema, delete, &mut parameters).map(TypedStatement::Delete)
+        }
+    }?;
+    Ok((statement, parameters.finish()?))
 }
 
 pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirError> {
+    let mut parameters = ParameterContext::new(&[]);
+    let query = lower_query_with_context(schema, query, &mut parameters)?;
+    let _ = parameters.finish()?;
+    Ok(query)
+}
+
+fn lower_query_with_context(
+    schema: &Schema,
+    query: &Query,
+    parameters: &mut ParameterContext,
+) -> Result<TypedQuery, HirError> {
     let mut scope = RelationScope::default();
-    let from = scope.add(schema, &query.from)?;
+    let from = query
+        .from
+        .as_ref()
+        .map(|from| scope.add(schema, from))
+        .transpose()?;
     let bool_type = SemanticType::physical(PhysicalType::Bool);
     let mut joins = Vec::with_capacity(query.joins.len());
     for join in &query.joins {
         let right = scope.add(schema, &join.right)?;
-        let predicate = lower_expr_in_scope(&scope, &join.condition, Some(&bool_type))?;
+        let predicate = lower_expr_in_scope(&scope, &join.condition, Some(&bool_type), parameters)?;
         require_type(&predicate, &bool_type)?;
         joins.push(TypedJoin {
             kind: JoinKind::Inner,
@@ -433,6 +585,24 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
         return Err(HirError::OrderByNotSupportedWithGrouping {
             span: query.order_by[0].span,
         });
+    }
+
+    // Predicates often provide the strongest contextual parameter types. Type
+    // them before projection so a repeated slot can be used in `SELECT $1`
+    // after being constrained by a source column in WHERE.
+    let selection = query
+        .selection
+        .as_ref()
+        .map(|expression| lower_expr_in_scope(&scope, expression, Some(&bool_type), parameters))
+        .transpose()?;
+    if let Some(predicate) = &selection {
+        if predicate.expr_type.data_type != bool_type {
+            return Err(HirError::TypeMismatch {
+                expected: bool_type.clone(),
+                actual: predicate.expr_type.data_type.clone(),
+                span: predicate.span,
+            });
+        }
     }
 
     let projection = query
@@ -465,24 +635,41 @@ pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirErro
                 netbadb_parser::SelectItem::Aggregate(aggregate) => projection.push(
                     TypedProjectionItem::Aggregate(lower_aggregate(&scope, aggregate)?),
                 ),
+                netbadb_parser::SelectItem::Expression {
+                    expression, alias, ..
+                } => {
+                    if is_grouping {
+                        return Err(HirError::InvalidAggregateArgument {
+                            function: AggregateFunction::Count,
+                            span: ast_expr_span(expression),
+                        });
+                    }
+                    // PostgreSQL and the native frontend both allow a standalone
+                    // `NULL` projection. With no surrounding expression there is
+                    // no contextual carrier type, so use TEXT as the deterministic
+                    // wire-visible carrier while preserving the value as SQL NULL.
+                    let null_carrier = matches!(
+                        expression,
+                        netbadb_parser::Expr::Literal {
+                            value: netbadb_parser::Literal::Null,
+                            ..
+                        }
+                    )
+                    .then(|| SemanticType::physical(PhysicalType::Text));
+                    let expression =
+                        lower_expr_in_scope(&scope, expression, null_carrier.as_ref(), parameters)?;
+                    let output_name = alias.as_ref().map_or_else(
+                        || expression_output_name(&expression),
+                        |alias| alias.name.clone(),
+                    );
+                    projection.push(TypedProjectionItem::Expression {
+                        expression,
+                        output_name,
+                    });
+                }
             }
             Ok::<_, HirError>(projection)
         })?;
-
-    let selection = query
-        .selection
-        .as_ref()
-        .map(|expression| lower_expr_in_scope(&scope, expression, Some(&bool_type)))
-        .transpose()?;
-    if let Some(predicate) = &selection {
-        if predicate.expr_type.data_type != bool_type {
-            return Err(HirError::TypeMismatch {
-                expected: bool_type,
-                actual: predicate.expr_type.data_type.clone(),
-                span: predicate.span,
-            });
-        }
-    }
 
     let order_by = query
         .order_by
@@ -617,6 +804,14 @@ fn select_item_span(item: &netbadb_parser::SelectItem) -> Span {
         netbadb_parser::SelectItem::Wildcard(span) => *span,
         netbadb_parser::SelectItem::Column(column) => column.span,
         netbadb_parser::SelectItem::Aggregate(aggregate) => aggregate.span,
+        netbadb_parser::SelectItem::Expression { span, .. } => *span,
+    }
+}
+
+fn expression_output_name(expression: &TypedExpr) -> String {
+    match &expression.kind {
+        TypedExprKind::Parameter(id) => format!("${}", id.0 + 1),
+        _ => "?column?".into(),
     }
 }
 
@@ -757,6 +952,7 @@ impl ScopeBinding<'_> {
 fn lower_insert(
     schema: &Schema,
     insert: &netbadb_parser::InsertStatement,
+    parameters: &mut ParameterContext,
 ) -> Result<TypedInsert, HirError> {
     let table = resolve_table(schema, &insert.table)?;
     if insert.columns.len() != insert.values.len() {
@@ -790,7 +986,7 @@ fn lower_insert(
                 name: target.name.clone(),
                 span: target.span,
             })?;
-        values[position] = Some(lower_value_for_column(table, value, &column)?);
+        values[position] = Some(lower_value_for_column(table, value, &column, parameters)?);
     }
 
     let values = table
@@ -824,6 +1020,7 @@ fn lower_insert(
 fn lower_update(
     schema: &Schema,
     update: &netbadb_parser::UpdateStatement,
+    parameters: &mut ParameterContext,
 ) -> Result<TypedUpdate, HirError> {
     let table = resolve_table(schema, &update.table)?;
     let mut seen = HashSet::new();
@@ -838,11 +1035,11 @@ fn lower_update(
                     span: assignment.column.span,
                 });
             }
-            let value = lower_value_for_column(table, &assignment.value, &column)?;
+            let value = lower_value_for_column(table, &assignment.value, &column, parameters)?;
             Ok(TypedAssignment { column, value })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let selection = lower_selection(table, update.selection.as_ref())?;
+    let selection = lower_selection(table, update.selection.as_ref(), parameters)?;
     Ok(TypedUpdate {
         table_id: table.id,
         table_name: table.name.clone(),
@@ -859,6 +1056,7 @@ fn lower_update(
 fn lower_delete(
     schema: &Schema,
     delete: &netbadb_parser::DeleteStatement,
+    parameters: &mut ParameterContext,
 ) -> Result<TypedDelete, HirError> {
     let table = resolve_table(schema, &delete.table)?;
     Ok(TypedDelete {
@@ -869,7 +1067,7 @@ fn lower_delete(
             .iter()
             .map(|column| column_ref(table, column))
             .collect(),
-        selection: lower_selection(table, delete.selection.as_ref())?,
+        selection: lower_selection(table, delete.selection.as_ref(), parameters)?,
     })
 }
 
@@ -885,10 +1083,11 @@ fn resolve_table<'a>(schema: &'a Schema, table: &Ident) -> Result<&'a TableDef, 
 fn lower_selection(
     table: &TableDef,
     selection: Option<&AstExpr>,
+    parameters: &mut ParameterContext,
 ) -> Result<Option<TypedExpr>, HirError> {
     let bool_type = SemanticType::physical(PhysicalType::Bool);
     let selection = selection
-        .map(|expression| lower_expr(table, expression, Some(&bool_type)))
+        .map(|expression| lower_expr(table, expression, Some(&bool_type), parameters))
         .transpose()?;
     if let Some(predicate) = &selection {
         require_type(predicate, &bool_type)?;
@@ -900,8 +1099,9 @@ fn lower_value_for_column(
     table: &TableDef,
     expression: &AstExpr,
     column: &ColumnRef,
+    parameters: &mut ParameterContext,
 ) -> Result<TypedExpr, HirError> {
-    let mut value = lower_expr(table, expression, Some(&column.data_type))?;
+    let mut value = lower_expr(table, expression, Some(&column.data_type), parameters)?;
     if matches!(&value.kind, TypedExprKind::Literal(_))
         && value.expr_type.data_type.physical == column.data_type.physical
     {
@@ -918,7 +1118,10 @@ fn lower_value_for_column(
             span: value.span,
         });
     }
-    if !column.nullable && value.expr_type.nullable {
+    if !column.nullable
+        && value.expr_type.nullable
+        && !matches!(value.kind, TypedExprKind::Parameter(_))
+    {
         return Err(HirError::NullNotAllowed {
             name: column.name.clone(),
             span: value.span,
@@ -930,7 +1133,7 @@ fn lower_value_for_column(
 fn expression_references_column(expression: &AstExpr) -> bool {
     match expression {
         AstExpr::Column(_) => true,
-        AstExpr::Literal { .. } => false,
+        AstExpr::Literal { .. } | AstExpr::Parameter { .. } => false,
         AstExpr::Binary { left, right, .. } => {
             expression_references_column(left) || expression_references_column(right)
         }
@@ -944,6 +1147,7 @@ fn ast_expr_span(expression: &AstExpr) -> Span {
     match expression {
         AstExpr::Column(column) => column.span,
         AstExpr::Literal { span, .. }
+        | AstExpr::Parameter { span, .. }
         | AstExpr::Binary { span, .. }
         | AstExpr::Unary { span, .. }
         | AstExpr::IsNull { span, .. } => *span,
@@ -954,14 +1158,21 @@ fn lower_expr(
     table: &TableDef,
     expression: &AstExpr,
     expected: Option<&SemanticType>,
+    parameters: &mut ParameterContext,
 ) -> Result<TypedExpr, HirError> {
-    lower_expr_in_scope(&RelationScope::single(table), expression, expected)
+    lower_expr_in_scope(
+        &RelationScope::single(table),
+        expression,
+        expected,
+        parameters,
+    )
 }
 
 fn lower_expr_in_scope(
     scope: &RelationScope<'_>,
     expression: &AstExpr,
     expected: Option<&SemanticType>,
+    parameters: &mut ParameterContext,
 ) -> Result<TypedExpr, HirError> {
     match expression {
         AstExpr::Column(column) => {
@@ -1009,6 +1220,17 @@ fn lower_expr_in_scope(
                 span: *span,
             })
         }
+        AstExpr::Parameter { id, span } => {
+            let data_type = parameters.resolve(*id, expected, *span)?;
+            Ok(TypedExpr {
+                kind: TypedExprKind::Parameter(*id),
+                expr_type: ExprType {
+                    data_type,
+                    nullable: true,
+                },
+                span: *span,
+            })
+        }
         AstExpr::Binary {
             left,
             operator,
@@ -1019,8 +1241,8 @@ fn lower_expr_in_scope(
             let bool_type = SemanticType::physical(PhysicalType::Bool);
             let (left, right) = match operator {
                 BinaryOp::And | BinaryOp::Or => {
-                    let left = lower_expr_in_scope(scope, left, Some(&bool_type))?;
-                    let right = lower_expr_in_scope(scope, right, Some(&bool_type))?;
+                    let left = lower_expr_in_scope(scope, left, Some(&bool_type), parameters)?;
+                    let right = lower_expr_in_scope(scope, right, Some(&bool_type), parameters)?;
                     require_type(&left, &bool_type)?;
                     require_type(&right, &bool_type)?;
                     (left, right)
@@ -1031,7 +1253,7 @@ fn lower_expr_in_scope(
                 | BinaryOp::LtEq
                 | BinaryOp::Gt
                 | BinaryOp::GtEq => {
-                    let (left, right) = lower_comparison_operands(scope, left, right)?;
+                    let (left, right) = lower_comparison_operands(scope, left, right, parameters)?;
                     if !left
                         .expr_type
                         .data_type
@@ -1066,7 +1288,7 @@ fn lower_expr_in_scope(
             span,
         } => {
             let bool_type = SemanticType::physical(PhysicalType::Bool);
-            let expression = lower_expr_in_scope(scope, expression, Some(&bool_type))?;
+            let expression = lower_expr_in_scope(scope, expression, Some(&bool_type), parameters)?;
             require_type(&expression, &bool_type)?;
             Ok(TypedExpr {
                 expr_type: ExprType {
@@ -1089,9 +1311,9 @@ fn lower_expr_in_scope(
         } => {
             let bool_type = SemanticType::physical(PhysicalType::Bool);
             let expression = if is_null_literal(expression) {
-                lower_expr_in_scope(scope, expression, Some(&bool_type))?
+                lower_expr_in_scope(scope, expression, Some(&bool_type), parameters)?
             } else {
-                lower_expr_in_scope(scope, expression, None)?
+                lower_expr_in_scope(scope, expression, None, parameters)?
             };
             Ok(TypedExpr {
                 expr_type: ExprType {
@@ -1112,30 +1334,43 @@ fn lower_comparison_operands(
     scope: &RelationScope<'_>,
     left: &AstExpr,
     right: &AstExpr,
+    parameters: &mut ParameterContext,
 ) -> Result<(TypedExpr, TypedExpr), HirError> {
+    if matches!(left, AstExpr::Parameter { .. }) && !matches!(right, AstExpr::Parameter { .. }) {
+        let right = lower_expr_in_scope(scope, right, None, parameters)?;
+        let left = lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type), parameters)?;
+        return Ok((left, right));
+    }
+    if !matches!(left, AstExpr::Parameter { .. }) && matches!(right, AstExpr::Parameter { .. }) {
+        let left = lower_expr_in_scope(scope, left, None, parameters)?;
+        let right = lower_expr_in_scope(scope, right, Some(&left.expr_type.data_type), parameters)?;
+        return Ok((left, right));
+    }
     match (is_null_literal(left), is_null_literal(right)) {
         (true, true) => {
             // With no operand context, BOOL is a deterministic carrier type;
             // both runtime values remain NULL and comparison yields UNKNOWN.
             let carrier = SemanticType::physical(PhysicalType::Bool);
             Ok((
-                lower_expr_in_scope(scope, left, Some(&carrier))?,
-                lower_expr_in_scope(scope, right, Some(&carrier))?,
+                lower_expr_in_scope(scope, left, Some(&carrier), parameters)?,
+                lower_expr_in_scope(scope, right, Some(&carrier), parameters)?,
             ))
         }
         (true, false) => {
-            let right = lower_expr_in_scope(scope, right, None)?;
-            let left = lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type))?;
+            let right = lower_expr_in_scope(scope, right, None, parameters)?;
+            let left =
+                lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type), parameters)?;
             Ok((left, right))
         }
         (false, true) => {
-            let left = lower_expr_in_scope(scope, left, None)?;
-            let right = lower_expr_in_scope(scope, right, Some(&left.expr_type.data_type))?;
+            let left = lower_expr_in_scope(scope, left, None, parameters)?;
+            let right =
+                lower_expr_in_scope(scope, right, Some(&left.expr_type.data_type), parameters)?;
             Ok((left, right))
         }
         (false, false) => Ok((
-            lower_expr_in_scope(scope, left, None)?,
-            lower_expr_in_scope(scope, right, None)?,
+            lower_expr_in_scope(scope, left, None, parameters)?,
+            lower_expr_in_scope(scope, right, None, parameters)?,
         )),
     }
 }
@@ -1483,7 +1718,10 @@ mod tests {
             .expect("parse"),
         )
         .expect("lower");
-        assert_eq!(typed.from.binding_id, RelationBindingId(0));
+        assert_eq!(
+            typed.from.as_ref().expect("FROM").binding_id,
+            RelationBindingId(0)
+        );
         assert_eq!(typed.joins[0].right.binding_id, RelationBindingId(1));
         assert_eq!(
             typed.projection[0]
@@ -1534,7 +1772,9 @@ mod tests {
             .iter()
             .map(|item| match item {
                 TypedProjectionItem::Aggregate(aggregate) => aggregate,
-                TypedProjectionItem::Column(_) => panic!("expected only aggregates"),
+                TypedProjectionItem::Column(_) | TypedProjectionItem::Expression { .. } => {
+                    panic!("expected only aggregates")
+                }
             })
             .collect::<Vec<_>>();
         assert!(matches!(aggregates[0].input, TypedAggregateInput::All));

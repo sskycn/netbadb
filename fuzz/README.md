@@ -37,7 +37,10 @@ and block boundaries return typed errors.
 `pgwire_decode` uses one selector byte to exercise either bounded PostgreSQL v3
 startup decoding or tagged frontend-message decoding. Arbitrary lengths,
 counts, C strings, UTF-8, format codes, parameters, and message tags must return
-a typed error without panic or unbounded allocation.
+a typed error without panic or unbounded allocation. The tagged path covers
+Parse, Bind (including text/binary payloads and malformed parameter lengths),
+Describe, Execute, Close, and every parameter/result format-code cardinality;
+the pgwire unit suite supplies valid base-type and exact-width assertions.
 
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 

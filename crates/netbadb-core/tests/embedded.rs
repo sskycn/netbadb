@@ -1,4 +1,6 @@
-use netbadb_core::{CoordinatorError, Database, DatabaseError, ExecutionResult, TransactionState};
+use netbadb_core::{
+    CoordinatorError, Database, DatabaseError, DatabaseErrorKind, ExecutionResult, TransactionState,
+};
 use netbadb_executor::ExecutionError;
 use netbadb_inspect::{PlanNodeInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
@@ -27,12 +29,13 @@ fn inspected_hash_keys(plan: &PlanNodeInspection) -> Option<(u32, u32)> {
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => inspected_hash_keys(input),
         PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => None,
-        PlanNodeInspection::PartitionedScan { .. } => None,
+        PlanNodeInspection::PartitionedScan { .. } | PlanNodeInspection::OneRow => None,
     }
 }
 
@@ -45,13 +48,63 @@ fn contains_nested_loop_join(plan: &PlanNodeInspection) -> bool {
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => contains_nested_loop_join(input),
         PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => false,
-        PlanNodeInspection::PartitionedScan { .. } => false,
+        PlanNodeInspection::PartitionedScan { .. } | PlanNodeInspection::OneRow => false,
     }
+}
+
+#[test]
+fn executes_fromless_select_and_reuses_typed_prepared_statement() {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-prepared-parameters-{}",
+        std::process::id()
+    ));
+    cleanup(&path);
+    let mut database = Database::create(&path, users()).expect("create");
+    database
+        .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+        .expect("insert Ada");
+    database
+        .insert(&[ScalarValue::Int64(2), ScalarValue::Text("Lin".into())])
+        .expect("insert Lin");
+
+    let scalar = database.query("SELECT 1 AS one").expect("scalar select");
+    assert_eq!(scalar.rows, vec![vec![ScalarValue::Int64(1)]]);
+    assert_eq!(scalar.columns[0].name, "one");
+    let null_scalar = database.query("SELECT NULL AS empty").expect("null scalar");
+    assert_eq!(null_scalar.rows, vec![vec![ScalarValue::Null]]);
+    assert_eq!(
+        null_scalar.columns[0].data_type.physical,
+        PhysicalType::Text
+    );
+    assert!(null_scalar.columns[0].nullable);
+
+    let prepared = database
+        .prepare_statement("SELECT name FROM users WHERE id = $1", &[])
+        .expect("prepare");
+    for (id, name) in [(1, "Ada"), (2, "Lin"), (1, "Ada")] {
+        let ExecutionResult::Query(result) = database
+            .execute_prepared(&prepared, &[ScalarValue::Int64(id)])
+            .expect("execute prepared")
+        else {
+            panic!("expected query");
+        };
+        assert_eq!(result.rows, vec![vec![ScalarValue::Text(name.into())]]);
+    }
+    let insert = database
+        .prepare_statement("INSERT INTO users (id, name) VALUES ($1, $2)", &[])
+        .expect("prepare insert");
+    let error = database
+        .execute_prepared(&insert, &[ScalarValue::Int64(3), ScalarValue::Null])
+        .expect_err("NULL must reach the existing NOT NULL storage boundary");
+    assert_eq!(error.kind(), DatabaseErrorKind::NotNullViolation);
+    database.close().expect("close");
+    cleanup(&path);
 }
 
 fn users() -> TableDef {

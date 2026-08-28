@@ -266,6 +266,7 @@ impl TextComparisonShape {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operator {
+    OneRow,
     SeqScan,
     IndexScan,
     RangeIndexScan,
@@ -274,6 +275,7 @@ enum Operator {
     Filter,
     Sort,
     Project,
+    ScalarProject,
     Aggregate,
     Limit,
 }
@@ -281,6 +283,7 @@ enum Operator {
 impl Operator {
     const fn name(self) -> &'static str {
         match self {
+            Self::OneRow => "OneRow",
             Self::SeqScan => "SeqScan",
             Self::IndexScan => "IndexScan",
             Self::RangeIndexScan => "RangeIndexScan",
@@ -289,6 +292,7 @@ impl Operator {
             Self::Filter => "Filter",
             Self::Sort => "Sort",
             Self::Project => "Project",
+            Self::ScalarProject => "ScalarProject",
             Self::Aggregate => "Aggregate",
             Self::Limit => "Limit",
         }
@@ -1012,9 +1016,11 @@ fn partitioned_scan_partitions(
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => partitioned_scan_partitions(input),
-        PlanNodeInspection::NestedLoopJoin { .. }
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::NestedLoopJoin { .. }
         | PlanNodeInspection::HashJoin { .. }
         | PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
@@ -1188,13 +1194,15 @@ fn selected_partition_count(plan: &PlanNodeInspection) -> Option<usize> {
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => selected_partition_count(input),
         PlanNodeInspection::NestedLoopJoin { left, right, .. }
         | PlanNodeInspection::HashJoin { left, right, .. } => {
             selected_partition_count(left).or_else(|| selected_partition_count(right))
         }
-        PlanNodeInspection::SeqScan { .. }
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => None,
     }
@@ -5054,9 +5062,11 @@ fn find_hash_join(plan: &PlanNodeInspection) -> Option<&PlanNodeInspection> {
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => find_hash_join(input),
-        PlanNodeInspection::SeqScan { .. }
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. }
         | PlanNodeInspection::PartitionedScan { .. }
@@ -5124,8 +5134,10 @@ fn collect_base_scan_columns(plan: &PlanNodeInspection, scans: &mut Vec<Vec<Colu
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => collect_base_scan_columns(input, scans),
+        PlanNodeInspection::OneRow => {}
     }
 }
 
@@ -5161,9 +5173,11 @@ fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => contains_operator(input, target),
-            PlanNodeInspection::SeqScan { .. }
+            PlanNodeInspection::OneRow
+            | PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. } => false,
             PlanNodeInspection::PartitionedScan { .. } => false,
@@ -5172,6 +5186,7 @@ fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
 
 const fn operator(plan: &PlanNodeInspection) -> Operator {
     match plan {
+        PlanNodeInspection::OneRow => Operator::OneRow,
         PlanNodeInspection::SeqScan { .. } => Operator::SeqScan,
         PlanNodeInspection::IndexScan { .. } => Operator::IndexScan,
         PlanNodeInspection::RangeIndexScan { .. } => Operator::RangeIndexScan,
@@ -5181,6 +5196,7 @@ const fn operator(plan: &PlanNodeInspection) -> Operator {
         PlanNodeInspection::Filter { .. } => Operator::Filter,
         PlanNodeInspection::Sort { .. } => Operator::Sort,
         PlanNodeInspection::Project { .. } => Operator::Project,
+        PlanNodeInspection::ScalarProject { .. } => Operator::ScalarProject,
         PlanNodeInspection::Aggregate { .. } => Operator::Aggregate,
         PlanNodeInspection::Limit { .. } => Operator::Limit,
     }
@@ -5203,9 +5219,11 @@ fn collect_operators(plan: &PlanNodeInspection, operators: &mut Vec<&'static str
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => collect_operators(input, operators),
-        PlanNodeInspection::SeqScan { .. }
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => {}
         PlanNodeInspection::PartitionedScan { .. } => {}

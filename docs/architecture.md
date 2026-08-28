@@ -2222,18 +2222,24 @@ The experimental PostgreSQL foundation adds a parallel frontend boundary:
 PostgreSQL bytes
     -> netbadb-pgwire bounded typed messages
     -> PostgreSQL session / prepared statement / portal state
+    -> Parse: compiler-owned prepared logical statement + parameter metadata
+    -> Bind: typed ScalarValue substitution into cloned logical expressions
     -> compiler-resolved StatementAccess + authorization
     -> shared netbadb-server DatabaseSession transaction/execution lifecycle
     -> netbadb-core
 ```
 
 `netbadb-pgwire` depends only on `netbadb-types`; it contains framing, message
-domains, PostgreSQL OIDs, format codes, and scalar text adaptation, but no
+domains, PostgreSQL OIDs, format codes, and scalar text/binary adaptation, but no
 socket listener or database calls. PostgreSQL OIDs and transaction-aborted
 behavior stop at the server adapter. The compiler exposes frontend-neutral
-compile error categories and statement output metadata, so PostgreSQL error and
-RowDescription mapping do not inspect AST/HIR Rust layouts, execute a query for
-metadata, or leak OIDs into HIR, relational IR, planner, executor, or storage.
+`ParameterId` expressions, contextual parameter inference, typed logical
+binding, compile error categories, and statement output metadata. Parse
+compiles once; each Bind decodes values once and substitutes typed literals
+without formatting or reparsing SQL, so planning sees concrete predicates.
+PostgreSQL error and RowDescription mapping do not inspect AST/HIR Rust layouts,
+execute a query for metadata, or leak OIDs into HIR, relational IR, planner,
+executor, or storage.
 
 Native and PostgreSQL sessions both use the private synchronous
 `DatabaseSession` for the optional database transaction, execute/commit/
@@ -2241,6 +2247,12 @@ rollback, disconnect rollback, and row-limit policy. PostgreSQL additionally
 owns named/unnamed prepared statements, portals, extended-protocol recovery to
 Sync, and the `I`/`T`/`E` compatibility state. These are frontend semantics and
 do not alter the core transaction state machine.
+
+FROM-less scalar queries use the ordinary typed pipeline. Parser/HIR represent
+an optional source, relational and physical IR use a single empty `OneRow`, and
+`ScalarProject` evaluates literal or bound-parameter expressions over it. This
+keeps `SELECT 1`, `SELECT true`, `SELECT 'x'`, and `SELECT NULL` out of the
+PostgreSQL compatibility-query string matcher.
 
 The first executable boundary is deliberately an exclusive listener mode:
 `netbadbd --postgres` uses manifest v4's existing loopback listen address for

@@ -229,9 +229,10 @@ The current code genuinely supports:
 - versioned protocol v1 framing, schema-fingerprint handshake, streamed query
   response messages, bounded synchronous codecs, and stable wire errors;
 - experimental PostgreSQL v3 wire framing with bounded Startup, SSLRequest,
-  CancelRequest, Simple Query, and zero-parameter Extended Query codecs,
-  centralized OID/text-value adaptation, SQLSTATE mapping, named statement and
-  portal lifecycles, and PostgreSQL failed-transaction session behavior;
+  CancelRequest, Simple Query, and typed-parameter Extended Query codecs,
+  contextual parameter inference, ParameterDescription, selected text/binary
+  scalar formats, SQLSTATE mapping, named statement and portal lifecycles, and
+  PostgreSQL failed-transaction session behavior;
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
@@ -271,9 +272,11 @@ Experimental PostgreSQL wire mode is documented in
 [`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
 `netbadbd --manifest server.json --postgres` to use the manifest's listen
 address as a loopback PostgreSQL endpoint. This first foundation is not a
-claim of general PostgreSQL compatibility: typed `$n` parameters, binary
-formats, TLS, `pg_catalog`, `information_schema`, and simultaneous native plus
-PostgreSQL listeners remain unsupported.
+claim of general PostgreSQL compatibility. Round 2 supports typed `$n`
+parameters, generic FROM-less scalar SELECT, and selected binary scalar
+formats; TLS, `pg_catalog`, `information_schema`, actual cancellation, broader
+PostgreSQL dialect syntax, and simultaneous native plus PostgreSQL listeners
+remain unsupported.
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

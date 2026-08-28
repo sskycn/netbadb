@@ -295,18 +295,131 @@ fn real_tcp_extended_query_manages_named_statement_and_portal() {
         [b'3', b'3', b'Z']
     );
 
-    let mut parameterized = b"by_id\0SELECT id FROM users WHERE id = $1\0".to_vec();
+    let mut parameterized = b"by_id\0SELECT id, name FROM users WHERE id = $1\0".to_vec();
     parameterized.extend_from_slice(&1_i16.to_be_bytes());
-    parameterized.extend_from_slice(&20_u32.to_be_bytes());
+    parameterized.extend_from_slice(&0_u32.to_be_bytes());
     stream.write_all(&frontend(b'P', &parameterized)).unwrap();
-    stream.write_all(&frontend(b'B', &bind)).unwrap();
+
+    let mut bind_one = b"first\0by_id\0".to_vec();
+    bind_one.extend_from_slice(&0_i16.to_be_bytes());
+    bind_one.extend_from_slice(&1_i16.to_be_bytes());
+    bind_one.extend_from_slice(&1_i32.to_be_bytes());
+    bind_one.push(b'1');
+    bind_one.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &bind_one)).unwrap();
+    stream.write_all(&frontend(b'D', b"Sby_id\0")).unwrap();
+    stream.write_all(&frontend(b'D', b"Pfirst\0")).unwrap();
+    let mut execute_first = b"first\0".to_vec();
+    execute_first.extend_from_slice(&0_u32.to_be_bytes());
+    stream.write_all(&frontend(b'E', &execute_first)).unwrap();
     stream.write_all(&frontend(b'S', &[])).unwrap();
-    let rejected = read_until_ready(&mut stream);
+    let first = read_until_ready(&mut stream);
     assert_eq!(
-        rejected.iter().map(|message| message.0).collect::<Vec<_>>(),
+        first.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'1', b'2', b't', b'T', b'T', b'D', b'C', b'Z']
+    );
+    let parameter_description = &first.iter().find(|message| message.0 == b't').unwrap().1;
+    assert_eq!(parameter_description, &[0, 1, 0, 0, 0, 20]);
+    assert!(
+        first
+            .iter()
+            .find(|message| message.0 == b'D')
+            .unwrap()
+            .1
+            .windows(3)
+            .any(|bytes| bytes == b"Ada")
+    );
+
+    let mut bind_two = b"second\0by_id\0".to_vec();
+    bind_two.extend_from_slice(&1_i16.to_be_bytes());
+    bind_two.extend_from_slice(&1_i16.to_be_bytes());
+    bind_two.extend_from_slice(&1_i16.to_be_bytes());
+    bind_two.extend_from_slice(&8_i32.to_be_bytes());
+    bind_two.extend_from_slice(&2_i64.to_be_bytes());
+    bind_two.extend_from_slice(&1_i16.to_be_bytes());
+    bind_two.extend_from_slice(&1_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &bind_two)).unwrap();
+    stream.write_all(&frontend(b'D', b"Psecond\0")).unwrap();
+    let mut execute_second = b"second\0".to_vec();
+    execute_second.extend_from_slice(&0_u32.to_be_bytes());
+    stream.write_all(&frontend(b'E', &execute_second)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let second = read_until_ready(&mut stream);
+    assert_eq!(
+        second.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'2', b'T', b'D', b'C', b'Z']
+    );
+    let binary_row = &second.iter().find(|message| message.0 == b'D').unwrap().1;
+    assert!(
+        binary_row
+            .windows(8)
+            .any(|bytes| bytes == 2_i64.to_be_bytes())
+    );
+    assert!(binary_row.windows(3).any(|bytes| bytes == b"Lin"));
+
+    let mut bad_bind = b"bad\0by_id\0".to_vec();
+    bad_bind.extend_from_slice(&0_i16.to_be_bytes());
+    bad_bind.extend_from_slice(&1_i16.to_be_bytes());
+    bad_bind.extend_from_slice(&3_i32.to_be_bytes());
+    bad_bind.extend_from_slice(b"bad");
+    bad_bind.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &bad_bind)).unwrap();
+    stream.write_all(&frontend(b'D', b"Sby_id\0")).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let recovered = read_until_ready(&mut stream);
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|message| message.0)
+            .collect::<Vec<_>>(),
         [b'E', b'Z']
     );
-    assert_eq!(error_sqlstate(&rejected[0].1), Some("0A000"));
+    assert_eq!(error_sqlstate(&recovered[0].1), Some("22P02"));
+    assert!(
+        query(&mut stream, "SELECT 1")
+            .iter()
+            .any(|message| message.0 == b'D')
+    );
+
+    let mut paged_parse = b"paged SELECT id FROM users WHERE id > $1 ORDER BY id ".to_vec();
+    paged_parse.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'P', &paged_parse)).unwrap();
+    let mut paged_bind = b"paged_portal paged ".to_vec();
+    paged_bind.extend_from_slice(&0_i16.to_be_bytes());
+    paged_bind.extend_from_slice(&1_i16.to_be_bytes());
+    paged_bind.extend_from_slice(&1_i32.to_be_bytes());
+    paged_bind.push(b'0');
+    paged_bind.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &paged_bind)).unwrap();
+    let mut paged_execute = b"paged_portal ".to_vec();
+    paged_execute.extend_from_slice(&1_u32.to_be_bytes());
+    stream.write_all(&frontend(b'E', &paged_execute)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let page_one = read_until_ready(&mut stream);
+    assert_eq!(
+        page_one.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'1', b'2', b'D', b's', b'Z']
+    );
+    stream.write_all(&frontend(b'E', &paged_execute)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let page_two = read_until_ready(&mut stream);
+    assert_eq!(
+        page_two.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'D', b'C', b'Z']
+    );
+    stream
+        .write_all(&frontend(b'C', b"Ppaged_portal "))
+        .unwrap();
+    stream.write_all(&frontend(b'C', b"Spaged ")).unwrap();
+    stream
+        .write_all(&frontend(b'C', b"Sdoes_not_exist "))
+        .unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let closed = read_until_ready(&mut stream);
+    assert_eq!(
+        closed.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'3', b'3', b'3', b'Z']
+    );
 
     stream.write_all(&frontend(b'X', &[])).unwrap();
     drop(stream);
@@ -325,6 +438,108 @@ fn cancel_request_is_accepted_without_creating_a_session() {
     stream.write_all(&cancel).unwrap();
     let mut byte = [0_u8; 1];
     assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn parameter_errors_recover_at_sync_and_preserve_failed_transaction_state() {
+    let (directory, server) = start_server("parameter-errors");
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let _ = query(
+        &mut stream,
+        "INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)",
+    );
+    assert_eq!(query(&mut stream, "BEGIN").last().unwrap().1, [b'T']);
+
+    let mut parse = b"tx_find\0SELECT id FROM users WHERE id = $1\0".to_vec();
+    parse.extend_from_slice(&1_i16.to_be_bytes());
+    parse.extend_from_slice(&20_u32.to_be_bytes());
+    stream.write_all(&frontend(b'P', &parse)).unwrap();
+    let mut invalid = b"bad\0tx_find\0".to_vec();
+    invalid.extend_from_slice(&0_i16.to_be_bytes());
+    invalid.extend_from_slice(&1_i16.to_be_bytes());
+    invalid.extend_from_slice(&3_i32.to_be_bytes());
+    invalid.extend_from_slice(b"bad");
+    invalid.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &invalid)).unwrap();
+    stream.write_all(&frontend(b'D', b"Stx_find\0")).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let failed_bind = read_until_ready(&mut stream);
+    assert_eq!(
+        failed_bind
+            .iter()
+            .map(|message| message.0)
+            .collect::<Vec<_>>(),
+        [b'1', b'E', b'Z']
+    );
+    assert_eq!(error_sqlstate(&failed_bind[1].1), Some("22P02"));
+    assert_eq!(failed_bind.last().unwrap().1, [b'E']);
+
+    let mut valid = b"blocked\0tx_find\0".to_vec();
+    valid.extend_from_slice(&0_i16.to_be_bytes());
+    valid.extend_from_slice(&1_i16.to_be_bytes());
+    valid.extend_from_slice(&1_i32.to_be_bytes());
+    valid.push(b'1');
+    valid.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &valid)).unwrap();
+    let mut execute = b"blocked\0".to_vec();
+    execute.extend_from_slice(&0_u32.to_be_bytes());
+    stream.write_all(&frontend(b'E', &execute)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let blocked = read_until_ready(&mut stream);
+    assert_eq!(
+        blocked.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'2', b'E', b'Z']
+    );
+    assert_eq!(error_sqlstate(&blocked[1].1), Some("25P02"));
+    assert_eq!(blocked.last().unwrap().1, [b'E']);
+
+    assert_eq!(query(&mut stream, "ROLLBACK").last().unwrap().1, [b'I']);
+    let mut indeterminate = b"unknown\0SELECT $1\0".to_vec();
+    indeterminate.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'P', &indeterminate)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let indeterminate = read_until_ready(&mut stream);
+    assert_eq!(error_sqlstate(&indeterminate[0].1), Some("42P18"));
+    assert_eq!(indeterminate.last().unwrap().1, [b'I']);
+
+    let mut supplied = b"int4_parameter\0SELECT id FROM users WHERE id = $1\0".to_vec();
+    supplied.extend_from_slice(&1_i16.to_be_bytes());
+    supplied.extend_from_slice(&23_u32.to_be_bytes());
+    stream.write_all(&frontend(b'P', &supplied)).unwrap();
+    stream
+        .write_all(&frontend(b'D', b"Sint4_parameter\0"))
+        .unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let supplied = read_until_ready(&mut stream);
+    assert_eq!(
+        supplied.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'1', b't', b'T', b'Z']
+    );
+    assert_eq!(
+        supplied.iter().find(|message| message.0 == b't').unwrap().1,
+        [0, 1, 0, 0, 0, 23]
+    );
+
+    for (name, oid, expected_state) in [
+        ("conflict", 25_u32, "42804"),
+        ("unsupported", 999_999_u32, "0A000"),
+    ] {
+        let mut invalid_parse =
+            format!("{name}\0SELECT id FROM users WHERE id = $1\0").into_bytes();
+        invalid_parse.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_parse.extend_from_slice(&oid.to_be_bytes());
+        stream.write_all(&frontend(b'P', &invalid_parse)).unwrap();
+        stream.write_all(&frontend(b'S', &[])).unwrap();
+        let rejected = read_until_ready(&mut stream);
+        assert_eq!(error_sqlstate(&rejected[0].1), Some(expected_state));
+        assert_eq!(rejected.last().unwrap().1, [b'I']);
+    }
+
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
     server.shutdown().unwrap();
     cleanup(&directory);
 }

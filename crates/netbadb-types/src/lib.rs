@@ -32,6 +32,12 @@ pub struct DatabaseTxnId(pub u64);
 /// Unlike [`TableId`], this identifier is never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelationBindingId(pub u32);
+/// Zero-based identity of one parameter slot in a prepared statement.
+///
+/// This identity is frontend-neutral and query-local. It is never persisted
+/// and carries no wire-protocol type identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ParameterId(pub u32);
 id_type!(ColumnId, u32);
 id_type!(IndexId, u64);
 /// Table-scoped opaque identity for one executable physical access path.

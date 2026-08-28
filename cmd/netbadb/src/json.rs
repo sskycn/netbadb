@@ -60,9 +60,11 @@ fn statement_has_partitions(statement: &StatementInspection) -> bool {
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => plan_has_partitions(input),
-            PlanNodeInspection::SeqScan { .. }
+            PlanNodeInspection::OneRow
+            | PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. } => false,
         }
@@ -447,6 +449,7 @@ impl<'a> From<&'a StatementPlanInspection> for StatementPlanJson<'a> {
 #[derive(Serialize)]
 #[serde(tag = "operator", rename_all = "snake_case")]
 enum PlanJson<'a> {
+    OneRow,
     SeqScan {
         binding_id: u32,
         table_id: u64,
@@ -505,6 +508,10 @@ enum PlanJson<'a> {
         columns: Vec<ColumnReferenceJson<'a>>,
         input: Box<PlanJson<'a>>,
     },
+    ScalarProject {
+        expressions: Vec<ExpressionJson<'a>>,
+        input: Box<PlanJson<'a>>,
+    },
     Aggregate {
         group_keys: Vec<ColumnReferenceJson<'a>>,
         outputs: Vec<AggregateOutputJson<'a>>,
@@ -540,6 +547,7 @@ enum PartitionAccessJson<'a> {
 impl<'a> From<&'a PlanNodeInspection> for PlanJson<'a> {
     fn from(plan: &'a PlanNodeInspection) -> Self {
         match plan {
+            PlanNodeInspection::OneRow => Self::OneRow,
             PlanNodeInspection::SeqScan {
                 binding_id,
                 table_id,
@@ -655,6 +663,10 @@ impl<'a> From<&'a PlanNodeInspection> for PlanJson<'a> {
             },
             PlanNodeInspection::Project { columns, input } => Self::Project {
                 columns: columns.iter().map(ColumnReferenceJson::from).collect(),
+                input: Box::new(PlanJson::from(input.as_ref())),
+            },
+            PlanNodeInspection::ScalarProject { expressions, input } => Self::ScalarProject {
+                expressions: expressions.iter().map(ExpressionJson::from).collect(),
                 input: Box::new(PlanJson::from(input.as_ref())),
             },
             PlanNodeInspection::Aggregate {
@@ -826,6 +838,9 @@ enum ExpressionKindJson<'a> {
     Literal {
         value: ScalarJson<'a>,
     },
+    Parameter {
+        id: u32,
+    },
     Binary {
         operator: &'static str,
         left: Box<ExpressionJson<'a>>,
@@ -850,6 +865,7 @@ impl<'a> From<&'a ExpressionKindInspection> for ExpressionKindJson<'a> {
             ExpressionKindInspection::Literal(value) => Self::Literal {
                 value: ScalarJson::from(value),
             },
+            ExpressionKindInspection::Parameter(id) => Self::Parameter { id: id.0 },
             ExpressionKindInspection::Binary {
                 operator,
                 left,

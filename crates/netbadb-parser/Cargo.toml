@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+netbadb-types = { path = "../netbadb-types" }
+
 [lints]
 workspace = true

@@ -204,6 +204,9 @@ dependencies = [
 [[package]]
 name = "netbadb-parser"
 version = "0.1.0"
+dependencies = [
+ "netbadb-types",
+]
 
 [[package]]
 name = "netbadb-pgwire"

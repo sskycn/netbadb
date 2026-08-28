@@ -262,6 +262,15 @@ impl PostgresType {
         }
     }
 
+    #[must_use]
+    pub const fn netbadb_physical(self) -> PhysicalType {
+        match self {
+            Self::Bool => PhysicalType::Bool,
+            Self::Int2 | Self::Int4 | Self::Int8 => PhysicalType::Int64,
+            Self::Text | Self::Varchar | Self::Unknown => PhysicalType::Text,
+        }
+    }
+
     pub fn from_netbadb(physical: PhysicalType) -> Result<Self, TypeMappingError> {
         match physical {
             PhysicalType::Bool => Ok(Self::Bool),
@@ -280,6 +289,7 @@ pub enum TypeMappingError {
     ValueOutOfRange(PostgresType),
     TypeMismatch,
     BinaryFormatUnsupported(PostgresType),
+    InvalidBinaryValue(PostgresType),
 }
 
 impl fmt::Display for TypeMappingError {
@@ -309,6 +319,12 @@ impl fmt::Display for TypeMappingError {
                     "binary format is unsupported for PostgreSQL {data_type:?}"
                 )
             }
+            Self::InvalidBinaryValue(data_type) => {
+                write!(
+                    formatter,
+                    "invalid binary value for PostgreSQL {data_type:?}"
+                )
+            }
         }
     }
 }
@@ -327,6 +343,24 @@ pub fn encode_text_value(
         (ScalarValue::Int64(value), PostgresType::Int8) => Ok(Some(value.to_string().into_bytes())),
         (ScalarValue::Text(value), PostgresType::Text | PostgresType::Varchar) => {
             Ok(Some(value.as_bytes().to_vec()))
+        }
+        _ => Err(TypeMappingError::TypeMismatch),
+    }
+}
+
+pub fn encode_binary_value(
+    value: &ScalarValue,
+    data_type: PostgresType,
+) -> Result<Option<Vec<u8>>, TypeMappingError> {
+    match (value, data_type) {
+        (ScalarValue::Null, _) => Ok(None),
+        (ScalarValue::Bool(value), PostgresType::Bool) => Ok(Some(vec![u8::from(*value)])),
+        (ScalarValue::Int64(value), PostgresType::Int8) => Ok(Some(value.to_be_bytes().to_vec())),
+        (ScalarValue::Text(value), PostgresType::Text | PostgresType::Varchar) => {
+            Ok(Some(value.as_bytes().to_vec()))
+        }
+        (_, PostgresType::Int2 | PostgresType::Int4 | PostgresType::Unknown) => {
+            Err(TypeMappingError::BinaryFormatUnsupported(data_type))
         }
         _ => Err(TypeMappingError::TypeMismatch),
     }
@@ -351,18 +385,63 @@ pub fn decode_text_parameter(
         PostgresType::Int2 => value
             .parse::<i16>()
             .map(|value| ScalarValue::Int64(i64::from(value)))
-            .map_err(|_| TypeMappingError::ValueOutOfRange(data_type)),
+            .map_err(|error| integer_text_error(data_type, &error)),
         PostgresType::Int4 => value
             .parse::<i32>()
             .map(|value| ScalarValue::Int64(i64::from(value)))
-            .map_err(|_| TypeMappingError::ValueOutOfRange(data_type)),
+            .map_err(|error| integer_text_error(data_type, &error)),
         PostgresType::Int8 => value
             .parse::<i64>()
             .map(ScalarValue::Int64)
-            .map_err(|_| TypeMappingError::ValueOutOfRange(data_type)),
+            .map_err(|error| integer_text_error(data_type, &error)),
         PostgresType::Text | PostgresType::Varchar | PostgresType::Unknown => {
             Ok(ScalarValue::Text(value.to_owned()))
         }
+    }
+}
+
+fn integer_text_error(
+    data_type: PostgresType,
+    error: &std::num::ParseIntError,
+) -> TypeMappingError {
+    match error.kind() {
+        std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+            TypeMappingError::ValueOutOfRange(data_type)
+        }
+        _ => TypeMappingError::InvalidTextValue(data_type),
+    }
+}
+
+pub fn decode_binary_parameter(
+    bytes: Option<&[u8]>,
+    oid: PostgresOid,
+) -> Result<ScalarValue, TypeMappingError> {
+    let Some(bytes) = bytes else {
+        return Ok(ScalarValue::Null);
+    };
+    let data_type = PostgresType::from_oid(oid).ok_or(TypeMappingError::UnsupportedOid(oid))?;
+    match data_type {
+        PostgresType::Bool if bytes.len() == 1 && bytes[0] <= 1 => {
+            Ok(ScalarValue::Bool(bytes[0] == 1))
+        }
+        PostgresType::Int2 if bytes.len() == 2 => {
+            Ok(ScalarValue::Int64(i64::from(i16::from_be_bytes([
+                bytes[0], bytes[1],
+            ]))))
+        }
+        PostgresType::Int4 if bytes.len() == 4 => {
+            Ok(ScalarValue::Int64(i64::from(i32::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]))))
+        }
+        PostgresType::Int8 if bytes.len() == 8 => Ok(ScalarValue::Int64(i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))),
+        PostgresType::Text | PostgresType::Varchar => std::str::from_utf8(bytes)
+            .map(|value| ScalarValue::Text(value.to_owned()))
+            .map_err(|_| TypeMappingError::InvalidBinaryValue(data_type)),
+        PostgresType::Unknown => Err(TypeMappingError::BinaryFormatUnsupported(data_type)),
+        _ => Err(TypeMappingError::InvalidBinaryValue(data_type)),
     }
 }
 
@@ -1000,9 +1079,86 @@ mod tests {
             decode_text_parameter(Some(b"32767"), PostgresOid(21)).unwrap(),
             ScalarValue::Int64(32767)
         );
+        assert_eq!(
+            decode_text_parameter(Some(b"true"), PostgresType::Bool.oid()).unwrap(),
+            ScalarValue::Bool(true)
+        );
+        assert_eq!(
+            decode_text_parameter(Some(b"-2147483648"), PostgresType::Int4.oid()).unwrap(),
+            ScalarValue::Int64(i64::from(i32::MIN))
+        );
+        assert_eq!(
+            decode_text_parameter(Some(b"9223372036854775807"), PostgresType::Int8.oid()).unwrap(),
+            ScalarValue::Int64(i64::MAX)
+        );
+        assert_eq!(
+            decode_text_parameter(Some("你好".as_bytes()), PostgresType::Text.oid()).unwrap(),
+            ScalarValue::Text("你好".into())
+        );
+        assert_eq!(
+            decode_text_parameter(Some(b"varchar"), PostgresType::Varchar.oid()).unwrap(),
+            ScalarValue::Text("varchar".into())
+        );
+        assert_eq!(
+            decode_text_parameter(None, PostgresType::Int8.oid()).unwrap(),
+            ScalarValue::Null
+        );
         assert!(matches!(
             decode_text_parameter(Some(b"32768"), PostgresOid(21)),
             Err(TypeMappingError::ValueOutOfRange(PostgresType::Int2))
         ));
+        assert!(matches!(
+            decode_text_parameter(Some(b"1"), PostgresOid(999_999)),
+            Err(TypeMappingError::UnsupportedOid(PostgresOid(999_999)))
+        ));
+    }
+
+    #[test]
+    fn decodes_and_encodes_base_binary_values_with_exact_widths() {
+        assert_eq!(
+            decode_binary_parameter(Some(&[1]), PostgresType::Bool.oid()).unwrap(),
+            ScalarValue::Bool(true)
+        );
+        assert_eq!(
+            decode_binary_parameter(Some(&(-7_i16).to_be_bytes()), PostgresType::Int2.oid())
+                .unwrap(),
+            ScalarValue::Int64(-7)
+        );
+        assert_eq!(
+            decode_binary_parameter(Some(&42_i32.to_be_bytes()), PostgresType::Int4.oid()).unwrap(),
+            ScalarValue::Int64(42)
+        );
+        assert_eq!(
+            decode_binary_parameter(Some(&99_i64.to_be_bytes()), PostgresType::Int8.oid()).unwrap(),
+            ScalarValue::Int64(99)
+        );
+        assert_eq!(
+            decode_binary_parameter(Some(b"Ada"), PostgresType::Text.oid()).unwrap(),
+            ScalarValue::Text("Ada".into())
+        );
+        assert_eq!(
+            decode_binary_parameter(Some(b"Lin"), PostgresType::Varchar.oid()).unwrap(),
+            ScalarValue::Text("Lin".into())
+        );
+        assert_eq!(
+            decode_binary_parameter(None, PostgresType::Bool.oid()).unwrap(),
+            ScalarValue::Null
+        );
+        assert!(matches!(
+            decode_binary_parameter(Some(&[0, 1]), PostgresType::Bool.oid()),
+            Err(TypeMappingError::InvalidBinaryValue(PostgresType::Bool))
+        ));
+        assert!(matches!(
+            decode_binary_parameter(Some(&[0; 3]), PostgresType::Int4.oid()),
+            Err(TypeMappingError::InvalidBinaryValue(PostgresType::Int4))
+        ));
+        assert_eq!(
+            encode_binary_value(&ScalarValue::Int64(7), PostgresType::Int8).unwrap(),
+            Some(7_i64.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            encode_binary_value(&ScalarValue::Null, PostgresType::Text).unwrap(),
+            None
+        );
     }
 }

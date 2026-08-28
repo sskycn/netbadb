@@ -7,7 +7,9 @@
 use std::fmt::{self, Write};
 
 use netbadb_schema::SchemaFingerprint;
-use netbadb_types::{ColumnId, PartitionId, RelationBindingId, ScalarValue, SemanticType, TableId};
+use netbadb_types::{
+    ColumnId, ParameterId, PartitionId, RelationBindingId, ScalarValue, SemanticType, TableId,
+};
 
 /// One declaration-ordered snapshot of the visible canonical catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +164,7 @@ pub struct ExpressionInspection {
 pub enum ExpressionKindInspection {
     Column(ColumnReferenceInspection),
     Literal(ScalarValue),
+    Parameter(ParameterId),
     Binary {
         operator: BinaryOpInspection,
         left: Box<ExpressionInspection>,
@@ -199,6 +202,7 @@ pub enum UnaryOpInspection {
 /// Chosen physical operator tree stripped of executor/storage handles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanNodeInspection {
+    OneRow,
     SeqScan {
         binding_id: RelationBindingId,
         table_id: TableId,
@@ -254,6 +258,10 @@ pub enum PlanNodeInspection {
     },
     Project {
         columns: Vec<ColumnReferenceInspection>,
+        input: Box<PlanNodeInspection>,
+    },
+    ScalarProject {
+        expressions: Vec<ExpressionInspection>,
         input: Box<PlanNodeInspection>,
     },
     Aggregate {
@@ -594,6 +602,7 @@ impl Renderer {
 
     fn plan(&mut self, depth: usize, plan: &PlanNodeInspection) {
         match plan {
+            PlanNodeInspection::OneRow => self.line(depth, format_args!("OneRow")),
             PlanNodeInspection::SeqScan {
                 binding_id,
                 table_id,
@@ -752,6 +761,18 @@ impl Renderer {
                 );
                 self.plan(depth + 1, input);
             }
+            PlanNodeInspection::ScalarProject { expressions, input } => {
+                let expressions = expressions
+                    .iter()
+                    .map(expression_text)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.line(
+                    depth,
+                    format_args!("ScalarProject expressions=[{expressions}]"),
+                );
+                self.plan(depth + 1, input);
+            }
             PlanNodeInspection::Aggregate {
                 group_keys,
                 outputs,
@@ -900,6 +921,7 @@ fn expression_text(expression: &ExpressionInspection) -> String {
     match &expression.kind {
         ExpressionKindInspection::Column(column) => column_reference_text(column),
         ExpressionKindInspection::Literal(value) => scalar_text(value),
+        ExpressionKindInspection::Parameter(id) => format!("${}", id.0 + 1),
         ExpressionKindInspection::Binary {
             operator,
             left,

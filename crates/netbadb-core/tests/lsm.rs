@@ -54,13 +54,16 @@ fn contains_index(plan: &PlanNodeInspection) -> bool {
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => contains_index(input),
         PlanNodeInspection::NestedLoopJoin { left, right, .. }
         | PlanNodeInspection::HashJoin { left, right, .. } => {
             contains_index(left) || contains_index(right)
         }
-        PlanNodeInspection::SeqScan { .. } | PlanNodeInspection::PartitionedScan { .. } => false,
+        PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::PartitionedScan { .. }
+        | PlanNodeInspection::OneRow => false,
     }
 }
 

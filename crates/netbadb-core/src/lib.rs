@@ -14,7 +14,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use netbadb_compiler::{CompileError, CompileErrorKind, CompiledStatement, compile_statement};
+use netbadb_compiler::{
+    BindError, CompileError, CompileErrorKind, CompiledStatement, PreparedParameter,
+    bind_statement, compile_statement, compile_statement_with_parameters,
+};
 use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
     execute_with_storage_context, prepare_mutation_with_storage_context,
@@ -194,6 +197,34 @@ pub struct StatementDescription {
     pub is_query: bool,
 }
 
+/// A statement parsed, resolved, and type-checked once with frontend-neutral
+/// parameter metadata. Binding produces a temporary logical statement so the
+/// planner sees concrete scalar values.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    compiled: CompiledStatement,
+}
+
+impl PreparedStatement {
+    #[must_use]
+    pub fn parameters(&self) -> &[PreparedParameter] {
+        &self.compiled.parameters
+    }
+
+    #[must_use]
+    pub fn access(&self) -> StatementAccess {
+        StatementAccess {
+            read_tables: self.compiled.logical_statement.read_tables(),
+            write_tables: self.compiled.logical_statement.write_tables(),
+        }
+    }
+
+    #[must_use]
+    pub fn description(&self) -> StatementDescription {
+        statement_description(&self.compiled.logical_statement)
+    }
+}
+
 impl StatementAccess {
     #[must_use]
     pub fn read_tables(&self) -> &[TableId] {
@@ -206,9 +237,31 @@ impl StatementAccess {
     }
 }
 
+fn statement_description(statement: &netbadb_rel::LogicalStatement) -> StatementDescription {
+    let netbadb_rel::LogicalStatement::Query(plan) = statement else {
+        return StatementDescription {
+            columns: Vec::new(),
+            is_query: false,
+        };
+    };
+    StatementDescription {
+        columns: plan
+            .output_fields()
+            .into_iter()
+            .map(|field| ResultColumn {
+                name: field.name().to_owned(),
+                data_type: field.data_type().clone(),
+                nullable: field.nullable(),
+            })
+            .collect(),
+        is_query: true,
+    }
+}
+
 #[derive(Debug)]
 pub enum DatabaseError {
     Compile(CompileError),
+    Bind(BindError),
     Schema(SchemaError),
     Storage(StorageError),
     Execution(ExecutionError),
@@ -260,6 +313,8 @@ pub enum DatabaseErrorKind {
     UndefinedColumn,
     AmbiguousColumn,
     DatatypeMismatch,
+    IndeterminateDatatype,
+    ParameterCount,
     NotNullViolation,
     FeatureNotSupported,
     TransactionState,
@@ -277,9 +332,20 @@ impl DatabaseError {
                 CompileErrorKind::UndefinedColumn => DatabaseErrorKind::UndefinedColumn,
                 CompileErrorKind::AmbiguousColumn => DatabaseErrorKind::AmbiguousColumn,
                 CompileErrorKind::DatatypeMismatch => DatabaseErrorKind::DatatypeMismatch,
+                CompileErrorKind::IndeterminateDatatype => DatabaseErrorKind::IndeterminateDatatype,
                 CompileErrorKind::NotNullViolation => DatabaseErrorKind::NotNullViolation,
                 CompileErrorKind::FeatureNotSupported => DatabaseErrorKind::FeatureNotSupported,
             },
+            Self::Bind(BindError::ParameterCount { .. }) => DatabaseErrorKind::ParameterCount,
+            Self::Bind(BindError::ParameterType { .. }) => DatabaseErrorKind::DatatypeMismatch,
+            Self::Storage(StorageError::NullNotAllowed { .. })
+            | Self::Execution(ExecutionError::Storage(StorageError::NullNotAllowed { .. })) => {
+                DatabaseErrorKind::NotNullViolation
+            }
+            Self::Storage(StorageError::TypeMismatch { .. })
+            | Self::Execution(ExecutionError::Storage(StorageError::TypeMismatch { .. })) => {
+                DatabaseErrorKind::DatatypeMismatch
+            }
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
             Self::Schema(_)
             | Self::Storage(_)
@@ -318,6 +384,7 @@ impl fmt::Display for DatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Compile(error) => error.fmt(formatter),
+            Self::Bind(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
@@ -394,6 +461,7 @@ impl Error for DatabaseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Compile(error) => Some(error),
+            Self::Bind(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
@@ -419,6 +487,12 @@ impl Error for DatabaseError {
 impl From<CompileError> for DatabaseError {
     fn from(error: CompileError) -> Self {
         Self::Compile(error)
+    }
+}
+
+impl From<BindError> for DatabaseError {
+    fn from(error: BindError) -> Self {
+        Self::Bind(error)
     }
 }
 
@@ -1353,6 +1427,19 @@ impl Database {
         })
     }
 
+    /// Parses, resolves, and type-checks a reusable parameterized statement.
+    /// Declared parameter constraints are physical frontend capabilities;
+    /// contextual inference still preserves canonical semantic types.
+    pub fn prepare_statement(
+        &self,
+        source: &str,
+        declared: &[Option<PhysicalType>],
+    ) -> Result<PreparedStatement, DatabaseError> {
+        Ok(PreparedStatement {
+            compiled: compile_statement_with_parameters(&self.schema, source, declared)?,
+        })
+    }
+
     /// Compiles and plans a statement and exposes only transport-neutral output
     /// metadata. No transaction starts and no storage row is read or written.
     pub fn describe_statement(&self, source: &str) -> Result<StatementDescription, DatabaseError> {
@@ -1454,6 +1541,36 @@ impl Database {
         }
     }
 
+    /// Binds typed values into a prepared logical statement, then optimizes,
+    /// plans, and executes that concrete ephemeral statement.
+    pub fn execute_prepared(
+        &mut self,
+        prepared: &PreparedStatement,
+        values: &[ScalarValue],
+    ) -> Result<ExecutionResult, DatabaseError> {
+        let logical = bind_statement(&prepared.compiled, values)?;
+        let physical = self.plan_logical_statement(&logical);
+        if let PhysicalStatement::Query(plan) = &physical {
+            let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
+            let view = self.autocommit_read_view(&storage_ids)?;
+            return self
+                .execute_query_plan(plan, &view)
+                .map(ExecutionResult::Query);
+        }
+
+        let mut transaction = self.begin_database_transaction(IsolationLevel::ReadCommitted)?;
+        match self.execute_mutation_in(&mut transaction, &physical) {
+            Ok(result) => {
+                transaction.commit()?;
+                Ok(result)
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error.into()),
+            },
+        }
+    }
+
     /// Executes a statement using an existing database transaction. Reads may
     /// span physical storages. Writes may span storages only when the database
     /// was opened with an explicit durable coordinator log. Until savepoints
@@ -1490,6 +1607,35 @@ impl Database {
         }
     }
 
+    pub fn execute_prepared_in(
+        &mut self,
+        transaction: &mut Transaction,
+        prepared: &PreparedStatement,
+        values: &[ScalarValue],
+    ) -> Result<ExecutionResult, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let logical = bind_statement(&prepared.compiled, values)?;
+        let physical = self.plan_logical_statement(&logical);
+        if let PhysicalStatement::Query(plan) = &physical {
+            let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
+            let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
+            return self
+                .execute_query_plan(plan, &view)
+                .map(ExecutionResult::Query);
+        }
+        let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
+        if let TablePlacement::Single { storage_id, .. } = self.bindings.placement(table_id)? {
+            let _ = transaction.write_context(*storage_id, &mut self.registry)?;
+        }
+        match self.execute_mutation_in(transaction, &physical) {
+            Ok(result) => Ok(result),
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error.into()),
+            },
+        }
+    }
+
     #[must_use]
     pub fn schema(&self) -> &Schema {
         &self.schema
@@ -1505,16 +1651,17 @@ impl Database {
         source: &str,
     ) -> Result<(CompiledStatement, PhysicalStatement), DatabaseError> {
         let compiled = compile_statement(&self.schema, source)?;
-        let table_statistics = self.planner_table_statistics();
-        let access_paths = self.planner_access_paths();
-        let range_tables = self.planner_range_tables();
-        let physical = plan_statement_with_partition_snapshots(
-            &compiled.logical_statement,
-            &table_statistics,
-            &access_paths,
-            &range_tables,
-        );
+        let physical = self.plan_logical_statement(&compiled.logical_statement);
         Ok((compiled, physical))
+    }
+
+    fn plan_logical_statement(&self, logical: &netbadb_rel::LogicalStatement) -> PhysicalStatement {
+        plan_statement_with_partition_snapshots(
+            logical,
+            &self.planner_table_statistics(),
+            &self.planner_access_paths(),
+            &self.planner_range_tables(),
+        )
     }
 
     fn planner_table_statistics(&self) -> Vec<TableAccessStatistics> {
@@ -3302,6 +3449,7 @@ mod tests {
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::ScalarProject { input, .. }
             | PhysicalPlan::Aggregate { input, .. }
             | PhysicalPlan::Limit { input, .. } => planned_index(input),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
@@ -3310,7 +3458,8 @@ mod tests {
             }
             PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::RangeIndexScan { .. }
-            | PhysicalPlan::PartitionedScan { .. } => None,
+            | PhysicalPlan::PartitionedScan { .. }
+            | PhysicalPlan::OneRow => None,
         }
     }
 
@@ -3911,11 +4060,13 @@ mod tests {
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_index(input),
             PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. }
-            | PlanNodeInspection::PartitionedScan { .. } => None,
+            | PlanNodeInspection::PartitionedScan { .. }
+            | PlanNodeInspection::OneRow => None,
         }
     }
 
@@ -3931,11 +4082,13 @@ mod tests {
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_range(input),
             PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::IndexScan { .. }
-            | PlanNodeInspection::PartitionedScan { .. } => None,
+            | PlanNodeInspection::PartitionedScan { .. }
+            | PlanNodeInspection::OneRow => None,
         }
     }
 
@@ -3978,8 +4131,10 @@ mod tests {
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => scan_bindings(input, bindings),
+            PlanNodeInspection::OneRow => {}
         }
     }
 
@@ -4000,8 +4155,10 @@ mod tests {
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_scan_columns(input),
+            PlanNodeInspection::OneRow => None,
         }
     }
 
@@ -4014,12 +4171,14 @@ mod tests {
             }
             PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_filter(input),
             PlanNodeInspection::SeqScan { .. }
             | PlanNodeInspection::IndexScan { .. }
-            | PlanNodeInspection::RangeIndexScan { .. } => None,
-            PlanNodeInspection::PartitionedScan { .. } => None,
+            | PlanNodeInspection::RangeIndexScan { .. }
+            | PlanNodeInspection::PartitionedScan { .. }
+            | PlanNodeInspection::OneRow => None,
         }
     }
 

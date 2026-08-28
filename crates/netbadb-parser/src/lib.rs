@@ -3,6 +3,8 @@
 use std::error::Error;
 use std::fmt;
 
+use netbadb_types::ParameterId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
@@ -18,7 +20,7 @@ pub struct Ident {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     pub projection: Vec<SelectItem>,
-    pub from: FromItem,
+    pub from: Option<FromItem>,
     pub joins: Vec<Join>,
     pub selection: Option<Expr>,
     pub group_by: Vec<ColumnName>,
@@ -117,6 +119,11 @@ pub enum SelectItem {
     Wildcard(Span),
     Column(ColumnName),
     Aggregate(AggregateCall),
+    Expression {
+        expression: Expr,
+        alias: Option<Ident>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +152,10 @@ pub enum Expr {
     Column(ColumnName),
     Literal {
         value: Literal,
+        span: Span,
+    },
+    Parameter {
+        id: ParameterId,
         span: Span,
     },
     Binary {
@@ -242,6 +253,7 @@ enum TokenKind {
     Ident(String),
     Number(i64),
     String(String),
+    Parameter(ParameterId),
     Comma,
     Dot,
     Star,
@@ -342,6 +354,40 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             b'>' => {
                 position += 1;
                 TokenKind::Gt
+            }
+            b'$' => {
+                position += 1;
+                let digits_start = position;
+                while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                    position += 1;
+                }
+                if digits_start == position {
+                    return Err(ParseError {
+                        message: "parameter marker expects a positive integer".into(),
+                        span: Span {
+                            start,
+                            end: position,
+                        },
+                    });
+                }
+                let ordinal =
+                    input[digits_start..position]
+                        .parse::<u32>()
+                        .map_err(|_| ParseError {
+                            message: "parameter number is too large".into(),
+                            span: Span {
+                                start,
+                                end: position,
+                            },
+                        })?;
+                let zero_based = ordinal.checked_sub(1).ok_or_else(|| ParseError {
+                    message: "parameter numbers start at $1".into(),
+                    span: Span {
+                        start,
+                        end: position,
+                    },
+                })?;
+                TokenKind::Parameter(ParameterId(zero_based))
             }
             b'\'' => {
                 position += 1;
@@ -471,8 +517,12 @@ impl Parser {
     fn parse_query(&mut self) -> Result<Query, ParseError> {
         let start = self.expect_simple(TokenKind::Select)?.span.start;
         let projection = self.parse_projection()?;
-        self.expect_simple(TokenKind::From)?;
-        let from = self.parse_from_item()?;
+        let from = if self.matches(&TokenKind::From) {
+            self.position += 1;
+            Some(self.parse_from_item()?)
+        } else {
+            None
+        };
         let mut joins = Vec::new();
         while self.matches(&TokenKind::Join) || self.matches(&TokenKind::Inner) {
             joins.push(self.parse_join()?);
@@ -743,7 +793,24 @@ impl Parser {
     fn parse_projection_item(&mut self) -> Result<SelectItem, ParseError> {
         let token = self.current().clone();
         let TokenKind::Ident(name) = &token.kind else {
-            return Err(self.error_here("expected a projected column or aggregate"));
+            let expression = self.parse_expr(0)?;
+            let alias = if self.matches(&TokenKind::As) {
+                self.position += 1;
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            let end = alias
+                .as_ref()
+                .map_or(expr_span(&expression).end, |alias| alias.span.end);
+            return Ok(SelectItem::Expression {
+                span: Span {
+                    start: expr_span(&expression).start,
+                    end,
+                },
+                expression,
+                alias,
+            });
         };
         if !self
             .tokens
@@ -890,6 +957,13 @@ impl Parser {
                     span: token.span,
                 })
             }
+            TokenKind::Parameter(id) => {
+                self.position += 1;
+                Ok(Expr::Parameter {
+                    id,
+                    span: token.span,
+                })
+            }
             TokenKind::True | TokenKind::False | TokenKind::Null => {
                 self.position += 1;
                 let value = match token.kind {
@@ -1002,6 +1076,7 @@ fn expr_span(expression: &Expr) -> Span {
     match expression {
         Expr::Column(column) => column.span,
         Expr::Literal { span, .. }
+        | Expr::Parameter { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Unary { span, .. }
         | Expr::IsNull { span, .. } => *span,
@@ -1037,7 +1112,7 @@ mod tests {
     fn parses_the_initial_query_subset() {
         let query = parse("SELECT id, name FROM users WHERE id >= 2 AND name != 'bob' LIMIT 10")
             .expect("query parses");
-        assert_eq!(query.from.table.name, "users");
+        assert_eq!(query.from.as_ref().expect("FROM").table.name, "users");
         assert_eq!(query.projection.len(), 2);
         assert_eq!(query.limit, Some(10));
         assert!(matches!(query.projection[0], SelectItem::Column(_)));
@@ -1206,7 +1281,17 @@ mod tests {
              WHERE o.active = true",
         )
         .expect("join query parses");
-        assert_eq!(query.from.alias.as_ref().expect("alias").name, "u");
+        assert_eq!(
+            query
+                .from
+                .as_ref()
+                .expect("FROM")
+                .alias
+                .as_ref()
+                .expect("alias")
+                .name,
+            "u"
+        );
         assert_eq!(query.joins.len(), 2);
         assert_eq!(query.joins[0].right.table.name, "teams");
         assert_eq!(
@@ -1225,7 +1310,7 @@ mod tests {
     fn join_keywords_are_not_consumed_as_shorthand_aliases() {
         let query =
             parse("SELECT * FROM users JOIN teams ON users.id = teams.id").expect("join parses");
-        assert!(query.from.alias.is_none());
+        assert!(query.from.as_ref().expect("FROM").alias.is_none());
         assert!(query.joins[0].right.alias.is_none());
 
         for source in [
@@ -1403,5 +1488,21 @@ mod tests {
             assert!(error.span.start <= error.span.end, "{source}");
             assert!(error.span.end <= source.len(), "{source}");
         }
+    }
+
+    #[test]
+    fn parses_fromless_scalar_select_and_parameter_slots() {
+        let query = parse("SELECT $2 AS value").expect("parse parameter projection");
+        assert!(query.from.is_none());
+        assert!(matches!(
+            &query.projection[0],
+            SelectItem::Expression {
+                expression: Expr::Parameter { id, .. },
+                alias: Some(alias),
+                ..
+            } if *id == netbadb_types::ParameterId(1) && alias.name == "value"
+        ));
+        assert!(parse("SELECT $0").is_err());
+        assert!(parse("SELECT $").is_err());
     }
 }

@@ -183,6 +183,7 @@ fn expression(expression: &Expr) -> ExpressionInspection {
     let kind = match &expression.kind {
         ExprKind::Column(column) => ExpressionKindInspection::Column(column_reference(column)),
         ExprKind::Literal(value) => ExpressionKindInspection::Literal(value.clone()),
+        ExprKind::Parameter(id) => ExpressionKindInspection::Parameter(*id),
         ExprKind::Binary {
             operator,
             left,
@@ -235,6 +236,7 @@ fn unary_operator(operator: UnaryOp) -> UnaryOpInspection {
 
 fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
     match plan {
+        PhysicalPlan::OneRow => PlanNodeInspection::OneRow,
         PhysicalPlan::SeqScan {
             binding_id,
             table_id,
@@ -360,6 +362,13 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
         },
         PhysicalPlan::Project { input, columns } => PlanNodeInspection::Project {
             columns: columns.iter().map(column_reference).collect(),
+            input: Box::new(inspect_plan(input)),
+        },
+        PhysicalPlan::ScalarProject { input, expressions } => PlanNodeInspection::ScalarProject {
+            expressions: expressions
+                .iter()
+                .map(|projected| expression(&projected.expression))
+                .collect(),
             input: Box::new(inspect_plan(input)),
         },
         PhysicalPlan::Aggregate {

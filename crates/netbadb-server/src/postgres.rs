@@ -8,15 +8,17 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use netbadb_core::{
-    Database, DatabaseError, DatabaseErrorKind, ExecutionResult, QueryResult, StatementDescription,
+    Database, DatabaseError, DatabaseErrorKind, ExecutionResult, PreparedStatement as CorePrepared,
+    QueryResult, StatementAccess, StatementDescription,
 };
 use netbadb_pgwire::{
     BackendMessage, CloseTarget, DescribeTarget, ErrorResponse, FieldDescription, FormatCode,
     FrontendMessage, PostgresOid, PostgresType, StartupMessage, StartupPacket, TypeMappingError,
-    WireError, encode_text_value, read_frontend_message, read_startup_packet,
-    write_backend_message,
+    WireError, decode_binary_parameter, decode_text_parameter, encode_binary_value,
+    encode_text_value, read_frontend_message, read_startup_packet, write_backend_message,
 };
 use netbadb_protocol::WireTransactionState;
+use netbadb_types::{PhysicalType, ScalarValue};
 
 use crate::authorization::{AuthorizationAction, AuthorizationPolicy, PrincipalAuthorization};
 use crate::{
@@ -575,6 +577,7 @@ impl PgTransactionStatus {
 
 struct PreparedStatement {
     sql: String,
+    prepared: CorePrepared,
     parameters: Vec<PostgresOid>,
     fields: Vec<FieldDescription>,
     is_query: bool,
@@ -583,6 +586,8 @@ struct PreparedStatement {
 struct Portal {
     statement: String,
     sql: String,
+    prepared: CorePrepared,
+    values: Vec<ScalarValue>,
     fields: Vec<FieldDescription>,
     result: Option<PortalResult>,
 }
@@ -694,6 +699,8 @@ impl PgWorkerSession {
     }
 
     fn simple_query(&mut self, database: &mut Database, sql: &str) -> Vec<BackendMessage> {
+        self.prepared.remove("");
+        self.portals.remove("");
         let statements = split_statements(sql);
         if statements.is_empty() {
             return vec![
@@ -732,15 +739,39 @@ impl PgWorkerSession {
                 "prepared statement session limit reached",
             ));
         }
-        if !parameter_types.is_empty() || query.as_bytes().contains(&b'$') {
-            return self.extended_error(fixed_error(
-                "0A000",
-                "typed query parameters are not yet supported by the NetbaDB compiler",
-            ));
-        }
-        let description = match database.describe_statement(&query) {
-            Ok(description) => description,
+        let declared = match parameter_types
+            .iter()
+            .map(|oid| parameter_constraint(*oid))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(declared) => declared,
+            Err(error) => return self.extended_error(error),
+        };
+        let prepared = match database.prepare_statement(&query, &declared) {
+            Ok(prepared) => prepared,
             Err(error) => return self.extended_error(map_database_error(&error)),
+        };
+        let description = prepared.description();
+        let inferred_oids = match prepared
+            .parameters()
+            .iter()
+            .enumerate()
+            .map(
+                |(index, parameter)| match parameter_types.get(index).copied() {
+                    Some(PostgresOid(oid)) if oid != 0 => PostgresType::from_oid(PostgresOid(oid))
+                        .map(PostgresType::oid)
+                        .ok_or_else(|| {
+                            map_type_error(TypeMappingError::UnsupportedOid(PostgresOid(oid)))
+                        }),
+                    _ => PostgresType::from_netbadb(parameter.data_type.physical)
+                        .map(PostgresType::oid)
+                        .map_err(map_type_error),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(oids) => oids,
+            Err(error) => return self.extended_error(error),
         };
         let fields = match fields_from_description(&description) {
             Ok(fields) => fields,
@@ -755,7 +786,8 @@ impl PgWorkerSession {
             statement,
             PreparedStatement {
                 sql: query,
-                parameters: parameter_types,
+                prepared,
+                parameters: inferred_oids,
                 fields,
                 is_query: description.is_query,
             },
@@ -780,30 +812,53 @@ impl PgWorkerSession {
         if !self.portals.contains_key(&portal) && self.portals.len() >= MAX_PORTALS {
             return self.extended_error(fixed_error("54000", "portal session limit reached"));
         }
-        if parameters.len() != prepared.parameters.len() || !parameters.is_empty() {
+        if parameters.len() != prepared.parameters.len() {
             return self.extended_error(fixed_error(
                 "08P01",
                 "Bind parameter count does not match Parse",
             ));
         }
-        if !parameter_formats.is_empty() {
-            return self.extended_error(fixed_error(
-                "08P01",
-                "zero-parameter Bind must not include parameter formats",
-            ));
-        }
-        if result_formats.contains(&FormatCode::Binary) {
-            return self.extended_error(fixed_error(
-                "0A000",
-                "binary parameter and result formats are unsupported",
-            ));
-        }
-        if result_formats.len() > 1 && result_formats.len() != prepared.fields.len() {
-            return self.extended_error(fixed_error(
-                "08P01",
-                "result format count does not match result columns",
-            ));
-        }
+        let parameter_formats = match expand_formats(
+            &parameter_formats,
+            parameters.len(),
+            "parameter format count does not match parameters",
+        ) {
+            Ok(formats) => formats,
+            Err(error) => return self.extended_error(error),
+        };
+        let values = match parameters
+            .iter()
+            .zip(&prepared.parameters)
+            .zip(&parameter_formats)
+            .map(|((bytes, oid), format)| match format {
+                FormatCode::Text => decode_text_parameter(bytes.as_deref(), *oid),
+                FormatCode::Binary => decode_binary_parameter(bytes.as_deref(), *oid),
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(values) => values,
+            Err(error) => return self.extended_error(map_type_error(error)),
+        };
+        let result_formats = match expand_formats(
+            &result_formats,
+            prepared.fields.len(),
+            "result format count does not match result columns",
+        ) {
+            Ok(formats) => formats,
+            Err(error) => return self.extended_error(error),
+        };
+        let fields = prepared
+            .fields
+            .iter()
+            .cloned()
+            .zip(result_formats)
+            .map(|(mut field, format)| {
+                field.format = format;
+                field
+            })
+            .collect();
+        let sql = prepared.sql.clone();
+        let core_prepared = prepared.prepared.clone();
         if portal.is_empty() {
             self.portals.remove("");
         }
@@ -811,8 +866,10 @@ impl PgWorkerSession {
             portal,
             Portal {
                 statement,
-                sql: prepared.sql.clone(),
-                fields: prepared.fields.clone(),
+                sql,
+                prepared: core_prepared,
+                values,
+                fields,
                 result: None,
             },
         );
@@ -859,7 +916,13 @@ impl PgWorkerSession {
             return self.extended_error(fixed_error("34000", "portal does not exist"));
         };
         if portal.result.is_none() {
-            let result = match self.execute_to_portal(database, &portal.sql, &portal.fields) {
+            let result = match self.execute_to_portal(
+                database,
+                &portal.sql,
+                &portal.prepared,
+                &portal.values,
+                &portal.fields,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     self.portals.insert(name.to_owned(), portal);
@@ -881,9 +944,11 @@ impl PgWorkerSession {
         &mut self,
         database: &mut Database,
         sql: &str,
+        prepared: &CorePrepared,
+        values: &[ScalarValue],
         fields: &[FieldDescription],
     ) -> Result<PortalResult, ErrorResponse> {
-        let result = self.execute_core(database, sql)?;
+        let result = self.execute_prepared_core(database, prepared, values)?;
         match result {
             ExecutionResult::Query(query) => Ok(PortalResult::Query {
                 rows: encode_query_rows(&query, fields, self.execution.policy.max_result_rows())?,
@@ -896,20 +961,14 @@ impl PgWorkerSession {
     }
 
     fn close_object(&mut self, target: CloseTarget, name: &str) -> Vec<BackendMessage> {
-        let existed = match target {
+        match target {
             CloseTarget::Statement => {
-                let existed = self.prepared.remove(name).is_some();
+                self.prepared.remove(name);
                 self.portals.retain(|_, portal| portal.statement != name);
-                existed
             }
-            CloseTarget::Portal => self.portals.remove(name).is_some(),
-        };
-        if !existed {
-            let (state, message) = match target {
-                CloseTarget::Statement => ("26000", "prepared statement does not exist"),
-                CloseTarget::Portal => ("34000", "portal does not exist"),
-            };
-            return self.extended_error(fixed_error(state, message));
+            CloseTarget::Portal => {
+                self.portals.remove(name);
+            }
         }
         vec![BackendMessage::CloseComplete]
     }
@@ -955,6 +1014,31 @@ impl PgWorkerSession {
         let access = database
             .statement_access(sql)
             .map_err(|error| self.record_error(&error))?;
+        self.authorize_access(&access)?;
+        self.execution
+            .execute(database, sql)
+            .map_err(|error| self.record_error(&error))
+    }
+
+    fn execute_prepared_core(
+        &mut self,
+        database: &mut Database,
+        prepared: &CorePrepared,
+        values: &[ScalarValue],
+    ) -> Result<ExecutionResult, ErrorResponse> {
+        if self.status == PgTransactionStatus::Failed {
+            return Err(fixed_error(
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ));
+        }
+        self.authorize_access(&prepared.access())?;
+        self.execution
+            .execute_prepared(database, prepared, values)
+            .map_err(|error| self.record_error(&error))
+    }
+
+    fn authorize_access(&mut self, access: &StatementAccess) -> Result<(), ErrorResponse> {
         for table in access.read_tables() {
             if self
                 .authorization
@@ -979,9 +1063,7 @@ impl PgWorkerSession {
                 )));
             }
         }
-        self.execution
-            .execute(database, sql)
-            .map_err(|error| self.record_error(&error))
+        Ok(())
     }
 
     fn record_error(&mut self, error: &DatabaseError) -> ErrorResponse {
@@ -1113,6 +1195,28 @@ fn parameter_status(name: &str, value: &str) -> BackendMessage {
     }
 }
 
+fn parameter_constraint(oid: PostgresOid) -> Result<Option<PhysicalType>, ErrorResponse> {
+    if oid.0 == 0 {
+        return Ok(None);
+    }
+    PostgresType::from_oid(oid)
+        .map(|data_type| Some(data_type.netbadb_physical()))
+        .ok_or_else(|| map_type_error(TypeMappingError::UnsupportedOid(oid)))
+}
+
+fn expand_formats(
+    formats: &[FormatCode],
+    count: usize,
+    message: &'static str,
+) -> Result<Vec<FormatCode>, ErrorResponse> {
+    match formats {
+        [] => Ok(vec![FormatCode::Text; count]),
+        [format] => Ok(vec![*format; count]),
+        formats if formats.len() == count => Ok(formats.to_vec()),
+        _ => Err(fixed_error("08P01", message)),
+    }
+}
+
 fn fields_from_description(
     description: &StatementDescription,
 ) -> Result<Vec<FieldDescription>, ErrorResponse> {
@@ -1175,7 +1279,11 @@ fn encode_query_rows(
             row.iter()
                 .zip(fields)
                 .map(|(value, field)| {
-                    encode_text_value(value, field.data_type).map_err(map_type_error)
+                    match field.format {
+                        FormatCode::Text => encode_text_value(value, field.data_type),
+                        FormatCode::Binary => encode_binary_value(value, field.data_type),
+                    }
+                    .map_err(map_type_error)
                 })
                 .collect()
         })
@@ -1238,6 +1346,8 @@ fn map_database_error(error: &DatabaseError) -> ErrorResponse {
         DatabaseErrorKind::UndefinedColumn => ("42703", Some(error.to_string())),
         DatabaseErrorKind::AmbiguousColumn => ("42702", Some(error.to_string())),
         DatabaseErrorKind::DatatypeMismatch => ("42804", Some(error.to_string())),
+        DatabaseErrorKind::IndeterminateDatatype => ("42P18", Some(error.to_string())),
+        DatabaseErrorKind::ParameterCount => ("08P01", Some(error.to_string())),
         DatabaseErrorKind::NotNullViolation => ("23502", Some(error.to_string())),
         DatabaseErrorKind::FeatureNotSupported => ("0A000", Some(error.to_string())),
         DatabaseErrorKind::TransactionState => ("25000", Some("invalid transaction state".into())),
@@ -1259,9 +1369,10 @@ fn map_type_error(error: TypeMappingError) -> ErrorResponse {
         TypeMappingError::UnsupportedUInt64
         | TypeMappingError::UnsupportedOid(_)
         | TypeMappingError::BinaryFormatUnsupported(_) => "0A000",
-        TypeMappingError::InvalidTextValue(_)
-        | TypeMappingError::ValueOutOfRange(_)
-        | TypeMappingError::TypeMismatch => "42804",
+        TypeMappingError::InvalidTextValue(_) => "22P02",
+        TypeMappingError::InvalidBinaryValue(_) => "22P03",
+        TypeMappingError::ValueOutOfRange(_) => "22003",
+        TypeMappingError::TypeMismatch => "42804",
     };
     fixed_error(state, &error.to_string())
 }
@@ -1355,6 +1466,29 @@ mod tests {
         assert_eq!(mapped.sqlstate, "42601");
         assert_eq!(mapped.position, Some(5));
         assert!(!mapped.message.contains("ParseError"));
+    }
+
+    #[test]
+    fn bind_format_cardinality_follows_protocol_rules() {
+        assert_eq!(
+            expand_formats(&[], 2, "bad").unwrap(),
+            [FormatCode::Text, FormatCode::Text]
+        );
+        assert_eq!(
+            expand_formats(&[FormatCode::Binary], 2, "bad").unwrap(),
+            [FormatCode::Binary, FormatCode::Binary]
+        );
+        assert_eq!(
+            expand_formats(&[FormatCode::Text, FormatCode::Binary], 2, "bad").unwrap(),
+            [FormatCode::Text, FormatCode::Binary]
+        );
+        assert_eq!(expand_formats(&[FormatCode::Binary], 0, "bad").unwrap(), []);
+        assert_eq!(
+            expand_formats(&[FormatCode::Text, FormatCode::Binary], 1, "bad")
+                .unwrap_err()
+                .sqlstate,
+            "08P01"
+        );
     }
 
     #[test]

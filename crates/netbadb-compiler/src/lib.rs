@@ -5,17 +5,18 @@ use std::fmt;
 
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
-    NullOrder as HirNullOrder, SortDirection as HirSortDirection, TypedAggregate,
-    TypedAggregateInput, TypedExpr, TypedExprKind, TypedProjectionItem, TypedQuery, TypedRelation,
-    TypedStatement,
+    NullOrder as HirNullOrder, ParameterMetadata, SortDirection as HirSortDirection,
+    TypedAggregate, TypedAggregateInput, TypedExpr, TypedExprKind, TypedProjectionItem, TypedQuery,
+    TypedRelation, TypedStatement,
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, DerivedField, Expr, ExprKind, JoinKind, LogicalPlan, LogicalStatement, NullOrder,
-    SortDirection, SortKey, UnaryOp,
+    ProjectedExpr, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_schema::Schema;
+use netbadb_types::{ParameterId, PhysicalType, ScalarValue, SemanticType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledQuery {
@@ -27,7 +28,49 @@ pub struct CompiledQuery {
 pub struct CompiledStatement {
     pub hir: TypedStatement,
     pub logical_statement: LogicalStatement,
+    pub parameters: Vec<PreparedParameter>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedParameter {
+    pub id: ParameterId,
+    pub data_type: SemanticType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindError {
+    ParameterCount {
+        expected: usize,
+        actual: usize,
+    },
+    ParameterType {
+        id: ParameterId,
+        expected: SemanticType,
+        actual: Option<PhysicalType>,
+    },
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ParameterCount { expected, actual } => {
+                write!(formatter, "expected {expected} parameters, found {actual}")
+            }
+            Self::ParameterType {
+                id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "parameter ${} expects {expected}, found {}",
+                id.0 + 1,
+                actual.map_or_else(|| "NULL".into(), |actual| actual.to_string())
+            ),
+        }
+    }
+}
+
+impl Error for BindError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
@@ -43,6 +86,7 @@ pub enum CompileErrorKind {
     UndefinedColumn,
     AmbiguousColumn,
     DatatypeMismatch,
+    IndeterminateDatatype,
     NotNullViolation,
     FeatureNotSupported,
 }
@@ -71,12 +115,16 @@ impl CompileError {
                 | HirError::TypeMismatch { .. }
                 | HirError::IncompatibleComparison { .. }
                 | HirError::CannotInferNullType { .. }
+                | HirError::ParameterTypeConflict { .. }
                 | HirError::DuplicateColumn { .. }
                 | HirError::ValueCountMismatch { .. }
                 | HirError::InsertValueReferencesColumn { .. }
                 | HirError::UngroupedColumn { .. }
                 | HirError::InvalidAggregateArgument { .. }
                 | HirError::InvalidAggregateType { .. } => CompileErrorKind::DatatypeMismatch,
+                HirError::CannotInferParameterType { .. } => {
+                    CompileErrorKind::IndeterminateDatatype
+                }
             },
         }
     }
@@ -129,13 +177,29 @@ pub fn compile(schema: &Schema, source: &str) -> Result<CompiledQuery, CompileEr
 }
 
 pub fn compile_statement(schema: &Schema, source: &str) -> Result<CompiledStatement, CompileError> {
+    compile_statement_with_parameters(schema, source, &[])
+}
+
+pub fn compile_statement_with_parameters(
+    schema: &Schema,
+    source: &str,
+    declared: &[Option<PhysicalType>],
+) -> Result<CompiledStatement, CompileError> {
     let ast = parse_statement(source)?;
-    let hir = netbadb_hir::lower_statement(schema, &ast)?;
+    let (hir, parameters) = netbadb_hir::lower_statement_with_parameters(schema, &ast, declared)?;
     let logical_statement = lower_statement(&hir);
     Ok(CompiledStatement {
         hir,
         logical_statement,
+        parameters: parameters.into_iter().map(prepared_parameter).collect(),
     })
+}
+
+fn prepared_parameter(parameter: ParameterMetadata) -> PreparedParameter {
+    PreparedParameter {
+        id: parameter.id,
+        data_type: parameter.data_type,
+    }
 }
 
 fn lower_statement(statement: &TypedStatement) -> LogicalStatement {
@@ -176,13 +240,10 @@ fn lower_statement(statement: &TypedStatement) -> LogicalStatement {
 }
 
 fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
-    let mut plan = lower_scan(&query.from);
-    let mut visible_columns = query
-        .from
-        .columns
-        .iter()
-        .map(column_ref_from_hir)
-        .collect::<Vec<_>>();
+    let mut plan = query.from.as_ref().map_or(LogicalPlan::OneRow, lower_scan);
+    let mut visible_columns = query.from.as_ref().map_or_else(Vec::new, |from| {
+        from.columns.iter().map(column_ref_from_hir).collect()
+    });
     for join in &query.joins {
         let right = lower_scan(&join.right);
         visible_columns.extend(join.right.columns.iter().map(column_ref_from_hir));
@@ -212,13 +273,14 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
             outputs: query
                 .projection
                 .iter()
-                .map(|item| match item {
+                .filter_map(|item| match item {
                     TypedProjectionItem::Column(column) => {
-                        AggregateOutput::GroupKey(column_ref_from_hir(column))
+                        Some(AggregateOutput::GroupKey(column_ref_from_hir(column)))
                     }
                     TypedProjectionItem::Aggregate(aggregate) => {
-                        AggregateOutput::Aggregate(lower_aggregate(aggregate))
+                        Some(AggregateOutput::Aggregate(lower_aggregate(aggregate)))
                     }
+                    TypedProjectionItem::Expression { .. } => None,
                 })
                 .collect(),
         };
@@ -243,14 +305,56 @@ fn lower_query_plan(query: &TypedQuery) -> LogicalPlan {
                     .collect(),
             };
         }
-        plan = LogicalPlan::Project {
-            input: Box::new(plan),
-            columns: query
-                .projection
-                .iter()
-                .filter_map(|item| item.source_column().map(column_ref_from_hir))
-                .collect(),
-        };
+        if query
+            .projection
+            .iter()
+            .any(|item| matches!(item, TypedProjectionItem::Expression { .. }))
+        {
+            plan = LogicalPlan::ScalarProject {
+                input: Box::new(plan),
+                expressions: query
+                    .projection
+                    .iter()
+                    .filter_map(|item| match item {
+                        TypedProjectionItem::Column(column) => Some(ProjectedExpr {
+                            expression: Expr {
+                                kind: ExprKind::Column(column_ref_from_hir(column)),
+                                expr_type: netbadb_types::ExprType {
+                                    data_type: column.data_type.clone(),
+                                    nullable: column.nullable,
+                                },
+                            },
+                            output: DerivedField {
+                                name: column.name.clone(),
+                                data_type: column.data_type.clone(),
+                                nullable: column.nullable,
+                            },
+                        }),
+                        TypedProjectionItem::Expression {
+                            expression,
+                            output_name,
+                        } => Some(ProjectedExpr {
+                            expression: lower_expr(expression),
+                            output: DerivedField {
+                                name: output_name.clone(),
+                                data_type: expression.expr_type.data_type.clone(),
+                                nullable: expression.expr_type.nullable,
+                            },
+                        }),
+                        TypedProjectionItem::Aggregate(_) => None,
+                    })
+                    .collect(),
+            };
+        } else {
+            plan = LogicalPlan::Project {
+                input: Box::new(plan),
+                columns: query
+                    .projection
+                    .iter()
+                    .filter_map(|item| item.source_column().map(column_ref_from_hir))
+                    .collect(),
+            };
+        }
     }
     if let Some(limit) = query.limit {
         plan = LogicalPlan::Limit {
@@ -333,6 +437,7 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
     let kind = match &expression.kind {
         TypedExprKind::Column(column) => ExprKind::Column(column_ref_from_hir(column)),
         TypedExprKind::Literal(value) => ExprKind::Literal(value.clone()),
+        TypedExprKind::Parameter(id) => ExprKind::Parameter(*id),
         TypedExprKind::Binary {
             operator,
             left,
@@ -374,15 +479,110 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
     }
 }
 
+/// Binds owned scalar values into a compiled parameterized statement without
+/// reparsing or resolving names. The returned statement is ephemeral and may
+/// be optimized and planned using the concrete values.
+pub fn bind_statement(
+    compiled: &CompiledStatement,
+    values: &[ScalarValue],
+) -> Result<LogicalStatement, BindError> {
+    if compiled.parameters.len() != values.len() {
+        return Err(BindError::ParameterCount {
+            expected: compiled.parameters.len(),
+            actual: values.len(),
+        });
+    }
+    for (parameter, value) in compiled.parameters.iter().zip(values) {
+        if !value.matches_type(&parameter.data_type) {
+            return Err(BindError::ParameterType {
+                id: parameter.id,
+                expected: parameter.data_type.clone(),
+                actual: value.physical_type(),
+            });
+        }
+    }
+    let mut statement = compiled.logical_statement.clone();
+    bind_logical_statement(&mut statement, values);
+    Ok(statement)
+}
+
+fn bind_logical_statement(statement: &mut LogicalStatement, values: &[ScalarValue]) {
+    match statement {
+        LogicalStatement::Query(plan) => bind_plan(plan, values),
+        LogicalStatement::Insert { values: exprs, .. } => {
+            exprs.iter_mut().for_each(|expr| bind_expr(expr, values));
+        }
+        LogicalStatement::Update {
+            input, assignments, ..
+        } => {
+            bind_plan(input, values);
+            assignments
+                .iter_mut()
+                .for_each(|assignment| bind_expr(&mut assignment.value, values));
+        }
+        LogicalStatement::Delete { input, .. } => bind_plan(input, values),
+    }
+}
+
+fn bind_plan(plan: &mut LogicalPlan, values: &[ScalarValue]) {
+    match plan {
+        LogicalPlan::OneRow | LogicalPlan::Scan { .. } => {}
+        LogicalPlan::Join {
+            left,
+            right,
+            predicate,
+            ..
+        } => {
+            bind_plan(left, values);
+            bind_plan(right, values);
+            bind_expr(predicate, values);
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            bind_plan(input, values);
+            bind_expr(predicate, values);
+        }
+        LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Limit { input, .. } => bind_plan(input, values),
+        LogicalPlan::ScalarProject { input, expressions } => {
+            bind_plan(input, values);
+            expressions
+                .iter_mut()
+                .for_each(|projected| bind_expr(&mut projected.expression, values));
+        }
+    }
+}
+
+fn bind_expr(expression: &mut Expr, values: &[ScalarValue]) {
+    match &mut expression.kind {
+        ExprKind::Parameter(id) => {
+            if let Some(value) = values.get(id.0 as usize) {
+                expression.kind = ExprKind::Literal(value.clone());
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            bind_expr(left, values);
+            bind_expr(right, values);
+        }
+        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+            bind_expr(expression, values);
+        }
+        ExprKind::Column(_) | ExprKind::Literal(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compile, compile_statement};
+    use super::{bind_statement, compile, compile_statement, compile_statement_with_parameters};
     use netbadb_rel::{
         AggregateFunction, ExprKind, LogicalPlan, LogicalStatement, NullOrder, OutputField,
         SortDirection,
     };
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
+    use netbadb_types::{
+        ColumnId, ParameterId, PhysicalType, RelationBindingId, ScalarValue, TableId,
+    };
 
     #[test]
     fn compiles_source_to_a_logical_plan() {
@@ -650,5 +850,122 @@ mod tests {
             }
         ));
         assert!(matches!(*left, LogicalPlan::Join { .. }));
+    }
+
+    #[test]
+    fn infers_nominal_parameters_and_rejects_conflicting_reuse() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "links",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "user_id",
+                    TypeSpec::Semantic {
+                        name: "UserId".into(),
+                        physical: PhysicalType::Int64,
+                    },
+                ),
+                ColumnDef::new(
+                    ColumnId(2),
+                    "parent_id",
+                    TypeSpec::Semantic {
+                        name: "UserId".into(),
+                        physical: PhysicalType::Int64,
+                    },
+                ),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "team_id",
+                    TypeSpec::Semantic {
+                        name: "TeamId".into(),
+                        physical: PhysicalType::Int64,
+                    },
+                ),
+            ],
+        )])
+        .expect("schema");
+        let prepared = compile_statement_with_parameters(
+            &schema,
+            "SELECT user_id FROM links WHERE user_id = $1 OR parent_id = $1",
+            &[],
+        )
+        .expect("infer repeated UserId");
+        assert_eq!(prepared.parameters.len(), 1);
+        assert_eq!(prepared.parameters[0].id, ParameterId(0));
+        assert_eq!(
+            prepared.parameters[0].data_type.name.as_deref(),
+            Some("UserId")
+        );
+        assert!(matches!(
+            compile_statement_with_parameters(
+                &schema,
+                "SELECT user_id FROM links WHERE user_id = $1 OR team_id = $1",
+                &[],
+            ),
+            Err(super::CompileError::Hir(
+                netbadb_hir::HirError::ParameterTypeConflict { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn binds_values_without_reparsing_and_supports_fromless_select() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )],
+        )])
+        .expect("schema");
+        let prepared = compile_statement_with_parameters(
+            &schema,
+            "SELECT $1 AS one",
+            &[Some(PhysicalType::Int64)],
+        )
+        .expect("prepare scalar SELECT");
+        assert_eq!(prepared.parameters.len(), 1);
+        let bound = bind_statement(&prepared, &[ScalarValue::Int64(42)]).expect("bind");
+        let LogicalStatement::Query(LogicalPlan::ScalarProject { expressions, input }) = bound
+        else {
+            panic!("expected scalar projection");
+        };
+        assert!(matches!(*input, LogicalPlan::OneRow));
+        assert!(matches!(
+            expressions[0].expression.kind,
+            ExprKind::Literal(ScalarValue::Int64(42))
+        ));
+    }
+
+    #[test]
+    fn parameters_cover_select_and_typed_dml() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ],
+        )])
+        .expect("schema");
+        for source in [
+            "SELECT id FROM users WHERE id = $1",
+            "INSERT INTO users (id, name) VALUES ($1, $2)",
+            "UPDATE users SET name = $1 WHERE id = $2",
+            "DELETE FROM users WHERE id = $1",
+        ] {
+            let prepared = compile_statement_with_parameters(&schema, source, &[])
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert!(!prepared.parameters.is_empty(), "{source}");
+        }
+        assert!(matches!(
+            compile_statement_with_parameters(&schema, "SELECT $1", &[]),
+            Err(super::CompileError::Hir(
+                netbadb_hir::HirError::CannotInferParameterType { .. }
+            ))
+        ));
     }
 }

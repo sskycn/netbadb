@@ -919,6 +919,7 @@ fn try_execute_streaming_filter_pipeline(
 
 fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>, ExecutionError> {
     match plan {
+        PhysicalPlan::OneRow | PhysicalPlan::ScalarProject { .. } => Ok(None),
         PhysicalPlan::SeqScan {
             table_id, columns, ..
         } => Ok(Some(BatchPipeline {
@@ -1320,6 +1321,13 @@ fn execute_rows_legacy_with_filter_mode(
     filter_mode: FilterEvaluationMode,
 ) -> Result<ExecutionRows, ExecutionError> {
     match plan {
+        PhysicalPlan::OneRow => Ok(ExecutionRows {
+            fields: Vec::new(),
+            rows: vec![ExecutionRow {
+                row_id: None,
+                values: Vec::new(),
+            }],
+        }),
         PhysicalPlan::SeqScan {
             table_id, columns, ..
         } => {
@@ -1709,6 +1717,37 @@ fn execute_rows_legacy_with_filter_mode(
                 rows,
             })
         }
+        PhysicalPlan::ScalarProject { input, expressions } => {
+            let input_result = execute_rows_legacy_with_filter_mode(
+                input,
+                bindings,
+                storages,
+                read_views,
+                filter_mode,
+            )?;
+            let fields = input_result.fields;
+            let rows = input_result
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let values = expressions
+                        .iter()
+                        .map(|expression| evaluate(&expression.expression, &row.values, &fields))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(ExecutionRow {
+                        row_id: row.row_id,
+                        values,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            Ok(ExecutionRows {
+                fields: expressions
+                    .iter()
+                    .map(|expression| OutputField::Derived(expression.output.clone()))
+                    .collect(),
+                rows,
+            })
+        }
         PhysicalPlan::Aggregate {
             input,
             group_keys,
@@ -2003,6 +2042,7 @@ fn expression_sources_match_fields(expression: &Expr, fields: &[OutputField]) ->
     match &expression.kind {
         ExprKind::Column(column) => find_exact_source_position(fields, column).is_ok(),
         ExprKind::Literal(_) => true,
+        ExprKind::Parameter(_) => false,
         ExprKind::Binary { left, right, .. } => {
             expression_sources_match_fields(left, fields)
                 && expression_sources_match_fields(right, fields)
@@ -2893,7 +2933,7 @@ fn collect_filter_columns(predicate: &Expr) -> BTreeSet<SourceIdentity> {
             ExprKind::Column(column) => {
                 columns.insert(source_identity(column));
             }
-            ExprKind::Literal(_) => {}
+            ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
             ExprKind::Binary { left, right, .. } => {
                 collect(left, columns);
                 collect(right, columns);
@@ -4335,6 +4375,7 @@ fn bind_expression<'a>(
             name: &column.name,
         },
         ExprKind::Literal(value) => BoundExprKind::Literal(value),
+        ExprKind::Parameter(_) => return Err(ExecutionError::TypeMismatch),
         ExprKind::Binary {
             operator,
             left,
@@ -4396,6 +4437,7 @@ fn filter_expression_source_schema_is_safe(
     match &expression.kind {
         ExprKind::Column(column) => source_column_schema_is_safe(column, bindings, storages),
         ExprKind::Literal(_) => true,
+        ExprKind::Parameter(_) => false,
         ExprKind::Binary { left, right, .. } => {
             filter_expression_source_schema_is_safe(left, bindings, storages)
                 && filter_expression_source_schema_is_safe(right, bindings, storages)
@@ -4470,6 +4512,7 @@ fn filter_expression_metadata_is_safe(expression: &Expr, fields: &[OutputField])
                 .is_none_or(|physical| physical == expression.expr_type.data_type.physical)
                 && expression.expr_type.nullable == matches!(value, ScalarValue::Null)
         }
+        ExprKind::Parameter(_) => false,
         ExprKind::Binary {
             operator,
             left,
@@ -5257,6 +5300,7 @@ where
                 .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
         }
         ExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(value))),
+        ExprKind::Parameter(_) => Err(ExecutionError::TypeMismatch),
         ExprKind::Binary {
             operator,
             left,
@@ -5336,6 +5380,7 @@ fn evaluate_values(
                 .ok_or_else(|| ExecutionError::MissingColumn(column.name.clone()))
         }
         ExprKind::Literal(value) => Ok(value.clone()),
+        ExprKind::Parameter(_) => Err(ExecutionError::TypeMismatch),
         ExprKind::Binary {
             operator,
             left,

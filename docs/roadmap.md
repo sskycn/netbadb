@@ -393,6 +393,29 @@ The phase is a foundation, not a general compatibility claim. P1 typed
 parameters, simultaneous listeners, and TLS; P2 catalog-derived `pg_catalog`
 and `information_schema`; and P3 broader PostgreSQL SQL remain open.
 
+### PostgreSQL Compatibility Round 2 — typed Extended Query (complete)
+
+- added frontend-neutral `ParameterId` expressions through parser, typed HIR,
+  relational IR, compiler metadata, and logical binding; PostgreSQL OIDs remain
+  confined to the pgwire/session adapter;
+- Parse now compiles once with supplied, zero, omitted, or contextually inferred
+  parameter types. Repeated nominal uses must agree and unresolved parameters
+  fail with `42P18`;
+- Bind validates PostgreSQL `0`/`1`/`N` format cardinality, decodes supported
+  text/binary values once into typed `ScalarValue`s, and substitutes into a
+  cloned logical statement without SQL interpolation or reparsing;
+- added `ParameterDescription`, repeated named prepared execution, text/binary
+  results for BOOL/INT8/TEXT, checked int2/int4/int8 inputs, and deterministic
+  `08P01`, `22P02`, `22003`, and `42804` boundaries;
+- added generic FROM-less scalar SELECT using typed `OneRow` and
+  `ScalarProject` nodes rather than session query matching;
+- verified parameterized CRUD, repeated binds, NULL, and transaction behavior
+  through raw TCP tests and pgx v5.7.6, plus real psql 17.11 scalar queries.
+
+Catalog-derived `pg_catalog`/`information_schema`, simultaneous listeners,
+PostgreSQL TLS/authentication, actual cancellation, and broader dialect support
+remain explicit later work.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

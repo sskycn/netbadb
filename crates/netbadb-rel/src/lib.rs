@@ -1,6 +1,8 @@
 //! Typed logical relational IR shared by the compiler, planner, and executor.
 
-use netbadb_types::{ColumnId, ExprType, RelationBindingId, ScalarValue, SemanticType, TableId};
+use netbadb_types::{
+    ColumnId, ExprType, ParameterId, RelationBindingId, ScalarValue, SemanticType, TableId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
@@ -164,6 +166,7 @@ pub struct Expr {
 pub enum ExprKind {
     Column(ColumnRef),
     Literal(ScalarValue),
+    Parameter(ParameterId),
     Binary {
         operator: BinaryOp,
         left: Box<Expr>,
@@ -180,7 +183,15 @@ pub enum ExprKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedExpr {
+    pub expression: Expr,
+    pub output: DerivedField,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicalPlan {
+    /// A relation containing exactly one empty row.
+    OneRow,
     Scan {
         binding_id: RelationBindingId,
         table_id: TableId,
@@ -205,6 +216,10 @@ pub enum LogicalPlan {
     Project {
         input: Box<LogicalPlan>,
         columns: Vec<ColumnRef>,
+    },
+    ScalarProject {
+        input: Box<LogicalPlan>,
+        expressions: Vec<ProjectedExpr>,
     },
     Aggregate {
         input: Box<LogicalPlan>,
@@ -269,6 +284,7 @@ impl LogicalStatement {
 
 fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<TableId>) {
     match plan {
+        LogicalPlan::OneRow => {}
         LogicalPlan::Scan { table_id, .. } => {
             if !tables.contains(table_id) {
                 tables.push(*table_id);
@@ -281,6 +297,7 @@ fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<TableId>) {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Project { input, .. }
+        | LogicalPlan::ScalarProject { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. } => collect_scan_tables(input, tables),
     }
@@ -290,6 +307,7 @@ impl LogicalPlan {
     #[must_use]
     pub fn output_fields(&self) -> Vec<OutputField> {
         match self {
+            Self::OneRow => Vec::new(),
             Self::Scan { columns, .. }
             | Self::Join { columns, .. }
             | Self::Project { columns, .. } => {
@@ -298,6 +316,10 @@ impl LogicalPlan {
             Self::Aggregate { outputs, .. } => {
                 outputs.iter().map(AggregateOutput::output_field).collect()
             }
+            Self::ScalarProject { expressions, .. } => expressions
+                .iter()
+                .map(|expression| OutputField::Derived(expression.output.clone()))
+                .collect(),
             Self::Filter { input, .. } | Self::Sort { input, .. } | Self::Limit { input, .. } => {
                 input.output_fields()
             }
