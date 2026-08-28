@@ -1598,10 +1598,42 @@ unchanged.
   change. Production remains the row-owned `ExecutionBatch` plus
   `AggregateAccumulator`.
 
-The next attribution phase should prefer a large residual with a more stable
-within-run comparison: HashJoin build-key ownership/hash metadata or bound
-AND/OR short-circuiting are narrower candidates. Full batch Sort and spilling
-remain larger separate projects. Any renewed column-layout work must first
-separate transposition cost from consumption and demonstrate a consistent
-primitive-heavy benefit across Heap, LSM, Filter, nullable, and partitioned
-inputs.
+Phase 68 therefore selected the narrower HashJoin build-key ownership residual.
+AND/OR short-circuiting, full batch Sort, and spilling remained separate
+candidates. Any renewed column-layout work must first separate transposition
+cost from consumption and demonstrate a consistent primitive-heavy benefit
+across Heap, LSM, Filter, nullable, and partitioned inputs.
+
+## Borrowed HashJoin Build Keys (Phase 68, complete)
+
+- added real planner-produced right-build Text HashJoin attribution for unique
+  8-byte and 128-byte keys, duplicate 128-byte keys, unique matching keys, and
+  ordered duplicate matches. Every target requires direct SeqScan children,
+  verifies left-probe/right-build key provenance and projected scan columns,
+  forbids NestedLoopJoin/index access, and checks exact ordered results;
+- changed the one shared production bucket builder used by streaming and
+  materialized HashJoin from `HashMap<ScalarValue, Vec<usize>>` to
+  `HashMap<&ScalarValue, Vec<usize>>`. The complete right rows remain separate
+  immutable local owners throughout build and probe; there is no
+  self-referential struct;
+- continues standard-library RandomState and ScalarValue value Hash/Eq. Equal
+  Text contents from distinct allocations share one logical bucket, NULL is
+  excluded, and duplicate indices retain right input order;
+- test-only statistics prove 513 unique Text rows produce 513 borrowed keys and
+  513 indices, while 513 rows over four Text values produce four logical keys
+  and 513 ordered indices. Both report zero owned build-key clones; pointer
+  checks tie the stored map key to the first authoritative right-row String;
+- retains the fixed fully materialized right build, streamed left probe,
+  complete residual evaluation, owned output projection, fixed right-build
+  policy, PhysicalPlan, storage APIs, dependencies, unsafe-code usage, and all
+  persistent/public contracts.
+
+The quick pair supports KEEP because the ownership result is exact and the
+implementation is small: short unique Text improved 15.8%, matching Text
+improved 36.7%, and Text/Int64 relative cost shrank, although long Text improved
+only 2.3%, duplicate Text regressed 5.8%, and broad non-target movement confirms
+substantial machine noise. HashJoin build-key ownership is closed here. Phase
+69 should separately attribute AND/OR short-circuiting with runtime-error timing
+audited first, or measure full Sort/spill and dynamic HashJoin build-side
+materialization/choice. General column batches remain rejected absent new
+evidence.

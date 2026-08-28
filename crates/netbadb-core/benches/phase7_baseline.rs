@@ -3252,6 +3252,7 @@ fn run_join_scenarios(
         )?;
     }
     run_phase65_hash_join_scenarios(settings, measurements)?;
+    run_phase68_hash_join_scenarios(settings, measurements)?;
     Ok(())
 }
 
@@ -3400,6 +3401,175 @@ fn run_asymmetric_hash_join_query(
         scenario: scenario.name.to_owned(),
         rows: format!("{}x{}", scenario.left_rows, scenario.right_rows),
         plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+fn run_phase68_hash_join_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let probe_rows = settings.phase65_build_rows;
+    let build_rows = settings.phase65_probe_rows;
+    let matching_ids = (0..probe_rows).collect::<Vec<_>>();
+    let duplicate_build_rows = settings.phase65_build_rows;
+    let duplicate_cardinality = 4_u64;
+    let duplicate_probe_rows = duplicate_cardinality;
+    let duplicate_step = usize::try_from(duplicate_cardinality)?;
+    let duplicate_ids = (0..duplicate_probe_rows)
+        .flat_map(|key| (key..duplicate_build_rows).step_by(duplicate_step))
+        .collect::<Vec<_>>();
+
+    for scenario in [
+        Phase68TextHashJoinScenario {
+            name: "phase68_hash_join_text_unique_short_none",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: build_rows,
+            left_key_offset: 0,
+            right_key_offset: build_rows,
+            key_width: 8,
+            projects_right_id: false,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+        Phase68TextHashJoinScenario {
+            name: "phase68_hash_join_text_unique_long_none",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: build_rows,
+            left_key_offset: 0,
+            right_key_offset: build_rows,
+            key_width: 128,
+            projects_right_id: false,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+        Phase68TextHashJoinScenario {
+            name: "phase68_hash_join_text_duplicate_none",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: probe_rows,
+            left_key_offset: 0,
+            right_key_offset: build_rows,
+            key_width: 128,
+            projects_right_id: false,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &[],
+        },
+        Phase68TextHashJoinScenario {
+            name: "phase68_hash_join_text_matching",
+            left_rows: probe_rows,
+            right_rows: build_rows,
+            left_cardinality: probe_rows,
+            right_cardinality: build_rows,
+            left_key_offset: 0,
+            right_key_offset: 0,
+            key_width: 128,
+            projects_right_id: false,
+            sql: "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &matching_ids,
+        },
+        Phase68TextHashJoinScenario {
+            name: "phase68_hash_join_text_duplicate_matching_order",
+            left_rows: duplicate_probe_rows,
+            right_rows: duplicate_build_rows,
+            left_cardinality: duplicate_cardinality,
+            right_cardinality: duplicate_cardinality,
+            left_key_offset: 0,
+            right_key_offset: 0,
+            key_width: 8,
+            projects_right_id: true,
+            sql: "SELECT r.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            expected_ids: &duplicate_ids,
+        },
+    ] {
+        run_phase68_text_hash_join_query(scenario, settings, measurements)?;
+    }
+    Ok(())
+}
+
+struct Phase68TextHashJoinScenario<'a> {
+    name: &'a str,
+    left_rows: u64,
+    right_rows: u64,
+    left_cardinality: u64,
+    right_cardinality: u64,
+    left_key_offset: u64,
+    right_key_offset: u64,
+    key_width: usize,
+    projects_right_id: bool,
+    sql: &'a str,
+    expected_ids: &'a [u64],
+}
+
+fn run_phase68_text_hash_join_query(
+    scenario: Phase68TextHashJoinScenario<'_>,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let paths = FixturePaths::new(scenario.name, 2);
+    let mut database = Database::create_tables(vec![
+        (
+            paths.path(0).to_path_buf(),
+            text_join_table(LEFT_TABLE_ID, "left_rows"),
+        ),
+        (
+            paths.path(1).to_path_buf(),
+            text_join_table(RIGHT_TABLE_ID, "right_rows"),
+        ),
+    ])?;
+    load_fixed_text_join_rows(
+        &mut database,
+        LEFT_TABLE_ID,
+        scenario.left_rows,
+        scenario.left_cardinality,
+        scenario.left_key_offset,
+        scenario.key_width,
+    )?;
+    load_fixed_text_join_rows(
+        &mut database,
+        RIGHT_TABLE_ID,
+        scenario.right_rows,
+        scenario.right_cardinality,
+        scenario.right_key_offset,
+        scenario.key_width,
+    )?;
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    let plan = inspect_plan(
+        &database,
+        scenario.name,
+        scenario.sql,
+        &[Operator::HashJoin, Operator::SeqScan],
+        &[Operator::NestedLoopJoin, Operator::IndexScan],
+    )?;
+    inspect_phase68_hash_join_shape(
+        &database,
+        scenario.name,
+        scenario.sql,
+        scenario.projects_right_id,
+    )?;
+    let expected = expected_ids_observation(scenario.expected_ids)?;
+    let durations = measure_checked(
+        scenario.name,
+        settings.query_warmup,
+        settings.join_iterations,
+        expected,
+        || database.query(scenario.sql).map_err(Into::into),
+        |result| ordered_ids_observation(result, scenario.expected_ids),
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: scenario.name.to_owned(),
+        rows: format!("{}x{}", scenario.left_rows, scenario.right_rows),
+        plan: format!("{plan} [right-build Text/{}]", scenario.key_width),
         operations_per_iteration: 1,
         durations,
     });
@@ -3964,6 +4134,41 @@ fn load_text_join_rows(
     Ok(())
 }
 
+fn load_fixed_text_join_rows(
+    database: &mut Database,
+    table_id: TableId,
+    rows: u64,
+    cardinality: u64,
+    key_offset: u64,
+    key_width: usize,
+) -> BenchResult<()> {
+    if cardinality == 0 {
+        return Err(message_error("Text join cardinality must be nonzero"));
+    }
+    let mut transaction = database.begin_transaction_for(table_id)?;
+    for id in 0..rows {
+        let id_value = i64::try_from(id).map_err(|_| message_error("join ID exceeds i64"))?;
+        let key = id
+            .checked_rem(cardinality)
+            .and_then(|key| key.checked_add(key_offset))
+            .ok_or_else(|| message_error("Text join key overflow"))?;
+        let digits = key.to_string();
+        if digits.len() > key_width {
+            return Err(message_error("Text join key exceeds fixed width"));
+        }
+        let mut key_value = String::with_capacity(key_width);
+        key_value.extend(std::iter::repeat_n('0', key_width - digits.len()));
+        key_value.push_str(&digits);
+        database.insert_into_in(
+            table_id,
+            &mut transaction,
+            &[ScalarValue::Int64(id_value), ScalarValue::Text(key_value)],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn inspect_plan(
     database: &Database,
     scenario: &str,
@@ -3992,6 +4197,95 @@ fn inspect_plan(
         }
     }
     Ok(plan_label(root))
+}
+
+fn inspect_phase68_hash_join_shape(
+    database: &Database,
+    scenario: &str,
+    sql: &str,
+    projects_right_id: bool,
+) -> BenchResult<()> {
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    let join = find_hash_join(root)
+        .ok_or_else(|| message_error(format!("scenario `{scenario}` is not HashJoin")))?;
+    let PlanNodeInspection::HashJoin {
+        left_key,
+        right_key,
+        left,
+        right,
+        ..
+    } = join
+    else {
+        return Err(message_error(format!(
+            "scenario `{scenario}` is not HashJoin"
+        )));
+    };
+    let join_key_column = ColumnId(2);
+    let text_type = netbadb_types::SemanticType::physical(PhysicalType::Text);
+    if left_key.table_id != LEFT_TABLE_ID
+        || left_key.column_id != join_key_column
+        || left_key.data_type != text_type
+        || right_key.table_id != RIGHT_TABLE_ID
+        || right_key.column_id != join_key_column
+        || right_key.data_type != text_type
+    {
+        return Err(message_error(format!(
+            "scenario `{scenario}` HashJoin keys do not preserve left-probe/right-build Text provenance"
+        )));
+    }
+    let expected_left_columns = if projects_right_id {
+        vec![join_key_column]
+    } else {
+        vec![ID_COLUMN_ID, join_key_column]
+    };
+    let expected_right_columns = if projects_right_id {
+        vec![ID_COLUMN_ID, join_key_column]
+    } else {
+        vec![join_key_column]
+    };
+    if !direct_seq_scan_matches(left, LEFT_TABLE_ID, &expected_left_columns)
+        || !direct_seq_scan_matches(right, RIGHT_TABLE_ID, &expected_right_columns)
+    {
+        return Err(message_error(format!(
+            "scenario `{scenario}` does not use the expected direct left-probe/right-build SeqScan columns"
+        )));
+    }
+    Ok(())
+}
+
+fn find_hash_join(plan: &PlanNodeInspection) -> Option<&PlanNodeInspection> {
+    match plan {
+        PlanNodeInspection::HashJoin { .. } => Some(plan),
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => find_hash_join(input),
+        PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. }
+        | PlanNodeInspection::PartitionedScan { .. }
+        | PlanNodeInspection::NestedLoopJoin { .. } => None,
+    }
+}
+
+fn direct_seq_scan_matches(
+    plan: &PlanNodeInspection,
+    expected_table: TableId,
+    expected_columns: &[ColumnId],
+) -> bool {
+    let PlanNodeInspection::SeqScan {
+        table_id, columns, ..
+    } = plan
+    else {
+        return false;
+    };
+    *table_id == expected_table
+        && columns
+            .iter()
+            .map(|column| column.column_id)
+            .eq(expected_columns.iter().copied())
 }
 
 fn inspect_base_scan_columns(

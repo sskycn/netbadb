@@ -842,14 +842,19 @@ The implementation sequence is intentionally vertical:
     the same noisy quick pair. Production therefore retains row-owned
     `ExecutionBatch` and `AggregateAccumulator`; only plan-gated attribution and
     the recorded decision remain.
+68. Borrowed HashJoin Build Keys — complete; both streaming-probe and
+    materialized HashJoin retain the fully owned right rows as authoritative key
+    owners while their shared hash buckets borrow `&ScalarValue`. Text build
+    keys therefore allocate no second String, NULL remains excluded, and
+    ordered right-row index buckets preserve value equality and join order.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. A general typed column-oriented batch
-is not justified by Phase 67; build-side HashJoin ownership/hash work,
-AND/OR short-circuiting, full batch Sort, spilling, and storage-level
+is not justified by Phase 67. AND/OR short-circuiting, dynamic HashJoin
+build-side choice/materialization, full batch Sort, spilling, and storage-level
 index/range visitors remain measurement-led candidates. Upstream Top-N
-cancellation is not implemented. Leaf-lookup micro-optimization stops with
-Phase 63.
+cancellation is not implemented. HashJoin build-key ownership stops with Phase
+68; leaf-lookup micro-optimization stops with Phase 63.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The
 durable coordinator byte layout is specified in

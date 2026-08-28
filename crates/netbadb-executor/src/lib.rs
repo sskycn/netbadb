@@ -434,6 +434,10 @@ struct StreamingHashJoinStats {
     probe_batches_seen: usize,
     max_probe_batch_rows: usize,
     build_rows_materialized: usize,
+    build_non_null_keys: usize,
+    build_distinct_keys: usize,
+    build_bucket_indices: usize,
+    build_owned_key_clones: usize,
     candidate_pairs_checked: usize,
     output_rows: usize,
 }
@@ -1697,11 +1701,13 @@ fn try_execute_streaming_hash_join_probe(
         .collect::<Vec<_>>();
 
     let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
-    #[cfg(test)]
-    if let Some(stats) = stats.as_deref_mut() {
-        stats.build_rows_materialized = right.rows.len();
-    }
-    let buckets = build_hash_join_buckets(&right, right_key_position, right_key)?;
+    let buckets = build_hash_join_buckets(
+        &right,
+        right_key_position,
+        right_key,
+        #[cfg(test)]
+        stats.as_deref_mut(),
+    )?;
     let mut rows = Vec::new();
     let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
         #[cfg(test)]
@@ -1777,7 +1783,13 @@ fn execute_hash_join_materialized(
     let right = execute_rows_legacy_with_views(right, bindings, storages, read_views)?;
     let left_key_position = find_source_position(&left.fields, left_key)?;
     let right_key_position = find_source_position(&right.fields, right_key)?;
-    let buckets = build_hash_join_buckets(&right, right_key_position, right_key)?;
+    let buckets = build_hash_join_buckets(
+        &right,
+        right_key_position,
+        right_key,
+        #[cfg(test)]
+        None,
+    )?;
     let mut joined_fields = left.fields.clone();
     joined_fields.extend(right.fields.clone());
     let output_positions = columns
@@ -1808,17 +1820,32 @@ fn execute_hash_join_materialized(
     Ok(ExecutionRows { fields, rows })
 }
 
-fn build_hash_join_buckets(
-    right: &ExecutionRows,
+fn build_hash_join_buckets<'a>(
+    right: &'a ExecutionRows,
     right_key_position: usize,
     right_key: &ColumnRef,
-) -> Result<HashMap<ScalarValue, Vec<usize>>, ExecutionError> {
-    let mut buckets = HashMap::<ScalarValue, Vec<usize>>::new();
+    #[cfg(test)] stats: Option<&mut StreamingHashJoinStats>,
+) -> Result<HashMap<&'a ScalarValue, Vec<usize>>, ExecutionError> {
+    let mut buckets = HashMap::<&ScalarValue, Vec<usize>>::new();
+    #[cfg(test)]
+    let mut non_null_keys = 0;
     for (right_index, right_row) in right.rows.iter().enumerate() {
         let key = hash_join_key(right_row, right_key_position, right_key)?;
         if let Some(key) = key {
-            buckets.entry(key.clone()).or_default().push(right_index);
+            #[cfg(test)]
+            {
+                non_null_keys += 1;
+            }
+            buckets.entry(key).or_default().push(right_index);
         }
+    }
+    #[cfg(test)]
+    if let Some(stats) = stats {
+        stats.build_rows_materialized = right.rows.len();
+        stats.build_non_null_keys = non_null_keys;
+        stats.build_distinct_keys = buckets.len();
+        stats.build_bucket_indices = buckets.values().map(Vec::len).sum();
+        stats.build_owned_key_clones = 0;
     }
     Ok(buckets)
 }
@@ -1829,7 +1856,7 @@ fn probe_hash_join_row(
     left_key_position: usize,
     left_key: &ColumnRef,
     right: &ExecutionRows,
-    buckets: &HashMap<ScalarValue, Vec<usize>>,
+    buckets: &HashMap<&ScalarValue, Vec<usize>>,
     bound_predicate: &BoundExpr<'_>,
     output_positions: &[usize],
     rows: &mut Vec<ExecutionRow>,
@@ -4851,20 +4878,20 @@ mod tests {
     use super::{
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
-        ExecutionRow, ExecutionStorage, FilteredCountSummary, GroupLookup, GroupState,
-        InequalityExecutionStrategy, PartitionedBatchStats, PrehashedBuildHasher, PrehashedKey,
-        ProjectionPlan, QueryResult, StreamingHashJoinStats, TopNState, TruthValue,
-        bind_expression, build_batch_pipeline, build_top_n_plan, choose_inequality_strategy,
-        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
-        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
-        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
-        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
-        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
-        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_truth,
-        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
-        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
-        execute_with_storages, filtered_count_eligibility, find_required_inequality,
-        hash_group_key, inequality_can_match, materialize_count_values,
+        ExecutionRow, ExecutionRows, ExecutionStorage, FilteredCountSummary, GroupLookup,
+        GroupState, InequalityExecutionStrategy, PartitionedBatchStats, PrehashedBuildHasher,
+        PrehashedKey, ProjectionPlan, QueryResult, StreamingHashJoinStats, TopNState, TruthValue,
+        bind_expression, build_batch_pipeline, build_hash_join_buckets, build_top_n_plan,
+        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
+        compatibility_bindings, count_to_sql_u64, direct_count_eligibility, evaluate,
+        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
+        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
+        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
+        evaluate_truth, evaluate_truth_values, evaluate_values, exact_candidate_pair_count,
+        execute, execute_inequality_sweep, execute_nested_loop_join, execute_rows,
+        execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
+        find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme,
         sorted_non_null_indices, streaming_seq_filter_eligibility,
@@ -10795,6 +10822,111 @@ mod tests {
         )
     }
 
+    fn hash_join_text_pointer(value: &ScalarValue) -> *const u8 {
+        let ScalarValue::Text(value) = value else {
+            panic!("expected Text HashJoin key")
+        };
+        value.as_ptr()
+    }
+
+    #[test]
+    fn borrowed_hash_join_buckets_reuse_text_allocations_and_value_equality() {
+        let first_same = ScalarValue::Text(String::from("same"));
+        let second_same = ScalarValue::Text(String::from("same"));
+        assert_ne!(
+            hash_join_text_pointer(&first_same),
+            hash_join_text_pointer(&second_same)
+        );
+        let first_pointer = hash_join_text_pointer(&first_same);
+        let right = ExecutionRows {
+            fields: Vec::new(),
+            rows: vec![
+                ExecutionRow {
+                    row_id: None,
+                    values: vec![first_same],
+                },
+                ExecutionRow {
+                    row_id: None,
+                    values: vec![second_same],
+                },
+                ExecutionRow {
+                    row_id: None,
+                    values: vec![ScalarValue::Null],
+                },
+                ExecutionRow {
+                    row_id: None,
+                    values: vec![ScalarValue::Text(String::from("other"))],
+                },
+            ],
+        };
+        let right_key = ColumnRef {
+            binding_id: RelationBindingId(20),
+            table_id: TableId(900),
+            column_id: ColumnId(2),
+            relation_name: "right_rows".into(),
+            name: "join_key".into(),
+            data_type: SemanticType::physical(PhysicalType::Text),
+            nullable: true,
+        };
+        let mut stats = StreamingHashJoinStats::default();
+        let buckets = build_hash_join_buckets(&right, 0, &right_key, Some(&mut stats))
+            .expect("build borrowed Text buckets");
+        let lookup = ScalarValue::Text(String::from("same"));
+        let (stored_key, indices) = buckets
+            .iter()
+            .find(|(key, _)| *key == &&lookup)
+            .expect("find equal Text bucket by value");
+        assert_eq!(indices, &[0, 1]);
+        assert_eq!(hash_join_text_pointer(stored_key), first_pointer);
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(stats.build_rows_materialized, 4);
+        assert_eq!(stats.build_non_null_keys, 3);
+        assert_eq!(stats.build_distinct_keys, 2);
+        assert_eq!(stats.build_bucket_indices, 3);
+        assert_eq!(stats.build_owned_key_clones, 0);
+    }
+
+    #[test]
+    fn borrowed_hash_join_bucket_stats_cover_unique_and_duplicate_text_builds() {
+        let right_key = ColumnRef {
+            binding_id: RelationBindingId(20),
+            table_id: TableId(901),
+            column_id: ColumnId(2),
+            relation_name: "right_rows".into(),
+            name: "join_key".into(),
+            data_type: SemanticType::physical(PhysicalType::Text),
+            nullable: false,
+        };
+        for (case, cardinality, expected_distinct) in
+            [("unique", 513_usize, 513_usize), ("duplicate", 4, 4)]
+        {
+            let right = ExecutionRows {
+                fields: Vec::new(),
+                rows: (0..513)
+                    .map(|index| ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Text(format!("key-{:04}", index % cardinality))],
+                    })
+                    .collect(),
+            };
+            let mut stats = StreamingHashJoinStats::default();
+            let buckets = build_hash_join_buckets(&right, 0, &right_key, Some(&mut stats))
+                .expect("build structural Text buckets");
+            assert_eq!(stats.build_rows_materialized, 513, "{case}");
+            assert_eq!(stats.build_non_null_keys, 513, "{case}");
+            assert_eq!(stats.build_distinct_keys, expected_distinct, "{case}");
+            assert_eq!(stats.build_bucket_indices, 513, "{case}");
+            assert_eq!(stats.build_owned_key_clones, 0, "{case}");
+            assert_eq!(buckets.len(), expected_distinct, "{case}");
+            assert!(
+                buckets
+                    .values()
+                    .all(|indices| indices.windows(2).all(|pair| pair[0] < pair[1])),
+                "{case} bucket indices must retain right input order"
+            );
+        }
+    }
+
     #[test]
     fn streaming_hash_join_probe_batches_bound_left_input_and_materialize_right() {
         for probe_rows in [
@@ -10849,6 +10981,10 @@ mod tests {
                 probe_rows.min(EXECUTION_BATCH_CAPACITY)
             );
             assert_eq!(stats.build_rows_materialized, 17);
+            assert_eq!(stats.build_non_null_keys, 17);
+            assert_eq!(stats.build_distinct_keys, 17);
+            assert_eq!(stats.build_bucket_indices, 17);
+            assert_eq!(stats.build_owned_key_clones, 0);
             assert_eq!(stats.candidate_pairs_checked, 0);
             assert_eq!(stats.output_rows, 0);
             for storage in storages {
@@ -10901,6 +11037,10 @@ mod tests {
         assert_eq!(stats.probe_batches_seen, 3);
         assert_eq!(stats.max_probe_batch_rows, EXECUTION_BATCH_CAPACITY);
         assert_eq!(stats.build_rows_materialized, 3);
+        assert_eq!(stats.build_non_null_keys, 3);
+        assert_eq!(stats.build_distinct_keys, 1);
+        assert_eq!(stats.build_bucket_indices, 3);
+        assert_eq!(stats.build_owned_key_clones, 0);
         assert_eq!(stats.candidate_pairs_checked, probe_rows * 3);
         assert_eq!(stats.output_rows, probe_rows * 3);
         let expected = (0..probe_rows)

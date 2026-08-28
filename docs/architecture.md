@@ -436,14 +436,15 @@ dynamically resolved. AND/OR still evaluate both sides without short-circuiting.
 The existing expression checker requires BOOL while allowing nullable BOOL,
 and nominal compatibility prevents JOIN from comparing distinct semantic types
 with the same physical encoding. Text still becomes owned once per decoded
-storage row; only repeated candidate-level Text cloning is removed.
+storage row; repeated candidate-level cloning and the separate HashJoin bucket
+key allocation are removed.
 For the planner-produced direct SeqScan × SeqScan INNER shape, HashJoin fixes
 the right child as the build side and streams only the left probe side:
 
 ```text
 right/build SeqScan
    -> full materialized rows
-   -> HashMap<ScalarValue, Vec<right-row index>>
+   -> HashMap<&ScalarValue, Vec<right-row index>>
 
 left/probe SeqScan
    -> ExecutionBatch, at most 256 rows
@@ -454,13 +455,23 @@ left/probe SeqScan
 ```
 
 Build and probe NULL keys are skipped because SQL `NULL = NULL` is UNKNOWN.
-Buckets store indices rather than cloned rows, and indices are appended in
-right input order. Probing in left input order therefore preserves duplicates
-and the current deterministic left-major/right-minor behavior. Hash iteration
-order never determines results. This is executor behavior, not an unordered SQL
-result-order guarantee. Bool, Int64, UInt64, and Text use exact ScalarValue
-identity, while semantic compatibility protects nominal types and self joins
-use binding plus column IDs to identify sides.
+The bucket map borrows each logical key directly from the immutable, fully
+materialized right rows and stores ordered indices rather than cloned rows or
+owned keys. Equal values from different Text allocations therefore share one
+logical bucket through `ScalarValue` value Hash/Eq, not pointer identity; the
+first inserted right value remains the borrowed map key. Indices are appended
+in right input order. Probing in left input order therefore preserves
+duplicates and the current deterministic left-major/right-minor behavior. Hash
+iteration order never determines results. This is executor behavior, not an
+unordered SQL result-order guarantee. Bool, Int64, UInt64, and Text use exact
+ScalarValue equality, while semantic compatibility protects nominal types and
+self joins use binding plus column IDs to identify sides.
+
+The right rows and borrowed map are separate local variables rather than a
+self-referential owner. Right rows remain immobile and immutable from bucket
+construction through the complete probe and output projection. QueryResult
+values remain fully owned; projecting a right Text value still clones or moves
+the required output owner independently of the borrowed lookup key.
 
 HashJoin setup resolves both key positions, joined predicate positions, and
 output positions from physical metadata before executing the right child. Only
@@ -471,7 +482,10 @@ without replay. Both sides use the statement's existing read views, including
 self joins. The input-side intermediate boundary changes from
 `O(left input + right input + hash metadata)` to
 `O(right build input + hash metadata + 256-row probe batch)`. HashJoin does not
-yet bound the fully owned final output or right/build-side memory.
+yet bound the fully owned final output or right/build-side memory. Phase 68
+removes only the map-owned `ScalarValue` key and, for Text, its second String
+allocation. Expected build/probe complexity remains `O(right)`/`O(left)` and
+the standard-library RandomState hashing algorithm is unchanged.
 
 Query operators are arranged as
 `Scan/Join -> Filter -> Sort -> Project -> Limit`, allowing sorting by source

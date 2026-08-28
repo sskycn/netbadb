@@ -1802,12 +1802,77 @@ and did not remove the row batch or final QueryResult ownership.
 
 The decision is **reject**. The production sidecar and its test-only statistics
 were removed; only the benchmark attribution and this decision record remain.
-`ExecutionBatch` and `AggregateAccumulator` are unchanged. Phase 68 should
-prefer a narrower residual with stable within-run attribution, such as HashJoin
-build-key ownership/hash metadata or AND/OR short-circuiting. Full batch Sort
-and spilling remain separate larger candidates. Any future typed-column trial
-must isolate row-to-column transposition cost and show consistent gains across
-Heap, LSM, Filter, nullable, and partitioned workloads before generalization.
+`ExecutionBatch` and `AggregateAccumulator` are unchanged. Phase 68 therefore
+selected the narrower HashJoin build-key ownership residual; AND/OR
+short-circuiting, full batch Sort, and spilling remained separate candidates.
+Any future typed-column trial must isolate row-to-column transposition cost and
+show consistent gains across Heap, LSM, Filter, nullable, and partitioned
+workloads before generalization.
+
+## Phase 68 borrowed HashJoin build keys
+
+Phase 68 first added five Text equality-join scenarios without changing
+production. Each fixture uses analyzed benchmark-only `id Int64, join_key Text`
+tables and requires a real planner-produced direct SeqScan × SeqScan HashJoin
+whose left key belongs to the probe table and right key belongs to the fixed
+build table. Scan-column provenance and exact ordered results are gated. The
+64-row probe/4,096-row build no-match targets minimize output ownership; the
+matching target emits only 64 rows, and a 4-by-64 duplicate case checks exact
+right-minor order. Raw quick output is stored outside the repository at
+`/tmp/netbadb-phase68-pre.txt` and `/tmp/netbadb-phase68-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | build rows | distinct | key shape | pre | post | change |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Text unique, no match | 4,096 | 4,096 | 8-byte Text | 1,100,792 | 926,375 | -15.8% |
+| Text unique, no match | 4,096 | 4,096 | 128-byte Text | 1,826,708 | 1,785,125 | -2.3% |
+| Text duplicate, no match | 4,096 | 64 | 128-byte Text | 1,437,333 | 1,520,417 | +5.8% |
+| Text unique, 64 matches | 4,096 | 4,096 | 128-byte Text | 2,073,417 | 1,312,375 | -36.7% |
+| Text duplicate ordered matches | 64 | 4 | 8-byte Text | 60,333 | 25,708 | -57.4% |
+| Int64 unique control, no match | 4,096 | 4,096 | Int64 | 712,500 | 700,041 | -1.7% |
+
+The long/short unique Text ratio moved from 1.659x to 1.927x, so this pair does
+not show the expected width-ratio contraction. Short Text/Int64 moved from
+1.545x to 1.323x, which is consistent with removing Text-only ownership.
+Duplicate-long/unique-long moved from 0.787x to 0.852x. These mixed ratios and
+only three timed samples per join scenario prohibit a general throughput claim.
+
+The authoritative result is structural. Both production HashJoin paths now use
+one `HashMap<&ScalarValue, Vec<usize>>` whose keys borrow the immutable right
+rows. A 513-row unique Text test reports 513 materialized build rows, 513
+non-NULL keys, 513 distinct keys, 513 bucket indices, and zero owned key clones.
+A four-key duplicate fixture reports the same row/non-NULL/index counts, four
+distinct keys, and zero clones. Distinct String allocations with equal contents
+share a bucket by ScalarValue value Hash/Eq, and the stored key pointer equals
+the first authoritative right-row String. NULL remains absent and indices stay
+in right input order.
+
+Before Phase 68, build memory contained fully owned right rows, map-owned cloned
+ScalarValue keys, and ordered index vectors. It now contains the same right rows
+and vectors plus borrowed key references; unique Text removes one additional
+String allocation per logical map insertion, while the old `entry(key.clone())`
+also no longer constructs and drops candidate clones for duplicate rows. The
+right build remains fully materialized `O(right)`, the left probe remains
+at-most-256-row batched, final QueryResult rows remain owned, and expected build
+and probe complexity remains linear. Hashing, RandomState, residual evaluation,
+build-side choice, and output projection are unchanged.
+
+Non-target movement was broad: the Phase 65 large-probe/small-build no-match
+control changed -19.7%, the small-probe/large-build Int64 control -1.7%, global
+SUM -32.0%, generic Filter -61.0%, direct COUNT(*) -64.6%, partition LIMIT
+-21.3%, and partition SUM -21.1%, while Top-N K=1 and full Sort were nearly
+flat. The duplicate Text regression is therefore recorded rather than treated
+as a stable common-path regression.
+
+The decision is **KEEP**: zero build-key ownership and Text pointer identity are
+exact, the shared implementation is small, correctness covers Bool/Int64/
+UInt64/Text, NULL, duplicates, ordering, Heap/LSM, self joins, errors, and both
+probe paths, and the Text/primitive relative signal does not contradict the
+ownership hypothesis. Phase 69 should separately audit AND/OR short-circuit
+error timing before benchmarking it, or measure full Sort/spill and dynamic
+HashJoin build-side materialization/choice. This result does not justify String
+interning, dictionary encoding, custom hashing, or reopening column batches.
 
 ## CI and compatibility
 
@@ -1833,6 +1898,7 @@ adds an executor-private HashJoin probe consumer and retains the materialized
 fallback. Phase 66 adds the second executor-private BatchSource variant for the
 existing all-SeqScan PartitionedScan and retains mixed-access materialization.
 Phase 67 retains only benchmark attribution after rejecting its private pilot.
-All five retain the current Heap metadata v4 and every public, inspection,
+Phase 68 changes only executor-private HashJoin key ownership and benchmark
+coverage. All six retain the current Heap metadata v4 and every public, inspection,
 protocol, SDK, and persistent contract. These phases add no dependency and no
 unsafe code.
