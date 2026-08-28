@@ -1744,15 +1744,70 @@ eligibility and execute through the materialized fallback. These measurements
 do not show planned IndexScan/RangeIndexScan cardinalities commonly exceeding
 256, so executor-side Vec chunking is not justified.
 
-Phase 67 should therefore prefer typed column-oriented batch attribution, or
-another measured large residual, before adding storage-level point/range
-visitors. If a future workload shows frequent RangeIndexScan results above 256
+Phase 67 therefore evaluated typed column-oriented aggregate attribution before
+adding storage-level point/range visitors. If a future workload shows frequent
+RangeIndexScan results above 256
 or large duplicate point candidates, the follow-up should add a real
 storage-level range or point visitor first and only then expand mixed
 PartitionedScan. Phase 66 changes no TableStorage API, storage engine,
 PhysicalPlan, planner cost, public contract, dependency, unsafe code, or
 persistent format. The Phase 65 HashJoin probe control changed from 735,291 to
 721,458 ns (-1.9%); its direct SeqScan source remains unchanged.
+
+## Phase 67 typed primitive aggregate column-batch attribution
+
+Phase 67 added attribution before changing production. Every target uses a real
+planned query, verifies its physical shape and aggregate source columns, and
+checks the exact result or a deterministic checksum. The pilot was restricted
+to global aggregates over Bool, Int64, and UInt64. It deduplicated referenced
+source positions, transposed each existing row batch into typed vectors with
+explicit validity bits, and used direct typed COUNT/SUM/MIN/MAX loops. Text,
+grouped aggregation, non-primitive types, and ineligible trees remained on the
+row accumulator. Raw serial quick output is stored outside the repository at
+`/tmp/netbadb-phase67-pre.txt` and `/tmp/netbadb-phase67-post.txt`.
+
+Machine-local medians are nanoseconds per query:
+
+| scenario | unique columns | consumers | pre | post | change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| global SUM(Int64) | 1 | 1 | 333,833 | 432,292 | +29.5% |
+| same-column SUM/MIN/MAX | 1 | 3 | 581,542 | 509,208 | -12.4% |
+| duplicate SUM x3 | 1 | 3 | 339,166 | 927,542 | +173.5% |
+| three distinct primitive columns | 3 | 3 | 565,167 | 463,333 | -18.0% |
+| Filter plus same-column SUM/MIN/MAX | 1 | 3 | 377,042 | 459,417 | +21.9% |
+| nullable primitive aggregates | 1 | 3 | 357,417 | 503,125 | +40.8% |
+| partitioned same-column aggregates | 1 | 3 | 155,791 | 128,708 | -17.4% |
+| LSM same-column aggregates | 1 | 3 | 82,042 | 85,667 | +4.4% |
+| Text MIN/MAX control | N/A | 2 | 450,625 | 637,291 | +41.4% |
+| grouped mixed-aggregate control | N/A | 4 | 532,750 | 546,042 | +2.5% |
+
+The intended same-column reuse ratio improved from 1.742x the single-SUM time
+to 1.178x. However, the distinct-three-column ratio moved from 0.972x the
+same-column case to 0.910x rather than producing a coherent reuse curve, while
+duplicate SUM moved from 1.016x single SUM to 2.146x. These contradictory
+relationships are not credible evidence for keeping the representation.
+Non-target movement was also broad: for example, the ordinary batch full scan
+moved from 352,542 to 520,083 ns (+47.5%). This is a noisy quick attribution
+pair, not a throughput threshold or statistical performance claim.
+
+The pilot's structural tests were positive: a 513-row input delivered 256,
+256, and 1 rows; SUM/MIN/MAX over one position allocated one unique typed
+column, while three source positions allocated three; validity bits preserved
+NULL exclusion; checked SUM and final SQL conversion preserved existing
+overflow errors; and row/column results agreed for empty, nullable, boundary,
+Heap, LSM, filtered, and partitioned cases. Memory during the experiment was
+the existing at-most-256-row owned batch plus at most one transient typed vector
+per unique primitive source and aggregate state. It was not columnar storage
+and did not remove the row batch or final QueryResult ownership.
+
+The decision is **reject**. The production sidecar and its test-only statistics
+were removed; only the benchmark attribution and this decision record remain.
+`ExecutionBatch` and `AggregateAccumulator` are unchanged. Phase 68 should
+prefer a narrower residual with stable within-run attribution, such as HashJoin
+build-key ownership/hash metadata or AND/OR short-circuiting. Full batch Sort
+and spilling remain separate larger candidates. Any future typed-column trial
+must isolate row-to-column transposition cost and show consistent gains across
+Heap, LSM, Filter, nullable, and partitioned workloads before generalization.
 
 ## CI and compatibility
 
@@ -1777,6 +1832,7 @@ adds an executor-private Top-N consumer of the existing physical tree. Phase 65
 adds an executor-private HashJoin probe consumer and retains the materialized
 fallback. Phase 66 adds the second executor-private BatchSource variant for the
 existing all-SeqScan PartitionedScan and retains mixed-access materialization.
-All four retain the current Heap metadata v4 and every public, inspection,
+Phase 67 retains only benchmark attribution after rejecting its private pilot.
+All five retain the current Heap metadata v4 and every public, inspection,
 protocol, SDK, and persistent contract. These phases add no dependency and no
 unsafe code.

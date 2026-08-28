@@ -1572,3 +1572,36 @@ still owns `O(N)` final QueryResult rows; Phase 66 removes only the extra source
 intermediate. PhysicalPlan, planner policy, storage APIs and engines,
 persistent formats, protocol, SDKs, dependencies, and unsafe-code usage remain
 unchanged.
+
+## Typed Primitive Aggregate Column-Batch Attribution (Phase 67, complete; pilot rejected)
+
+- added plan- and result-gated attribution for global primitive aggregation:
+  one SUM, same-column SUM/MIN/MAX, duplicate SUM, three distinct primitive
+  columns, Filter plus same-column aggregates, nullable primitives, an
+  all-SeqScan PartitionedScan, and LSM. Existing Text MIN/MAX and grouped
+  aggregate cases remain non-target controls;
+- evaluated an executor-private sidecar only for eligible global Bool/Int64/
+  UInt64 aggregates. It deduplicated source positions, transposed each bounded
+  row batch into typed value vectors plus explicit validity bits, and updated
+  direct COUNT/SUM/MIN/MAX loops with checked arithmetic;
+- verified during the pilot that 513 rows arrived as batches of 256, 256, and
+  1, that three aggregates over one source created one typed column while three
+  source positions created three columns, and that nullable and overflow
+  behavior matched the row accumulator;
+- rejected and removed the production pilot because the quick pre/post pair
+  was internally inconsistent. Same-column SUM/MIN/MAX improved 12.4%, but
+  duplicate SUM regressed 173.5%, Filter plus aggregate regressed 21.9%, the
+  nullable target regressed 40.8%, and LSM changed by +4.4%. Broad controls also
+  moved substantially, confirming material run-to-run noise;
+- retains no typed sidecar, test-only sidecar statistics, new public API,
+  dependency, unsafe code, planner policy, storage change, or persistent-format
+  change. Production remains the row-owned `ExecutionBatch` plus
+  `AggregateAccumulator`.
+
+The next attribution phase should prefer a large residual with a more stable
+within-run comparison: HashJoin build-key ownership/hash metadata or bound
+AND/OR short-circuiting are narrower candidates. Full batch Sort and spilling
+remain larger separate projects. Any renewed column-layout work must first
+separate transposition cost from consumption and demonstrate a consistent
+primitive-heavy benefit across Heap, LSM, Filter, nullable, and partitioned
+inputs.

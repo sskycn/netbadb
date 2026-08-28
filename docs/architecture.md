@@ -1179,6 +1179,15 @@ last use and move the final owner. The group lookup remains
 `HashMap<Vec<ScalarValue>, usize>` and its per-row key ownership is explicitly
 outside Phase 57.
 
+Phase 67 evaluated, then removed, a narrower typed-column sidecar for eligible
+global primitive aggregates. The experiment transposed unique Bool, Int64, and
+UInt64 source positions from each row batch into typed vectors plus explicit
+validity bits and ran direct COUNT/SUM/MIN/MAX loops. Its mixed benchmark
+evidence did not justify retaining a second transient representation. The
+production invariant therefore remains one row-owned `ExecutionBatch` feeding
+the existing typed `AggregateAccumulator`; there is no primitive column batch,
+columnar storage contract, or generalized column execution API.
+
 Phase 58 replaces that owned-key lookup with an executor-private `GroupLookup`:
 
 ```text

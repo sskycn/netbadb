@@ -835,12 +835,20 @@ The implementation sequence is intentionally vertical:
     partitions while Aggregate and Top-N still consume every partition.
     Mixed IndexScan/RangeIndexScan access retains the authoritative materialized
     fallback, and point/range storage APIs remain unchanged.
+67. Typed Primitive Aggregate Column-Batch Attribution — complete; the private
+    global-aggregate pilot was rejected and removed. Dedicated Bool/Int64/UInt64
+    columns with validity bits showed an encouraging same-column central result,
+    but duplicate-SUM, filtered, nullable, and LSM targets were inconsistent in
+    the same noisy quick pair. Production therefore retains row-owned
+    `ExecutionBatch` and `AggregateAccumulator`; only plan-gated attribution and
+    the recorded decision remain.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
-index-join planning remain roadmap items. Typed column-oriented batches,
-build-side HashJoin ownership/hash work, and storage-level index/range visitors
-remain measurement-led candidates; full batch Sort and upstream Top-N
-cancellation are not implemented. Leaf-lookup micro-optimization stops with
+index-join planning remain roadmap items. A general typed column-oriented batch
+is not justified by Phase 67; build-side HashJoin ownership/hash work,
+AND/OR short-circuiting, full batch Sort, spilling, and storage-level
+index/range visitors remain measurement-led candidates. Upstream Top-N
+cancellation is not implemented. Leaf-lookup micro-optimization stops with
 Phase 63.
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/roadmap.md`](docs/roadmap.md) for the maintained design notes. The

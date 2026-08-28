@@ -496,6 +496,32 @@ fn run_lsm_correctness_scenarios(
         durations,
     });
 
+    let scenario = "phase67_lsm_same_column_multi";
+    let sql = "SELECT SUM(id), MIN(id), MAX(id) FROM items";
+    let plan = inspect_plan(
+        &database,
+        scenario,
+        sql,
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[],
+    )?;
+    inspect_base_scan_columns(&database, scenario, sql, &[ID_COLUMN_ID])?;
+    let durations = measure_checked(
+        scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected_global_multi(rows),
+        || database.query(sql).map_err(Into::into),
+        |result| global_multi_observation(result, rows),
+    )?;
+    measurements.push(Measurement {
+        scenario: scenario.into(),
+        rows: rows.to_string(),
+        plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+
     for (scenario, sql) in [
         (
             "lsm_update",
@@ -778,6 +804,21 @@ fn run_phase66_partitioned_scenarios(
                 },
                 settings,
                 sum_observation,
+                measurements,
+            )?;
+            let scenario = "phase67_partition_same_column_multi";
+            let sql = "SELECT SUM(id), MIN(id), MAX(id) FROM partitioned_items";
+            inspect_base_scan_columns(&database, scenario, sql, &[ID_COLUMN_ID])?;
+            measure_phase66_partition_query(
+                &mut database,
+                scenario,
+                rows,
+                partition_count,
+                sql,
+                &[Operator::Aggregate, Operator::SeqScan],
+                expected_global_multi(rows),
+                settings,
+                |result| global_multi_observation(result, rows),
                 measurements,
             )?;
             measure_phase66_partition_query(
@@ -1270,6 +1311,99 @@ fn run_projection_attribution_scenarios(
         expected_global_multi(rows),
         settings,
         |result| global_multi_observation(result, rows),
+        measurements,
+    )?;
+    let sum = i64::try_from(arithmetic_sum(rows))?;
+    let duplicate_sum_values = vec![
+        ScalarValue::Int64(sum),
+        ScalarValue::Int64(sum),
+        ScalarValue::Int64(sum),
+    ];
+    run_attribution_query(
+        "phase67_aggregate_same_column_sum_triplicate",
+        rows,
+        "SELECT SUM(id), SUM(id), SUM(id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID],
+        primitive_values_expected(&duplicate_sum_values)?,
+        settings,
+        |result| primitive_values_observation(result, &duplicate_sum_values),
+        measurements,
+    )?;
+    let three_column_values = vec![
+        ScalarValue::Int64(sum),
+        ScalarValue::Int64(0),
+        ScalarValue::Int64(i64::try_from(rows.saturating_sub(1))?),
+    ];
+    run_attribution_query(
+        "phase67_aggregate_three_primitive_columns",
+        rows,
+        "SELECT SUM(id), MIN(team_id), MAX(bucket_id) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[ID_COLUMN_ID, TEAM_COLUMN_ID, BUCKET_COLUMN_ID],
+        primitive_values_expected(&three_column_values)?,
+        settings,
+        |result| primitive_values_observation(result, &three_column_values),
+        measurements,
+    )?;
+    let active_ids = (0..rows).filter(|id| id % 3 == 0).collect::<Vec<_>>();
+    let active_sum = active_ids.iter().try_fold(0_u64, |sum, id| {
+        sum.checked_add(*id)
+            .ok_or_else(|| message_error("active fixture SUM overflow"))
+    })?;
+    let filtered_values = vec![
+        ScalarValue::Int64(i64::try_from(active_sum)?),
+        active_ids
+            .first()
+            .copied()
+            .map(i64::try_from)
+            .transpose()?
+            .map_or(ScalarValue::Null, ScalarValue::Int64),
+        active_ids
+            .last()
+            .copied()
+            .map(i64::try_from)
+            .transpose()?
+            .map_or(ScalarValue::Null, ScalarValue::Int64),
+    ];
+    run_attribution_query(
+        "phase67_aggregate_filtered_same_column_multi",
+        rows,
+        "SELECT SUM(id), MIN(id), MAX(id) FROM items WHERE active = true",
+        &[Operator::Aggregate, Operator::Filter, Operator::SeqScan],
+        &[ID_COLUMN_ID, ACTIVE_COLUMN_ID],
+        primitive_values_expected(&filtered_values)?,
+        settings,
+        |result| primitive_values_observation(result, &filtered_values),
+        measurements,
+    )?;
+    let nullable_ids = (0..rows)
+        .filter(|id| !NullDistribution::Low.is_null(*id))
+        .collect::<Vec<_>>();
+    let nullable_values = vec![
+        ScalarValue::UInt64(u64::try_from(nullable_ids.len())?),
+        nullable_ids
+            .first()
+            .copied()
+            .map(i64::try_from)
+            .transpose()?
+            .map_or(ScalarValue::Null, ScalarValue::Int64),
+        nullable_ids
+            .last()
+            .copied()
+            .map(i64::try_from)
+            .transpose()?
+            .map_or(ScalarValue::Null, ScalarValue::Int64),
+    ];
+    run_attribution_query(
+        "phase67_aggregate_nullable_primitive_multi",
+        rows,
+        "SELECT COUNT(nullable_key), MIN(nullable_key), MAX(nullable_key) FROM items",
+        &[Operator::Aggregate, Operator::SeqScan],
+        &[NULLABLE_COLUMN_ID],
+        primitive_values_expected(&nullable_values)?,
+        settings,
+        |result| primitive_values_observation(result, &nullable_values),
         measurements,
     )?;
     for (scenario, shape) in [
@@ -4338,6 +4472,50 @@ fn global_multi_observation(result: &QueryResult, fixture_rows: u64) -> BenchRes
         )));
     }
     Ok(expected_global_multi(fixture_rows))
+}
+
+fn primitive_values_expected(values: &[ScalarValue]) -> BenchResult<Observation> {
+    Ok(Observation {
+        rows: 1,
+        checksum: primitive_values_checksum(values)?,
+    })
+}
+
+fn primitive_values_observation(
+    result: &QueryResult,
+    expected: &[ScalarValue],
+) -> BenchResult<Observation> {
+    let [row] = result.rows.as_slice() else {
+        return Err(message_error(
+            "primitive aggregate query must return one row",
+        ));
+    };
+    if row != expected {
+        return Err(message_error(format!(
+            "primitive aggregate returned {row:?}; expected {expected:?}"
+        )));
+    }
+    primitive_values_expected(row)
+}
+
+fn primitive_values_checksum(values: &[ScalarValue]) -> BenchResult<u128> {
+    values.iter().try_fold(0_u128, |checksum, value| {
+        let value = match value {
+            ScalarValue::Null => 0,
+            ScalarValue::Bool(value) => u128::from(*value),
+            ScalarValue::Int64(value) => u128::try_from(*value)
+                .map_err(|_| message_error("negative primitive aggregate result"))?,
+            ScalarValue::UInt64(value) => u128::from(*value),
+            ScalarValue::Text(_) => {
+                return Err(message_error(
+                    "primitive aggregate result unexpectedly contained Text",
+                ));
+            }
+        };
+        checksum
+            .checked_add(value)
+            .ok_or_else(|| message_error("primitive aggregate checksum overflow"))
+    })
 }
 
 fn text_min_max_observation(result: &QueryResult, fixture_rows: u64) -> BenchResult<Observation> {
