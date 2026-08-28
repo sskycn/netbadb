@@ -424,6 +424,17 @@ struct ExecutionRows {
     rows: Vec<ExecutionRow>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FullSortStats {
+    input_rows: usize,
+    rows_before_sort: usize,
+    rows_after_sort: usize,
+    sort_keys: usize,
+    input_scalar_slots: usize,
+    logical_text_payload_bytes: usize,
+}
+
 #[derive(Debug)]
 struct ExecutionBatch {
     rows: Vec<ExecutionRow>,
@@ -1660,25 +1671,12 @@ fn execute_rows_legacy_with_filter_mode(
                 read_views,
                 filter_mode,
             )?;
-            let positions = resolve_sort_positions(&result.fields, keys)?;
-            validate_sort_values(&result.rows, &positions, keys)?;
-
-            let mut comparison_error = None;
-            result.rows.sort_by(|left, right| {
-                if comparison_error.is_some() {
-                    return Ordering::Equal;
-                }
-                match compare_sort_rows(left, right, &positions, keys) {
-                    Ok(ordering) => ordering,
-                    Err(error) => {
-                        comparison_error = Some(error);
-                        Ordering::Equal
-                    }
-                }
-            });
-            if let Some(error) = comparison_error {
-                return Err(error);
-            }
+            sort_execution_rows(
+                &mut result,
+                keys,
+                #[cfg(test)]
+                None,
+            )?;
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
@@ -2257,6 +2255,61 @@ fn resolve_sort_positions(
     keys.iter()
         .map(|key| find_source_position(fields, &key.column))
         .collect()
+}
+
+fn sort_execution_rows(
+    result: &mut ExecutionRows,
+    keys: &[SortKey],
+    #[cfg(test)] mut stats: Option<&mut FullSortStats>,
+) -> Result<(), ExecutionError> {
+    #[cfg(test)]
+    if let Some(stats) = stats.as_deref_mut() {
+        *stats = FullSortStats {
+            input_rows: result.rows.len(),
+            rows_before_sort: result.rows.len(),
+            rows_after_sort: 0,
+            sort_keys: keys.len(),
+            input_scalar_slots: result.rows.iter().map(|row| row.values.len()).sum(),
+            logical_text_payload_bytes: result
+                .rows
+                .iter()
+                .flat_map(|row| &row.values)
+                .filter_map(|value| match value {
+                    ScalarValue::Text(value) => Some(value.len()),
+                    ScalarValue::Null
+                    | ScalarValue::Bool(_)
+                    | ScalarValue::Int64(_)
+                    | ScalarValue::UInt64(_) => None,
+                })
+                .sum(),
+        };
+    }
+
+    let positions = resolve_sort_positions(&result.fields, keys)?;
+    validate_sort_values(&result.rows, &positions, keys)?;
+
+    let mut comparison_error = None;
+    result.rows.sort_by(|left, right| {
+        if comparison_error.is_some() {
+            return Ordering::Equal;
+        }
+        match compare_sort_rows(left, right, &positions, keys) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                comparison_error = Some(error);
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = comparison_error {
+        return Err(error);
+    }
+
+    #[cfg(test)]
+    if let Some(stats) = stats {
+        stats.rows_after_sort = result.rows.len();
+    }
+    Ok(())
 }
 
 fn validate_sort_values(
@@ -5478,23 +5531,24 @@ mod tests {
     use super::{
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
-        ExecutionRow, ExecutionRows, ExecutionStorage, FilteredCountSummary, GroupLookup,
-        GroupState, HashJoinBuildSide, InequalityExecutionStrategy, PartitionedBatchStats,
-        PrehashedBuildHasher, PrehashedKey, ProjectionPlan, QueryResult, StreamingHashJoinStats,
-        TopNState, TruthValue, bind_expression, bind_filter_predicate, build_batch_pipeline,
-        build_hash_join_buckets, build_top_n_plan, choose_inequality_strategy,
-        collect_filter_columns, collect_streaming_filter_row, compatibility_bindings,
-        count_to_sql_u64, direct_count_eligibility, evaluate, evaluate_binary,
-        evaluate_binary_refs, evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth,
-        evaluate_bound_truth, evaluate_bound_values, evaluate_bound_with,
-        evaluate_dynamic_borrowed_truth_values, evaluate_dynamic_borrowed_values,
-        evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with, evaluate_filter_bound_truth,
-        evaluate_filter_bound_with, evaluate_truth, evaluate_truth_values, evaluate_values,
-        exact_candidate_pair_count, execute, execute_inequality_sweep, execute_nested_loop_join,
-        execute_rows, execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
-        find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
+        ExecutionRow, ExecutionRows, ExecutionStorage, FilteredCountSummary, FullSortStats,
+        GroupLookup, GroupState, HashJoinBuildSide, InequalityExecutionStrategy,
+        PartitionedBatchStats, PrehashedBuildHasher, PrehashedKey, ProjectionPlan, QueryResult,
+        StreamingHashJoinStats, TopNState, TruthValue, bind_expression, bind_filter_predicate,
+        build_batch_pipeline, build_hash_join_buckets, build_top_n_plan,
+        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
+        compatibility_bindings, count_to_sql_u64, direct_count_eligibility, evaluate,
+        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
+        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
+        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
+        evaluate_filter_bound_truth, evaluate_filter_bound_with, evaluate_truth,
+        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
+        execute_with_storages, filtered_count_eligibility, find_required_inequality,
+        hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
-        projected_streaming_seq_filter_eligibility, required_right_extreme,
+        projected_streaming_seq_filter_eligibility, required_right_extreme, sort_execution_rows,
         sorted_non_null_indices, streaming_seq_filter_eligibility,
         try_execute_streaming_hash_join_probe, update_filtered_count_summary, visit_batch_pipeline,
         visit_batch_pipeline_with_stats,
@@ -7883,6 +7937,148 @@ mod tests {
     }
 
     #[test]
+    fn full_sort_stats_attribute_complete_narrow_and_hidden_text_inputs() {
+        let columns = batch_columns();
+        let id = columns[0].clone();
+        let payload = columns[3].clone();
+        let row_count = 2 * EXECUTION_BATCH_CAPACITY + 1;
+        let ascending_keys = [SortKey {
+            column: id.clone(),
+            direction: SortDirection::Asc,
+            null_order: NullOrder::Last,
+        }];
+        for boundary_rows in [
+            0,
+            1,
+            EXECUTION_BATCH_CAPACITY - 1,
+            EXECUTION_BATCH_CAPACITY,
+            EXECUTION_BATCH_CAPACITY + 1,
+            2 * EXECUTION_BATCH_CAPACITY,
+            2 * EXECUTION_BATCH_CAPACITY + 1,
+        ] {
+            let mut boundary = ExecutionRows {
+                fields: vec![OutputField::Source(id.clone())],
+                rows: (0..boundary_rows)
+                    .rev()
+                    .map(|index| ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Int64(index as i64)],
+                    })
+                    .collect(),
+            };
+            sort_execution_rows(&mut boundary, &ascending_keys, None)
+                .expect("sort complete boundary input");
+            assert_eq!(
+                boundary
+                    .rows
+                    .into_iter()
+                    .map(|row| row.values)
+                    .collect::<Vec<_>>(),
+                (0..boundary_rows)
+                    .map(|index| vec![ScalarValue::Int64(index as i64)])
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let mut narrow = ExecutionRows {
+            fields: vec![OutputField::Source(id.clone())],
+            rows: (0..row_count)
+                .map(|index| ExecutionRow {
+                    row_id: None,
+                    values: vec![ScalarValue::Int64(index as i64)],
+                })
+                .collect(),
+        };
+        let narrow_keys = [SortKey {
+            column: id.clone(),
+            direction: SortDirection::Desc,
+            null_order: NullOrder::First,
+        }];
+        let mut narrow_stats = FullSortStats::default();
+        sort_execution_rows(&mut narrow, &narrow_keys, Some(&mut narrow_stats))
+            .expect("sort complete narrow input");
+        assert_eq!(
+            narrow_stats,
+            FullSortStats {
+                input_rows: 513,
+                rows_before_sort: 513,
+                rows_after_sort: 513,
+                sort_keys: 1,
+                input_scalar_slots: 513,
+                logical_text_payload_bytes: 0,
+            }
+        );
+        assert_eq!(narrow.rows[0].values, vec![ScalarValue::Int64(512)]);
+        assert_eq!(narrow.rows[512].values, vec![ScalarValue::Int64(0)]);
+
+        let mut hidden_text = ExecutionRows {
+            fields: vec![
+                OutputField::Source(id.clone()),
+                OutputField::Source(payload.clone()),
+            ],
+            rows: (0..row_count)
+                .map(|index| {
+                    let reverse_key = row_count - index;
+                    let text = format!("{reverse_key:0>128}");
+                    assert_eq!(text.len(), 128);
+                    ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Int64(index as i64), ScalarValue::Text(text)],
+                    }
+                })
+                .collect(),
+        };
+        let hidden_keys = [SortKey {
+            column: payload,
+            direction: SortDirection::Asc,
+            null_order: NullOrder::Last,
+        }];
+        let mut hidden_stats = FullSortStats::default();
+        sort_execution_rows(&mut hidden_text, &hidden_keys, Some(&mut hidden_stats))
+            .expect("sort complete hidden-Text input");
+        assert_eq!(
+            hidden_stats,
+            FullSortStats {
+                input_rows: 513,
+                rows_before_sort: 513,
+                rows_after_sort: 513,
+                sort_keys: 1,
+                input_scalar_slots: 1_026,
+                logical_text_payload_bytes: 513 * 128,
+            }
+        );
+
+        let final_projection =
+            ProjectionPlan::from_positions(2, vec![0]).expect("build hidden-key final projection");
+        let final_rows = hidden_text
+            .rows
+            .into_iter()
+            .map(|row| project_execution_row(row, &final_projection))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("project hidden-key result");
+        assert_eq!(
+            final_rows.iter().map(|row| row.values.len()).sum::<usize>(),
+            513
+        );
+        assert_eq!(
+            final_rows
+                .iter()
+                .flat_map(|row| &row.values)
+                .filter_map(|value| match value {
+                    ScalarValue::Text(value) => Some(value.len()),
+                    ScalarValue::Null
+                    | ScalarValue::Bool(_)
+                    | ScalarValue::Int64(_)
+                    | ScalarValue::UInt64(_) => None,
+                })
+                .sum::<usize>(),
+            0
+        );
+        assert_eq!(final_rows[0].values, vec![ScalarValue::Int64(512)]);
+        assert_eq!(final_rows[512].values, vec![ScalarValue::Int64(0)]);
+    }
+
+    #[test]
     fn top_n_state_bounds_retention_and_preserves_equal_key_input_order() {
         let key_column = batch_columns()[1].clone();
         for direction in [SortDirection::Asc, SortDirection::Desc] {
@@ -8180,6 +8376,24 @@ mod tests {
                     vec![columns[0].clone(), columns[3].clone()],
                 ),
                 20,
+            ),
+            batch_project(
+                batch_sort(
+                    scan(),
+                    vec![
+                        SortKey {
+                            column: columns[3].clone(),
+                            direction: SortDirection::Asc,
+                            null_order: NullOrder::Last,
+                        },
+                        SortKey {
+                            column: columns[0].clone(),
+                            direction: SortDirection::Desc,
+                            null_order: NullOrder::First,
+                        },
+                    ],
+                ),
+                vec![columns[0].clone(), columns[3].clone()],
             ),
         ];
         for plan in plans {

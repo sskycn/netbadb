@@ -875,13 +875,23 @@ The implementation sequence is intentionally vertical:
     BuildLeft buffers owned matches by logical left row before move-flattening,
     so exact left-major/right-minor order, eager residuals, NULL behavior,
     borrowed build keys, and the materialized fallback remain unchanged.
+71. Full Sort Memory & Spill Boundary Attribution — complete; exact-plan real
+    SQL benchmarks now compare no-LIMIT Full Sort with width-matched no-Sort
+    controls across primitive, nullable, short/long Text, hidden-key, filtered,
+    partitioned, Heap, and LSM shapes. Test-only `FullSortStats` confirms that a
+    513-row Sort owns and sorts all 513 rows, including 1,026 scalar slots and
+    65,664 logical owned Text payload bytes for the hidden 128-byte-key case.
+    Full Sort remains materialized and in-memory. Because the final fully owned
+    `QueryResult` still has an Ω(N output) memory lower bound and the measured
+    hidden-key overhead was modest, external spill is deferred rather than
+    selected for Phase 72.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 index-join planning remain roadmap items. A general typed column-oriented batch
-is not justified by Phase 67. Full batch Sort, spilling, and storage-level
-index/range visitors remain measurement-led candidates. Upstream Top-N
-cancellation is not implemented. HashJoin build-side structure closes with
-Phase 70 rather than continuing into micro-tuning; general lazy expression
+is not justified by Phase 67. Phase 71 does not justify external Sort spill;
+storage-level index/range visitors remain measurement-led candidates. Upstream
+Top-N cancellation is not implemented. HashJoin build-side structure closes
+with Phase 70 rather than continuing into micro-tuning; general lazy expression
 semantics are not implemented beyond the metadata-gated Phase 69 Filter
 boundary.
 See [`docs/architecture.md`](docs/architecture.md) and

@@ -2006,6 +2006,108 @@ APIs, dependencies, or persistent contracts. Phase 71 should move to full
 Sort/spill attribution, a storage-level range visitor only with new workload
 evidence, or larger algorithmic work; HashJoin micro-tuning closes here.
 
+## Phase 71 full Sort memory and spill boundary attribution
+
+Phase 71 changes no production Sort algorithm. It adds real SQL through the
+real compiler/planner and requires exact no-LIMIT plans, exact base scan
+ColumnIds, and complete ordered results. The matrix covers unique Int64,
+duplicate primitive keys with stable ties, unique multi-key order, filtered
+input, all four explicit NULL direction/placement combinations, fixed 8-byte
+Text, fixed 128-byte retained/hidden Text, a four-way all-SeqScan
+PartitionedScan, Heap, and LSM. Each important ordered query has a no-ORDER-BY
+control with the same final row count and width. Phase 64's LIMIT 20 path is a
+separate Top-N control, not a Full Sort implementation comparison.
+
+Three serial quick runs are stored at
+`/tmp/netbadb-phase71-run1.txt`, `/tmp/netbadb-phase71-run2.txt`, and
+`/tmp/netbadb-phase71-run3.txt`. The first two used the documented `cargo bench`
+command. Before the third, unrelated concurrent workspace edits introduced a
+new uncached dependency while the configured local proxy was unavailable, so
+Cargo resolution failed before execution; the valid third sample directly ran
+the same release benchmark binary produced by the first two runs. Values below
+are the median of the three per-run medians in nanoseconds per query.
+
+| scenario | N | Sort input columns | output columns | median | ordered / no-Sort |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Int64 unique DESC | 4,096 | 1 | 1 | 754,167 | 0.985x |
+| primitive duplicate team | 4,096 | 2 | 1 | 973,542 | 1.271x |
+| primitive team ASC, ID DESC | 4,096 | 2 | 1 | 1,300,500 | 1.698x |
+| short Text retained | 4,096 | 2 | 2 | 637,333 | 0.985x |
+| long Text retained | 4,096 | 2 | 2 | 964,125 | 0.924x |
+| long Text hidden | 4,096 | 2 | 1 | 985,416 | 1.290x |
+| filtered primitive multi-key | 4,096 source | 2 | 1 | 798,083 | 1.245x |
+| partitioned primitive multi-key | 1,024 / 4 partitions | 2 | 1 | 282,959 | 2.273x |
+| LSM primitive multi-key | 250 | 2 | 1 | 137,916 | 2.517x |
+
+Ratios below 1 do not mean sorting has negative cost. The three runs moved
+widely, especially at small N, and result materialization, scan width, cache
+state, and machine noise dominate some pairs. They are evidence against making
+a throughput claim or selecting spill from latency alone. The hidden long-Text
+ratio was the most consistent width-sensitive target: 1.261x at 512, 1.214x at
+2,048, and 1.290x at 4,096. At 4,096, hidden long Text was 1.307x narrow unique
+Int64 and only 1.022x retained long Text.
+
+Primitive growth medians are:
+
+| scenario | T(512) | T(1,024) | T(4,096) | T(4,096) / T(1,024) |
+| --- | ---: | ---: | ---: | ---: |
+| Int64 unique DESC | 176,042 | 406,666 | 754,167 | 1.854x |
+| primitive duplicate | 231,625 | 445,292 | 973,542 | 2.187x |
+| primitive multi-key | 305,209 | 645,583 | 1,300,500 | 2.014x |
+| filtered multi-key | 188,958 | 364,792 | 798,083 | 2.188x |
+
+This is a growth-shape observation, not a complexity proof. Increasing N from
+1,024 to 4,096 did not produce a disproportionate jump in these fixtures. Text
+uses its requested 512/2,048/4,096 sweep:
+
+| Text shape | T(512) | T(2,048) | T(4,096) | T(4,096) / T(2,048) |
+| --- | ---: | ---: | ---: | ---: |
+| 8-byte retained | 198,375 | 326,625 | 637,333 | 1.952x |
+| 128-byte retained | 289,708 | 777,000 | 964,125 | 1.241x |
+| 128-byte hidden | 297,625 | 720,166 | 985,416 | 1.368x |
+
+The structural result is more reliable than the timings. Test-only
+`FullSortStats` shares the private function used by production Sort and reports:
+
+| 513-row shape | rows before | rows after | Sort keys | input scalar slots | logical owned Text payload bytes | final scalar slots |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| narrow Int64 | 513 | 513 | 1 | 513 | 0 | 513 |
+| hidden 128-byte Text | 513 | 513 | 1 | 1,026 | 65,664 | 513 |
+
+The hidden projection retains no Text. “Logical owned Text payload bytes” is
+the sum of String lengths, not exact heap allocation or RSS. The 513-row result
+also proves Full Sort crosses both the 256-row and 512-row batch boundaries
+without bounded retention. Existing exact-order coverage protects empty input,
+255/256/257 and 512/513 boundaries, Text, NULL placement, multi-key order,
+stable duplicate ties, Heap, LSM, and PartitionedScan behavior without adding
+release counters.
+
+Partitioned source batching is already bounded by Phase 66, yet Full Sort still
+materializes all 1,024 rows; its 282,959 ns median versus the 124,500 ns
+one-column no-Sort control confirms Sort is a remaining blocking operator. The
+small LSM pair similarly measures 137,916 versus 54,792 ns, but both controls
+also differ in scanned key width and neither establishes a memory failure.
+Phase 64 remains effective for small K: the existing 1,000-row K=1 median was
+168,000 ns versus 224,958 ns for the duplicate Full Sort control, while Top-N
+retains only K candidates plus one batch.
+
+Current Full Sort owns `O(N input rows)`, then its sorted rows flow into the
+fully owned `QueryResult`. Returning N rows therefore has an Ω(N final-output)
+memory lower bound. External runs could reduce additional sorting scratch,
+bound pre-output work, or eliminate some wide hidden-key residency, but cannot
+change total query memory to `O(run_size)` under this contract. A future merge
+would also need a global input ordinal or equivalent stable-tie mechanism and
+must validate all runtime keys before exposing output, matching current error
+timing.
+
+The decision is **DEFER spill**. The hidden-wide shape shows a real 2-to-1
+Sort-input/final-output slot difference and about 29% latency overhead, but not
+enough evidence to justify a memory budget, temporary run format, codec,
+writer/reader, k-way merge, cleanup policy, and failure lifecycle. Phase 72
+should select another independently measured large feature. If a future real
+workload isolates hidden wide keys, compare a compact indirect key/ordinal
+representation before assuming disk spill is the right boundary.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -2033,6 +2135,8 @@ Phase 67 retains only benchmark attribution after rejecting its private pilot.
 Phase 68 changes only executor-private HashJoin key ownership and benchmark
 coverage. Phase 69 adds only executor-private Filter predicate validation and
 evaluation plus benchmark coverage. Phase 70 adds only executor-private
-HashJoin build-side selection and benchmark coverage. All eight retain the
-current Heap metadata v4 and every public, inspection, protocol, SDK, and
-persistent contract. These phases add no dependency and no unsafe code.
+HashJoin build-side selection and benchmark coverage. Phase 71 adds benchmark
+coverage and test-only Full Sort statistics while leaving release execution
+unchanged. All nine retain the current Heap metadata v4 and every public,
+inspection, protocol, SDK, and persistent contract. These phases add no
+dependency and no unsafe code.

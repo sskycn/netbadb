@@ -552,6 +552,52 @@ candidate. Setup failures, unsupported producers, full Sort without Limit, and
 other plan shapes use the authoritative legacy executor. There is no new
 PhysicalPlan variant, cost model, spill path, or storage-facing ordering API.
 
+## Full Sort ownership and spill boundary
+
+Full Sort without LIMIT remains the authoritative materialized path:
+
+```text
+complete child
+    ↓
+ExecutionRows { rows: Vec<ExecutionRow> }  // N owned rows
+    ↓
+resolve key positions and validate all N rows
+    ↓
+stable in-memory Vec::sort_by
+    ↓
+the same N owned rows
+    ↓
+Project -> QueryResult { rows: Vec<Vec<ScalarValue>> }
+```
+
+The Sort input is `O(N input rows)`. The public result is also fully owned, so
+a query returning N rows has an Ω(N final output) memory lower bound. External
+sorting could reduce additional sorting/intermediate peak memory, but it could
+not change total query memory to `O(run_size)` while this result contract is in
+place. Retained-wide shapes such as `SELECT id, payload ORDER BY payload` keep
+the Text in the final result. Hidden-wide shapes such as
+`SELECT id ORDER BY payload` temporarily require `id + payload` in Sort but
+retain only `id` after projection; only the latter exposes a width difference
+that spill or an indirect key/index representation could remove.
+
+Phase 71 adds no release instrumentation or production Sort change. Its
+test-only `FullSortStats` is populated by the same private sorting function used
+by production. At 513 rows, a narrow one-column Sort reports 513 rows and 513
+scalar slots before and after sorting. A hidden 128-byte Text-key Sort reports
+513 rows, 1,026 input scalar slots, and 65,664 logical owned Text payload bytes;
+the final projection has 513 scalar slots and no Text. These are logical owned
+payload counts, not allocator or RSS measurements.
+
+Any future external merge must preserve current stable ties by carrying a
+global input ordinal or an equivalent stability mechanism across runs. It must
+also preserve error timing: full Sort validates every runtime key before
+sorting, so a run-based implementation must not emit early rows or otherwise
+skip malformed keys in later input. A future spill phase would additionally
+need an explicit memory budget, ephemeral row/ordinal codec, run lifecycle,
+k-way merge, and cleanup on every error. Phase 71 deliberately introduces none
+of those boundaries and defers spill because its measurements do not justify
+that infrastructure under the fully owned result contract.
+
 ## Typed global and grouped aggregates
 
 Aggregate function names are contextual only in SELECT projection. A plain

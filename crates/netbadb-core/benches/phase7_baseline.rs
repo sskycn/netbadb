@@ -304,6 +304,7 @@ fn main() -> BenchResult<()> {
     run_projection_attribution_scenarios(settings, &mut measurements)?;
     run_phase69_filter_short_circuit_scenarios(settings, &mut measurements)?;
     run_top_n_attribution_scenarios(settings, &mut measurements)?;
+    run_full_sort_attribution_scenarios(profile, settings, &mut measurements)?;
     run_point_and_shape_scenarios(settings, &mut measurements)?;
     run_join_scenarios(settings, &mut measurements)?;
     run_insert_scenarios(settings, &mut measurements)?;
@@ -467,6 +468,28 @@ fn run_lsm_correctness_scenarios(
         operations_per_iteration: 1,
         durations,
     });
+
+    let scenario = "phase71_lsm_full_sort_multi_key";
+    let sql = "SELECT id FROM items ORDER BY team_id, id";
+    let mut expected_ids = (0..rows).collect::<Vec<_>>();
+    expected_ids.sort_by_key(|id| (id % 4, *id));
+    measure_full_sort_query(
+        &mut database,
+        FullSortQuerySpec {
+            scenario,
+            sql,
+            expected_plan: "Project>Sort>SeqScan",
+            expected_base_columns: &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+            sort_input_columns: 2,
+            output_columns: 1,
+            text_retained: false,
+        },
+        rows,
+        expected_ids_observation(&expected_ids)?,
+        settings,
+        |result| ordered_ids_observation(result, &expected_ids),
+        measurements,
+    )?;
 
     let scenario = "lsm_stream_aggregate_sum";
     let sql = "SELECT SUM(id) FROM items";
@@ -855,6 +878,42 @@ fn run_phase66_partitioned_scenarios(
                 |result| ordered_ids_observation(result, &top_n_ids),
                 measurements,
             )?;
+
+            let scenario = "phase71_partition_full_sort";
+            let sql = "SELECT id FROM partitioned_items ORDER BY team_id, id";
+            let plan = inspect_plan(
+                &database,
+                scenario,
+                sql,
+                &[Operator::Project, Operator::Sort, Operator::SeqScan],
+                &[Operator::Limit],
+            )?;
+            if plan != "Project>Sort>SeqScan" {
+                return Err(message_error(format!(
+                    "scenario `{scenario}` plan was `{plan}`; expected `Project>Sort>SeqScan`"
+                )));
+            }
+            inspect_base_scan_columns(&database, scenario, sql, &[ID_COLUMN_ID, TEAM_COLUMN_ID])?;
+            let mut full_sort_ids = (0..rows).collect::<Vec<_>>();
+            full_sort_ids.sort_by_key(|id| (id % 4, *id));
+            measure_phase66_partition_query(
+                &mut database,
+                scenario,
+                rows,
+                partition_count,
+                sql,
+                &[Operator::Project, Operator::Sort, Operator::SeqScan],
+                expected_ids_observation(&full_sort_ids)?,
+                settings,
+                |result| ordered_ids_observation(result, &full_sort_ids),
+                measurements,
+            )?;
+            let measurement = measurements
+                .last_mut()
+                .ok_or_else(|| message_error("partition full Sort measurement missing"))?;
+            measurement
+                .plan
+                .push_str(" [sort_input_columns=2 output_columns=1 text_retained=false]");
 
             let filtered_ids = (0..rows)
                 .filter(|id| id % 3 == 0)
@@ -2462,6 +2521,380 @@ fn measure_top_n_query(
         scenario: scenario.to_owned(),
         rows: format!("{fixture_rows}/k={}", expected_ids.len()),
         plan,
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+struct FullSortQuerySpec<'a> {
+    scenario: &'a str,
+    sql: &'a str,
+    expected_plan: &'a str,
+    expected_base_columns: &'a [ColumnId],
+    sort_input_columns: usize,
+    output_columns: usize,
+    text_retained: bool,
+}
+
+fn run_full_sort_attribution_scenarios(
+    profile: BenchProfile,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let primitive_rows: &[u64] = match profile {
+        BenchProfile::Quick => &[256, 512, 1_024, 4_096],
+        BenchProfile::Full => &[256, 512, 1_024, 4_096, 16_384],
+    };
+    for &rows in primitive_rows {
+        let fixture_name = format!("phase71-primitive-{rows}");
+        let (mut database, paths) =
+            items_fixture(&fixture_name, rows, &[], NullDistribution::Low, 4)?;
+        let insertion_order = (0..rows).collect::<Vec<_>>();
+        measure_full_sort_query(
+            &mut database,
+            FullSortQuerySpec {
+                scenario: "phase71_int64_no_sort",
+                sql: "SELECT id FROM items",
+                expected_plan: "Project>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID],
+                sort_input_columns: 0,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&insertion_order)?,
+            settings,
+            |result| ordered_ids_observation(result, &insertion_order),
+            measurements,
+        )?;
+
+        let mut unique_desc = insertion_order.clone();
+        unique_desc.reverse();
+        measure_full_sort_query(
+            &mut database,
+            FullSortQuerySpec {
+                scenario: "phase71_int64_unique_sort",
+                sql: "SELECT id FROM items ORDER BY id DESC",
+                expected_plan: "Project>Sort>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID],
+                sort_input_columns: 1,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&unique_desc)?,
+            settings,
+            |result| ordered_ids_observation(result, &unique_desc),
+            measurements,
+        )?;
+
+        let mut duplicate = insertion_order.clone();
+        duplicate.sort_by_key(|id| id % 4);
+        measure_full_sort_query(
+            &mut database,
+            FullSortQuerySpec {
+                scenario: "phase71_primitive_duplicate_sort",
+                sql: "SELECT id FROM items ORDER BY team_id",
+                expected_plan: "Project>Sort>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+                sort_input_columns: 2,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&duplicate)?,
+            settings,
+            |result| ordered_ids_observation(result, &duplicate),
+            measurements,
+        )?;
+
+        let mut multi_key = insertion_order.clone();
+        multi_key.sort_by(|left, right| (left % 4).cmp(&(right % 4)).then_with(|| right.cmp(left)));
+        measure_full_sort_query(
+            &mut database,
+            FullSortQuerySpec {
+                scenario: "phase71_primitive_multi_key_sort",
+                sql: "SELECT id FROM items ORDER BY team_id ASC, id DESC",
+                expected_plan: "Project>Sort>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, TEAM_COLUMN_ID],
+                sort_input_columns: 2,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&multi_key)?,
+            settings,
+            |result| ordered_ids_observation(result, &multi_key),
+            measurements,
+        )?;
+
+        let filtered_insertion = insertion_order
+            .iter()
+            .copied()
+            .filter(|id| id % 3 == 0)
+            .collect::<Vec<_>>();
+        measure_full_sort_query(
+            &mut database,
+            FullSortQuerySpec {
+                scenario: "phase71_filtered_no_sort",
+                sql: "SELECT id FROM items WHERE active = true",
+                expected_plan: "Project>Filter>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, ACTIVE_COLUMN_ID],
+                sort_input_columns: 0,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&filtered_insertion)?,
+            settings,
+            |result| ordered_ids_observation(result, &filtered_insertion),
+            measurements,
+        )?;
+        let mut filtered_sorted = filtered_insertion.clone();
+        filtered_sorted.sort_by_key(|id| (id % 4, *id));
+        measure_full_sort_query(
+            &mut database,
+            FullSortQuerySpec {
+                scenario: "phase71_filtered_sort",
+                sql: "SELECT id FROM items WHERE active = true ORDER BY team_id, id",
+                expected_plan: "Project>Sort>Filter>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, TEAM_COLUMN_ID, ACTIVE_COLUMN_ID],
+                sort_input_columns: 2,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&filtered_sorted)?,
+            settings,
+            |result| ordered_ids_observation(result, &filtered_sorted),
+            measurements,
+        )?;
+
+        if rows == 512 {
+            for (scenario, direction, null_order, descending, nulls_first) in [
+                ("phase71_nullable_asc_first", "ASC", "FIRST", false, true),
+                ("phase71_nullable_asc_last", "ASC", "LAST", false, false),
+                ("phase71_nullable_desc_first", "DESC", "FIRST", true, true),
+                ("phase71_nullable_desc_last", "DESC", "LAST", true, false),
+            ] {
+                let expected_ids = expected_nullable_sort_ids(rows, descending, nulls_first);
+                let sql = format!(
+                    "SELECT id FROM items ORDER BY nullable_key {direction} NULLS {null_order}"
+                );
+                measure_full_sort_query(
+                    &mut database,
+                    FullSortQuerySpec {
+                        scenario,
+                        sql: &sql,
+                        expected_plan: "Project>Sort>SeqScan",
+                        expected_base_columns: &[ID_COLUMN_ID, NULLABLE_COLUMN_ID],
+                        sort_input_columns: 2,
+                        output_columns: 1,
+                        text_retained: false,
+                    },
+                    rows,
+                    expected_ids_observation(&expected_ids)?,
+                    settings,
+                    |result| ordered_ids_observation(result, &expected_ids),
+                    measurements,
+                )?;
+            }
+        }
+        database.close()?;
+        paths.cleanup()?;
+    }
+
+    for rows in [512, 2_048, 4_096] {
+        let short_name = format!("phase71-text-short-{rows}");
+        let (mut short_database, short_paths) = sort_text_fixture(&short_name, rows, 8)?;
+        let insertion_order = (0..rows).collect::<Vec<_>>();
+        let mut sorted_ids = insertion_order.clone();
+        sorted_ids.reverse();
+        measure_full_sort_query(
+            &mut short_database,
+            FullSortQuerySpec {
+                scenario: "phase71_text_short_no_sort",
+                sql: "SELECT id, payload FROM items",
+                expected_plan: "Project>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+                sort_input_columns: 0,
+                output_columns: 2,
+                text_retained: true,
+            },
+            rows,
+            expected_ids_observation(&insertion_order)?,
+            settings,
+            |result| ordered_id_payload_observation(result, &insertion_order, rows, 8),
+            measurements,
+        )?;
+        measure_full_sort_query(
+            &mut short_database,
+            FullSortQuerySpec {
+                scenario: "phase71_text_short_sort",
+                sql: "SELECT id, payload FROM items ORDER BY payload",
+                expected_plan: "Project>Sort>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+                sort_input_columns: 2,
+                output_columns: 2,
+                text_retained: true,
+            },
+            rows,
+            expected_ids_observation(&sorted_ids)?,
+            settings,
+            |result| ordered_id_payload_observation(result, &sorted_ids, rows, 8),
+            measurements,
+        )?;
+        short_database.close()?;
+        short_paths.cleanup()?;
+
+        let long_name = format!("phase71-text-long-{rows}");
+        let (mut long_database, long_paths) = sort_text_fixture(&long_name, rows, 128)?;
+        measure_full_sort_query(
+            &mut long_database,
+            FullSortQuerySpec {
+                scenario: "phase71_text_long_retained_no_sort",
+                sql: "SELECT id, payload FROM items",
+                expected_plan: "Project>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+                sort_input_columns: 0,
+                output_columns: 2,
+                text_retained: true,
+            },
+            rows,
+            expected_ids_observation(&insertion_order)?,
+            settings,
+            |result| ordered_id_payload_observation(result, &insertion_order, rows, 128),
+            measurements,
+        )?;
+        measure_full_sort_query(
+            &mut long_database,
+            FullSortQuerySpec {
+                scenario: "phase71_text_long_retained_sort",
+                sql: "SELECT id, payload FROM items ORDER BY payload",
+                expected_plan: "Project>Sort>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+                sort_input_columns: 2,
+                output_columns: 2,
+                text_retained: true,
+            },
+            rows,
+            expected_ids_observation(&sorted_ids)?,
+            settings,
+            |result| ordered_id_payload_observation(result, &sorted_ids, rows, 128),
+            measurements,
+        )?;
+        measure_full_sort_query(
+            &mut long_database,
+            FullSortQuerySpec {
+                scenario: "phase71_text_long_hidden_no_sort",
+                sql: "SELECT id FROM items",
+                expected_plan: "Project>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID],
+                sort_input_columns: 0,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&insertion_order)?,
+            settings,
+            |result| ordered_ids_observation(result, &insertion_order),
+            measurements,
+        )?;
+        measure_full_sort_query(
+            &mut long_database,
+            FullSortQuerySpec {
+                scenario: "phase71_text_long_hidden_sort",
+                sql: "SELECT id FROM items ORDER BY payload",
+                expected_plan: "Project>Sort>SeqScan",
+                expected_base_columns: &[ID_COLUMN_ID, PAYLOAD_COLUMN_ID],
+                sort_input_columns: 2,
+                output_columns: 1,
+                text_retained: false,
+            },
+            rows,
+            expected_ids_observation(&sorted_ids)?,
+            settings,
+            |result| ordered_ids_observation(result, &sorted_ids),
+            measurements,
+        )?;
+        long_database.close()?;
+        long_paths.cleanup()?;
+    }
+    Ok(())
+}
+
+fn expected_nullable_sort_ids(rows: u64, descending: bool, nulls_first: bool) -> Vec<u64> {
+    let mut ids = (0..rows).collect::<Vec<_>>();
+    ids.sort_by(|left, right| {
+        let left_null = NullDistribution::Low.is_null(*left);
+        let right_null = NullDistribution::Low.is_null(*right);
+        match (left_null, right_null) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => {
+                if nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let ordering = left.cmp(right);
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+        }
+    });
+    ids
+}
+
+fn measure_full_sort_query(
+    database: &mut Database,
+    spec: FullSortQuerySpec<'_>,
+    source_rows: u64,
+    expected: Observation,
+    settings: ProfileSettings,
+    mut observe: impl FnMut(&QueryResult) -> BenchResult<Observation>,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let plan = inspect_plan(database, spec.scenario, spec.sql, &[], &[])?;
+    if plan != spec.expected_plan {
+        return Err(message_error(format!(
+            "scenario `{}` plan was `{plan}`; expected `{}`",
+            spec.scenario, spec.expected_plan
+        )));
+    }
+    inspect_base_scan_columns(
+        database,
+        spec.scenario,
+        spec.sql,
+        spec.expected_base_columns,
+    )?;
+    let durations = measure_checked(
+        spec.scenario,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || database.query(spec.sql).map_err(Into::into),
+        &mut observe,
+    )?;
+    measurements.push(Measurement {
+        scenario: spec.scenario.to_owned(),
+        rows: source_rows.to_string(),
+        plan: format!(
+            "{plan} [sort_input_columns={} output_columns={} text_retained={}]",
+            spec.sort_input_columns, spec.output_columns, spec.text_retained
+        ),
         operations_per_iteration: 1,
         durations,
     });
@@ -4183,6 +4616,37 @@ fn text_comparison_fixture(
     Ok((database, paths))
 }
 
+fn sort_text_fixture(
+    scenario: &str,
+    rows: u64,
+    key_width: usize,
+) -> BenchResult<(Database, FixturePaths)> {
+    let paths = FixturePaths::new(scenario, 1);
+    let mut database = Database::create(paths.path(0), items_table())?;
+    let mut transaction = database.begin_transaction_for(ITEMS_TABLE_ID)?;
+    for id in 0..rows {
+        let mut row = item_row(id, 4, NullDistribution::Low)?;
+        row[5] = ScalarValue::Text(sort_text_payload(id, rows, key_width)?);
+        database.insert_into_in(ITEMS_TABLE_ID, &mut transaction, &row)?;
+    }
+    transaction.commit()?;
+    Ok((database, paths))
+}
+
+fn sort_text_payload(id: u64, rows: u64, key_width: usize) -> BenchResult<String> {
+    let reverse_key = rows
+        .checked_sub(id)
+        .ok_or_else(|| message_error("sort Text fixture ID exceeds row count"))?;
+    let digits = reverse_key.to_string();
+    if digits.len() > key_width {
+        return Err(message_error("sort Text key exceeds fixed width"));
+    }
+    let mut payload = String::with_capacity(key_width);
+    payload.extend(std::iter::repeat_n('0', key_width - digits.len()));
+    payload.push_str(&digits);
+    Ok(payload)
+}
+
 fn items_table() -> TableDef {
     TableDef::new(
         ITEMS_TABLE_ID,
@@ -4803,6 +5267,42 @@ fn ordered_ids_observation(result: &QueryResult, expected_ids: &[u64]) -> BenchR
         )));
     }
     expected_ids_observation(&actual)
+}
+
+fn ordered_id_payload_observation(
+    result: &QueryResult,
+    expected_ids: &[u64],
+    fixture_rows: u64,
+    key_width: usize,
+) -> BenchResult<Observation> {
+    if result.rows.len() != expected_ids.len() {
+        return Err(message_error(format!(
+            "ordered Text query returned {} rows; expected {}",
+            result.rows.len(),
+            expected_ids.len()
+        )));
+    }
+    for (position, (row, expected_id)) in result.rows.iter().zip(expected_ids).enumerate() {
+        let [ScalarValue::Int64(id), ScalarValue::Text(payload)] = row.as_slice() else {
+            return Err(message_error(
+                "ordered Text query must return Int64 ID and non-NULL Text payload",
+            ));
+        };
+        let id = u64::try_from(*id)
+            .map_err(|_| message_error("ordered Text query returned a negative ID"))?;
+        if id != *expected_id {
+            return Err(message_error(format!(
+                "ordered Text query diverged at row {position}: actual ID={id}, expected ID={expected_id}"
+            )));
+        }
+        let expected_payload = sort_text_payload(id, fixture_rows, key_width)?;
+        if payload != &expected_payload {
+            return Err(message_error(format!(
+                "ordered Text query payload diverged at row {position}"
+            )));
+        }
+    }
+    expected_ids_observation(expected_ids)
 }
 
 fn primitive_item_observation(result: &QueryResult, expected_id: u64) -> BenchResult<Observation> {

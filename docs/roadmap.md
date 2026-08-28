@@ -1745,3 +1745,44 @@ Sort/spill boundary, or a storage-level range visitor only if new workloads
 justify it, before selecting larger algorithmic work. Do not continue HashJoin
 micro-tuning or reopen the rejected Phase 67 column-sidecar without new
 evidence.
+
+## Full Sort Memory & Spill Boundary Attribution (Phase 71, complete)
+
+- added real-SQL, real-planner Full Sort benchmarks with exact physical-tree,
+  base-scan-column, no-LIMIT, and complete ordered-result gates;
+- sweeps narrow unique Int64, duplicate primitive keys, unique multi-key order,
+  filtered input, all four explicit NULL direction/placement combinations,
+  fixed 8-byte Text, fixed 128-byte retained and hidden Text keys, four-way
+  PartitionedScan, Heap, and LSM controls;
+- compares every important ordered shape with a no-ORDER-BY control returning
+  the same final row count and width, while retaining Phase 64 Top-N as a
+  separate small-K control;
+- adds only `#[cfg(test)]` `FullSortStats`, populated by the production private
+  sorting function. The 513-row boundary reports 513 rows before/after Sort;
+  hidden 128-byte Text reports 1,026 scalar slots and 65,664 logical owned Text
+  payload bytes before its one-column final projection;
+- records that current stable ties are an external-run ordinal constraint and
+  that every runtime key must still be validated before any future result is
+  exposed;
+- retains the production in-memory stable Sort, PhysicalPlan, fully owned
+  QueryResult, public APIs, configuration, dependencies, safe Rust, and every
+  protocol and persistent format.
+
+The decision is **DEFER spill**. Across three serial quick runs, the median of
+per-run medians at 4,096 rows was 754,167 ns for narrow unique Sort versus
+765,917 ns without Sort (0.985x), 964,125 versus 1,043,166 ns for retained long
+Text (0.924x), and 985,416 versus 764,125 ns for hidden long Text (1.290x).
+Hidden and retained ordered long-Text medians differed by only 1.022x. Multi-key
+primitive and partitioned Sort controls showed visible work at 1.698x and
+2.273x relative to their controls, but they do not show that disk runs would
+remove the dominant owned-result cost.
+
+Full Sort input ownership remains `O(N input rows)`, while a fully owned result
+returning N rows has an Ω(N final output) lower bound. Spill could remove some
+wide hidden-key residency or sorting scratch; it cannot reduce total query
+memory to `O(run_size)` under the current contract. Phase 72 should therefore
+select another independently measured large feature rather than external Sort
+infrastructure. A storage-level range visitor remains a candidate only if a new
+real workload invalidates the Phase 66 selectivity boundary. If future evidence
+specifically isolates hidden wide keys, first compare a compact indirect
+key/index representation against disk spill.
