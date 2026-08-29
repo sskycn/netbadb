@@ -2240,50 +2240,56 @@ and an LSM 8×512 IndexJoin control. Each paired SQL fixture loads data once,
 measures and warms the no-join-key-index state, creates/analyzes the right
 join-key index, then independently warms and measures the indexed state.
 
-Three serial full quick runs are preserved at
-`/tmp/netbadb-phase73-pre-run1.txt`, `run2.txt`, and `run3.txt`. They also
-served as a deliberately tested pilot in which Heap sequential cost counted
-only Heap data pages. The pilot was **rejected and restored**: actual Heap
-SeqScan still traverses colocated access pages, and indexed HashJoin was
-consistently slower than no-index HashJoin. The final-code smoke confirming the
-restored total-managed-page semantics is
-`/tmp/netbadb-phase73-smoke.txt`. Query execution was unchanged by the pilot;
-for the core 4,096-row fixture its planner boundary was also unchanged.
+The earlier `/tmp/netbadb-phase73-pre-run1.txt`, `run2.txt`, and `run3.txt`
+files exercised a deliberately tested pilot in which Heap sequential cost
+counted only Heap data pages. The pilot was **rejected and restored**: actual
+Heap SeqScan still traverses colocated access pages, and indexed HashJoin was
+consistently slower than no-index HashJoin. Those pilot timings are not used in
+the results below.
+
+Three serial full quick runs of the final restored Phase 73 implementation are
+preserved at
+`/tmp/netbadb-phase73-final-run1.txt`, `final-run2.txt`, and `final-run3.txt`.
+All three commands completed successfully and each report emitted all 93
+Phase 73 scenarios. The following values are therefore medians of restored
+Phase 73 per-run medians rather than measurements from the reverted pilot.
 
 The median of the three per-run medians for the core points was:
 
 | workload | outer | indexed median (ns) | no-index median (ns) | indexed plan | evidence |
 | --- | ---: | ---: | ---: | --- | --- |
-| unique | 1 | 30,083 | 697,916 | IndexJoin | reference is NestedLoop, not Hash |
-| unique | 8 | 140,417 | 661,667 | IndexJoin | Index faster in all 3 runs |
-| unique | 16 | 265,959 | 610,875 | IndexJoin | Index faster in all 3 runs |
-| unique | 32 | 971,833 | 661,833 | HashJoin | both states use Hash; no Index reference |
-| unique | 64 | 1,121,292 | 659,584 | HashJoin | both states use Hash; no Index reference |
-| unique | 128 | 1,316,375 | 666,250 | HashJoin | both states use Hash; no Index reference |
-| unique | 256 | 1,363,417 | 764,875 | HashJoin | both states use Hash; no Index reference |
-| unique | 512 | 1,359,500 | 864,833 | HashJoin | both states use Hash; no Index reference |
-| unique | 1,024 | 1,597,875 | 1,053,333 | HashJoin | both states use Hash; no Index reference |
-| no match | 8 | 99,625 | 664,500 | IndexJoin | Index faster in all 3 runs |
-| no match | 16 | 186,541 | 625,917 | IndexJoin | Index faster in all 3 runs |
-| no match | 32 | 1,122,167 | 668,125 | HashJoin | both states use Hash; no Index reference |
-| no match | 64 | 1,258,375 | 646,375 | HashJoin | both states use Hash; no Index reference |
+| unique | 1 | 29,791 | 628,000 | IndexJoin | reference is NestedLoop, not Hash |
+| unique | 8 | 140,417 | 578,292 | IndexJoin | Index faster in all 3 runs |
+| unique | 16 | 265,791 | 570,750 | IndexJoin | Index faster in all 3 runs |
+| unique | 32 | 967,792 | 597,792 | HashJoin | both states use Hash; no Index reference |
+| unique | 64 | 1,130,458 | 627,542 | HashJoin | both states use Hash; no Index reference |
+| unique | 128 | 1,016,708 | 626,958 | HashJoin | both states use Hash; no Index reference |
+| unique | 256 | 1,057,250 | 630,708 | HashJoin | both states use Hash; no Index reference |
+| unique | 512 | 1,336,959 | 815,584 | HashJoin | both states use Hash; no Index reference |
+| unique | 1,024 | 1,500,250 | 1,084,292 | HashJoin | both states use Hash; no Index reference |
+| no match | 8 | 100,541 | 586,959 | IndexJoin | Index faster in all 3 runs |
+| no match | 16 | 189,542 | 580,042 | IndexJoin | Index faster in all 3 runs |
+| no match | 32 | 578,208 | 510,833 | HashJoin | both states use Hash; no Index reference |
+| no match | 64 | 1,076,792 | 607,250 | HashJoin | both states use Hash; no Index reference |
 
 The largest measured SQL outer with a valid, consistently faster Index
 reference is 16. There is no measured smallest Hash winner: from outer 32 the
 planner selects Hash in both fixture states, and Phase 73 intentionally adds no
 FORCE JOIN mechanism. Direct Heap attribution provides only a proxy: median
-per-probe hit cost was 15,182 ns at 32 probes and 12,243 ns at 64; miss cost was
-7,563/7,198 ns, versus a 489,542 ns projected full scan. That places the direct
-hit/miss crossover around 32–64 probes, but excludes SQL executor work and is
-not promoted to an optimizer threshold.
+per-probe hit cost was 8,328 ns at 32 probes and 8,409 ns at 64; miss cost was
+6,378/6,380 ns, versus a 487,834 ns projected full scan. That places the direct
+hit crossover between 32 and 64 probes and the miss crossover between 64 and
+256 probes, but excludes SQL executor work and is not promoted to an optimizer
+threshold.
 
 Duplicate estimates naturally raise the shared point cost: at outer 8,
-matches 1 and 4 select IndexJoin (three-run medians 141,000 and 345,916 ns),
+matches 1 and 4 select IndexJoin (three-run medians 141,083 and 194,208 ns),
 while matches 16 and 64 select HashJoin. The restored final model also varies
-with inner layout: the final smoke selects Hash/Index/Index/Index for outer 8
-at inner 512/1,024/4,096/16,384, and Hash/Hash/Hash/Index for outer 32. Text/8
-keeps IndexJoin at outer 8 and HashJoin at outer 64. LSM keeps its dynamic hints
-and selects IndexJoin for the 8×512 control.
+with inner layout: all three final runs select Hash/Index/Index/Index for outer
+8 at inner 512/1,024/4,096/16,384, and Hash/Hash/Hash/Index for outer 32. Text/8
+keeps IndexJoin at outer 8 and HashJoin at outer 64 in every final run. LSM keeps
+its dynamic hints and selects IndexJoin for the 8×512 control in every final
+run.
 
 The static Heap-hint calibration decision is **REJECT**. Heap hints were
 `None` before and remain `None`; the generic
@@ -2293,8 +2299,8 @@ earlier even though direct evidence suggests the current 16→32 switch is
 already conservative; a smaller base cannot honestly represent the measured
 fixed probe work. Hit/miss also cannot be separated from join statistics, and
 the paired no-index Hash latency is not a pure indexed-layout Hash reference.
-No magic outer threshold, executor change, runtime replanning, post-calibration
-run, or nanosecond-derived planner constant was added.
+No magic outer threshold, executor change, runtime replanning, or
+nanosecond-derived planner constant was added.
 
 ## CI and compatibility
 
