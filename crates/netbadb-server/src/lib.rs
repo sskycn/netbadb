@@ -12,7 +12,8 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_core::{
-    Database, DatabaseError, DatabaseTransaction, ExecutionResult, QueryResult, TransactionState,
+    Database, DatabaseError, DatabaseTransaction, DdlOutcome, ExecutionResult,
+    PreparedDdlStatement, QueryResult, TransactionState,
 };
 use netbadb_protocol::{
     ClientMessage, MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, ProtocolError,
@@ -190,6 +191,17 @@ impl DatabaseSession {
         result
     }
 
+    fn execute_ddl(
+        &mut self,
+        database: &mut Database,
+        prepared: &PreparedDdlStatement,
+    ) -> Result<DdlOutcome, DatabaseError> {
+        match self.transaction.as_mut() {
+            Some(transaction) => database.execute_ddl_in(transaction, prepared),
+            None => database.execute_ddl(prepared),
+        }
+    }
+
     fn begin(
         &mut self,
         database: &mut Database,
@@ -203,12 +215,12 @@ impl DatabaseSession {
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<(), DatabaseError> {
+    fn commit(&mut self, database: &mut Database) -> Result<(), DatabaseError> {
         let transaction = self
             .transaction
             .as_mut()
             .ok_or(DatabaseError::ExpectedQuery)?;
-        transaction.commit().map_err(DatabaseError::from)?;
+        database.commit_transaction(transaction)?;
         self.transaction = None;
         Ok(())
     }
@@ -329,7 +341,7 @@ impl SessionState {
             ClientMessage::Ping => Ok(vec![ServerMessage::Pong]),
             ClientMessage::Execute { sql } => self.execute(database, &sql),
             ClientMessage::Begin { table_id } => self.begin(database, table_id),
-            ClientMessage::Commit => self.commit(),
+            ClientMessage::Commit => self.commit(database),
             ClientMessage::Rollback => self.rollback(),
             ClientMessage::Analyze { table_id } => {
                 if self.execution.transaction.is_some() {
@@ -401,14 +413,16 @@ impl SessionState {
         Ok(vec![ServerMessage::TransactionStarted])
     }
 
-    fn commit(&mut self) -> Result<Vec<ServerMessage>, SessionFailure> {
+    fn commit(&mut self, database: &mut Database) -> Result<Vec<ServerMessage>, SessionFailure> {
         if self.execution.transaction.is_none() {
             return Err(SessionFailure::fixed(
                 ProtocolErrorCode::NoActiveTransaction,
                 "session has no active transaction to commit",
             ));
         }
-        self.execution.commit().map_err(SessionFailure::Database)?;
+        self.execution
+            .commit(database)
+            .map_err(SessionFailure::Database)?;
         Ok(vec![ServerMessage::TransactionCommitted])
     }
 
@@ -614,7 +628,8 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::InspectionStorageMissing { .. }
         | DatabaseError::InspectionIndexColumnMissing { .. }
         | DatabaseError::InspectionRegistrationOrderOverflow { .. }
-        | DatabaseError::CreateTablesRollback { .. } => ProtocolErrorCode::Database,
+        | DatabaseError::CreateTablesRollback { .. }
+        | DatabaseError::DuplicateIndexName(_) => ProtocolErrorCode::Database,
     }
 }
 

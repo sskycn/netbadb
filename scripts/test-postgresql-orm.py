@@ -8,7 +8,7 @@ import re
 
 import psycopg
 import sqlalchemy
-from sqlalchemy import BigInteger, Boolean, Column, MetaData, Table, Text, delete, insert
+from sqlalchemy import BigInteger, Boolean, Column, Index, MetaData, Table, Text, delete, insert
 from sqlalchemy import inspect, select, update
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.orm import Session, registry
@@ -204,6 +204,19 @@ def sqlalchemy_smoke(dsn: str) -> None:
 
     with engine.begin() as connection:
         connection.execute(update(users).where(users.c.id == 1).values(name="Ada"))
+
+    created_index = Index("users_id_round6_idx", users.c.id)
+    with second_engine.connect() as existing_observer:
+        created_index.create(engine)
+        created = {
+            index["name"]: (tuple(index["column_names"]), index["unique"])
+            for index in inspect(engine).get_indexes("users")
+        }
+        assert created["users_id_round6_idx"] == (("id",), False)
+        assert "users_id_round6_idx" in {
+            index["name"] for index in inspect(existing_observer).get_indexes("users")
+        }
+    second_engine.dispose()
     engine.dispose()
 
 

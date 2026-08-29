@@ -8,8 +8,8 @@ use std::fmt::{self, Write};
 
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
-    AccessPathId, ColumnId, ParameterId, PartitionId, RelationBindingId, ScalarValue, SemanticType,
-    TableId,
+    AccessPathId, ColumnId, IndexName, ParameterId, PartitionId, RelationBindingId, ScalarValue,
+    SemanticType, TableId,
 };
 
 /// One declaration-ordered snapshot of the visible canonical catalog.
@@ -67,6 +67,8 @@ pub struct IndexInspection {
     /// `(table_id, column_id)`; physical B+Tree page handles are deliberately
     /// excluded from this observation boundary.
     pub table_id: TableId,
+    /// Durable logical name, absent only for legacy pre-DDL registry entries.
+    pub name: Option<IndexName>,
     pub column_id: ColumnId,
     pub column_name: String,
     pub kind: IndexKindInspection,

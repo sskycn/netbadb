@@ -150,6 +150,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
         table_statistics: None,
         entries: vec![IndexCatalogEntry {
             definition: IndexDefinition {
+                name: None,
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
                     meta_page: PageId(3),
@@ -171,6 +172,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
             }),
             entries: vec![IndexCatalogEntry {
                 definition: IndexDefinition {
+                    name: None,
                     column_id: ColumnId(1),
                     handle: BTreeHandle {
                         meta_page: PageId(3),

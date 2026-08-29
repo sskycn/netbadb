@@ -7,10 +7,10 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
-use netbadb_types::{ColumnId, PageId, PhysicalType, RowId, ScalarValue, SemanticType};
+use netbadb_types::{ColumnId, IndexName, PageId, PhysicalType, RowId, ScalarValue, SemanticType};
 
 pub const BTREE_FORMAT_VERSION: u16 = 1;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 2;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 3;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -20,7 +20,8 @@ const ROW_ID_SIZE: usize = 8 + 2 + 4;
 const MIN_ENTRY_SIZE: usize = 1 + ROW_ID_SIZE;
 const INDEX_CATALOG_MAGIC: &[u8; 4] = b"NBIC";
 const INDEX_CATALOG_HEADER_SIZE: usize = 48;
-const INDEX_CATALOG_ENTRY_SIZE: usize = 40;
+const INDEX_CATALOG_ENTRY_HEADER_SIZE: usize = 40;
+const LEGACY_INDEX_CATALOG_FORMAT_VERSION: u16 = 2;
 
 /// Persistent physical/nominal key identity and NULL acceptance for one tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,8 @@ pub struct BTreeHandle {
 /// Persistent single-column registered-index identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDefinition {
+    /// Durable user-visible logical name. Legacy pre-v3 entries are unnamed.
+    pub name: Option<IndexName>,
     pub column_id: ColumnId,
     pub handle: BTreeHandle,
 }
@@ -84,8 +87,8 @@ pub struct IndexCatalogEntry {
 
 /// One append-only page in the persistent index registry chain.
 ///
-/// The version-2 `NBIC` payload uses a fixed-width little-endian header and
-/// fixed-width entries. Storage validates root/continuation-page invariants.
+/// The version-3 `NBIC` payload uses a fixed-width little-endian header and
+/// entry prefixes plus bounded optional names. Storage validates chain rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
     pub next_catalog: Option<PageId>,
@@ -163,6 +166,8 @@ pub enum IndexError {
     InvalidNullable(u8),
     InvalidSemanticNamePresence(u8),
     InvalidStatisticsPresence(u8),
+    InvalidIndexNamePresence(u8),
+    InvalidIndexName,
     InvalidValueTag(u8),
     InvalidBoolean(u8),
     InvalidUtf8,
@@ -205,6 +210,9 @@ pub enum IndexError {
     },
     IndexAlreadyExists {
         column_id: ColumnId,
+    },
+    IndexNameAlreadyExists {
+        name: IndexName,
     },
     UnknownIndexColumn {
         column_id: ColumnId,
@@ -265,6 +273,10 @@ impl fmt::Display for IndexError {
             Self::InvalidStatisticsPresence(value) => {
                 write!(formatter, "invalid statistics presence flag {value}")
             }
+            Self::InvalidIndexNamePresence(value) => {
+                write!(formatter, "invalid index-name presence flag {value}")
+            }
+            Self::InvalidIndexName => formatter.write_str("invalid persistent index name"),
             Self::InvalidValueTag(tag) => write!(formatter, "invalid index value tag {tag}"),
             Self::InvalidBoolean(value) => write!(formatter, "invalid index boolean {value}"),
             Self::InvalidUtf8 => formatter.write_str("B+Tree text is not valid UTF-8"),
@@ -325,6 +337,9 @@ impl fmt::Display for IndexError {
                     "column {} already has a registered index",
                     column_id.0
                 )
+            }
+            Self::IndexNameAlreadyExists { name } => {
+                write!(formatter, "index name `{name}` already exists")
             }
             Self::UnknownIndexColumn { column_id } => {
                 write!(
@@ -892,7 +907,7 @@ pub fn merge_internals_if_fits(
     Ok((payload.len() <= capacity).then_some(merged))
 }
 
-/// Encodes one explicit version-2 append-only index catalog page payload.
+/// Encodes one explicit version-3 append-only index catalog page payload.
 pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
     if let Some(next) = node.next_catalog {
         validate_child(next)?;
@@ -913,14 +928,22 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     }
     validate_catalog_entries(&node.entries)?;
     let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
-    let capacity = INDEX_CATALOG_HEADER_SIZE
-        .checked_add(
-            node.entries
-                .len()
-                .checked_mul(INDEX_CATALOG_ENTRY_SIZE)
-                .ok_or(IndexError::LengthOverflow)?,
-        )
-        .ok_or(IndexError::LengthOverflow)?;
+    let capacity = node
+        .entries
+        .iter()
+        .try_fold(INDEX_CATALOG_HEADER_SIZE, |size, entry| {
+            size.checked_add(INDEX_CATALOG_ENTRY_HEADER_SIZE)
+                .and_then(|size| {
+                    size.checked_add(
+                        entry
+                            .definition
+                            .name
+                            .as_ref()
+                            .map_or(0, |name| name.as_str().len()),
+                    )
+                })
+                .ok_or(IndexError::LengthOverflow)
+        })?;
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(INDEX_CATALOG_MAGIC);
     output.extend_from_slice(&INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
@@ -939,7 +962,16 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     for entry in &node.entries {
         output.extend_from_slice(&entry.definition.column_id.0.to_le_bytes());
         output.push(u8::from(entry.statistics.is_some()));
-        output.extend_from_slice(&[0; 3]);
+        output.push(u8::from(entry.definition.name.is_some()));
+        let name_length = u16::try_from(
+            entry
+                .definition
+                .name
+                .as_ref()
+                .map_or(0, |name| name.as_str().len()),
+        )
+        .map_err(|_| IndexError::LengthOverflow)?;
+        output.extend_from_slice(&name_length.to_le_bytes());
         output.extend_from_slice(&entry.definition.handle.meta_page.0.to_le_bytes());
         let statistics = entry.statistics.unwrap_or(IndexStatistics {
             distinct_non_null_keys: 0,
@@ -950,11 +982,14 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         output.extend_from_slice(&statistics.null_count.to_le_bytes());
         output.extend_from_slice(&statistics.tree_height.to_le_bytes());
         output.extend_from_slice(&0_u32.to_le_bytes());
+        if let Some(name) = &entry.definition.name {
+            output.extend_from_slice(name.as_str().as_bytes());
+        }
     }
     Ok(output)
 }
 
-/// Decodes and validates one bounded version-2 index catalog page payload.
+/// Decodes legacy version-2 or current version-3 index catalog payloads.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -966,7 +1001,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         });
     }
     let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
-    if version != INDEX_CATALOG_FORMAT_VERSION {
+    if version != LEGACY_INDEX_CATALOG_FORMAT_VERSION && version != INDEX_CATALOG_FORMAT_VERSION {
         return Err(IndexError::UnsupportedVersion(version));
     }
     let table_statistics_present = decode_statistics_presence(input[6])?;
@@ -983,18 +1018,10 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
             .try_into()
             .map_err(|_| IndexError::Truncated)?,
     ) as usize;
-    let expected = INDEX_CATALOG_HEADER_SIZE
-        .checked_add(
-            count
-                .checked_mul(INDEX_CATALOG_ENTRY_SIZE)
-                .ok_or(IndexError::LengthOverflow)?,
-        )
-        .ok_or(IndexError::LengthOverflow)?;
-    if input.len() < expected {
+    let maximum_entries =
+        input.len().saturating_sub(INDEX_CATALOG_HEADER_SIZE) / INDEX_CATALOG_ENTRY_HEADER_SIZE;
+    if count > maximum_entries {
         return Err(IndexError::Truncated);
-    }
-    if input.len() != expected {
-        return Err(IndexError::ExtraBytes);
     }
     let raw_table_statistics = TableStatistics {
         row_count: u64::from_le_bytes(
@@ -1018,13 +1045,32 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         None
     };
     let mut entries = Vec::with_capacity(count);
-    for chunk in input[INDEX_CATALOG_HEADER_SIZE..].chunks_exact(INDEX_CATALOG_ENTRY_SIZE) {
+    let mut offset = INDEX_CATALOG_HEADER_SIZE;
+    for _ in 0..count {
+        let end = offset
+            .checked_add(INDEX_CATALOG_ENTRY_HEADER_SIZE)
+            .ok_or(IndexError::LengthOverflow)?;
+        let chunk = input.get(offset..end).ok_or(IndexError::Truncated)?;
         let column_id = ColumnId(u32::from_le_bytes(
             chunk[..4].try_into().map_err(|_| IndexError::Truncated)?,
         ));
         let statistics_present = decode_statistics_presence(chunk[4])?;
-        if chunk[5..8].iter().any(|byte| *byte != 0) || chunk[36..40].iter().any(|byte| *byte != 0)
-        {
+        let (name_present, name_length) = if version == LEGACY_INDEX_CATALOG_FORMAT_VERSION {
+            if chunk[5..8].iter().any(|byte| *byte != 0) {
+                return Err(IndexError::InvalidReservedBytes);
+            }
+            (false, 0_usize)
+        } else {
+            let present = decode_index_name_presence(chunk[5])?;
+            let length = usize::from(u16::from_le_bytes(
+                chunk[6..8].try_into().map_err(|_| IndexError::Truncated)?,
+            ));
+            if present != (length != 0) {
+                return Err(IndexError::InvalidIndexName);
+            }
+            (present, length)
+        };
+        if chunk[36..40].iter().any(|byte| *byte != 0) {
             return Err(IndexError::InvalidReservedBytes);
         }
         let meta_page = PageId(u64::from_le_bytes(
@@ -1063,13 +1109,29 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
             }
             None
         };
+        offset = end;
+        let name = if name_present {
+            let name_end = offset
+                .checked_add(name_length)
+                .ok_or(IndexError::LengthOverflow)?;
+            let bytes = input.get(offset..name_end).ok_or(IndexError::Truncated)?;
+            let value = std::str::from_utf8(bytes).map_err(|_| IndexError::InvalidUtf8)?;
+            offset = name_end;
+            Some(IndexName::new(value).map_err(|_| IndexError::InvalidIndexName)?)
+        } else {
+            None
+        };
         entries.push(IndexCatalogEntry {
             definition: IndexDefinition {
+                name,
                 column_id,
                 handle: BTreeHandle { meta_page },
             },
             statistics,
         });
+    }
+    if offset != input.len() {
+        return Err(IndexError::ExtraBytes);
     }
     validate_catalog_entries(&entries)?;
     Ok(IndexCatalogNode {
@@ -1077,6 +1139,14 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         table_statistics,
         entries,
     })
+}
+
+fn decode_index_name_presence(value: u8) -> Result<bool, IndexError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(IndexError::InvalidIndexNamePresence(other)),
+    }
 }
 
 fn decode_statistics_presence(value: u8) -> Result<bool, IndexError> {
@@ -1147,6 +1217,14 @@ fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), IndexEr
             return Err(IndexError::DuplicateRegisteredColumn {
                 column_id: entry.definition.column_id,
             });
+        }
+        if let Some(name) = &entry.definition.name {
+            if entries[..position]
+                .iter()
+                .any(|existing| existing.definition.name.as_ref() == Some(name))
+            {
+                return Err(IndexError::IndexNameAlreadyExists { name: name.clone() });
+            }
         }
     }
     Ok(())
@@ -1693,6 +1771,7 @@ mod tests {
             }),
             entries: vec![IndexCatalogEntry {
                 definition: IndexDefinition {
+                    name: None,
                     column_id: ColumnId(7),
                     handle: BTreeHandle {
                         meta_page: PageId(11),
@@ -1707,6 +1786,33 @@ mod tests {
         };
         let bytes = encode_index_catalog(&node).unwrap();
         assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        let mut legacy = bytes.clone();
+        legacy[4..6].copy_from_slice(&LEGACY_INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
+        assert_eq!(decode_index_catalog(&legacy).unwrap(), node);
+        let mut named = node.clone();
+        named.entries[0].definition.name = Some(IndexName::new("users_name_idx").unwrap());
+        let named_bytes = encode_index_catalog(&named).unwrap();
+        let named_golden = [
+            b"NBIC".as_slice(),
+            &[3, 0, 1, 0],
+            &[9, 0, 0, 0, 0, 0, 0, 0],
+            &[1, 0, 0, 0],
+            &[0, 0, 0, 0],
+            &[10, 0, 0, 0, 0, 0, 0, 0],
+            &[4, 0, 0, 0, 0, 0, 0, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+            &[7, 0, 0, 0],
+            &[1, 1, 14, 0],
+            &[11, 0, 0, 0, 0, 0, 0, 0],
+            &[8, 0, 0, 0, 0, 0, 0, 0],
+            &[2, 0, 0, 0, 0, 0, 0, 0],
+            &[2, 0, 0, 0],
+            &[0, 0, 0, 0],
+            b"users_name_idx".as_slice(),
+        ]
+        .concat();
+        assert_eq!(named_bytes, named_golden);
+        assert_eq!(decode_index_catalog(&named_bytes).unwrap(), named);
         for end in 0..bytes.len() {
             assert!(decode_index_catalog(&bytes[..end]).is_err());
         }
@@ -1768,10 +1874,32 @@ mod tests {
             Err(IndexError::InvalidStatisticsPresence(3))
         );
         let mut entry_reserved = bytes.clone();
-        entry_reserved[53] = 1;
+        entry_reserved[84] = 1;
         assert_eq!(
             decode_index_catalog(&entry_reserved),
             Err(IndexError::InvalidReservedBytes)
+        );
+        let mut invalid_name_flag = bytes.clone();
+        invalid_name_flag[53] = 2;
+        assert_eq!(
+            decode_index_catalog(&invalid_name_flag),
+            Err(IndexError::InvalidIndexNamePresence(2))
+        );
+        let mut invalid_name_utf8 = named_bytes.clone();
+        *invalid_name_utf8.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_index_catalog(&invalid_name_utf8),
+            Err(IndexError::InvalidUtf8)
+        );
+        let mut oversized_name = named_bytes.clone();
+        oversized_name[54..56].copy_from_slice(&256_u16.to_le_bytes());
+        oversized_name.resize(
+            INDEX_CATALOG_HEADER_SIZE + INDEX_CATALOG_ENTRY_HEADER_SIZE + 256,
+            b'x',
+        );
+        assert_eq!(
+            decode_index_catalog(&oversized_name),
+            Err(IndexError::InvalidIndexName)
         );
         let mut zero_managed_pages = bytes.clone();
         zero_managed_pages[32..40].fill(0);

@@ -1,7 +1,8 @@
 # Experimental PostgreSQL wire compatibility
 
-Round 5 adds psql 17.11 `\d`, `\dt`, and `\di` reflection on top of real
-secondary-index reflection and the Alembic read-only existing-schema profile.
+Round 6 adds the first mutable DDL slice: transactional, durable `CREATE INDEX`
+for one non-unique Heap BTree column. It is exercised by psql, SQLAlchemy
+`Index.create()`, and a guarded Alembic add-index operation.
 The feature remains experimental: it is a real path through NetbaDB's compiler, Canonical
 Schema, index registry, and storage engine, not a claim of complete PostgreSQL
 dialect, catalog, or migration compatibility.
@@ -77,8 +78,9 @@ SQLAlchemy / psycopg Extended Query     psql Simple Query
 Classification uses relation, selected capability, function, and predicate
 markers after whitespace/case normalization. It does not compare a complete SQL
 string, depend on whitespace, or return hard-coded table rows. Ordinary user
-SQL never enters this evaluator. The snapshot is derived once per session from
-the Core inspection DTO and contains stable table/column identity, physical
+SQL never enters this evaluator. Before metadata evaluation, the snapshot is
+refreshed when Core's catalog generation changes, so committed DDL is visible
+to existing connections. It is derived from the Core inspection DTO and contains stable table/column identity, physical
 types, nullability, primary keys, and real registered index definitions. The
 index DTO exposes `(TableId, ColumnId)` logical identity, single-column order,
 `BTree` kind, and `unique=false`; it excludes BTreeHandle, PageId, storage kind,
@@ -148,6 +150,32 @@ SHA-256 digests cover canonical table identity and logical index identity;
 candidates share one collision set and use deterministic linear probing.
 Compatibility index names use a sanitized readable table/column prefix plus a
 12-hex digest suffix, remain at most 63 ASCII bytes, and are collision checked.
+Explicit CREATE INDEX names are durable generic metadata and are reflected
+verbatim; synthetic names remain only for legacy unnamed registry entries.
+
+## Mutable index DDL profile
+
+Supported syntax is `CREATE INDEX [IF NOT EXISTS] name ON [public.]table
+(column)`. It creates one non-unique BTree on an existing non-partitioned Heap
+table. Resolution produces frontend-neutral typed DDL with `IndexName`,
+`TableId`, and `ColumnId`; the PostgreSQL adapter never manipulates pages,
+BTree handles, or catalog bytes. Tree creation, existing-row backfill, named
+IndexCatalog registration, and commit share one existing WAL transaction. The
+backfill validates all persisted row fields while retaining keys from at most
+one Heap page before inserting them into the tree.
+
+Explicit `BEGIN`/`COMMIT` and `ROLLBACK` are supported. Planner and inspection
+state is published only after durable commit. Later INSERT/UPDATE/DELETE uses
+the ordinary registered-index maintenance path, and prepared queries plan
+against the current access-path snapshot at execution.
+
+Unique, composite, partial, expression, INCLUDE, non-BTree, and concurrent
+forms return `0A000`. Quoted identifiers are not part of the current generic
+SQL identifier grammar and fail closed rather than being partially parsed;
+missing tables and columns retain `42P01` and `42703`.
+LSM and partitioned-table secondary-index DDL is unsupported. `DROP INDEX`
+remains `0A000`: the registry is append-only and BTree page reclamation has no
+safe removal lifecycle, so hiding reflection would be a false drop.
 The same Canonical Schema/index registry therefore produces the same names and
 OIDs across queries, connections, and restarts. They are not persisted or
 stable across schema/index changes and remain private to the adapter.

@@ -57,6 +57,7 @@ pub(crate) fn catalog(
             )?;
             indexes.push(IndexInspection {
                 table_id: table.id,
+                name: definition.name.clone(),
                 column_id: definition.column_id,
                 column_name: column.name.clone(),
                 kind: IndexKindInspection::BTree,

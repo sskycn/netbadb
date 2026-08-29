@@ -275,12 +275,14 @@ Experimental PostgreSQL wire mode is documented in
 [`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
 `netbadbd --manifest server.json --postgres` to use the manifest's listen
 address as a loopback PostgreSQL endpoint. This experimental profile is not a
-claim of general PostgreSQL compatibility. Round 5 adds real psql 17.11
-`\d`, `\dt`, and `\di` support, including schema/name patterns, on top of the
+claim of general PostgreSQL compatibility. Round 6 adds transactional
+single-column non-unique Heap BTree `CREATE INDEX` through psql, SQLAlchemy,
+and guarded Alembic add-index apply. This builds on Round 5's psql 17.11 `\d`,
+`\dt`, and `\di` support, including schema/name patterns, and the
 psycopg 3 and SQLAlchemy 2 Core/ORM profile. The PostgreSQL adapter consumes
-stable read-only Core metadata, synthesizes deterministic compatibility names/OIDs, and supports
-Alembic schema introspection plus read-only autogenerate comparison. Migration
-execution, PostgreSQL DDL, a complete `pg_catalog` or `information_schema`,
+stable Core metadata, preserves explicit durable index names while synthesizing
+legacy names/OIDs, and supports index-only Alembic add migration. `DROP INDEX`,
+table DDL, general migration execution, a complete `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
@@ -324,9 +326,9 @@ the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
-IndexCatalog payload version 2 stores optional table and per-index optimizer
-statistics in explicit fixed-width little-endian fields. Version 1 is rejected
-without migration. These values are snapshots created only by explicit
+IndexCatalog payload version 3 adds a bounded durable logical index name to the
+version-2 optimizer fields. The decoder retains version 2 as legacy unnamed
+metadata; version 1 is rejected without migration. Statistics remain snapshots created only by explicit
 `ANALYZE`; ordinary DML deliberately does not update or invalidate them.
 
 Each database uses two alternating WAL slots named `<database>-wal` and

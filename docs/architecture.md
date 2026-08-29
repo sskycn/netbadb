@@ -1761,18 +1761,20 @@ reclamation. Uniqueness, SQL index DDL, and range lookup remain deferred.
 ## Persistent index registry
 
 Heap metadata v4 points to a fixed `IndexCatalog` root. Catalog pages are
-ordinary checksummed Page v5 single-payload pages containing version-2 `NBIC`
-payloads; v1 is rejected without migration. They form an append-only,
+ordinary checksummed Page v5 single-payload pages containing version-3 `NBIC`
+payloads. The decoder retains version 2 for legacy unnamed entries; v1 is
+rejected without migration. They form an append-only,
 cycle-checked linked chain in creation order. Overflow logs the new catalog
 page before the old tail link, flushes through both records before extending
 the file, and therefore follows the existing reverse-order rollback contract.
 
-The v2 payload is fixed-width and little-endian:
+The v3 payload keeps the v2 header and fixed entry prefix little-endian, then
+appends the bounded UTF-8 logical name when present:
 
 ```text
 header (48 bytes)
 0..4    NBIC magic
-4..6    u16 version (2)
+4..6    u16 version (3; decoder also accepts legacy 2)
 6       u8 table-statistics presence (0 or 1)
 7       reserved zero
 8..16   u64 next catalog PageId (0 means none)
@@ -1782,15 +1784,17 @@ header (48 bytes)
 32..40  u64 managed_page_count (zero when absent)
 40..48  reserved zero
 
-entry (40 bytes)
+entry prefix (40 bytes)
 0..4    u32 ColumnId
 4       u8 index-statistics presence (0 or 1)
-5..8    reserved zero
+5       u8 logical-name presence (0 or 1)
+6..8    u16 logical-name byte length
 8..16   u64 BTree metadata PageId
 16..24  u64 distinct_non_null_keys (zero when absent)
 24..32  u64 null_count (zero when absent)
 32..36  u32 tree_height (zero when absent)
 36..40  reserved zero
+40..    logical-name UTF-8 bytes when present (maximum 255)
 ```
 
 Only the root may contain table statistics. Index statistics on any page
@@ -1799,7 +1803,9 @@ count at most row count, a valid distinct count for the non-NULL population,
 and tree height at least one. It deliberately does not compare a persisted
 snapshot with current rows or current tree height.
 
-Phase 4F changed only IndexCatalog v1 to v2. The later MVCC phase changes Heap
+Round 6 changes only IndexCatalog v2 to v3 to persist explicit generic index
+names. Legacy v2 entries decode with no name and continue to receive stable
+synthetic PostgreSQL reflection names. The later MVCC phase changes Heap
 metadata to v4 and tuple payloads to `NBMV` v1; Canonical Schema v1, Page v5,
 BTree payload v1, WAL v3, and WAL record v2 remain unchanged.
 
@@ -1813,10 +1819,13 @@ optimizer snapshots are cached in persistent creation order. BTree roots
 remain uncached; analyzed height is a snapshot, not authoritative metadata.
 
 `HeapStorage::create_index` owns one transaction and single-writer lease. It
-creates the tree, materializes the current live heap rows, backfills every
-typed `(value, RowId)` entry, and writes the catalog registration as the final
-logical mutation. Only a successful durable commit updates the in-memory
+creates the tree, walks the stable read view page by page, buffers at most one
+Heap page of typed `(value, RowId)` entries, and writes the catalog registration
+as the final logical mutation. Only a successful durable commit updates the in-memory
 registry, so crashes or errors before commit leave no visible partial index.
+Generic named CREATE INDEX uses the same build. Inside an explicit database
+transaction, Core publishes planner and inspection caches only after durable
+commit; rollback leaves no visible registration.
 For every physical Heap version that has not been vacuumed and every registered
 index, one candidate entry `(version[column], version RowId)` exists. Raw
 B+Trees are outside this invariant. INSERT and UPDATE publish a new Heap version

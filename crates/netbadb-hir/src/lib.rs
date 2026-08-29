@@ -7,15 +7,25 @@ use std::fmt;
 use netbadb_parser::{
     AggregateArgument as AstAggregateArgument, AggregateCall as AstAggregateCall,
     AggregateFunction as AstAggregateFunction, BinaryOp as AstBinaryOp, ColumnName,
-    Expr as AstExpr, FromItem, Ident, Literal, NullOrder as AstNullOrder, Query,
-    SortDirection as AstSortDirection, Span, SqlTypeName as AstSqlTypeName,
-    Statement as AstStatement, UnaryOp as AstUnaryOp,
+    CreateIndexStatement as AstCreateIndexStatement, Expr as AstExpr, FromItem, Ident, Literal,
+    NullOrder as AstNullOrder, Query, SortDirection as AstSortDirection, Span,
+    SqlTypeName as AstSqlTypeName, Statement as AstStatement, UnaryOp as AstUnaryOp,
 };
 use netbadb_schema::{Schema, TableDef};
 use netbadb_types::{
-    ColumnId, ExprType, ParameterId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
-    TableId,
+    ColumnId, ExprType, IndexName, ParameterId, PhysicalType, RelationBindingId, ScalarValue,
+    SemanticType, TableId,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCreateIndex {
+    pub name: IndexName,
+    pub table_id: TableId,
+    pub table_name: String,
+    pub column_id: ColumnId,
+    pub column_name: String,
+    pub if_not_exists: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
@@ -224,6 +234,10 @@ pub struct TypedDelete {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HirError {
+    InvalidIndexDefinition {
+        message: &'static str,
+        span: Span,
+    },
     UnknownTable {
         name: String,
         span: Span,
@@ -317,7 +331,8 @@ impl HirError {
     #[must_use]
     pub const fn span(&self) -> Span {
         match self {
-            Self::UnknownTable { span, .. }
+            Self::InvalidIndexDefinition { span, .. }
+            | Self::UnknownTable { span, .. }
             | Self::UnknownColumn { span, .. }
             | Self::UnknownRelationQualifier { span, .. }
             | Self::DuplicateRelationName { span, .. }
@@ -345,6 +360,7 @@ impl HirError {
 impl fmt::Display for HirError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidIndexDefinition { message, .. } => formatter.write_str(message),
             Self::UnknownTable { name, .. } => write!(formatter, "unknown table `{name}`"),
             Self::UnknownColumn { table, name, .. } => {
                 write!(formatter, "unknown column `{table}.{name}`")
@@ -540,8 +556,63 @@ pub fn lower_statement_with_parameters(
         AstStatement::Delete(delete) => {
             lower_delete(schema, delete, &mut parameters).map(TypedStatement::Delete)
         }
+        AstStatement::CreateIndex(create) => {
+            return Err(HirError::InvalidIndexDefinition {
+                message: "CREATE INDEX requires the schema-mutation compiler boundary",
+                span: create.span,
+            });
+        }
     }?;
     Ok((statement, parameters.finish()?))
+}
+
+pub fn lower_create_index(
+    schema: &Schema,
+    statement: &AstCreateIndexStatement,
+) -> Result<TypedCreateIndex, HirError> {
+    if statement
+        .table
+        .qualifier
+        .as_ref()
+        .is_some_and(|schema| schema.name != "public")
+    {
+        return Err(HirError::UnknownTable {
+            name: format!(
+                "{}.{}",
+                statement
+                    .table
+                    .qualifier
+                    .as_ref()
+                    .map_or("", |value| value.name.as_str()),
+                statement.table.name.name
+            ),
+            span: statement.table.span,
+        });
+    }
+    let table = resolve_table(schema, &statement.table.name)?;
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name == statement.column.name)
+        .ok_or_else(|| HirError::UnknownColumn {
+            table: table.name.clone(),
+            name: statement.column.name.clone(),
+            span: statement.column.span,
+        })?;
+    let name = IndexName::new(statement.name.name.clone()).map_err(|_| {
+        HirError::InvalidIndexDefinition {
+            message: "index name is empty or exceeds the generic identifier bound",
+            span: statement.name.span,
+        }
+    })?;
+    Ok(TypedCreateIndex {
+        name,
+        table_id: table.id,
+        table_name: table.name.clone(),
+        column_id: column.id,
+        column_name: column.name.clone(),
+        if_not_exists: statement.if_not_exists,
+    })
 }
 
 pub fn lower_query(schema: &Schema, query: &Query) -> Result<TypedQuery, HirError> {

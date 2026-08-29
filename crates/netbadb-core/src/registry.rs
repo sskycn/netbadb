@@ -3,7 +3,9 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_storage::TableStorage;
-use netbadb_types::{ColumnId, PartitionId, PhysicalType, ScalarValue, StorageId, TableId};
+use netbadb_types::{
+    ColumnId, IndexName, PartitionId, PhysicalType, ScalarValue, StorageId, TableId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RangePartitionBinding {
@@ -168,6 +170,7 @@ impl StorageRegistry {
 
     pub(crate) fn new(entries: Vec<StorageRegistryEntry>) -> Result<Self, StorageRegistryError> {
         let mut ids = BTreeSet::new();
+        let mut index_names = BTreeSet::new();
         for entry in &entries {
             if entry.id != entry.storage.storage_id() {
                 return Err(StorageRegistryError::RegistryStorageIdentityMismatch {
@@ -179,6 +182,15 @@ impl StorageRegistry {
                 return Err(StorageRegistryError::DuplicateStorageId {
                     storage_id: entry.id,
                 });
+            }
+            for definition in entry.storage.indexes() {
+                if let Some(name) = &definition.name {
+                    if !index_names.insert(name.clone()) {
+                        return Err(StorageRegistryError::DuplicateIndexName {
+                            name: name.clone(),
+                        });
+                    }
+                }
             }
         }
         Ok(Self { entries })
@@ -217,6 +229,9 @@ impl StorageRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRegistryError {
+    DuplicateIndexName {
+        name: IndexName,
+    },
     UnknownStorageId {
         storage_id: StorageId,
     },
@@ -254,6 +269,12 @@ pub enum StorageRegistryError {
 impl fmt::Display for StorageRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DuplicateIndexName { name } => {
+                write!(
+                    formatter,
+                    "index name `{name}` is registered more than once"
+                )
+            }
             Self::UnknownStorageId { storage_id } => write!(
                 formatter,
                 "physical storage {} is not registered",

@@ -8,9 +8,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use netbadb_core::{
-    Database, DatabaseError, DatabaseErrorKind, ExecutionResult, IndexKindInspection,
-    PreparedStatement as CorePrepared, QueryResult, StatementAccess, StatementDescription,
-    TablePlacementInspection,
+    Database, DatabaseError, DatabaseErrorKind, DdlOutcome, ExecutionResult, IndexKindInspection,
+    PreparedDdlStatement as CorePreparedDdl, PreparedStatement as CorePrepared, QueryResult,
+    StatementAccess, StatementDescription, TablePlacementInspection,
 };
 use netbadb_pgwire::{
     BackendMessage, CloseTarget, DescribeTarget, ErrorResponse, FieldDescription, FormatCode,
@@ -600,6 +600,7 @@ struct PreparedStatement {
 #[derive(Clone)]
 enum PreparedExecution {
     Core(Box<CorePrepared>),
+    Ddl(Box<CorePreparedDdl>),
     Compatibility(CompatibilityStatement),
 }
 
@@ -716,6 +717,12 @@ impl PgCompatibilityCatalog {
         let inspected = database.inspect_catalog()?;
         let mut identities = Vec::new();
         let mut index_name_inputs = Vec::new();
+        let explicit_index_names = inspected
+            .tables
+            .iter()
+            .flat_map(|table| &table.indexes)
+            .filter_map(|index| index.name.as_ref().map(|name| name.as_str().to_owned()))
+            .collect::<HashSet<_>>();
         for table in &inspected.tables {
             let mut table_hash = Sha256::new();
             table_hash.update(b"netbadb-pg-table-object-oid-v2");
@@ -741,17 +748,20 @@ impl PgCompatibilityCatalog {
                     column_id: index.column_id,
                 };
                 identities.push((key, digest));
-                index_name_inputs.push((
-                    key,
-                    table.name.as_str(),
-                    index.column_name.as_str(),
-                    digest,
-                ));
+                if index.name.is_none() {
+                    index_name_inputs.push((
+                        key,
+                        table.name.as_str(),
+                        index.column_name.as_str(),
+                        digest,
+                    ));
+                }
             }
         }
         identities.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
         let object_oids = assign_synthetic_oids(&identities, SYNTHETIC_OID_BASE);
-        let index_names = assign_compatibility_index_names(&index_name_inputs);
+        let index_names =
+            assign_compatibility_index_names_avoiding(&index_name_inputs, explicit_index_names);
         let tables = inspected
             .tables
             .into_iter()
@@ -784,7 +794,10 @@ impl PgCompatibilityCatalog {
                             })?;
                         Ok(PgCatalogIndex {
                             oid: object_oids[&key],
-                            name: index_names[&key].clone(),
+                            name: index.name.as_ref().map_or_else(
+                                || index_names[&key].clone(),
+                                |name| name.as_str().to_owned(),
+                            ),
                             column_id: index.column_id,
                             column_name: index.column_name.clone(),
                             column_physical: column.physical,
@@ -839,13 +852,20 @@ fn assign_synthetic_oids(
     assigned
 }
 
+#[cfg(test)]
 fn assign_compatibility_index_names(
     inputs: &[(PgCatalogObjectKey, &str, &str, [u8; 32])],
+) -> HashMap<PgCatalogObjectKey, String> {
+    assign_compatibility_index_names_avoiding(inputs, HashSet::new())
+}
+
+fn assign_compatibility_index_names_avoiding(
+    inputs: &[(PgCatalogObjectKey, &str, &str, [u8; 32])],
+    mut used: HashSet<String>,
 ) -> HashMap<PgCatalogObjectKey, String> {
     let mut inputs = inputs.to_vec();
     inputs.sort_by(|left, right| left.3.cmp(&right.3).then(left.0.cmp(&right.0)));
     let mut assigned = HashMap::with_capacity(inputs.len());
-    let mut used = HashSet::with_capacity(inputs.len());
     for (object, table_name, column_name, digest) in inputs {
         let readable = sanitized_index_name_prefix(table_name, column_name);
         let hash_suffix = digest[..6]
@@ -924,6 +944,7 @@ struct PgWorkerSession {
     mutation_generation: u64,
     savepoints: Vec<ReadOnlySavepoint>,
     catalog: PgCompatibilityCatalog,
+    catalog_generation: u64,
     trace_enabled: bool,
 }
 
@@ -974,6 +995,7 @@ impl PgWorkerSession {
                 mutation_generation: 0,
                 savepoints: Vec::new(),
                 catalog: PgCompatibilityCatalog::derive(database)?,
+                catalog_generation: database.catalog_generation(),
                 trace_enabled,
             },
             messages,
@@ -1133,11 +1155,40 @@ impl PgWorkerSession {
                 "prepared statement session limit reached",
             ));
         }
-        if is_index_ddl(&normalize_sql(&query)) {
-            return self.extended_error(fixed_error(
-                "0A000",
-                "PostgreSQL index DDL is unsupported; use the native index API",
-            ));
+        let normalized = normalize_sql(&query);
+        if is_index_ddl(&normalized) {
+            if !normalized.starts_with("create index ") {
+                return self.extended_error(unsupported_index_ddl());
+            }
+            let prepared = match database.prepare_ddl_statement(&query) {
+                Ok(prepared) => prepared,
+                Err(error) => return self.extended_error(map_create_index_error(&error)),
+            };
+            if !parameter_types.is_empty() {
+                return self.extended_error(fixed_error(
+                    "08P01",
+                    "CREATE INDEX does not accept bind parameters",
+                ));
+            }
+            if statement.is_empty() {
+                self.prepared.remove("");
+                self.portals
+                    .retain(|_, portal| !portal.statement.is_empty());
+            }
+            self.prepared.insert(
+                statement,
+                PreparedStatement {
+                    sql: query,
+                    execution: PreparedExecution::Ddl(Box::new(prepared)),
+                    parameters: Vec::new(),
+                    fields: Vec::new(),
+                    is_query: false,
+                },
+            );
+            return vec![BackendMessage::ParseComplete];
+        }
+        if is_unsupported_schema_ddl(&normalized) {
+            return self.extended_error(unsupported_schema_ddl());
         }
         if let Some(compatibility) = classify_compatibility_statement(&query) {
             if self.trace_enabled {
@@ -1416,7 +1467,25 @@ impl PgWorkerSession {
             PreparedExecution::Core(prepared) => {
                 self.execute_prepared_core(database, prepared, values)?
             }
+            PreparedExecution::Ddl(prepared) => {
+                if !values.is_empty() {
+                    return Err(fixed_error("08P01", "DDL does not accept parameters"));
+                }
+                self.authorize_access(&prepared.access())?;
+                let outcome = self
+                    .execution
+                    .execute_ddl(database, prepared)
+                    .map_err(|error| self.record_error(&error))?;
+                if outcome == DdlOutcome::Created {
+                    self.mutation_generation = self.mutation_generation.saturating_add(1);
+                }
+                self.refresh_catalog(database)?;
+                return Ok(PortalResult::Command {
+                    tag: "CREATE INDEX".into(),
+                });
+            }
             PreparedExecution::Compatibility(statement) => {
+                self.refresh_catalog(database)?;
                 ExecutionResult::Query(execute_compatibility_statement(
                     &self.catalog,
                     &self.authorization,
@@ -1437,6 +1506,16 @@ impl PgWorkerSession {
                 })
             }
         }
+    }
+
+    fn refresh_catalog(&mut self, database: &Database) -> Result<(), ErrorResponse> {
+        let generation = database.catalog_generation();
+        if generation != self.catalog_generation {
+            self.catalog = PgCompatibilityCatalog::derive(database)
+                .map_err(|error| map_database_error(&error))?;
+            self.catalog_generation = generation;
+        }
+        Ok(())
     }
 
     fn close_object(&mut self, target: CloseTarget, name: &str) -> Vec<BackendMessage> {
@@ -1460,7 +1539,7 @@ impl PgWorkerSession {
         let normalized = normalize_sql(sql);
         match normalized.as_str() {
             "begin" | "begin transaction" | "start transaction" => return self.begin(database),
-            "commit" | "commit transaction" => return self.commit(),
+            "commit" | "commit transaction" => return self.commit(database),
             "rollback" | "rollback transaction" => return self.rollback(),
             "deallocate all" => {
                 self.prepared.clear();
@@ -1495,6 +1574,7 @@ impl PgWorkerSession {
                 "current transaction is aborted, commands ignored until end of transaction block",
             ));
         }
+        self.refresh_catalog(database)?;
         if let Some(messages) = self.compatibility_query(&normalized) {
             if self.trace_enabled {
                 eprintln!("netbadb postgres trace: compatibility classification=ScalarCommand");
@@ -1543,10 +1623,25 @@ impl PgWorkerSession {
             ));
         }
         if is_index_ddl(&normalized) {
-            return Err(fixed_error(
-                "0A000",
-                "PostgreSQL index DDL is unsupported; use the native index API",
-            ));
+            if !normalized.starts_with("create index ") {
+                return Err(self.record_protocol_error(unsupported_index_ddl()));
+            }
+            let prepared = database
+                .prepare_ddl_statement(sql)
+                .map_err(|error| self.record_protocol_error(map_create_index_error(&error)))?;
+            self.authorize_access(&prepared.access())?;
+            let outcome = self
+                .execution
+                .execute_ddl(database, &prepared)
+                .map_err(|error| self.record_error(&error))?;
+            if outcome == DdlOutcome::Created {
+                self.mutation_generation = self.mutation_generation.saturating_add(1);
+            }
+            self.refresh_catalog(database)?;
+            return Ok(vec![BackendMessage::CommandComplete("CREATE INDEX".into())]);
+        }
+        if is_unsupported_schema_ddl(&normalized) {
+            return Err(self.record_protocol_error(unsupported_schema_ddl()));
         }
         let result = self.execute_core(database, sql)?;
         match result {
@@ -1662,7 +1757,7 @@ impl PgWorkerSession {
         Ok(vec![BackendMessage::CommandComplete("BEGIN".into())])
     }
 
-    fn commit(&mut self) -> Result<Vec<BackendMessage>, ErrorResponse> {
+    fn commit(&mut self, database: &mut Database) -> Result<Vec<BackendMessage>, ErrorResponse> {
         match self.status {
             PgTransactionStatus::Idle => Ok(vec![BackendMessage::CommandComplete("COMMIT".into())]),
             PgTransactionStatus::Failed => Err(fixed_error(
@@ -1671,7 +1766,7 @@ impl PgWorkerSession {
             )),
             PgTransactionStatus::InTransaction => {
                 self.execution
-                    .commit()
+                    .commit(database)
                     .map_err(|error| map_database_error(&error))?;
                 self.status = PgTransactionStatus::Idle;
                 self.savepoints.clear();
@@ -2605,6 +2700,57 @@ fn is_index_ddl(normalized: &str) -> bool {
     normalized.starts_with("create index ")
         || normalized.starts_with("create unique index ")
         || normalized.starts_with("drop index ")
+}
+
+fn is_unsupported_schema_ddl(normalized: &str) -> bool {
+    [
+        "create table ",
+        "alter table ",
+        "drop table ",
+        "create schema ",
+        "alter schema ",
+        "drop schema ",
+        "create type ",
+        "alter type ",
+        "drop type ",
+        "create sequence ",
+        "alter sequence ",
+        "drop sequence ",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn unsupported_schema_ddl() -> ErrorResponse {
+    fixed_error(
+        "0A000",
+        "table, schema, type, and sequence DDL is not supported",
+    )
+}
+
+fn unsupported_index_ddl() -> ErrorResponse {
+    fixed_error(
+        "0A000",
+        "only single-column non-unique non-concurrent BTree CREATE INDEX is supported",
+    )
+}
+
+fn map_create_index_error(error: &DatabaseError) -> ErrorResponse {
+    match error.kind() {
+        DatabaseErrorKind::UndefinedTable
+        | DatabaseErrorKind::UndefinedColumn
+        | DatabaseErrorKind::DuplicateObject
+        | DatabaseErrorKind::TransactionState
+        | DatabaseErrorKind::Operational
+        | DatabaseErrorKind::Internal => map_database_error(error),
+        DatabaseErrorKind::Syntax
+        | DatabaseErrorKind::AmbiguousColumn
+        | DatabaseErrorKind::DatatypeMismatch
+        | DatabaseErrorKind::IndeterminateDatatype
+        | DatabaseErrorKind::ParameterCount
+        | DatabaseErrorKind::NotNullViolation
+        | DatabaseErrorKind::FeatureNotSupported => unsupported_index_ddl(),
+    }
 }
 
 fn compatibility_parameter_types(statement: CompatibilityStatement) -> &'static [PostgresType] {
@@ -4304,6 +4450,7 @@ fn map_database_error(error: &DatabaseError) -> ErrorResponse {
         DatabaseErrorKind::ParameterCount => ("08P01", Some(error.to_string())),
         DatabaseErrorKind::NotNullViolation => ("23502", Some(error.to_string())),
         DatabaseErrorKind::FeatureNotSupported => ("0A000", Some(error.to_string())),
+        DatabaseErrorKind::DuplicateObject => ("42P07", Some(error.to_string())),
         DatabaseErrorKind::TransactionState => ("25000", Some("invalid transaction state".into())),
         DatabaseErrorKind::Operational => ("58000", Some("database operation failed".into())),
         DatabaseErrorKind::Internal => ("XX000", Some("internal database error".into())),
@@ -4496,6 +4643,24 @@ mod tests {
             ]
         );
         assert!(split_statements(" ; ").is_empty());
+    }
+
+    #[test]
+    fn unsupported_schema_ddl_is_classified_without_entering_the_generic_parser() {
+        for sql in [
+            "create table users (id bigint)",
+            "alter table users add column name text",
+            "drop table users",
+            "create schema private",
+            "create type mood as enum ('ok')",
+            "create sequence users_id_seq",
+        ] {
+            assert!(is_unsupported_schema_ddl(sql), "{sql}");
+        }
+        assert!(!is_unsupported_schema_ddl(
+            "create index users_id_idx on users (id)"
+        ));
+        assert_eq!(unsupported_schema_ddl().sqlstate, "0A000");
     }
 
     #[test]

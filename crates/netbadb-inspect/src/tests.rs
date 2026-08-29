@@ -129,6 +129,7 @@ fn catalog_renderer_is_explicit_and_deterministic() {
                 },
             ],
             indexes: vec![IndexInspection {
+                name: None,
                 table_id: TableId(1),
                 column_id: ColumnId(1),
                 column_name: "id".into(),
@@ -407,6 +408,7 @@ fn renderers_escape_free_form_names_without_injecting_lines_or_controls() {
                 primary_key: false,
             }],
             indexes: vec![IndexInspection {
+                name: None,
                 table_id: TableId(1),
                 column_id: ColumnId(1),
                 column_name: "id\t\\\"".into(),

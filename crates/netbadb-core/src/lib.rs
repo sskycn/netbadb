@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use netbadb_compiler::{
-    BindError, CompileError, CompileErrorKind, CompiledStatement, PreparedParameter,
-    bind_statement, compile_statement, compile_statement_with_parameters,
+    BindError, CompileError, CompileErrorKind, CompiledDdlStatement, CompiledStatement,
+    PreparedParameter, bind_statement, compile_ddl_statement, compile_statement,
+    compile_statement_with_parameters,
 };
 use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
@@ -34,7 +35,7 @@ use netbadb_storage::{
     PreparedTxnResolution, StorageError, TableStorage,
 };
 use netbadb_types::{
-    ColumnId, DatabaseTxnId, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
+    ColumnId, DatabaseTxnId, IndexName, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
 };
 
 use coordinator_log::{CoordinatorDecision, CoordinatorLog};
@@ -206,6 +207,29 @@ pub struct PreparedStatement {
     compiled: CompiledStatement,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedDdlStatement {
+    compiled: CompiledDdlStatement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlOutcome {
+    Created,
+    Unchanged,
+}
+
+impl PreparedDdlStatement {
+    #[must_use]
+    pub fn access(&self) -> StatementAccess {
+        match &self.compiled {
+            CompiledDdlStatement::CreateIndex(statement) => StatementAccess {
+                read_tables: Vec::new(),
+                write_tables: vec![statement.table_id],
+            },
+        }
+    }
+}
+
 impl PreparedStatement {
     #[must_use]
     pub fn parameters(&self) -> &[PreparedParameter] {
@@ -296,6 +320,7 @@ pub enum DatabaseError {
         table_id: TableId,
         position: usize,
     },
+    DuplicateIndexName(IndexName),
     CreateTablesRollback {
         creation: StorageError,
         cleanup_path: PathBuf,
@@ -318,6 +343,7 @@ pub enum DatabaseErrorKind {
     ParameterCount,
     NotNullViolation,
     FeatureNotSupported,
+    DuplicateObject,
     TransactionState,
     Operational,
     Internal,
@@ -347,7 +373,19 @@ impl DatabaseError {
             | Self::Execution(ExecutionError::Storage(StorageError::TypeMismatch { .. })) => {
                 DatabaseErrorKind::DatatypeMismatch
             }
+            Self::Storage(StorageError::Index(
+                netbadb_index::IndexError::IndexAlreadyExists { .. }
+                | netbadb_index::IndexError::IndexNameAlreadyExists { .. },
+            )) => DatabaseErrorKind::DuplicateObject,
+            Self::Storage(StorageError::UnsupportedOperation { .. })
+            | Self::Partition(PartitionError::PartitionedIndexCreationNotSupported(_)) => {
+                DatabaseErrorKind::FeatureNotSupported
+            }
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
+            Self::DuplicateIndexName(_) => DatabaseErrorKind::DuplicateObject,
+            Self::Registry(StorageRegistryError::DuplicateIndexName { .. }) => {
+                DatabaseErrorKind::DuplicateObject
+            }
             Self::Schema(_)
             | Self::Storage(_)
             | Self::Registry(_)
@@ -445,6 +483,7 @@ impl fmt::Display for DatabaseError {
                 "inspection index registration position {position} for table {} exceeds u32",
                 table_id.0
             ),
+            Self::DuplicateIndexName(name) => write!(formatter, "index `{name}` already exists"),
             Self::CreateTablesRollback {
                 creation,
                 cleanup_path,
@@ -481,6 +520,7 @@ impl Error for DatabaseError {
             | Self::InspectionStorageMissing { .. }
             | Self::InspectionIndexColumnMissing { .. }
             | Self::InspectionRegistrationOrderOverflow { .. } => None,
+            Self::DuplicateIndexName(_) => None,
         }
     }
 }
@@ -549,6 +589,7 @@ pub struct Database {
     transaction_owner: Rc<()>,
     next_transaction_id: DatabaseTxnId,
     coordinator: Option<SharedCoordinatorLog>,
+    catalog_generation: u64,
 }
 
 impl Database {
@@ -1086,6 +1127,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
+            catalog_generation: 0,
         })
     }
 
@@ -1103,6 +1145,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
+            catalog_generation: 0,
         })
     }
 
@@ -1137,6 +1180,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
+            catalog_generation: 0,
         })
     }
 
@@ -1322,6 +1366,43 @@ impl Database {
         }
     }
 
+    /// Creates a durable logically named non-unique single-column B+Tree.
+    pub fn create_named_index(
+        &mut self,
+        name: IndexName,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, DatabaseError> {
+        if self.registry.iter().any(|entry| {
+            entry
+                .storage
+                .indexes()
+                .iter()
+                .any(|definition| definition.name.as_ref() == Some(&name))
+        }) {
+            return Err(DatabaseError::DuplicateIndexName(name));
+        }
+        let definition = match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .create_named_index(name, column_id)?,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into());
+            }
+        };
+        self.catalog_generation = self.catalog_generation.saturating_add(1);
+        Ok(definition)
+    }
+
+    #[must_use]
+    pub const fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
     /// Creates one explicitly partition-local index. This API cannot create a
     /// global index and validates that the partition belongs to `table_id`.
     pub fn create_partition_index(
@@ -1439,6 +1520,142 @@ impl Database {
         Ok(PreparedStatement {
             compiled: compile_statement_with_parameters(&self.schema, source, declared)?,
         })
+    }
+
+    /// Parses and resolves a generic schema mutation without touching storage.
+    pub fn prepare_ddl_statement(
+        &self,
+        source: &str,
+    ) -> Result<PreparedDdlStatement, DatabaseError> {
+        Ok(PreparedDdlStatement {
+            compiled: compile_ddl_statement(&self.schema, source)?,
+        })
+    }
+
+    /// Executes one prepared generic DDL statement in its storage-owned atomic
+    /// transaction. Frontends remain responsible for their protocol tag.
+    pub fn execute_ddl(
+        &mut self,
+        prepared: &PreparedDdlStatement,
+    ) -> Result<DdlOutcome, DatabaseError> {
+        match &prepared.compiled {
+            CompiledDdlStatement::CreateIndex(statement) => {
+                if let Some((existing_table_id, existing)) =
+                    self.registry.iter().find_map(|entry| {
+                        entry
+                            .storage
+                            .indexes()
+                            .iter()
+                            .find(|definition| definition.name.as_ref() == Some(&statement.name))
+                            .map(|definition| (entry.storage.table().id, definition))
+                    })
+                {
+                    if statement.if_not_exists
+                        && existing.column_id == statement.column_id
+                        && existing_table_id == statement.table_id
+                    {
+                        return Ok(DdlOutcome::Unchanged);
+                    }
+                    return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
+                }
+                self.create_named_index(
+                    statement.name.clone(),
+                    statement.table_id,
+                    statement.column_id,
+                )?;
+                Ok(DdlOutcome::Created)
+            }
+        }
+    }
+
+    /// Executes generic DDL inside an existing database transaction. Durable
+    /// registry bytes remain invisible to other sessions until commit, and a
+    /// rollback removes the tree, backfill, and catalog entry together.
+    pub fn execute_ddl_in(
+        &mut self,
+        transaction: &mut Transaction,
+        prepared: &PreparedDdlStatement,
+    ) -> Result<DdlOutcome, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        match &prepared.compiled {
+            CompiledDdlStatement::CreateIndex(statement) => {
+                if let Some((existing_table_id, existing)) =
+                    self.registry.iter().find_map(|entry| {
+                        entry
+                            .storage
+                            .indexes()
+                            .iter()
+                            .find(|definition| definition.name.as_ref() == Some(&statement.name))
+                            .map(|definition| (entry.storage.table().id, definition))
+                    })
+                {
+                    if statement.if_not_exists
+                        && existing_table_id == statement.table_id
+                        && existing.column_id == statement.column_id
+                    {
+                        return Ok(DdlOutcome::Unchanged);
+                    }
+                    return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
+                }
+                let storage_id = match self.bindings.placement(statement.table_id)? {
+                    TablePlacement::Single { storage_id, .. } => *storage_id,
+                    TablePlacement::RangePartitioned { .. } => {
+                        return Err(PartitionError::PartitionedIndexCreationNotSupported(
+                            statement.table_id,
+                        )
+                        .into());
+                    }
+                };
+                if let Some((pending_storage, existing)) =
+                    transaction.pending_index_by_name(&statement.name)
+                {
+                    if statement.if_not_exists
+                        && pending_storage == storage_id
+                        && existing.column_id == statement.column_id
+                    {
+                        return Ok(DdlOutcome::Unchanged);
+                    }
+                    return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
+                }
+                if transaction.has_pending_index_column(storage_id, statement.column_id) {
+                    return Err(StorageError::from(
+                        netbadb_index::IndexError::IndexAlreadyExists {
+                            column_id: statement.column_id,
+                        },
+                    )
+                    .into());
+                }
+                let context = transaction.write_context(storage_id, &mut self.registry)?;
+                let definition = self
+                    .registry
+                    .get_mut(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                    .create_named_index_in(context, statement.name.clone(), statement.column_id)?;
+                transaction.stage_index(storage_id, definition);
+                Ok(DdlOutcome::Created)
+            }
+        }
+    }
+
+    /// Commits a transaction and publishes any schema-cache changes only after
+    /// the physical commit decision is durable.
+    pub fn commit_transaction(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        transaction.commit_with_schema_mutations()?;
+        let pending = transaction.take_pending_indexes();
+        if !pending.is_empty() {
+            for (storage_id, definition) in pending {
+                self.registry
+                    .get_mut(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                    .publish_committed_index(definition);
+            }
+            self.catalog_generation = self.catalog_generation.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Compiles and plans a statement and exposes only transport-neutral output
@@ -1592,6 +1809,9 @@ impl Database {
                 .execute_query_plan(plan, &view)
                 .map(ExecutionResult::Query);
         }
+        if transaction.has_pending_schema_mutations() {
+            return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
+        }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
         if let TablePlacement::Single { storage_id, .. } = self.bindings.placement(table_id)? {
             // Preserve the legacy one-writer preflight boundary: rejecting a
@@ -1623,6 +1843,9 @@ impl Database {
             return self
                 .execute_query_plan(plan, &view)
                 .map(ExecutionResult::Query);
+        }
+        if transaction.has_pending_schema_mutations() {
+            return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
         if let TablePlacement::Single { storage_id, .. } = self.bindings.placement(table_id)? {
@@ -2542,10 +2765,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, ExecutionResult,
-        IsolationLevel, ParticipantMode, PartitionCatalogConfig, PhysicalStatement,
-        RangePartitionSpec, TablePlacementSpec, TableStorageCreateSpec, TableStorageOpenSpec,
-        TransactionState, cleanup_created_table_files,
+        CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, DdlOutcome,
+        ExecutionResult, IsolationLevel, ParticipantMode, PartitionCatalogConfig,
+        PhysicalStatement, RangePartitionSpec, TablePlacementSpec, TableStorageCreateSpec,
+        TableStorageOpenSpec, TransactionState, cleanup_created_table_files,
     };
     use crate::registry::{
         PhysicalBindings, StorageRegistry, StorageRegistryEntry, StorageRegistryError,
@@ -3598,6 +3821,7 @@ mod tests {
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
+            catalog_generation: 0,
         };
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
@@ -4519,6 +4743,119 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn generic_create_index_ddl_commits_rolls_back_plans_and_reopens_with_its_name() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-named-index-ddl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal = netbadb_storage::wal_path(&path);
+        for target in [&path, &wal, &netbadb_storage::wal_alternate_path(&wal)] {
+            let _ = std::fs::remove_file(target);
+        }
+        let mut database = Database::create(&path, table()).expect("create database");
+        database
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("Ada".into())])
+            .expect("insert existing row");
+        let prepared_select = database
+            .prepare_statement(
+                "SELECT id FROM users WHERE name = $1",
+                &[Some(PhysicalType::Text)],
+            )
+            .expect("prepare SELECT before CREATE INDEX");
+        let ddl = database
+            .prepare_ddl_statement("CREATE INDEX users_name_idx ON public.users (name)")
+            .expect("prepare generic DDL");
+
+        let mut rolled_back = database.begin_transaction().expect("begin rollback DDL");
+        assert_eq!(
+            database.execute_ddl_in(&mut rolled_back, &ddl).unwrap(),
+            DdlOutcome::Created
+        );
+        assert!(database.indexes(TableId(1)).unwrap().is_empty());
+        rolled_back.rollback().expect("rollback DDL");
+        assert!(database.indexes(TableId(1)).unwrap().is_empty());
+
+        let mut committed = database.begin_transaction().expect("begin committed DDL");
+        database
+            .execute_ddl_in(&mut committed, &ddl)
+            .expect("stage DDL");
+        database
+            .commit_transaction(&mut committed)
+            .expect("commit DDL through database");
+        let indexes = database.indexes(TableId(1)).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(
+            indexes[0].name.as_ref().map(|name| name.as_str()),
+            Some("users_name_idx")
+        );
+        let PhysicalStatement::Query(plan) = database
+            .plan_source("SELECT id FROM users WHERE name = 'Ada'")
+            .unwrap()
+        else {
+            panic!("SELECT must plan as a query");
+        };
+        assert!(planned_index(&plan).is_some());
+        let ExecutionResult::Query(prepared_result) = database
+            .execute_prepared(&prepared_select, &[ScalarValue::Text("Ada".into())])
+            .expect("old prepared SELECT replans after CREATE INDEX")
+        else {
+            panic!("prepared SELECT must return rows");
+        };
+        assert_eq!(prepared_result.rows.len(), 1);
+        database
+            .execute("INSERT INTO users (id, name) VALUES (2, 'Ada')")
+            .expect("DML maintains SQL-created index");
+        database
+            .execute("UPDATE users SET name = 'Grace' WHERE id = 2")
+            .expect("UPDATE maintains SQL-created index");
+        assert_eq!(
+            database
+                .query("SELECT id FROM users WHERE name = 'Grace'")
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        database
+            .execute("DELETE FROM users WHERE id = 2")
+            .expect("DELETE maintains SQL-created index");
+        assert!(
+            database
+                .query("SELECT id FROM users WHERE name = 'Grace'")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        database.checkpoint().expect("checkpoint SQL-created index");
+        database.close().expect("close named-index database");
+
+        let mut reopened = Database::open(&path, table()).expect("reopen named index");
+        let inspection = reopened
+            .inspect_catalog()
+            .expect("inspect reopened catalog");
+        assert_eq!(
+            inspection.tables[0].indexes[0]
+                .name
+                .as_ref()
+                .map(|name| name.as_str()),
+            Some("users_name_idx")
+        );
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM users WHERE name = 'Ada'")
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        reopened.close().expect("close reopened named index");
+        for target in [&path, &wal, &netbadb_storage::wal_alternate_path(&wal)] {
+            let _ = std::fs::remove_file(target);
+        }
     }
 
     #[test]
