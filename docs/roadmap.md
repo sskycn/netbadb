@@ -460,10 +460,25 @@ broader dialect support remain explicit later work.
   produces no diff, while omitting the two indexes produces two `remove_index`
   proposals. No migration operation or DDL is executed.
 
-The optional `psql \\d users` probe currently stops at its regex-operator
-catalog query (`OPERATOR(pg_catalog.~)`). This is evidence for a focused future
-psql catalog/query-lowering round, not justification for broad PostgreSQL SQL
-or migration DDL in Round 4.
+### PostgreSQL Compatibility Round 5 — psql describe catalogs (complete)
+
+- captured the real psql 17.11 Simple Query sequence blocker by blocker with
+  `-X -E`, then added structured operations for relation lookup/properties,
+  columns, indexes, and truthful empty PostgreSQL-only metadata;
+- added authorized `\dt` and `\di` projections, compatibility primary-key
+  indexes, real Round 4 secondary indexes, and authenticated-session owner
+  projection without creating a PostgreSQL role catalog;
+- added bounded catalog-only psql pattern matching for relation and schema
+  filters. It supports only anchored literals, `.`, and `.*`, uses
+  non-backtracking dynamic programming, and rejects unsupported regex syntax;
+- routed Simple Query catalog operations through the same read-only
+  `CompatibilityStatement` evaluator used by Extended Query reflection;
+- verified `\d users`, qualified/missing/wildcard variants, `\dt`, `\di`, and
+  their required patterns with the real psql 17.11 executable.
+
+This remains an existing-schema inspection profile. `\d+`, unrelated slash
+commands, a general PostgreSQL regex engine/parser/catalog, migration DDL, and
+PostgreSQL-only metadata absent from NetbaDB remain unsupported.
 
 ## Phase 6 — SDK and tooling
 

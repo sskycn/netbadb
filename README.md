@@ -274,10 +274,10 @@ Experimental PostgreSQL wire mode is documented in
 [`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
 `netbadbd --manifest server.json --postgres` to use the manifest's listen
 address as a loopback PostgreSQL endpoint. This experimental profile is not a
-claim of general PostgreSQL compatibility. Round 4 adds real non-primary
-single-column B+Tree reflection to the existing psycopg 3 and SQLAlchemy 2
-Core/ORM profile. The PostgreSQL adapter consumes stable read-only Core
-metadata, synthesizes deterministic compatibility names/OIDs, and supports
+claim of general PostgreSQL compatibility. Round 5 adds real psql 17.11
+`\d`, `\dt`, and `\di` support, including schema/name patterns, on top of the
+psycopg 3 and SQLAlchemy 2 Core/ORM profile. The PostgreSQL adapter consumes
+stable read-only Core metadata, synthesizes deterministic compatibility names/OIDs, and supports
 Alembic schema introspection plus read-only autogenerate comparison. Migration
 execution, PostgreSQL DDL, a complete `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus

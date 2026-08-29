@@ -2243,7 +2243,8 @@ PostgreSQL error and RowDescription mapping do not inspect AST/HIR Rust layouts,
 execute a query for metadata, or leak OIDs into HIR, relational IR, planner,
 executor, or storage.
 
-Rounds 3 and 4 keep ORM introspection in a separate, typed server-side adapter because
+Rounds 3 through 5 keep ORM and psql introspection in a separate, typed
+server-side adapter because
 SQLAlchemy's PostgreSQL catalog SQL uses schema-qualified system relations,
 arrays, `ANY`, `regclass`, and catalog-only functions that would otherwise
 force a premature full PostgreSQL parser into the native compiler. The adapter
@@ -2261,6 +2262,15 @@ Every emitted row is generated from that snapshot and filtered through the
 principal's existing `TableId` visibility.
 There is no PostgreSQL catalog heap, WAL record, or second source of schema
 truth.
+
+Round 5 adds a second entry into that same evaluator for psql Simple Query.
+A bounded tokenizer recognizes semantic catalog relations, columns, functions,
+operators, and literal predicates without implementing general PostgreSQL
+SELECT. Catalog name patterns compile into a small anchored automaton subset
+(`literal`, `.`, and `.*`) with fixed byte/atom/token/nesting limits and a
+non-backtracking dynamic-programming matcher. The adapter therefore supports
+psql 17.11 `\d`, `\dt`, and `\di` without adding regex or PostgreSQL catalog
+syntax to parser, HIR, relational IR, planner, executor, or storage.
 
 Compatibility object OIDs are server-only deterministic identifiers. Separate
 SHA-256 domains cover table and index objects; index identity includes the

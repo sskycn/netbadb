@@ -1,8 +1,8 @@
 # Experimental PostgreSQL wire compatibility
 
-Round 4 adds real secondary-index reflection and an Alembic read-only
-autogenerate probe on top of the existing-schema ORM profile. The feature
-remains experimental: it is a real path through NetbaDB's compiler, Canonical
+Round 5 adds psql 17.11 `\d`, `\dt`, and `\di` reflection on top of real
+secondary-index reflection and the Alembic read-only existing-schema profile.
+The feature remains experimental: it is a real path through NetbaDB's compiler, Canonical
 Schema, index registry, and storage engine, not a claim of complete PostgreSQL
 dialect, catalog, or migration compatibility.
 
@@ -54,16 +54,17 @@ frontends can map syntax, undefined-name, ambiguity, datatype, NOT NULL, and
 unsupported-feature diagnostics and describe typed output without parsing a
 Rust debug string or reading rows.
 
-## ORM metadata architecture
+## ORM and psql metadata architecture
 
 Real SQLAlchemy PostgreSQL introspection contains catalog-only syntax such as
 schema-qualified relations, arrays, `ANY`, `regclass`, and PostgreSQL catalog
 functions. Expanding the native SQL grammar into a partial PostgreSQL system
-query engine would couple unrelated layers and still be brittle. Rounds 3 and 4 use
+query engine would couple unrelated layers and still be brittle. Rounds 3 through 5 use
 a closed, typed compatibility operation boundary:
 
 ```text
-SQLAlchemy / psycopg Extended Query
+SQLAlchemy / psycopg Extended Query     psql Simple Query
+                 \                       /
     -> structural catalog-query classification
     -> CompatibilityStatement + typed Bind values
     -> per-session read-only compatibility snapshot
@@ -101,11 +102,40 @@ the result needs neither expressions, predicates, INCLUDE columns, reloptions,
 nor `pg_get_indexdef` evaluation. Catalog text/bool arrays are output-only
 pgwire types and have no NetbaDB physical-type mapping.
 
-Captured reflection uses typed Extended Query parameters. A matching catalog
-statement sent through Simple Query returns explicit `0A000` rather than being
-misparsed or treated as ordinary user SQL; literal catalog-query lowering is
-not implemented. INSERT/UPDATE/DELETE targeting `pg_catalog` also returns
-`0A000` because the projection is strictly read-only.
+Captured SQLAlchemy reflection uses typed Extended Query parameters. Captured
+psql reflection uses a bounded tokenizer to lower literal Simple Query catalog
+predicates into the same `CompatibilityStatement` evaluator; it does not
+compare complete SQL strings or run the hidden queries through the native SQL
+engine. Both paths use the same snapshot, result limit, authorization filter,
+RowDescription/DataRow encoder, and read-only boundary. INSERT/UPDATE/DELETE
+targeting `pg_catalog` returns `0A000`.
+
+## psql describe profile
+
+The supported psql 17.11 surface is deliberately narrow:
+
+| Command | Status | Projection |
+| --- | --- | --- |
+| `\d users`, `\d public.users`, `\d user*` | supported | columns, PostgreSQL type names, nullability, Canonical primary key, real secondary indexes |
+| `\d missing` | supported | normal no-relation result |
+| `\dt`, `\dt user*`, `\dt public.*` | supported | authorized `public` tables |
+| `\di`, `\di *users*` | supported | compatibility primary-key indexes and real registered secondary indexes |
+| `\d+`, `\dt+`, `\di+`, other slash commands | unsupported | outside the Round 5 profile |
+
+psql converts its glob-like input to anchored PostgreSQL regular expressions.
+The server implements only the observed catalog subset: `^(...)$`, escaped
+literals, `.` and `.*`. Compilation is limited to 1,024 input bytes and 1,024
+atoms, matching uses dynamic programming without backtracking, and unsupported
+regex constructs return `0A000`. Query tokens and nesting are independently
+bounded. This is not a general PostgreSQL regex operator and no regex concept
+enters HIR, relational IR, planning, execution, or storage.
+
+NetbaDB has no persistent PostgreSQL role catalog. The `Owner` column in psql
+relation lists is an explicit compatibility projection of the authenticated
+session username; it does not assert persistent PostgreSQL role ownership.
+Policies, publications, extended statistics, and inheritance/partition
+relations are typed empty results because those features are absent. Table
+access method is NULL rather than falsely reporting PostgreSQL `heap`.
 
 User tables map to `public`; `current_schema()`, `SHOW search_path`, qualified
 lookups, and the namespace projection all agree. Metadata visibility reuses the

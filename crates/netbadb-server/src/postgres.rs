@@ -31,6 +31,10 @@ use crate::{
 const MAX_PREPARED_STATEMENTS: usize = 1_024;
 const MAX_PORTALS: usize = 1_024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
+const MAX_COMPATIBILITY_TOKENS: usize = 4_096;
+const MAX_COMPATIBILITY_NESTING: usize = 32;
+const MAX_CATALOG_PATTERN_BYTES: usize = 1_024;
+const MAX_CATALOG_PATTERN_ATOMS: usize = 1_024;
 
 pub struct PostgresTcpServer {
     config: ServerConfig,
@@ -601,6 +605,18 @@ enum PreparedExecution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompatibilityStatement {
+    PsqlRelationLookup,
+    PsqlRelationLookupQualified,
+    PsqlTableList,
+    PsqlIndexList,
+    PsqlRelationProperties,
+    PsqlColumns,
+    PsqlIndexes,
+    PsqlPolicies,
+    PsqlExtendedStatistics,
+    PsqlPublications,
+    PsqlInheritanceParents,
+    PsqlInheritanceChildren,
     TypeLookup,
     SchemaNames,
     TableNames,
@@ -620,6 +636,17 @@ enum CompatibilityStatement {
     TableCommentsQualified,
     CheckConstraintsVisible,
     CheckConstraintsQualified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgCompatibilityOperator {
+    RegexMatch,
+}
+
+#[derive(Debug)]
+struct SimpleCompatibilityQuery {
+    statement: CompatibilityStatement,
+    values: Vec<ScalarValue>,
 }
 
 struct Portal {
@@ -1484,6 +1511,31 @@ impl PgWorkerSession {
                 "the PostgreSQL compatibility catalog is read-only",
             ));
         }
+        if let Some(query) = classify_simple_compatibility_query(sql)
+            .map_err(|error| self.record_protocol_error(error))?
+        {
+            if self.trace_enabled {
+                eprintln!(
+                    "netbadb postgres trace: compatibility classification={:?}",
+                    query.statement
+                );
+            }
+            let fields = compatibility_fields(query.statement);
+            let result = execute_compatibility_statement_for_owner(
+                &self.catalog,
+                &self.authorization,
+                &self.user,
+                query.statement,
+                &query.values,
+            )
+            .map_err(|error| self.record_protocol_error(error))?;
+            return query_messages_with_fields(
+                result,
+                fields,
+                self.execution.policy.max_result_rows(),
+            )
+            .map_err(|error| self.record_protocol_error(error));
+        }
         if classify_compatibility_statement(sql).is_some() {
             return Err(fixed_error(
                 "0A000",
@@ -1772,6 +1824,639 @@ impl PgWorkerSession {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PgCompatibilityToken<'a> {
+    Word(&'a str),
+    Identifier(String),
+    String(String),
+    Symbol(u8),
+}
+
+fn classify_simple_compatibility_query(
+    sql: &str,
+) -> Result<Option<SimpleCompatibilityQuery>, ErrorResponse> {
+    let normalized = normalize_sql(sql);
+    if !normalized.starts_with("select ")
+        || !(normalized.contains("pg_catalog.pg_class")
+            || normalized.contains("pg_catalog.pg_attribute")
+            || normalized.contains("pg_catalog.pg_index")
+            || normalized.contains("pg_catalog.pg_policy")
+            || normalized.contains("pg_catalog.pg_statistic_ext"))
+    {
+        return Ok(None);
+    }
+    let tokens = lex_compatibility_query(sql)?;
+    if let Some(class_alias) = relation_alias(&tokens, "pg_catalog", "pg_class") {
+        if let Some(namespace_alias) = relation_alias(&tokens, "pg_catalog", "pg_namespace")
+            && !normalized.contains("pg_catalog.pg_get_userbyid(")
+            && has_column_reference(&tokens, class_alias, "oid")
+            && has_column_reference(&tokens, class_alias, "relname")
+            && has_column_reference(&tokens, class_alias, "relnamespace")
+            && has_column_reference(&tokens, namespace_alias, "oid")
+            && has_column_reference(&tokens, namespace_alias, "nspname")
+            && let Some((PgCompatibilityOperator::RegexMatch, pattern)) =
+                column_pattern(&tokens, class_alias, "relname")
+        {
+            PgCatalogPattern::compile(&pattern)?;
+            if has_visible_table_predicate(&tokens, class_alias) {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlRelationLookup,
+                    values: vec![ScalarValue::Text(pattern)],
+                }));
+            }
+            if let Some((PgCompatibilityOperator::RegexMatch, schema_pattern)) =
+                column_pattern(&tokens, namespace_alias, "nspname")
+            {
+                PgCatalogPattern::compile(&schema_pattern)?;
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlRelationLookupQualified,
+                    values: vec![
+                        ScalarValue::Text(schema_pattern),
+                        ScalarValue::Text(pattern),
+                    ],
+                }));
+            }
+        }
+        if let Some(namespace_alias) = relation_alias(&tokens, "pg_catalog", "pg_namespace")
+            && relation_alias(&tokens, "pg_catalog", "pg_am").is_some()
+            && normalized.contains("pg_catalog.pg_get_userbyid(")
+            && ["relname", "relkind", "relowner", "relnamespace"]
+                .into_iter()
+                .all(|column| has_column_reference(&tokens, class_alias, column))
+            && has_column_reference(&tokens, namespace_alias, "oid")
+            && has_column_reference(&tokens, namespace_alias, "nspname")
+        {
+            let schema_pattern = column_pattern(&tokens, namespace_alias, "nspname")
+                .map(|(_, pattern)| PgCatalogPattern::compile(&pattern).map(|_| pattern))
+                .transpose()?;
+            let name_pattern = column_pattern(&tokens, class_alias, "relname")
+                .map(|(_, pattern)| PgCatalogPattern::compile(&pattern).map(|_| pattern))
+                .transpose()?;
+            let values = vec![
+                schema_pattern.map_or(ScalarValue::Null, ScalarValue::Text),
+                name_pattern.map_or(ScalarValue::Null, ScalarValue::Text),
+            ];
+            if relation_alias(&tokens, "pg_catalog", "pg_index").is_some()
+                && normalized.contains("indexrelid")
+                && normalized.contains("indrelid")
+            {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlIndexList,
+                    values,
+                }));
+            }
+            return Ok(Some(SimpleCompatibilityQuery {
+                statement: CompatibilityStatement::PsqlTableList,
+                values,
+            }));
+        }
+        if relation_alias(&tokens, "pg_catalog", "pg_am").is_some()
+            && [
+                "relchecks",
+                "relkind",
+                "relhasindex",
+                "relhasrules",
+                "relhastriggers",
+                "relrowsecurity",
+                "relforcerowsecurity",
+                "relispartition",
+                "reltablespace",
+                "reloftype",
+                "relpersistence",
+                "relreplident",
+            ]
+            .into_iter()
+            .all(|column| has_column_reference(&tokens, class_alias, column))
+            && let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")?
+        {
+            return Ok(Some(SimpleCompatibilityQuery {
+                statement: CompatibilityStatement::PsqlRelationProperties,
+                values: vec![ScalarValue::Int64(i64::from(oid))],
+            }));
+        }
+        if let Some(index_alias) = relation_alias(&tokens, "pg_catalog", "pg_index")
+            && relation_alias(&tokens, "pg_catalog", "pg_constraint").is_some()
+            && normalized.contains("pg_catalog.pg_get_indexdef(")
+            && normalized.contains("pg_catalog.pg_get_constraintdef(")
+            && [
+                "indrelid",
+                "indexrelid",
+                "indisprimary",
+                "indisunique",
+                "indisclustered",
+                "indisvalid",
+                "indisreplident",
+            ]
+            .into_iter()
+            .all(|column| has_column_reference(&tokens, index_alias, column))
+            && let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")?
+        {
+            return Ok(Some(SimpleCompatibilityQuery {
+                statement: CompatibilityStatement::PsqlIndexes,
+                values: vec![ScalarValue::Int64(i64::from(oid))],
+            }));
+        }
+    }
+    if let Some(attribute_alias) = relation_alias(&tokens, "pg_catalog", "pg_attribute")
+        && relation_alias(&tokens, "pg_catalog", "pg_attrdef").is_some()
+        && relation_alias(&tokens, "pg_catalog", "pg_collation").is_some()
+        && relation_alias(&tokens, "pg_catalog", "pg_type").is_some()
+        && normalized.contains("pg_catalog.format_type(")
+        && normalized.contains("pg_catalog.pg_get_expr(")
+        && [
+            "attname",
+            "atttypid",
+            "atttypmod",
+            "attrelid",
+            "attnum",
+            "attnotnull",
+            "attcollation",
+            "attidentity",
+            "attgenerated",
+            "attisdropped",
+        ]
+        .into_iter()
+        .all(|column| has_column_reference(&tokens, attribute_alias, column))
+        && let Some(oid) = relation_oid_literal(&tokens, attribute_alias, "attrelid")?
+    {
+        return Ok(Some(SimpleCompatibilityQuery {
+            statement: CompatibilityStatement::PsqlColumns,
+            values: vec![ScalarValue::Int64(i64::from(oid))],
+        }));
+    }
+    if let Some(policy_alias) = relation_alias(&tokens, "pg_catalog", "pg_policy")
+        && relation_alias(&tokens, "pg_catalog", "pg_roles").is_some()
+        && normalized.contains("pg_catalog.pg_get_expr(")
+        && [
+            "polname",
+            "polpermissive",
+            "polroles",
+            "polqual",
+            "polrelid",
+            "polwithcheck",
+            "polcmd",
+        ]
+        .into_iter()
+        .all(|column| has_column_reference(&tokens, policy_alias, column))
+        && let Some(oid) = relation_oid_literal(&tokens, policy_alias, "polrelid")?
+    {
+        return Ok(Some(SimpleCompatibilityQuery {
+            statement: CompatibilityStatement::PsqlPolicies,
+            values: vec![ScalarValue::Int64(i64::from(oid))],
+        }));
+    }
+    if normalized.contains(" from pg_catalog.pg_statistic_ext ")
+        && normalized.contains("pg_catalog.pg_get_statisticsobjdef_columns(")
+        && [
+            "oid",
+            "stxrelid",
+            "stxnamespace",
+            "stxname",
+            "stxkind",
+            "stxstattarget",
+        ]
+        .into_iter()
+        .all(|column| normalized.contains(column))
+        && let Some(oid) = unqualified_oid_literal(&tokens, "stxrelid")?
+    {
+        return Ok(Some(SimpleCompatibilityQuery {
+            statement: CompatibilityStatement::PsqlExtendedStatistics,
+            values: vec![ScalarValue::Int64(i64::from(oid))],
+        }));
+    }
+    if relation_alias(&tokens, "pg_catalog", "pg_publication").is_some()
+        && relation_alias(&tokens, "pg_catalog", "pg_publication_namespace").is_some()
+        && relation_alias(&tokens, "pg_catalog", "pg_publication_rel").is_some()
+        && normalized.contains("pg_catalog.pg_relation_is_publishable(")
+        && normalized.contains(" union ")
+        && normalized.contains("pubname")
+        && let Some(class_alias) = relation_alias(&tokens, "pg_catalog", "pg_class")
+        && let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")?
+    {
+        return Ok(Some(SimpleCompatibilityQuery {
+            statement: CompatibilityStatement::PsqlPublications,
+            values: vec![ScalarValue::Int64(i64::from(oid))],
+        }));
+    }
+    if let Some(inherits_alias) = relation_alias(&tokens, "pg_catalog", "pg_inherits")
+        && normalized.contains("::pg_catalog.regclass")
+        && ["inhparent", "inhrelid"]
+            .into_iter()
+            .all(|column| has_column_reference(&tokens, inherits_alias, column))
+        && normalized.contains("inhseqno")
+        && let Some(oid) = relation_oid_literal(&tokens, inherits_alias, "inhrelid")?
+    {
+        return Ok(Some(SimpleCompatibilityQuery {
+            statement: CompatibilityStatement::PsqlInheritanceParents,
+            values: vec![ScalarValue::Int64(i64::from(oid))],
+        }));
+    }
+    if let Some(inherits_alias) = relation_alias(&tokens, "pg_catalog", "pg_inherits")
+        && normalized.contains("::pg_catalog.regclass")
+        && normalized.contains("pg_catalog.pg_get_expr(")
+        && normalized.contains("relpartbound")
+        && normalized.contains("inhdetachpending")
+        && ["inhparent", "inhrelid"]
+            .into_iter()
+            .all(|column| has_column_reference(&tokens, inherits_alias, column))
+        && let Some(oid) = relation_oid_literal(&tokens, inherits_alias, "inhparent")?
+    {
+        return Ok(Some(SimpleCompatibilityQuery {
+            statement: CompatibilityStatement::PsqlInheritanceChildren,
+            values: vec![ScalarValue::Int64(i64::from(oid))],
+        }));
+    }
+    Ok(None)
+}
+
+fn lex_compatibility_query(sql: &str) -> Result<Vec<PgCompatibilityToken<'_>>, ErrorResponse> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    let mut nesting = 0_usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let token = match bytes[index] {
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+                {
+                    index += 1;
+                }
+                PgCompatibilityToken::Word(&sql[start..index])
+            }
+            b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    index += 1;
+                }
+                PgCompatibilityToken::Word(&sql[start..index])
+            }
+            b'\'' => {
+                index += 1;
+                let mut value = String::new();
+                let mut segment = index;
+                loop {
+                    let Some(relative) = bytes[index..].iter().position(|byte| *byte == b'\'')
+                    else {
+                        return Err(fixed_error(
+                            "42601",
+                            "unterminated string in PostgreSQL compatibility query",
+                        ));
+                    };
+                    let quote = index + relative;
+                    value.push_str(&sql[segment..quote]);
+                    if bytes.get(quote + 1) == Some(&b'\'') {
+                        value.push('\'');
+                        index = quote + 2;
+                        segment = index;
+                    } else {
+                        index = quote + 1;
+                        break;
+                    }
+                    if value.len() > MAX_CATALOG_PATTERN_BYTES {
+                        return Err(fixed_error(
+                            "54000",
+                            "PostgreSQL compatibility literal exceeds the pattern limit",
+                        ));
+                    }
+                }
+                if value.len() > MAX_CATALOG_PATTERN_BYTES {
+                    return Err(fixed_error(
+                        "54000",
+                        "PostgreSQL compatibility literal exceeds the pattern limit",
+                    ));
+                }
+                PgCompatibilityToken::String(value)
+            }
+            b'"' => {
+                index += 1;
+                let mut value = String::new();
+                loop {
+                    let Some(relative) = bytes[index..].iter().position(|byte| *byte == b'"')
+                    else {
+                        return Err(fixed_error(
+                            "42601",
+                            "unterminated quoted identifier in PostgreSQL compatibility query",
+                        ));
+                    };
+                    let quote = index + relative;
+                    value.push_str(&sql[index..quote]);
+                    if bytes.get(quote + 1) == Some(&b'"') {
+                        value.push('"');
+                        index = quote + 2;
+                    } else {
+                        index = quote + 1;
+                        break;
+                    }
+                    if value.len() > MAX_CATALOG_PATTERN_BYTES {
+                        return Err(fixed_error(
+                            "54000",
+                            "PostgreSQL compatibility identifier exceeds the configured limit",
+                        ));
+                    }
+                }
+                if value.len() > MAX_CATALOG_PATTERN_BYTES {
+                    return Err(fixed_error(
+                        "54000",
+                        "PostgreSQL compatibility identifier exceeds the configured limit",
+                    ));
+                }
+                PgCompatibilityToken::Identifier(value)
+            }
+            byte @ (b'.' | b',' | b'(' | b')' | b'=' | b'~' | b'*' | b';' | b':' | b'<' | b'>'
+            | b'[' | b']' | b'!') => {
+                index += 1;
+                if byte == b'(' {
+                    nesting = nesting.checked_add(1).ok_or_else(|| {
+                        fixed_error("54000", "PostgreSQL compatibility nesting is too deep")
+                    })?;
+                    if nesting > MAX_COMPATIBILITY_NESTING {
+                        return Err(fixed_error(
+                            "54000",
+                            "PostgreSQL compatibility nesting is too deep",
+                        ));
+                    }
+                } else if byte == b')' {
+                    nesting = nesting.checked_sub(1).ok_or_else(|| {
+                        fixed_error("42601", "unbalanced PostgreSQL compatibility parentheses")
+                    })?;
+                }
+                PgCompatibilityToken::Symbol(byte)
+            }
+            _ => {
+                return Err(fixed_error(
+                    "42601",
+                    "unsupported token in PostgreSQL compatibility query",
+                ));
+            }
+        };
+        tokens.push(token);
+        if tokens.len() > MAX_COMPATIBILITY_TOKENS {
+            return Err(fixed_error(
+                "54000",
+                "PostgreSQL compatibility query has too many tokens",
+            ));
+        }
+    }
+    if nesting != 0 {
+        return Err(fixed_error(
+            "42601",
+            "unbalanced PostgreSQL compatibility parentheses",
+        ));
+    }
+    Ok(tokens)
+}
+
+fn relation_alias<'a>(
+    tokens: &'a [PgCompatibilityToken<'a>],
+    schema: &str,
+    relation: &str,
+) -> Option<&'a str> {
+    for index in 0..tokens.len() {
+        if !qualified_name_at(tokens, index, schema, relation) {
+            continue;
+        }
+        let mut alias_index = index + 3;
+        if token_word_eq(tokens.get(alias_index), "as") {
+            alias_index += 1;
+        }
+        if let Some(PgCompatibilityToken::Word(alias)) = tokens.get(alias_index) {
+            return Some(alias);
+        }
+        if let Some(PgCompatibilityToken::Identifier(alias)) = tokens.get(alias_index) {
+            return Some(alias);
+        }
+    }
+    None
+}
+
+fn qualified_name_at(
+    tokens: &[PgCompatibilityToken<'_>],
+    index: usize,
+    qualifier: &str,
+    name: &str,
+) -> bool {
+    token_word_eq(tokens.get(index), qualifier)
+        && tokens.get(index + 1) == Some(&PgCompatibilityToken::Symbol(b'.'))
+        && token_word_eq(tokens.get(index + 2), name)
+}
+
+fn token_word_eq(token: Option<&PgCompatibilityToken<'_>>, expected: &str) -> bool {
+    match token {
+        Some(PgCompatibilityToken::Word(actual)) => actual.eq_ignore_ascii_case(expected),
+        Some(PgCompatibilityToken::Identifier(actual)) => actual == expected,
+        _ => false,
+    }
+}
+
+fn column_reference_at(
+    tokens: &[PgCompatibilityToken<'_>],
+    index: usize,
+    alias: &str,
+    column: &str,
+) -> bool {
+    token_word_eq(tokens.get(index), alias)
+        && tokens.get(index + 1) == Some(&PgCompatibilityToken::Symbol(b'.'))
+        && token_word_eq(tokens.get(index + 2), column)
+}
+
+fn has_column_reference(tokens: &[PgCompatibilityToken<'_>], alias: &str, column: &str) -> bool {
+    (0..tokens.len()).any(|index| column_reference_at(tokens, index, alias, column))
+}
+
+fn has_visible_table_predicate(tokens: &[PgCompatibilityToken<'_>], class_alias: &str) -> bool {
+    (0..tokens.len()).any(|index| {
+        qualified_name_at(tokens, index, "pg_catalog", "pg_table_is_visible")
+            && tokens.get(index + 3) == Some(&PgCompatibilityToken::Symbol(b'('))
+            && column_reference_at(tokens, index + 4, class_alias, "oid")
+            && tokens.get(index + 7) == Some(&PgCompatibilityToken::Symbol(b')'))
+    })
+}
+
+fn column_pattern(
+    tokens: &[PgCompatibilityToken<'_>],
+    relation_alias: &str,
+    column: &str,
+) -> Option<(PgCompatibilityOperator, String)> {
+    for index in 0..tokens.len() {
+        if !column_reference_at(tokens, index, relation_alias, column)
+            || !token_word_eq(tokens.get(index + 3), "operator")
+            || tokens.get(index + 4) != Some(&PgCompatibilityToken::Symbol(b'('))
+            || !token_word_eq(tokens.get(index + 5), "pg_catalog")
+            || tokens.get(index + 6) != Some(&PgCompatibilityToken::Symbol(b'.'))
+            || tokens.get(index + 7) != Some(&PgCompatibilityToken::Symbol(b'~'))
+            || tokens.get(index + 8) != Some(&PgCompatibilityToken::Symbol(b')'))
+        {
+            continue;
+        }
+        let PgCompatibilityToken::String(pattern) = tokens.get(index + 9)? else {
+            return None;
+        };
+        if !token_word_eq(tokens.get(index + 10), "collate")
+            || !qualified_name_at(tokens, index + 11, "pg_catalog", "default")
+        {
+            return None;
+        }
+        return Some((PgCompatibilityOperator::RegexMatch, pattern.clone()));
+    }
+    None
+}
+
+fn relation_oid_literal(
+    tokens: &[PgCompatibilityToken<'_>],
+    relation_alias: &str,
+    column: &str,
+) -> Result<Option<u32>, ErrorResponse> {
+    for index in 0..tokens.len() {
+        if !column_reference_at(tokens, index, relation_alias, column)
+            || tokens.get(index + 3) != Some(&PgCompatibilityToken::Symbol(b'='))
+        {
+            continue;
+        }
+        let Some(PgCompatibilityToken::String(oid)) = tokens.get(index + 4) else {
+            return Err(fixed_error(
+                "42601",
+                "psql relation OID predicate must use one literal",
+            ));
+        };
+        let oid = oid
+            .parse::<u32>()
+            .map_err(|_| fixed_error("22P02", "invalid psql relation OID literal"))?;
+        return Ok(Some(oid));
+    }
+    Ok(None)
+}
+
+fn unqualified_oid_literal(
+    tokens: &[PgCompatibilityToken<'_>],
+    column: &str,
+) -> Result<Option<u32>, ErrorResponse> {
+    for index in 0..tokens.len() {
+        if !token_word_eq(tokens.get(index), column)
+            || tokens.get(index + 1) != Some(&PgCompatibilityToken::Symbol(b'='))
+        {
+            continue;
+        }
+        let Some(PgCompatibilityToken::String(oid)) = tokens.get(index + 2) else {
+            return Err(fixed_error(
+                "42601",
+                "psql relation OID predicate must use one literal",
+            ));
+        };
+        return oid
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| fixed_error("22P02", "invalid psql relation OID literal"));
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgCatalogPatternAtom {
+    Literal(char),
+    AnyCharacter,
+    AnySequence,
+}
+
+#[derive(Debug)]
+struct PgCatalogPattern {
+    atoms: Vec<PgCatalogPatternAtom>,
+}
+
+impl PgCatalogPattern {
+    fn compile(pattern: &str) -> Result<Self, ErrorResponse> {
+        if pattern.len() > MAX_CATALOG_PATTERN_BYTES {
+            return Err(fixed_error(
+                "54000",
+                "PostgreSQL catalog pattern exceeds the configured limit",
+            ));
+        }
+        let Some(body) = pattern
+            .strip_prefix("^(")
+            .and_then(|pattern| pattern.strip_suffix(")$"))
+        else {
+            return Err(fixed_error(
+                "0A000",
+                "only anchored psql catalog patterns are supported",
+            ));
+        };
+        let mut atoms = Vec::new();
+        let mut characters = body.chars();
+        while let Some(character) = characters.next() {
+            let atom = match character {
+                '\\' => {
+                    PgCatalogPatternAtom::Literal(characters.next().ok_or_else(|| {
+                        fixed_error("42601", "catalog pattern ends with an escape")
+                    })?)
+                }
+                '.' if characters.clone().next() == Some('*') => {
+                    characters.next();
+                    PgCatalogPatternAtom::AnySequence
+                }
+                '.' => PgCatalogPatternAtom::AnyCharacter,
+                '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '+' | '*' | '?' => {
+                    return Err(fixed_error(
+                        "0A000",
+                        "catalog pattern uses an unsupported PostgreSQL regular expression feature",
+                    ));
+                }
+                literal => PgCatalogPatternAtom::Literal(literal),
+            };
+            atoms.push(atom);
+            if atoms.len() > MAX_CATALOG_PATTERN_ATOMS {
+                return Err(fixed_error(
+                    "54000",
+                    "PostgreSQL catalog pattern has too many atoms",
+                ));
+            }
+        }
+        Ok(Self { atoms })
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        let value = value.chars().collect::<Vec<_>>();
+        let mut previous = vec![false; value.len() + 1];
+        previous[0] = true;
+        for atom in &self.atoms {
+            let mut current = vec![false; value.len() + 1];
+            if *atom == PgCatalogPatternAtom::AnySequence {
+                current[0] = previous[0];
+            }
+            for index in 1..=value.len() {
+                current[index] = match atom {
+                    PgCatalogPatternAtom::Literal(expected) => {
+                        previous[index - 1] && value[index - 1] == *expected
+                    }
+                    PgCatalogPatternAtom::AnyCharacter => previous[index - 1],
+                    PgCatalogPatternAtom::AnySequence => previous[index] || current[index - 1],
+                };
+            }
+            previous = current;
+        }
+        previous[value.len()]
+    }
+}
+
+fn compile_optional_catalog_pattern(
+    value: &ScalarValue,
+) -> Result<Option<PgCatalogPattern>, ErrorResponse> {
+    match value {
+        ScalarValue::Null => Ok(None),
+        ScalarValue::Text(pattern) => PgCatalogPattern::compile(pattern).map(Some),
+        _ => Err(fixed_error(
+            "42804",
+            "psql catalog pattern must be text or NULL",
+        )),
+    }
+}
+
 fn classify_compatibility_statement(sql: &str) -> Option<CompatibilityStatement> {
     let normalized = normalize_sql(sql);
     if !normalized.starts_with("select ") {
@@ -1924,9 +2609,20 @@ fn is_index_ddl(normalized: &str) -> bool {
 
 fn compatibility_parameter_types(statement: CompatibilityStatement) -> &'static [PostgresType] {
     match statement {
-        CompatibilityStatement::TypeLookup | CompatibilityStatement::SchemaNames => {
-            &[PostgresType::Text]
-        }
+        CompatibilityStatement::PsqlRelationLookup
+        | CompatibilityStatement::TypeLookup
+        | CompatibilityStatement::SchemaNames => &[PostgresType::Text],
+        CompatibilityStatement::PsqlRelationLookupQualified
+        | CompatibilityStatement::PsqlTableList
+        | CompatibilityStatement::PsqlIndexList => &[PostgresType::Text, PostgresType::Text],
+        CompatibilityStatement::PsqlRelationProperties
+        | CompatibilityStatement::PsqlColumns
+        | CompatibilityStatement::PsqlIndexes
+        | CompatibilityStatement::PsqlPolicies
+        | CompatibilityStatement::PsqlExtendedStatistics
+        | CompatibilityStatement::PsqlPublications
+        | CompatibilityStatement::PsqlInheritanceParents
+        | CompatibilityStatement::PsqlInheritanceChildren => &[PostgresType::Int8],
         CompatibilityStatement::TableNames => &[
             PostgresType::Text,
             PostgresType::Text,
@@ -2030,6 +2726,113 @@ fn compatibility_parameter_types(statement: CompatibilityStatement) -> &'static 
 
 fn compatibility_fields(statement: CompatibilityStatement) -> Vec<FieldDescription> {
     let fields = match statement {
+        CompatibilityStatement::PsqlRelationLookup => [
+            ("oid", PostgresType::Int8),
+            ("nspname", PostgresType::Text),
+            ("relname", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlRelationLookupQualified => [
+            ("oid", PostgresType::Int8),
+            ("nspname", PostgresType::Text),
+            ("relname", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlTableList => [
+            ("Schema", PostgresType::Text),
+            ("Name", PostgresType::Text),
+            ("Type", PostgresType::Text),
+            ("Owner", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlIndexList => [
+            ("Schema", PostgresType::Text),
+            ("Name", PostgresType::Text),
+            ("Type", PostgresType::Text),
+            ("Owner", PostgresType::Text),
+            ("Table", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlRelationProperties => [
+            ("relchecks", PostgresType::Int8),
+            ("relkind", PostgresType::Text),
+            ("relhasindex", PostgresType::Bool),
+            ("relhasrules", PostgresType::Bool),
+            ("relhastriggers", PostgresType::Bool),
+            ("relrowsecurity", PostgresType::Bool),
+            ("relforcerowsecurity", PostgresType::Bool),
+            ("relhasoids", PostgresType::Bool),
+            ("relispartition", PostgresType::Bool),
+            ("reloptions", PostgresType::Text),
+            ("reltablespace", PostgresType::Int8),
+            ("reloftype", PostgresType::Text),
+            ("relpersistence", PostgresType::Text),
+            ("relreplident", PostgresType::Text),
+            ("amname", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlColumns => [
+            ("attname", PostgresType::Text),
+            ("format_type", PostgresType::Text),
+            ("default", PostgresType::Text),
+            ("attnotnull", PostgresType::Bool),
+            ("attcollation", PostgresType::Text),
+            ("attidentity", PostgresType::Text),
+            ("attgenerated", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlIndexes => [
+            ("relname", PostgresType::Text),
+            ("indisprimary", PostgresType::Bool),
+            ("indisunique", PostgresType::Bool),
+            ("indisclustered", PostgresType::Bool),
+            ("indisvalid", PostgresType::Bool),
+            ("indexdef", PostgresType::Text),
+            ("constraintdef", PostgresType::Text),
+            ("contype", PostgresType::Text),
+            ("condeferrable", PostgresType::Bool),
+            ("condeferred", PostgresType::Bool),
+            ("indisreplident", PostgresType::Bool),
+            ("reltablespace", PostgresType::Int8),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlPolicies => [
+            ("polname", PostgresType::Text),
+            ("polpermissive", PostgresType::Bool),
+            ("roles", PostgresType::Text),
+            ("qual", PostgresType::Text),
+            ("withcheck", PostgresType::Text),
+            ("cmd", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlExtendedStatistics => [
+            ("oid", PostgresType::Int8),
+            ("stxrelid", PostgresType::Text),
+            ("nsp", PostgresType::Text),
+            ("stxname", PostgresType::Text),
+            ("columns", PostgresType::Text),
+            ("ndist_enabled", PostgresType::Bool),
+            ("deps_enabled", PostgresType::Bool),
+            ("mcv_enabled", PostgresType::Bool),
+            ("stxstattarget", PostgresType::Int8),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlPublications => [
+            ("pubname", PostgresType::Text),
+            ("qual", PostgresType::Text),
+            ("columns", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::PsqlInheritanceParents => {
+            [("parent", PostgresType::Text)].as_slice()
+        }
+        CompatibilityStatement::PsqlInheritanceChildren => [
+            ("child", PostgresType::Text),
+            ("relkind", PostgresType::Text),
+            ("inhdetachpending", PostgresType::Bool),
+            ("relpartbound", PostgresType::Text),
+        ]
+        .as_slice(),
         CompatibilityStatement::TypeLookup => [
             ("name", PostgresType::Text),
             ("oid", PostgresType::Int8),
@@ -2146,7 +2949,543 @@ fn execute_compatibility_statement(
     statement: CompatibilityStatement,
     values: &[ScalarValue],
 ) -> Result<QueryResult, ErrorResponse> {
+    execute_compatibility_statement_for_owner(catalog, authorization, "netbadb", statement, values)
+}
+
+fn execute_compatibility_statement_for_owner(
+    catalog: &PgCompatibilityCatalog,
+    authorization: &PrincipalAuthorization,
+    compatibility_owner: &str,
+    statement: CompatibilityStatement,
+    values: &[ScalarValue],
+) -> Result<QueryResult, ErrorResponse> {
     match statement {
+        CompatibilityStatement::PsqlRelationLookup => {
+            let [ScalarValue::Text(pattern)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql relation lookup requires one text pattern",
+                ));
+            };
+            let pattern = PgCatalogPattern::compile(pattern)?;
+            let mut tables = catalog
+                .tables
+                .iter()
+                .filter(|table| {
+                    authorization.can_see(table.table_id) && pattern.matches(&table.name)
+                })
+                .collect::<Vec<_>>();
+            tables.sort_by(|left, right| left.name.cmp(&right.name).then(left.oid.cmp(&right.oid)));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("oid", PhysicalType::Int64, false),
+                    compatibility_result_column("nspname", PhysicalType::Text, false),
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                ],
+                rows: tables
+                    .into_iter()
+                    .map(|table| {
+                        vec![
+                            ScalarValue::Int64(i64::from(table.oid)),
+                            ScalarValue::Text("public".into()),
+                            ScalarValue::Text(table.name.clone()),
+                        ]
+                    })
+                    .collect(),
+            })
+        }
+        CompatibilityStatement::PsqlRelationLookupQualified => {
+            let [schema_pattern, relation_pattern] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "qualified psql relation lookup requires schema and relation patterns",
+                ));
+            };
+            let Some(schema_pattern) = compile_optional_catalog_pattern(schema_pattern)? else {
+                return Err(fixed_error("42804", "psql schema pattern cannot be NULL"));
+            };
+            let Some(relation_pattern) = compile_optional_catalog_pattern(relation_pattern)? else {
+                return Err(fixed_error("42804", "psql relation pattern cannot be NULL"));
+            };
+            let mut tables = catalog
+                .tables
+                .iter()
+                .filter(|table| {
+                    authorization.can_see(table.table_id)
+                        && schema_pattern.matches("public")
+                        && relation_pattern.matches(&table.name)
+                })
+                .collect::<Vec<_>>();
+            tables.sort_by(|left, right| left.name.cmp(&right.name).then(left.oid.cmp(&right.oid)));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("oid", PhysicalType::Int64, false),
+                    compatibility_result_column("nspname", PhysicalType::Text, false),
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                ],
+                rows: tables
+                    .into_iter()
+                    .map(|table| {
+                        vec![
+                            ScalarValue::Int64(i64::from(table.oid)),
+                            ScalarValue::Text("public".into()),
+                            ScalarValue::Text(table.name.clone()),
+                        ]
+                    })
+                    .collect(),
+            })
+        }
+        CompatibilityStatement::PsqlTableList => {
+            let [schema_pattern, name_pattern] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql table listing requires schema and name pattern slots",
+                ));
+            };
+            let schema_pattern = compile_optional_catalog_pattern(schema_pattern)?;
+            let name_pattern = compile_optional_catalog_pattern(name_pattern)?;
+            let mut tables = catalog
+                .tables
+                .iter()
+                .filter(|table| authorization.can_see(table.table_id))
+                .filter(|_| {
+                    schema_pattern
+                        .as_ref()
+                        .is_none_or(|pattern| pattern.matches("public"))
+                })
+                .filter(|table| {
+                    name_pattern
+                        .as_ref()
+                        .is_none_or(|pattern| pattern.matches(&table.name))
+                })
+                .collect::<Vec<_>>();
+            tables.sort_by(|left, right| left.name.cmp(&right.name).then(left.oid.cmp(&right.oid)));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("Schema", PhysicalType::Text, false),
+                    compatibility_result_column("Name", PhysicalType::Text, false),
+                    compatibility_result_column("Type", PhysicalType::Text, false),
+                    compatibility_result_column("Owner", PhysicalType::Text, false),
+                ],
+                rows: tables
+                    .into_iter()
+                    .map(|table| {
+                        vec![
+                            ScalarValue::Text("public".into()),
+                            ScalarValue::Text(table.name.clone()),
+                            ScalarValue::Text("table".into()),
+                            ScalarValue::Text(compatibility_owner.into()),
+                        ]
+                    })
+                    .collect(),
+            })
+        }
+        CompatibilityStatement::PsqlIndexList => {
+            let [schema_pattern, name_pattern] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql index listing requires schema and name pattern slots",
+                ));
+            };
+            let schema_pattern = compile_optional_catalog_pattern(schema_pattern)?;
+            let name_pattern = compile_optional_catalog_pattern(name_pattern)?;
+            let schema_matches = schema_pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.matches("public"));
+            let mut rows = Vec::new();
+            if schema_matches {
+                for table in catalog
+                    .tables
+                    .iter()
+                    .filter(|table| authorization.can_see(table.table_id))
+                {
+                    let primary_name = compatibility_primary_key_name(&table.name, table.oid);
+                    let pattern_selects_table = name_pattern.as_ref().is_none_or(|pattern| {
+                        (table.columns.iter().any(|column| column.primary_key)
+                            && pattern.matches(&primary_name))
+                            || table
+                                .indexes
+                                .iter()
+                                .any(|index| pattern.matches(&index.name))
+                    });
+                    if !pattern_selects_table {
+                        continue;
+                    }
+                    if !table.index_reflection_supported {
+                        return Err(fixed_error(
+                            "0A000",
+                            "logical index reflection is unsupported for partitioned tables",
+                        ));
+                    }
+                    if table.columns.iter().any(|column| column.primary_key)
+                        && name_pattern
+                            .as_ref()
+                            .is_none_or(|pattern| pattern.matches(&primary_name))
+                    {
+                        rows.push(vec![
+                            ScalarValue::Text("public".into()),
+                            ScalarValue::Text(primary_name),
+                            ScalarValue::Text("index".into()),
+                            ScalarValue::Text(compatibility_owner.into()),
+                            ScalarValue::Text(table.name.clone()),
+                        ]);
+                    }
+                    for index in &table.indexes {
+                        if name_pattern
+                            .as_ref()
+                            .is_some_and(|pattern| !pattern.matches(&index.name))
+                        {
+                            continue;
+                        }
+                        rows.push(vec![
+                            ScalarValue::Text("public".into()),
+                            ScalarValue::Text(index.name.clone()),
+                            ScalarValue::Text("index".into()),
+                            ScalarValue::Text(compatibility_owner.into()),
+                            ScalarValue::Text(table.name.clone()),
+                        ]);
+                    }
+                }
+            }
+            rows.sort_by(|left, right| match (&left[1], &right[1]) {
+                (ScalarValue::Text(left), ScalarValue::Text(right)) => left.cmp(right),
+                _ => std::cmp::Ordering::Equal,
+            });
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("Schema", PhysicalType::Text, false),
+                    compatibility_result_column("Name", PhysicalType::Text, false),
+                    compatibility_result_column("Type", PhysicalType::Text, false),
+                    compatibility_result_column("Owner", PhysicalType::Text, false),
+                    compatibility_result_column("Table", PhysicalType::Text, false),
+                ],
+                rows,
+            })
+        }
+        CompatibilityStatement::PsqlRelationProperties => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql relation properties require one OID",
+                ));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("relchecks", PhysicalType::Int64, false),
+                    compatibility_result_column("relkind", PhysicalType::Text, false),
+                    compatibility_result_column("relhasindex", PhysicalType::Bool, false),
+                    compatibility_result_column("relhasrules", PhysicalType::Bool, false),
+                    compatibility_result_column("relhastriggers", PhysicalType::Bool, false),
+                    compatibility_result_column("relrowsecurity", PhysicalType::Bool, false),
+                    compatibility_result_column("relforcerowsecurity", PhysicalType::Bool, false),
+                    compatibility_result_column("relhasoids", PhysicalType::Bool, false),
+                    compatibility_result_column("relispartition", PhysicalType::Bool, false),
+                    compatibility_result_column("reloptions", PhysicalType::Text, false),
+                    compatibility_result_column("reltablespace", PhysicalType::Int64, false),
+                    compatibility_result_column("reloftype", PhysicalType::Text, false),
+                    compatibility_result_column("relpersistence", PhysicalType::Text, false),
+                    compatibility_result_column("relreplident", PhysicalType::Text, false),
+                    compatibility_result_column("amname", PhysicalType::Text, true),
+                ],
+                rows: table
+                    .map(|table| {
+                        let has_index = !table.indexes.is_empty()
+                            || table.columns.iter().any(|column| column.primary_key);
+                        vec![vec![
+                            ScalarValue::Int64(0),
+                            ScalarValue::Text("r".into()),
+                            ScalarValue::Bool(has_index),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Text(String::new()),
+                            ScalarValue::Int64(0),
+                            ScalarValue::Text(String::new()),
+                            ScalarValue::Text("p".into()),
+                            ScalarValue::Text("n".into()),
+                            ScalarValue::Null,
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+        CompatibilityStatement::PsqlColumns => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error("42804", "psql columns require one table OID"));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            let rows = table
+                .into_iter()
+                .flat_map(|table| {
+                    table.columns.iter().map(|column| {
+                        Ok(vec![
+                            ScalarValue::Text(column.name.clone()),
+                            ScalarValue::Text(postgres_reflection_type(column.physical)?.into()),
+                            ScalarValue::Null,
+                            ScalarValue::Bool(!column.nullable),
+                            ScalarValue::Null,
+                            ScalarValue::Text(String::new()),
+                            ScalarValue::Text(String::new()),
+                        ])
+                    })
+                })
+                .collect::<Result<Vec<_>, ErrorResponse>>()?;
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("attname", PhysicalType::Text, false),
+                    compatibility_result_column("format_type", PhysicalType::Text, false),
+                    compatibility_result_column("default", PhysicalType::Text, true),
+                    compatibility_result_column("attnotnull", PhysicalType::Bool, false),
+                    compatibility_result_column("attcollation", PhysicalType::Text, true),
+                    compatibility_result_column("attidentity", PhysicalType::Text, false),
+                    compatibility_result_column("attgenerated", PhysicalType::Text, false),
+                ],
+                rows,
+            })
+        }
+        CompatibilityStatement::PsqlIndexes => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error("42804", "psql indexes require one table OID"));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            if table.is_some_and(|table| !table.index_reflection_supported) {
+                return Err(fixed_error(
+                    "0A000",
+                    "logical index reflection is unsupported for partitioned tables",
+                ));
+            }
+            let mut rows = Vec::new();
+            if let Some(table) = table {
+                let primary_columns = table
+                    .columns
+                    .iter()
+                    .filter(|column| column.primary_key)
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>();
+                if !primary_columns.is_empty() {
+                    let name = compatibility_primary_key_name(&table.name, table.oid);
+                    let columns = postgres_identifier_list(&primary_columns);
+                    rows.push(vec![
+                        ScalarValue::Text(name.clone()),
+                        ScalarValue::Bool(true),
+                        ScalarValue::Bool(true),
+                        ScalarValue::Bool(false),
+                        ScalarValue::Bool(true),
+                        ScalarValue::Text(format!(
+                            "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({columns})",
+                            quote_postgres_identifier(&name),
+                            quote_postgres_identifier("public"),
+                            quote_postgres_identifier(&table.name),
+                        )),
+                        ScalarValue::Text(format!("PRIMARY KEY ({columns})")),
+                        ScalarValue::Text("p".into()),
+                        ScalarValue::Bool(false),
+                        ScalarValue::Bool(false),
+                        ScalarValue::Bool(false),
+                        ScalarValue::Int64(0),
+                    ]);
+                }
+                for index in &table.indexes {
+                    let column = quote_postgres_identifier(&index.column_name);
+                    rows.push(vec![
+                        ScalarValue::Text(index.name.clone()),
+                        ScalarValue::Bool(false),
+                        ScalarValue::Bool(index.unique),
+                        ScalarValue::Bool(false),
+                        ScalarValue::Bool(true),
+                        ScalarValue::Text(format!(
+                            "CREATE INDEX {} ON {}.{} USING {} ({column})",
+                            quote_postgres_identifier(&index.name),
+                            quote_postgres_identifier("public"),
+                            quote_postgres_identifier(&table.name),
+                            index.access_method,
+                        )),
+                        ScalarValue::Null,
+                        ScalarValue::Null,
+                        ScalarValue::Null,
+                        ScalarValue::Null,
+                        ScalarValue::Bool(false),
+                        ScalarValue::Int64(0),
+                    ]);
+                }
+                rows.sort_by(|left, right| {
+                    let left_primary = matches!(left.get(1), Some(ScalarValue::Bool(true)));
+                    let right_primary = matches!(right.get(1), Some(ScalarValue::Bool(true)));
+                    right_primary.cmp(&left_primary).then_with(|| {
+                        let left_name = match left.first() {
+                            Some(ScalarValue::Text(name)) => name.as_str(),
+                            _ => "",
+                        };
+                        let right_name = match right.first() {
+                            Some(ScalarValue::Text(name)) => name.as_str(),
+                            _ => "",
+                        };
+                        left_name.cmp(right_name)
+                    })
+                });
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                    compatibility_result_column("indisprimary", PhysicalType::Bool, false),
+                    compatibility_result_column("indisunique", PhysicalType::Bool, false),
+                    compatibility_result_column("indisclustered", PhysicalType::Bool, false),
+                    compatibility_result_column("indisvalid", PhysicalType::Bool, false),
+                    compatibility_result_column("indexdef", PhysicalType::Text, false),
+                    compatibility_result_column("constraintdef", PhysicalType::Text, true),
+                    compatibility_result_column("contype", PhysicalType::Text, true),
+                    compatibility_result_column("condeferrable", PhysicalType::Bool, true),
+                    compatibility_result_column("condeferred", PhysicalType::Bool, true),
+                    compatibility_result_column("indisreplident", PhysicalType::Bool, false),
+                    compatibility_result_column("reltablespace", PhysicalType::Int64, false),
+                ],
+                rows,
+            })
+        }
+        CompatibilityStatement::PsqlPolicies => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error("42804", "psql policies require one table OID"));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let _visible_table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("polname", PhysicalType::Text, false),
+                    compatibility_result_column("polpermissive", PhysicalType::Bool, false),
+                    compatibility_result_column("roles", PhysicalType::Text, true),
+                    compatibility_result_column("qual", PhysicalType::Text, true),
+                    compatibility_result_column("withcheck", PhysicalType::Text, true),
+                    compatibility_result_column("cmd", PhysicalType::Text, false),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::PsqlExtendedStatistics => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql extended statistics require one table OID",
+                ));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let _visible_table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("oid", PhysicalType::Int64, false),
+                    compatibility_result_column("stxrelid", PhysicalType::Text, false),
+                    compatibility_result_column("nsp", PhysicalType::Text, false),
+                    compatibility_result_column("stxname", PhysicalType::Text, false),
+                    compatibility_result_column("columns", PhysicalType::Text, false),
+                    compatibility_result_column("ndist_enabled", PhysicalType::Bool, false),
+                    compatibility_result_column("deps_enabled", PhysicalType::Bool, false),
+                    compatibility_result_column("mcv_enabled", PhysicalType::Bool, false),
+                    compatibility_result_column("stxstattarget", PhysicalType::Int64, false),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::PsqlPublications => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql publications require one table OID",
+                ));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let _visible_table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("pubname", PhysicalType::Text, false),
+                    compatibility_result_column("qual", PhysicalType::Text, true),
+                    compatibility_result_column("columns", PhysicalType::Text, true),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::PsqlInheritanceParents => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql inheritance lookup requires one table OID",
+                ));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let _visible_table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![compatibility_result_column(
+                    "parent",
+                    PhysicalType::Text,
+                    false,
+                )],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::PsqlInheritanceChildren => {
+            let [ScalarValue::Int64(oid)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "psql inheritance lookup requires one table OID",
+                ));
+            };
+            let oid = u32::try_from(*oid)
+                .map_err(|_| fixed_error("22003", "psql relation OID is out of range"))?;
+            let _visible_table = catalog
+                .tables
+                .iter()
+                .find(|table| table.oid == oid)
+                .filter(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("child", PhysicalType::Text, false),
+                    compatibility_result_column("relkind", PhysicalType::Text, false),
+                    compatibility_result_column("inhdetachpending", PhysicalType::Bool, false),
+                    compatibility_result_column("relpartbound", PhysicalType::Text, true),
+                ],
+                rows: Vec::new(),
+            })
+        }
         CompatibilityStatement::TypeLookup => {
             if !matches!(values, [ScalarValue::Text(_) | ScalarValue::Null]) {
                 return Err(fixed_error(
@@ -2294,17 +3633,7 @@ fn execute_compatibility_statement(
                     .columns
                     .iter()
                     .map(|column| {
-                        let format_type = match column.physical {
-                            PhysicalType::Bool => "boolean",
-                            PhysicalType::Int64 => "bigint",
-                            PhysicalType::Text => "text",
-                            PhysicalType::UInt64 => {
-                                return Err(fixed_error(
-                                    "0A000",
-                                    "UINT64 has no lossless PostgreSQL reflection type",
-                                ));
-                            }
-                        };
+                        let format_type = postgres_reflection_type(column.physical)?;
                         Ok(vec![
                             ScalarValue::Text(column.name.clone()),
                             ScalarValue::Text(format_type.to_owned()),
@@ -2698,6 +4027,56 @@ fn execute_compatibility_statement(
     }
 }
 
+fn postgres_reflection_type(physical: PhysicalType) -> Result<&'static str, ErrorResponse> {
+    match physical {
+        PhysicalType::Bool => Ok("boolean"),
+        PhysicalType::Int64 => Ok("bigint"),
+        PhysicalType::Text => Ok("text"),
+        PhysicalType::UInt64 => Err(fixed_error(
+            "0A000",
+            "UINT64 has no lossless PostgreSQL reflection type",
+        )),
+    }
+}
+
+fn compatibility_primary_key_name(table_name: &str, table_oid: u32) -> String {
+    let simple = format!("{table_name}_pkey");
+    if simple.len() <= POSTGRES_IDENTIFIER_MAX_BYTES
+        && simple.bytes().enumerate().all(|(index, byte)| {
+            matches!(byte, b'a'..=b'z' | b'_') || (index != 0 && byte.is_ascii_digit())
+        })
+    {
+        return simple;
+    }
+    let readable = sanitized_index_name_prefix(table_name, "pkey");
+    let suffix = format!("_{table_oid:08x}_pkey");
+    let keep = readable
+        .len()
+        .min(POSTGRES_IDENTIFIER_MAX_BYTES.saturating_sub("nb_".len() + suffix.len()));
+    format!("nb_{}{suffix}", &readable[..keep])
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    let mut quoted = String::with_capacity(identifier.len().saturating_add(2));
+    quoted.push('"');
+    for character in identifier.chars() {
+        if character == '"' {
+            quoted.push('"');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn postgres_identifier_list(identifiers: &[&str]) -> String {
+    identifiers
+        .iter()
+        .map(|identifier| quote_postgres_identifier(identifier))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn sql_like(value: &str, pattern: &str) -> bool {
     fn matches(value: &[u8], pattern: &[u8]) -> bool {
         match pattern.first().copied() {
@@ -2803,6 +4182,22 @@ fn query_messages(query: QueryResult, limit: usize) -> Result<Vec<BackendMessage
         is_query: true,
     };
     let fields = fields_from_description(&description)?;
+    let rows = encode_query_rows(&query, &fields, limit)?;
+    let row_count = rows.len();
+    let mut messages = Vec::with_capacity(row_count.saturating_add(2));
+    messages.push(BackendMessage::RowDescription(fields));
+    messages.extend(rows.into_iter().map(BackendMessage::DataRow));
+    messages.push(BackendMessage::CommandComplete(format!(
+        "SELECT {row_count}"
+    )));
+    Ok(messages)
+}
+
+fn query_messages_with_fields(
+    query: QueryResult,
+    fields: Vec<FieldDescription>,
+    limit: usize,
+) -> Result<Vec<BackendMessage>, ErrorResponse> {
     let rows = encode_query_rows(&query, &fields, limit)?;
     let row_count = rows.len();
     let mut messages = Vec::with_capacity(row_count.saturating_add(2));
@@ -3215,7 +4610,13 @@ mod tests {
                 table_id: TableId(41),
                 oid: SYNTHETIC_OID_BASE,
                 name: "events".into(),
-                columns: Vec::new(),
+                columns: vec![PgCatalogColumn {
+                    column_id: ColumnId(1),
+                    name: "id".into(),
+                    physical: PhysicalType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                }],
                 indexes: Vec::new(),
                 index_reflection_supported: false,
             }],
@@ -3239,6 +4640,25 @@ mod tests {
         )
         .expect_err("partition-local indexes cannot become one logical index");
         assert_eq!(error.sqlstate, "0A000");
+        let unrelated = execute_compatibility_statement(
+            &catalog,
+            &authorized,
+            CompatibilityStatement::PsqlIndexList,
+            &[ScalarValue::Null, ScalarValue::Text("^(users.*)$".into())],
+        )
+        .expect("an unrelated psql index pattern does not select the partitioned table");
+        assert!(unrelated.rows.is_empty());
+        assert_eq!(
+            execute_compatibility_statement(
+                &catalog,
+                &authorized,
+                CompatibilityStatement::PsqlIndexList,
+                &[ScalarValue::Null, ScalarValue::Text("^(events.*)$".into()),],
+            )
+            .expect_err("a selected partitioned logical index remains unsupported")
+            .sqlstate,
+            "0A000"
+        );
     }
 
     #[test]
@@ -3322,6 +4742,69 @@ mod tests {
         )
         .expect("table names");
         assert_eq!(names.rows, [vec![ScalarValue::Text("users".into())]]);
+
+        let psql_tables = execute_compatibility_statement_for_owner(
+            &catalog,
+            &restricted,
+            "restricted_user",
+            CompatibilityStatement::PsqlTableList,
+            &[ScalarValue::Null, ScalarValue::Null],
+        )
+        .expect("psql table list");
+        assert_eq!(
+            psql_tables.rows,
+            [vec![
+                ScalarValue::Text("public".into()),
+                ScalarValue::Text("users".into()),
+                ScalarValue::Text("table".into()),
+                ScalarValue::Text("restricted_user".into()),
+            ]]
+        );
+
+        let qualified_users = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::PsqlRelationLookupQualified,
+            &[
+                ScalarValue::Text("^(public)$".into()),
+                ScalarValue::Text("^(user.*)$".into()),
+            ],
+        )
+        .expect("qualified psql relation lookup");
+        assert_eq!(qualified_users.rows.len(), 1);
+        let wrong_schema = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::PsqlRelationLookupQualified,
+            &[
+                ScalarValue::Text("^(private)$".into()),
+                ScalarValue::Text("^(user.*)$".into()),
+            ],
+        )
+        .expect("non-matching schema");
+        assert!(wrong_schema.rows.is_empty());
+
+        let psql_indexes = execute_compatibility_statement_for_owner(
+            &catalog,
+            &restricted,
+            "restricted_user",
+            CompatibilityStatement::PsqlIndexList,
+            &[ScalarValue::Null, ScalarValue::Text("^(.*users.*)$".into())],
+        )
+        .expect("psql index list");
+        assert_eq!(psql_indexes.rows.len(), 3);
+        assert!(
+            psql_indexes
+                .rows
+                .iter()
+                .all(|row| row[3] == ScalarValue::Text("restricted_user".into()))
+        );
+        assert!(
+            psql_indexes
+                .rows
+                .iter()
+                .all(|row| { matches!(&row[4], ScalarValue::Text(table) if table == "users") })
+        );
 
         let missing = execute_compatibility_statement(
             &catalog,
@@ -3511,5 +4994,316 @@ mod tests {
         assert!(sql_like("pg_catalog", "pg_%"));
         assert!(sql_like("public", "pub_ic"));
         assert!(!sql_like("public", "pg_%"));
+    }
+
+    #[test]
+    fn psql_relation_lookup_is_structural_bounded_and_non_backtracking() {
+        let query = "SELECT klass.oid, space.nspname, klass.relname \
+                     FROM pg_catalog.pg_class AS klass \
+                     LEFT JOIN pg_catalog.pg_namespace AS space \
+                       ON space.oid = klass.relnamespace \
+                     WHERE klass.relname OPERATOR ( pg_catalog.~ ) '^(user.*)$' \
+                       COLLATE pg_catalog.default \
+                       AND pg_catalog.pg_table_is_visible(klass.oid) \
+                     ORDER BY 2, 3";
+        let classified = classify_simple_compatibility_query(query)
+            .expect("classify psql relation lookup")
+            .expect("recognized psql relation lookup");
+        assert_eq!(
+            classified.statement,
+            CompatibilityStatement::PsqlRelationLookup
+        );
+        assert_eq!(
+            classified.values,
+            vec![ScalarValue::Text("^(user.*)$".into())]
+        );
+
+        let qualified = "SELECT rel.oid, ns.nspname, rel.relname \
+                         FROM pg_catalog.pg_class rel \
+                         LEFT JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace \
+                         WHERE rel.relname OPERATOR(pg_catalog.~) '^(users)$' COLLATE pg_catalog.default \
+                           AND ns.nspname OPERATOR(pg_catalog.~) '^(public)$' COLLATE pg_catalog.default";
+        let classified = classify_simple_compatibility_query(qualified)
+            .expect("classify qualified relation lookup")
+            .expect("recognize qualified relation lookup");
+        assert_eq!(
+            classified.statement,
+            CompatibilityStatement::PsqlRelationLookupQualified
+        );
+        assert_eq!(
+            classified.values,
+            [
+                ScalarValue::Text("^(public)$".into()),
+                ScalarValue::Text("^(users)$".into()),
+            ]
+        );
+
+        let table_list = "SELECT ns.nspname AS \"Schema\", rel.relname AS \"Name\", \
+                          CASE rel.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' END AS \"Type\", \
+                          pg_catalog.pg_get_userbyid(rel.relowner) AS \"Owner\" \
+                          FROM pg_catalog.pg_class AS rel \
+                          LEFT JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace \
+                          LEFT JOIN pg_catalog.pg_am AS method ON method.oid = rel.relam \
+                          WHERE rel.relkind IN ('r', 'p', '') \
+                            AND rel.relname OPERATOR(pg_catalog.~) '^(user.*)$' COLLATE pg_catalog.default \
+                            AND pg_catalog.pg_table_is_visible(rel.oid)";
+        let classified = classify_simple_compatibility_query(table_list)
+            .expect("classify table listing")
+            .expect("recognize table listing");
+        assert_eq!(classified.statement, CompatibilityStatement::PsqlTableList);
+        assert_eq!(
+            classified.values,
+            [ScalarValue::Null, ScalarValue::Text("^(user.*)$".into())]
+        );
+
+        let index_list = "SELECT ns.nspname AS \"Schema\", idx_class.relname AS \"Name\", \
+                          pg_catalog.pg_get_userbyid(idx_class.relowner) AS \"Owner\", table_class.relname AS \"Table\" \
+                          FROM pg_catalog.pg_class AS idx_class \
+                          LEFT JOIN pg_catalog.pg_namespace AS ns ON ns.oid = idx_class.relnamespace \
+                          LEFT JOIN pg_catalog.pg_am AS method ON method.oid = idx_class.relam \
+                          LEFT JOIN pg_catalog.pg_index AS idx ON idx.indexrelid = idx_class.oid \
+                          LEFT JOIN pg_catalog.pg_class AS table_class ON idx.indrelid = table_class.oid \
+                          WHERE idx_class.relkind IN ('i', 'I', '') \
+                            AND idx_class.relname OPERATOR(pg_catalog.~) '^(.*users.*)$' COLLATE pg_catalog.default \
+                            AND pg_catalog.pg_table_is_visible(idx_class.oid)";
+        let classified = classify_simple_compatibility_query(index_list)
+            .expect("classify index listing")
+            .expect("recognize index listing");
+        assert_eq!(classified.statement, CompatibilityStatement::PsqlIndexList);
+        assert_eq!(
+            classified.values,
+            [ScalarValue::Null, ScalarValue::Text("^(.*users.*)$".into()),]
+        );
+
+        let policies = "SELECT pol.polname, pol.polpermissive, pol.polroles, \
+                        pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), \
+                        pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid), pol.polcmd \
+                        FROM pg_catalog.pg_policy pol, pg_catalog.pg_roles role \
+                        WHERE pol.polrelid = '2591984850'";
+        assert_eq!(
+            classify_simple_compatibility_query(policies)
+                .expect("classify policies")
+                .expect("recognize policies")
+                .statement,
+            CompatibilityStatement::PsqlPolicies
+        );
+        let statistics = "SELECT oid, stxrelid, stxnamespace, stxname, stxkind, stxstattarget, \
+                          pg_catalog.pg_get_statisticsobjdef_columns(oid) \
+                          FROM pg_catalog.pg_statistic_ext WHERE stxrelid = '2591984850'";
+        assert_eq!(
+            classify_simple_compatibility_query(statistics)
+                .expect("classify statistics")
+                .expect("recognize statistics")
+                .statement,
+            CompatibilityStatement::PsqlExtendedStatistics
+        );
+        let publications = "SELECT pub.pubname FROM pg_catalog.pg_publication pub \
+                            JOIN pg_catalog.pg_publication_namespace pubns ON true \
+                            JOIN pg_catalog.pg_publication_rel pubrel ON true \
+                            JOIN pg_catalog.pg_class rel ON true \
+                            WHERE rel.oid = '2591984850' \
+                              AND pg_catalog.pg_relation_is_publishable(rel.oid) \
+                            UNION SELECT pub.pubname FROM pg_catalog.pg_publication pub";
+        assert_eq!(
+            classify_simple_compatibility_query(publications)
+                .expect("classify publications")
+                .expect("recognize publications")
+                .statement,
+            CompatibilityStatement::PsqlPublications
+        );
+        let parents = "SELECT rel.oid::pg_catalog.regclass \
+                       FROM pg_catalog.pg_class rel, pg_catalog.pg_inherits inh \
+                       WHERE rel.oid = inh.inhparent AND inh.inhrelid = '2591984850' \
+                       ORDER BY inhseqno";
+        assert_eq!(
+            classify_simple_compatibility_query(parents)
+                .expect("classify inheritance parents")
+                .expect("recognize inheritance parents")
+                .statement,
+            CompatibilityStatement::PsqlInheritanceParents
+        );
+        let children = "SELECT rel.oid::pg_catalog.regclass, rel.relkind, inhdetachpending, \
+                        pg_catalog.pg_get_expr(rel.relpartbound, rel.oid) \
+                        FROM pg_catalog.pg_class rel, pg_catalog.pg_inherits inh \
+                        WHERE rel.oid = inh.inhrelid AND inh.inhparent = '2591984850'";
+        assert_eq!(
+            classify_simple_compatibility_query(children)
+                .expect("classify inheritance children")
+                .expect("recognize inheritance children")
+                .statement,
+            CompatibilityStatement::PsqlInheritanceChildren
+        );
+
+        let properties = "SELECT k.relchecks, k.relkind, k.relhasindex, k.relhasrules, \
+                          k.relhastriggers, k.relrowsecurity, k.relforcerowsecurity, false, \
+                          k.relispartition, '', k.reltablespace, \
+                          CASE WHEN k.reloftype = 0 THEN '' ELSE k.reloftype::pg_catalog.regtype::pg_catalog.text END, \
+                          k.relpersistence, k.relreplident, method.amname \
+                          FROM pg_catalog.pg_class k \
+                          LEFT JOIN pg_catalog.pg_class toast_class ON (k.reltoastrelid = toast_class.oid) \
+                          LEFT JOIN pg_catalog.pg_am method ON (k.relam = method.oid) \
+                          WHERE k.oid = '2591984850'";
+        let classified = classify_simple_compatibility_query(properties)
+            .expect("classify psql relation properties")
+            .expect("recognized psql relation properties");
+        assert_eq!(
+            classified.statement,
+            CompatibilityStatement::PsqlRelationProperties
+        );
+        assert_eq!(classified.values, vec![ScalarValue::Int64(2_591_984_850)]);
+
+        let columns = "SELECT attr.attname, \
+                       pg_catalog.format_type(attr.atttypid, attr.atttypmod), \
+                       (SELECT pg_catalog.pg_get_expr(def.adbin, def.adrelid, true) \
+                        FROM pg_catalog.pg_attrdef def \
+                        WHERE def.adrelid = attr.attrelid AND def.adnum = attr.attnum AND attr.atthasdef), \
+                       attr.attnotnull, \
+                       (SELECT coll.collname FROM pg_catalog.pg_collation coll, pg_catalog.pg_type typ \
+                        WHERE coll.oid = attr.attcollation AND typ.oid = attr.atttypid) AS attcollation, \
+                       attr.attidentity, attr.attgenerated \
+                       FROM pg_catalog.pg_attribute attr \
+                       WHERE attr.attrelid = '2591984850' AND attr.attnum > 0 AND NOT attr.attisdropped \
+                       ORDER BY attr.attnum";
+        let tokens = lex_compatibility_query(columns).expect("lex psql columns");
+        let attribute_alias =
+            relation_alias(&tokens, "pg_catalog", "pg_attribute").expect("attribute alias");
+        assert!(relation_alias(&tokens, "pg_catalog", "pg_attrdef").is_some());
+        assert!(relation_alias(&tokens, "pg_catalog", "pg_collation").is_some());
+        assert!(relation_alias(&tokens, "pg_catalog", "pg_type").is_some());
+        let normalized_columns = normalize_sql(columns);
+        assert!(normalized_columns.contains("pg_catalog.format_type("));
+        assert!(normalized_columns.contains("pg_catalog.pg_get_expr("));
+        for column in [
+            "attname",
+            "atttypid",
+            "atttypmod",
+            "attrelid",
+            "attnum",
+            "attnotnull",
+            "attcollation",
+            "attidentity",
+            "attgenerated",
+            "attisdropped",
+        ] {
+            assert!(
+                has_column_reference(&tokens, attribute_alias, column),
+                "missing column marker {column}"
+            );
+        }
+        assert_eq!(
+            relation_oid_literal(&tokens, attribute_alias, "attrelid")
+                .expect("column OID predicate"),
+            Some(2_591_984_850)
+        );
+        let classified = classify_simple_compatibility_query(columns)
+            .expect("classify psql columns")
+            .expect("recognized psql columns");
+        assert_eq!(classified.statement, CompatibilityStatement::PsqlColumns);
+        assert_eq!(classified.values, vec![ScalarValue::Int64(2_591_984_850)]);
+
+        let indexes = "SELECT idx_class.relname, idx.indisprimary, idx.indisunique, \
+                       idx.indisclustered, idx.indisvalid, \
+                       pg_catalog.pg_get_indexdef(idx.indexrelid, 0, true), \
+                       pg_catalog.pg_get_constraintdef(con.oid, true), contype, \
+                       condeferrable, condeferred, idx.indisreplident, idx_class.reltablespace \
+                       FROM pg_catalog.pg_class table_class, pg_catalog.pg_class idx_class, \
+                            pg_catalog.pg_index idx \
+                       LEFT JOIN pg_catalog.pg_constraint con ON \
+                         (conrelid = idx.indrelid AND conindid = idx.indexrelid AND contype IN ('p','u','x')) \
+                       WHERE table_class.oid = '2591984850' \
+                         AND table_class.oid = idx.indrelid AND idx.indexrelid = idx_class.oid \
+                       ORDER BY idx.indisprimary DESC, idx_class.relname";
+        let classified = classify_simple_compatibility_query(indexes)
+            .expect("classify psql indexes")
+            .expect("recognized psql indexes");
+        assert_eq!(classified.statement, CompatibilityStatement::PsqlIndexes);
+        assert_eq!(classified.values, vec![ScalarValue::Int64(2_591_984_850)]);
+
+        let wildcard = PgCatalogPattern::compile("^(user.*)$").expect("compile wildcard");
+        assert!(wildcard.matches("users"));
+        assert!(wildcard.matches("user_profiles"));
+        assert!(!wildcard.matches("teams"));
+        let utf8 = PgCatalogPattern::compile("^(用户.)$").expect("compile UTF-8 pattern");
+        assert!(utf8.matches("用户表"));
+        let escaped = PgCatalogPattern::compile(r"^(user\.name)$").expect("compile escape");
+        assert!(escaped.matches("user.name"));
+        assert!(!escaped.matches("userXname"));
+        assert_eq!(
+            PgCatalogPattern::compile("^(user[0-9])$")
+                .expect_err("reject unsupported character class")
+                .sqlstate,
+            "0A000"
+        );
+
+        let unterminated = query.replace("'^(user.*)$'", "'^(user.*)$");
+        assert_eq!(
+            classify_simple_compatibility_query(&unterminated)
+                .expect_err("reject unterminated literal")
+                .sqlstate,
+            "42601"
+        );
+        let oversized = format!("^({})$", "x".repeat(MAX_CATALOG_PATTERN_BYTES));
+        assert_eq!(
+            PgCatalogPattern::compile(&oversized)
+                .expect_err("reject oversized pattern")
+                .sqlstate,
+            "54000"
+        );
+
+        let truncated_operator = query.replace(
+            "OPERATOR ( pg_catalog.~ ) '^(user.*)$'",
+            "OPERATOR ( pg_catalog.",
+        );
+        assert_eq!(
+            classify_simple_compatibility_query(&truncated_operator)
+                .expect_err("reject truncated OPERATOR")
+                .sqlstate,
+            "42601"
+        );
+        let invalid_operator = query.replace("pg_catalog.~", "pg_catalog.=");
+        assert!(
+            classify_simple_compatibility_query(&invalid_operator)
+                .expect("invalid operator is not a supported compatibility query")
+                .is_none()
+        );
+        let invalid_schema = query.replace("pg_catalog.~", "other.~");
+        assert!(
+            classify_simple_compatibility_query(&invalid_schema)
+                .expect("invalid operator schema is not a supported compatibility query")
+                .is_none()
+        );
+        assert_eq!(
+            lex_compatibility_query("SELECT \"unterminated FROM pg_catalog.pg_class c")
+                .expect_err("reject unterminated quoted identifier")
+                .sqlstate,
+            "42601"
+        );
+        let oversized_identifier = format!(
+            "SELECT \"{}\" FROM pg_catalog.pg_class c",
+            "x".repeat(MAX_CATALOG_PATTERN_BYTES + 1),
+        );
+        assert_eq!(
+            lex_compatibility_query(&oversized_identifier)
+                .expect_err("reject oversized quoted identifier")
+                .sqlstate,
+            "54000"
+        );
+        assert_eq!(
+            lex_compatibility_query("SELECT (c.oid FROM pg_catalog.pg_class c")
+                .expect_err("reject unclosed parenthesis")
+                .sqlstate,
+            "42601"
+        );
+        let deeply_nested = format!(
+            "SELECT {}c.oid{} FROM pg_catalog.pg_class c",
+            "(".repeat(MAX_COMPATIBILITY_NESTING + 1),
+            ")".repeat(MAX_COMPATIBILITY_NESTING + 1),
+        );
+        assert_eq!(
+            lex_compatibility_query(&deeply_nested)
+                .expect_err("reject excessive nesting")
+                .sqlstate,
+            "54000"
+        );
     }
 }

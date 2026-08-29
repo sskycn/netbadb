@@ -1,6 +1,6 @@
 # PostgreSQL client compatibility matrix
 
-This matrix records Round 4 observations against a real loopback TCP listener.
+This matrix records Round 5 observations against a real loopback TCP listener.
 It is evidence for the experimental existing-schema profile, not a claim of
 drop-in PostgreSQL compatibility.
 
@@ -40,6 +40,9 @@ production or build dependencies.
 | SQLAlchemy ORM mapped SELECT | yes | reflected imperative mapping |
 | SQLAlchemy ORM CRUD | yes | explicit primary keys; no schema creation |
 | Alembic inspect / autogenerate | yes, read-only | matching metadata has no diff; absent indexes propose two `remove_index` operations |
+| psql `\d` | yes | columns, types, nullability, PK and real secondary indexes; qualified/missing/wildcard variants |
+| psql `\dt` | yes | authorized `public` tables and name/schema patterns |
+| psql `\di` | yes | compatibility PK and real secondary indexes, plus name patterns |
 | DDL / migration apply | unsupported | not invoked; existing-schema profile only |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
@@ -77,10 +80,10 @@ bounded deterministic names because the native registry has no user-defined
 index name. The names and domain-separated synthetic object OIDs are stable for
 the same Canonical Schema/index registry across reopen and connections.
 
-The optional psql `\\d users` probe remains unsupported: psql first issues a
-Simple Query containing `OPERATOR(pg_catalog.~)`, which the native parser
-rejects. Round 4 does not broaden the catalog parser just to satisfy this
-stretch probe.
+psql Simple Query catalog SQL is recognized structurally and lowered to the
+same read-only metadata evaluator as Extended Query reflection. The catalog-only
+pattern subset is bounded and non-backtracking; it is not exposed as a general
+SQL regex operator.
 
 ## Reproduction
 
@@ -106,6 +109,8 @@ In another terminal, substitute the printed port:
 
 /tmp/netbadb-pg-venv/bin/python scripts/test-postgresql-alembic.py \
   --dsn postgresql+psycopg://netbadb@127.0.0.1:PORT/test
+
+python3 scripts/test-postgresql-psql.py
 ```
 
 Set `NETBADB_POSTGRES_TRACE=1` only when protocol diagnostics are needed. The
