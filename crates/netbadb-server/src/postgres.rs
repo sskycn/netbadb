@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
@@ -18,7 +18,8 @@ use netbadb_pgwire::{
     encode_text_value, read_frontend_message, read_startup_packet, write_backend_message,
 };
 use netbadb_protocol::WireTransactionState;
-use netbadb_types::{PhysicalType, ScalarValue};
+use netbadb_types::{PhysicalType, ScalarValue, SemanticType, TableId};
+use sha2::{Digest, Sha256};
 
 use crate::authorization::{AuthorizationAction, AuthorizationPolicy, PrincipalAuthorization};
 use crate::{
@@ -508,7 +509,7 @@ fn run_pg_worker(
                     }
                 };
                 let (session, messages) =
-                    PgWorkerSession::new(policy, principal, startup, session_id);
+                    PgWorkerSession::new(&database, policy, principal, startup, session_id);
                 sessions.insert(session_id, session);
                 let _ = reply.send(Ok(messages));
             }
@@ -577,19 +578,147 @@ impl PgTransactionStatus {
 
 struct PreparedStatement {
     sql: String,
-    prepared: CorePrepared,
+    execution: PreparedExecution,
     parameters: Vec<PostgresOid>,
     fields: Vec<FieldDescription>,
     is_query: bool,
 }
 
+#[derive(Clone)]
+enum PreparedExecution {
+    Core(Box<CorePrepared>),
+    Compatibility(CompatibilityStatement),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatibilityStatement {
+    TypeLookup,
+    SchemaNames,
+    TableNames,
+    HasTableVisible,
+    HasTableQualified,
+    ColumnsVisible,
+    ColumnsQualified,
+    Domains,
+    Enums,
+    TableOidsVisible,
+    TableOidsQualified,
+    PrimaryKeys,
+    ForeignKeysVisible,
+    ForeignKeysQualified,
+    Indexes,
+    TableCommentsVisible,
+    TableCommentsQualified,
+    CheckConstraintsVisible,
+    CheckConstraintsQualified,
+}
+
 struct Portal {
     statement: String,
     sql: String,
-    prepared: CorePrepared,
+    execution: PreparedExecution,
     values: Vec<ScalarValue>,
     fields: Vec<FieldDescription>,
     result: Option<PortalResult>,
+}
+
+struct ReadOnlySavepoint {
+    name: String,
+    mutation_generation: u64,
+}
+
+const SYNTHETIC_TABLE_OID_BASE: u32 = 0x8000_0000;
+const SYNTHETIC_OID_MASK: u32 = 0x1fff_ffff;
+
+#[derive(Clone)]
+struct PgCompatibilityCatalog {
+    tables: Vec<PgCatalogTable>,
+}
+
+#[derive(Clone)]
+struct PgCatalogTable {
+    table_id: TableId,
+    oid: u32,
+    name: String,
+    columns: Vec<PgCatalogColumn>,
+}
+
+#[derive(Clone)]
+struct PgCatalogColumn {
+    name: String,
+    physical: PhysicalType,
+    nullable: bool,
+    primary_key: bool,
+}
+
+impl PgCompatibilityCatalog {
+    fn derive(database: &Database) -> Self {
+        let mut identities = database
+            .schema()
+            .tables()
+            .iter()
+            .map(|table| {
+                let mut hash = Sha256::new();
+                hash.update(b"netbadb-pg-object-oid-v1");
+                hash.update(table.id.0.to_be_bytes());
+                hash.update(table.name.as_bytes());
+                for column in &table.columns {
+                    hash.update(column.id.0.to_be_bytes());
+                    hash.update(column.name.as_bytes());
+                    hash.update([match column.semantic_type().physical {
+                        PhysicalType::Bool => 1,
+                        PhysicalType::Int64 => 2,
+                        PhysicalType::UInt64 => 3,
+                        PhysicalType::Text => 4,
+                    }]);
+                    hash.update([u8::from(column.nullable), u8::from(column.primary_key)]);
+                }
+                (table.id, <[u8; 32]>::from(hash.finalize()))
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by(|left, right| left.1.cmp(&right.1).then((left.0).0.cmp(&(right.0).0)));
+        let table_oids = assign_synthetic_oids(&identities, SYNTHETIC_TABLE_OID_BASE);
+        let tables = database
+            .schema()
+            .tables()
+            .iter()
+            .map(|table| PgCatalogTable {
+                table_id: table.id,
+                oid: table_oids[&table.id],
+                name: table.name.clone(),
+                columns: table
+                    .columns
+                    .iter()
+                    .map(|column| PgCatalogColumn {
+                        name: column.name.clone(),
+                        physical: column.semantic_type().physical,
+                        nullable: column.nullable,
+                        primary_key: column.primary_key,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self { tables }
+    }
+
+    fn table(&self, name: &str) -> Option<&PgCatalogTable> {
+        self.tables.iter().find(|table| table.name == name)
+    }
+}
+
+fn assign_synthetic_oids(identities: &[(TableId, [u8; 32])], base: u32) -> HashMap<TableId, u32> {
+    let mut assigned = HashMap::with_capacity(identities.len());
+    let mut used = HashSet::with_capacity(identities.len());
+    for (table_id, digest) in identities {
+        let mut candidate = base
+            | (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+                & SYNTHETIC_OID_MASK);
+        while !used.insert(candidate) {
+            candidate = base | (candidate.wrapping_add(1) & SYNTHETIC_OID_MASK);
+        }
+        assigned.insert(*table_id, candidate);
+    }
+    assigned
 }
 
 enum PortalResult {
@@ -611,15 +740,27 @@ struct PgWorkerSession {
     prepared: HashMap<String, PreparedStatement>,
     portals: HashMap<String, Portal>,
     awaiting_sync: bool,
+    mutation_generation: u64,
+    savepoints: Vec<ReadOnlySavepoint>,
+    catalog: PgCompatibilityCatalog,
+    trace_enabled: bool,
 }
 
 impl PgWorkerSession {
     fn new(
+        database: &Database,
         policy: SessionPolicy,
         authorization: PrincipalAuthorization,
         startup: StartupMessage,
         session_id: u64,
     ) -> (Self, Vec<BackendMessage>) {
+        let trace_enabled = std::env::var_os("NETBADB_POSTGRES_TRACE").is_some();
+        if trace_enabled {
+            let parameter_names = startup.parameters.keys().cloned().collect::<Vec<_>>();
+            eprintln!(
+                "netbadb postgres trace: startup session={session_id} parameter_names={parameter_names:?}"
+            );
+        }
         let user = startup.parameter("user").unwrap_or("netbadb").to_owned();
         let database_name = startup.parameter("database").unwrap_or(&user).to_owned();
         let process_id = i32::try_from(session_id).unwrap_or(i32::MAX);
@@ -649,52 +790,124 @@ impl PgWorkerSession {
                 prepared: HashMap::new(),
                 portals: HashMap::new(),
                 awaiting_sync: false,
+                mutation_generation: 0,
+                savepoints: Vec::new(),
+                catalog: PgCompatibilityCatalog::derive(database),
+                trace_enabled,
             },
             messages,
         )
     }
 
     fn handle(&mut self, database: &mut Database, message: FrontendMessage) -> Vec<BackendMessage> {
-        if self.awaiting_sync {
-            return match message {
+        self.trace_frontend(&message);
+        let messages = if self.awaiting_sync {
+            match message {
                 FrontendMessage::Sync => {
                     self.awaiting_sync = false;
                     vec![BackendMessage::ReadyForQuery(self.status.ready_byte())]
                 }
                 _ => Vec::new(),
-            };
+            }
+        } else {
+            match message {
+                FrontendMessage::Query(sql) => self.simple_query(database, &sql),
+                FrontendMessage::Parse {
+                    statement,
+                    query,
+                    parameter_types,
+                } => self.parse(database, statement, query, parameter_types),
+                FrontendMessage::Bind {
+                    portal,
+                    statement,
+                    parameter_formats,
+                    parameters,
+                    result_formats,
+                } => self.bind(
+                    portal,
+                    statement,
+                    parameter_formats,
+                    parameters,
+                    result_formats,
+                ),
+                FrontendMessage::Describe { target, name } => self.describe(target, &name),
+                FrontendMessage::Execute { portal, max_rows } => {
+                    self.execute_portal(database, &portal, max_rows)
+                }
+                FrontendMessage::Close { target, name } => self.close_object(target, &name),
+                FrontendMessage::Sync => {
+                    vec![BackendMessage::ReadyForQuery(self.status.ready_byte())]
+                }
+                FrontendMessage::Flush => Vec::new(),
+                FrontendMessage::Password(_) => {
+                    self.extended_error(fixed_error("08P01", "unexpected PasswordMessage"))
+                }
+                FrontendMessage::Terminate => Vec::new(),
+            }
+        };
+        self.trace_backend_errors(&messages);
+        messages
+    }
+
+    fn trace_frontend(&self, message: &FrontendMessage) {
+        if !self.trace_enabled {
+            return;
         }
         match message {
-            FrontendMessage::Query(sql) => self.simple_query(database, &sql),
+            FrontendMessage::Query(sql) => {
+                eprintln!("netbadb postgres trace: Query sql={sql:?}");
+            }
             FrontendMessage::Parse {
                 statement,
                 query,
                 parameter_types,
-            } => self.parse(database, statement, query, parameter_types),
+            } => {
+                let parameter_oids = parameter_types.iter().map(|oid| oid.0).collect::<Vec<_>>();
+                eprintln!(
+                    "netbadb postgres trace: Parse statement={statement:?} parameter_oids={parameter_oids:?} sql={query:?}"
+                );
+            }
             FrontendMessage::Bind {
                 portal,
                 statement,
                 parameter_formats,
                 parameters,
                 result_formats,
-            } => self.bind(
-                portal,
-                statement,
-                parameter_formats,
-                parameters,
-                result_formats,
-            ),
-            FrontendMessage::Describe { target, name } => self.describe(target, &name),
+            } => {
+                eprintln!(
+                    "netbadb postgres trace: Bind portal={portal:?} statement={statement:?} parameter_count={} parameter_formats={parameter_formats:?} result_formats={result_formats:?}",
+                    parameters.len()
+                );
+            }
+            FrontendMessage::Describe { target, name } => {
+                eprintln!("netbadb postgres trace: Describe target={target:?} name={name:?}");
+            }
             FrontendMessage::Execute { portal, max_rows } => {
-                self.execute_portal(database, &portal, max_rows)
+                eprintln!("netbadb postgres trace: Execute portal={portal:?} max_rows={max_rows}");
             }
-            FrontendMessage::Close { target, name } => self.close_object(target, &name),
-            FrontendMessage::Sync => vec![BackendMessage::ReadyForQuery(self.status.ready_byte())],
-            FrontendMessage::Flush => Vec::new(),
+            FrontendMessage::Close { target, name } => {
+                eprintln!("netbadb postgres trace: Close target={target:?} name={name:?}");
+            }
+            FrontendMessage::Sync => eprintln!("netbadb postgres trace: Sync"),
+            FrontendMessage::Flush => eprintln!("netbadb postgres trace: Flush"),
+            FrontendMessage::Terminate => eprintln!("netbadb postgres trace: Terminate"),
             FrontendMessage::Password(_) => {
-                self.extended_error(fixed_error("08P01", "unexpected PasswordMessage"))
+                eprintln!("netbadb postgres trace: Password payload=<redacted>");
             }
-            FrontendMessage::Terminate => Vec::new(),
+        }
+    }
+
+    fn trace_backend_errors(&self, messages: &[BackendMessage]) {
+        if !self.trace_enabled {
+            return;
+        }
+        for message in messages {
+            if let BackendMessage::ErrorResponse(error) = message {
+                eprintln!(
+                    "netbadb postgres trace: ErrorResponse sqlstate={} message={:?}",
+                    error.sqlstate, error.message
+                );
+            }
         }
     }
 
@@ -738,6 +951,12 @@ impl PgWorkerSession {
                 "54000",
                 "prepared statement session limit reached",
             ));
+        }
+        if let Some(compatibility) = classify_compatibility_statement(&query) {
+            if self.trace_enabled {
+                eprintln!("netbadb postgres trace: compatibility classification={compatibility:?}");
+            }
+            return self.parse_compatibility(statement, query, parameter_types, compatibility);
         }
         let declared = match parameter_types
             .iter()
@@ -786,10 +1005,68 @@ impl PgWorkerSession {
             statement,
             PreparedStatement {
                 sql: query,
-                prepared,
+                execution: PreparedExecution::Core(Box::new(prepared)),
                 parameters: inferred_oids,
                 fields,
                 is_query: description.is_query,
+            },
+        );
+        vec![BackendMessage::ParseComplete]
+    }
+
+    fn parse_compatibility(
+        &mut self,
+        statement: String,
+        query: String,
+        parameter_types: Vec<PostgresOid>,
+        compatibility: CompatibilityStatement,
+    ) -> Vec<BackendMessage> {
+        let expected_parameters = compatibility_parameter_types(compatibility);
+        if parameter_types.len() > expected_parameters.len() {
+            return self.extended_error(fixed_error(
+                "08P01",
+                "Parse declares more parameters than the compatibility query uses",
+            ));
+        }
+        let parameters = expected_parameters
+            .iter()
+            .enumerate()
+            .map(
+                |(index, expected)| match parameter_types.get(index).copied() {
+                    None | Some(PostgresOid(0)) => Ok(expected.oid()),
+                    Some(oid) => {
+                        let Some(supplied) = PostgresType::from_oid(oid) else {
+                            return Err(map_type_error(TypeMappingError::UnsupportedOid(oid)));
+                        };
+                        if supplied.netbadb_physical() == expected.netbadb_physical() {
+                            Ok(oid)
+                        } else {
+                            Err(fixed_error(
+                                "42804",
+                                "compatibility query parameter has an incompatible type",
+                            ))
+                        }
+                    }
+                },
+            )
+            .collect::<Result<Vec<_>, _>>();
+        let parameters = match parameters {
+            Ok(parameters) => parameters,
+            Err(error) => return self.extended_error(error),
+        };
+        if statement.is_empty() {
+            self.prepared.remove("");
+            self.portals
+                .retain(|_, portal| !portal.statement.is_empty());
+        }
+        self.prepared.insert(
+            statement,
+            PreparedStatement {
+                sql: query,
+                execution: PreparedExecution::Compatibility(compatibility),
+                parameters,
+                fields: compatibility_fields(compatibility),
+                is_query: true,
             },
         );
         vec![BackendMessage::ParseComplete]
@@ -858,7 +1135,7 @@ impl PgWorkerSession {
             })
             .collect();
         let sql = prepared.sql.clone();
-        let core_prepared = prepared.prepared.clone();
+        let execution = prepared.execution.clone();
         if portal.is_empty() {
             self.portals.remove("");
         }
@@ -867,7 +1144,7 @@ impl PgWorkerSession {
             Portal {
                 statement,
                 sql,
-                prepared: core_prepared,
+                execution,
                 values,
                 fields,
                 result: None,
@@ -919,7 +1196,7 @@ impl PgWorkerSession {
             let result = match self.execute_to_portal(
                 database,
                 &portal.sql,
-                &portal.prepared,
+                &portal.execution,
                 &portal.values,
                 &portal.fields,
             ) {
@@ -944,19 +1221,34 @@ impl PgWorkerSession {
         &mut self,
         database: &mut Database,
         sql: &str,
-        prepared: &CorePrepared,
+        execution: &PreparedExecution,
         values: &[ScalarValue],
         fields: &[FieldDescription],
     ) -> Result<PortalResult, ErrorResponse> {
-        let result = self.execute_prepared_core(database, prepared, values)?;
+        let result = match execution {
+            PreparedExecution::Core(prepared) => {
+                self.execute_prepared_core(database, prepared, values)?
+            }
+            PreparedExecution::Compatibility(statement) => {
+                ExecutionResult::Query(execute_compatibility_statement(
+                    &self.catalog,
+                    &self.authorization,
+                    *statement,
+                    values,
+                )?)
+            }
+        };
         match result {
             ExecutionResult::Query(query) => Ok(PortalResult::Query {
                 rows: encode_query_rows(&query, fields, self.execution.policy.max_result_rows())?,
                 position: 0,
             }),
-            ExecutionResult::AffectedRows(count) => Ok(PortalResult::Command {
-                tag: command_tag(sql, count),
-            }),
+            ExecutionResult::AffectedRows(count) => {
+                self.mutation_generation = self.mutation_generation.saturating_add(1);
+                Ok(PortalResult::Command {
+                    tag: command_tag(sql, count),
+                })
+            }
         }
     }
 
@@ -983,7 +1275,32 @@ impl PgWorkerSession {
             "begin" | "begin transaction" | "start transaction" => return self.begin(database),
             "commit" | "commit transaction" => return self.commit(),
             "rollback" | "rollback transaction" => return self.rollback(),
+            "deallocate all" => {
+                self.prepared.clear();
+                self.portals.clear();
+                return Ok(vec![BackendMessage::CommandComplete("DEALLOCATE".into())]);
+            }
             _ => {}
+        }
+        if let Some(name) = transaction_control_name(&normalized, "deallocate prepare ")
+            .or_else(|| transaction_control_name(&normalized, "deallocate "))
+        {
+            self.prepared.remove(name);
+            self.portals.retain(|_, portal| portal.statement != name);
+            return Ok(vec![BackendMessage::CommandComplete("DEALLOCATE".into())]);
+        }
+        if let Some(name) = transaction_control_name(&normalized, "savepoint ") {
+            return self.savepoint(name);
+        }
+        if let Some(name) = transaction_control_name(&normalized, "release savepoint ")
+            .or_else(|| transaction_control_name(&normalized, "release "))
+        {
+            return self.release_savepoint(name);
+        }
+        if let Some(name) = transaction_control_name(&normalized, "rollback to savepoint ")
+            .or_else(|| transaction_control_name(&normalized, "rollback to "))
+        {
+            return self.rollback_to_savepoint(name);
         }
         if self.status == PgTransactionStatus::Failed {
             return Err(fixed_error(
@@ -992,7 +1309,26 @@ impl PgWorkerSession {
             ));
         }
         if let Some(messages) = self.compatibility_query(&normalized) {
+            if self.trace_enabled {
+                eprintln!("netbadb postgres trace: compatibility classification=ScalarCommand");
+            }
             return Ok(messages);
+        }
+        if normalized.contains("pg_catalog.")
+            && ["insert ", "update ", "delete "]
+                .into_iter()
+                .any(|prefix| normalized.starts_with(prefix))
+        {
+            return Err(fixed_error(
+                "0A000",
+                "the PostgreSQL compatibility catalog is read-only",
+            ));
+        }
+        if classify_compatibility_statement(sql).is_some() {
+            return Err(fixed_error(
+                "0A000",
+                "parameterized catalog reflection requires Extended Query",
+            ));
         }
         let result = self.execute_core(database, sql)?;
         match result {
@@ -1000,9 +1336,12 @@ impl PgWorkerSession {
                 query_messages(query, self.execution.policy.max_result_rows())
                     .map_err(|error| self.record_protocol_error(error))
             }
-            ExecutionResult::AffectedRows(count) => Ok(vec![BackendMessage::CommandComplete(
-                command_tag(sql, count),
-            )]),
+            ExecutionResult::AffectedRows(count) => {
+                self.mutation_generation = self.mutation_generation.saturating_add(1);
+                Ok(vec![BackendMessage::CommandComplete(command_tag(
+                    sql, count,
+                ))])
+            }
         }
     }
 
@@ -1090,10 +1429,18 @@ impl PgWorkerSession {
                 "permission denied to start transaction",
             ));
         }
+        let transaction_anchor = self
+            .catalog
+            .tables
+            .iter()
+            .find(|table| self.authorization.can_see(table.table_id))
+            .map(|table| table.table_id)
+            .ok_or_else(|| fixed_error("42501", "no authorized transaction anchor"))?;
         self.execution
-            .begin(database, None)
+            .begin(database, Some(transaction_anchor))
             .map_err(|error| map_database_error(&error))?;
         self.status = PgTransactionStatus::InTransaction;
+        self.savepoints.clear();
         Ok(vec![BackendMessage::CommandComplete("BEGIN".into())])
     }
 
@@ -1109,6 +1456,7 @@ impl PgWorkerSession {
                     .commit()
                     .map_err(|error| map_database_error(&error))?;
                 self.status = PgTransactionStatus::Idle;
+                self.savepoints.clear();
                 Ok(vec![BackendMessage::CommandComplete("COMMIT".into())])
             }
         }
@@ -1121,6 +1469,58 @@ impl PgWorkerSession {
                 .map_err(|error| map_database_error(&error))?;
         }
         self.status = PgTransactionStatus::Idle;
+        self.savepoints.clear();
+        Ok(vec![BackendMessage::CommandComplete("ROLLBACK".into())])
+    }
+
+    fn savepoint(&mut self, name: &str) -> Result<Vec<BackendMessage>, ErrorResponse> {
+        if self.status != PgTransactionStatus::InTransaction {
+            return Err(fixed_error(
+                "25P01",
+                "SAVEPOINT can only be used in transaction blocks",
+            ));
+        }
+        self.savepoints.push(ReadOnlySavepoint {
+            name: name.to_owned(),
+            mutation_generation: self.mutation_generation,
+        });
+        Ok(vec![BackendMessage::CommandComplete("SAVEPOINT".into())])
+    }
+
+    fn release_savepoint(&mut self, name: &str) -> Result<Vec<BackendMessage>, ErrorResponse> {
+        if self.status == PgTransactionStatus::Failed {
+            return Err(fixed_error(
+                "25P02",
+                "current transaction is aborted, commands ignored until rollback",
+            ));
+        }
+        let Some(position) = self
+            .savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == name)
+        else {
+            return Err(fixed_error("3B001", "savepoint does not exist"));
+        };
+        self.savepoints.truncate(position);
+        Ok(vec![BackendMessage::CommandComplete("RELEASE".into())])
+    }
+
+    fn rollback_to_savepoint(&mut self, name: &str) -> Result<Vec<BackendMessage>, ErrorResponse> {
+        let Some(position) = self
+            .savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == name)
+        else {
+            return Err(fixed_error("3B001", "savepoint does not exist"));
+        };
+        if self.savepoints[position].mutation_generation != self.mutation_generation {
+            return Err(fixed_error(
+                "0A000",
+                "rollback to a savepoint after a write is not supported",
+            ));
+        }
+        self.savepoints.truncate(position + 1);
+        self.status = PgTransactionStatus::InTransaction;
         Ok(vec![BackendMessage::CommandComplete("ROLLBACK".into())])
     }
 
@@ -1139,10 +1539,28 @@ impl PgWorkerSession {
                 "SHOW",
             ),
             "show timezone" => ("TimeZone", PostgresType::Text, "UTC".to_owned(), "SHOW"),
-            "select version()" => (
+            "show transaction isolation level" => (
+                "transaction_isolation",
+                PostgresType::Text,
+                "read committed".to_owned(),
+                "SHOW",
+            ),
+            "show standard_conforming_strings" => (
+                "standard_conforming_strings",
+                PostgresType::Text,
+                "on".to_owned(),
+                "SHOW",
+            ),
+            "show search_path" => (
+                "search_path",
+                PostgresType::Text,
+                "public".to_owned(),
+                "SHOW",
+            ),
+            "select version()" | "select pg_catalog.version()" => (
                 "version",
                 PostgresType::Text,
-                "NetbaDB 0.1 experimental PostgreSQL compatibility".to_owned(),
+                "PostgreSQL 16.0 (NetbaDB experimental compatibility profile)".to_owned(),
                 "SELECT 1",
             ),
             "select current_database()" => (
@@ -1188,6 +1606,933 @@ impl PgWorkerSession {
     }
 }
 
+fn classify_compatibility_statement(sql: &str) -> Option<CompatibilityStatement> {
+    let normalized = normalize_sql(sql);
+    if !normalized.starts_with("select ") {
+        return None;
+    }
+    let has_type =
+        normalized.contains("pg_catalog.pg_type") || normalized.contains(" from pg_type ");
+    let has_class = normalized.contains("pg_catalog.pg_class");
+    let has_attribute = normalized.contains("pg_catalog.pg_attribute");
+    let has_constraint = normalized.contains("pg_catalog.pg_constraint");
+    let has_description = normalized.contains("pg_catalog.pg_description");
+    let is_visible = normalized.contains("pg_table_is_visible(");
+    let is_qualified = normalized.contains(".nspname = ");
+    if has_type && normalized.contains("to_regtype(") {
+        return Some(CompatibilityStatement::TypeLookup);
+    }
+    if has_type && has_constraint && normalized.contains(".typtype = ") {
+        return Some(CompatibilityStatement::Domains);
+    }
+    if has_type && normalized.contains("pg_catalog.pg_enum") && normalized.contains(".typtype = ") {
+        return Some(CompatibilityStatement::Enums);
+    }
+    if has_class
+        && normalized.contains("pg_catalog.pg_index")
+        && normalized.contains("pg_catalog.pg_opclass")
+        && normalized.contains("not pg_catalog.pg_index.indisprimary")
+    {
+        return Some(CompatibilityStatement::Indexes);
+    }
+    if has_attribute
+        && has_constraint
+        && normalized.contains(".contype = ")
+        && normalized.contains("array_agg(")
+    {
+        return Some(CompatibilityStatement::PrimaryKeys);
+    }
+    if has_class
+        && has_constraint
+        && normalized.contains(".confrelid")
+        && normalized.contains(".contype = ")
+        && is_visible
+    {
+        return Some(CompatibilityStatement::ForeignKeysVisible);
+    }
+    if has_class
+        && has_constraint
+        && normalized.contains(".confrelid")
+        && normalized.contains(".contype = ")
+        && is_qualified
+    {
+        return Some(CompatibilityStatement::ForeignKeysQualified);
+    }
+    if has_class
+        && has_description
+        && !has_attribute
+        && !has_constraint
+        && normalized.contains(".description")
+        && is_visible
+    {
+        return Some(CompatibilityStatement::TableCommentsVisible);
+    }
+    if has_class
+        && has_description
+        && !has_attribute
+        && !has_constraint
+        && normalized.contains(".description")
+        && is_qualified
+    {
+        return Some(CompatibilityStatement::TableCommentsQualified);
+    }
+    if has_class
+        && has_constraint
+        && !normalized.contains(".confrelid")
+        && normalized.contains("pg_get_constraintdef(")
+        && is_visible
+    {
+        return Some(CompatibilityStatement::CheckConstraintsVisible);
+    }
+    if has_class
+        && has_constraint
+        && !normalized.contains(".confrelid")
+        && normalized.contains("pg_get_constraintdef(")
+        && is_qualified
+    {
+        return Some(CompatibilityStatement::CheckConstraintsQualified);
+    }
+    if normalized.contains("pg_catalog.pg_namespace")
+        && !has_class
+        && normalized.contains(".nspname")
+    {
+        return Some(CompatibilityStatement::SchemaNames);
+    }
+    if has_class
+        && has_attribute
+        && normalized.contains("format_type(")
+        && normalized.contains(".attnotnull")
+        && normalized.contains(".relname in ")
+        && is_visible
+    {
+        return Some(CompatibilityStatement::ColumnsVisible);
+    }
+    if has_class
+        && has_attribute
+        && normalized.contains("format_type(")
+        && normalized.contains(".attnotnull")
+        && normalized.contains(".relname in ")
+        && is_qualified
+    {
+        return Some(CompatibilityStatement::ColumnsQualified);
+    }
+    if has_class
+        && normalized.contains("pg_catalog.pg_class.oid")
+        && normalized.contains(".relname in ")
+        && is_visible
+    {
+        return Some(CompatibilityStatement::TableOidsVisible);
+    }
+    if has_class
+        && normalized.contains("pg_catalog.pg_class.oid")
+        && normalized.contains(".relname in ")
+        && is_qualified
+    {
+        return Some(CompatibilityStatement::TableOidsQualified);
+    }
+    if has_class
+        && normalized.contains(".relname = ")
+        && normalized.contains(".relkind = any ")
+        && is_visible
+    {
+        return Some(CompatibilityStatement::HasTableVisible);
+    }
+    if has_class
+        && normalized.contains(".relname = ")
+        && normalized.contains(".relkind = any ")
+        && is_qualified
+    {
+        return Some(CompatibilityStatement::HasTableQualified);
+    }
+    if has_class && normalized.contains(".relkind = any ") && is_visible {
+        return Some(CompatibilityStatement::TableNames);
+    }
+    None
+}
+
+fn compatibility_parameter_types(statement: CompatibilityStatement) -> &'static [PostgresType] {
+    match statement {
+        CompatibilityStatement::TypeLookup | CompatibilityStatement::SchemaNames => {
+            &[PostgresType::Text]
+        }
+        CompatibilityStatement::TableNames => &[
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::HasTableVisible | CompatibilityStatement::HasTableQualified => &[
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::ColumnsVisible | CompatibilityStatement::ColumnsQualified => &[
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Int8,
+            PostgresType::Int8,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::Domains => {
+            &[PostgresType::Bool, PostgresType::Int8, PostgresType::Text]
+        }
+        CompatibilityStatement::Enums => &[PostgresType::Text],
+        CompatibilityStatement::TableOidsVisible | CompatibilityStatement::TableOidsQualified => &[
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::PrimaryKeys => {
+            &[PostgresType::Int8, PostgresType::Text, PostgresType::Int8]
+        }
+        CompatibilityStatement::ForeignKeysVisible
+        | CompatibilityStatement::ForeignKeysQualified => &[
+            PostgresType::Bool,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::Indexes => &[
+            PostgresType::Int8,
+            PostgresType::Int8,
+            PostgresType::Bool,
+            PostgresType::Int8,
+            PostgresType::Int8,
+            PostgresType::Int8,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::TableCommentsVisible
+        | CompatibilityStatement::TableCommentsQualified => &[
+            PostgresType::Int8,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+        CompatibilityStatement::CheckConstraintsVisible
+        | CompatibilityStatement::CheckConstraintsQualified => &[
+            PostgresType::Bool,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ],
+    }
+}
+
+fn compatibility_fields(statement: CompatibilityStatement) -> Vec<FieldDescription> {
+    let fields = match statement {
+        CompatibilityStatement::TypeLookup => [
+            ("name", PostgresType::Text),
+            ("oid", PostgresType::Int8),
+            ("array_oid", PostgresType::Int8),
+            ("regtype", PostgresType::Text),
+            ("delimiter", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::SchemaNames => [("nspname", PostgresType::Text)].as_slice(),
+        CompatibilityStatement::TableNames => [("relname", PostgresType::Text)].as_slice(),
+        CompatibilityStatement::HasTableVisible | CompatibilityStatement::HasTableQualified => {
+            [("relname", PostgresType::Text)].as_slice()
+        }
+        CompatibilityStatement::ColumnsVisible | CompatibilityStatement::ColumnsQualified => [
+            ("name", PostgresType::Text),
+            ("format_type", PostgresType::Text),
+            ("default", PostgresType::Text),
+            ("not_null", PostgresType::Bool),
+            ("table_name", PostgresType::Text),
+            ("comment", PostgresType::Text),
+            ("generated", PostgresType::Text),
+            ("identity_options", PostgresType::Text),
+            ("collation", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::Domains => [
+            ("name", PostgresType::Text),
+            ("attype", PostgresType::Text),
+            ("nullable", PostgresType::Bool),
+            ("default", PostgresType::Text),
+            ("visible", PostgresType::Bool),
+            ("schema", PostgresType::Text),
+            ("condefs", PostgresType::Text),
+            ("connames", PostgresType::Text),
+            ("collname", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::Enums => [
+            ("name", PostgresType::Text),
+            ("visible", PostgresType::Bool),
+            ("schema", PostgresType::Text),
+            ("labels", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::TableOidsVisible | CompatibilityStatement::TableOidsQualified => {
+            [("oid", PostgresType::Int8), ("relname", PostgresType::Text)].as_slice()
+        }
+        CompatibilityStatement::PrimaryKeys => [
+            ("conrelid", PostgresType::Int8),
+            ("cols", PostgresType::TextArray),
+            ("conname", PostgresType::Text),
+            ("description", PostgresType::Text),
+            ("indnkeyatts", PostgresType::Int8),
+            ("indnullsnotdistinct", PostgresType::Bool),
+        ]
+        .as_slice(),
+        CompatibilityStatement::ForeignKeysVisible
+        | CompatibilityStatement::ForeignKeysQualified => [
+            ("relname", PostgresType::Text),
+            ("conname", PostgresType::Text),
+            ("anon_1", PostgresType::Text),
+            ("nspname", PostgresType::Text),
+            ("description", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::Indexes => [
+            ("indrelid", PostgresType::Int8),
+            ("relname", PostgresType::Text),
+            ("indisunique", PostgresType::Bool),
+            ("has_constraint", PostgresType::Bool),
+            ("indoption", PostgresType::Text),
+            ("reloptions", PostgresType::Text),
+            ("amname", PostgresType::Text),
+            ("filter_definition", PostgresType::Text),
+            ("indnkeyatts", PostgresType::Int8),
+            ("indnullsnotdistinct", PostgresType::Bool),
+            ("elements", PostgresType::Text),
+            ("elements_is_expr", PostgresType::Text),
+            ("elements_opclass", PostgresType::Text),
+            ("elements_opdefault", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::TableCommentsVisible
+        | CompatibilityStatement::TableCommentsQualified => [
+            ("relname", PostgresType::Text),
+            ("description", PostgresType::Text),
+        ]
+        .as_slice(),
+        CompatibilityStatement::CheckConstraintsVisible
+        | CompatibilityStatement::CheckConstraintsQualified => [
+            ("relname", PostgresType::Text),
+            ("conname", PostgresType::Text),
+            ("anon_1", PostgresType::Text),
+            ("description", PostgresType::Text),
+        ]
+        .as_slice(),
+    };
+    fields
+        .iter()
+        .map(|(name, data_type)| FieldDescription {
+            name: (*name).to_owned(),
+            table_oid: 0,
+            column_attribute: 0,
+            data_type: *data_type,
+            type_modifier: -1,
+            format: FormatCode::Text,
+        })
+        .collect()
+}
+
+fn execute_compatibility_statement(
+    catalog: &PgCompatibilityCatalog,
+    authorization: &PrincipalAuthorization,
+    statement: CompatibilityStatement,
+    values: &[ScalarValue],
+) -> Result<QueryResult, ErrorResponse> {
+    match statement {
+        CompatibilityStatement::TypeLookup => {
+            if !matches!(values, [ScalarValue::Text(_) | ScalarValue::Null]) {
+                return Err(fixed_error(
+                    "42804",
+                    "type lookup requires one text parameter",
+                ));
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("name", PhysicalType::Text, false),
+                    compatibility_result_column("oid", PhysicalType::Int64, false),
+                    compatibility_result_column("array_oid", PhysicalType::Int64, false),
+                    compatibility_result_column("regtype", PhysicalType::Text, false),
+                    compatibility_result_column("delimiter", PhysicalType::Text, false),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::SchemaNames => {
+            let [ScalarValue::Text(excluded_pattern)] = values else {
+                return Err(fixed_error(
+                    "42804",
+                    "schema-name lookup requires one text pattern",
+                ));
+            };
+            let rows = ["pg_catalog", "public"]
+                .into_iter()
+                .filter(|name| !sql_like(name, excluded_pattern))
+                .map(|name| vec![ScalarValue::Text(name.to_owned())])
+                .collect();
+            Ok(QueryResult {
+                columns: vec![compatibility_result_column(
+                    "nspname",
+                    PhysicalType::Text,
+                    false,
+                )],
+                rows,
+            })
+        }
+        CompatibilityStatement::TableNames => {
+            let [
+                ScalarValue::Text(first_kind),
+                ScalarValue::Text(second_kind),
+                ScalarValue::Text(excluded_persistence),
+                ScalarValue::Text(excluded_namespace),
+            ] = values
+            else {
+                return Err(fixed_error(
+                    "42804",
+                    "table-name lookup requires four text parameters",
+                ));
+            };
+            let exposes_tables = first_kind == "r" || second_kind == "r";
+            let namespace_allowed = excluded_namespace != "public";
+            let persistence_allowed = excluded_persistence != "p";
+            let mut names = if exposes_tables && namespace_allowed && persistence_allowed {
+                catalog
+                    .tables
+                    .iter()
+                    .filter(|table| authorization.can_see(table.table_id))
+                    .map(|table| table.name.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            names.sort();
+            Ok(QueryResult {
+                columns: vec![compatibility_result_column(
+                    "relname",
+                    PhysicalType::Text,
+                    false,
+                )],
+                rows: names
+                    .into_iter()
+                    .map(|name| vec![ScalarValue::Text(name)])
+                    .collect(),
+            })
+        }
+        CompatibilityStatement::HasTableVisible | CompatibilityStatement::HasTableQualified => {
+            let [
+                ScalarValue::Text(table_name),
+                ScalarValue::Text(kind_1),
+                ScalarValue::Text(kind_2),
+                ScalarValue::Text(kind_3),
+                ScalarValue::Text(kind_4),
+                ScalarValue::Text(kind_5),
+                ScalarValue::Text(namespace),
+            ] = values
+            else {
+                return Err(fixed_error(
+                    "42804",
+                    "has-table lookup requires seven text parameters",
+                ));
+            };
+            let exposes_tables = [kind_1, kind_2, kind_3, kind_4, kind_5]
+                .into_iter()
+                .any(|kind| kind == "r");
+            let namespace_matches = match statement {
+                CompatibilityStatement::HasTableVisible => namespace != "public",
+                CompatibilityStatement::HasTableQualified => namespace == "public",
+                _ => false,
+            };
+            let exists = exposes_tables
+                && namespace_matches
+                && catalog
+                    .table(table_name)
+                    .is_some_and(|table| authorization.can_see(table.table_id));
+            Ok(QueryResult {
+                columns: vec![compatibility_result_column(
+                    "relname",
+                    PhysicalType::Text,
+                    false,
+                )],
+                rows: if exists {
+                    vec![vec![ScalarValue::Text(table_name.clone())]]
+                } else {
+                    Vec::new()
+                },
+            })
+        }
+        CompatibilityStatement::ColumnsVisible | CompatibilityStatement::ColumnsQualified => {
+            if values.len() != 18 {
+                return Err(fixed_error(
+                    "42804",
+                    "column reflection requires eighteen typed parameters",
+                ));
+            }
+            let Some(ScalarValue::Text(namespace)) = values.get(16) else {
+                return Err(fixed_error("42804", "column namespace must be text"));
+            };
+            let Some(ScalarValue::Text(table_name)) = values.get(17) else {
+                return Err(fixed_error("42804", "column table name must be text"));
+            };
+            let namespace_matches = match statement {
+                CompatibilityStatement::ColumnsVisible => namespace != "public",
+                CompatibilityStatement::ColumnsQualified => namespace == "public",
+                _ => false,
+            };
+            let table = catalog
+                .table(table_name)
+                .filter(|table| namespace_matches && authorization.can_see(table.table_id));
+            let rows = match table {
+                None => Vec::new(),
+                Some(table) => table
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        let format_type = match column.physical {
+                            PhysicalType::Bool => "boolean",
+                            PhysicalType::Int64 => "bigint",
+                            PhysicalType::Text => "text",
+                            PhysicalType::UInt64 => {
+                                return Err(fixed_error(
+                                    "0A000",
+                                    "UINT64 has no lossless PostgreSQL reflection type",
+                                ));
+                            }
+                        };
+                        Ok(vec![
+                            ScalarValue::Text(column.name.clone()),
+                            ScalarValue::Text(format_type.to_owned()),
+                            ScalarValue::Null,
+                            ScalarValue::Bool(!column.nullable),
+                            ScalarValue::Text(table.name.clone()),
+                            ScalarValue::Null,
+                            ScalarValue::Text(String::new()),
+                            ScalarValue::Null,
+                            ScalarValue::Null,
+                        ])
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("name", PhysicalType::Text, false),
+                    compatibility_result_column("format_type", PhysicalType::Text, false),
+                    compatibility_result_column("default", PhysicalType::Text, true),
+                    compatibility_result_column("not_null", PhysicalType::Bool, false),
+                    compatibility_result_column("table_name", PhysicalType::Text, false),
+                    compatibility_result_column("comment", PhysicalType::Text, true),
+                    compatibility_result_column("generated", PhysicalType::Text, false),
+                    compatibility_result_column("identity_options", PhysicalType::Text, true),
+                    compatibility_result_column("collation", PhysicalType::Text, true),
+                ],
+                rows,
+            })
+        }
+        CompatibilityStatement::Domains => {
+            if !matches!(
+                values,
+                [
+                    ScalarValue::Bool(_),
+                    ScalarValue::Int64(_),
+                    ScalarValue::Text(_)
+                ]
+            ) {
+                return Err(fixed_error(
+                    "42804",
+                    "domain reflection requires bool, integer, and text parameters",
+                ));
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("name", PhysicalType::Text, false),
+                    compatibility_result_column("attype", PhysicalType::Text, false),
+                    compatibility_result_column("nullable", PhysicalType::Bool, false),
+                    compatibility_result_column("default", PhysicalType::Text, true),
+                    compatibility_result_column("visible", PhysicalType::Bool, false),
+                    compatibility_result_column("schema", PhysicalType::Text, false),
+                    compatibility_result_column("condefs", PhysicalType::Text, true),
+                    compatibility_result_column("connames", PhysicalType::Text, true),
+                    compatibility_result_column("collname", PhysicalType::Text, true),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::Enums => {
+            if !matches!(values, [ScalarValue::Text(_)]) {
+                return Err(fixed_error(
+                    "42804",
+                    "enum reflection requires one text parameter",
+                ));
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("name", PhysicalType::Text, false),
+                    compatibility_result_column("visible", PhysicalType::Bool, false),
+                    compatibility_result_column("schema", PhysicalType::Text, false),
+                    compatibility_result_column("labels", PhysicalType::Text, true),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::TableOidsVisible | CompatibilityStatement::TableOidsQualified => {
+            let [
+                ScalarValue::Text(kind_1),
+                ScalarValue::Text(kind_2),
+                ScalarValue::Text(kind_3),
+                ScalarValue::Text(kind_4),
+                ScalarValue::Text(kind_5),
+                ScalarValue::Text(namespace),
+                ScalarValue::Text(table_name),
+            ] = values
+            else {
+                return Err(fixed_error(
+                    "42804",
+                    "table OID lookup requires seven text parameters",
+                ));
+            };
+            let exposes_tables = [kind_1, kind_2, kind_3, kind_4, kind_5]
+                .into_iter()
+                .any(|kind| kind == "r");
+            let namespace_matches = match statement {
+                CompatibilityStatement::TableOidsVisible => namespace != "public",
+                CompatibilityStatement::TableOidsQualified => namespace == "public",
+                _ => false,
+            };
+            let table = catalog.table(table_name).filter(|table| {
+                exposes_tables && namespace_matches && authorization.can_see(table.table_id)
+            });
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("oid", PhysicalType::Int64, false),
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                ],
+                rows: table
+                    .map(|table| {
+                        vec![vec![
+                            ScalarValue::Int64(i64::from(table.oid)),
+                            ScalarValue::Text(table.name.clone()),
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+        CompatibilityStatement::PrimaryKeys => {
+            let [
+                ScalarValue::Int64(_subscript_start),
+                ScalarValue::Text(constraint_kind),
+                ScalarValue::Int64(table_oid),
+            ] = values
+            else {
+                return Err(fixed_error(
+                    "42804",
+                    "primary-key reflection requires integer, text, and OID parameters",
+                ));
+            };
+            let table = u32::try_from(*table_oid)
+                .ok()
+                .and_then(|oid| catalog.tables.iter().find(|table| table.oid == oid))
+                .filter(|table| constraint_kind == "p" && authorization.can_see(table.table_id));
+            let rows = table
+                .and_then(|table| {
+                    let columns = table
+                        .columns
+                        .iter()
+                        .filter(|column| column.primary_key)
+                        .map(|column| column.name.as_str())
+                        .collect::<Vec<_>>();
+                    (!columns.is_empty()).then(|| {
+                        vec![
+                            ScalarValue::Int64(i64::from(table.oid)),
+                            ScalarValue::Text(postgres_text_array(&columns)),
+                            ScalarValue::Text(format!("{}_pkey", table.name)),
+                            ScalarValue::Null,
+                            ScalarValue::Int64(columns.len() as i64),
+                            ScalarValue::Bool(false),
+                        ]
+                    })
+                })
+                .into_iter()
+                .collect();
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("conrelid", PhysicalType::Int64, false),
+                    compatibility_result_column("cols", PhysicalType::Text, false),
+                    compatibility_result_column("conname", PhysicalType::Text, false),
+                    compatibility_result_column("description", PhysicalType::Text, true),
+                    compatibility_result_column("indnkeyatts", PhysicalType::Int64, false),
+                    compatibility_result_column("indnullsnotdistinct", PhysicalType::Bool, false),
+                ],
+                rows,
+            })
+        }
+        CompatibilityStatement::ForeignKeysVisible
+        | CompatibilityStatement::ForeignKeysQualified => {
+            if values.len() != 9 {
+                return Err(fixed_error(
+                    "42804",
+                    "foreign-key reflection requires nine typed parameters",
+                ));
+            }
+            let Some(ScalarValue::Text(constraint_kind)) = values.get(1) else {
+                return Err(fixed_error("42804", "foreign-key kind must be text"));
+            };
+            let Some(ScalarValue::Text(namespace)) = values.get(7) else {
+                return Err(fixed_error("42804", "foreign-key namespace must be text"));
+            };
+            let Some(ScalarValue::Text(table_name)) = values.get(8) else {
+                return Err(fixed_error("42804", "foreign-key table name must be text"));
+            };
+            let namespace_matches = match statement {
+                CompatibilityStatement::ForeignKeysVisible => namespace != "public",
+                CompatibilityStatement::ForeignKeysQualified => namespace == "public",
+                _ => false,
+            };
+            let table = catalog.table(table_name).filter(|table| {
+                constraint_kind == "f" && namespace_matches && authorization.can_see(table.table_id)
+            });
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                    compatibility_result_column("conname", PhysicalType::Text, true),
+                    compatibility_result_column("anon_1", PhysicalType::Text, true),
+                    compatibility_result_column("nspname", PhysicalType::Text, true),
+                    compatibility_result_column("description", PhysicalType::Text, true),
+                ],
+                rows: table
+                    .map(|table| {
+                        vec![vec![
+                            ScalarValue::Text(table.name.clone()),
+                            ScalarValue::Null,
+                            ScalarValue::Null,
+                            ScalarValue::Null,
+                            ScalarValue::Null,
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+        CompatibilityStatement::Indexes => {
+            if !matches!(
+                values,
+                [
+                    ScalarValue::Int64(_),
+                    ScalarValue::Int64(_),
+                    ScalarValue::Bool(_),
+                    ScalarValue::Int64(_),
+                    ScalarValue::Int64(_),
+                    ScalarValue::Int64(_),
+                    ScalarValue::Text(_),
+                    ScalarValue::Text(_),
+                    ScalarValue::Text(_),
+                ]
+            ) {
+                return Err(fixed_error(
+                    "42804",
+                    "index reflection requires nine typed parameters",
+                ));
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("indrelid", PhysicalType::Int64, false),
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                    compatibility_result_column("indisunique", PhysicalType::Bool, false),
+                    compatibility_result_column("has_constraint", PhysicalType::Bool, false),
+                    compatibility_result_column("indoption", PhysicalType::Text, true),
+                    compatibility_result_column("reloptions", PhysicalType::Text, true),
+                    compatibility_result_column("amname", PhysicalType::Text, false),
+                    compatibility_result_column("filter_definition", PhysicalType::Text, true),
+                    compatibility_result_column("indnkeyatts", PhysicalType::Int64, false),
+                    compatibility_result_column("indnullsnotdistinct", PhysicalType::Bool, false),
+                    compatibility_result_column("elements", PhysicalType::Text, true),
+                    compatibility_result_column("elements_is_expr", PhysicalType::Text, true),
+                    compatibility_result_column("elements_opclass", PhysicalType::Text, true),
+                    compatibility_result_column("elements_opdefault", PhysicalType::Text, true),
+                ],
+                rows: Vec::new(),
+            })
+        }
+        CompatibilityStatement::TableCommentsVisible
+        | CompatibilityStatement::TableCommentsQualified => {
+            let [
+                ScalarValue::Int64(_),
+                ScalarValue::Text(_),
+                ScalarValue::Text(kind_1),
+                ScalarValue::Text(kind_2),
+                ScalarValue::Text(kind_3),
+                ScalarValue::Text(kind_4),
+                ScalarValue::Text(kind_5),
+                ScalarValue::Text(namespace),
+                ScalarValue::Text(table_name),
+            ] = values
+            else {
+                return Err(fixed_error(
+                    "42804",
+                    "table-comment reflection requires nine typed parameters",
+                ));
+            };
+            let exposes_tables = [kind_1, kind_2, kind_3, kind_4, kind_5]
+                .into_iter()
+                .any(|kind| kind == "r");
+            let namespace_matches = match statement {
+                CompatibilityStatement::TableCommentsVisible => namespace != "public",
+                CompatibilityStatement::TableCommentsQualified => namespace == "public",
+                _ => false,
+            };
+            let table = catalog.table(table_name).filter(|table| {
+                exposes_tables && namespace_matches && authorization.can_see(table.table_id)
+            });
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                    compatibility_result_column("description", PhysicalType::Text, true),
+                ],
+                rows: table
+                    .map(|table| {
+                        vec![vec![
+                            ScalarValue::Text(table.name.clone()),
+                            ScalarValue::Null,
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+        CompatibilityStatement::CheckConstraintsVisible
+        | CompatibilityStatement::CheckConstraintsQualified => {
+            let [
+                ScalarValue::Bool(_),
+                ScalarValue::Text(constraint_kind),
+                ScalarValue::Text(kind_1),
+                ScalarValue::Text(kind_2),
+                ScalarValue::Text(kind_3),
+                ScalarValue::Text(kind_4),
+                ScalarValue::Text(kind_5),
+                ScalarValue::Text(namespace),
+                ScalarValue::Text(table_name),
+            ] = values
+            else {
+                return Err(fixed_error(
+                    "42804",
+                    "check-constraint reflection requires nine typed parameters",
+                ));
+            };
+            let exposes_tables = [kind_1, kind_2, kind_3, kind_4, kind_5]
+                .into_iter()
+                .any(|kind| kind == "r");
+            let namespace_matches = match statement {
+                CompatibilityStatement::CheckConstraintsVisible => namespace != "public",
+                CompatibilityStatement::CheckConstraintsQualified => namespace == "public",
+                _ => false,
+            };
+            let table = catalog.table(table_name).filter(|table| {
+                constraint_kind == "c"
+                    && exposes_tables
+                    && namespace_matches
+                    && authorization.can_see(table.table_id)
+            });
+            Ok(QueryResult {
+                columns: vec![
+                    compatibility_result_column("relname", PhysicalType::Text, false),
+                    compatibility_result_column("conname", PhysicalType::Text, true),
+                    compatibility_result_column("anon_1", PhysicalType::Text, true),
+                    compatibility_result_column("description", PhysicalType::Text, true),
+                ],
+                rows: table
+                    .map(|table| {
+                        vec![vec![
+                            ScalarValue::Text(table.name.clone()),
+                            ScalarValue::Null,
+                            ScalarValue::Null,
+                            ScalarValue::Null,
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+    }
+}
+
+fn sql_like(value: &str, pattern: &str) -> bool {
+    fn matches(value: &[u8], pattern: &[u8]) -> bool {
+        match pattern.first().copied() {
+            None => value.is_empty(),
+            Some(b'%') => {
+                matches(value, &pattern[1..])
+                    || (!value.is_empty() && matches(&value[1..], pattern))
+            }
+            Some(b'_') => !value.is_empty() && matches(&value[1..], &pattern[1..]),
+            Some(expected) => {
+                value.first() == Some(&expected) && matches(&value[1..], &pattern[1..])
+            }
+        }
+    }
+    matches(value.as_bytes(), pattern.as_bytes())
+}
+
+fn postgres_text_array(values: &[&str]) -> String {
+    let mut output = String::from("{");
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push('"');
+        for character in value.chars() {
+            if matches!(character, '\\' | '"') {
+                output.push('\\');
+            }
+            output.push(character);
+        }
+        output.push('"');
+    }
+    output.push('}');
+    output
+}
+
+fn compatibility_result_column(
+    name: &str,
+    physical: PhysicalType,
+    nullable: bool,
+) -> netbadb_core::ResultColumn {
+    netbadb_core::ResultColumn {
+        name: name.to_owned(),
+        data_type: SemanticType::physical(physical),
+        nullable,
+    }
+}
+
 fn parameter_status(name: &str, value: &str) -> BackendMessage {
     BackendMessage::ParameterStatus {
         name: name.to_owned(),
@@ -1200,7 +2545,8 @@ fn parameter_constraint(oid: PostgresOid) -> Result<Option<PhysicalType>, ErrorR
         return Ok(None);
     }
     PostgresType::from_oid(oid)
-        .map(|data_type| Some(data_type.netbadb_physical()))
+        .and_then(PostgresType::netbadb_physical)
+        .map(Some)
         .ok_or_else(|| map_type_error(TypeMappingError::UnsupportedOid(oid)))
 }
 
@@ -1408,6 +2754,18 @@ fn normalize_sql(sql: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn transaction_control_name<'a>(sql: &'a str, prefix: &str) -> Option<&'a str> {
+    let name = sql.strip_prefix(prefix)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(
+        name.strip_prefix('"')
+            .and_then(|name| name.strip_suffix('"'))
+            .unwrap_or(name),
+    )
+}
+
 fn split_statements(sql: &str) -> Vec<&str> {
     let mut statements = Vec::new();
     let mut start = 0;
@@ -1438,7 +2796,86 @@ fn split_statements(sql: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+    use netbadb_types::ColumnId;
+
     use super::*;
+    use crate::authorization::TablePermissions;
+
+    fn test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "netbadb-postgres-catalog-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup(paths: &[&Path]) {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn catalog_tables() -> Vec<TableDef> {
+        vec![
+            TableDef::new(
+                TableId(1),
+                "users",
+                vec![
+                    ColumnDef::new(
+                        ColumnId(1),
+                        "id",
+                        TypeSpec::Semantic {
+                            name: "UserId".into(),
+                            physical: PhysicalType::Int64,
+                        },
+                    )
+                    .primary_key(true),
+                    ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text))
+                        .nullable(true),
+                    ColumnDef::new(
+                        ColumnId(3),
+                        "active",
+                        TypeSpec::Physical(PhysicalType::Bool),
+                    ),
+                ],
+            ),
+            TableDef::new(
+                TableId(2),
+                "teams",
+                vec![
+                    ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64))
+                        .primary_key(true),
+                ],
+            ),
+            TableDef::new(
+                TableId(3),
+                "unsigned_values",
+                vec![ColumnDef::new(
+                    ColumnId(1),
+                    "value",
+                    TypeSpec::Physical(PhysicalType::UInt64),
+                )],
+            ),
+        ]
+    }
+
+    fn principal(known: &[TableId], visible: &[TableId]) -> PrincipalAuthorization {
+        let permissions = visible
+            .iter()
+            .map(|table_id| TablePermissions::new(*table_id, true, false, false, false))
+            .collect();
+        AuthorizationPolicy::new(
+            TransportKind::PlaintextLoopback,
+            Some(permissions),
+            Vec::new(),
+            known,
+        )
+        .expect("authorization policy")
+        .admit(&ClientIdentity::LocalPlaintext)
+        .expect("principal")
+    }
 
     #[test]
     fn statement_splitter_preserves_quoted_semicolons() {
@@ -1496,5 +2933,198 @@ mod tests {
         assert_eq!(PgTransactionStatus::Idle.ready_byte(), b'I');
         assert_eq!(PgTransactionStatus::InTransaction.ready_byte(), b'T');
         assert_eq!(PgTransactionStatus::Failed.ready_byte(), b'E');
+    }
+
+    #[test]
+    fn synthetic_oids_are_deterministic_separated_and_collision_checked() {
+        let first = [0_u8; 32];
+        let mut second = [0_u8; 32];
+        second[31] = 1;
+        let assigned = assign_synthetic_oids(
+            &[(TableId(1), first), (TableId(2), second)],
+            SYNTHETIC_TABLE_OID_BASE,
+        );
+        assert_eq!(assigned[&TableId(1)], SYNTHETIC_TABLE_OID_BASE);
+        assert_eq!(assigned[&TableId(2)], SYNTHETIC_TABLE_OID_BASE + 1);
+        assert!(assigned.values().all(|oid| oid & 0x8000_0000 != 0));
+        assert_eq!(
+            assigned,
+            assign_synthetic_oids(
+                &[(TableId(1), first), (TableId(2), second)],
+                SYNTHETIC_TABLE_OID_BASE,
+            )
+        );
+    }
+
+    #[test]
+    fn derived_catalog_preserves_schema_metadata_and_authorization() {
+        let paths = [
+            test_path("users"),
+            test_path("teams"),
+            test_path("unsigned"),
+        ];
+        cleanup(&[&paths[0], &paths[1], &paths[2]]);
+        let tables = catalog_tables();
+        let database = Database::create_tables(
+            paths
+                .iter()
+                .cloned()
+                .zip(tables.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("create catalog fixture");
+        let catalog = PgCompatibilityCatalog::derive(&database);
+        let repeated = PgCompatibilityCatalog::derive(&database);
+        assert_eq!(
+            catalog
+                .tables
+                .iter()
+                .map(|table| table.oid)
+                .collect::<Vec<_>>(),
+            repeated
+                .tables
+                .iter()
+                .map(|table| table.oid)
+                .collect::<Vec<_>>()
+        );
+        let users = catalog.table("users").expect("users metadata");
+        assert_eq!(
+            users
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "name", "active"]
+        );
+        assert!(users.columns[0].primary_key);
+        assert!(!users.columns[0].nullable);
+        assert!(users.columns[1].nullable);
+        assert_eq!(users.columns[2].physical, PhysicalType::Bool);
+
+        let restricted = principal(&[TableId(1), TableId(2), TableId(3)], &[TableId(1)]);
+        let names = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::TableNames,
+            &[
+                ScalarValue::Text("r".into()),
+                ScalarValue::Text("p".into()),
+                ScalarValue::Text("t".into()),
+                ScalarValue::Text("pg_catalog".into()),
+            ],
+        )
+        .expect("table names");
+        assert_eq!(names.rows, [vec![ScalarValue::Text("users".into())]]);
+
+        let missing = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::HasTableQualified,
+            &[
+                ScalarValue::Text("missing".into()),
+                ScalarValue::Text("r".into()),
+                ScalarValue::Text("p".into()),
+                ScalarValue::Text("f".into()),
+                ScalarValue::Text("v".into()),
+                ScalarValue::Text("m".into()),
+                ScalarValue::Text("public".into()),
+            ],
+        )
+        .expect("missing table");
+        assert!(missing.rows.is_empty());
+
+        let mut column_parameters = vec![ScalarValue::Null; 18];
+        column_parameters[16] = ScalarValue::Text("public".into());
+        column_parameters[17] = ScalarValue::Text("users".into());
+        let columns = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::ColumnsQualified,
+            &column_parameters,
+        )
+        .expect("columns");
+        assert_eq!(columns.rows.len(), 3);
+        assert_eq!(columns.rows[0][0], ScalarValue::Text("id".into()));
+        assert_eq!(columns.rows[0][1], ScalarValue::Text("bigint".into()));
+        assert_eq!(columns.rows[1][3], ScalarValue::Bool(false));
+
+        column_parameters[17] = ScalarValue::Text("unsigned_values".into());
+        let unrestricted = principal(
+            &[TableId(1), TableId(2), TableId(3)],
+            &[TableId(1), TableId(2), TableId(3)],
+        );
+        assert_eq!(
+            execute_compatibility_statement(
+                &catalog,
+                &unrestricted,
+                CompatibilityStatement::ColumnsQualified,
+                &column_parameters,
+            )
+            .expect_err("UINT64 reflection must be explicit")
+            .sqlstate,
+            "0A000"
+        );
+
+        let primary_key = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::PrimaryKeys,
+            &[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("p".into()),
+                ScalarValue::Int64(i64::from(users.oid)),
+            ],
+        )
+        .expect("primary key");
+        assert_eq!(primary_key.rows.len(), 1);
+        assert_eq!(primary_key.rows[0][1], ScalarValue::Text("{\"id\"}".into()));
+
+        database.close().expect("close catalog fixture");
+        cleanup(&[&paths[0], &paths[1], &paths[2]]);
+    }
+
+    #[test]
+    fn catalog_classification_is_structural_and_sql_like_is_bounded() {
+        assert_eq!(
+            classify_compatibility_statement(
+                "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.relkind = ANY ($1) AND pg_catalog.pg_table_is_visible(c.oid)"
+            ),
+            Some(CompatibilityStatement::TableNames)
+        );
+        assert_eq!(
+            classify_compatibility_statement(
+                "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, d.description \
+                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON true \
+                 LEFT JOIN pg_catalog.pg_description d ON true JOIN pg_catalog.pg_namespace n ON true \
+                 WHERE pg_catalog.pg_table_is_visible(c.oid) AND c.relname IN ($1)"
+            ),
+            Some(CompatibilityStatement::ColumnsVisible)
+        );
+        assert_eq!(
+            classify_compatibility_statement(
+                "SELECT c.relname, d.description FROM pg_catalog.pg_class c \
+                 LEFT JOIN pg_catalog.pg_description d ON true \
+                 WHERE pg_catalog.pg_table_is_visible(c.oid)"
+            ),
+            Some(CompatibilityStatement::TableCommentsVisible)
+        );
+        assert_eq!(
+            classify_compatibility_statement(
+                "SELECT a.conrelid, array_agg(a.attname) FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_constraint c ON true JOIN pg_catalog.pg_index i ON true \
+                 WHERE c.contype = $1"
+            ),
+            Some(CompatibilityStatement::PrimaryKeys)
+        );
+        assert_eq!(
+            classify_compatibility_statement(
+                "SELECT i.indrelid FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON true \
+                 JOIN pg_catalog.pg_opclass o ON true WHERE NOT pg_catalog.pg_index.indisprimary"
+            ),
+            Some(CompatibilityStatement::Indexes)
+        );
+        assert!(sql_like("pg_catalog", "pg_%"));
+        assert!(sql_like("public", "pub_ic"));
+        assert!(!sql_like("public", "pg_%"));
     }
 }

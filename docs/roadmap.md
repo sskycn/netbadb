@@ -412,9 +412,34 @@ and `information_schema`; and P3 broader PostgreSQL SQL remain open.
 - verified parameterized CRUD, repeated binds, NULL, and transaction behavior
   through raw TCP tests and pgx v5.7.6, plus real psql 17.11 scalar queries.
 
-Catalog-derived `pg_catalog`/`information_schema`, simultaneous listeners,
-PostgreSQL TLS/authentication, actual cancellation, and broader dialect support
-remain explicit later work.
+### PostgreSQL Compatibility Round 3 — ORM reflection (complete)
+
+- captured real psycopg 3.2.13 and SQLAlchemy 2.0.52 PostgreSQL-dialect startup,
+  Core, reflection, autoload, and ORM traffic instead of guessing catalog
+  surface area;
+- added a bounded structured compatibility-operation layer for only the
+  observed `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, `pg_constraint`,
+  `pg_index`, and `pg_description` projections;
+- derives authorized table names, ordered columns, nullability, physical type
+  projection, and primary keys from immutable Canonical Schema without a
+  persistent PostgreSQL catalog or storage mutation;
+- added deterministic high-range synthetic table OIDs with domain-separated
+  hashing and collision checking, confined to the PostgreSQL server adapter;
+- added generic typed postfix BOOL/INT64/TEXT casts and qualified projection
+  aliases required by normal SQLAlchemy Core/ORM SQL while retaining nominal
+  types inside HIR;
+- added read-only savepoint recovery for psycopg's hstore capability probe,
+  `DEALLOCATE` prepared-cache cleanup, a redacted opt-in protocol trace, and a
+  reproducible real-client smoke script;
+- verified schema/table/column/primary-key inspection, repeated multi-table
+  autoload, reflected parameterized SELECT, Core CRUD and rollback, and ORM
+  SELECT/CRUD against existing NetbaDB tables.
+
+A complete `pg_catalog` or `information_schema`, DDL/migrations, simultaneous
+listeners, PostgreSQL TLS/password authentication, actual cancellation, and
+broader dialect support remain explicit later work. Index reflection currently
+returns no rows because the stable Canonical Schema boundary does not expose
+PostgreSQL-equivalent non-primary index metadata; it does not fabricate it.
 
 ## Phase 6 — SDK and tooling
 

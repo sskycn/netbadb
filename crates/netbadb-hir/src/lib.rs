@@ -8,7 +8,8 @@ use netbadb_parser::{
     AggregateArgument as AstAggregateArgument, AggregateCall as AstAggregateCall,
     AggregateFunction as AstAggregateFunction, BinaryOp as AstBinaryOp, ColumnName,
     Expr as AstExpr, FromItem, Ident, Literal, NullOrder as AstNullOrder, Query,
-    SortDirection as AstSortDirection, Span, Statement as AstStatement, UnaryOp as AstUnaryOp,
+    SortDirection as AstSortDirection, Span, SqlTypeName as AstSqlTypeName,
+    Statement as AstStatement, UnaryOp as AstUnaryOp,
 };
 use netbadb_schema::{Schema, TableDef};
 use netbadb_types::{
@@ -152,6 +153,9 @@ pub enum TypedExprKind {
     Column(ColumnRef),
     Literal(ScalarValue),
     Parameter(ParameterId),
+    Cast {
+        expression: Box<TypedExpr>,
+    },
     Binary {
         operator: BinaryOp,
         left: Box<TypedExpr>,
@@ -1118,10 +1122,7 @@ fn lower_value_for_column(
             span: value.span,
         });
     }
-    if !column.nullable
-        && value.expr_type.nullable
-        && !matches!(value.kind, TypedExprKind::Parameter(_))
-    {
+    if !column.nullable && value.expr_type.nullable && !is_typed_parameter_expression(&value) {
         return Err(HirError::NullNotAllowed {
             name: column.name.clone(),
             span: value.span,
@@ -1130,10 +1131,19 @@ fn lower_value_for_column(
     Ok(value)
 }
 
+fn is_typed_parameter_expression(expression: &TypedExpr) -> bool {
+    match &expression.kind {
+        TypedExprKind::Parameter(_) => true,
+        TypedExprKind::Cast { expression } => is_typed_parameter_expression(expression),
+        _ => false,
+    }
+}
+
 fn expression_references_column(expression: &AstExpr) -> bool {
     match expression {
         AstExpr::Column(_) => true,
         AstExpr::Literal { .. } | AstExpr::Parameter { .. } => false,
+        AstExpr::Cast { expression, .. } => expression_references_column(expression),
         AstExpr::Binary { left, right, .. } => {
             expression_references_column(left) || expression_references_column(right)
         }
@@ -1148,6 +1158,7 @@ fn ast_expr_span(expression: &AstExpr) -> Span {
         AstExpr::Column(column) => column.span,
         AstExpr::Literal { span, .. }
         | AstExpr::Parameter { span, .. }
+        | AstExpr::Cast { span, .. }
         | AstExpr::Binary { span, .. }
         | AstExpr::Unary { span, .. }
         | AstExpr::IsNull { span, .. } => *span,
@@ -1227,6 +1238,33 @@ fn lower_expr_in_scope(
                 expr_type: ExprType {
                     data_type,
                     nullable: true,
+                },
+                span: *span,
+            })
+        }
+        AstExpr::Cast {
+            expression,
+            data_type,
+            span,
+        } => {
+            let physical = match data_type {
+                AstSqlTypeName::Bool => PhysicalType::Bool,
+                AstSqlTypeName::Int64 => PhysicalType::Int64,
+                AstSqlTypeName::Text => PhysicalType::Text,
+            };
+            let target = expected
+                .filter(|expected| expected.physical == physical)
+                .cloned()
+                .unwrap_or_else(|| SemanticType::physical(physical));
+            let expression = lower_expr_in_scope(scope, expression, Some(&target), parameters)?;
+            require_type(&expression, &target)?;
+            Ok(TypedExpr {
+                expr_type: ExprType {
+                    data_type: target,
+                    nullable: expression.expr_type.nullable,
+                },
+                kind: TypedExprKind::Cast {
+                    expression: Box::new(expression),
                 },
                 span: *span,
             })
@@ -1336,12 +1374,12 @@ fn lower_comparison_operands(
     right: &AstExpr,
     parameters: &mut ParameterContext,
 ) -> Result<(TypedExpr, TypedExpr), HirError> {
-    if matches!(left, AstExpr::Parameter { .. }) && !matches!(right, AstExpr::Parameter { .. }) {
+    if is_parameter_expression(left) && !is_parameter_expression(right) {
         let right = lower_expr_in_scope(scope, right, None, parameters)?;
         let left = lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type), parameters)?;
         return Ok((left, right));
     }
-    if !matches!(left, AstExpr::Parameter { .. }) && matches!(right, AstExpr::Parameter { .. }) {
+    if !is_parameter_expression(left) && is_parameter_expression(right) {
         let left = lower_expr_in_scope(scope, left, None, parameters)?;
         let right = lower_expr_in_scope(scope, right, Some(&left.expr_type.data_type), parameters)?;
         return Ok((left, right));
@@ -1372,6 +1410,14 @@ fn lower_comparison_operands(
             lower_expr_in_scope(scope, left, None, parameters)?,
             lower_expr_in_scope(scope, right, None, parameters)?,
         )),
+    }
+}
+
+fn is_parameter_expression(expression: &AstExpr) -> bool {
+    match expression {
+        AstExpr::Parameter { .. } => true,
+        AstExpr::Cast { expression, .. } => is_parameter_expression(expression),
+        _ => false,
     }
 }
 

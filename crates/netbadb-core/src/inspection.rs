@@ -184,6 +184,7 @@ fn expression(expression: &Expr) -> ExpressionInspection {
         ExprKind::Column(column) => ExpressionKindInspection::Column(column_reference(column)),
         ExprKind::Literal(value) => ExpressionKindInspection::Literal(value.clone()),
         ExprKind::Parameter(id) => ExpressionKindInspection::Parameter(*id),
+        ExprKind::Cast { expression } => return self::expression(expression),
         ExprKind::Binary {
             operator,
             left,

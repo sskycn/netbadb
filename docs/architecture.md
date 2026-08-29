@@ -2222,8 +2222,9 @@ The experimental PostgreSQL foundation adds a parallel frontend boundary:
 PostgreSQL bytes
     -> netbadb-pgwire bounded typed messages
     -> PostgreSQL session / prepared statement / portal state
-    -> Parse: compiler-owned prepared logical statement + parameter metadata
-    -> Bind: typed ScalarValue substitution into cloned logical expressions
+    -> ordinary SQL: compiler-owned typed statement and parameter metadata
+    -> metadata SQL: bounded compatibility operation classifier
+    -> ephemeral metadata projection <- immutable Canonical Schema
     -> compiler-resolved StatementAccess + authorization
     -> shared netbadb-server DatabaseSession transaction/execution lifecycle
     -> netbadb-core
@@ -2240,6 +2241,35 @@ without formatting or reparsing SQL, so planning sees concrete predicates.
 PostgreSQL error and RowDescription mapping do not inspect AST/HIR Rust layouts,
 execute a query for metadata, or leak OIDs into HIR, relational IR, planner,
 executor, or storage.
+
+Round 3 keeps ORM introspection in a separate, typed server-side adapter because
+SQLAlchemy's PostgreSQL catalog SQL uses schema-qualified system relations,
+arrays, `ANY`, `regclass`, and catalog-only functions that would otherwise
+force a premature full PostgreSQL parser into the native compiler. The adapter
+classifies queries from structural relation/function/predicate markers into a
+closed `CompatibilityStatement` domain; it does not compare whole SQL strings
+or execute user-table SQL. Each session derives a bounded read-only snapshot of
+table IDs, names, ordered columns, nullability, primary keys, and physical types
+from `Database::schema()` once. Every emitted row is generated from that
+snapshot and filtered through the principal's existing `TableId` visibility.
+There is no PostgreSQL catalog heap, WAL record, or second source of schema
+truth.
+
+Compatibility object OIDs are server-only deterministic identifiers. A
+SHA-256 domain-separated digest of stable table identity and canonical column
+metadata selects an OID in the high synthetic range; deterministic linear
+probing resolves collisions. Built-in PostgreSQL type OIDs stay centralized in
+`netbadb-pgwire`, while object OIDs do not enter types, HIR, relational IR,
+planning, execution, storage, or persistent formats. Stability is guaranteed
+for the same Canonical Schema across connections and restarts; it is not a
+persistent identity contract across schema changes.
+
+The generic compiler did gain two ordinary SQL expression capabilities exposed
+by the real client: postfix casts for the lossless BOOL/INT64/TEXT family and
+qualified projection aliases. Cast validation occurs in typed HIR and retains
+contextual nominal types, then binding removes the proven no-op cast so the
+planner still sees concrete values. PostgreSQL-only `regclass`, `regtype`, OID,
+array, and catalog function semantics remain confined to the adapter.
 
 Native and PostgreSQL sessions both use the private synchronous
 `DatabaseSession` for the optional database transaction, execute/commit/

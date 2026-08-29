@@ -167,6 +167,9 @@ pub enum ExprKind {
     Column(ColumnRef),
     Literal(ScalarValue),
     Parameter(ParameterId),
+    Cast {
+        expression: Box<Expr>,
+    },
     Binary {
         operator: BinaryOp,
         left: Box<Expr>,

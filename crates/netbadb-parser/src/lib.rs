@@ -158,6 +158,11 @@ pub enum Expr {
         id: ParameterId,
         span: Span,
     },
+    Cast {
+        expression: Box<Expr>,
+        data_type: SqlTypeName,
+        span: Span,
+    },
     Binary {
         left: Box<Expr>,
         operator: BinaryOp,
@@ -174,6 +179,13 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlTypeName {
+    Bool,
+    Int64,
+    Text,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +266,7 @@ enum TokenKind {
     Number(i64),
     String(String),
     Parameter(ParameterId),
+    ColonColon,
     Comma,
     Dot,
     Star,
@@ -314,6 +327,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             b'.' => {
                 position += 1;
                 TokenKind::Dot
+            }
+            b':' if bytes.get(position + 1) == Some(&b':') => {
+                position += 2;
+                TokenKind::ColonColon
             }
             b'*' => {
                 position += 1;
@@ -815,9 +832,39 @@ impl Parser {
         if !self
             .tokens
             .get(self.position + 1)
-            .is_some_and(|next| next.kind == TokenKind::LParen)
+            .is_some_and(|next| matches!(next.kind, TokenKind::LParen | TokenKind::ColonColon))
         {
-            return self.parse_column_name().map(SelectItem::Column);
+            let column = self.parse_column_name()?;
+            if self.matches(&TokenKind::As) {
+                self.position += 1;
+                let alias = self.expect_ident()?;
+                return Ok(SelectItem::Expression {
+                    span: Span {
+                        start: column.span.start,
+                        end: alias.span.end,
+                    },
+                    expression: Expr::Column(column),
+                    alias: Some(alias),
+                });
+            }
+            return Ok(SelectItem::Column(column));
+        }
+
+        if self
+            .tokens
+            .get(self.position + 1)
+            .is_some_and(|next| next.kind == TokenKind::ColonColon)
+        {
+            let expression = self.parse_expr(0)?;
+            let end = expr_span(&expression).end;
+            return Ok(SelectItem::Expression {
+                span: Span {
+                    start: expr_span(&expression).start,
+                    end,
+                },
+                expression,
+                alias: None,
+            });
         }
 
         let function = if name.eq_ignore_ascii_case("count") {
@@ -865,6 +912,39 @@ impl Parser {
     fn parse_expr(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_prefix()?;
         loop {
+            if self.matches(&TokenKind::ColonColon) {
+                self.position += 1;
+                let data_type_token = self.current().clone();
+                let TokenKind::Ident(name) = data_type_token.kind else {
+                    return Err(self.error_here("expected a type name after `::`"));
+                };
+                let data_type = if name.eq_ignore_ascii_case("bool")
+                    || name.eq_ignore_ascii_case("boolean")
+                {
+                    SqlTypeName::Bool
+                } else if name.eq_ignore_ascii_case("bigint") || name.eq_ignore_ascii_case("int8") {
+                    SqlTypeName::Int64
+                } else if name.eq_ignore_ascii_case("text") || name.eq_ignore_ascii_case("varchar")
+                {
+                    SqlTypeName::Text
+                } else {
+                    return Err(ParseError {
+                        message: format!("unsupported cast type `{name}`"),
+                        span: data_type_token.span,
+                    });
+                };
+                self.position += 1;
+                let span = Span {
+                    start: expr_span(&left).start,
+                    end: data_type_token.span.end,
+                };
+                left = Expr::Cast {
+                    expression: Box::new(left),
+                    data_type,
+                    span,
+                };
+                continue;
+            }
             if self.matches(&TokenKind::Is) {
                 const IS_PRECEDENCE: u8 = 4;
                 if IS_PRECEDENCE < minimum_precedence {
@@ -1077,6 +1157,7 @@ fn expr_span(expression: &Expr) -> Span {
         Expr::Column(column) => column.span,
         Expr::Literal { span, .. }
         | Expr::Parameter { span, .. }
+        | Expr::Cast { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Unary { span, .. }
         | Expr::IsNull { span, .. } => *span,
@@ -1105,7 +1186,7 @@ const fn aggregate_name(function: AggregateFunction) -> &'static str {
 mod tests {
     use super::{
         AggregateArgument, AggregateFunction, BinaryOp, Expr, Literal, NullOrder, SelectItem,
-        SortDirection, Statement, UnaryOp, parse, parse_statement,
+        SortDirection, SqlTypeName, Statement, UnaryOp, parse, parse_statement,
     };
 
     #[test]
@@ -1504,5 +1585,43 @@ mod tests {
         ));
         assert!(parse("SELECT $0").is_err());
         assert!(parse("SELECT $").is_err());
+    }
+
+    #[test]
+    fn parses_postfix_casts_as_generic_typed_expressions() {
+        let query = parse("SELECT $1::BIGINT AS id").expect("parse cast projection");
+        assert!(matches!(
+            &query.projection[0],
+            SelectItem::Expression {
+                expression: Expr::Cast {
+                    expression,
+                    data_type: SqlTypeName::Int64,
+                    ..
+                },
+                alias: Some(alias),
+                ..
+            } if matches!(**expression, Expr::Parameter { .. }) && alias.name == "id"
+        ));
+
+        let statement = parse_statement(
+            "INSERT INTO users (id, name, active) VALUES ($1::INT8, $2::VARCHAR, $3::BOOL)",
+        )
+        .expect("parse cast parameters in DML");
+        assert!(matches!(statement, Statement::Insert(_)));
+        assert!(parse("SELECT $1::REGCLASS").is_err());
+    }
+
+    #[test]
+    fn parses_qualified_column_projection_aliases() {
+        let query = parse("SELECT users.id AS users_id, users.name AS users_name FROM users")
+            .expect("parse aliased columns");
+        assert!(matches!(
+            &query.projection[0],
+            SelectItem::Expression {
+                expression: Expr::Column(column),
+                alias: Some(alias),
+                ..
+            } if column.name.name == "id" && alias.name == "users_id"
+        ));
     }
 }
