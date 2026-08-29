@@ -2123,10 +2123,11 @@ necessary equality under AND, both table statistics, and an analyzed ordered
 point access path on logical right. It reuses the Filter planner's non-NULL
 average-match estimate and exact point startup/match cost. Since HashJoin and
 IndexNestedLoopJoin both read logical left, checked `u128` compares
-`left_rows × point_cost` with the full right row count; the index candidate
-must also be strictly cheaper than NestedLoopJoin. Ties retain the old choice.
-Missing or stale statistics, no right index, only a left index, high estimated
-duplicates, self joins, and partitioned inputs never trigger executor fallback.
+`left_rows × point_cost` with the right table's `managed_page_count`, the same
+SeqScan cost used by Filter access-path planning; the index candidate must also
+be strictly cheaper than NestedLoopJoin. Ties retain the old choice. Missing or
+stale statistics, no right index, only a left index, high estimated duplicates,
+self joins, and partitioned inputs never trigger executor fallback.
 
 Execution validates the complete physical setup even for empty outer input,
 then reuses the direct SeqScan batch source with at most 256 owned outer rows.
@@ -2152,13 +2153,14 @@ never replays as HashJoin.
 
 The benchmark additionally gates unique outer sizes 1/8/64/256/512/1,024,
 disjoint, high-duplicate, residual, fixed-width Text, no-index, and
-left-index-only controls. The post run is saved at
-`/tmp/netbadb-phase72-post.txt`. Inspection text exposes the real left child and
-explicit right point access rather than a fake right SeqScan. Statement JSON
-advances conditionally to v5; ordinary v3 and partition v4 documents remain
-unchanged.
+left-index-only controls. The initial post run is saved at
+`/tmp/netbadb-phase72-post.txt`; the cost-review correction is saved at
+`/tmp/netbadb-phase72-cost-fix.txt`. Inspection text exposes the real left child
+and explicit right point access rather than a fake right SeqScan. Statement
+JSON advances conditionally to v5; ordinary v3 and partition v4 documents
+remain unchanged.
 
-The serial quick post run reported:
+The initial serial quick post run exposed a bad crossover:
 
 | scenario | outer × inner | average matches estimate | pre/reference plan | post plan | pre/reference median | post median | change |
 | --- | ---: | ---: | --- | --- | ---: | ---: | ---: |
@@ -2176,19 +2178,123 @@ Only the first two rows are actual before/after samples from the same indexed
 fixtures; the 64-row no-index entry is labeled as a control rather than
 misrepresented as a pre sample. Unique indexed medians for outer sizes
 1/8/64/256/512 were 36,292/167,875/553,375/2,175,375/5,988,458 ns. At 1,024,
-the checked cost crossed to HashJoin and fell to 901,875 ns. This single quick
-run strongly confirms the small-outer structural target and also shows that
-the storage-neutral integer work units are not a latency model: 256 and 512
-point probes were slower than scanning and hashing right. No magic outer-size
-threshold is introduced from one noisy run; future work should calibrate
-engine-provided access cost hints or collect repeated crossover evidence.
+the row-count comparison crossed to HashJoin and fell to 901,875 ns. Selecting
+the 256/512 point plans despite that evidence was not retained as a deferred
+calibration issue.
 
-The decision is **KEEP** for the narrow algorithm and conservative eligibility.
-The two actual pre/post targets remove the full right input and improve, exact
-memory/order/error invariants hold, and high-duplicate/large/no-right-index
-controls retain HashJoin. KEEP is not a claim that every cost-selected point
-plan is faster; the mid-size sweep is recorded as an explicit cost-calibration
-limit rather than hidden.
+The review correction compares point work with the already established
+managed-page SeqScan cost instead of right row count. Its serial quick run was:
+
+| scenario | outer × inner | corrected plan | corrected median (ns) |
+| --- | ---: | --- | ---: |
+| unique match | 1×4,096 | IndexNestedLoopJoin | 25,792 |
+| unique match | 8×4,096 | IndexNestedLoopJoin | 66,709 |
+| unique match | 64×4,096 | HashJoin | 1,129,458 |
+| unique match | 256×4,096 | HashJoin | 1,403,625 |
+| unique match | 512×4,096 | HashJoin | 1,110,500 |
+| unique match | 1,024×4,096 | HashJoin | 1,440,750 |
+| disjoint | 64×4,096 | HashJoin | 1,104,375 |
+| duplicate disjoint | 64×4,096 | HashJoin | 1,698,916 |
+| residual no-output | 8×4,096 | IndexNestedLoopJoin | 144,375 |
+| fixed Text/8 match | 64×4,096 | HashJoin | 1,203,416 |
+| no right index | 64×4,096 | HashJoin | 651,709 |
+| left index only | 64×4,096 | HashJoin | 573,583 |
+
+Machine-local runs remain noisy, so cross-run values are not treated as a
+general throughput claim. The directly reported regression case nevertheless
+moves from the initial 5,988,458 ns 512-row IndexJoin to a 1,110,500 ns
+HashJoin, while 1/8-row and residual/8 targets retain the structurally bounded
+point plan. No outer-row threshold was added: actual table layout feeds the
+existing managed-page statistic, and duplicate estimates still raise point
+cost.
+
+The decision remains **KEEP** for the narrow algorithm after correcting the
+cost units. Exact memory/order/error invariants hold, the smallest outer cases
+remove the full right input, and 64/256/512, high-duplicate, Text/64,
+no-right-index, and left-index-only controls now conservatively retain
+HashJoin. Future repeated crossover work may refine engine-provided cost hints;
+it is no longer required to tolerate the measured 512-row regression.
+
+## IndexJoin cost-unit audit and Heap calibration (Phase 73)
+
+Phase 73 audited the units before changing any access-method constant. The
+current direct-join decision has two separate comparisons:
+
+- NestedLoop and Hash CPU work remain row units: `left_rows × right_rows` and
+  `left_rows + right_rows`, respectively;
+- IndexJoin inner access work is `left_rows × point_cost`, where the shared
+  Filter/Join point cost is either
+  `base + expected_io + estimated_matches × sequential_unit` or the retained
+  fallback `1 + tree_height + estimated_matches`;
+- IndexJoin access work is compared with the right engine's
+  `managed_page_count`, the same neutral sequential-work unit used by Filter
+  IndexScan versus SeqScan. Heap SeqScan currently visits every managed page
+  in its colocated file and validates/skips B+Tree and catalog pages, so those
+  pages correctly remain part of Heap sequential work.
+
+The benchmark now records direct Heap point hit/miss probes at 1/8/32/64/256,
+a same-fixture projected scan, paired unique and no-match outer sweeps from 1
+through 1,024, duplicate estimates 1/4/16/64, inner sizes
+512/1,024/4,096/16,384 at outer 8/32/64, fixed-width Text, Filter/range controls,
+and an LSM 8×512 IndexJoin control. Each paired SQL fixture loads data once,
+measures and warms the no-join-key-index state, creates/analyzes the right
+join-key index, then independently warms and measures the indexed state.
+
+Three serial full quick runs are preserved at
+`/tmp/netbadb-phase73-pre-run1.txt`, `run2.txt`, and `run3.txt`. They also
+served as a deliberately tested pilot in which Heap sequential cost counted
+only Heap data pages. The pilot was **rejected and restored**: actual Heap
+SeqScan still traverses colocated access pages, and indexed HashJoin was
+consistently slower than no-index HashJoin. The final-code smoke confirming the
+restored total-managed-page semantics is
+`/tmp/netbadb-phase73-smoke.txt`. Query execution was unchanged by the pilot;
+for the core 4,096-row fixture its planner boundary was also unchanged.
+
+The median of the three per-run medians for the core points was:
+
+| workload | outer | indexed median (ns) | no-index median (ns) | indexed plan | evidence |
+| --- | ---: | ---: | ---: | --- | --- |
+| unique | 1 | 30,083 | 697,916 | IndexJoin | reference is NestedLoop, not Hash |
+| unique | 8 | 140,417 | 661,667 | IndexJoin | Index faster in all 3 runs |
+| unique | 16 | 265,959 | 610,875 | IndexJoin | Index faster in all 3 runs |
+| unique | 32 | 971,833 | 661,833 | HashJoin | both states use Hash; no Index reference |
+| unique | 64 | 1,121,292 | 659,584 | HashJoin | both states use Hash; no Index reference |
+| unique | 128 | 1,316,375 | 666,250 | HashJoin | both states use Hash; no Index reference |
+| unique | 256 | 1,363,417 | 764,875 | HashJoin | both states use Hash; no Index reference |
+| unique | 512 | 1,359,500 | 864,833 | HashJoin | both states use Hash; no Index reference |
+| unique | 1,024 | 1,597,875 | 1,053,333 | HashJoin | both states use Hash; no Index reference |
+| no match | 8 | 99,625 | 664,500 | IndexJoin | Index faster in all 3 runs |
+| no match | 16 | 186,541 | 625,917 | IndexJoin | Index faster in all 3 runs |
+| no match | 32 | 1,122,167 | 668,125 | HashJoin | both states use Hash; no Index reference |
+| no match | 64 | 1,258,375 | 646,375 | HashJoin | both states use Hash; no Index reference |
+
+The largest measured SQL outer with a valid, consistently faster Index
+reference is 16. There is no measured smallest Hash winner: from outer 32 the
+planner selects Hash in both fixture states, and Phase 73 intentionally adds no
+FORCE JOIN mechanism. Direct Heap attribution provides only a proxy: median
+per-probe hit cost was 15,182 ns at 32 probes and 12,243 ns at 64; miss cost was
+7,563/7,198 ns, versus a 489,542 ns projected full scan. That places the direct
+hit/miss crossover around 32–64 probes, but excludes SQL executor work and is
+not promoted to an optimizer threshold.
+
+Duplicate estimates naturally raise the shared point cost: at outer 8,
+matches 1 and 4 select IndexJoin (three-run medians 141,000 and 345,916 ns),
+while matches 16 and 64 select HashJoin. The restored final model also varies
+with inner layout: the final smoke selects Hash/Index/Index/Index for outer 8
+at inner 512/1,024/4,096/16,384, and Hash/Hash/Hash/Index for outer 32. Text/8
+keeps IndexJoin at outer 8 and HashJoin at outer 64. LSM keeps its dynamic hints
+and selects IndexJoin for the 8×512 control.
+
+The static Heap-hint calibration decision is **REJECT**. Heap hints were
+`None` before and remain `None`; the generic
+`1 + tree_height + estimated_matches` fallback remains. LSM hints were dynamic
+before and remain unchanged. A larger Heap point base would move the planner
+earlier even though direct evidence suggests the current 16→32 switch is
+already conservative; a smaller base cannot honestly represent the measured
+fixed probe work. Hit/miss also cannot be separated from join statistics, and
+the paired no-index Hash latency is not a pure indexed-layout Hash reference.
+No magic outer threshold, executor change, runtime replanning, post-calibration
+run, or nanosecond-derived planner constant was added.
 
 ## CI and compatibility
 

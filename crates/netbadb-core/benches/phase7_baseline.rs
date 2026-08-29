@@ -307,6 +307,7 @@ fn main() -> BenchResult<()> {
     let mut measurements = Vec::new();
 
     run_direct_heap_scan_scenarios(settings, &mut measurements)?;
+    run_phase73_index_join_cost_scenarios(settings, &mut measurements)?;
     run_projection_attribution_scenarios(settings, &mut measurements)?;
     run_phase69_filter_short_circuit_scenarios(settings, &mut measurements)?;
     run_top_n_attribution_scenarios(settings, &mut measurements)?;
@@ -3259,6 +3260,7 @@ fn run_direct_heap_scan_scenarios(
     settings: ProfileSettings,
     measurements: &mut Vec<Measurement>,
 ) -> BenchResult<()> {
+    run_phase73_direct_heap_point_scenarios(settings, measurements)?;
     run_direct_heap_scan(
         "heap_scan_join_shape",
         settings.join_large,
@@ -3281,6 +3283,120 @@ fn run_direct_heap_scan_scenarios(
         measurements,
     )?;
     run_direct_heap_payload_scan(settings, measurements)
+}
+
+fn run_phase73_direct_heap_point_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let scenario = "phase73_direct_heap_point_fixture";
+    let rows = 4_096;
+    let paths = FixturePaths::new(scenario, 1);
+    let mut storage = HeapStorage::create(paths.path(0), join_table(RIGHT_TABLE_ID, "right_rows"))?;
+    let mut transaction = storage.begin_transaction()?;
+    for id in 0..rows {
+        let value = i64::try_from(id).map_err(|_| message_error("join ID exceeds i64"))?;
+        storage.insert_in(
+            &mut transaction,
+            &[ScalarValue::Int64(value), ScalarValue::Int64(value)],
+        )?;
+    }
+    transaction.commit()?;
+    let index = storage.create_index(ColumnId(2))?;
+    let view = storage.read_view()?;
+    let hit_key = ScalarValue::Int64(i64::try_from(rows / 2)?);
+    let miss_key = ScalarValue::Int64(i64::try_from(rows)?);
+
+    for (kind, key, rows_per_probe, checksum_per_probe) in [
+        ("hit", &hit_key, 1_u64, u128::from(rows / 2)),
+        ("miss", &miss_key, 0_u64, 0_u128),
+    ] {
+        for probes in [1_u64, 8, 32, 64, 256] {
+            let name = format!("phase73_direct_heap_point_{kind}_{probes}");
+            let expected = Observation {
+                rows: rows_per_probe
+                    .checked_mul(probes)
+                    .ok_or_else(|| message_error("point attribution row count overflow"))?,
+                checksum: checksum_per_probe
+                    .checked_mul(u128::from(probes))
+                    .ok_or_else(|| message_error("point attribution checksum overflow"))?,
+            };
+            let durations = measure_checked(
+                &name,
+                settings.query_warmup,
+                settings.query_iterations,
+                expected,
+                || {
+                    let mut observed = Observation {
+                        rows: 0,
+                        checksum: 0,
+                    };
+                    for _ in 0..probes {
+                        let candidates = storage.btree().lookup(index.handle, key)?;
+                        for row_id in candidates {
+                            let Some(values) = storage.read_row_columns_with_view(
+                                row_id,
+                                &[ID_COLUMN_ID],
+                                &view,
+                            )?
+                            else {
+                                continue;
+                            };
+                            let [ScalarValue::Int64(id)] = values.as_slice() else {
+                                return Err(message_error(
+                                    "direct Heap point probe returned an invalid projection",
+                                ));
+                            };
+                            observed.rows = observed.rows.checked_add(1).ok_or_else(|| {
+                                message_error("point attribution row count overflow")
+                            })?;
+                            observed.checksum = observed
+                                .checksum
+                                .checked_add(u128::try_from(*id).map_err(|_| {
+                                    message_error("direct Heap point probe returned a negative ID")
+                                })?)
+                                .ok_or_else(|| {
+                                    message_error("point attribution checksum overflow")
+                                })?;
+                        }
+                    }
+                    Ok(observed)
+                },
+                |observed| Ok(*observed),
+            )?;
+            measurements.push(Measurement {
+                scenario: name,
+                rows: format!("{probes} probes / {} returned", expected.rows),
+                plan: format!("DirectHeapBTreePoint{kind}Projected"),
+                operations_per_iteration: probes,
+                durations,
+            });
+        }
+    }
+
+    let name = "phase73_direct_heap_projected_scan";
+    let expected = Observation {
+        rows,
+        checksum: arithmetic_sum(rows),
+    };
+    let durations = measure_checked(
+        name,
+        settings.query_warmup,
+        settings.query_iterations,
+        expected,
+        || storage.scan_columns(&[ID_COLUMN_ID]).map_err(Into::into),
+        |result| heap_scan_observation(result, 1),
+    )?;
+    measurements.push(Measurement {
+        scenario: name.to_owned(),
+        rows: rows.to_string(),
+        plan: "DirectProjectedHeapScan".to_owned(),
+        operations_per_iteration: 1,
+        durations,
+    });
+
+    storage.close()?;
+    paths.cleanup()
 }
 
 fn run_direct_heap_payload_scan(
@@ -3401,6 +3517,22 @@ fn run_point_and_shape_scenarios(
         Observation {
             rows: 1,
             checksum: u128::from(middle),
+        },
+        settings,
+        ids_observation,
+        measurements,
+    )?;
+    run_items_query(
+        "phase73_point_index_miss",
+        rows,
+        &[ID_COLUMN_ID],
+        NullDistribution::Low,
+        &format!("SELECT id FROM items WHERE id = {rows}"),
+        &[Operator::Filter, Operator::IndexScan],
+        &[Operator::SeqScan],
+        Observation {
+            rows: 0,
+            checksum: 0,
         },
         settings,
         ids_observation,
@@ -4134,7 +4266,7 @@ fn run_phase72_index_join_attribution_scenarios(
             false,
         ),
         (
-            "phase72_index_join_unique_64x4096",
+            "phase72_hash_join_unique_64x4096",
             64,
             right_rows,
             0,
@@ -4142,11 +4274,11 @@ fn run_phase72_index_join_attribution_scenarios(
             false,
             "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             (0..64).collect::<Vec<_>>(),
-            Operator::IndexNestedLoopJoin,
+            Operator::HashJoin,
             false,
         ),
         (
-            "phase72_index_join_unique_256x4096",
+            "phase72_hash_join_unique_256x4096",
             256,
             right_rows,
             0,
@@ -4154,11 +4286,11 @@ fn run_phase72_index_join_attribution_scenarios(
             false,
             "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             (0..256).collect::<Vec<_>>(),
-            Operator::IndexNestedLoopJoin,
+            Operator::HashJoin,
             false,
         ),
         (
-            "phase72_index_join_unique_512x4096",
+            "phase72_hash_join_unique_512x4096",
             512,
             right_rows,
             0,
@@ -4166,7 +4298,7 @@ fn run_phase72_index_join_attribution_scenarios(
             false,
             "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             (0..512).collect::<Vec<_>>(),
-            Operator::IndexNestedLoopJoin,
+            Operator::HashJoin,
             false,
         ),
         (
@@ -4182,7 +4314,7 @@ fn run_phase72_index_join_attribution_scenarios(
             false,
         ),
         (
-            "phase72_index_join_none_64x4096",
+            "phase72_hash_join_none_64x4096",
             64,
             right_rows,
             right_rows,
@@ -4190,7 +4322,7 @@ fn run_phase72_index_join_attribution_scenarios(
             false,
             "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
             Vec::new(),
-            Operator::IndexNestedLoopJoin,
+            Operator::HashJoin,
             false,
         ),
         (
@@ -4321,7 +4453,7 @@ fn run_phase72_index_join_attribution_scenarios(
             durations,
         });
     }
-    let name = "phase72_index_join_text8_unique_64x4096";
+    let name = "phase72_hash_join_text8_unique_64x4096";
     let left_rows = 64;
     let paths = FixturePaths::new(name, 2);
     let mut database = Database::create_tables(vec![
@@ -4344,14 +4476,10 @@ fn run_phase72_index_join_attribution_scenarios(
         &database,
         name,
         sql,
-        &[Operator::IndexNestedLoopJoin, Operator::SeqScan],
-        &[
-            Operator::NestedLoopJoin,
-            Operator::HashJoin,
-            Operator::IndexScan,
-        ],
+        &[Operator::HashJoin, Operator::SeqScan],
+        &[Operator::NestedLoopJoin, Operator::IndexNestedLoopJoin],
     )?;
-    inspect_phase72_index_join_shape(&database, name, sql, false)?;
+    inspect_phase70_hash_join_shape(&database, name, sql, PhysicalType::Text, false)?;
     let expected_ids = (0..left_rows).collect::<Vec<_>>();
     let expected = expected_ids_observation(&expected_ids)?;
     let durations = measure_checked(
@@ -4368,6 +4496,386 @@ fn run_phase72_index_join_attribution_scenarios(
         scenario: name.to_owned(),
         rows: format!("{left_rows}x{right_rows}"),
         plan: format!("{plan} [right_point_index=join_key#2 Text/8]"),
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Phase73JoinScenario {
+    family: &'static str,
+    left_rows: u64,
+    right_rows: u64,
+    right_cardinality: u64,
+    matching: bool,
+    text_width: Option<usize>,
+}
+
+fn run_phase73_index_join_cost_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    for left_rows in [1_u64, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024] {
+        for matching in [true, false] {
+            run_phase73_join_pair(
+                Phase73JoinScenario {
+                    family: if matching { "unique" } else { "no_match" },
+                    left_rows,
+                    right_rows: 4_096,
+                    right_cardinality: 4_096,
+                    matching,
+                    text_width: None,
+                },
+                settings,
+                measurements,
+            )?;
+        }
+    }
+
+    for average_matches in [1_u64, 4, 16, 64] {
+        run_phase73_join_pair(
+            Phase73JoinScenario {
+                family: "duplicate",
+                left_rows: 8,
+                right_rows: 4_096,
+                right_cardinality: 4_096 / average_matches,
+                matching: true,
+                text_width: None,
+            },
+            settings,
+            measurements,
+        )?;
+    }
+
+    for left_rows in [8_u64, 32, 64] {
+        for right_rows in [512_u64, 1_024, 4_096, 16_384] {
+            run_phase73_join_pair(
+                Phase73JoinScenario {
+                    family: "inner_size",
+                    left_rows,
+                    right_rows,
+                    right_cardinality: right_rows,
+                    matching: true,
+                    text_width: None,
+                },
+                settings,
+                measurements,
+            )?;
+        }
+    }
+
+    for left_rows in [8_u64, 64] {
+        run_phase73_join_pair(
+            Phase73JoinScenario {
+                family: "text8_unique",
+                left_rows,
+                right_rows: 4_096,
+                right_cardinality: 4_096,
+                matching: true,
+                text_width: Some(8),
+            },
+            settings,
+            measurements,
+        )?;
+    }
+    run_phase73_lsm_index_join_control(settings, measurements)
+}
+
+fn run_phase73_join_pair(
+    scenario: Phase73JoinScenario,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let matches_per_probe = scenario.right_rows / scenario.right_cardinality;
+    let fixture_name = format!(
+        "phase73_{}_{}x{}_m{}_paired",
+        scenario.family,
+        scenario.left_rows,
+        scenario.right_rows,
+        if scenario.matching {
+            matches_per_probe
+        } else {
+            0
+        },
+    );
+    let paths = FixturePaths::new(&fixture_name, 2);
+    let left_table = if scenario.text_width.is_some() {
+        text_join_table(LEFT_TABLE_ID, "left_rows")
+    } else {
+        join_table(LEFT_TABLE_ID, "left_rows")
+    };
+    let right_table = if scenario.text_width.is_some() {
+        text_join_table(RIGHT_TABLE_ID, "right_rows")
+    } else {
+        join_table(RIGHT_TABLE_ID, "right_rows")
+    };
+    let mut database = Database::create_tables(vec![
+        (paths.path(0).to_path_buf(), left_table),
+        (paths.path(1).to_path_buf(), right_table),
+    ])?;
+    let right_offset = if scenario.matching {
+        0
+    } else {
+        scenario.right_rows
+    };
+    if let Some(width) = scenario.text_width {
+        load_fixed_text_join_rows(
+            &mut database,
+            LEFT_TABLE_ID,
+            scenario.left_rows,
+            scenario.left_rows,
+            0,
+            width,
+        )?;
+        load_fixed_text_join_rows(
+            &mut database,
+            RIGHT_TABLE_ID,
+            scenario.right_rows,
+            scenario.right_cardinality,
+            right_offset,
+            width,
+        )?;
+    } else {
+        load_join_rows(
+            &mut database,
+            LEFT_TABLE_ID,
+            scenario.left_rows,
+            scenario.left_rows,
+            0,
+        )?;
+        load_join_rows(
+            &mut database,
+            RIGHT_TABLE_ID,
+            scenario.right_rows,
+            scenario.right_cardinality,
+            right_offset,
+        )?;
+    }
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    inspect_analyzed_row_counts(
+        &database,
+        &fixture_name,
+        scenario.left_rows,
+        scenario.right_rows,
+    )?;
+
+    measure_phase73_join_state(&mut database, scenario, false, settings, measurements)?;
+    database.create_index(RIGHT_TABLE_ID, ColumnId(2))?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    measure_phase73_join_state(&mut database, scenario, true, settings, measurements)?;
+
+    database.close()?;
+    paths.cleanup()
+}
+
+fn measure_phase73_join_state(
+    database: &mut Database,
+    scenario: Phase73JoinScenario,
+    indexed: bool,
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let matches_per_probe = scenario.right_rows / scenario.right_cardinality;
+    let reference = if indexed {
+        "indexed"
+    } else {
+        "no_index_reference"
+    };
+    let name = format!(
+        "phase73_{}_{}x{}_m{}_{}",
+        scenario.family,
+        scenario.left_rows,
+        scenario.right_rows,
+        if scenario.matching {
+            matches_per_probe
+        } else {
+            0
+        },
+        reference,
+    );
+
+    let sql = "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key";
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    let has_index_join = contains_operator(root, Operator::IndexNestedLoopJoin);
+    let has_hash_join = contains_operator(root, Operator::HashJoin);
+    let has_nested_loop = contains_operator(root, Operator::NestedLoopJoin);
+    if usize::from(has_index_join) + usize::from(has_hash_join) + usize::from(has_nested_loop) != 1
+    {
+        return Err(message_error(format!(
+            "scenario `{name}` expected exactly one direct join algorithm: {}",
+            plan_label(root)
+        )));
+    }
+    if !indexed && !(has_hash_join || scenario.left_rows == 1 && has_nested_loop) {
+        return Err(message_error(format!(
+            "scenario `{name}` no-index reference did not select the expected HashJoin"
+        )));
+    }
+    let selected = if has_index_join {
+        inspect_phase72_index_join_shape(database, &name, sql, false)?;
+        "IndexNestedLoopJoin"
+    } else if has_hash_join {
+        inspect_phase70_hash_join_shape(
+            database,
+            &name,
+            sql,
+            if scenario.text_width.is_some() {
+                PhysicalType::Text
+            } else {
+                PhysicalType::Int64
+            },
+            false,
+        )?;
+        "HashJoin"
+    } else {
+        inspect_plan(
+            database,
+            &name,
+            sql,
+            &[Operator::NestedLoopJoin, Operator::SeqScan],
+            &[Operator::IndexNestedLoopJoin, Operator::HashJoin],
+        )?;
+        "NestedLoopJoin"
+    };
+    let plan = plan_label(root);
+    let (managed_pages, tree_height) = phase73_right_cost_inputs(database, &name, indexed)?;
+    let estimated_matches = u128::from(matches_per_probe);
+    let point_cost = tree_height.map(|height| u128::from(height) + 1 + estimated_matches);
+    let index_work = point_cost.and_then(|cost| cost.checked_mul(u128::from(scenario.left_rows)));
+    let hash_row_work = u128::from(scenario.left_rows)
+        .checked_add(u128::from(scenario.right_rows))
+        .ok_or_else(|| message_error("Phase 73 HashJoin work overflow"))?;
+    let returned_rows = if scenario.matching {
+        scenario
+            .left_rows
+            .checked_mul(matches_per_probe)
+            .ok_or_else(|| message_error("Phase 73 result row count overflow"))?
+    } else {
+        0
+    };
+    let checksum = if scenario.matching {
+        arithmetic_sum(scenario.left_rows)
+            .checked_mul(u128::from(matches_per_probe))
+            .ok_or_else(|| message_error("Phase 73 result checksum overflow"))?
+    } else {
+        0
+    };
+    let expected = Observation {
+        rows: returned_rows,
+        checksum,
+    };
+    let durations = measure_checked(
+        &name,
+        settings.query_warmup,
+        settings.join_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        ids_observation,
+    )?;
+    measurements.push(Measurement {
+        scenario: name,
+        rows: format!(
+            "{}x{} probes={} returned={returned_rows}",
+            scenario.left_rows, scenario.right_rows, scenario.left_rows
+        ),
+        plan: format!(
+            "{plan} [selected={selected} estimated_matches={estimated_matches} point_cost={} index_work={} hash_scan_work={managed_pages} hash_row_work={hash_row_work} tree_height={}]",
+            point_cost
+                .map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+            index_work
+                .map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+            tree_height.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+        ),
+        operations_per_iteration: 1,
+        durations,
+    });
+    Ok(())
+}
+
+fn phase73_right_cost_inputs(
+    database: &Database,
+    scenario: &str,
+    indexed: bool,
+) -> BenchResult<(u64, Option<u32>)> {
+    let catalog = database.inspect_catalog()?;
+    let right = catalog
+        .tables
+        .iter()
+        .find(|table| table.table_id == RIGHT_TABLE_ID)
+        .ok_or_else(|| message_error(format!("scenario `{scenario}` right table is missing")))?;
+    let managed_pages = right
+        .statistics
+        .as_ref()
+        .map(|statistics| statistics.managed_page_count)
+        .ok_or_else(|| {
+            message_error(format!(
+                "scenario `{scenario}` right table statistics are missing"
+            ))
+        })?;
+    let tree_height = right
+        .indexes
+        .iter()
+        .find(|index| index.column_id == ColumnId(2))
+        .and_then(|index| index.statistics.as_ref())
+        .map(|statistics| statistics.tree_height);
+    if indexed != tree_height.is_some() {
+        return Err(message_error(format!(
+            "scenario `{scenario}` index statistics presence did not match fixture"
+        )));
+    }
+    Ok((managed_pages, tree_height))
+}
+
+fn run_phase73_lsm_index_join_control(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let name = "phase73_lsm_index_join_unique_8x512";
+    let left_rows = 8;
+    let right_rows = 512;
+    let paths = FixturePaths::new(name, 2);
+    let mut database = Database::create_storages(vec![
+        TableStorageCreateSpec::heap(paths.path(0), join_table(LEFT_TABLE_ID, "left_rows")),
+        TableStorageCreateSpec::lsm(
+            paths.path(1),
+            join_table(RIGHT_TABLE_ID, "right_rows"),
+            ColumnId(2),
+        ),
+    ])?;
+    load_join_rows(&mut database, LEFT_TABLE_ID, left_rows, left_rows, 0)?;
+    load_join_rows(&mut database, RIGHT_TABLE_ID, right_rows, right_rows, 0)?;
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    let sql = "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key";
+    let plan = inspect_plan(
+        &database,
+        name,
+        sql,
+        &[Operator::IndexNestedLoopJoin, Operator::SeqScan],
+        &[Operator::HashJoin, Operator::NestedLoopJoin],
+    )?;
+    inspect_phase72_index_join_shape(&database, name, sql, false)?;
+    let expected = Observation {
+        rows: left_rows,
+        checksum: arithmetic_sum(left_rows),
+    };
+    let durations = measure_checked(
+        name,
+        settings.query_warmup,
+        settings.join_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        ids_observation,
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: name.to_owned(),
+        rows: format!("{left_rows}x{right_rows}"),
+        plan: format!("{plan} [engine=LSM hints=dynamic unchanged]"),
         operations_per_iteration: 1,
         durations,
     });

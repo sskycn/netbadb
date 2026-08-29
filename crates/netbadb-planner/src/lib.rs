@@ -22,8 +22,14 @@ pub struct AccessPathCapabilities {
 
 /// Storage-neutral integer costs supplied by an access method.
 ///
-/// These are planning work units, not physical page identities. Engines may
-/// derive them from trees, levels, filters, or another persistent layout.
+/// Storage-supplied weights in neutral integer planning-work units.
+///
+/// They share the scale of a table's managed sequential-page cost; they are
+/// not elapsed time. The point base is fixed access-method work, point I/O is
+/// expected candidate-source reads, range startup precedes returned
+/// candidates, and the sequential unit weights each returned candidate row.
+/// Engines may derive the weights from trees, levels, filters, or another
+/// persistent layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccessCostHints {
     pub point_probe_base_cost: u32,
@@ -862,18 +868,24 @@ fn choose_direct_inner_join(
     let Some(left_table_id) = direct_scan_table_id(left) else {
         return DirectInnerJoin::NestedLoop;
     };
-    let (Some(left_rows), Some(right_rows)) = (
-        direct_scan_row_count(left, table_statistics),
-        direct_scan_row_count(right, table_statistics),
+    let (Some(left_statistics), Some(right_statistics)) = (
+        direct_scan_statistics(left, table_statistics),
+        direct_scan_statistics(right, table_statistics),
     ) else {
         return DirectInnerJoin::NestedLoop;
     };
+    let left_rows = left_statistics.row_count;
+    let right_rows = right_statistics.row_count;
     let Some(nested_loop_work) = u128::from(left_rows).checked_mul(u128::from(right_rows)) else {
         return DirectInnerJoin::NestedLoop;
     };
     let Some(hash_join_work) = u128::from(left_rows).checked_add(u128::from(right_rows)) else {
         return DirectInnerJoin::NestedLoop;
     };
+    // Point access and SeqScan must stay in the storage-neutral units already
+    // used by Filter planning. Row count remains the existing Hash-vs-Nested
+    // CPU-work comparison, but is not a full-scan access cost.
+    let hash_join_right_work = seq_scan_cost(right_statistics);
 
     if let Some((right_table_id, right_access_path, point_cost)) = eligible_right_point_access(
         right,
@@ -889,7 +901,7 @@ fn choose_direct_inner_join(
         }
         && let Some(index_join_inner_work) = u128::from(left_rows).checked_mul(point_cost)
         && index_join_inner_work < nested_loop_work
-        && index_join_inner_work < u128::from(right_rows)
+        && index_join_inner_work < hash_join_right_work
     {
         return DirectInnerJoin::Index {
             left_key,
@@ -954,10 +966,10 @@ fn eligible_right_point_access(
         .map(|(access_path, cost)| (*table_id, access_path, cost))
 }
 
-fn direct_scan_row_count(
+fn direct_scan_statistics<'a>(
     plan: &LogicalPlan,
-    table_statistics: &[TableAccessStatistics],
-) -> Option<u64> {
+    table_statistics: &'a [TableAccessStatistics],
+) -> Option<&'a TableStatistics> {
     let LogicalPlan::Scan { table_id, .. } = plan else {
         return None;
     };
@@ -966,7 +978,6 @@ fn direct_scan_row_count(
         .find(|candidate| candidate.table_id == *table_id)?
         .statistics
         .as_ref()
-        .map(|statistics| statistics.row_count)
 }
 
 fn find_hash_equality(
@@ -1832,7 +1843,7 @@ mod tests {
         AccessCostHints, AccessPath, AccessPathCapabilities, PhysicalPlan, PhysicalStatement,
         RangeTablePlanningSnapshot, TableAccessStatistics, plan, plan_statement,
         plan_statement_with_access_paths, plan_statement_with_statistics, plan_with_access_paths,
-        plan_with_partition_snapshots, plan_with_statistics,
+        plan_with_partition_snapshots, plan_with_statistics, point_lookup_cost,
     };
     use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
@@ -2002,11 +2013,19 @@ mod tests {
     }
 
     fn join_table_statistics(table_id: u64, row_count: u64) -> TableAccessStatistics {
+        join_table_statistics_with_pages(table_id, row_count, row_count.max(1))
+    }
+
+    fn join_table_statistics_with_pages(
+        table_id: u64,
+        row_count: u64,
+        managed_page_count: u64,
+    ) -> TableAccessStatistics {
         TableAccessStatistics {
             table_id: TableId(table_id),
             statistics: Some(TableStatistics {
                 row_count,
-                managed_page_count: 1,
+                managed_page_count,
             }),
         }
     }
@@ -2114,7 +2133,10 @@ mod tests {
         let logical = logical_join(left, right, predicate);
         let access = [join_index_path(2, 1, 4_096)];
 
-        let small = [join_table_statistics(1, 8), join_table_statistics(2, 4_096)];
+        let small = [
+            join_table_statistics_with_pages(1, 8, 1),
+            join_table_statistics_with_pages(2, 4_096, 128),
+        ];
         assert!(matches!(
             plan_with_statistics(&logical, &small, &access),
             PhysicalPlan::IndexNestedLoopJoin {
@@ -2136,11 +2158,20 @@ mod tests {
         ));
 
         let tie = [
-            join_table_statistics(1, 1_024),
-            join_table_statistics(2, 4_096),
+            join_table_statistics_with_pages(1, 8, 1),
+            join_table_statistics_with_pages(2, 4_096, 32),
         ];
         assert!(matches!(
             plan_with_statistics(&logical, &tie, &access),
+            PhysicalPlan::HashJoin { .. }
+        ));
+
+        let scan_cheaper = [
+            join_table_statistics_with_pages(1, 8, 1),
+            join_table_statistics_with_pages(2, 4_096, 16),
+        ];
+        assert!(matches!(
+            plan_with_statistics(&logical, &scan_cheaper, &access),
             PhysicalPlan::HashJoin { .. }
         ));
 
@@ -2151,6 +2182,47 @@ mod tests {
         ];
         assert!(matches!(
             plan_with_statistics(&logical, &duplicate_outer, &duplicate_access),
+            PhysicalPlan::HashJoin { .. }
+        ));
+    }
+
+    #[test]
+    fn index_join_uses_shared_point_units_against_right_scan_units() {
+        let (left, right, left_key, right_key) = simple_join_fixture(
+            SemanticType::physical(PhysicalType::Int64),
+            SemanticType::physical(PhysicalType::Int64),
+        );
+        let logical = logical_join(
+            left,
+            right,
+            join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key)),
+        );
+        let hints = AccessCostHints {
+            point_probe_base_cost: 8,
+            expected_point_io: 2,
+            range_startup_cost: 2,
+            sequential_unit_cost: 1,
+        };
+        let mut access = join_index_path(2, 1, 4_096);
+        access.cost_hints = Some(hints);
+        let index = access.statistics.as_ref().expect("index statistics");
+        assert_eq!(point_lookup_cost(index, Some(&hints), 1), Some(11));
+
+        let index_cheaper = [
+            join_table_statistics_with_pages(1, 8, 1),
+            join_table_statistics_with_pages(2, 4_096, 89),
+        ];
+        assert!(matches!(
+            plan_with_statistics(&logical, &index_cheaper, &[access.clone()]),
+            PhysicalPlan::IndexNestedLoopJoin { .. }
+        ));
+
+        let exact_tie = [
+            join_table_statistics_with_pages(1, 8, 1),
+            join_table_statistics_with_pages(2, 4_096, 88),
+        ];
+        assert!(matches!(
+            plan_with_statistics(&logical, &exact_tie, &[access]),
             PhysicalPlan::HashJoin { .. }
         ));
     }

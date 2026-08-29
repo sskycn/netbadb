@@ -244,8 +244,8 @@ Join
  |      -> NestedLoopJoin
  |
  +-- analyzed direct Scan × Scan with cross-side equality
-        +-- costed ordered point index on logical right is strictly cheaper
-        |      than both alternatives -> IndexNestedLoopJoin
+        +-- costed ordered point index on logical right beats right SeqScan
+        |      managed-page work and NestedLoop work -> IndexNestedLoopJoin
         +-- left_rows + right_rows < left_rows * right_rows -> HashJoin
         +-- otherwise -> NestedLoopJoin
 ```
@@ -255,16 +255,35 @@ only the algorithm choice; the complete predicate remains the semantic source
 of truth. There is no join reorder, selectivity estimate, or global optimizer
 cost model.
 
+The cost-unit audit keeps row CPU work and storage access work explicit rather
+than adding them into one undocumented scalar. NestedLoop/Hash eligibility uses
+row work. IndexJoin then compares its additional right-side point work with the
+right engine's sequential work because both alternatives already consume the
+same logical left. `managed_page_count` means every managed page the engine's
+sequential path must visit; for the current colocated Heap file this includes
+pages that SeqScan validates and skips for B+Tree/catalog structures. Point
+base, expected point I/O, range startup, and returned-candidate weights are
+dimensionless neutral integer work—not nanoseconds. Storage owns optional
+hints, planner compares them, and executor only executes the selected node.
+
 IndexNestedLoopJoin is deliberately narrower than general join enumeration. It
 requires distinct, non-partitioned direct logical scans, an INNER join, the
 same deterministic compatible equality used by HashJoin, both table row-count
 snapshots, and statistics for an ordered point-capable access path on the
 logical right equality column. Since both candidates read logical left, its
 checked additional inner work is one existing point-lookup cost per estimated
-left row and is compared with a full right scan. It wins only when strictly
-cheaper than both existing alternatives; registration order breaks equal index
-candidate costs, while a tie with either join alternative preserves the older
-choice. Stale statistics may change only performance.
+left row. The HashJoin comparison uses the same `managed_page_count` SeqScan
+cost already used by Filter access-path selection, rather than mixing point
+work with right-table row count. It wins only when strictly cheaper than that
+full scan and NestedLoop work; registration order breaks equal index candidate
+costs, while a tie with either join alternative preserves the older choice.
+Stale statistics may change only performance.
+
+Phase 73 retained Heap `cost_hints = None` and the generic
+`1 + tree_height + estimated_matches` fallback. LSM continues to publish its
+dynamic level/Bloom-derived hints. A tested Heap-data-pages-only scan-cost
+pilot was rejected because it did not describe the current physical SeqScan;
+no engine-kind branch or outer-row threshold remains in the planner.
 
 The physical node keeps logical left as its sole child and explicitly records
 the right binding/table, required right columns, equality key, and opaque

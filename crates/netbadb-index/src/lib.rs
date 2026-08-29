@@ -61,6 +61,9 @@ pub struct IndexDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableStatistics {
     pub row_count: u64,
+    /// Storage-neutral work for one sequential table scan. It includes every
+    /// managed page the engine's scan path must visit, including colocated
+    /// access-method pages when the engine validates and skips them.
     pub managed_page_count: u64,
 }
 

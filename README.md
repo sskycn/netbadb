@@ -892,12 +892,22 @@ The implementation sequence is intentionally vertical:
 72. Costed Index Nested-Loop Join — complete; analyzed direct Scan × Scan INNER
     equality joins may keep logical left as a bounded at-most-256-row outer
     stream and point-probe an ordered analyzed index on logical right. Checked
-    costs must be strictly lower than both NestedLoopJoin and HashJoin, so ties,
-    missing/stale statistics, high duplication, unsupported shapes, self joins,
-    and partitioned inputs preserve the existing choice. NULL outer keys issue
-    no probe; every candidate still evaluates the complete eager predicate and
-    output remains exact left-major/right-minor order. Inspection JSON v5
-    exposes the right table/access path without inventing a right scan child.
+    point work must beat both NestedLoopJoin work and the right table's existing
+    `managed_page_count` SeqScan cost, so ties, missing/stale statistics, high
+    duplication, unsupported shapes, self joins, and partitioned inputs preserve
+    the existing choice. NULL outer keys issue no probe; every candidate still
+    evaluates the complete eager predicate and output remains exact
+    left-major/right-minor order. Inspection JSON v5 exposes the right
+    table/access path without inventing a right scan child.
+73. IndexJoin Cost-Unit Audit & Heap Point-Probe Calibration — complete; static
+    Heap calibration rejected. Repeated direct probes and SQL matrices confirm
+    the shared point-versus-`managed_page_count` comparison is the correct
+    storage-neutral boundary. Heap SeqScan really visits colocated index/catalog
+    pages, so a Heap-data-pages-only pilot was restored. The largest measured
+    SQL outer with an independent consistently faster Index reference is 16;
+    from 32 onward both paired states select Hash, so no forced Hash crossover
+    is claimed. Heap hints remain `None`, LSM dynamic hints remain unchanged,
+    and no outer threshold, executor change, or runtime adaptation was added.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 broader join enumeration remain roadmap items. A general typed column-oriented batch

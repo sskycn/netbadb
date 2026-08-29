@@ -27,7 +27,18 @@ pub struct AccessPathCapabilities {
     pub ordered: bool,
 }
 
-/// Storage-owned form of neutral integer planning costs.
+/// Storage-owned weights in neutral integer planning-work units.
+///
+/// One unit is conventionally comparable to one managed sequential-page unit
+/// from [`TableStatistics::managed_page_count`]; these values are neither
+/// elapsed time nor persistent page identities. `point_probe_base_cost` is the
+/// fixed CPU/access-method startup for one probe, excluding source reads and
+/// returned rows. `expected_point_io` is the engine's expected count of
+/// candidate-source reads for one point probe in the same neutral scale.
+/// `range_startup_cost` is the fixed access-method work before a range returns
+/// candidates. `sequential_unit_cost` converts each returned candidate row to
+/// the same scale. Engines must not encode outer-row thresholds or measured
+/// nanoseconds in these fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageAccessCostHints {
     pub point_probe_base_cost: u32,

@@ -1819,9 +1819,9 @@ key/index representation against disk spill.
   Scan × Scan equality joins over distinct non-partitioned tables, with both
   table statistics and an analyzed ordered point access path on logical right;
 - reuses the point lookup cardinality and storage-neutral startup/match cost,
-  checked in `u128`, and selects only when strictly cheaper than both the
-  existing NestedLoopJoin and HashJoin candidates. Ties and unsupported or
-  incomplete metadata preserve the existing plan;
+  checked in `u128`, and compares it with the same `managed_page_count` SeqScan
+  cost used by Filter planning as well as NestedLoop work. Ties and unsupported
+  or incomplete metadata preserve the existing plan;
 - streams logical left in at-most-256-row owned batches, skips probes for NULL,
   consumes one unchanged Heap/LSM point result at a time, evaluates the complete
   eager predicate, and preserves exact left-major/right-minor output;
@@ -1836,7 +1836,33 @@ key/index representation against disk spill.
   manifest, compiler semantics, dependency, unsafe boundary, or automatic
   analyze policy.
 
-The decision is **KEEP**. This is a deliberately narrow right-index alternative,
-not join reordering, composite probing, an index-only join, a partition-aware
-join, or a general optimizer framework. Stale statistics can choose a slower
-operator but cannot alter results.
+The decision is **KEEP** after review correction. The first row-count comparison
+selected the measured-slower 256/512 and Text/64 point plans; using the existing
+SeqScan managed-page work moves those cases back to HashJoin without a magic
+outer-size threshold. This remains a deliberately narrow right-index
+alternative, not join reordering, composite probing, an index-only join, a
+partition-aware join, or a general optimizer framework. Stale statistics can
+choose a slower operator but cannot alter results.
+
+## IndexJoin Cost Calibration Attribution (Phase 73, complete; static calibration rejected)
+
+- audited NestedLoop/Hash row-work units separately from the storage-neutral
+  IndexJoin point-versus-sequential-access comparison;
+- documented exact `StorageAccessCostHints` semantics and retained the checked
+  shared Filter/Join fallback `1 + tree_height + estimated_matches`;
+- added repeated Heap direct-probe, unique/no-match crossover, duplicate,
+  inner-size, Text, Filter/range, and LSM controls without changing executor,
+  PhysicalPlan, inspection, or lookup semantics;
+- confirmed IndexJoin is consistently faster through the largest independently
+  measured SQL point at outer 16, while outer 32 and above select Hash in both
+  fixture states and therefore cannot supply a forced Index reference;
+- rejected a Heap-only-page sequential-cost pilot because actual Heap SeqScan
+  traverses colocated B+Tree/catalog pages; restored total managed-page work;
+- leaves Heap hints as `None` and LSM dynamic hints unchanged. No static point
+  constant simultaneously improves the conservative boundary, explains
+  indexed-layout Hash cost, and preserves honest fixed-probe semantics.
+
+The planner boundary for unique 4,096-row Heap inner input remains between
+outer 16 and 32. Phase 74 may investigate a richer access/scan layout model
+only if a real workload needs it; it should not add an outer-row threshold or
+continue tuning this benchmark in isolation.
