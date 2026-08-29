@@ -287,6 +287,14 @@ fn local_indexes_joins_aggregates_and_range_boundaries_preserve_logical_semantic
     database
         .create_partition_index(TableId(41), PartitionId(20), ColumnId(1))
         .expect("create local index");
+    let catalog = database
+        .inspect_catalog()
+        .expect("inspect partitioned catalog");
+    assert!(catalog.tables[0].indexes.is_empty());
+    assert!(matches!(
+        catalog.tables[0].placement,
+        netbadb_core::TablePlacementInspection::RangePartitioned { .. }
+    ));
     for (key, payload) in [(-1, "a"), (0, "b"), (99, "c"), (100, "gap"), (200, "d")] {
         let result = database.execute(&format!(
             "INSERT INTO events (key, payload) VALUES ({key}, '{payload}')"

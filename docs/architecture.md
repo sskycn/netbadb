@@ -2265,8 +2265,10 @@ The experimental PostgreSQL foundation adds a parallel frontend boundary:
 PostgreSQL bytes
     -> netbadb-pgwire bounded typed messages
     -> PostgreSQL session / prepared statement / portal state
-    -> Parse: compiler-owned prepared logical statement + parameter metadata
-    -> Bind: typed ScalarValue substitution into cloned logical expressions
+    -> ordinary SQL: compiler-owned typed statement and parameter metadata
+    -> metadata SQL: bounded compatibility operation classifier
+    -> ephemeral metadata projection <- Database::inspect_catalog()
+                                      <- Canonical Schema + index registry
     -> compiler-resolved StatementAccess + authorization
     -> shared netbadb-server DatabaseSession transaction/execution lifecycle
     -> netbadb-core
@@ -2283,6 +2285,55 @@ without formatting or reparsing SQL, so planning sees concrete predicates.
 PostgreSQL error and RowDescription mapping do not inspect AST/HIR Rust layouts,
 execute a query for metadata, or leak OIDs into HIR, relational IR, planner,
 executor, or storage.
+
+Rounds 3 through 5 keep ORM and psql introspection in a separate, typed
+server-side adapter because
+SQLAlchemy's PostgreSQL catalog SQL uses schema-qualified system relations,
+arrays, `ANY`, `regclass`, and catalog-only functions that would otherwise
+force a premature full PostgreSQL parser into the native compiler. The adapter
+classifies queries from structural relation/function/predicate markers into a
+closed `CompatibilityStatement` domain; it does not compare whole SQL strings
+or execute user-table SQL. Each session derives a bounded read-only snapshot
+from `Database::inspect_catalog()`. The Core DTO combines Canonical Schema
+table/column identity with registered index definitions while excluding B+Tree
+handles, PageIds, optimizer policy, and storage variants. A registered index
+has logical identity `(TableId, ColumnId)`, ordered single-column membership,
+`BTree` kind, and `unique=false`; LSM clustering access is not a secondary
+index. Partition-local physical indexes are not projected as logical indexes
+because the current registry cannot prove they form one logical definition.
+Every emitted row is generated from that snapshot and filtered through the
+principal's existing `TableId` visibility.
+There is no PostgreSQL catalog heap, WAL record, or second source of schema
+truth.
+
+Round 5 adds a second entry into that same evaluator for psql Simple Query.
+A bounded tokenizer recognizes semantic catalog relations, columns, functions,
+operators, and literal predicates without implementing general PostgreSQL
+SELECT. Catalog name patterns compile into a small anchored automaton subset
+(`literal`, `.`, and `.*`) with fixed byte/atom/token/nesting limits and a
+non-backtracking dynamic-programming matcher. The adapter therefore supports
+psql 17.11 `\d`, `\dt`, and `\di` without adding regex or PostgreSQL catalog
+syntax to parser, HIR, relational IR, planner, executor, or storage.
+
+Compatibility object OIDs are server-only deterministic identifiers. Separate
+SHA-256 domains cover table and index objects; index identity includes the
+canonical fingerprint, column, kind, and uniqueness. All candidates share one
+high synthetic range and collision set, and deterministic linear probing
+resolves collisions. Index names combine a sanitized readable table/column
+prefix with a stable digest suffix, are bounded to 63 ASCII bytes, and
+collision-check the complete catalog. Built-in PostgreSQL type OIDs stay centralized in
+`netbadb-pgwire`, while object OIDs do not enter types, HIR, relational IR,
+planning, execution, storage, or persistent formats. Stability is guaranteed
+for the same Canonical Schema and index registry across connections and
+restarts; names and OIDs are not persistent contracts across schema/index
+changes.
+
+The generic compiler did gain two ordinary SQL expression capabilities exposed
+by the real client: postfix casts for the lossless BOOL/INT64/TEXT family and
+qualified projection aliases. Cast validation occurs in typed HIR and retains
+contextual nominal types, then binding removes the proven no-op cast so the
+planner still sees concrete values. PostgreSQL-only `regclass`, `regtype`, OID,
+array, and catalog function semantics remain confined to the adapter.
 
 Native and PostgreSQL sessions both use the private synchronous
 `DatabaseSession` for the optional database transaction, execute/commit/

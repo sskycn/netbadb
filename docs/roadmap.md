@@ -412,9 +412,73 @@ and `information_schema`; and P3 broader PostgreSQL SQL remain open.
 - verified parameterized CRUD, repeated binds, NULL, and transaction behavior
   through raw TCP tests and pgx v5.7.6, plus real psql 17.11 scalar queries.
 
-Catalog-derived `pg_catalog`/`information_schema`, simultaneous listeners,
-PostgreSQL TLS/authentication, actual cancellation, and broader dialect support
-remain explicit later work.
+### PostgreSQL Compatibility Round 3 — ORM reflection (complete)
+
+- captured real psycopg 3.2.13 and SQLAlchemy 2.0.52 PostgreSQL-dialect startup,
+  Core, reflection, autoload, and ORM traffic instead of guessing catalog
+  surface area;
+- added a bounded structured compatibility-operation layer for only the
+  observed `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, `pg_constraint`,
+  `pg_index`, and `pg_description` projections;
+- derives authorized table names, ordered columns, nullability, physical type
+  projection, and primary keys from immutable Canonical Schema without a
+  persistent PostgreSQL catalog or storage mutation;
+- added deterministic high-range synthetic table OIDs with domain-separated
+  hashing and collision checking, confined to the PostgreSQL server adapter;
+- added generic typed postfix BOOL/INT64/TEXT casts and qualified projection
+  aliases required by normal SQLAlchemy Core/ORM SQL while retaining nominal
+  types inside HIR;
+- added read-only savepoint recovery for psycopg's hstore capability probe,
+  `DEALLOCATE` prepared-cache cleanup, a redacted opt-in protocol trace, and a
+  reproducible real-client smoke script;
+- verified schema/table/column/primary-key inspection, repeated multi-table
+  autoload, reflected parameterized SELECT, Core CRUD and rollback, and ORM
+  SELECT/CRUD against existing NetbaDB tables.
+
+A complete `pg_catalog` or `information_schema`, DDL/migrations, simultaneous
+listeners, PostgreSQL TLS/password authentication, actual cancellation, and
+broader dialect support remain explicit later work.
+
+### PostgreSQL Compatibility Round 4 — index reflection (complete)
+
+- reused and strengthened the storage-neutral `CatalogInspection` Core boundary
+  so registered indexes expose stable `(TableId, ColumnId)` logical identity,
+  single-column order, BTree kind, and non-unique semantics without PageIds or
+  storage handles;
+- projects only real Heap registry entries; LSM clustering remains a table
+  access path rather than a secondary index, while partition-local physical
+  indexes are explicitly unsupported for logical reflection;
+- added deterministic, bounded PostgreSQL-facing index names and domain-
+  separated synthetic index OIDs with catalog-wide collision checking;
+- implemented the captured SQLAlchemy `pg_index`/`pg_class`/`pg_attribute`/
+  `pg_am` result shape, including array-typed column/opclass flags, without a
+  general `pg_index` table or `pg_get_indexdef` implementation;
+- verified two real secondary indexes (including a nullable column), a zero-
+  index table, repeated reflection, multiple connections, reopen stability,
+  autoloaded `Index` objects, authorization filtering, and no PK duplication;
+- added an Alembic 1.16.5 read-only `compare_metadata` probe: matching metadata
+  produces no diff, while omitting the two indexes produces two `remove_index`
+  proposals. No migration operation or DDL is executed.
+
+### PostgreSQL Compatibility Round 5 — psql describe catalogs (complete)
+
+- captured the real psql 17.11 Simple Query sequence blocker by blocker with
+  `-X -E`, then added structured operations for relation lookup/properties,
+  columns, indexes, and truthful empty PostgreSQL-only metadata;
+- added authorized `\dt` and `\di` projections, compatibility primary-key
+  indexes, real Round 4 secondary indexes, and authenticated-session owner
+  projection without creating a PostgreSQL role catalog;
+- added bounded catalog-only psql pattern matching for relation and schema
+  filters. It supports only anchored literals, `.`, and `.*`, uses
+  non-backtracking dynamic programming, and rejects unsupported regex syntax;
+- routed Simple Query catalog operations through the same read-only
+  `CompatibilityStatement` evaluator used by Extended Query reflection;
+- verified `\d users`, qualified/missing/wildcard variants, `\dt`, `\di`, and
+  their required patterns with the real psql 17.11 executable.
+
+This remains an existing-schema inspection profile. `\d+`, unrelated slash
+commands, a general PostgreSQL regex engine/parser/catalog, migration DDL, and
+PostgreSQL-only metadata absent from NetbaDB remain unsupported.
 
 ## Phase 6 — SDK and tooling
 

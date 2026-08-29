@@ -232,7 +232,9 @@ The current code genuinely supports:
   CancelRequest, Simple Query, and typed-parameter Extended Query codecs,
   contextual parameter inference, ParameterDescription, selected text/binary
   scalar formats, SQLSTATE mapping, named statement and portal lifecycles, and
-  PostgreSQL failed-transaction session behavior;
+  PostgreSQL failed-transaction session behavior, plus a read-only ORM metadata
+  projection derived from Canonical Schema and the persistent Heap index
+  registry through the storage-neutral Core inspection boundary;
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
@@ -272,12 +274,16 @@ database worker authorizes compiler-resolved TableIds before execution.
 Experimental PostgreSQL wire mode is documented in
 [`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
 `netbadbd --manifest server.json --postgres` to use the manifest's listen
-address as a loopback PostgreSQL endpoint. This first foundation is not a
-claim of general PostgreSQL compatibility. Round 2 supports typed `$n`
-parameters, generic FROM-less scalar SELECT, and selected binary scalar
-formats; TLS, `pg_catalog`, `information_schema`, actual cancellation, broader
-PostgreSQL dialect syntax, and simultaneous native plus PostgreSQL listeners
-remain unsupported.
+address as a loopback PostgreSQL endpoint. This experimental profile is not a
+claim of general PostgreSQL compatibility. Round 5 adds real psql 17.11
+`\d`, `\dt`, and `\di` support, including schema/name patterns, on top of the
+psycopg 3 and SQLAlchemy 2 Core/ORM profile. The PostgreSQL adapter consumes
+stable read-only Core metadata, synthesizes deterministic compatibility names/OIDs, and supports
+Alembic schema introspection plus read-only autogenerate comparison. Migration
+execution, PostgreSQL DDL, a complete `pg_catalog` or `information_schema`,
+TLS/password authentication, actual cancellation, and simultaneous native plus
+PostgreSQL listeners remain unsupported. The reproducible client matrix is in
+[`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

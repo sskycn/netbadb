@@ -438,6 +438,9 @@ fn lower_expr(expression: &TypedExpr) -> Expr {
         TypedExprKind::Column(column) => ExprKind::Column(column_ref_from_hir(column)),
         TypedExprKind::Literal(value) => ExprKind::Literal(value.clone()),
         TypedExprKind::Parameter(id) => ExprKind::Parameter(*id),
+        TypedExprKind::Cast { expression } => ExprKind::Cast {
+            expression: Box::new(lower_expr(expression)),
+        },
         TypedExprKind::Binary {
             operator,
             left,
@@ -564,6 +567,10 @@ fn bind_expr(expression: &mut Expr, values: &[ScalarValue]) {
         ExprKind::Binary { left, right, .. } => {
             bind_expr(left, values);
             bind_expr(right, values);
+        }
+        ExprKind::Cast { expression: inner } => {
+            bind_expr(inner, values);
+            *expression = (**inner).clone();
         }
         ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
             bind_expr(expression, values);
@@ -907,6 +914,53 @@ mod tests {
                 netbadb_hir::HirError::ParameterTypeConflict { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn typed_casts_preserve_contextual_nominal_parameter_types() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "users",
+            vec![
+                ColumnDef::new(
+                    ColumnId(1),
+                    "id",
+                    TypeSpec::Semantic {
+                        name: "UserId".into(),
+                        physical: PhysicalType::Int64,
+                    },
+                ),
+                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ],
+        )])
+        .expect("schema");
+        for source in [
+            "SELECT id FROM users WHERE id = $1::BIGINT",
+            "INSERT INTO users (id, name) VALUES ($1::INT8, $2::VARCHAR)",
+        ] {
+            let prepared = compile_statement_with_parameters(&schema, source, &[])
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert_eq!(
+                prepared.parameters[0].data_type.name.as_deref(),
+                Some("UserId"),
+                "{source}"
+            );
+            let values = if source.starts_with("SELECT") {
+                vec![ScalarValue::Int64(7)]
+            } else {
+                vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
+            };
+            bind_statement(&prepared, &values)
+                .unwrap_or_else(|error| panic!("bind {source}: {error}"));
+        }
+        assert!(
+            compile_statement_with_parameters(
+                &schema,
+                "SELECT id FROM users WHERE id = $1::TEXT",
+                &[],
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -530,7 +530,9 @@ fn collect_expression_columns(expression: &Expr, required: &mut Vec<SourceIdenti
             collect_expression_columns(left, required);
             collect_expression_columns(right, required);
         }
-        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+        ExprKind::Cast { expression }
+        | ExprKind::Unary { expression, .. }
+        | ExprKind::IsNull { expression, .. } => {
             collect_expression_columns(expression, required);
         }
     }

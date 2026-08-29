@@ -63,12 +63,24 @@ pub struct ColumnInspection {
 /// One registered single-column index without its physical tree handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInspection {
+    /// Stable logical identity. Registered indexes are currently unique by
+    /// `(table_id, column_id)`; physical B+Tree page handles are deliberately
+    /// excluded from this observation boundary.
+    pub table_id: TableId,
     pub column_id: ColumnId,
     pub column_name: String,
+    pub kind: IndexKindInspection,
+    pub unique: bool,
     /// Zero-based persistent registration position.
     pub registration_order: u32,
     /// Last explicit `ANALYZE` snapshot. It may be stale.
     pub statistics: Option<IndexStatisticsInspection>,
+}
+
+/// Storage-neutral logical index implementation exposed to read-only clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKindInspection {
+    BTree,
 }
 
 /// Last-`ANALYZE` table snapshot used by the planner.

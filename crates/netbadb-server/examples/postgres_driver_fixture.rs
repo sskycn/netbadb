@@ -18,8 +18,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
-    let table = users_table();
-    Database::create(directory.join("users.ndb"), table)?.close()?;
+    let tables = vec![
+        (directory.join("users.ndb"), users_table()),
+        (directory.join("teams.ndb"), teams_table()),
+    ];
+    let mut database = Database::create_tables(tables.clone())?;
+    database.create_index(TableId(1), ColumnId(2))?;
+    database.create_index(TableId(1), ColumnId(3))?;
+    database.close()?;
+    let reopened = Database::open_tables(tables)?;
+    let indexes = &reopened.inspect_catalog()?.tables[0].indexes;
+    if indexes.len() != 2 {
+        return Err(format!(
+            "expected two reopened users indexes, found {}",
+            indexes.len()
+        )
+        .into());
+    }
+    reopened.close()?;
     let manifest = directory.join("server.json");
     std::fs::write(
         &manifest,
@@ -27,13 +43,22 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
             "version": 4,
             "listen": "127.0.0.1:0",
             "authorization": {
-                "local_plaintext": {"tables": [{
-                    "table_id": 1,
-                    "read": true,
-                    "write": true,
-                    "transaction": true,
-                    "analyze": false
-                }]},
+                "local_plaintext": {"tables": [
+                    {
+                        "table_id": 1,
+                        "read": true,
+                        "write": true,
+                        "transaction": true,
+                        "analyze": false
+                    },
+                    {
+                        "table_id": 2,
+                        "read": true,
+                        "write": true,
+                        "transaction": true,
+                        "analyze": false
+                    }
+                ]},
                 "clients": []
             },
             "tables": [{
@@ -45,6 +70,14 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
                     {"id": 2, "name": "name", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
                     {"id": 3, "name": "active", "physical_type": "bool", "semantic_type": null, "nullable": false, "primary_key": false}
                 ]
+            }, {
+                "path": "teams.ndb",
+                "id": 2,
+                "name": "teams",
+                "columns": [
+                    {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": "TeamId", "nullable": false, "primary_key": true},
+                    {"id": 2, "name": "name", "physical_type": "text", "semantic_type": null, "nullable": false, "primary_key": false}
+                ]
             }]
         }))?,
     )?;
@@ -55,6 +88,25 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
     io::stdin().read_to_end(&mut input)?;
     server.shutdown()?;
     Ok(())
+}
+
+fn teams_table() -> TableDef {
+    TableDef::new(
+        TableId(2),
+        "teams",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Semantic {
+                    name: "TeamId".into(),
+                    physical: PhysicalType::Int64,
+                },
+            )
+            .primary_key(true),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    )
 }
 
 fn users_table() -> TableDef {

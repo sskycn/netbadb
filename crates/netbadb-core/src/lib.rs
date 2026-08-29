@@ -22,7 +22,7 @@ use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
     execute_with_storage_context, prepare_mutation_with_storage_context,
 };
-use netbadb_inspect::{CatalogInspection, StatementInspection};
+use netbadb_inspect::StatementInspection;
 use netbadb_planner::{
     AccessCostHints, AccessPath, AccessPathCapabilities, PartitionPlanningSnapshot,
     PhysicalStatement, RangeTablePlanningSnapshot, TableAccessStatistics,
@@ -46,6 +46,7 @@ use transaction::SharedCoordinatorLog;
 
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
+pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_storage::{
     IndexDefinition, IndexStatistics, IsolationLevel, LsmInspection, LsmLevelInspection,
     LsmReadAmplification, LsmWriteAmplification, StorageKind, TableStatistics,
@@ -1465,9 +1466,9 @@ impl Database {
         })
     }
 
-    /// Returns canonical catalog metadata, persistent index registration
-    /// order, and cached `ANALYZE` snapshots without scanning data or
-    /// refreshing statistics.
+    /// Returns canonical catalog metadata, storage-neutral logical index
+    /// identity/kind/uniqueness in persistent registration order, and cached
+    /// `ANALYZE` snapshots without scanning data or refreshing statistics.
     pub fn inspect_catalog(&self) -> Result<CatalogInspection, DatabaseError> {
         inspection::catalog(&self.schema, &self.bindings, &self.registry)
     }
@@ -2552,8 +2553,9 @@ mod tests {
     };
     use netbadb_inspect::{
         AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
-        ExpressionKindInspection, NullOrderInspection, PlanNodeInspection, SortDirectionInspection,
-        StatementPlanInspection, StatementResultInspection, UnaryOpInspection,
+        ExpressionKindInspection, IndexKindInspection, NullOrderInspection, PlanNodeInspection,
+        SortDirectionInspection, StatementPlanInspection, StatementResultInspection,
+        UnaryOpInspection,
     };
     use netbadb_planner::PhysicalPlan;
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
@@ -5148,9 +5150,18 @@ mod tests {
             inspected_users
                 .indexes
                 .iter()
-                .map(|index| (index.registration_order, index.column_id))
+                .map(|index| (
+                    index.table_id,
+                    index.registration_order,
+                    index.column_id,
+                    index.kind,
+                    index.unique,
+                ))
                 .collect::<Vec<_>>(),
-            vec![(0, ColumnId(2)), (1, ColumnId(1))]
+            vec![
+                (users.id, 0, ColumnId(2), IndexKindInspection::BTree, false,),
+                (users.id, 1, ColumnId(1), IndexKindInspection::BTree, false,),
+            ]
         );
         assert_eq!(
             inspected_users.columns[0].data_type.name.as_deref(),
@@ -5175,10 +5186,49 @@ mod tests {
             Some(analyzed)
         );
 
+        let index_snapshot = inspected_users.indexes.clone();
+        let users_len = std::fs::metadata(&users_path).unwrap().len();
+        let users_wal_len = std::fs::metadata(&users_wal).unwrap().len();
+        assert_eq!(
+            database.inspect_catalog().unwrap().tables[0].indexes,
+            index_snapshot
+        );
+        assert_eq!(std::fs::metadata(&users_path).unwrap().len(), users_len);
+        assert_eq!(std::fs::metadata(&users_wal).unwrap().len(), users_wal_len);
+
         database.close().unwrap();
+        let reopened = Database::open_tables(vec![
+            (users_path.clone(), users.clone()),
+            (teams_path.clone(), teams.clone()),
+        ])
+        .unwrap();
+        assert_eq!(
+            reopened.inspect_catalog().unwrap().tables[0].indexes,
+            index_snapshot
+        );
+        reopened.close().unwrap();
         for path in [&users_path, &users_wal, &teams_path, &teams_wal] {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn catalog_inspection_does_not_report_lsm_clustering_as_secondary_index() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-core-index-metadata-lsm-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let database = Database::create_storages(vec![TableStorageCreateSpec::lsm(
+            &root,
+            mixed_lsm_table(),
+            ColumnId(1),
+        )])
+        .unwrap();
+        let catalog = database.inspect_catalog().unwrap();
+        assert!(catalog.tables[0].indexes.is_empty());
+        database.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -215,12 +215,14 @@ pub struct PostgresOid(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresType {
     Bool,
+    BoolArray,
     Int2,
     Int4,
     Int8,
     Text,
     Varchar,
     Unknown,
+    TextArray,
 }
 
 impl PostgresType {
@@ -228,12 +230,14 @@ impl PostgresType {
     pub const fn oid(self) -> PostgresOid {
         PostgresOid(match self {
             Self::Bool => 16,
+            Self::BoolArray => 1_000,
             Self::Int8 => 20,
             Self::Int2 => 21,
             Self::Int4 => 23,
             Self::Text => 25,
             Self::Varchar => 1_043,
             Self::Unknown => 705,
+            Self::TextArray => 1_009,
         })
     }
 
@@ -244,7 +248,7 @@ impl PostgresType {
             Self::Int2 => 2,
             Self::Int4 => 4,
             Self::Int8 => 8,
-            Self::Text | Self::Varchar | Self::Unknown => -1,
+            Self::Text | Self::Varchar | Self::Unknown | Self::BoolArray | Self::TextArray => -1,
         }
     }
 
@@ -252,22 +256,25 @@ impl PostgresType {
     pub const fn from_oid(oid: PostgresOid) -> Option<Self> {
         match oid.0 {
             16 => Some(Self::Bool),
+            1_000 => Some(Self::BoolArray),
             20 => Some(Self::Int8),
             21 => Some(Self::Int2),
             23 => Some(Self::Int4),
             25 => Some(Self::Text),
             705 => Some(Self::Unknown),
+            1_009 => Some(Self::TextArray),
             1_043 => Some(Self::Varchar),
             _ => None,
         }
     }
 
     #[must_use]
-    pub const fn netbadb_physical(self) -> PhysicalType {
+    pub const fn netbadb_physical(self) -> Option<PhysicalType> {
         match self {
-            Self::Bool => PhysicalType::Bool,
-            Self::Int2 | Self::Int4 | Self::Int8 => PhysicalType::Int64,
-            Self::Text | Self::Varchar | Self::Unknown => PhysicalType::Text,
+            Self::Bool => Some(PhysicalType::Bool),
+            Self::Int2 | Self::Int4 | Self::Int8 => Some(PhysicalType::Int64),
+            Self::Text | Self::Varchar | Self::Unknown => Some(PhysicalType::Text),
+            Self::BoolArray | Self::TextArray => None,
         }
     }
 
@@ -341,9 +348,13 @@ pub fn encode_text_value(
             Ok(Some(if *value { b"t".to_vec() } else { b"f".to_vec() }))
         }
         (ScalarValue::Int64(value), PostgresType::Int8) => Ok(Some(value.to_string().into_bytes())),
-        (ScalarValue::Text(value), PostgresType::Text | PostgresType::Varchar) => {
-            Ok(Some(value.as_bytes().to_vec()))
-        }
+        (
+            ScalarValue::Text(value),
+            PostgresType::Text
+            | PostgresType::Varchar
+            | PostgresType::BoolArray
+            | PostgresType::TextArray,
+        ) => Ok(Some(value.as_bytes().to_vec())),
         _ => Err(TypeMappingError::TypeMismatch),
     }
 }
@@ -359,9 +370,14 @@ pub fn encode_binary_value(
         (ScalarValue::Text(value), PostgresType::Text | PostgresType::Varchar) => {
             Ok(Some(value.as_bytes().to_vec()))
         }
-        (_, PostgresType::Int2 | PostgresType::Int4 | PostgresType::Unknown) => {
-            Err(TypeMappingError::BinaryFormatUnsupported(data_type))
-        }
+        (
+            _,
+            PostgresType::Int2
+            | PostgresType::Int4
+            | PostgresType::Unknown
+            | PostgresType::BoolArray
+            | PostgresType::TextArray,
+        ) => Err(TypeMappingError::BinaryFormatUnsupported(data_type)),
         _ => Err(TypeMappingError::TypeMismatch),
     }
 }
@@ -396,6 +412,9 @@ pub fn decode_text_parameter(
             .map_err(|error| integer_text_error(data_type, &error)),
         PostgresType::Text | PostgresType::Varchar | PostgresType::Unknown => {
             Ok(ScalarValue::Text(value.to_owned()))
+        }
+        PostgresType::BoolArray | PostgresType::TextArray => {
+            Err(TypeMappingError::InvalidTextValue(data_type))
         }
     }
 }
@@ -440,7 +459,9 @@ pub fn decode_binary_parameter(
         PostgresType::Text | PostgresType::Varchar => std::str::from_utf8(bytes)
             .map(|value| ScalarValue::Text(value.to_owned()))
             .map_err(|_| TypeMappingError::InvalidBinaryValue(data_type)),
-        PostgresType::Unknown => Err(TypeMappingError::BinaryFormatUnsupported(data_type)),
+        PostgresType::Unknown | PostgresType::BoolArray | PostgresType::TextArray => {
+            Err(TypeMappingError::BinaryFormatUnsupported(data_type))
+        }
         _ => Err(TypeMappingError::InvalidBinaryValue(data_type)),
     }
 }
@@ -1075,6 +1096,38 @@ mod tests {
             PostgresType::from_netbadb(PhysicalType::UInt64),
             Err(TypeMappingError::UnsupportedUInt64)
         );
+        assert_eq!(
+            PostgresType::from_oid(PostgresOid(1_009)),
+            Some(PostgresType::TextArray)
+        );
+        assert_eq!(PostgresType::TextArray.netbadb_physical(), None);
+        assert_eq!(
+            encode_text_value(&ScalarValue::Text("{id}".into()), PostgresType::TextArray).unwrap(),
+            Some(b"{id}".to_vec())
+        );
+        assert!(matches!(
+            decode_text_parameter(Some(b"{id}"), PostgresType::TextArray.oid()),
+            Err(TypeMappingError::InvalidTextValue(PostgresType::TextArray))
+        ));
+        assert_eq!(
+            PostgresType::from_oid(PostgresOid(1_000)),
+            Some(PostgresType::BoolArray)
+        );
+        assert_eq!(PostgresType::BoolArray.netbadb_physical(), None);
+        assert_eq!(
+            encode_text_value(&ScalarValue::Text("{t,f}".into()), PostgresType::BoolArray).unwrap(),
+            Some(b"{t,f}".to_vec())
+        );
+        assert!(matches!(
+            decode_text_parameter(Some(b"{t,f}"), PostgresType::BoolArray.oid()),
+            Err(TypeMappingError::InvalidTextValue(PostgresType::BoolArray))
+        ));
+        assert!(matches!(
+            encode_binary_value(&ScalarValue::Text("{t,f}".into()), PostgresType::BoolArray),
+            Err(TypeMappingError::BinaryFormatUnsupported(
+                PostgresType::BoolArray
+            ))
+        ));
         assert_eq!(
             decode_text_parameter(Some(b"32767"), PostgresOid(21)).unwrap(),
             ScalarValue::Int64(32767)

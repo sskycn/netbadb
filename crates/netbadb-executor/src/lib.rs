@@ -2336,7 +2336,9 @@ fn expression_sources_match_fields(expression: &Expr, fields: &[OutputField]) ->
             expression_sources_match_fields(left, fields)
                 && expression_sources_match_fields(right, fields)
         }
-        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+        ExprKind::Cast { expression }
+        | ExprKind::Unary { expression, .. }
+        | ExprKind::IsNull { expression, .. } => {
             expression_sources_match_fields(expression, fields)
         }
     }
@@ -3227,7 +3229,9 @@ fn collect_filter_columns(predicate: &Expr) -> BTreeSet<SourceIdentity> {
                 collect(left, columns);
                 collect(right, columns);
             }
-            ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+            ExprKind::Cast { expression }
+            | ExprKind::Unary { expression, .. }
+            | ExprKind::IsNull { expression, .. } => {
                 collect(expression, columns);
             }
         }
@@ -4665,6 +4669,7 @@ fn bind_expression<'a>(
         },
         ExprKind::Literal(value) => BoundExprKind::Literal(value),
         ExprKind::Parameter(_) => return Err(ExecutionError::TypeMismatch),
+        ExprKind::Cast { expression } => return bind_expression(expression, fields),
         ExprKind::Binary {
             operator,
             left,
@@ -4731,7 +4736,9 @@ fn filter_expression_source_schema_is_safe(
             filter_expression_source_schema_is_safe(left, bindings, storages)
                 && filter_expression_source_schema_is_safe(right, bindings, storages)
         }
-        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
+        ExprKind::Cast { expression }
+        | ExprKind::Unary { expression, .. }
+        | ExprKind::IsNull { expression, .. } => {
             filter_expression_source_schema_is_safe(expression, bindings, storages)
         }
     }
@@ -4802,6 +4809,10 @@ fn filter_expression_metadata_is_safe(expression: &Expr, fields: &[OutputField])
                 && expression.expr_type.nullable == matches!(value, ScalarValue::Null)
         }
         ExprKind::Parameter(_) => false,
+        ExprKind::Cast { expression: child } => {
+            filter_expression_metadata_is_safe(child, fields)
+                && expression.expr_type == child.expr_type
+        }
         ExprKind::Binary {
             operator,
             left,
@@ -5590,6 +5601,7 @@ where
         }
         ExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(value))),
         ExprKind::Parameter(_) => Err(ExecutionError::TypeMismatch),
+        ExprKind::Cast { expression } => evaluate_dynamic_with(expression, fields, value_at),
         ExprKind::Binary {
             operator,
             left,
@@ -5670,6 +5682,7 @@ fn evaluate_values(
         }
         ExprKind::Literal(value) => Ok(value.clone()),
         ExprKind::Parameter(_) => Err(ExecutionError::TypeMismatch),
+        ExprKind::Cast { expression } => evaluate_values(expression, values, fields),
         ExprKind::Binary {
             operator,
             left,
