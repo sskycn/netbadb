@@ -139,6 +139,19 @@ pub enum PhysicalPlan {
         predicate: Expr,
         columns: Vec<ColumnRef>,
     },
+    IndexNestedLoopJoin {
+        left: Box<PhysicalPlan>,
+        right_binding_id: RelationBindingId,
+        right_table_id: TableId,
+        right_table_name: String,
+        right_columns: Vec<ColumnRef>,
+        kind: JoinKind,
+        left_key: ColumnRef,
+        right_key: ColumnRef,
+        right_access_path: AccessPathId,
+        predicate: Expr,
+        columns: Vec<ColumnRef>,
+    },
     HashJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -204,6 +217,7 @@ impl PhysicalPlan {
             | Self::RangeIndexScan { columns, .. }
             | Self::PartitionedScan { columns, .. }
             | Self::NestedLoopJoin { columns, .. }
+            | Self::IndexNestedLoopJoin { columns, .. }
             | Self::HashJoin { columns, .. }
             | Self::Project { columns, .. } => {
                 columns.iter().cloned().map(OutputField::Source).collect()
@@ -302,32 +316,83 @@ fn plan_raw_with_statistics(
                 access_paths,
                 range_tables,
             ));
-            let physical_right = Box::new(plan_raw_with_statistics(
+            match choose_direct_inner_join(
+                *kind,
+                left,
                 right,
+                predicate,
                 table_statistics,
                 access_paths,
                 range_tables,
-            ));
-            if let Some((left_key, right_key)) =
-                eligible_simple_hash_join(*kind, left, right, predicate, table_statistics)
-            {
-                PhysicalPlan::HashJoin {
+            ) {
+                DirectInnerJoin::Index {
+                    left_key,
+                    right_key,
+                    right_access_path,
+                } => {
+                    let LogicalPlan::Scan {
+                        binding_id,
+                        table_id,
+                        table_name,
+                        columns: right_columns,
+                    } = right.as_ref()
+                    else {
+                        return PhysicalPlan::NestedLoopJoin {
+                            left: physical_left,
+                            right: Box::new(plan_raw_with_statistics(
+                                right,
+                                table_statistics,
+                                access_paths,
+                                range_tables,
+                            )),
+                            kind: *kind,
+                            predicate: predicate.clone(),
+                            columns: columns.clone(),
+                        };
+                    };
+                    PhysicalPlan::IndexNestedLoopJoin {
+                        left: physical_left,
+                        right_binding_id: *binding_id,
+                        right_table_id: *table_id,
+                        right_table_name: table_name.clone(),
+                        right_columns: right_columns.clone(),
+                        kind: *kind,
+                        left_key,
+                        right_key,
+                        right_access_path,
+                        predicate: predicate.clone(),
+                        columns: columns.clone(),
+                    }
+                }
+                DirectInnerJoin::Hash {
+                    left_key,
+                    right_key,
+                } => PhysicalPlan::HashJoin {
                     left: physical_left,
-                    right: physical_right,
+                    right: Box::new(plan_raw_with_statistics(
+                        right,
+                        table_statistics,
+                        access_paths,
+                        range_tables,
+                    )),
                     kind: *kind,
                     left_key,
                     right_key,
                     predicate: predicate.clone(),
                     columns: columns.clone(),
-                }
-            } else {
-                PhysicalPlan::NestedLoopJoin {
+                },
+                DirectInnerJoin::NestedLoop => PhysicalPlan::NestedLoopJoin {
                     left: physical_left,
-                    right: physical_right,
+                    right: Box::new(plan_raw_with_statistics(
+                        right,
+                        table_statistics,
+                        access_paths,
+                        range_tables,
+                    )),
                     kind: *kind,
                     predicate: predicate.clone(),
                     columns: columns.clone(),
-                }
+                },
             }
         }
         LogicalPlan::Filter { input, predicate } => {
@@ -609,6 +674,32 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             None,
             parent_required,
         ),
+        PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            right_binding_id,
+            right_table_id,
+            right_table_name,
+            right_columns,
+            kind,
+            left_key,
+            right_key,
+            right_access_path,
+            predicate,
+            columns,
+        } => prune_index_join(
+            *left,
+            right_binding_id,
+            right_table_id,
+            right_table_name,
+            right_columns,
+            kind,
+            left_key,
+            right_key,
+            right_access_path,
+            predicate,
+            columns,
+            parent_required,
+        ),
         PhysicalPlan::HashJoin {
             left,
             right,
@@ -626,6 +717,48 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             Some((left_key, right_key)),
             parent_required,
         ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prune_index_join(
+    left: PhysicalPlan,
+    right_binding_id: RelationBindingId,
+    right_table_id: TableId,
+    right_table_name: String,
+    right_columns: Vec<ColumnRef>,
+    kind: JoinKind,
+    left_key: ColumnRef,
+    right_key: ColumnRef,
+    right_access_path: AccessPathId,
+    predicate: Expr,
+    columns: Vec<ColumnRef>,
+    parent_required: &[SourceIdentity],
+) -> PhysicalPlan {
+    let mut required = parent_required.to_vec();
+    collect_expression_columns(&predicate, &mut required);
+    add_required(&mut required, &left_key);
+    add_required(&mut required, &right_key);
+    let left_outputs = left.output_fields();
+    let left_required = required
+        .iter()
+        .copied()
+        .filter(|identity| output_contains(&left_outputs, *identity))
+        .collect::<Vec<_>>();
+    let right_columns = prune_columns(right_columns, &required);
+    let columns = prune_columns(columns, &required);
+    PhysicalPlan::IndexNestedLoopJoin {
+        left: Box::new(prune_required_columns(left, &left_required)),
+        right_binding_id,
+        right_table_id,
+        right_table_name,
+        right_columns,
+        kind,
+        left_key,
+        right_key,
+        right_access_path,
+        predicate,
+        columns,
     }
 }
 
@@ -697,24 +830,128 @@ fn output_contains(fields: &[OutputField], identity: SourceIdentity) -> bool {
     })
 }
 
-fn eligible_simple_hash_join(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectInnerJoin {
+    NestedLoop,
+    Hash {
+        left_key: ColumnRef,
+        right_key: ColumnRef,
+    },
+    Index {
+        left_key: ColumnRef,
+        right_key: ColumnRef,
+        right_access_path: AccessPathId,
+    },
+}
+
+fn choose_direct_inner_join(
     kind: JoinKind,
     left: &LogicalPlan,
     right: &LogicalPlan,
     predicate: &Expr,
     table_statistics: &[TableAccessStatistics],
-) -> Option<(ColumnRef, ColumnRef)> {
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+) -> DirectInnerJoin {
     if !matches!(kind, JoinKind::Inner) {
+        return DirectInnerJoin::NestedLoop;
+    }
+    let Some((left_key, right_key)) = find_hash_equality(predicate, left, right) else {
+        return DirectInnerJoin::NestedLoop;
+    };
+    let Some(left_table_id) = direct_scan_table_id(left) else {
+        return DirectInnerJoin::NestedLoop;
+    };
+    let (Some(left_rows), Some(right_rows)) = (
+        direct_scan_row_count(left, table_statistics),
+        direct_scan_row_count(right, table_statistics),
+    ) else {
+        return DirectInnerJoin::NestedLoop;
+    };
+    let Some(nested_loop_work) = u128::from(left_rows).checked_mul(u128::from(right_rows)) else {
+        return DirectInnerJoin::NestedLoop;
+    };
+    let Some(hash_join_work) = u128::from(left_rows).checked_add(u128::from(right_rows)) else {
+        return DirectInnerJoin::NestedLoop;
+    };
+
+    if let Some((right_table_id, right_access_path, point_cost)) = eligible_right_point_access(
+        right,
+        &right_key,
+        table_statistics,
+        access_paths,
+        range_tables,
+    ) && left_table_id != right_table_id
+        && {
+            !range_tables
+                .iter()
+                .any(|placement| placement.table_id == left_table_id)
+        }
+        && let Some(index_join_inner_work) = u128::from(left_rows).checked_mul(point_cost)
+        && index_join_inner_work < nested_loop_work
+        && index_join_inner_work < u128::from(right_rows)
+    {
+        return DirectInnerJoin::Index {
+            left_key,
+            right_key,
+            right_access_path,
+        };
+    }
+
+    if hash_join_work < nested_loop_work {
+        DirectInnerJoin::Hash {
+            left_key,
+            right_key,
+        }
+    } else {
+        DirectInnerJoin::NestedLoop
+    }
+}
+
+fn direct_scan_table_id(plan: &LogicalPlan) -> Option<TableId> {
+    let LogicalPlan::Scan { table_id, .. } = plan else {
+        return None;
+    };
+    Some(*table_id)
+}
+
+fn eligible_right_point_access(
+    right: &LogicalPlan,
+    right_key: &ColumnRef,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+) -> Option<(TableId, AccessPathId, u128)> {
+    let LogicalPlan::Scan { table_id, .. } = right else {
+        return None;
+    };
+    if range_tables
+        .iter()
+        .any(|placement| placement.table_id == *table_id)
+    {
         return None;
     }
-    let left_rows = direct_scan_row_count(left, table_statistics)?;
-    let right_rows = direct_scan_row_count(right, table_statistics)?;
-    let nested_loop_work = u128::from(left_rows).checked_mul(u128::from(right_rows))?;
-    let hash_join_work = u128::from(left_rows).checked_add(u128::from(right_rows))?;
-    if hash_join_work >= nested_loop_work {
-        return None;
-    }
-    find_hash_equality(predicate, left, right)
+    let table = table_statistics
+        .iter()
+        .find(|candidate| candidate.table_id == *table_id)?
+        .statistics
+        .as_ref()?;
+    access_paths
+        .iter()
+        .filter(|path| {
+            path.table_id == *table_id
+                && path.column_id == right_key.column_id
+                && path.capabilities.point_lookup
+                && path.capabilities.ordered
+        })
+        .filter_map(|path| {
+            let index = path.statistics.as_ref()?;
+            let matches = estimate_non_null_point_rows(table, index)?;
+            let cost = point_lookup_cost(index, path.cost_hints.as_ref(), matches)?;
+            Some((path.id, cost))
+        })
+        .min_by_key(|(_, cost)| *cost)
+        .map(|(access_path, cost)| (*table_id, access_path, cost))
 }
 
 fn direct_scan_row_count(
@@ -1168,17 +1405,29 @@ fn candidate_cost(
             ..
         } => estimate_range_rows(table, index, *possible_integer_keys)?,
     };
+    if matches!(candidate, IndexLookupCandidate::Point { .. }) {
+        return point_lookup_cost(index, hints, estimated_matches);
+    }
     if let Some(hints) = hints {
-        let startup = match candidate {
-            IndexLookupCandidate::Point { .. } => {
-                u128::from(hints.point_probe_base_cost) + u128::from(hints.expected_point_io)
-            }
-            IndexLookupCandidate::Range { .. } => u128::from(hints.range_startup_cost),
-        };
-        return startup
+        return u128::from(hints.range_startup_cost)
             .checked_add(estimated_matches.checked_mul(u128::from(hints.sequential_unit_cost))?);
     }
     Some(1 + u128::from(index.tree_height) + estimated_matches)
+}
+
+fn point_lookup_cost(
+    index: &IndexStatistics,
+    hints: Option<&AccessCostHints>,
+    estimated_matches: u128,
+) -> Option<u128> {
+    if let Some(hints) = hints {
+        return u128::from(hints.point_probe_base_cost)
+            .checked_add(u128::from(hints.expected_point_io))?
+            .checked_add(estimated_matches.checked_mul(u128::from(hints.sequential_unit_cost))?);
+    }
+    u128::from(index.tree_height)
+        .checked_add(1)?
+        .checked_add(estimated_matches)
 }
 
 fn estimate_range_rows(
@@ -1208,6 +1457,10 @@ fn estimate_point_rows(
     if matches!(key, ScalarValue::Null) {
         return Some(u128::from(index.null_count));
     }
+    estimate_non_null_point_rows(table, index)
+}
+
+fn estimate_non_null_point_rows(table: &TableStatistics, index: &IndexStatistics) -> Option<u128> {
     let non_null_rows = table.row_count.checked_sub(index.null_count)?;
     if non_null_rows == 0 {
         return Some(0);
@@ -1577,8 +1830,9 @@ pub fn plan_statement_with_partition_snapshots(
 mod tests {
     use super::{
         AccessCostHints, AccessPath, AccessPathCapabilities, PhysicalPlan, PhysicalStatement,
-        TableAccessStatistics, plan, plan_statement, plan_statement_with_access_paths,
-        plan_statement_with_statistics, plan_with_access_paths, plan_with_statistics,
+        RangeTablePlanningSnapshot, TableAccessStatistics, plan, plan_statement,
+        plan_statement_with_access_paths, plan_statement_with_statistics, plan_with_access_paths,
+        plan_with_partition_snapshots, plan_with_statistics,
     };
     use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
@@ -1757,6 +2011,25 @@ mod tests {
         }
     }
 
+    fn join_index_path(table_id: u64, column_id: u32, distinct_non_null_keys: u64) -> AccessPath {
+        AccessPath {
+            table_id: TableId(table_id),
+            column_id: ColumnId(column_id),
+            id: AccessPathId(72),
+            capabilities: AccessPathCapabilities {
+                point_lookup: true,
+                range_lookup: true,
+                ordered: true,
+            },
+            statistics: Some(IndexStatistics {
+                distinct_non_null_keys,
+                null_count: 0,
+                tree_height: 2,
+            }),
+            cost_hints: None,
+        }
+    }
+
     fn simple_join_fixture(
         left_type: SemanticType,
         right_type: SemanticType,
@@ -1829,6 +2102,132 @@ mod tests {
                 hash_expected
             );
         }
+    }
+
+    #[test]
+    fn costed_right_point_index_wins_only_when_strictly_cheaper() {
+        let (left, right, left_key, right_key) = simple_join_fixture(
+            SemanticType::physical(PhysicalType::Int64),
+            SemanticType::physical(PhysicalType::Int64),
+        );
+        let predicate = join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key));
+        let logical = logical_join(left, right, predicate);
+        let access = [join_index_path(2, 1, 4_096)];
+
+        let small = [join_table_statistics(1, 8), join_table_statistics(2, 4_096)];
+        assert!(matches!(
+            plan_with_statistics(&logical, &small, &access),
+            PhysicalPlan::IndexNestedLoopJoin {
+                right_table_id: TableId(2),
+                right_access_path: AccessPathId(72),
+                left_key: actual_left,
+                right_key: actual_right,
+                ..
+            } if actual_left == left_key && actual_right == right_key
+        ));
+        let mut second_equal_index = join_index_path(2, 1, 4_096);
+        second_equal_index.id = AccessPathId(73);
+        assert!(matches!(
+            plan_with_statistics(&logical, &small, &[second_equal_index, access[0].clone()],),
+            PhysicalPlan::IndexNestedLoopJoin {
+                right_access_path: AccessPathId(73),
+                ..
+            }
+        ));
+
+        let tie = [
+            join_table_statistics(1, 1_024),
+            join_table_statistics(2, 4_096),
+        ];
+        assert!(matches!(
+            plan_with_statistics(&logical, &tie, &access),
+            PhysicalPlan::HashJoin { .. }
+        ));
+
+        let duplicate_access = [join_index_path(2, 1, 64)];
+        let duplicate_outer = [
+            join_table_statistics(1, 64),
+            join_table_statistics(2, 4_096),
+        ];
+        assert!(matches!(
+            plan_with_statistics(&logical, &duplicate_outer, &duplicate_access),
+            PhysicalPlan::HashJoin { .. }
+        ));
+    }
+
+    #[test]
+    fn index_join_requires_complete_statistics_ordered_right_index_and_distinct_tables() {
+        let (left, right, left_key, right_key) = simple_join_fixture(
+            SemanticType::physical(PhysicalType::Int64),
+            SemanticType::physical(PhysicalType::Int64),
+        );
+        let predicate = join_binary(BinaryOp::Eq, join_expr(&left_key), join_expr(&right_key));
+        let logical = logical_join(left.clone(), right, predicate);
+        let statistics = [join_table_statistics(1, 8), join_table_statistics(2, 4_096)];
+        let mut missing_index_statistics = join_index_path(2, 1, 4_096);
+        missing_index_statistics.statistics = None;
+        let mut unordered = join_index_path(2, 1, 4_096);
+        unordered.capabilities.ordered = false;
+        for access in [
+            Vec::new(),
+            vec![missing_index_statistics],
+            vec![unordered],
+            vec![join_index_path(1, 1, 4_096)],
+        ] {
+            assert!(matches!(
+                plan_with_statistics(&logical, &statistics, &access),
+                PhysicalPlan::HashJoin { .. }
+            ));
+        }
+        assert!(matches!(
+            plan_with_statistics(
+                &logical,
+                &[join_table_statistics(1, 8)],
+                &[join_index_path(2, 1, 4_096)],
+            ),
+            PhysicalPlan::NestedLoopJoin { .. }
+        ));
+
+        let self_right_key = join_column_ref(
+            20,
+            1,
+            1,
+            "key",
+            SemanticType::physical(PhysicalType::Int64),
+            true,
+        );
+        let self_join = logical_join(
+            left,
+            join_scan(20, 1, vec![self_right_key.clone()]),
+            join_binary(
+                BinaryOp::Eq,
+                join_expr(&left_key),
+                join_expr(&self_right_key),
+            ),
+        );
+        assert!(!matches!(
+            plan_with_statistics(
+                &self_join,
+                &[join_table_statistics(1, 4_096)],
+                &[join_index_path(1, 1, 4_096)],
+            ),
+            PhysicalPlan::IndexNestedLoopJoin { .. }
+        ));
+
+        let partitioned_left = [RangeTablePlanningSnapshot {
+            table_id: TableId(1),
+            partition_key: ColumnId(1),
+            partitions: Vec::new(),
+        }];
+        assert!(!matches!(
+            plan_with_partition_snapshots(
+                &logical,
+                &statistics,
+                &[join_index_path(2, 1, 4_096)],
+                &partitioned_left,
+            ),
+            PhysicalPlan::IndexNestedLoopJoin { .. }
+        ));
     }
 
     #[test]
@@ -3056,6 +3455,7 @@ mod tests {
             | PhysicalPlan::Limit { input, .. } => base_columns(input),
             PhysicalPlan::OneRow
             | PhysicalPlan::NestedLoopJoin { .. }
+            | PhysicalPlan::IndexNestedLoopJoin { .. }
             | PhysicalPlan::HashJoin { .. } => {
                 panic!("expected one base scan")
             }

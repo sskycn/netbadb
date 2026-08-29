@@ -26,6 +26,7 @@ fn inspected_hash_keys(plan: &PlanNodeInspection) -> Option<(u32, u32)> {
         PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
             inspected_hash_keys(left).or_else(|| inspected_hash_keys(right))
         }
+        PlanNodeInspection::IndexNestedLoopJoin { left, .. } => inspected_hash_keys(left),
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
@@ -42,6 +43,7 @@ fn inspected_hash_keys(plan: &PlanNodeInspection) -> Option<(u32, u32)> {
 fn contains_nested_loop_join(plan: &PlanNodeInspection) -> bool {
     match plan {
         PlanNodeInspection::NestedLoopJoin { .. } => true,
+        PlanNodeInspection::IndexNestedLoopJoin { .. } => true,
         PlanNodeInspection::HashJoin { left, right, .. } => {
             contains_nested_loop_join(left) || contains_nested_loop_join(right)
         }

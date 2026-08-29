@@ -3452,6 +3452,7 @@ mod tests {
             | PhysicalPlan::ScalarProject { input, .. }
             | PhysicalPlan::Aggregate { input, .. }
             | PhysicalPlan::Limit { input, .. } => planned_index(input),
+            PhysicalPlan::IndexNestedLoopJoin { left, .. } => planned_index(left),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. } => {
                 planned_index(left).or_else(|| planned_index(right))
@@ -4057,6 +4058,7 @@ mod tests {
             | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_index(left).or_else(|| inspected_index(right))
             }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. } => inspected_index(left),
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
@@ -4079,6 +4081,7 @@ mod tests {
             | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_range(left).or_else(|| inspected_range(right))
             }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. } => inspected_range(left),
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
@@ -4128,6 +4131,15 @@ mod tests {
                 scan_bindings(left, bindings);
                 scan_bindings(right, bindings);
             }
+            PlanNodeInspection::IndexNestedLoopJoin {
+                left,
+                right_table_id,
+                right_binding_id,
+                ..
+            } => {
+                scan_bindings(left, bindings);
+                bindings.push((*right_table_id, right_binding_id.0));
+            }
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
@@ -4152,6 +4164,7 @@ mod tests {
             | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_scan_columns(left).or_else(|| inspected_scan_columns(right))
             }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. } => inspected_scan_columns(left),
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
@@ -4169,6 +4182,7 @@ mod tests {
             | PlanNodeInspection::HashJoin { left, right, .. } => {
                 inspected_filter(left).or_else(|| inspected_filter(right))
             }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. } => inspected_filter(left),
             PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
             | PlanNodeInspection::ScalarProject { input, .. }

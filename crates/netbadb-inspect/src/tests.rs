@@ -1,6 +1,6 @@
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
-    ColumnId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+    AccessPathId, ColumnId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
 };
 
 use super::*;
@@ -22,6 +22,46 @@ fn column(
         data_type: SemanticType::physical(physical),
         nullable: false,
     }
+}
+
+#[test]
+fn statement_renderer_exposes_index_join_without_a_fake_right_child() {
+    let left = column(10, 1, "l", 2, "join_key", PhysicalType::Int64);
+    let right = column(20, 2, "r", 2, "join_key", PhysicalType::Int64);
+    let predicate = ExpressionInspection {
+        kind: ExpressionKindInspection::Binary {
+            operator: BinaryOpInspection::Eq,
+            left: Box::new(column_expression(&left)),
+            right: Box::new(column_expression(&right)),
+        },
+        data_type: SemanticType::physical(PhysicalType::Bool),
+        nullable: false,
+    };
+    let text = render_statement(&query_statement(PlanNodeInspection::IndexNestedLoopJoin {
+        kind: JoinKindInspection::Inner,
+        left_key: left.clone(),
+        right_key: right.clone(),
+        right_binding_id: RelationBindingId(20),
+        right_table_id: TableId(2),
+        right_table_name: "right_rows".into(),
+        right_access_path: AccessPathId(72),
+        right_columns: vec![right.clone()],
+        columns: vec![left.clone(), right],
+        predicate,
+        left: Box::new(PlanNodeInspection::SeqScan {
+            binding_id: RelationBindingId(10),
+            table_id: TableId(1),
+            table_name: "left_rows".into(),
+            columns: vec![left],
+        }),
+    }));
+    assert!(text.contains(concat!(
+        "IndexNestedLoopJoin kind=Inner ",
+        "left_key=l#10.join_key#2@table#1 right_key=r#20.join_key#2@table#2 ",
+        "right_table=right_rows#2 right_binding=#20 right_access_path=#72 "
+    )));
+    assert!(text.contains("      left:\n        SeqScan table=left_rows#1"));
+    assert!(!text.contains("      right:\n"));
 }
 
 fn literal(value: ScalarValue, physical: PhysicalType) -> ExpressionInspection {

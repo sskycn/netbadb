@@ -50,7 +50,9 @@ fn root(plan: &StatementPlanInspection) -> &PlanNodeInspection {
 
 fn contains_index(plan: &PlanNodeInspection) -> bool {
     match plan {
-        PlanNodeInspection::IndexScan { .. } | PlanNodeInspection::RangeIndexScan { .. } => true,
+        PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. }
+        | PlanNodeInspection::IndexNestedLoopJoin { .. } => true,
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }

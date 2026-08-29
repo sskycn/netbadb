@@ -18,7 +18,8 @@ use netbadb_storage::{
     TableStorage,
 };
 use netbadb_types::{
-    ColumnId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
+    AccessPathId, ColumnId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId,
+    TableId,
 };
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
@@ -109,6 +110,15 @@ pub enum ExecutionError {
         planned: TableId,
         storage: TableId,
     },
+    IndexJoinStorageAlias {
+        left: TableId,
+        right: TableId,
+    },
+    InvalidIndexJoinAccessPath {
+        table_id: TableId,
+        access_path: AccessPathId,
+        column_id: ColumnId,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -162,6 +172,20 @@ impl fmt::Display for ExecutionError {
                 formatter,
                 "physical plan targets table {}, but storage contains table {}",
                 planned.0, storage.0
+            ),
+            Self::IndexJoinStorageAlias { left, right } => write!(
+                formatter,
+                "index nested-loop join requires distinct outer and inner storage (tables {} and {})",
+                left.0, right.0
+            ),
+            Self::InvalidIndexJoinAccessPath {
+                table_id,
+                access_path,
+                column_id,
+            } => write!(
+                formatter,
+                "access path {} is not an ordered point index for table {} column {}",
+                access_path.0, table_id.0, column_id.0
             ),
         }
     }
@@ -466,6 +490,20 @@ struct StreamingHashJoinStats {
     build_distinct_keys: usize,
     build_bucket_indices: usize,
     build_owned_key_clones: usize,
+    candidate_pairs_checked: usize,
+    output_rows: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IndexNestedLoopJoinStats {
+    outer_rows_seen: usize,
+    outer_batches_seen: usize,
+    max_outer_batch_rows: usize,
+    null_outer_keys_skipped: usize,
+    point_probes: usize,
+    point_rows_returned: usize,
+    max_point_rows: usize,
     candidate_pairs_checked: usize,
     output_rows: usize,
 }
@@ -985,6 +1023,7 @@ fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>
         PhysicalPlan::IndexScan { .. }
         | PhysicalPlan::RangeIndexScan { .. }
         | PhysicalPlan::NestedLoopJoin { .. }
+        | PhysicalPlan::IndexNestedLoopJoin { .. }
         | PhysicalPlan::HashJoin { .. }
         | PhysicalPlan::Sort { .. }
         | PhysicalPlan::Aggregate { .. } => Ok(None),
@@ -1574,6 +1613,35 @@ fn execute_rows_legacy_with_filter_mode(
             .collect::<Result<Vec<_>, _>>()?;
             Ok(ExecutionRows { fields, rows })
         }
+        PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            right_binding_id,
+            right_table_id,
+            right_columns,
+            kind,
+            left_key,
+            right_key,
+            right_access_path,
+            predicate,
+            columns,
+            ..
+        } => execute_index_nested_loop_join(
+            left,
+            *right_binding_id,
+            *right_table_id,
+            right_columns,
+            *kind,
+            left_key,
+            right_key,
+            *right_access_path,
+            predicate,
+            columns,
+            bindings,
+            storages,
+            read_views,
+            #[cfg(test)]
+            None,
+        ),
         PhysicalPlan::HashJoin {
             left,
             right,
@@ -1793,6 +1861,227 @@ fn execute_rows_legacy_with_filter_mode(
             result.rows.truncate(limit);
             Ok(result)
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_index_nested_loop_join(
+    left: &PhysicalPlan,
+    right_binding_id: RelationBindingId,
+    right_table_id: TableId,
+    right_columns: &[ColumnRef],
+    kind: JoinKind,
+    left_key: &ColumnRef,
+    right_key: &ColumnRef,
+    right_access_path: AccessPathId,
+    predicate: &Expr,
+    columns: &[ColumnRef],
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    #[cfg(test)] mut stats: Option<&mut IndexNestedLoopJoinStats>,
+) -> Result<ExecutionRows, ExecutionError> {
+    if !matches!(kind, JoinKind::Inner)
+        || !left_key.data_type.is_compatible_with(&right_key.data_type)
+        || right_key.binding_id != right_binding_id
+        || right_key.table_id != right_table_id
+        || right_columns.iter().any(|column| {
+            column.binding_id != right_binding_id || column.table_id != right_table_id
+        })
+    {
+        return Err(ExecutionError::TypeMismatch);
+    }
+
+    let Some(pipeline) = build_batch_pipeline(left)? else {
+        return Err(ExecutionError::TypeMismatch);
+    };
+    if !pipeline.operators.is_empty() {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    let BatchSource::SeqScan {
+        table_id: left_table_id,
+        columns: left_column_ids,
+    } = pipeline.source
+    else {
+        return Err(ExecutionError::TypeMismatch);
+    };
+    if left_table_id == right_table_id {
+        return Err(ExecutionError::IndexJoinStorageAlias {
+            left: left_table_id,
+            right: right_table_id,
+        });
+    }
+
+    let left_key_position = find_exact_source_position(&pipeline.fields, left_key)?;
+    let right_fields = right_columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    find_exact_source_position(&right_fields, right_key)?;
+    let mut joined_fields = pipeline.fields.clone();
+    joined_fields.extend(right_fields);
+    if !expression_sources_match_fields(predicate, &joined_fields) {
+        return Err(ExecutionError::TypeMismatch);
+    }
+    let bound_predicate = bind_expression(predicate, &joined_fields)?;
+    let output_positions = columns
+        .iter()
+        .map(|column| find_exact_source_position(&joined_fields, column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = columns
+        .iter()
+        .cloned()
+        .map(OutputField::Source)
+        .collect::<Vec<_>>();
+    let right_column_ids = right_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<Vec<_>>();
+
+    let (left_storage_id, left_storage_position) =
+        execution_storage_position(bindings, storages, left_table_id)?;
+    let (right_storage_id, right_storage_position) =
+        execution_storage_position(bindings, storages, right_table_id)?;
+    if left_storage_position == right_storage_position {
+        return Err(ExecutionError::IndexJoinStorageAlias {
+            left: left_table_id,
+            right: right_table_id,
+        });
+    }
+    let left_view = read_view_for_storage(read_views, left_storage_id)?;
+    let right_view = read_view_for_storage(read_views, right_storage_id)?;
+    let (left_storage, right_storage) =
+        distinct_execution_storages(storages, left_storage_position, right_storage_position);
+    ensure_table(left_table_id, left_storage)?;
+    ensure_table(right_table_id, right_storage)?;
+    if !right_storage.access_paths().iter().any(|path| {
+        path.id == right_access_path
+            && path.column_id == right_key.column_id
+            && path.capabilities.point_lookup
+            && path.capabilities.ordered
+    }) {
+        return Err(ExecutionError::InvalidIndexJoinAccessPath {
+            table_id: right_table_id,
+            access_path: right_access_path,
+            column_id: right_key.column_id,
+        });
+    }
+
+    let mut rows = Vec::new();
+    let mut batch = ExecutionBatch::with_capacity();
+    let mut deliver = |batch: &mut ExecutionBatch| -> Result<(), ExecutionError> {
+        #[cfg(test)]
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.outer_batches_seen += 1;
+            stats.max_outer_batch_rows = stats.max_outer_batch_rows.max(batch.rows.len());
+        }
+        for left_row in &batch.rows {
+            #[cfg(test)]
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.outer_rows_seen += 1;
+            }
+            let Some(key) = hash_join_key(left_row, left_key_position, left_key)? else {
+                #[cfg(test)]
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.null_outer_keys_skipped += 1;
+                }
+                continue;
+            };
+            #[cfg(test)]
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.point_probes += 1;
+            }
+            let candidates = right_storage.point_lookup_columns_with_view(
+                right_access_path,
+                key,
+                &right_column_ids,
+                right_view,
+            )?;
+            #[cfg(test)]
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.point_rows_returned += candidates.len();
+                stats.max_point_rows = stats.max_point_rows.max(candidates.len());
+            }
+            for (_, right_values) in candidates {
+                #[cfg(test)]
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.candidate_pairs_checked += 1;
+                }
+                if evaluate_bound_truth(
+                    &bound_predicate,
+                    EvaluationValues::Joined {
+                        left: &left_row.values,
+                        right: &right_values,
+                    },
+                )? == TruthValue::True
+                {
+                    rows.push(ExecutionRow {
+                        row_id: None,
+                        values: project_join_values(
+                            &left_row.values,
+                            &right_values,
+                            &output_positions,
+                        )?,
+                    });
+                    #[cfg(test)]
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.output_rows += 1;
+                    }
+                }
+            }
+        }
+        batch.rows.clear();
+        Ok(())
+    };
+    let _ = left_storage.visit_rows_with_view_control::<ExecutionError, _>(
+        &left_column_ids,
+        left_view,
+        |row_id, values| {
+            batch.rows.push(ExecutionRow {
+                row_id: Some(row_id),
+                values,
+            });
+            if batch.is_full_at(EXECUTION_BATCH_CAPACITY) {
+                deliver(&mut batch)?;
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    if !batch.rows.is_empty() {
+        deliver(&mut batch)?;
+    }
+    Ok(ExecutionRows { fields, rows })
+}
+
+fn execution_storage_position(
+    bindings: &[ExecutionStorageBinding],
+    storages: &[ExecutionStorage<'_>],
+    table_id: TableId,
+) -> Result<(StorageId, usize), ExecutionError> {
+    let storage_id = bindings
+        .iter()
+        .find(|binding| binding.table_id == table_id)
+        .map(|binding| binding.storage_id)
+        .ok_or(ExecutionError::MissingTableStorage(table_id))?;
+    let position = storages
+        .iter()
+        .position(|storage| storage.storage_id == storage_id)
+        .ok_or(ExecutionError::MissingPhysicalStorage(storage_id))?;
+    Ok((storage_id, position))
+}
+
+fn distinct_execution_storages<'a>(
+    storages: &'a mut [ExecutionStorage<'_>],
+    left: usize,
+    right: usize,
+) -> (&'a mut TableStorage, &'a mut TableStorage) {
+    if left < right {
+        let (before_right, at_right) = storages.split_at_mut(right);
+        (&mut *before_right[left].storage, &mut *at_right[0].storage)
+    } else {
+        let (before_left, at_left) = storages.split_at_mut(left);
+        (&mut *at_left[0].storage, &mut *before_left[right].storage)
     }
 }
 
@@ -5577,21 +5866,21 @@ mod tests {
         AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
         EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
         ExecutionRow, ExecutionRows, ExecutionStorage, FilteredCountSummary, FullSortStats,
-        GroupLookup, GroupState, HashJoinBuildSide, InequalityExecutionStrategy,
-        PartitionedBatchStats, PrehashedBuildHasher, PrehashedKey, ProjectionPlan, QueryResult,
-        StreamingHashJoinStats, TopNState, TruthValue, bind_expression, bind_filter_predicate,
-        build_batch_pipeline, build_hash_join_buckets, build_top_n_plan,
-        choose_inequality_strategy, collect_filter_columns, collect_streaming_filter_row,
-        compatibility_bindings, count_to_sql_u64, direct_count_eligibility, evaluate,
-        evaluate_binary, evaluate_binary_refs, evaluate_binary_scalar_refs,
-        evaluate_bound_scalar_ref_truth, evaluate_bound_truth, evaluate_bound_values,
-        evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
+        GroupLookup, GroupState, HashJoinBuildSide, IndexNestedLoopJoinStats,
+        InequalityExecutionStrategy, PartitionedBatchStats, PrehashedBuildHasher, PrehashedKey,
+        ProjectionPlan, QueryResult, StreamingHashJoinStats, TopNState, TruthValue,
+        bind_expression, bind_filter_predicate, build_batch_pipeline, build_hash_join_buckets,
+        build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
+        collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
+        direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
+        evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
+        evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
         evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
         evaluate_filter_bound_truth, evaluate_filter_bound_with, evaluate_truth,
         evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
-        execute_inequality_sweep, execute_nested_loop_join, execute_rows, execute_rows_legacy,
-        execute_with_storages, filtered_count_eligibility, find_required_inequality,
-        hash_group_key, inequality_can_match, materialize_count_values,
+        execute_index_nested_loop_join, execute_inequality_sweep, execute_nested_loop_join,
+        execute_rows, execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
+        find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
         materialize_direct_count_values, potential_left_indices, project_execution_row,
         projected_streaming_seq_filter_eligibility, required_right_extreme, sort_execution_rows,
         sorted_non_null_indices, streaming_seq_filter_eligibility,
@@ -11939,6 +12228,33 @@ mod tests {
         }
     }
 
+    fn index_join_plan(
+        left_columns: &[ColumnRef],
+        right_columns: &[ColumnRef],
+        right_access_path: netbadb_types::AccessPathId,
+        predicate: Expr,
+        columns: Vec<ColumnRef>,
+    ) -> PhysicalPlan {
+        PhysicalPlan::IndexNestedLoopJoin {
+            left: Box::new(PhysicalPlan::SeqScan {
+                binding_id: left_columns[0].binding_id,
+                table_id: left_columns[0].table_id,
+                table_name: "left_rows".into(),
+                columns: left_columns.to_vec(),
+            }),
+            right_binding_id: right_columns[0].binding_id,
+            right_table_id: right_columns[0].table_id,
+            right_table_name: "right_rows".into(),
+            right_columns: right_columns.to_vec(),
+            kind: JoinKind::Inner,
+            left_key: left_columns[1].clone(),
+            right_key: right_columns[1].clone(),
+            right_access_path,
+            predicate,
+            columns,
+        }
+    }
+
     fn streaming_join_storage(
         case: &str,
         side: &str,
@@ -12029,6 +12345,357 @@ mod tests {
             &execution_views,
             Some(stats),
         )
+    }
+
+    fn execute_index_join_with_stats(
+        plan: &PhysicalPlan,
+        storages: &mut [TableStorage],
+        stats: &mut IndexNestedLoopJoinStats,
+    ) -> Result<ExecutionRows, ExecutionError> {
+        let views = storages
+            .iter()
+            .map(TableStorage::read_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        let bindings = compatibility_bindings(storages)?;
+        let mut execution_storages = storages
+            .iter_mut()
+            .zip(&bindings)
+            .map(|(storage, binding)| ExecutionStorage {
+                storage_id: binding.storage_id,
+                storage,
+            })
+            .collect::<Vec<_>>();
+        let execution_views = views
+            .iter()
+            .zip(&bindings)
+            .map(|(view, binding)| ExecutionReadView {
+                storage_id: binding.storage_id,
+                view,
+            })
+            .collect::<Vec<_>>();
+        let PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            right_binding_id,
+            right_table_id,
+            right_columns,
+            kind,
+            left_key,
+            right_key,
+            right_access_path,
+            predicate,
+            columns,
+            ..
+        } = plan
+        else {
+            panic!("expected IndexNestedLoopJoin")
+        };
+        execute_index_nested_loop_join(
+            left,
+            *right_binding_id,
+            *right_table_id,
+            right_columns,
+            *kind,
+            left_key,
+            right_key,
+            *right_access_path,
+            predicate,
+            columns,
+            &bindings,
+            &mut execution_storages,
+            &execution_views,
+            Some(stats),
+        )
+    }
+
+    #[test]
+    fn index_join_batches_outer_rows_skips_nulls_and_checks_the_full_predicate() {
+        let left_table_id = TableId(72_001);
+        let right_table_id = TableId(72_002);
+        let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+        let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+        let (left_storage, left_path) =
+            streaming_join_storage("index", "left", left_table_id, 64, false, |index| {
+                ScalarValue::Int64(i64::try_from(index).expect("key fits i64"))
+            });
+        let (mut right_storage, right_path) =
+            streaming_join_storage("index", "right", right_table_id, 4_096, false, |index| {
+                ScalarValue::Int64(i64::try_from(index).expect("key fits i64"))
+            });
+        right_storage
+            .create_index(ColumnId(2))
+            .expect("create right join index");
+        let access_path = right_storage.access_paths()[0].id;
+        let equality = streaming_join_binary(
+            BinaryOp::Eq,
+            streaming_join_expression(&left_columns[1]),
+            streaming_join_expression(&right_columns[1]),
+        );
+        let residual = streaming_join_binary(
+            BinaryOp::Gt,
+            streaming_join_expression(&right_columns[1]),
+            Expr {
+                kind: ExprKind::Literal(ScalarValue::Int64(5)),
+                expr_type: ExprType {
+                    data_type: SemanticType::physical(PhysicalType::Int64),
+                    nullable: false,
+                },
+            },
+        );
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            left: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(10),
+                table_id: left_table_id,
+                table_name: "left_rows".into(),
+                columns: left_columns.clone(),
+            }),
+            right_binding_id: RelationBindingId(20),
+            right_table_id,
+            right_table_name: "right_rows".into(),
+            right_columns: right_columns.clone(),
+            kind: JoinKind::Inner,
+            left_key: left_columns[1].clone(),
+            right_key: right_columns[1].clone(),
+            right_access_path: access_path,
+            predicate: streaming_join_binary(BinaryOp::And, equality, residual),
+            columns: vec![left_columns[0].clone(), right_columns[0].clone()],
+        };
+        let mut storages = [left_storage, right_storage];
+        let mut stats = IndexNestedLoopJoinStats::default();
+        let result = execute_index_join_with_stats(&plan, &mut storages, &mut stats)
+            .expect("execute index nested-loop join");
+        let expected = (6..64)
+            .map(|index| {
+                vec![
+                    ScalarValue::Int64(i64::from(index)),
+                    ScalarValue::Int64(i64::from(index)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result
+                .rows
+                .into_iter()
+                .map(|row| row.values)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(stats.outer_rows_seen, 64);
+        assert_eq!(stats.outer_batches_seen, 1);
+        assert_eq!(stats.max_outer_batch_rows, 64);
+        assert_eq!(stats.null_outer_keys_skipped, 0);
+        assert_eq!(stats.point_probes, 64);
+        assert_eq!(stats.point_rows_returned, 64);
+        assert_eq!(stats.max_point_rows, 1);
+        assert_eq!(stats.candidate_pairs_checked, 64);
+        assert_eq!(stats.output_rows, expected.len());
+        remove_batch_test_path(&left_path, false);
+        remove_batch_test_path(&right_path, false);
+    }
+
+    #[test]
+    fn index_join_no_match_and_duplicate_results_have_bounded_point_rows() {
+        for (case, left_rows, right_rows, left_key, right_key, expected_max) in [
+            ("none", 64, 4_096, 0_i64, 1_000_i64, 0),
+            ("duplicate", 2, 3, 7_i64, 7_i64, 3),
+        ] {
+            let left_table_id = TableId(72_200);
+            let right_table_id = TableId(72_201);
+            let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+            let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+            let (left_storage, left_path) =
+                streaming_join_storage(case, "index-left", left_table_id, left_rows, false, |_| {
+                    ScalarValue::Int64(left_key)
+                });
+            let (mut right_storage, right_path) = streaming_join_storage(
+                case,
+                "index-right",
+                right_table_id,
+                right_rows,
+                false,
+                |_| ScalarValue::Int64(right_key),
+            );
+            right_storage
+                .create_index(ColumnId(2))
+                .expect("create duplicate/no-match join index");
+            let access_path = right_storage.access_paths()[0].id;
+            let predicate = streaming_join_binary(
+                BinaryOp::Eq,
+                streaming_join_expression(&left_columns[1]),
+                streaming_join_expression(&right_columns[1]),
+            );
+            let output_columns = vec![left_columns[0].clone(), right_columns[0].clone()];
+            let index_plan = index_join_plan(
+                &left_columns,
+                &right_columns,
+                access_path,
+                predicate.clone(),
+                output_columns.clone(),
+            );
+            let hash_plan =
+                streaming_join_plan(&left_columns, &right_columns, predicate, output_columns);
+            let mut storages = [left_storage, right_storage];
+            let mut stats = IndexNestedLoopJoinStats::default();
+            let index_result =
+                execute_index_join_with_stats(&index_plan, &mut storages, &mut stats)
+                    .expect("execute duplicate/no-match index join");
+            let hash_result = execute_rows(&hash_plan, &mut storages)
+                .expect("execute duplicate/no-match HashJoin reference");
+            assert_eq!(index_result, hash_result, "{case}");
+            assert_eq!(stats.outer_rows_seen, left_rows, "{case}");
+            assert_eq!(stats.point_probes, left_rows, "{case}");
+            assert_eq!(
+                stats.point_rows_returned,
+                left_rows * expected_max,
+                "{case}"
+            );
+            assert_eq!(stats.max_point_rows, expected_max, "{case}");
+            assert_eq!(stats.candidate_pairs_checked, left_rows * expected_max);
+            assert_eq!(stats.output_rows, left_rows * expected_max);
+            remove_batch_test_path(&left_path, false);
+            remove_batch_test_path(&right_path, false);
+        }
+    }
+
+    #[test]
+    fn index_join_outer_batch_boundaries_and_empty_setup_are_explicit() {
+        for outer_rows in [0_usize, 1, 64, 255, 256, 257, 512, 513] {
+            let case = format!("index-boundary-{outer_rows}");
+            let left_table_id = TableId(72_300);
+            let right_table_id = TableId(72_301);
+            let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+            let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+            let (left_storage, left_path) =
+                streaming_join_storage(&case, "left", left_table_id, outer_rows, false, |index| {
+                    if outer_rows == 64 && index % 8 == 0 {
+                        ScalarValue::Null
+                    } else {
+                        ScalarValue::Int64(i64::try_from(index).expect("key fits i64"))
+                    }
+                });
+            let (mut right_storage, right_path) =
+                streaming_join_storage(&case, "right", right_table_id, 0, false, |_| {
+                    ScalarValue::Int64(0)
+                });
+            right_storage
+                .create_index(ColumnId(2))
+                .expect("create empty right join index");
+            let predicate = streaming_join_binary(
+                BinaryOp::Eq,
+                streaming_join_expression(&left_columns[1]),
+                streaming_join_expression(&right_columns[1]),
+            );
+            let plan = index_join_plan(
+                &left_columns,
+                &right_columns,
+                right_storage.access_paths()[0].id,
+                predicate,
+                vec![left_columns[0].clone()],
+            );
+            let mut storages = [left_storage, right_storage];
+            let mut stats = IndexNestedLoopJoinStats::default();
+            let result = execute_index_join_with_stats(&plan, &mut storages, &mut stats)
+                .expect("execute boundary index join");
+            assert!(result.rows.is_empty());
+            assert_eq!(stats.outer_rows_seen, outer_rows);
+            let expected_probes = if outer_rows == 64 { 56 } else { outer_rows };
+            assert_eq!(stats.point_probes, expected_probes);
+            assert_eq!(stats.null_outer_keys_skipped, outer_rows - expected_probes);
+            assert_eq!(stats.outer_batches_seen, outer_rows.div_ceil(256));
+            assert!(stats.max_outer_batch_rows <= EXECUTION_BATCH_CAPACITY);
+
+            if outer_rows == 0 {
+                let mut invalid = plan.clone();
+                let PhysicalPlan::IndexNestedLoopJoin {
+                    right_access_path, ..
+                } = &mut invalid
+                else {
+                    panic!("expected IndexNestedLoopJoin")
+                };
+                *right_access_path = netbadb_types::AccessPathId(u64::MAX);
+                assert!(matches!(
+                    execute_rows(&invalid, &mut storages),
+                    Err(ExecutionError::InvalidIndexJoinAccessPath { .. })
+                ));
+            }
+            remove_batch_test_path(&left_path, false);
+            remove_batch_test_path(&right_path, false);
+        }
+    }
+
+    #[test]
+    fn index_join_uses_the_lsm_right_point_access_path() {
+        let left_table_id = TableId(72_101);
+        let right_table_id = TableId(72_102);
+        let left_columns = streaming_join_columns(10, left_table_id, "left_rows");
+        let right_columns = streaming_join_columns(20, right_table_id, "right_rows");
+        let (left_storage, left_path) =
+            streaming_join_storage("index-lsm", "left", left_table_id, 3, false, |index| {
+                ScalarValue::Int64(i64::try_from(2 - index).expect("key fits i64"))
+            });
+        let right_path = batch_test_path("index-lsm-right", true);
+        remove_batch_test_path(&right_path, true);
+        let mut right_storage = TableStorage::create_lsm(
+            &right_path,
+            streaming_join_table(right_table_id, "right_rows"),
+            ColumnId(1),
+        )
+        .expect("create right LSM join storage");
+        let mut transaction = right_storage
+            .begin_transaction()
+            .expect("begin right LSM join load");
+        for index in 0..3 {
+            right_storage
+                .insert_in(
+                    &mut transaction,
+                    &[
+                        ScalarValue::Int64(i64::from(index)),
+                        ScalarValue::Int64(i64::from(index)),
+                        ScalarValue::Text(format!("right-{index}")),
+                    ],
+                )
+                .expect("insert right LSM join row");
+        }
+        transaction.commit().expect("commit right LSM join load");
+        let access_path = right_storage.access_paths()[0].id;
+        let predicate = streaming_join_binary(
+            BinaryOp::Eq,
+            streaming_join_expression(&left_columns[0]),
+            streaming_join_expression(&right_columns[0]),
+        );
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            left: Box::new(PhysicalPlan::SeqScan {
+                binding_id: RelationBindingId(10),
+                table_id: left_table_id,
+                table_name: "left_rows".into(),
+                columns: left_columns.clone(),
+            }),
+            right_binding_id: RelationBindingId(20),
+            right_table_id,
+            right_table_name: "right_rows".into(),
+            right_columns: right_columns.clone(),
+            kind: JoinKind::Inner,
+            left_key: left_columns[0].clone(),
+            right_key: right_columns[0].clone(),
+            right_access_path: access_path,
+            predicate,
+            columns: vec![left_columns[0].clone(), right_columns[0].clone()],
+        };
+        let mut storages = [left_storage, right_storage];
+        let result = execute_rows(&plan, &mut storages).expect("execute LSM index join");
+        assert_eq!(
+            result
+                .rows
+                .into_iter()
+                .map(|row| row.values)
+                .collect::<Vec<_>>(),
+            vec![
+                vec![ScalarValue::Int64(0), ScalarValue::Int64(0)],
+                vec![ScalarValue::Int64(1), ScalarValue::Int64(1)],
+                vec![ScalarValue::Int64(2), ScalarValue::Int64(2)],
+            ]
+        );
+        remove_batch_test_path(&left_path, false);
+        remove_batch_test_path(&right_path, true);
     }
 
     fn hash_join_text_pointer(value: &ScalarValue) -> *const u8 {

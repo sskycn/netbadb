@@ -271,6 +271,7 @@ enum Operator {
     IndexScan,
     RangeIndexScan,
     NestedLoopJoin,
+    IndexNestedLoopJoin,
     HashJoin,
     Filter,
     Sort,
@@ -288,6 +289,7 @@ impl Operator {
             Self::IndexScan => "IndexScan",
             Self::RangeIndexScan => "RangeIndexScan",
             Self::NestedLoopJoin => "NestedLoopJoin",
+            Self::IndexNestedLoopJoin => "IndexNestedLoopJoin",
             Self::HashJoin => "HashJoin",
             Self::Filter => "Filter",
             Self::Sort => "Sort",
@@ -1021,6 +1023,7 @@ fn partitioned_scan_partitions(
         | PlanNodeInspection::Limit { input, .. } => partitioned_scan_partitions(input),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::NestedLoopJoin { .. }
+        | PlanNodeInspection::IndexNestedLoopJoin { .. }
         | PlanNodeInspection::HashJoin { .. }
         | PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
@@ -1201,6 +1204,7 @@ fn selected_partition_count(plan: &PlanNodeInspection) -> Option<usize> {
         | PlanNodeInspection::HashJoin { left, right, .. } => {
             selected_partition_count(left).or_else(|| selected_partition_count(right))
         }
+        PlanNodeInspection::IndexNestedLoopJoin { left, .. } => selected_partition_count(left),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
         | PlanNodeInspection::IndexScan { .. }
@@ -3877,6 +3881,7 @@ fn run_join_scenarios(
     run_phase65_hash_join_scenarios(settings, measurements)?;
     run_phase68_hash_join_scenarios(settings, measurements)?;
     run_phase70_hash_join_scenarios(settings, measurements)?;
+    run_phase72_index_join_attribution_scenarios(settings, measurements)?;
     Ok(())
 }
 
@@ -4084,6 +4089,288 @@ fn run_phase70_hash_join_scenarios(
     ] {
         run_asymmetric_hash_join_query(scenario, settings, measurements)?;
     }
+    Ok(())
+}
+
+fn run_phase72_index_join_attribution_scenarios(
+    settings: ProfileSettings,
+    measurements: &mut Vec<Measurement>,
+) -> BenchResult<()> {
+    let right_rows = 4_096;
+    for (
+        name,
+        left_rows,
+        right_cardinality,
+        right_offset,
+        right_index,
+        left_index,
+        sql,
+        expected_ids,
+        expected_operator,
+        right_id_required,
+    ) in [
+        (
+            "phase72_index_join_unique_1x4096",
+            1,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..1).collect::<Vec<_>>(),
+            Operator::IndexNestedLoopJoin,
+            false,
+        ),
+        (
+            "phase72_index_join_unique_8x4096",
+            8,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..8).collect::<Vec<_>>(),
+            Operator::IndexNestedLoopJoin,
+            false,
+        ),
+        (
+            "phase72_index_join_unique_64x4096",
+            64,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..64).collect::<Vec<_>>(),
+            Operator::IndexNestedLoopJoin,
+            false,
+        ),
+        (
+            "phase72_index_join_unique_256x4096",
+            256,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..256).collect::<Vec<_>>(),
+            Operator::IndexNestedLoopJoin,
+            false,
+        ),
+        (
+            "phase72_index_join_unique_512x4096",
+            512,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..512).collect::<Vec<_>>(),
+            Operator::IndexNestedLoopJoin,
+            false,
+        ),
+        (
+            "phase72_hash_join_unique_1024x4096",
+            1_024,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..1_024).collect::<Vec<_>>(),
+            Operator::HashJoin,
+            false,
+        ),
+        (
+            "phase72_index_join_none_64x4096",
+            64,
+            right_rows,
+            right_rows,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            Vec::new(),
+            Operator::IndexNestedLoopJoin,
+            false,
+        ),
+        (
+            "phase72_hash_join_duplicate_none_64x4096",
+            64,
+            64,
+            right_rows,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            Vec::new(),
+            Operator::HashJoin,
+            false,
+        ),
+        (
+            "phase72_index_join_residual_8x4096",
+            8,
+            right_rows,
+            0,
+            true,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key AND l.id < r.id",
+            Vec::new(),
+            Operator::IndexNestedLoopJoin,
+            true,
+        ),
+        (
+            "phase72_hash_join_no_index_64x4096",
+            64,
+            right_rows,
+            0,
+            false,
+            false,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..64).collect::<Vec<_>>(),
+            Operator::HashJoin,
+            false,
+        ),
+        (
+            "phase72_hash_join_left_index_only_64x4096",
+            64,
+            right_rows,
+            0,
+            false,
+            true,
+            "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key",
+            (0..64).collect::<Vec<_>>(),
+            Operator::HashJoin,
+            false,
+        ),
+    ] {
+        let paths = FixturePaths::new(name, 2);
+        let mut database = Database::create_tables(vec![
+            (
+                paths.path(0).to_path_buf(),
+                join_table(LEFT_TABLE_ID, "left_rows"),
+            ),
+            (
+                paths.path(1).to_path_buf(),
+                join_table(RIGHT_TABLE_ID, "right_rows"),
+            ),
+        ])?;
+        load_join_rows(&mut database, LEFT_TABLE_ID, left_rows, left_rows, 0)?;
+        load_join_rows(
+            &mut database,
+            RIGHT_TABLE_ID,
+            right_rows,
+            right_cardinality,
+            right_offset,
+        )?;
+        if right_index {
+            database.create_index(RIGHT_TABLE_ID, ColumnId(2))?;
+        }
+        if left_index {
+            database.create_index(LEFT_TABLE_ID, ColumnId(2))?;
+        }
+        database.analyze(LEFT_TABLE_ID)?;
+        database.analyze(RIGHT_TABLE_ID)?;
+        inspect_analyzed_row_counts(&database, name, left_rows, right_rows)?;
+
+        let excluded = match expected_operator {
+            Operator::IndexNestedLoopJoin => vec![
+                Operator::NestedLoopJoin,
+                Operator::HashJoin,
+                Operator::IndexScan,
+            ],
+            Operator::HashJoin => vec![Operator::NestedLoopJoin, Operator::IndexNestedLoopJoin],
+            _ => return Err(message_error("unsupported Phase 72 expected operator")),
+        };
+        let plan = inspect_plan(
+            &database,
+            name,
+            sql,
+            &[expected_operator, Operator::SeqScan],
+            &excluded,
+        )?;
+        if expected_operator == Operator::IndexNestedLoopJoin {
+            inspect_phase72_index_join_shape(&database, name, sql, right_id_required)?;
+        } else {
+            inspect_phase70_hash_join_shape(
+                &database,
+                name,
+                sql,
+                PhysicalType::Int64,
+                right_id_required,
+            )?;
+        }
+        let expected = expected_ids_observation(&expected_ids)?;
+        let durations = measure_checked(
+            name,
+            settings.query_warmup,
+            settings.join_iterations,
+            expected,
+            || database.query(sql).map_err(Into::into),
+            |result| ordered_ids_observation(result, &expected_ids),
+        )?;
+        database.close()?;
+        paths.cleanup()?;
+        measurements.push(Measurement {
+            scenario: name.to_owned(),
+            rows: format!("{left_rows}x{right_rows}"),
+            plan: format!(
+                "{plan} [right_point_index={} left_point_index={} right_distinct_keys={right_cardinality}]",
+                if right_index { "join_key#2" } else { "none" },
+                if left_index { "join_key#2" } else { "none" },
+            ),
+            operations_per_iteration: 1,
+            durations,
+        });
+    }
+    let name = "phase72_index_join_text8_unique_64x4096";
+    let left_rows = 64;
+    let paths = FixturePaths::new(name, 2);
+    let mut database = Database::create_tables(vec![
+        (
+            paths.path(0).to_path_buf(),
+            text_join_table(LEFT_TABLE_ID, "left_rows"),
+        ),
+        (
+            paths.path(1).to_path_buf(),
+            text_join_table(RIGHT_TABLE_ID, "right_rows"),
+        ),
+    ])?;
+    load_fixed_text_join_rows(&mut database, LEFT_TABLE_ID, left_rows, left_rows, 0, 8)?;
+    load_fixed_text_join_rows(&mut database, RIGHT_TABLE_ID, right_rows, right_rows, 0, 8)?;
+    database.create_index(RIGHT_TABLE_ID, ColumnId(2))?;
+    database.analyze(LEFT_TABLE_ID)?;
+    database.analyze(RIGHT_TABLE_ID)?;
+    let sql = "SELECT l.id FROM left_rows l JOIN right_rows r ON l.join_key = r.join_key";
+    let plan = inspect_plan(
+        &database,
+        name,
+        sql,
+        &[Operator::IndexNestedLoopJoin, Operator::SeqScan],
+        &[
+            Operator::NestedLoopJoin,
+            Operator::HashJoin,
+            Operator::IndexScan,
+        ],
+    )?;
+    inspect_phase72_index_join_shape(&database, name, sql, false)?;
+    let expected_ids = (0..left_rows).collect::<Vec<_>>();
+    let expected = expected_ids_observation(&expected_ids)?;
+    let durations = measure_checked(
+        name,
+        settings.query_warmup,
+        settings.join_iterations,
+        expected,
+        || database.query(sql).map_err(Into::into),
+        |result| ordered_ids_observation(result, &expected_ids),
+    )?;
+    database.close()?;
+    paths.cleanup()?;
+    measurements.push(Measurement {
+        scenario: name.to_owned(),
+        rows: format!("{left_rows}x{right_rows}"),
+        plan: format!("{plan} [right_point_index=join_key#2 Text/8]"),
+        operations_per_iteration: 1,
+        durations,
+    });
     Ok(())
 }
 
@@ -5023,6 +5310,64 @@ fn inspect_phase70_hash_join_shape(
     Ok(())
 }
 
+fn inspect_phase72_index_join_shape(
+    database: &Database,
+    scenario: &str,
+    sql: &str,
+    right_id_required: bool,
+) -> BenchResult<()> {
+    let inspection = database.inspect_statement(sql)?;
+    let root = query_root(&inspection)?;
+    let join = find_index_nested_loop_join(root).ok_or_else(|| {
+        message_error(format!("scenario `{scenario}` is not IndexNestedLoopJoin"))
+    })?;
+    let PlanNodeInspection::IndexNestedLoopJoin {
+        left_key,
+        right_key,
+        right_table_id,
+        right_columns,
+        columns,
+        left,
+        ..
+    } = join
+    else {
+        return Err(message_error(format!(
+            "scenario `{scenario}` is not IndexNestedLoopJoin"
+        )));
+    };
+    let join_key = ColumnId(2);
+    let expected_right_columns = if right_id_required {
+        vec![ID_COLUMN_ID, join_key]
+    } else {
+        vec![join_key]
+    };
+    let mut expected_columns = vec![(LEFT_TABLE_ID, ID_COLUMN_ID), (LEFT_TABLE_ID, join_key)];
+    if right_id_required {
+        expected_columns.push((RIGHT_TABLE_ID, ID_COLUMN_ID));
+    }
+    expected_columns.push((RIGHT_TABLE_ID, join_key));
+    if left_key.table_id != LEFT_TABLE_ID
+        || left_key.column_id != join_key
+        || right_key.table_id != RIGHT_TABLE_ID
+        || right_key.column_id != join_key
+        || *right_table_id != RIGHT_TABLE_ID
+        || right_columns
+            .iter()
+            .map(|column| column.column_id)
+            .ne(expected_right_columns)
+        || columns
+            .iter()
+            .map(|column| (column.table_id, column.column_id))
+            .ne(expected_columns)
+        || !direct_seq_scan_matches(left, LEFT_TABLE_ID, &[ID_COLUMN_ID, join_key])
+    {
+        return Err(message_error(format!(
+            "scenario `{scenario}` does not expose the selected right point index and pruned columns"
+        )));
+    }
+    Ok(())
+}
+
 fn inspect_analyzed_row_counts(
     database: &Database,
     scenario: &str,
@@ -5070,7 +5415,27 @@ fn find_hash_join(plan: &PlanNodeInspection) -> Option<&PlanNodeInspection> {
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. }
         | PlanNodeInspection::PartitionedScan { .. }
-        | PlanNodeInspection::NestedLoopJoin { .. } => None,
+        | PlanNodeInspection::NestedLoopJoin { .. }
+        | PlanNodeInspection::IndexNestedLoopJoin { .. } => None,
+    }
+}
+
+fn find_index_nested_loop_join(plan: &PlanNodeInspection) -> Option<&PlanNodeInspection> {
+    match plan {
+        PlanNodeInspection::IndexNestedLoopJoin { .. } => Some(plan),
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => find_index_nested_loop_join(input),
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::IndexScan { .. }
+        | PlanNodeInspection::RangeIndexScan { .. }
+        | PlanNodeInspection::PartitionedScan { .. }
+        | PlanNodeInspection::NestedLoopJoin { .. }
+        | PlanNodeInspection::HashJoin { .. } => None,
     }
 }
 
@@ -5131,6 +5496,19 @@ fn collect_base_scan_columns(plan: &PlanNodeInspection, scans: &mut Vec<Vec<Colu
             collect_base_scan_columns(left, scans);
             collect_base_scan_columns(right, scans);
         }
+        PlanNodeInspection::IndexNestedLoopJoin {
+            left,
+            right_columns,
+            ..
+        } => {
+            collect_base_scan_columns(left, scans);
+            scans.push(
+                right_columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect(),
+            );
+        }
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }
         | PlanNodeInspection::Project { input, .. }
@@ -5170,6 +5548,7 @@ fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
             | PlanNodeInspection::HashJoin { left, right, .. } => {
                 contains_operator(left, target) || contains_operator(right, target)
             }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. } => contains_operator(left, target),
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
@@ -5192,6 +5571,7 @@ const fn operator(plan: &PlanNodeInspection) -> Operator {
         PlanNodeInspection::RangeIndexScan { .. } => Operator::RangeIndexScan,
         PlanNodeInspection::PartitionedScan { .. } => Operator::SeqScan,
         PlanNodeInspection::NestedLoopJoin { .. } => Operator::NestedLoopJoin,
+        PlanNodeInspection::IndexNestedLoopJoin { .. } => Operator::IndexNestedLoopJoin,
         PlanNodeInspection::HashJoin { .. } => Operator::HashJoin,
         PlanNodeInspection::Filter { .. } => Operator::Filter,
         PlanNodeInspection::Sort { .. } => Operator::Sort,
@@ -5215,6 +5595,9 @@ fn collect_operators(plan: &PlanNodeInspection, operators: &mut Vec<&'static str
         | PlanNodeInspection::HashJoin { left, right, .. } => {
             collect_operators(left, operators);
             collect_operators(right, operators);
+        }
+        PlanNodeInspection::IndexNestedLoopJoin { left, .. } => {
+            collect_operators(left, operators);
         }
         PlanNodeInspection::Filter { input, .. }
         | PlanNodeInspection::Sort { input, .. }

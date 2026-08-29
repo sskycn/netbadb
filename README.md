@@ -243,11 +243,12 @@ The current code genuinely supports:
   in-process metrics, and the standalone `netbadbd` executable;
 - a native embedded `netbadb-core::Database` API;
 - stable, read-only embedded catalog and chosen-plan inspection DTOs with an
-  explicit deterministic text renderer that exposes no planner or storage
-  handles and never drives execution;
+  explicit deterministic text renderer that exposes no planner objects or
+  storage internals and never drives execution;
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
-  current versioned Inspection JSON v4 output (with v1/v2/v3 retained historically);
+  current versioned Inspection JSON v5 output (with v1/v2/v3/v4 retained
+  historically);
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
@@ -521,7 +522,7 @@ frequency, `IS NULL` uses `null_count`, and bounded integer range estimates use
 the exact discrete bound count times average duplicates. SeqScan wins an equal
 cost; equal index costs preserve registration order. Stale snapshots can
 change only plan choice and performance, never query semantics. One-sided and
-Text/Bool range costing, index joins, and index-only scans remain deferred.
+Text/Bool range costing, composite/index-left joins, and index-only scans remain deferred.
 
 Typed INNER JOIN resolution assigns deterministic `RelationBindingId` values
 in source order. An alias hides the underlying table name. Qualified columns
@@ -696,7 +697,7 @@ The implementation sequence is intentionally vertical:
     complete.
 27. Structured inspection and offline local CLI (Phases 6D1 and 6D2) — stable
     DTOs, deterministic text, manifest-v4 bootstrap, and historical Inspection
-    JSON v1. Complete; the current CLI contract is v4 after Range Partition.
+    JSON v1. Complete; the current CLI contract is v5 after IndexNestedLoopJoin.
     Complete.
 28. Shared SQL diagnostics and diagnostics-only LSP (Phase 6E1) — complete.
 29. MCP and additional tooling adapters (Phase 6E2) — future work.
@@ -704,7 +705,7 @@ The implementation sequence is intentionally vertical:
 31. Predicate-first NestedLoopJoin rejected-pair materialization avoidance
     (Phase 7C) — complete.
 32. Costed simple equi HashJoin for analyzed direct Scan × Scan INNER JOINs
-    (Phase 7D) — complete; Inspection JSON v3 is current.
+    (Phase 7D) — complete; HashJoin introduced Inspection JSON v3.
 33. Validate-once Heap sequential scan (Phase 7E) — complete; one authoritative
     full validation is reused through a crate-private immutable page borrow,
     with checked record access and unchanged persistent formats.
@@ -888,9 +889,18 @@ The implementation sequence is intentionally vertical:
     `QueryResult` still has an Ω(N output) memory lower bound and the measured
     hidden-key overhead was modest, external spill is deferred rather than
     selected for Phase 72.
+72. Costed Index Nested-Loop Join — complete; analyzed direct Scan × Scan INNER
+    equality joins may keep logical left as a bounded at-most-256-row outer
+    stream and point-probe an ordered analyzed index on logical right. Checked
+    costs must be strictly lower than both NestedLoopJoin and HashJoin, so ties,
+    missing/stale statistics, high duplication, unsupported shapes, self joins,
+    and partitioned inputs preserve the existing choice. NULL outer keys issue
+    no probe; every candidate still evaluates the complete eager predicate and
+    output remains exact left-major/right-minor order. Inspection JSON v5
+    exposes the right table/access path without inventing a right scan child.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
-index-join planning remain roadmap items. A general typed column-oriented batch
+broader join enumeration remain roadmap items. A general typed column-oriented batch
 is not justified by Phase 67. Phase 71 does not justify external Sort spill;
 storage-level index/range visitors remain measurement-led candidates. Upstream
 Top-N cancellation is not implemented. HashJoin build-side structure closes

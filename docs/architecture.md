@@ -61,7 +61,7 @@ Canonical Schema + source SQL               netbadb-inspect DTOs
         ↓                                           ↓
 netbadb-compiler                             embedded SDK / offline CLI
         ↓                                           ↓
-ToolingDiagnostic                           text / Inspection JSON v4
+ToolingDiagnostic                           text / Inspection JSON v5
         ↓
 netbadb-lsp UTF-16 adapter
 ```
@@ -122,14 +122,15 @@ netbadb-sdk embedded Database
           ↓
 netbadb-inspect DTOs
        ↙       ↘
-human text   Inspection JSON v4
+human text   Inspection JSON v5
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
 obtain table bootstrap paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
-filesystem access. JSON v4 is the current explicit external CLI contract,
-converted exhaustively from inspection DTOs; v1, v2, and v3 remain historical
+filesystem access. JSON v5 is the current explicit external CLI contract when
+IndexNestedLoopJoin appears, converted exhaustively from inspection DTOs;
+ordinary plans remain v3, partition plans remain v4, and v1/v2 are historical
 contracts and the DTOs themselves remain serde-free.
 Future runtime-inspection tooling, including MCP, consumes those DTOs directly
 rather than spawning the CLI. The diagnostics-only LSP does not use this path.
@@ -219,7 +220,8 @@ left-associated tree:
 ```text
 LogicalPlan::Join(left plan, right plan, Inner, typed predicate)
     ↓ planner (no join reordering)
-PhysicalPlan::NestedLoopJoin or eligible PhysicalPlan::HashJoin
+PhysicalPlan::NestedLoopJoin, eligible PhysicalPlan::HashJoin,
+or eligible PhysicalPlan::IndexNestedLoopJoin
 ```
 
 Every physical node has binding-aware output columns. Expression and projection
@@ -242,16 +244,38 @@ Join
  |      -> NestedLoopJoin
  |
  +-- analyzed direct Scan × Scan with cross-side equality
-        +-- left_rows + right_rows < left_rows * right_rows
-               -> HashJoin
-        +-- otherwise
-               -> NestedLoopJoin
+        +-- costed ordered point index on logical right is strictly cheaper
+        |      than both alternatives -> IndexNestedLoopJoin
+        +-- left_rows + right_rows < left_rows * right_rows -> HashJoin
+        +-- otherwise -> NestedLoopJoin
 ```
 
 Both costs use checked `u128` work units. Missing or stale statistics can affect
 only the algorithm choice; the complete predicate remains the semantic source
 of truth. There is no join reorder, selectivity estimate, or global optimizer
 cost model.
+
+IndexNestedLoopJoin is deliberately narrower than general join enumeration. It
+requires distinct, non-partitioned direct logical scans, an INNER join, the
+same deterministic compatible equality used by HashJoin, both table row-count
+snapshots, and statistics for an ordered point-capable access path on the
+logical right equality column. Since both candidates read logical left, its
+checked additional inner work is one existing point-lookup cost per estimated
+left row and is compared with a full right scan. It wins only when strictly
+cheaper than both existing alternatives; registration order breaks equal index
+candidate costs, while a tie with either join alternative preserves the older
+choice. Stale statistics may change only performance.
+
+The physical node keeps logical left as its sole child and explicitly records
+the right binding/table, required right columns, equality key, and opaque
+access-path ID. The executor validates all of that setup even for empty input,
+then visits left in batches of at most 256 rows. Each non-NULL outer key issues
+one `point_lookup_columns_with_view`; one lookup result is consumed and dropped
+before the next probe. NULL issues no lookup. Candidate rows retain storage
+index order, the complete eager predicate is checked before projection, and
+the result is therefore exact logical-left-major/right-minor order without
+materializing the full right relation. Heap and LSM use the unchanged shared
+point-lookup API; self joins and partitioned inputs remain on existing plans.
 
 NestedLoopJoin materializes both child results, iterates left rows outside and
 right rows inside, and evaluates the typed `ON` predicate through a non-owning

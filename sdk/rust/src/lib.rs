@@ -10,7 +10,8 @@ pub use netbadb_schema::{
     TypeSpec,
 };
 pub use netbadb_types::{
-    ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, TableId,
+    AccessPathId, ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue,
+    SemanticType, TableId,
 };
 
 /// Stable embedded catalog and physical-plan inspection values and renderers.

@@ -11,7 +11,8 @@ use netbadb_sdk::inspection::{
 use netbadb_sdk::{PhysicalType, ScalarValue, SemanticType};
 use serde::Serialize;
 
-pub(crate) const INSPECTION_JSON_VERSION: u32 = 3;
+const BASE_INSPECTION_JSON_VERSION: u32 = 3;
+pub(crate) const INSPECTION_JSON_VERSION: u32 = 5;
 const INSPECTION_JSON_FORMAT: &str = "netbadb-inspection";
 
 pub(crate) fn render_catalog(catalog: &CatalogInspection) -> Result<String, serde_json::Error> {
@@ -25,7 +26,7 @@ pub(crate) fn render_catalog(catalog: &CatalogInspection) -> Result<String, serd
         }) {
             4
         } else {
-            INSPECTION_JSON_VERSION
+            BASE_INSPECTION_JSON_VERSION
         },
         kind: "catalog",
         catalog: CatalogJson::from(catalog),
@@ -38,15 +39,47 @@ pub(crate) fn render_statement(
 ) -> Result<String, serde_json::Error> {
     let envelope = StatementEnvelope {
         format: INSPECTION_JSON_FORMAT,
-        version: if statement_has_partitions(statement) {
-            4
-        } else {
-            INSPECTION_JSON_VERSION
-        },
+        version: statement_json_version(statement),
         kind: "statement",
         statement: StatementJson::from(statement),
     };
     pretty(&envelope)
+}
+
+fn statement_json_version(statement: &StatementInspection) -> u32 {
+    fn plan_has_index_join(plan: &PlanNodeInspection) -> bool {
+        match plan {
+            PlanNodeInspection::IndexNestedLoopJoin { .. } => true,
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
+                plan_has_index_join(left) || plan_has_index_join(right)
+            }
+            PlanNodeInspection::Filter { input, .. }
+            | PlanNodeInspection::Sort { input, .. }
+            | PlanNodeInspection::Project { input, .. }
+            | PlanNodeInspection::ScalarProject { input, .. }
+            | PlanNodeInspection::Aggregate { input, .. }
+            | PlanNodeInspection::Limit { input, .. } => plan_has_index_join(input),
+            PlanNodeInspection::OneRow
+            | PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::IndexScan { .. }
+            | PlanNodeInspection::RangeIndexScan { .. }
+            | PlanNodeInspection::PartitionedScan { .. } => false,
+        }
+    }
+    let has_index_join = match &statement.plan {
+        StatementPlanInspection::Query { root } => plan_has_index_join(root),
+        StatementPlanInspection::Update { input, .. }
+        | StatementPlanInspection::Delete { input, .. } => plan_has_index_join(input),
+        StatementPlanInspection::Insert { .. } => false,
+    };
+    if has_index_join {
+        INSPECTION_JSON_VERSION
+    } else if statement_has_partitions(statement) {
+        4
+    } else {
+        BASE_INSPECTION_JSON_VERSION
+    }
 }
 
 fn statement_has_partitions(statement: &StatementInspection) -> bool {
@@ -57,6 +90,7 @@ fn statement_has_partitions(statement: &StatementInspection) -> bool {
             | PlanNodeInspection::HashJoin { left, right, .. } => {
                 plan_has_partitions(left) || plan_has_partitions(right)
             }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. } => plan_has_partitions(left),
             PlanNodeInspection::Filter { input, .. }
             | PlanNodeInspection::Sort { input, .. }
             | PlanNodeInspection::Project { input, .. }
@@ -488,6 +522,19 @@ enum PlanJson<'a> {
         left: Box<PlanJson<'a>>,
         right: Box<PlanJson<'a>>,
     },
+    IndexNestedLoopJoin {
+        kind: &'static str,
+        left_key: ColumnReferenceJson<'a>,
+        right_key: ColumnReferenceJson<'a>,
+        right_binding_id: u32,
+        right_table_id: u64,
+        right_table_name: &'a str,
+        right_access_path: u64,
+        right_columns: Vec<ColumnReferenceJson<'a>>,
+        columns: Vec<ColumnReferenceJson<'a>>,
+        predicate: ExpressionJson<'a>,
+        left: Box<PlanJson<'a>>,
+    },
     HashJoin {
         kind: &'static str,
         left_key: ColumnReferenceJson<'a>,
@@ -637,6 +684,34 @@ impl<'a> From<&'a PlanNodeInspection> for PlanJson<'a> {
                 predicate: ExpressionJson::from(predicate),
                 left: Box::new(PlanJson::from(left.as_ref())),
                 right: Box::new(PlanJson::from(right.as_ref())),
+            },
+            PlanNodeInspection::IndexNestedLoopJoin {
+                kind,
+                left_key,
+                right_key,
+                right_binding_id,
+                right_table_id,
+                right_table_name,
+                right_access_path,
+                right_columns,
+                columns,
+                predicate,
+                left,
+            } => Self::IndexNestedLoopJoin {
+                kind: join_kind(*kind),
+                left_key: ColumnReferenceJson::from(left_key),
+                right_key: ColumnReferenceJson::from(right_key),
+                right_binding_id: right_binding_id.0,
+                right_table_id: right_table_id.0,
+                right_table_name,
+                right_access_path: right_access_path.0,
+                right_columns: right_columns
+                    .iter()
+                    .map(ColumnReferenceJson::from)
+                    .collect(),
+                columns: columns.iter().map(ColumnReferenceJson::from).collect(),
+                predicate: ExpressionJson::from(predicate),
+                left: Box::new(PlanJson::from(left.as_ref())),
             },
             PlanNodeInspection::HashJoin {
                 kind,
@@ -956,8 +1031,8 @@ mod tests {
         TablePlacementInspection, TableStatisticsInspection,
     };
     use netbadb_sdk::{
-        ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue, SchemaFingerprint,
-        SemanticType, TableId,
+        AccessPathId, ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue,
+        SchemaFingerprint, SemanticType, TableId,
     };
 
     use super::{render_catalog, render_statement};
@@ -1214,6 +1289,55 @@ mod tests {
             render_statement(&join_statement(true)).unwrap(),
             include_str!("../tests/golden/statement-hash-join-v3.json")
         );
+    }
+
+    #[test]
+    fn index_nested_loop_join_advances_statement_json_to_v5() {
+        let left = bound_column(10, 1, "l", 2, "join_key", PhysicalType::Int64);
+        let right = bound_column(20, 2, "r", 2, "join_key", PhysicalType::Int64);
+        let predicate = expression(
+            ExpressionKindInspection::Binary {
+                operator: BinaryOpInspection::Eq,
+                left: Box::new(expression(
+                    ExpressionKindInspection::Column(left.clone()),
+                    PhysicalType::Int64,
+                )),
+                right: Box::new(expression(
+                    ExpressionKindInspection::Column(right.clone()),
+                    PhysicalType::Int64,
+                )),
+            },
+            PhysicalType::Bool,
+        );
+        let inspection = statement(
+            PlanNodeInspection::IndexNestedLoopJoin {
+                kind: netbadb_sdk::inspection::JoinKindInspection::Inner,
+                left_key: left.clone(),
+                right_key: right.clone(),
+                right_binding_id: RelationBindingId(20),
+                right_table_id: TableId(2),
+                right_table_name: "right_rows".into(),
+                right_access_path: AccessPathId(72),
+                right_columns: vec![right.clone()],
+                columns: vec![left.clone(), right],
+                predicate,
+                left: Box::new(PlanNodeInspection::SeqScan {
+                    binding_id: RelationBindingId(10),
+                    table_id: TableId(1),
+                    table_name: "left_rows".into(),
+                    columns: vec![left.clone()],
+                }),
+            },
+            vec![result(&left)],
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
+        assert_eq!(json["version"], 5);
+        let root = &json["statement"]["plan"]["root"];
+        assert_eq!(root["operator"], "index_nested_loop_join");
+        assert_eq!(root["right_table_id"], 2);
+        assert_eq!(root["right_access_path"], 72);
+        assert_eq!(root["left"]["operator"], "seq_scan");
     }
 
     #[test]

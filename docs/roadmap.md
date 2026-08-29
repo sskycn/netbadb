@@ -1809,3 +1809,34 @@ infrastructure. A storage-level range visitor remains a candidate only if a new
 real workload invalidates the Phase 66 selectivity boundary. If future evidence
 specifically isolates hidden wide keys, first compare a compact indirect
 key/index representation against disk spill.
+
+## Costed Index Nested-Loop Join (Phase 72, complete)
+
+- added pre-production real-SQL Heap attribution for matching 8×4,096 and
+  disjoint 64×4,096 analyzed joins, with exact HashJoin/SeqScan and ordered
+  result gates before the operator existed;
+- added explicit `PhysicalPlan::IndexNestedLoopJoin` only for INNER direct
+  Scan × Scan equality joins over distinct non-partitioned tables, with both
+  table statistics and an analyzed ordered point access path on logical right;
+- reuses the point lookup cardinality and storage-neutral startup/match cost,
+  checked in `u128`, and selects only when strictly cheaper than both the
+  existing NestedLoopJoin and HashJoin candidates. Ties and unsupported or
+  incomplete metadata preserve the existing plan;
+- streams logical left in at-most-256-row owned batches, skips probes for NULL,
+  consumes one unchanged Heap/LSM point result at a time, evaluates the complete
+  eager predicate, and preserves exact left-major/right-minor output;
+- adds executor-private structural statistics and coverage for duplicates,
+  residuals, projection, empty and NULL input, batch boundaries, Heap/LSM,
+  malformed plans, and exact ordering;
+- exposes a distinct inspection node with explicit logical keys, right table,
+  opaque access path, required columns, and only the real left child. Statement
+  Inspection JSON advances conditionally to v5; non-index plans remain v3 and
+  partition plans remain v4;
+- changes no storage API, persistent format, network protocol, deployment
+  manifest, compiler semantics, dependency, unsafe boundary, or automatic
+  analyze policy.
+
+The decision is **KEEP**. This is a deliberately narrow right-index alternative,
+not join reordering, composite probing, an index-only join, a partition-aware
+join, or a general optimizer framework. Stale statistics can choose a slower
+operator but cannot alter results.

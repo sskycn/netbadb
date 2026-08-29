@@ -8,7 +8,8 @@ use std::fmt::{self, Write};
 
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
-    ColumnId, ParameterId, PartitionId, RelationBindingId, ScalarValue, SemanticType, TableId,
+    AccessPathId, ColumnId, ParameterId, PartitionId, RelationBindingId, ScalarValue, SemanticType,
+    TableId,
 };
 
 /// One declaration-ordered snapshot of the visible canonical catalog.
@@ -239,6 +240,19 @@ pub enum PlanNodeInspection {
         predicate: ExpressionInspection,
         left: Box<PlanNodeInspection>,
         right: Box<PlanNodeInspection>,
+    },
+    IndexNestedLoopJoin {
+        kind: JoinKindInspection,
+        left_key: ColumnReferenceInspection,
+        right_key: ColumnReferenceInspection,
+        right_binding_id: RelationBindingId,
+        right_table_id: TableId,
+        right_table_name: String,
+        right_access_path: AccessPathId,
+        right_columns: Vec<ColumnReferenceInspection>,
+        columns: Vec<ColumnReferenceInspection>,
+        predicate: ExpressionInspection,
+        left: Box<PlanNodeInspection>,
     },
     HashJoin {
         kind: JoinKindInspection,
@@ -719,6 +733,38 @@ impl Renderer {
                 self.plan(depth + 2, left);
                 self.line(depth + 1, format_args!("right:"));
                 self.plan(depth + 2, right);
+            }
+            PlanNodeInspection::IndexNestedLoopJoin {
+                kind,
+                left_key,
+                right_key,
+                right_binding_id,
+                right_table_id,
+                right_table_name,
+                right_access_path,
+                right_columns,
+                columns,
+                predicate,
+                left,
+            } => {
+                self.line(
+                    depth,
+                    format_args!(
+                        "IndexNestedLoopJoin kind={} left_key={} right_key={} right_table={}#{} right_binding=#{} right_access_path=#{} right_columns={} columns={} predicate={}",
+                        join_kind(*kind),
+                        column_reference_text(left_key),
+                        column_reference_text(right_key),
+                        escape_text(right_table_name),
+                        right_table_id.0,
+                        right_binding_id.0,
+                        right_access_path.0,
+                        columns_text(right_columns),
+                        columns_text(columns),
+                        expression_text(predicate)
+                    ),
+                );
+                self.line(depth + 1, format_args!("left:"));
+                self.plan(depth + 2, left);
             }
             PlanNodeInspection::HashJoin {
                 kind,

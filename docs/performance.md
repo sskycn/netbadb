@@ -2108,6 +2108,88 @@ should select another independently measured large feature. If a future real
 workload isolates hidden wide keys, compare a compact indirect key/ordinal
 representation before assuming disk spill is the right boundary.
 
+## Phase 72 costed index nested-loop join
+
+Phase 72 first added real analyzed Heap SQL attribution while production still
+selected direct SeqScan × SeqScan HashJoin. The 8×4,096 unique match case had a
+604,542 ns quick median; the disjoint 64×4,096 case had a 1,018,209 ns median.
+Both scanned the complete right table, exposed exact logical key provenance,
+and returned exact ordered results. The saved run is
+`/tmp/netbadb-phase72-pre.txt`.
+
+The production planner now considers one deliberately narrow third candidate:
+INNER direct Scan × Scan, distinct non-partitioned tables, the first compatible
+necessary equality under AND, both table statistics, and an analyzed ordered
+point access path on logical right. It reuses the Filter planner's non-NULL
+average-match estimate and exact point startup/match cost. Since HashJoin and
+IndexNestedLoopJoin both read logical left, checked `u128` compares
+`left_rows × point_cost` with the full right row count; the index candidate
+must also be strictly cheaper than NestedLoopJoin. Ties retain the old choice.
+Missing or stale statistics, no right index, only a left index, high estimated
+duplicates, self joins, and partitioned inputs never trigger executor fallback.
+
+Execution validates the complete physical setup even for empty outer input,
+then reuses the direct SeqScan batch source with at most 256 owned outer rows.
+One non-NULL outer row produces one unchanged storage-neutral point lookup;
+that result is consumed and dropped before the next. The full eager predicate
+and final owned projection remain authoritative. Test-only structural evidence
+is:
+
+| shape | outer rows | batches | probes | point rows | max point rows | candidate pairs | output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| unique + residual 64×4,096 | 64 | 1 | 64 | 64 | 1 | 64 | 58 |
+| disjoint 64×4,096 | 64 | 1 | 64 | 0 | 0 | 0 | 0 |
+| duplicate 2×3 | 2 | 1 | 2 | 6 | 3 | 6 | 6 |
+| 64 outer with 8 NULL keys | 64 | 1 | 56 | 0 | 0 | 0 | 0 |
+
+The boundary matrix covers 0/1/255/256/257/512/513 outer rows and never exceeds
+256 rows per batch. The duplicate result is value-for-value and order-for-order
+equal to the existing HashJoin reference (`L0-R0,R1,R2` before
+`L1-R0,R1,R2`). Heap and LSM both use
+`point_lookup_columns_with_view`; LSM requires no executor branch. Malformed
+table, access path, key, type, or predicate metadata returns a typed error and
+never replays as HashJoin.
+
+The benchmark additionally gates unique outer sizes 1/8/64/256/512/1,024,
+disjoint, high-duplicate, residual, fixed-width Text, no-index, and
+left-index-only controls. The post run is saved at
+`/tmp/netbadb-phase72-post.txt`. Inspection text exposes the real left child and
+explicit right point access rather than a fake right SeqScan. Statement JSON
+advances conditionally to v5; ordinary v3 and partition v4 documents remain
+unchanged.
+
+The serial quick post run reported:
+
+| scenario | outer × inner | average matches estimate | pre/reference plan | post plan | pre/reference median | post median | change |
+| --- | ---: | ---: | --- | --- | ---: | ---: | ---: |
+| unique match | 8×4,096 | 1 | HashJoin | IndexNestedLoopJoin | 604,542 | 167,875 | -72.2% |
+| disjoint | 64×4,096 | 1 | HashJoin | IndexNestedLoopJoin | 1,018,209 | 384,667 | -62.2% |
+| unique match | 64×4,096 | 1 | same-run no-index HashJoin control | IndexNestedLoopJoin | 534,834 | 553,375 | +3.5% |
+| duplicate disjoint | 64×4,096 | 64 | HashJoin | HashJoin | — | 641,583 | retained |
+| residual no-output | 8×4,096 | 1 | HashJoin before operator | IndexNestedLoopJoin | — | 77,291 | selected |
+| fixed Text/8 match | 64×4,096 | 1 | HashJoin before operator | IndexNestedLoopJoin | — | 1,246,041 | selected |
+| large outer unique | 1,024×4,096 | 1 | HashJoin | HashJoin | — | 901,875 | retained |
+| no right index | 64×4,096 | 1 | HashJoin | HashJoin | — | 534,834 | retained |
+| left index only | 64×4,096 | 1 | HashJoin | HashJoin | — | 522,958 | retained |
+
+Only the first two rows are actual before/after samples from the same indexed
+fixtures; the 64-row no-index entry is labeled as a control rather than
+misrepresented as a pre sample. Unique indexed medians for outer sizes
+1/8/64/256/512 were 36,292/167,875/553,375/2,175,375/5,988,458 ns. At 1,024,
+the checked cost crossed to HashJoin and fell to 901,875 ns. This single quick
+run strongly confirms the small-outer structural target and also shows that
+the storage-neutral integer work units are not a latency model: 256 and 512
+point probes were slower than scanning and hashing right. No magic outer-size
+threshold is introduced from one noisy run; future work should calibrate
+engine-provided access cost hints or collect repeated crossover evidence.
+
+The decision is **KEEP** for the narrow algorithm and conservative eligibility.
+The two actual pre/post targets remove the full right input and improve, exact
+memory/order/error invariants hold, and high-duplicate/large/no-right-index
+controls retain HashJoin. KEEP is not a claim that every cost-selected point
+plan is faster; the mid-size sweep is recorded as an explicit cost-calibration
+limit rather than hidden.
+
 ## CI and compatibility
 
 `cargo check --workspace --all-targets` compiles the benchmark, including on
@@ -2137,6 +2219,7 @@ coverage. Phase 69 adds only executor-private Filter predicate validation and
 evaluation plus benchmark coverage. Phase 70 adds only executor-private
 HashJoin build-side selection and benchmark coverage. Phase 71 adds benchmark
 coverage and test-only Full Sort statistics while leaving release execution
-unchanged. All nine retain the current Heap metadata v4 and every public,
-inspection, protocol, SDK, and persistent contract. These phases add no
-dependency and no unsafe code.
+unchanged. Phase 72 adds the explicit physical/inspection operator and advances
+only affected statement Inspection JSON to v5. It retains Protocol v1, SDK
+Schema Spec v1, deployment manifest v4, Heap metadata v4, Page v5, WAL and row
+formats, the storage API, dependencies, and safe Rust boundaries.
