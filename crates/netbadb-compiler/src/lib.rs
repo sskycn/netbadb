@@ -6,8 +6,8 @@ use std::fmt;
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
     NullOrder as HirNullOrder, ParameterMetadata, SortDirection as HirSortDirection,
-    TypedAggregate, TypedAggregateInput, TypedExpr, TypedExprKind, TypedProjectionItem, TypedQuery,
-    TypedRelation, TypedStatement,
+    TypedAggregate, TypedAggregateInput, TypedCreateIndex, TypedExpr, TypedExprKind,
+    TypedProjectionItem, TypedQuery, TypedRelation, TypedStatement,
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
@@ -35,6 +35,11 @@ pub struct CompiledStatement {
 pub struct PreparedParameter {
     pub id: ParameterId,
     pub data_type: SemanticType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledDdlStatement {
+    CreateIndex(TypedCreateIndex),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +116,7 @@ impl CompileError {
                 | HirError::OrderByNotSupportedWithGrouping { .. } => {
                     CompileErrorKind::FeatureNotSupported
                 }
+                HirError::InvalidIndexDefinition { .. } => CompileErrorKind::FeatureNotSupported,
                 HirError::TooManyRelations { .. }
                 | HirError::TypeMismatch { .. }
                 | HirError::IncompatibleComparison { .. }
@@ -193,6 +199,29 @@ pub fn compile_statement_with_parameters(
         logical_statement,
         parameters: parameters.into_iter().map(prepared_parameter).collect(),
     })
+}
+
+pub fn compile_ddl_statement(
+    schema: &Schema,
+    source: &str,
+) -> Result<CompiledDdlStatement, CompileError> {
+    match parse_statement(source)? {
+        netbadb_parser::Statement::CreateIndex(statement) => {
+            netbadb_hir::lower_create_index(schema, &statement)
+                .map(CompiledDdlStatement::CreateIndex)
+                .map_err(CompileError::from)
+        }
+        statement => Err(CompileError::Hir(HirError::InvalidIndexDefinition {
+            message: "statement is not generic DDL",
+            span: match statement {
+                netbadb_parser::Statement::Select(value) => value.span,
+                netbadb_parser::Statement::Insert(value) => value.span,
+                netbadb_parser::Statement::Update(value) => value.span,
+                netbadb_parser::Statement::Delete(value) => value.span,
+                netbadb_parser::Statement::CreateIndex(value) => value.span,
+            },
+        })),
+    }
 }
 
 fn prepared_parameter(parameter: ParameterMetadata) -> PreparedParameter {

@@ -5,12 +5,14 @@ use std::path::Path;
 use std::rc::Rc;
 
 use netbadb_index::{
-    IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexError, IndexSpec, IndexStatistics,
-    TableStatistics, decode_index_catalog, encode_index_catalog, ensure_key_fits,
+    BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexError, IndexSpec,
+    IndexStatistics, TableStatistics, decode_index_catalog, encode_index_catalog, ensure_key_fits,
     validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
-use netbadb_types::{ColumnId, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId};
+use netbadb_types::{
+    ColumnId, IndexName, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId,
+};
 
 use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
 use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
@@ -509,6 +511,148 @@ impl HeapStorage {
     /// live rows, then registers it as the transaction's final logical step.
     /// Subsequent heap DML maintains every registered index automatically.
     pub fn create_index(&mut self, column_id: ColumnId) -> Result<IndexDefinition, StorageError> {
+        self.create_index_with_name(None, column_id)
+    }
+
+    /// Named counterpart used by generic SQL DDL. The name is committed in
+    /// the same transaction as the tree, backfill, and registry entry.
+    pub fn create_named_index(
+        &mut self,
+        name: IndexName,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        self.create_index_with_name(Some(name), column_id)
+    }
+
+    fn create_index_with_name(
+        &mut self,
+        name: Option<IndexName>,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        // Keep validation outside the implicit transaction so an invalid or
+        // duplicate request is a true no-op, including in the WAL.
+        self.validate_index_creation(name.as_ref(), column_id)?;
+        let mut transaction = self.begin_transaction()?;
+        let result = self.build_index_in(&mut transaction, name, column_id);
+        match result {
+            Ok(plan) => {
+                transaction.commit()?;
+                let definition = plan.definition.clone();
+                self.publish_committed_index_plan(plan);
+                Ok(definition)
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
+        }
+    }
+
+    pub(crate) fn create_named_index_in(
+        &mut self,
+        transaction: &mut Transaction,
+        name: IndexName,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        self.build_index_in(transaction, Some(name), column_id)
+            .map(|plan| plan.definition)
+    }
+
+    fn build_index_in(
+        &mut self,
+        transaction: &mut Transaction,
+        name: Option<IndexName>,
+        column_id: ColumnId,
+    ) -> Result<RegisteredIndexPlan, StorageError> {
+        let (column_position, spec) = self.validate_index_creation(name.as_ref(), column_id)?;
+
+        transaction.acquire_writer()?;
+        (|| {
+            let handle = self.btree().create_in(transaction, spec.clone())?;
+            // Writer ownership is already held. Capture the stable heap view
+            // before further BTree growth extends shared PageIds, then keep
+            // backfill memory bounded to one validated Heap page at a time.
+            let view = transaction.current_read_view()?;
+            self.backfill_index_in(transaction, handle, column_id, &view)?;
+            let definition = IndexDefinition {
+                name,
+                column_id,
+                handle,
+            };
+            // Registration is deliberately last: no committed catalog entry
+            // can ever describe a partially backfilled tree.
+            #[cfg(test)]
+            crate::crash_test::maybe_crash(
+                crate::crash_test::TestCrashPoint::IndexBuildBeforeCatalogLog,
+            );
+            self.append_index_definition(transaction, &definition)?;
+            Ok(RegisteredIndexPlan {
+                definition,
+                column_position,
+                spec: spec.clone(),
+            })
+        })()
+    }
+
+    fn backfill_index_in(
+        &mut self,
+        transaction: &mut Transaction,
+        handle: BTreeHandle,
+        column_id: ColumnId,
+        view: &ReadView,
+    ) -> Result<(), StorageError> {
+        let positions = resolve_projection(&self.table, &[column_id])?;
+        let page_limit = self.buffer.page_count();
+        for page_number in FIRST_MANAGED_PAGE.0..page_limit {
+            let page_id = PageId(page_number);
+            let mut entries = Vec::new();
+            {
+                let page = self.buffer.read_page(page_id)?;
+                let validated = page.page().validated()?;
+                let header = validated.header();
+                if header.page_type != PageType::Heap {
+                    page.page().single_payload(header.page_type)?;
+                    continue;
+                }
+                for slot_number in 0..header.slot_count {
+                    let slot = SlotId(slot_number);
+                    if let Some((slot_entry, tuple)) = validated.live_record(slot)? {
+                        let (tuple_header, payload) = decode_tuple(tuple)?;
+                        if !is_visible(&tuple_header, view)? {
+                            continue;
+                        }
+                        let mut values = decode_row_columns(payload, &self.table, &positions)?;
+                        let key = values.pop().ok_or(StorageError::InvalidRowLength {
+                            expected: 1,
+                            actual: 0,
+                        })?;
+                        entries.push((
+                            RowId {
+                                page: page_id,
+                                slot: slot.0,
+                                generation: slot_entry.generation,
+                            },
+                            key,
+                        ));
+                    }
+                }
+            }
+            for (row_id, key) in entries {
+                self.btree().insert_in(transaction, handle, key, row_id)?;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::IndexBuildDuringBackfill,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_index_creation(
+        &self,
+        name: Option<&IndexName>,
+        column_id: ColumnId,
+    ) -> Result<(usize, IndexSpec), StorageError> {
         let (column_position, spec) = self
             .table
             .columns
@@ -528,54 +672,40 @@ impl HeapStorage {
         if self.index_for_column(column_id).is_some() {
             return Err(IndexError::IndexAlreadyExists { column_id }.into());
         }
-
-        let mut transaction = self.begin_transaction()?;
-        transaction.acquire_writer()?;
-        let result =
-            (|| {
-                let handle = self.btree().create_in(&mut transaction, spec.clone())?;
-                // Writer ownership is already held. Materialize the stable heap
-                // snapshot before further BTree growth extends shared PageIds.
-                let rows = self.scan()?;
-                for (row_id, values) in rows {
-                    let key = values.get(column_position).cloned().ok_or(
-                        StorageError::InvalidRowLength {
-                            expected: self.table.columns.len(),
-                            actual: values.len(),
-                        },
-                    )?;
-                    self.btree()
-                        .insert_in(&mut transaction, handle, key, row_id)?;
-                }
-                let definition = IndexDefinition { column_id, handle };
-                // Registration is deliberately last: no committed catalog entry
-                // can ever describe a partially backfilled tree.
-                #[cfg(test)]
-                crate::crash_test::maybe_crash(
-                    crate::crash_test::TestCrashPoint::IndexBuildBeforeCatalogLog,
-                );
-                self.append_index_definition(&mut transaction, &definition)?;
-                Ok(RegisteredIndexPlan {
-                    definition,
-                    column_position,
-                    spec: spec.clone(),
-                })
-            })();
-
-        match result {
-            Ok(plan) => {
-                transaction.commit()?;
-                let definition = plan.definition.clone();
-                self.indexes.push(definition.clone());
-                self.index_plans.push(plan);
-                self.index_statistics.push(None);
-                Ok(definition)
+        if let Some(name) = name {
+            if self
+                .indexes
+                .iter()
+                .any(|definition| definition.name.as_ref() == Some(name))
+            {
+                return Err(IndexError::IndexNameAlreadyExists { name: name.clone() }.into());
             }
-            Err(error) => match transaction.rollback() {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(rollback),
-            },
         }
+        Ok((column_position, spec))
+    }
+
+    pub(crate) fn publish_committed_index(&mut self, definition: IndexDefinition) {
+        let column_position = self
+            .table
+            .columns
+            .iter()
+            .position(|column| column.id == definition.column_id)
+            .expect("committed index column was validated before durable commit");
+        let column = &self.table.columns[column_position];
+        self.publish_committed_index_plan(RegisteredIndexPlan {
+            definition,
+            column_position,
+            spec: IndexSpec {
+                data_type: column.semantic_type(),
+                nullable: column.nullable,
+            },
+        });
+    }
+
+    fn publish_committed_index_plan(&mut self, plan: RegisteredIndexPlan) {
+        self.indexes.push(plan.definition.clone());
+        self.index_plans.push(plan);
+        self.index_statistics.push(None);
     }
 
     /// Replaces optimizer statistics with one explicit, transactionally
@@ -804,6 +934,16 @@ impl HeapStorage {
                         column_id: definition.column_id,
                     }
                     .into());
+                }
+                if let Some(name) = &definition.name {
+                    if entries
+                        .iter()
+                        .any(|existing| existing.definition.name.as_ref() == Some(name))
+                    {
+                        return Err(
+                            IndexError::IndexNameAlreadyExists { name: name.clone() }.into()
+                        );
+                    }
                 }
                 let column = self.table.column_by_id(definition.column_id).ok_or(
                     IndexError::UnknownIndexColumn {
@@ -2554,8 +2694,8 @@ mod tests {
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{
-        ColumnId, DatabaseTxnId, Lsn, PageId, PhysicalType, ScalarRef, ScalarValue, SemanticType,
-        StorageId, TableId,
+        ColumnId, DatabaseTxnId, IndexName, Lsn, PageId, PhysicalType, ScalarRef, ScalarValue,
+        SemanticType, StorageId, TableId,
     };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
@@ -7590,14 +7730,14 @@ mod tests {
                 let mut storage =
                     HeapStorage::open(path, indexed_table()).expect("open index heap");
                 storage
-                    .create_index(ColumnId(2))
+                    .create_named_index(IndexName::new("members_team_idx").unwrap(), ColumnId(2))
                     .expect("build index until crash point");
             }
             "index-build-winner" => {
                 let mut storage =
                     HeapStorage::open(path, indexed_table()).expect("open index heap");
                 storage
-                    .create_index(ColumnId(2))
+                    .create_named_index(IndexName::new("members_team_idx").unwrap(), ColumnId(2))
                     .expect("commit index build");
                 crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
@@ -7839,6 +7979,7 @@ mod tests {
     #[test]
     fn process_crash_index_build_loser_never_exposes_registration() {
         for (case, point) in [
+            ("during-backfill", TestCrashPoint::IndexBuildDuringBackfill),
             ("before-catalog", TestCrashPoint::IndexBuildBeforeCatalogLog),
             (
                 "after-catalog-log",
@@ -7869,6 +8010,10 @@ mod tests {
             .index_for_column(ColumnId(2))
             .cloned()
             .expect("discover committed index");
+        assert_eq!(
+            definition.name.as_ref().map(|name| name.as_str()),
+            Some("members_team_idx")
+        );
         assert_eq!(
             reopened
                 .btree()

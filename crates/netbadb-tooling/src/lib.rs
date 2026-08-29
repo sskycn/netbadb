@@ -52,6 +52,7 @@ pub enum DiagnosticCode {
     OrderByNotSupportedWithGrouping,
     InvalidAggregateArgument,
     InvalidAggregateType,
+    InvalidIndexDefinition,
 }
 
 impl DiagnosticCode {
@@ -81,6 +82,7 @@ impl DiagnosticCode {
             Self::OrderByNotSupportedWithGrouping => "order_by_not_supported_with_grouping",
             Self::InvalidAggregateArgument => "invalid_aggregate_argument",
             Self::InvalidAggregateType => "invalid_aggregate_type",
+            Self::InvalidIndexDefinition => "invalid_index_definition",
         }
     }
 }
@@ -132,6 +134,7 @@ const fn text_span(span: Span) -> TextSpan {
 
 const fn hir_code(error: &HirError) -> DiagnosticCode {
     match error {
+        HirError::InvalidIndexDefinition { .. } => DiagnosticCode::InvalidIndexDefinition,
         HirError::UnknownTable { .. } => DiagnosticCode::UnknownTable,
         HirError::UnknownColumn { .. } => DiagnosticCode::UnknownColumn,
         HirError::UnknownRelationQualifier { .. } => DiagnosticCode::UnknownRelationQualifier,

@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub const MAX_INDEX_NAME_BYTES: usize = 255;
+
 macro_rules! id_type {
     ($name:ident, $inner:ty) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -40,6 +42,57 @@ pub struct RelationBindingId(pub u32);
 pub struct ParameterId(pub u32);
 id_type!(ColumnId, u32);
 id_type!(IndexId, u64);
+
+/// Stable logical name of a registered secondary index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IndexName(String);
+
+impl IndexName {
+    pub fn new(name: impl Into<String>) -> Result<Self, IndexNameError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(IndexNameError::Empty);
+        }
+        if name.len() > MAX_INDEX_NAME_BYTES {
+            return Err(IndexNameError::TooLong {
+                length: name.len(),
+                maximum: MAX_INDEX_NAME_BYTES,
+            });
+        }
+        Ok(Self(name))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for IndexName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexNameError {
+    Empty,
+    TooLong { length: usize, maximum: usize },
+}
+
+impl fmt::Display for IndexNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("index name must not be empty"),
+            Self::TooLong { length, maximum } => write!(
+                formatter,
+                "index name is {length} bytes; maximum is {maximum} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IndexNameError {}
 /// Table-scoped opaque identity for one executable physical access path.
 ///
 /// The planner may compare and copy this value but must not infer a B+Tree

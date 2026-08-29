@@ -82,6 +82,16 @@ pub enum Statement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    CreateIndex(CreateIndexStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndexStatement {
+    pub name: Ident,
+    pub table: ColumnName,
+    pub column: Ident,
+    pub if_not_exists: bool,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +261,10 @@ enum TokenKind {
     Update,
     Set,
     Delete,
+    Create,
+    Index,
+    If,
+    Exists,
     As,
     Join,
     Inner,
@@ -468,6 +482,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "UPDATE" => TokenKind::Update,
                     "SET" => TokenKind::Set,
                     "DELETE" => TokenKind::Delete,
+                    "CREATE" => TokenKind::Create,
+                    "INDEX" => TokenKind::Index,
+                    "IF" => TokenKind::If,
+                    "EXISTS" => TokenKind::Exists,
                     "AS" => TokenKind::As,
                     "JOIN" => TokenKind::Join,
                     "INNER" => TokenKind::Inner,
@@ -522,13 +540,66 @@ impl Parser {
             TokenKind::Insert => Statement::Insert(self.parse_insert()?),
             TokenKind::Update => Statement::Update(self.parse_update()?),
             TokenKind::Delete => Statement::Delete(self.parse_delete()?),
-            _ => return Err(self.error_here("expected SELECT, INSERT, UPDATE, or DELETE")),
+            TokenKind::Create => Statement::CreateIndex(self.parse_create_index()?),
+            _ => {
+                return Err(
+                    self.error_here("expected SELECT, INSERT, UPDATE, DELETE, or CREATE INDEX")
+                );
+            }
         };
         if self.matches(&TokenKind::Semicolon) {
             self.position += 1;
         }
         self.expect_simple(TokenKind::Eof)?;
         Ok(statement)
+    }
+
+    fn parse_create_index(&mut self) -> Result<CreateIndexStatement, ParseError> {
+        let start = self.expect_simple(TokenKind::Create)?.span.start;
+        self.expect_simple(TokenKind::Index)?;
+        let if_not_exists = if self.matches(&TokenKind::If) {
+            self.position += 1;
+            self.expect_simple(TokenKind::Not)?;
+            self.expect_simple(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect_simple(TokenKind::On)?;
+        let first = self.expect_ident()?;
+        let table = if self.matches(&TokenKind::Dot) {
+            self.position += 1;
+            let relation = self.expect_ident()?;
+            let span = Span {
+                start: first.span.start,
+                end: relation.span.end,
+            };
+            ColumnName {
+                qualifier: Some(first),
+                name: relation,
+                span,
+            }
+        } else {
+            ColumnName {
+                span: first.span,
+                qualifier: None,
+                name: first,
+            }
+        };
+        self.expect_simple(TokenKind::LParen)?;
+        let column = self.expect_ident()?;
+        self.expect_simple(TokenKind::RParen)?;
+        Ok(CreateIndexStatement {
+            name,
+            table,
+            column,
+            if_not_exists,
+            span: Span {
+                start,
+                end: self.current().span.start,
+            },
+        })
     }
 
     fn parse_query(&mut self) -> Result<Query, ParseError> {
@@ -1170,6 +1241,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::Insert(statement) => statement.span,
         Statement::Update(statement) => statement.span,
         Statement::Delete(statement) => statement.span,
+        Statement::CreateIndex(statement) => statement.span,
     }
 }
 
@@ -1623,5 +1695,29 @@ mod tests {
                 ..
             } if column.name.name == "id" && alias.name == "users_id"
         ));
+    }
+
+    #[test]
+    fn parses_only_the_bounded_create_index_shape() {
+        let statement =
+            parse_statement("CREATE INDEX IF NOT EXISTS users_name_idx ON public.users (name);")
+                .expect("CREATE INDEX parses");
+        let Statement::CreateIndex(create) = statement else {
+            panic!("expected CREATE INDEX");
+        };
+        assert_eq!(create.name.name, "users_name_idx");
+        assert_eq!(create.table.qualifier.unwrap().name, "public");
+        assert_eq!(create.table.name.name, "users");
+        assert_eq!(create.column.name, "name");
+        assert!(create.if_not_exists);
+
+        for unsupported in [
+            "CREATE INDEX idx ON users (a, b)",
+            "CREATE INDEX idx ON users (name) WHERE active = true",
+            "CREATE INDEX idx ON users (name) INCLUDE (id)",
+            "CREATE INDEX idx ON users (lower(name))",
+        ] {
+            assert!(parse_statement(unsupported).is_err(), "{unsupported}");
+        }
     }
 }

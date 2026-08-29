@@ -158,6 +158,18 @@ def main() -> int:
         )
         if "teams_pkey" in user_indexes:
             raise AssertionError(f"index pattern leaked teams_pkey:\n{user_indexes}")
+
+        rolled_back = describe(
+            "BEGIN; CREATE INDEX users_id_rolled_back_idx ON users (id); ROLLBACK;"
+        )
+        require(rolled_back, "BEGIN", "CREATE INDEX", "ROLLBACK")
+        absent = describe(r"\di *rolled_back*", expected_returncodes=(0, 1))
+        if "users_id_rolled_back_idx" in absent:
+            raise AssertionError(f"rolled-back index remained visible:\n{absent}")
+
+        require(describe("CREATE INDEX users_id_round6_idx ON users (id);"), "CREATE INDEX")
+        require(describe(r"\di *round6*"), "users_id_round6_idx", "users")
+        require(describe(r"\d users"), "users_id_round6_idx")
     finally:
         if fixture.stdin is not None:
             fixture.stdin.close()

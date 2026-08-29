@@ -1,6 +1,6 @@
 # PostgreSQL client compatibility matrix
 
-This matrix records Round 5 observations against a real loopback TCP listener.
+This matrix records Round 6 observations against a real loopback TCP listener.
 It is evidence for the experimental existing-schema profile, not a claim of
 drop-in PostgreSQL compatibility.
 
@@ -39,11 +39,13 @@ production or build dependencies.
 | Reflected parameterized SELECT | yes | returns real stored rows |
 | SQLAlchemy ORM mapped SELECT | yes | reflected imperative mapping |
 | SQLAlchemy ORM CRUD | yes | explicit primary keys; no schema creation |
-| Alembic inspect / autogenerate | yes, read-only | matching metadata has no diff; absent indexes propose two `remove_index` operations |
+| SQLAlchemy `Index.create()` | yes | named non-unique single-column Heap BTree through Extended Query |
+| Alembic inspect / autogenerate | yes | guarded add-index proposal is applied and subsequent comparison is empty |
 | psql `\d` | yes | columns, types, nullability, PK and real secondary indexes; qualified/missing/wildcard variants |
 | psql `\dt` | yes | authorized `public` tables and name/schema patterns |
 | psql `\di` | yes | compatibility PK and real secondary indexes, plus name patterns |
-| DDL / migration apply | unsupported | not invoked; existing-schema profile only |
+| psql `CREATE INDEX` | yes | transactional commit/rollback; `\d` and `\di` refresh immediately |
+| `DROP INDEX` / table DDL | unsupported | explicit `0A000`; no fake registry removal |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
 dialect, `implicit_returning=False`, `use_insertmanyvalues=False`, `create_all`,
@@ -75,10 +77,10 @@ selection.
 The real registry supports non-unique single-column Heap B+Trees. The
 compatibility layer does not report the primary key as an extra secondary
 index, does not report LSM clustering as an index, and rejects partition-local
-physical indexes when asked for logical-table reflection. It synthesizes
-bounded deterministic names because the native registry has no user-defined
-index name. The names and domain-separated synthetic object OIDs are stable for
-the same Canonical Schema/index registry across reopen and connections.
+physical indexes when asked for logical-table reflection. Legacy unnamed
+entries receive bounded deterministic names. Explicit CREATE INDEX names are
+persisted in IndexCatalog v3 and remain stable across reopen and connections;
+domain-separated synthetic object OIDs remain server-only and deterministic.
 
 psql Simple Query catalog SQL is recognized structurally and lowered to the
 same read-only metadata evaluator as Extended Query reflection. The catalog-only

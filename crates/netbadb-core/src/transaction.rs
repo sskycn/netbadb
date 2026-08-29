@@ -5,9 +5,10 @@ use std::fmt;
 use std::rc::Rc;
 
 use netbadb_storage::{
-    IsolationLevel, StorageError, StorageReadView, StorageTransaction,
+    IndexDefinition, IsolationLevel, StorageError, StorageReadView, StorageTransaction,
     TransactionState as StorageTransactionState,
 };
+use netbadb_types::{ColumnId, IndexName};
 use netbadb_types::{DatabaseTxnId, StorageId};
 
 use crate::coordinator_log::{CoordinatorLog, CoordinatorLogError, CoordinatorParticipant};
@@ -95,6 +96,7 @@ pub struct DatabaseTransaction {
     participants: BTreeMap<StorageId, StorageParticipant>,
     write_participants: BTreeSet<StorageId>,
     coordinator: Option<SharedCoordinatorLog>,
+    pending_indexes: Vec<(StorageId, IndexDefinition)>,
 }
 
 impl DatabaseTransaction {
@@ -112,6 +114,7 @@ impl DatabaseTransaction {
             participants: BTreeMap::new(),
             write_participants: BTreeSet::new(),
             coordinator,
+            pending_indexes: Vec::new(),
         }
     }
 
@@ -230,6 +233,13 @@ impl DatabaseTransaction {
     }
 
     pub fn commit(&mut self) -> Result<(), CoordinatorError> {
+        if !self.pending_indexes.is_empty() {
+            return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit);
+        }
+        self.commit_with_schema_mutations()
+    }
+
+    pub(crate) fn commit_with_schema_mutations(&mut self) -> Result<(), CoordinatorError> {
         if self.write_participants.len() > 1 {
             return self.commit_multi_write();
         }
@@ -265,6 +275,40 @@ impl DatabaseTransaction {
         }
         self.state = TransactionState::Committed;
         Ok(())
+    }
+
+    pub(crate) fn stage_index(&mut self, storage_id: StorageId, definition: IndexDefinition) {
+        self.pending_indexes.push((storage_id, definition));
+    }
+
+    pub(crate) fn pending_index_by_name(
+        &self,
+        name: &IndexName,
+    ) -> Option<(StorageId, &IndexDefinition)> {
+        self.pending_indexes
+            .iter()
+            .find(|(_, definition)| definition.name.as_ref() == Some(name))
+            .map(|(storage_id, definition)| (*storage_id, definition))
+    }
+
+    pub(crate) fn has_pending_index_column(
+        &self,
+        storage_id: StorageId,
+        column_id: ColumnId,
+    ) -> bool {
+        self.pending_indexes
+            .iter()
+            .any(|(pending_storage, definition)| {
+                *pending_storage == storage_id && definition.column_id == column_id
+            })
+    }
+
+    pub(crate) fn take_pending_indexes(&mut self) -> Vec<(StorageId, IndexDefinition)> {
+        std::mem::take(&mut self.pending_indexes)
+    }
+
+    pub(crate) fn has_pending_schema_mutations(&self) -> bool {
+        !self.pending_indexes.is_empty()
     }
 
     fn commit_multi_write(&mut self) -> Result<(), CoordinatorError> {
@@ -611,6 +655,7 @@ pub enum CoordinatorError {
         state: TransactionState,
     },
     TransactionIdExhausted,
+    SchemaMutationRequiresDatabaseCommit,
 }
 
 impl fmt::Display for CoordinatorError {
@@ -673,6 +718,9 @@ impl fmt::Display for CoordinatorError {
             Self::TransactionIdExhausted => {
                 formatter.write_str("database transaction identity space is exhausted")
             }
+            Self::SchemaMutationRequiresDatabaseCommit => formatter.write_str(
+                "transaction contains schema mutations and must be committed through Database",
+            ),
         }
     }
 }
@@ -692,7 +740,8 @@ impl Error for CoordinatorError {
             | Self::CommitAlreadyDecided { .. }
             | Self::ParticipantStateViolation { .. }
             | Self::NotActive { .. }
-            | Self::TransactionIdExhausted => None,
+            | Self::TransactionIdExhausted
+            | Self::SchemaMutationRequiresDatabaseCommit => None,
         }
     }
 }

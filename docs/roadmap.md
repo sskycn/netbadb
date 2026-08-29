@@ -480,6 +480,22 @@ This remains an existing-schema inspection profile. `\d+`, unrelated slash
 commands, a general PostgreSQL regex engine/parser/catalog, migration DDL, and
 PostgreSQL-only metadata absent from NetbaDB remain unsupported.
 
+### PostgreSQL Compatibility Round 6 — index DDL lifecycle foundation (complete)
+
+- added generic parsed and typed `CREATE INDEX` resolution into durable
+  `IndexName`/`TableId`/`ColumnId` metadata without PostgreSQL types below the
+  frontend;
+- evolved IndexCatalog v2 to backward-readable v3 for optional bounded logical
+  names, retaining synthetic reflection names for legacy entries;
+- reused the transactional BTree create/backfill/catalog WAL path for implicit
+  and explicit transactions, publishing planner/inspection state only after
+  commit and proving rollback/crash/reopen behavior;
+- verified psql, SQLAlchemy `Index.create()`, guarded Alembic add-index apply,
+  immediate cross-connection reflection, planner discovery, and later DML
+  maintenance;
+- retained `DROP INDEX` as `0A000` because registry removal and safe physical
+  reclamation do not yet exist.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

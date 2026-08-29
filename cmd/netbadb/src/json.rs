@@ -1042,6 +1042,7 @@ mod tests {
                     primary_key: true,
                 }],
                 indexes: vec![IndexInspection {
+                    name: None,
                     table_id: TableId(1),
                     column_id: ColumnId(1),
                     column_name: "id".into(),

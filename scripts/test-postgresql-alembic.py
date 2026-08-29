@@ -9,6 +9,7 @@ import alembic
 import sqlalchemy
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import BigInteger, Boolean, Column, Index, MetaData, Table, Text, inspect
 
 
@@ -77,12 +78,34 @@ def main() -> None:
         isinstance(difference, tuple) and difference[0] == "add_index"
         for difference in without_indexes
     )
+
+    target = existing_schema(names, with_indexes=True)
+    Index("users_id_alembic_idx", target.tables["users"].c.id, unique=False)
+    add_index = compare(engine, target)
+    assert len(add_index) == 1, add_index
+    difference = add_index[0]
+    assert isinstance(difference, tuple) and difference[0] == "add_index", add_index
+    proposed = difference[1]
+    assert proposed.name == "users_id_alembic_idx"
+    assert proposed.table.name == "users"
+    assert [column.name for column in proposed.columns] == ["id"]
+    assert not proposed.unique
+
+    with engine.begin() as connection:
+        context = MigrationContext.configure(connection)
+        Operations(context).create_index(
+            "users_id_alembic_idx",
+            "users",
+            ["id"],
+            unique=False,
+        )
+    assert compare(engine, target) == []
     engine.dispose()
     print(
-        "Alembic read-only comparison passed: "
+        "Alembic guarded index-only mutation passed: "
         f"Python, psycopg, SQLAlchemy {sqlalchemy.__version__}, "
         f"Alembic {alembic.__version__}; baseline differences=0, "
-        f"remove_index differences={len(remove_indexes)}"
+        f"remove_index differences={len(remove_indexes)}, add_index applied=1"
     )
 
 

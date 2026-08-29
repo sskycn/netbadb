@@ -4,8 +4,8 @@ use std::path::Path;
 use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, TableStatistics};
 use netbadb_schema::TableDef;
 use netbadb_types::{
-    AccessPathId, ColumnId, DatabaseTxnId, Lsn, RowId, ScalarRef, ScalarValue, StorageId, TableId,
-    TxnId,
+    AccessPathId, ColumnId, DatabaseTxnId, IndexName, Lsn, RowId, ScalarRef, ScalarValue,
+    StorageId, TableId, TxnId,
 };
 
 use crate::{
@@ -1076,6 +1076,49 @@ impl TableStorage {
                 operation: "create B+Tree access method",
                 storage_kind: "LSM",
             }),
+        }
+    }
+
+    pub fn create_named_index(
+        &mut self,
+        name: IndexName,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.create_named_index(name, column_id),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "create B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    pub fn create_named_index_in(
+        &mut self,
+        transaction: &mut StorageTransaction,
+        name: IndexName,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                storage.create_named_index_in(
+                    transaction.heap_transaction_mut(table_id)?,
+                    name,
+                    column_id,
+                )
+            }
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "create B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn publish_committed_index(&mut self, definition: IndexDefinition) {
+        if let Self::Heap(storage) = self {
+            storage.publish_committed_index(definition);
         }
     }
 
