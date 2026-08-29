@@ -215,6 +215,7 @@ pub struct PostgresOid(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresType {
     Bool,
+    BoolArray,
     Int2,
     Int4,
     Int8,
@@ -229,6 +230,7 @@ impl PostgresType {
     pub const fn oid(self) -> PostgresOid {
         PostgresOid(match self {
             Self::Bool => 16,
+            Self::BoolArray => 1_000,
             Self::Int8 => 20,
             Self::Int2 => 21,
             Self::Int4 => 23,
@@ -246,7 +248,7 @@ impl PostgresType {
             Self::Int2 => 2,
             Self::Int4 => 4,
             Self::Int8 => 8,
-            Self::Text | Self::Varchar | Self::Unknown | Self::TextArray => -1,
+            Self::Text | Self::Varchar | Self::Unknown | Self::BoolArray | Self::TextArray => -1,
         }
     }
 
@@ -254,6 +256,7 @@ impl PostgresType {
     pub const fn from_oid(oid: PostgresOid) -> Option<Self> {
         match oid.0 {
             16 => Some(Self::Bool),
+            1_000 => Some(Self::BoolArray),
             20 => Some(Self::Int8),
             21 => Some(Self::Int2),
             23 => Some(Self::Int4),
@@ -271,7 +274,7 @@ impl PostgresType {
             Self::Bool => Some(PhysicalType::Bool),
             Self::Int2 | Self::Int4 | Self::Int8 => Some(PhysicalType::Int64),
             Self::Text | Self::Varchar | Self::Unknown => Some(PhysicalType::Text),
-            Self::TextArray => None,
+            Self::BoolArray | Self::TextArray => None,
         }
     }
 
@@ -347,7 +350,10 @@ pub fn encode_text_value(
         (ScalarValue::Int64(value), PostgresType::Int8) => Ok(Some(value.to_string().into_bytes())),
         (
             ScalarValue::Text(value),
-            PostgresType::Text | PostgresType::Varchar | PostgresType::TextArray,
+            PostgresType::Text
+            | PostgresType::Varchar
+            | PostgresType::BoolArray
+            | PostgresType::TextArray,
         ) => Ok(Some(value.as_bytes().to_vec())),
         _ => Err(TypeMappingError::TypeMismatch),
     }
@@ -369,6 +375,7 @@ pub fn encode_binary_value(
             PostgresType::Int2
             | PostgresType::Int4
             | PostgresType::Unknown
+            | PostgresType::BoolArray
             | PostgresType::TextArray,
         ) => Err(TypeMappingError::BinaryFormatUnsupported(data_type)),
         _ => Err(TypeMappingError::TypeMismatch),
@@ -406,7 +413,9 @@ pub fn decode_text_parameter(
         PostgresType::Text | PostgresType::Varchar | PostgresType::Unknown => {
             Ok(ScalarValue::Text(value.to_owned()))
         }
-        PostgresType::TextArray => Err(TypeMappingError::InvalidTextValue(data_type)),
+        PostgresType::BoolArray | PostgresType::TextArray => {
+            Err(TypeMappingError::InvalidTextValue(data_type))
+        }
     }
 }
 
@@ -450,7 +459,7 @@ pub fn decode_binary_parameter(
         PostgresType::Text | PostgresType::Varchar => std::str::from_utf8(bytes)
             .map(|value| ScalarValue::Text(value.to_owned()))
             .map_err(|_| TypeMappingError::InvalidBinaryValue(data_type)),
-        PostgresType::Unknown | PostgresType::TextArray => {
+        PostgresType::Unknown | PostgresType::BoolArray | PostgresType::TextArray => {
             Err(TypeMappingError::BinaryFormatUnsupported(data_type))
         }
         _ => Err(TypeMappingError::InvalidBinaryValue(data_type)),
@@ -1099,6 +1108,25 @@ mod tests {
         assert!(matches!(
             decode_text_parameter(Some(b"{id}"), PostgresType::TextArray.oid()),
             Err(TypeMappingError::InvalidTextValue(PostgresType::TextArray))
+        ));
+        assert_eq!(
+            PostgresType::from_oid(PostgresOid(1_000)),
+            Some(PostgresType::BoolArray)
+        );
+        assert_eq!(PostgresType::BoolArray.netbadb_physical(), None);
+        assert_eq!(
+            encode_text_value(&ScalarValue::Text("{t,f}".into()), PostgresType::BoolArray).unwrap(),
+            Some(b"{t,f}".to_vec())
+        );
+        assert!(matches!(
+            decode_text_parameter(Some(b"{t,f}"), PostgresType::BoolArray.oid()),
+            Err(TypeMappingError::InvalidTextValue(PostgresType::BoolArray))
+        ));
+        assert!(matches!(
+            encode_binary_value(&ScalarValue::Text("{t,f}".into()), PostgresType::BoolArray),
+            Err(TypeMappingError::BinaryFormatUnsupported(
+                PostgresType::BoolArray
+            ))
         ));
         assert_eq!(
             decode_text_parameter(Some(b"32767"), PostgresOid(21)).unwrap(),

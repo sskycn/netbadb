@@ -1,9 +1,10 @@
 # Experimental PostgreSQL wire compatibility
 
-Round 3 adds existing-schema ORM reflection on top of the typed prepared and
-binary foundation. The feature remains experimental: it is a real path through
-NetbaDB's compiler, Canonical Schema, and storage engine, not a claim of
-complete PostgreSQL dialect or catalog compatibility.
+Round 4 adds real secondary-index reflection and an Alembic read-only
+autogenerate probe on top of the existing-schema ORM profile. The feature
+remains experimental: it is a real path through NetbaDB's compiler, Canonical
+Schema, index registry, and storage engine, not a claim of complete PostgreSQL
+dialect, catalog, or migration compatibility.
 
 NetbaDB has an experimental PostgreSQL v3 frontend foundation. It is intended
 to let PostgreSQL clients enter the existing typed compiler and database core;
@@ -58,7 +59,7 @@ Rust debug string or reading rows.
 Real SQLAlchemy PostgreSQL introspection contains catalog-only syntax such as
 schema-qualified relations, arrays, `ANY`, `regclass`, and PostgreSQL catalog
 functions. Expanding the native SQL grammar into a partial PostgreSQL system
-query engine would couple unrelated layers and still be brittle. Round 3 uses
+query engine would couple unrelated layers and still be brittle. Rounds 3 and 4 use
 a closed, typed compatibility operation boundary:
 
 ```text
@@ -66,7 +67,8 @@ SQLAlchemy / psycopg Extended Query
     -> structural catalog-query classification
     -> CompatibilityStatement + typed Bind values
     -> per-session read-only compatibility snapshot
-    <- Database::schema() / Canonical Schema
+    <- Database::inspect_catalog()
+    <- Canonical Schema + persistent Heap index registry
     -> authorized virtual rows
     -> ordinary pgwire RowDescription / DataRow encoding
 ```
@@ -75,17 +77,29 @@ Classification uses relation, selected capability, function, and predicate
 markers after whitespace/case normalization. It does not compare a complete SQL
 string, depend on whitespace, or return hard-coded table rows. Ordinary user
 SQL never enters this evaluator. The snapshot is derived once per session from
-immutable Canonical Schema and contains only stable table identity, names,
-ordered columns, physical types, nullability, and primary-key flags. Catalog
-execution accepts no mutable database or storage handle, so reflection cannot
-write a heap, WAL, index registry, statistics, or checkpoint.
+the Core inspection DTO and contains stable table/column identity, physical
+types, nullability, primary keys, and real registered index definitions. The
+index DTO exposes `(TableId, ColumnId)` logical identity, single-column order,
+`BTree` kind, and `unique=false`; it excludes BTreeHandle, PageId, storage kind,
+statistics policy, and mutable state. Catalog execution accepts no mutable
+database or storage handle, so reflection cannot write a heap, WAL, index
+registry, statistics, or checkpoint.
 
 The current virtual surface is exactly the subset observed from SQLAlchemy
 2.0.52: namespaces; user-table names and visibility; column definitions;
 domain/enum probes (empty because NetbaDB exposes neither); table OID lookup;
-primary keys; and conservative empty foreign-key, non-primary-index, table
-comment, and check-constraint results. Those empty results describe missing
-NetbaDB capabilities; they do not invent PostgreSQL semantics.
+primary keys; real non-primary Heap B+Tree indexes; and conservative empty
+foreign-key, table-comment, and check-constraint results. LSM clustering is not
+reported as a secondary index. Partition-local indexes are rejected for
+logical reflection because the current registry cannot prove that every
+partition implements one logical index.
+
+The index operation implements only the captured SQLAlchemy result shape over
+`pg_index`, index/table `pg_class` objects, table `pg_attribute`, `pg_am`, and
+default operator-class flags. Current indexes are ordinary column B+Trees, so
+the result needs neither expressions, predicates, INCLUDE columns, reloptions,
+nor `pg_get_indexdef` evaluation. Catalog text/bool arrays are output-only
+pgwire types and have no NetbaDB physical-type mapping.
 
 Captured reflection uses typed Extended Query parameters. A matching catalog
 statement sent through Simple Query returns explicit `0A000` rather than being
@@ -98,13 +112,15 @@ lookups, and the namespace projection all agree. Metadata visibility reuses the
 existing principal's table grants. `UINT64` column reflection fails with
 SQLSTATE `0A000` because no lossless PostgreSQL base integer mapping exists.
 
-Synthetic table OIDs use the high range beginning at `0x80000000`, separate
-from centralized PostgreSQL built-in type OIDs. A domain-separated SHA-256
-digest covers stable TableId and canonical table/column metadata; candidates
-are assigned in digest order and collision-checked with deterministic linear
-probing. The same Canonical Schema therefore produces the same OIDs across
-queries, connections, and restarts. OIDs are not persisted and are not stable
-across schema changes. They remain private to the PostgreSQL adapter.
+Synthetic table and index OIDs use the high range beginning at `0x80000000`,
+separate from centralized PostgreSQL built-in type OIDs. Domain-separated
+SHA-256 digests cover canonical table identity and logical index identity;
+candidates share one collision set and use deterministic linear probing.
+Compatibility index names use a sanitized readable table/column prefix plus a
+12-hex digest suffix, remain at most 63 ASCII bytes, and are collision checked.
+The same Canonical Schema/index registry therefore produces the same names and
+OIDs across queries, connections, and restarts. They are not persisted or
+stable across schema/index changes and remain private to the adapter.
 
 ## Compatibility tracing
 
@@ -175,7 +191,7 @@ the same per-TableId read/write/transaction grants as Protocol v1.
 | Close / Flush / Terminate | complete | statement and portal cleanup |
 | DEALLOCATE / DEALLOCATE ALL | complete | SQL-form psycopg prepared-cache cleanup |
 | Binary format | selected types | bool, int2, int4, int8, text, varchar input; bool, int8, text output |
-| ORM reflection | existing schemas | SQLAlchemy table/column/PK autoload through derived metadata |
+| ORM reflection | existing schemas | SQLAlchemy table/column/PK/index autoload through derived metadata |
 | PasswordMessage | unsupported | unexpected message is a protocol error |
 
 Extended-protocol errors suppress subsequent frontend messages until `Sync`,
@@ -293,7 +309,7 @@ format inputs return typed errors without panic or unbounded allocation.
 
 ## Catalog scope and client compatibility
 
-Round 3 implements only the read-only `pg_catalog` projection required by the
+Rounds 3 and 4 implement only the read-only `pg_catalog` projection required by the
 captured SQLAlchemy operations. It does not expose catalog relations as general
 user-queryable tables and does not implement `information_schema`. No second
 schema catalog is maintained.
@@ -306,6 +322,7 @@ Compatibility results actually exercised in this environment:
 | psql 17.11 | yes | libpq query path | yes | scalar profile and ordinary table SELECT |
 | psycopg 3.2.13 | yes | explicit `prepare=True`, repeated reuse, binary result cursor | commit, rollback, failed transaction recovery | SQLAlchemy transport |
 | SQLAlchemy 2.0.52 + psycopg | yes | generated typed parameters | Core rollback and ORM transactions | Inspector, autoload, reflected SELECT, Core and ORM CRUD |
+| Alembic 1.16.5 | yes | SQLAlchemy transport | read-only rollback | inspect and `compare_metadata`; no migration execution |
 | pgx v5.7.6 | yes (Round 2) | prepared CRUD and repeated binds | yes | not tested |
 
 The TCP integration suite performs SSL refusal, startup with known and unknown
@@ -314,12 +331,15 @@ failed-transaction recovery, named prepared statement and portal lifecycle,
 Describe, Execute, Sync, Close, and CancelRequest framing against a real
 listener and database worker.
 
-The Round 3 Python test is
-`scripts/test-postgresql-orm.py`; its isolated dependencies are pinned in
-`scripts/requirements-postgresql-orm.txt`. It tests two existing tables,
-missing-table lookup, repeated autoload, explicit prepared reuse, selected
-binary formats, CRUD, transaction/error rollback, NULL, Core-generated SQL,
-reflected SELECT, and mapped ORM SELECT/CRUD. See
+The Python tests are `scripts/test-postgresql-orm.py` and
+`scripts/test-postgresql-alembic.py`; their isolated dependencies are pinned in
+`scripts/requirements-postgresql-orm.txt`. They test two existing tables, two
+real secondary indexes, a zero-index table, missing-table lookup, repeated and
+qualified reflection, reopen-stable names/OIDs, autoloaded Index objects,
+explicit prepared reuse, selected binary formats, CRUD, transaction/error
+rollback, NULL, Core-generated SQL, reflected SELECT, mapped ORM SELECT/CRUD,
+and Alembic read-only comparison. Matching metadata has no diff; omitting the
+indexes proposes two `remove_index` operations without executing them. See
 `postgresql-client-matrix.md` for captured blockers and exact reproduction.
 
 ## Remaining work
@@ -329,9 +349,9 @@ reflected SELECT, and mapped ORM SELECT/CRUD. See
   non-loopback deployment.
 - P1: implement actual cancellation and broaden PostgreSQL dialect lowering
   only where real clients demonstrate a need.
-- P2: expose real non-primary index metadata through a stable core metadata
-  boundary before claiming `get_indexes()` results; add `information_schema`
-  only after a captured client needs it.
+- P2: add `information_schema` or broader catalog query lowering only after a
+  captured client needs it. The optional `psql \\d users` probe currently
+  reaches an unsupported `OPERATOR(pg_catalog.~)` regex predicate.
 - P3: add only justified generic SQL such as RETURNING, UPSERT, CTEs, and
   broader joins without
   leaking dialect policy into core layers.

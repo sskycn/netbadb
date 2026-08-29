@@ -233,7 +233,8 @@ The current code genuinely supports:
   contextual parameter inference, ParameterDescription, selected text/binary
   scalar formats, SQLSTATE mapping, named statement and portal lifecycles, and
   PostgreSQL failed-transaction session behavior, plus a read-only ORM metadata
-  projection derived from Canonical Schema;
+  projection derived from Canonical Schema and the persistent Heap index
+  registry through the storage-neutral Core inspection boundary;
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
@@ -273,11 +274,13 @@ Experimental PostgreSQL wire mode is documented in
 [`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
 `netbadbd --manifest server.json --postgres` to use the manifest's listen
 address as a loopback PostgreSQL endpoint. This experimental profile is not a
-claim of general PostgreSQL compatibility. Round 3 adds real psycopg 3 and
-SQLAlchemy 2 Core/ORM use over existing schemas, including table/column/primary
-key reflection and autoload from a minimal Canonical-Schema-derived catalog.
-PostgreSQL DDL, a complete `pg_catalog` or `information_schema`, TLS/password
-authentication, actual cancellation, migrations, and simultaneous native plus
+claim of general PostgreSQL compatibility. Round 4 adds real non-primary
+single-column B+Tree reflection to the existing psycopg 3 and SQLAlchemy 2
+Core/ORM profile. The PostgreSQL adapter consumes stable read-only Core
+metadata, synthesizes deterministic compatibility names/OIDs, and supports
+Alembic schema introspection plus read-only autogenerate comparison. Migration
+execution, PostgreSQL DDL, a complete `pg_catalog` or `information_schema`,
+TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
 

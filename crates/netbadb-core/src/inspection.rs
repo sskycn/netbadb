@@ -6,12 +6,12 @@ use netbadb_inspect::{
     AggregateFunctionInspection, AggregateInputInspection, AggregateOutputInspection,
     AssignmentInspection, BinaryOpInspection, CatalogInspection, ColumnInspection,
     ColumnReferenceInspection, ExpressionInspection, ExpressionKindInspection, IndexInspection,
-    IndexRangeInspection, IndexStatisticsInspection, JoinKindInspection, NullOrderInspection,
-    PartitionAccessInspection, PartitionScanInspection, PlanNodeInspection, RangeBoundInspection,
-    RangePartitionInspection, ResultFieldInspection, SortDirectionInspection, SortKeyInspection,
-    SourceColumnInspection, StatementAccessInspection, StatementInspection, StatementKind,
-    StatementPlanInspection, StatementResultInspection, TableInspection, TablePlacementInspection,
-    TableStatisticsInspection, UnaryOpInspection,
+    IndexKindInspection, IndexRangeInspection, IndexStatisticsInspection, JoinKindInspection,
+    NullOrderInspection, PartitionAccessInspection, PartitionScanInspection, PlanNodeInspection,
+    RangeBoundInspection, RangePartitionInspection, ResultFieldInspection, SortDirectionInspection,
+    SortKeyInspection, SourceColumnInspection, StatementAccessInspection, StatementInspection,
+    StatementKind, StatementPlanInspection, StatementResultInspection, TableInspection,
+    TablePlacementInspection, TableStatisticsInspection, UnaryOpInspection,
 };
 use netbadb_planner::{PartitionAccessPlan, PhysicalPlan, PhysicalStatement};
 use netbadb_rel::{
@@ -56,8 +56,11 @@ pub(crate) fn catalog(
                 },
             )?;
             indexes.push(IndexInspection {
+                table_id: table.id,
                 column_id: definition.column_id,
                 column_name: column.name.clone(),
+                kind: IndexKindInspection::BTree,
+                unique: false,
                 registration_order,
                 statistics: single_storage
                     .and_then(|storage| storage.index_statistics(definition.column_id))

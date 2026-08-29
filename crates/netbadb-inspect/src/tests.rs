@@ -89,8 +89,11 @@ fn catalog_renderer_is_explicit_and_deterministic() {
                 },
             ],
             indexes: vec![IndexInspection {
+                table_id: TableId(1),
                 column_id: ColumnId(1),
                 column_name: "id".into(),
+                kind: IndexKindInspection::BTree,
+                unique: false,
                 registration_order: 0,
                 statistics: Some(IndexStatisticsInspection {
                     distinct_non_null_keys: 8,
@@ -364,8 +367,11 @@ fn renderers_escape_free_form_names_without_injecting_lines_or_controls() {
                 primary_key: false,
             }],
             indexes: vec![IndexInspection {
+                table_id: TableId(1),
                 column_id: ColumnId(1),
                 column_name: "id\t\\\"".into(),
+                kind: IndexKindInspection::BTree,
+                unique: false,
                 registration_order: 0,
                 statistics: None,
             }],

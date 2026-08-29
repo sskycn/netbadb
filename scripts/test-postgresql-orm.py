@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import re
 
 import psycopg
 import sqlalchemy
 from sqlalchemy import BigInteger, Boolean, Column, MetaData, Table, Text, delete, insert
 from sqlalchemy import inspect, select, update
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.orm import Session, registry
 
 
@@ -118,7 +120,39 @@ def sqlalchemy_smoke(dsn: str) -> None:
         ("active", False),
     ]
     assert inspector.get_pk_constraint("users")["constrained_columns"] == ["id"]
-    assert inspector.get_indexes("users") == []
+    indexes = inspector.get_indexes("users")
+    index_signature = sorted(
+        (index["name"], tuple(index["column_names"]), index["unique"])
+        for index in indexes
+    )
+    assert [(columns, unique) for _, columns, unique in index_signature] == [
+        (("active",), False),
+        (("name",), False),
+    ]
+    assert all(
+        len(name.encode("ascii")) <= 63
+        and re.fullmatch(r"nb_[a-z0-9_]+_[0-9a-f]{12}_idx", name)
+        for name, _, _ in index_signature
+    )
+    assert inspector.get_indexes("teams") == []
+    for schema in (None, "public"):
+        repeated = inspect(engine).get_indexes("users", schema=schema)
+        assert sorted(
+            (index["name"], tuple(index["column_names"]), index["unique"])
+            for index in repeated
+        ) == index_signature
+    second_engine = sqlalchemy.create_engine(dsn)
+    assert sorted(
+        (index["name"], tuple(index["column_names"]), index["unique"])
+        for index in inspect(second_engine).get_indexes("users")
+    ) == index_signature
+    second_engine.dispose()
+    try:
+        inspector.get_indexes("missing")
+    except NoSuchTableError:
+        pass
+    else:
+        raise AssertionError("missing table index reflection must raise NoSuchTableError")
 
     reflected = Table("users", MetaData(), autoload_with=engine)
     assert list(reflected.columns) == [
@@ -127,9 +161,17 @@ def sqlalchemy_smoke(dsn: str) -> None:
         reflected.c.active,
     ]
     assert list(reflected.primary_key.columns) == [reflected.c.id]
+    assert sorted(
+        (index.name, tuple(column.name for column in index.columns), index.unique)
+        for index in reflected.indexes
+    ) == index_signature
     for _ in range(3):
         repeated = Table("users", MetaData(), autoload_with=engine)
         assert repeated.c.id.primary_key
+        assert sorted(
+            (index.name, tuple(column.name for column in index.columns), index.unique)
+            for index in repeated.indexes
+        ) == index_signature
     teams = Table("teams", MetaData(), autoload_with=engine)
     assert list(teams.columns.keys()) == ["id", "name"]
 

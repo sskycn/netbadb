@@ -2224,7 +2224,8 @@ PostgreSQL bytes
     -> PostgreSQL session / prepared statement / portal state
     -> ordinary SQL: compiler-owned typed statement and parameter metadata
     -> metadata SQL: bounded compatibility operation classifier
-    -> ephemeral metadata projection <- immutable Canonical Schema
+    -> ephemeral metadata projection <- Database::inspect_catalog()
+                                      <- Canonical Schema + index registry
     -> compiler-resolved StatementAccess + authorization
     -> shared netbadb-server DatabaseSession transaction/execution lifecycle
     -> netbadb-core
@@ -2242,27 +2243,37 @@ PostgreSQL error and RowDescription mapping do not inspect AST/HIR Rust layouts,
 execute a query for metadata, or leak OIDs into HIR, relational IR, planner,
 executor, or storage.
 
-Round 3 keeps ORM introspection in a separate, typed server-side adapter because
+Rounds 3 and 4 keep ORM introspection in a separate, typed server-side adapter because
 SQLAlchemy's PostgreSQL catalog SQL uses schema-qualified system relations,
 arrays, `ANY`, `regclass`, and catalog-only functions that would otherwise
 force a premature full PostgreSQL parser into the native compiler. The adapter
 classifies queries from structural relation/function/predicate markers into a
 closed `CompatibilityStatement` domain; it does not compare whole SQL strings
-or execute user-table SQL. Each session derives a bounded read-only snapshot of
-table IDs, names, ordered columns, nullability, primary keys, and physical types
-from `Database::schema()` once. Every emitted row is generated from that
-snapshot and filtered through the principal's existing `TableId` visibility.
+or execute user-table SQL. Each session derives a bounded read-only snapshot
+from `Database::inspect_catalog()`. The Core DTO combines Canonical Schema
+table/column identity with registered index definitions while excluding B+Tree
+handles, PageIds, optimizer policy, and storage variants. A registered index
+has logical identity `(TableId, ColumnId)`, ordered single-column membership,
+`BTree` kind, and `unique=false`; LSM clustering access is not a secondary
+index. Partition-local physical indexes are not projected as logical indexes
+because the current registry cannot prove they form one logical definition.
+Every emitted row is generated from that snapshot and filtered through the
+principal's existing `TableId` visibility.
 There is no PostgreSQL catalog heap, WAL record, or second source of schema
 truth.
 
-Compatibility object OIDs are server-only deterministic identifiers. A
-SHA-256 domain-separated digest of stable table identity and canonical column
-metadata selects an OID in the high synthetic range; deterministic linear
-probing resolves collisions. Built-in PostgreSQL type OIDs stay centralized in
+Compatibility object OIDs are server-only deterministic identifiers. Separate
+SHA-256 domains cover table and index objects; index identity includes the
+canonical fingerprint, column, kind, and uniqueness. All candidates share one
+high synthetic range and collision set, and deterministic linear probing
+resolves collisions. Index names combine a sanitized readable table/column
+prefix with a stable digest suffix, are bounded to 63 ASCII bytes, and
+collision-check the complete catalog. Built-in PostgreSQL type OIDs stay centralized in
 `netbadb-pgwire`, while object OIDs do not enter types, HIR, relational IR,
 planning, execution, storage, or persistent formats. Stability is guaranteed
-for the same Canonical Schema across connections and restarts; it is not a
-persistent identity contract across schema changes.
+for the same Canonical Schema and index registry across connections and
+restarts; names and OIDs are not persistent contracts across schema/index
+changes.
 
 The generic compiler did gain two ordinary SQL expression capabilities exposed
 by the real client: postfix casts for the lossless BOOL/INT64/TEXT family and

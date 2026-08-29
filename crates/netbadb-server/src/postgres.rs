@@ -8,8 +8,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use netbadb_core::{
-    Database, DatabaseError, DatabaseErrorKind, ExecutionResult, PreparedStatement as CorePrepared,
-    QueryResult, StatementAccess, StatementDescription,
+    Database, DatabaseError, DatabaseErrorKind, ExecutionResult, IndexKindInspection,
+    PreparedStatement as CorePrepared, QueryResult, StatementAccess, StatementDescription,
+    TablePlacementInspection,
 };
 use netbadb_pgwire::{
     BackendMessage, CloseTarget, DescribeTarget, ErrorResponse, FieldDescription, FormatCode,
@@ -18,7 +19,7 @@ use netbadb_pgwire::{
     encode_text_value, read_frontend_message, read_startup_packet, write_backend_message,
 };
 use netbadb_protocol::WireTransactionState;
-use netbadb_types::{PhysicalType, ScalarValue, SemanticType, TableId};
+use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
 use sha2::{Digest, Sha256};
 
 use crate::authorization::{AuthorizationAction, AuthorizationPolicy, PrincipalAuthorization};
@@ -509,7 +510,15 @@ fn run_pg_worker(
                     }
                 };
                 let (session, messages) =
-                    PgWorkerSession::new(&database, policy, principal, startup, session_id);
+                    match PgWorkerSession::new(&database, policy, principal, startup, session_id) {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            let _ = reply.send(Ok(vec![BackendMessage::ErrorResponse(
+                                map_database_error(&error),
+                            )]));
+                            continue;
+                        }
+                    };
                 sessions.insert(session_id, session);
                 let _ = reply.send(Ok(messages));
             }
@@ -627,8 +636,18 @@ struct ReadOnlySavepoint {
     mutation_generation: u64,
 }
 
-const SYNTHETIC_TABLE_OID_BASE: u32 = 0x8000_0000;
+const SYNTHETIC_OID_BASE: u32 = 0x8000_0000;
 const SYNTHETIC_OID_MASK: u32 = 0x1fff_ffff;
+const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PgCatalogObjectKey {
+    Table(TableId),
+    Index {
+        table_id: TableId,
+        column_id: ColumnId,
+    },
+}
 
 #[derive(Clone)]
 struct PgCompatibilityCatalog {
@@ -641,64 +660,133 @@ struct PgCatalogTable {
     oid: u32,
     name: String,
     columns: Vec<PgCatalogColumn>,
+    indexes: Vec<PgCatalogIndex>,
+    index_reflection_supported: bool,
 }
 
 #[derive(Clone)]
 struct PgCatalogColumn {
+    column_id: ColumnId,
     name: String,
     physical: PhysicalType,
     nullable: bool,
     primary_key: bool,
 }
 
+#[derive(Clone)]
+struct PgCatalogIndex {
+    oid: u32,
+    name: String,
+    column_id: ColumnId,
+    column_name: String,
+    column_physical: PhysicalType,
+    unique: bool,
+    access_method: &'static str,
+}
+
 impl PgCompatibilityCatalog {
-    fn derive(database: &Database) -> Self {
-        let mut identities = database
-            .schema()
-            .tables()
-            .iter()
+    fn derive(database: &Database) -> Result<Self, DatabaseError> {
+        let inspected = database.inspect_catalog()?;
+        let mut identities = Vec::new();
+        let mut index_name_inputs = Vec::new();
+        for table in &inspected.tables {
+            let mut table_hash = Sha256::new();
+            table_hash.update(b"netbadb-pg-table-object-oid-v2");
+            table_hash.update(table.table_id.0.to_be_bytes());
+            table_hash.update(table.fingerprint.as_bytes());
+            identities.push((
+                PgCatalogObjectKey::Table(table.table_id),
+                <[u8; 32]>::from(table_hash.finalize()),
+            ));
+            for index in &table.indexes {
+                let mut index_hash = Sha256::new();
+                index_hash.update(b"netbadb-pg-index-object-oid-v1");
+                index_hash.update(table.table_id.0.to_be_bytes());
+                index_hash.update(table.fingerprint.as_bytes());
+                index_hash.update(index.column_id.0.to_be_bytes());
+                index_hash.update([match index.kind {
+                    IndexKindInspection::BTree => 1,
+                }]);
+                index_hash.update([u8::from(index.unique)]);
+                let digest = <[u8; 32]>::from(index_hash.finalize());
+                let key = PgCatalogObjectKey::Index {
+                    table_id: table.table_id,
+                    column_id: index.column_id,
+                };
+                identities.push((key, digest));
+                index_name_inputs.push((
+                    key,
+                    table.name.as_str(),
+                    index.column_name.as_str(),
+                    digest,
+                ));
+            }
+        }
+        identities.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+        let object_oids = assign_synthetic_oids(&identities, SYNTHETIC_OID_BASE);
+        let index_names = assign_compatibility_index_names(&index_name_inputs);
+        let tables = inspected
+            .tables
+            .into_iter()
             .map(|table| {
-                let mut hash = Sha256::new();
-                hash.update(b"netbadb-pg-object-oid-v1");
-                hash.update(table.id.0.to_be_bytes());
-                hash.update(table.name.as_bytes());
-                for column in &table.columns {
-                    hash.update(column.id.0.to_be_bytes());
-                    hash.update(column.name.as_bytes());
-                    hash.update([match column.semantic_type().physical {
-                        PhysicalType::Bool => 1,
-                        PhysicalType::Int64 => 2,
-                        PhysicalType::UInt64 => 3,
-                        PhysicalType::Text => 4,
-                    }]);
-                    hash.update([u8::from(column.nullable), u8::from(column.primary_key)]);
-                }
-                (table.id, <[u8; 32]>::from(hash.finalize()))
-            })
-            .collect::<Vec<_>>();
-        identities.sort_by(|left, right| left.1.cmp(&right.1).then((left.0).0.cmp(&(right.0).0)));
-        let table_oids = assign_synthetic_oids(&identities, SYNTHETIC_TABLE_OID_BASE);
-        let tables = database
-            .schema()
-            .tables()
-            .iter()
-            .map(|table| PgCatalogTable {
-                table_id: table.id,
-                oid: table_oids[&table.id],
-                name: table.name.clone(),
-                columns: table
+                let columns = table
                     .columns
                     .iter()
                     .map(|column| PgCatalogColumn {
+                        column_id: column.column_id,
                         name: column.name.clone(),
-                        physical: column.semantic_type().physical,
+                        physical: column.data_type.physical,
                         nullable: column.nullable,
                         primary_key: column.primary_key,
                     })
-                    .collect(),
+                    .collect::<Vec<_>>();
+                let mut indexes = table
+                    .indexes
+                    .iter()
+                    .map(|index| {
+                        let key = PgCatalogObjectKey::Index {
+                            table_id: table.table_id,
+                            column_id: index.column_id,
+                        };
+                        let column = columns
+                            .iter()
+                            .find(|column| column.column_id == index.column_id)
+                            .ok_or(DatabaseError::InspectionIndexColumnMissing {
+                                table_id: table.table_id,
+                                column_id: index.column_id,
+                            })?;
+                        Ok(PgCatalogIndex {
+                            oid: object_oids[&key],
+                            name: index_names[&key].clone(),
+                            column_id: index.column_id,
+                            column_name: index.column_name.clone(),
+                            column_physical: column.physical,
+                            unique: index.unique,
+                            access_method: match index.kind {
+                                IndexKindInspection::BTree => "btree",
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DatabaseError>>()?;
+                indexes.sort_by(|left, right| {
+                    left.name
+                        .cmp(&right.name)
+                        .then(left.column_id.cmp(&right.column_id))
+                });
+                Ok(PgCatalogTable {
+                    table_id: table.table_id,
+                    oid: object_oids[&PgCatalogObjectKey::Table(table.table_id)],
+                    name: table.name,
+                    columns,
+                    indexes,
+                    index_reflection_supported: matches!(
+                        table.placement,
+                        TablePlacementInspection::Single
+                    ),
+                })
             })
-            .collect();
-        Self { tables }
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        Ok(Self { tables })
     }
 
     fn table(&self, name: &str) -> Option<&PgCatalogTable> {
@@ -706,19 +794,85 @@ impl PgCompatibilityCatalog {
     }
 }
 
-fn assign_synthetic_oids(identities: &[(TableId, [u8; 32])], base: u32) -> HashMap<TableId, u32> {
+fn assign_synthetic_oids(
+    identities: &[(PgCatalogObjectKey, [u8; 32])],
+    base: u32,
+) -> HashMap<PgCatalogObjectKey, u32> {
     let mut assigned = HashMap::with_capacity(identities.len());
     let mut used = HashSet::with_capacity(identities.len());
-    for (table_id, digest) in identities {
+    for (object, digest) in identities {
         let mut candidate = base
             | (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
                 & SYNTHETIC_OID_MASK);
         while !used.insert(candidate) {
             candidate = base | (candidate.wrapping_add(1) & SYNTHETIC_OID_MASK);
         }
-        assigned.insert(*table_id, candidate);
+        assigned.insert(*object, candidate);
     }
     assigned
+}
+
+fn assign_compatibility_index_names(
+    inputs: &[(PgCatalogObjectKey, &str, &str, [u8; 32])],
+) -> HashMap<PgCatalogObjectKey, String> {
+    let mut inputs = inputs.to_vec();
+    inputs.sort_by(|left, right| left.3.cmp(&right.3).then(left.0.cmp(&right.0)));
+    let mut assigned = HashMap::with_capacity(inputs.len());
+    let mut used = HashSet::with_capacity(inputs.len());
+    for (object, table_name, column_name, digest) in inputs {
+        let readable = sanitized_index_name_prefix(table_name, column_name);
+        let hash_suffix = digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let fixed_bytes = "nb__".len() + hash_suffix.len() + "_idx".len();
+        let readable_limit = POSTGRES_IDENTIFIER_MAX_BYTES - fixed_bytes;
+        let readable = &readable[..readable.len().min(readable_limit)];
+        let base = format!("nb_{readable}_{hash_suffix}_idx");
+        let mut candidate = base.clone();
+        let mut collision = 0_u32;
+        while !used.insert(candidate.clone()) {
+            collision = collision.wrapping_add(1);
+            let discriminator = format!("_{collision:x}");
+            let keep = base
+                .len()
+                .saturating_sub(discriminator.len())
+                .min(POSTGRES_IDENTIFIER_MAX_BYTES - discriminator.len());
+            candidate = format!("{}{}", &base[..keep], discriminator);
+        }
+        assigned.insert(object, candidate);
+    }
+    assigned
+}
+
+fn sanitized_index_name_prefix(table_name: &str, column_name: &str) -> String {
+    let mut output = String::new();
+    for (position, name) in [table_name, column_name].into_iter().enumerate() {
+        if position != 0 && !output.ends_with('_') {
+            output.push('_');
+        }
+        let before = output.len();
+        for byte in name.bytes() {
+            let normalized = match byte {
+                b'a'..=b'z' | b'0'..=b'9' => char::from(byte),
+                b'A'..=b'Z' => char::from(byte.to_ascii_lowercase()),
+                _ => '_',
+            };
+            if normalized != '_' || !output.ends_with('_') {
+                output.push(normalized);
+            }
+        }
+        if output.len() == before {
+            output.push_str("index");
+        }
+    }
+    while output.ends_with('_') {
+        output.pop();
+    }
+    if output.is_empty() {
+        output.push_str("index");
+    }
+    output
 }
 
 enum PortalResult {
@@ -753,7 +907,7 @@ impl PgWorkerSession {
         authorization: PrincipalAuthorization,
         startup: StartupMessage,
         session_id: u64,
-    ) -> (Self, Vec<BackendMessage>) {
+    ) -> Result<(Self, Vec<BackendMessage>), DatabaseError> {
         let trace_enabled = std::env::var_os("NETBADB_POSTGRES_TRACE").is_some();
         if trace_enabled {
             let parameter_names = startup.parameters.keys().cloned().collect::<Vec<_>>();
@@ -780,7 +934,7 @@ impl PgWorkerSession {
             },
             BackendMessage::ReadyForQuery(b'I'),
         ];
-        (
+        Ok((
             Self {
                 execution: DatabaseSession::with_policy(policy),
                 authorization,
@@ -792,11 +946,11 @@ impl PgWorkerSession {
                 awaiting_sync: false,
                 mutation_generation: 0,
                 savepoints: Vec::new(),
-                catalog: PgCompatibilityCatalog::derive(database),
+                catalog: PgCompatibilityCatalog::derive(database)?,
                 trace_enabled,
             },
             messages,
-        )
+        ))
     }
 
     fn handle(&mut self, database: &mut Database, message: FrontendMessage) -> Vec<BackendMessage> {
@@ -950,6 +1104,12 @@ impl PgWorkerSession {
             return self.extended_error(fixed_error(
                 "54000",
                 "prepared statement session limit reached",
+            ));
+        }
+        if is_index_ddl(&normalize_sql(&query)) {
+            return self.extended_error(fixed_error(
+                "0A000",
+                "PostgreSQL index DDL is unsupported; use the native index API",
             ));
         }
         if let Some(compatibility) = classify_compatibility_statement(&query) {
@@ -1328,6 +1488,12 @@ impl PgWorkerSession {
             return Err(fixed_error(
                 "0A000",
                 "parameterized catalog reflection requires Extended Query",
+            ));
+        }
+        if is_index_ddl(&normalized) {
+            return Err(fixed_error(
+                "0A000",
+                "PostgreSQL index DDL is unsupported; use the native index API",
             ));
         }
         let result = self.execute_core(database, sql)?;
@@ -1750,6 +1916,12 @@ fn classify_compatibility_statement(sql: &str) -> Option<CompatibilityStatement>
     None
 }
 
+fn is_index_ddl(normalized: &str) -> bool {
+    normalized.starts_with("create index ")
+        || normalized.starts_with("create unique index ")
+        || normalized.starts_with("drop index ")
+}
+
 fn compatibility_parameter_types(statement: CompatibilityStatement) -> &'static [PostgresType] {
     match statement {
         CompatibilityStatement::TypeLookup | CompatibilityStatement::SchemaNames => {
@@ -1929,15 +2101,15 @@ fn compatibility_fields(statement: CompatibilityStatement) -> Vec<FieldDescripti
             ("indisunique", PostgresType::Bool),
             ("has_constraint", PostgresType::Bool),
             ("indoption", PostgresType::Text),
-            ("reloptions", PostgresType::Text),
+            ("reloptions", PostgresType::TextArray),
             ("amname", PostgresType::Text),
             ("filter_definition", PostgresType::Text),
             ("indnkeyatts", PostgresType::Int8),
             ("indnullsnotdistinct", PostgresType::Bool),
-            ("elements", PostgresType::Text),
-            ("elements_is_expr", PostgresType::Text),
-            ("elements_opclass", PostgresType::Text),
-            ("elements_opdefault", PostgresType::Text),
+            ("elements", PostgresType::TextArray),
+            ("elements_is_expr", PostgresType::BoolArray),
+            ("elements_opclass", PostgresType::TextArray),
+            ("elements_opdefault", PostgresType::BoolArray),
         ]
         .as_slice(),
         CompatibilityStatement::TableCommentsVisible
@@ -2346,25 +2518,66 @@ fn execute_compatibility_statement(
             })
         }
         CompatibilityStatement::Indexes => {
-            if !matches!(
-                values,
-                [
-                    ScalarValue::Int64(_),
-                    ScalarValue::Int64(_),
-                    ScalarValue::Bool(_),
-                    ScalarValue::Int64(_),
-                    ScalarValue::Int64(_),
-                    ScalarValue::Int64(_),
-                    ScalarValue::Text(_),
-                    ScalarValue::Text(_),
-                    ScalarValue::Text(_),
-                ]
-            ) {
+            let [
+                ScalarValue::Int64(_expression_attnum),
+                ScalarValue::Int64(_subscript_offset),
+                ScalarValue::Bool(_pretty),
+                ScalarValue::Int64(_expression_attnum_again),
+                ScalarValue::Int64(_subscript_dimension),
+                ScalarValue::Int64(table_oid),
+                ScalarValue::Text(_primary_kind),
+                ScalarValue::Text(_unique_kind),
+                ScalarValue::Text(_exclusion_kind),
+            ] = values
+            else {
                 return Err(fixed_error(
                     "42804",
                     "index reflection requires nine typed parameters",
                 ));
+            };
+            let table = u32::try_from(*table_oid)
+                .ok()
+                .and_then(|oid| catalog.tables.iter().find(|table| table.oid == oid))
+                .filter(|table| authorization.can_see(table.table_id));
+            if table.is_some_and(|table| !table.index_reflection_supported) {
+                return Err(fixed_error(
+                    "0A000",
+                    "logical index reflection is unsupported for partitioned tables",
+                ));
             }
+            let rows = table
+                .into_iter()
+                .flat_map(|table| {
+                    table.indexes.iter().map(move |index| {
+                        debug_assert_ne!(index.oid, table.oid);
+                        let opclass = match index.column_physical {
+                            PhysicalType::Bool => Ok("bool_ops"),
+                            PhysicalType::Int64 => Ok("int8_ops"),
+                            PhysicalType::Text => Ok("text_ops"),
+                            PhysicalType::UInt64 => Err(fixed_error(
+                                "0A000",
+                                "UINT64 indexes cannot be represented by PostgreSQL reflection",
+                            )),
+                        }?;
+                        Ok(vec![
+                            ScalarValue::Int64(i64::from(table.oid)),
+                            ScalarValue::Text(index.name.clone()),
+                            ScalarValue::Bool(index.unique),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Text("0".into()),
+                            ScalarValue::Null,
+                            ScalarValue::Text(index.access_method.into()),
+                            ScalarValue::Null,
+                            ScalarValue::Int64(1),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Text(postgres_text_array(&[&index.column_name])),
+                            ScalarValue::Text("{f}".into()),
+                            ScalarValue::Text(postgres_text_array(&[opclass])),
+                            ScalarValue::Text("{t}".into()),
+                        ])
+                    })
+                })
+                .collect::<Result<Vec<_>, ErrorResponse>>()?;
             Ok(QueryResult {
                 columns: vec![
                     compatibility_result_column("indrelid", PhysicalType::Int64, false),
@@ -2382,7 +2595,7 @@ fn execute_compatibility_statement(
                     compatibility_result_column("elements_opclass", PhysicalType::Text, true),
                     compatibility_result_column("elements_opdefault", PhysicalType::Text, true),
                 ],
-                rows: Vec::new(),
+                rows,
             })
         }
         CompatibilityStatement::TableCommentsVisible
@@ -2940,20 +3153,92 @@ mod tests {
         let first = [0_u8; 32];
         let mut second = [0_u8; 32];
         second[31] = 1;
-        let assigned = assign_synthetic_oids(
-            &[(TableId(1), first), (TableId(2), second)],
-            SYNTHETIC_TABLE_OID_BASE,
-        );
-        assert_eq!(assigned[&TableId(1)], SYNTHETIC_TABLE_OID_BASE);
-        assert_eq!(assigned[&TableId(2)], SYNTHETIC_TABLE_OID_BASE + 1);
+        let table = PgCatalogObjectKey::Table(TableId(1));
+        let index = PgCatalogObjectKey::Index {
+            table_id: TableId(1),
+            column_id: ColumnId(2),
+        };
+        let assigned =
+            assign_synthetic_oids(&[(table, first), (index, second)], SYNTHETIC_OID_BASE);
+        assert_eq!(assigned[&table], SYNTHETIC_OID_BASE);
+        assert_eq!(assigned[&index], SYNTHETIC_OID_BASE + 1);
+        assert_ne!(assigned[&table], assigned[&index]);
         assert!(assigned.values().all(|oid| oid & 0x8000_0000 != 0));
         assert_eq!(
             assigned,
-            assign_synthetic_oids(
-                &[(TableId(1), first), (TableId(2), second)],
-                SYNTHETIC_TABLE_OID_BASE,
-            )
+            assign_synthetic_oids(&[(table, first), (index, second)], SYNTHETIC_OID_BASE)
         );
+    }
+
+    #[test]
+    fn compatibility_index_names_are_bounded_readable_stable_and_collision_checked() {
+        let first = PgCatalogObjectKey::Index {
+            table_id: TableId(1),
+            column_id: ColumnId(1),
+        };
+        let second = PgCatalogObjectKey::Index {
+            table_id: TableId(1),
+            column_id: ColumnId(2),
+        };
+        let digest = [0xab; 32];
+        let inputs = [
+            (
+                first,
+                "Very Long Users Table Name With Spaces And Punctuation !!!",
+                "E-mail Address With More Punctuation ???",
+                digest,
+            ),
+            (
+                second,
+                "Very Long Users Table Name With Spaces And Punctuation !!!",
+                "E-mail Address With More Punctuation ???",
+                digest,
+            ),
+        ];
+        let names = assign_compatibility_index_names(&inputs);
+        let repeated = assign_compatibility_index_names(&inputs);
+        assert_eq!(names, repeated);
+        assert_ne!(names[&first], names[&second]);
+        assert!(names.values().all(|name| {
+            name.len() <= POSTGRES_IDENTIFIER_MAX_BYTES
+                && name.starts_with("nb_very_long_users_table")
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        }));
+    }
+
+    #[test]
+    fn partitioned_index_reflection_is_explicitly_unsupported() {
+        let catalog = PgCompatibilityCatalog {
+            tables: vec![PgCatalogTable {
+                table_id: TableId(41),
+                oid: SYNTHETIC_OID_BASE,
+                name: "events".into(),
+                columns: Vec::new(),
+                indexes: Vec::new(),
+                index_reflection_supported: false,
+            }],
+        };
+        let authorized = principal(&[TableId(41)], &[TableId(41)]);
+        let error = execute_compatibility_statement(
+            &catalog,
+            &authorized,
+            CompatibilityStatement::Indexes,
+            &[
+                ScalarValue::Int64(0),
+                ScalarValue::Int64(1),
+                ScalarValue::Bool(true),
+                ScalarValue::Int64(0),
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(i64::from(SYNTHETIC_OID_BASE)),
+                ScalarValue::Text("p".into()),
+                ScalarValue::Text("u".into()),
+                ScalarValue::Text("x".into()),
+            ],
+        )
+        .expect_err("partition-local indexes cannot become one logical index");
+        assert_eq!(error.sqlstate, "0A000");
     }
 
     #[test]
@@ -2965,7 +3250,7 @@ mod tests {
         ];
         cleanup(&[&paths[0], &paths[1], &paths[2]]);
         let tables = catalog_tables();
-        let database = Database::create_tables(
+        let mut database = Database::create_tables(
             paths
                 .iter()
                 .cloned()
@@ -2973,8 +3258,14 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("create catalog fixture");
-        let catalog = PgCompatibilityCatalog::derive(&database);
-        let repeated = PgCompatibilityCatalog::derive(&database);
+        database
+            .create_index(TableId(1), ColumnId(2))
+            .expect("create nullable text index");
+        database
+            .create_index(TableId(1), ColumnId(3))
+            .expect("create bool index");
+        let catalog = PgCompatibilityCatalog::derive(&database).expect("derive catalog");
+        let repeated = PgCompatibilityCatalog::derive(&database).expect("repeat catalog");
         assert_eq!(
             catalog
                 .tables
@@ -3000,6 +3291,22 @@ mod tests {
         assert!(!users.columns[0].nullable);
         assert!(users.columns[1].nullable);
         assert_eq!(users.columns[2].physical, PhysicalType::Bool);
+        assert_eq!(users.indexes.len(), 2);
+        assert!(users.indexes.iter().all(|index| !index.unique));
+        assert!(
+            users
+                .indexes
+                .iter()
+                .all(|index| index.access_method == "btree")
+        );
+        assert!(users.indexes.iter().all(|index| index.oid != users.oid));
+        assert!(
+            catalog
+                .table("teams")
+                .expect("teams metadata")
+                .indexes
+                .is_empty()
+        );
 
         let restricted = principal(&[TableId(1), TableId(2), TableId(3)], &[TableId(1)]);
         let names = execute_compatibility_statement(
@@ -3079,12 +3386,90 @@ mod tests {
         assert_eq!(primary_key.rows.len(), 1);
         assert_eq!(primary_key.rows[0][1], ScalarValue::Text("{\"id\"}".into()));
 
+        let index_parameters = [
+            ScalarValue::Int64(0),
+            ScalarValue::Int64(1),
+            ScalarValue::Bool(true),
+            ScalarValue::Int64(0),
+            ScalarValue::Int64(1),
+            ScalarValue::Int64(i64::from(users.oid)),
+            ScalarValue::Text("p".into()),
+            ScalarValue::Text("u".into()),
+            ScalarValue::Text("x".into()),
+        ];
+        let reflected_indexes = execute_compatibility_statement(
+            &catalog,
+            &restricted,
+            CompatibilityStatement::Indexes,
+            &index_parameters,
+        )
+        .expect("reflect indexes");
+        assert_eq!(reflected_indexes.rows.len(), 2);
+        assert_eq!(
+            reflected_indexes
+                .rows
+                .iter()
+                .map(|row| (&row[10], &row[2], &row[6]))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    &ScalarValue::Text("{\"active\"}".into()),
+                    &ScalarValue::Bool(false),
+                    &ScalarValue::Text("btree".into()),
+                ),
+                (
+                    &ScalarValue::Text("{\"name\"}".into()),
+                    &ScalarValue::Bool(false),
+                    &ScalarValue::Text("btree".into()),
+                ),
+            ]
+        );
+        let denied = principal(&[TableId(1), TableId(2), TableId(3)], &[TableId(2)]);
+        assert!(
+            execute_compatibility_statement(
+                &catalog,
+                &denied,
+                CompatibilityStatement::Indexes,
+                &index_parameters,
+            )
+            .expect("deny index metadata")
+            .rows
+            .is_empty()
+        );
+
+        let stable_indexes = users
+            .indexes
+            .iter()
+            .map(|index| (index.oid, index.name.clone(), index.column_id))
+            .collect::<Vec<_>>();
+
         database.close().expect("close catalog fixture");
+        let reopened = Database::open_tables(paths.iter().cloned().zip(tables).collect::<Vec<_>>())
+            .expect("reopen catalog fixture");
+        let reopened_catalog =
+            PgCompatibilityCatalog::derive(&reopened).expect("derive reopened catalog");
+        assert_eq!(
+            reopened_catalog
+                .table("users")
+                .expect("reopened users")
+                .indexes
+                .iter()
+                .map(|index| (index.oid, index.name.clone(), index.column_id))
+                .collect::<Vec<_>>(),
+            stable_indexes
+        );
+        reopened.close().expect("close reopened catalog fixture");
         cleanup(&[&paths[0], &paths[1], &paths[2]]);
     }
 
     #[test]
     fn catalog_classification_is_structural_and_sql_like_is_bounded() {
+        assert!(is_index_ddl("create index users_name on users (name)"));
+        assert!(is_index_ddl(
+            "create unique index users_name on users (name)"
+        ));
+        assert!(is_index_ddl("drop index users_name"));
+        assert!(!is_index_ddl("select name from users"));
         assert_eq!(
             classify_compatibility_statement(
                 "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.relkind = ANY ($1) AND pg_catalog.pg_table_is_visible(c.oid)"

@@ -948,9 +948,9 @@ mod tests {
     use netbadb_sdk::inspection::{
         AggregateInputInspection, AggregateOutputInspection, BinaryOpInspection, CatalogInspection,
         ColumnInspection, ColumnReferenceInspection, ExpressionInspection,
-        ExpressionKindInspection, IndexInspection, IndexRangeInspection, IndexStatisticsInspection,
-        PartitionAccessInspection, PartitionScanInspection, PlanNodeInspection,
-        RangeBoundInspection, RangePartitionInspection, ResultFieldInspection,
+        ExpressionKindInspection, IndexInspection, IndexKindInspection, IndexRangeInspection,
+        IndexStatisticsInspection, PartitionAccessInspection, PartitionScanInspection,
+        PlanNodeInspection, RangeBoundInspection, RangePartitionInspection, ResultFieldInspection,
         SourceColumnInspection, StatementAccessInspection, StatementInspection, StatementKind,
         StatementPlanInspection, StatementResultInspection, TableInspection,
         TablePlacementInspection, TableStatisticsInspection,
@@ -1042,8 +1042,11 @@ mod tests {
                     primary_key: true,
                 }],
                 indexes: vec![IndexInspection {
+                    table_id: TableId(1),
                     column_id: ColumnId(1),
                     column_name: "id".into(),
+                    kind: IndexKindInspection::BTree,
+                    unique: false,
                     registration_order: 0,
                     statistics: Some(IndexStatisticsInspection {
                         distinct_non_null_keys: 8,

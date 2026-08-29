@@ -1,6 +1,6 @@
 # PostgreSQL client compatibility matrix
 
-This matrix records Round 3 observations against a real loopback TCP listener.
+This matrix records Round 4 observations against a real loopback TCP listener.
 It is evidence for the experimental existing-schema profile, not a claim of
 drop-in PostgreSQL compatibility.
 
@@ -12,6 +12,7 @@ drop-in PostgreSQL compatibility.
 | psycopg | 3.2.13 |
 | psycopg-binary | 3.2.13 |
 | SQLAlchemy | 2.0.52 |
+| Alembic | 1.16.5 |
 | PostgreSQL dialect | `postgresql+psycopg` |
 | psql | 17.11 from `/opt/local/lib/pgsql/bin/psql` |
 
@@ -33,12 +34,13 @@ production or build dependencies.
 | Inspector `has_table` | yes | existing/missing and `schema="public"` |
 | Inspector columns | yes | order, BOOL/BIGINT/TEXT, nullability |
 | Inspector primary key | yes | real Canonical Schema primary key |
-| Inspector non-primary indexes | yes, empty | stable schema boundary exposes none; nothing fabricated |
-| `Table(..., autoload_with=engine)` | yes | repeated and across `users` / `teams` |
+| Inspector non-primary indexes | yes, real | two non-unique single-column Heap B+Trees; zero-index table remains empty |
+| `Table(..., autoload_with=engine)` | yes | repeated indexes stable across `users` / `teams` and connections |
 | Reflected parameterized SELECT | yes | returns real stored rows |
 | SQLAlchemy ORM mapped SELECT | yes | reflected imperative mapping |
 | SQLAlchemy ORM CRUD | yes | explicit primary keys; no schema creation |
-| DDL / migrations | unsupported | not invoked; existing-schema profile only |
+| Alembic inspect / autogenerate | yes, read-only | matching metadata has no diff; absent indexes propose two `remove_index` operations |
+| DDL / migration apply | unsupported | not invoked; existing-schema profile only |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
 dialect, `implicit_returning=False`, `use_insertmanyvalues=False`, `create_all`,
@@ -57,7 +59,7 @@ or another compatibility-disable flag.
 | domain and enum probes | catalog SQL grammar unsupported | typed empty results matching absent NetbaDB semantics |
 | table OID and primary-key queries | no PG object identity or array result type | deterministic synthetic table OIDs, derived PK rows, server-only text-array output |
 | foreign-key probe | catalog SQL grammar unsupported | conservative empty result for existing visible tables |
-| non-primary-index query using arrays, `ANY`, and index functions | native parser failed on catalog expression syntax | bounded empty index operation; no fake indexes or access methods |
+| non-primary-index query using arrays, `ANY`, and index functions | stable Core metadata boundary lacked index definitions | Core `CatalogInspection` index DTO plus bounded real index operation and catalog-array outputs |
 | table-comment and check-constraint probes | misclassified as generic `pg_class` lookup | distinct structured operations with absent metadata represented as NULL/empty |
 | psycopg prepared-cache maintenance `DEALLOCATE ALL` | native parser syntax error | session-scoped SQL-form prepared/portal cleanup |
 | ORM identity load with `users.id AS users_id` | native parser rejected column alias | generic qualified projection aliases |
@@ -66,6 +68,19 @@ The classifier keys on catalog relations and semantic functions/predicates,
 not the complete SQL text, whitespace, or a fixed result table. Bind values are
 validated against an operation-specific type signature and drive table/schema
 selection.
+
+The real registry supports non-unique single-column Heap B+Trees. The
+compatibility layer does not report the primary key as an extra secondary
+index, does not report LSM clustering as an index, and rejects partition-local
+physical indexes when asked for logical-table reflection. It synthesizes
+bounded deterministic names because the native registry has no user-defined
+index name. The names and domain-separated synthetic object OIDs are stable for
+the same Canonical Schema/index registry across reopen and connections.
+
+The optional psql `\\d users` probe remains unsupported: psql first issues a
+Simple Query containing `OPERATOR(pg_catalog.~)`, which the native parser
+rejects. Round 4 does not broaden the catalog parser just to satisfy this
+stretch probe.
 
 ## Reproduction
 
@@ -87,6 +102,9 @@ In another terminal, substitute the printed port:
 
 ```bash
 /tmp/netbadb-pg-venv/bin/python scripts/test-postgresql-orm.py \
+  --dsn postgresql+psycopg://netbadb@127.0.0.1:PORT/test
+
+/tmp/netbadb-pg-venv/bin/python scripts/test-postgresql-alembic.py \
   --dsn postgresql+psycopg://netbadb@127.0.0.1:PORT/test
 ```
 

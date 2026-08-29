@@ -18,11 +18,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
-    Database::create_tables(vec![
+    let tables = vec![
         (directory.join("users.ndb"), users_table()),
         (directory.join("teams.ndb"), teams_table()),
-    ])?
-    .close()?;
+    ];
+    let mut database = Database::create_tables(tables.clone())?;
+    database.create_index(TableId(1), ColumnId(2))?;
+    database.create_index(TableId(1), ColumnId(3))?;
+    database.close()?;
+    let reopened = Database::open_tables(tables)?;
+    let indexes = &reopened.inspect_catalog()?.tables[0].indexes;
+    if indexes.len() != 2 {
+        return Err(format!(
+            "expected two reopened users indexes, found {}",
+            indexes.len()
+        )
+        .into());
+    }
+    reopened.close()?;
     let manifest = directory.join("server.json");
     std::fs::write(
         &manifest,

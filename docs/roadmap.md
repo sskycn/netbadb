@@ -437,9 +437,33 @@ and `information_schema`; and P3 broader PostgreSQL SQL remain open.
 
 A complete `pg_catalog` or `information_schema`, DDL/migrations, simultaneous
 listeners, PostgreSQL TLS/password authentication, actual cancellation, and
-broader dialect support remain explicit later work. Index reflection currently
-returns no rows because the stable Canonical Schema boundary does not expose
-PostgreSQL-equivalent non-primary index metadata; it does not fabricate it.
+broader dialect support remain explicit later work.
+
+### PostgreSQL Compatibility Round 4 — index reflection (complete)
+
+- reused and strengthened the storage-neutral `CatalogInspection` Core boundary
+  so registered indexes expose stable `(TableId, ColumnId)` logical identity,
+  single-column order, BTree kind, and non-unique semantics without PageIds or
+  storage handles;
+- projects only real Heap registry entries; LSM clustering remains a table
+  access path rather than a secondary index, while partition-local physical
+  indexes are explicitly unsupported for logical reflection;
+- added deterministic, bounded PostgreSQL-facing index names and domain-
+  separated synthetic index OIDs with catalog-wide collision checking;
+- implemented the captured SQLAlchemy `pg_index`/`pg_class`/`pg_attribute`/
+  `pg_am` result shape, including array-typed column/opclass flags, without a
+  general `pg_index` table or `pg_get_indexdef` implementation;
+- verified two real secondary indexes (including a nullable column), a zero-
+  index table, repeated reflection, multiple connections, reopen stability,
+  autoloaded `Index` objects, authorization filtering, and no PK duplication;
+- added an Alembic 1.16.5 read-only `compare_metadata` probe: matching metadata
+  produces no diff, while omitting the two indexes produces two `remove_index`
+  proposals. No migration operation or DDL is executed.
+
+The optional `psql \\d users` probe currently stops at its regex-operator
+catalog query (`OPERATOR(pg_catalog.~)`). This is evidence for a focused future
+psql catalog/query-lowering round, not justification for broad PostgreSQL SQL
+or migration DDL in Round 4.
 
 ## Phase 6 — SDK and tooling
 
