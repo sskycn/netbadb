@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use netbadb_index::{
     BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexEntry, IndexSpec,
     IndexStatistics, InternalNode, InternalSeparator, LeafNode, MetaNode, TableStatistics,
-    encode_index_catalog, encode_internal, encode_leaf, encode_meta,
+    encode_index_catalog as encode_current_index_catalog, encode_internal, encode_leaf,
+    encode_meta,
 };
 use netbadb_protocol::{
     ClientMessage, MAX_FRAME_PAYLOAD, ProtocolErrorCode, ServerMessage, WireResultColumn,
@@ -63,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_btree_decode_seeds(&output)?;
     write_index_catalog_decode_seeds(&output)?;
     write_protocol_decode_seeds(&output)?;
+    write_generation_seeds(&output)?;
     Ok(())
 }
 
@@ -160,7 +162,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
                     owner: None,
-                    meta_page: PageId(3),
+                    meta_page: netbadb_index::BTreePageRef::Legacy(PageId(3)),
                 },
             },
             statistics: None,
@@ -257,7 +259,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
                     column_id: ColumnId(1),
                     handle: BTreeHandle {
                         owner: None,
-                        meta_page: PageId(3),
+                        meta_page: netbadb_index::BTreePageRef::Legacy(PageId(3)),
                     },
                 },
                 statistics: Some(IndexStatistics {
@@ -295,7 +297,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     pending.next_index_id = Some(netbadb_types::IndexId(9));
     pending.pending.push(netbadb_index::RetiredIndexOwnership {
         index_id: netbadb_types::IndexId(7),
-        meta_page: PageId(2),
+        meta_page: netbadb_index::BTreePageRef::Legacy(PageId(2)),
     });
     let pending_bytes = encode_index_catalog(&pending)?;
     std::fs::write(output.join("valid-pending-v6"), &pending_bytes)?;
@@ -336,8 +338,9 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
         "valid-meta",
         0,
         &encode_meta(&MetaNode {
+            generation: None,
             owner: None,
-            root_page: PageId(2),
+            root_page: netbadb_index::BTreePageRef::Legacy(PageId(2)),
             height: 1,
             spec: spec.clone(),
         })?,
@@ -363,10 +366,10 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
         &encode_internal(
             &spec,
             &InternalNode {
-                first_child: PageId(2),
+                first_child: netbadb_index::BTreePageRef::Legacy(PageId(2)),
                 separators: vec![InternalSeparator {
                     key: entry,
-                    right_child: PageId(3),
+                    right_child: netbadb_index::BTreePageRef::Legacy(PageId(3)),
                 }],
             },
         )?,
@@ -374,8 +377,9 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
     write_btree_seed(&output, "truncated-leaf", 1, &leaf[..leaf.len() - 1])?;
     let owner = Some(netbadb_types::IndexId(7));
     let meta = encode_meta(&MetaNode {
+        generation: None,
         owner,
-        root_page: PageId(2),
+        root_page: netbadb_index::BTreePageRef::Legacy(PageId(2)),
         height: 2,
         spec: spec.clone(),
     })?;
@@ -383,7 +387,7 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
     let internal = netbadb_index::encode_internal_owned(
         &spec,
         &InternalNode {
-            first_child: PageId(2),
+            first_child: netbadb_index::BTreePageRef::Legacy(PageId(2)),
             separators: vec![],
         },
         owner,
@@ -462,13 +466,13 @@ fn write_page_update_seed(output: &Path) -> Result<(), Box<dyn std::error::Error
     let mut storage = HeapStorage::create(&owned_path, fuzz_table())?;
     let index = storage.create_index(ColumnId(1))?;
     storage.flush()?;
-    std::fs::copy(&owned_wal, output.join("valid-owned-btree-v2"))?;
+    std::fs::copy(&owned_wal, output.join("valid-owned-btree-v3"))?;
     storage.drop_index(index.id)?;
     storage.compact_index_catalog()?;
     storage.flush()?;
     let pending_seed = std::fs::read(&owned_wal)?;
     assert!(pending_seed.len() <= 64 * 1024);
-    std::fs::write(output.join("valid-pending-catalog-v6"), pending_seed)?;
+    std::fs::write(output.join("valid-pending-catalog-v7"), pending_seed)?;
     drop(storage);
     std::fs::remove_file(owned_wal)?;
     std::fs::remove_file(&owned_path)?;
@@ -503,6 +507,167 @@ fn write_seed(
     build(&mut wal, &path)?;
     drop(wal);
     std::fs::copy(&path, output.join(name))?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+// Existing corpus fixtures explicitly retain the v6 legacy handle representation.
+fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, netbadb_index::IndexError> {
+    let current = encode_current_index_catalog(node)?;
+    let mut legacy = current[..48].to_vec();
+    legacy[4..6].copy_from_slice(&6_u16.to_le_bytes());
+    let mut offset = 48;
+    for entry in &node.entries {
+        assert!(entry.definition.handle.meta_page.generation().is_none());
+        let length = entry
+            .definition
+            .name
+            .as_ref()
+            .map_or(0, |name| name.as_str().len());
+        legacy.extend_from_slice(&current[offset..offset + 48]);
+        legacy.extend_from_slice(&current[offset + 56..offset + 56 + length]);
+        offset += 56 + length;
+    }
+    for pending in &node.pending {
+        assert!(pending.meta_page.generation().is_none());
+        legacy.extend_from_slice(&current[offset..offset + 16]);
+        offset += 32;
+    }
+    Ok(legacy)
+}
+
+fn write_generation_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use netbadb_index::{
+        BTreePageRef, RetiredIndexOwnership, encode_internal_generation, encode_leaf_generation,
+    };
+    use netbadb_types::{IndexId, PageGeneration, PageRef};
+    let root = wal_output.parent().unwrap_or_else(|| Path::new("."));
+    let refs = |page, generation| {
+        BTreePageRef::Allocated(PageRef {
+            page_id: PageId(page),
+            generation: PageGeneration(generation),
+        })
+    };
+    let spec = IndexSpec {
+        data_type: SemanticType::physical(PhysicalType::UInt64),
+        nullable: true,
+    };
+    let owner = Some(IndexId(7));
+    let generation = Some(PageGeneration(100));
+    let meta = MetaNode {
+        owner,
+        generation,
+        root_page: refs(2, 101),
+        height: 2,
+        spec: spec.clone(),
+    };
+    let leaf = LeafNode {
+        entries: vec![],
+        next_leaf: Some(refs(3, 102)),
+    };
+    let internal = InternalNode {
+        first_child: refs(2, 101),
+        separators: vec![InternalSeparator {
+            key: IndexEntry {
+                key: ScalarValue::UInt64(42),
+                row_id: RowId {
+                    page: PageId(1),
+                    slot: 0,
+                    generation: 1,
+                },
+            },
+            right_child: refs(3, 102),
+        }],
+    };
+    let output = root.join("btree_decode");
+    for (kind, name, bytes, pointer_offset) in [
+        (0, "meta", encode_meta(&meta)?, 32),
+        (
+            1,
+            "leaf",
+            encode_leaf_generation(&spec, &leaf, owner, generation)?,
+            36,
+        ),
+        (
+            2,
+            "internal",
+            encode_internal_generation(&spec, &internal, owner, generation)?,
+            75,
+        ),
+    ] {
+        write_btree_seed(&output, &format!("valid-{name}-v3"), kind, &bytes)?;
+        for (field, offset) in [
+            ("owner", 8),
+            ("generation", 16),
+            ("pointer", pointer_offset),
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset..offset + 8].fill(0);
+            write_btree_seed(&output, &format!("zero-{field}-{name}-v3"), kind, &corrupt)?;
+        }
+        write_btree_seed(
+            &output,
+            &format!("truncated-ref-{name}-v3"),
+            kind,
+            &bytes[..pointer_offset + 7],
+        )?;
+    }
+    let mut catalog = IndexCatalogNode::empty();
+    catalog.next_index_id = Some(IndexId(9));
+    catalog.entries.push(IndexCatalogEntry {
+        retired: false,
+        statistics: None,
+        definition: IndexDefinition {
+            id: IndexId(7),
+            name: None,
+            column_id: ColumnId(1),
+            handle: BTreeHandle {
+                owner,
+                meta_page: refs(2, 100),
+            },
+        },
+    });
+    catalog.pending.push(RetiredIndexOwnership {
+        index_id: IndexId(8),
+        meta_page: refs(3, 102),
+    });
+    let bytes = encode_current_index_catalog(&catalog)?;
+    let output = root.join("index_catalog_decode");
+    std::fs::write(output.join("valid-active-pending-v7"), &bytes)?;
+    for (name, offset) in [("active", 96), ("pending", 120)] {
+        let mut corrupt = bytes.clone();
+        corrupt[offset..offset + 8].fill(0);
+        std::fs::write(output.join(format!("zero-generation-{name}-v7")), corrupt)?;
+        std::fs::write(
+            output.join(format!("truncated-ref-{name}-v7")),
+            &bytes[..offset + 7],
+        )?;
+    }
+    write_seed(wal_output, "valid-generation-reservation-v4", |wal, _| {
+        let begin = wal.append(TxnId(1), None, WalRecordKind::Begin)?;
+        let reservation = wal.append(
+            TxnId(1),
+            Some(begin),
+            WalRecordKind::PageGenerationReservation,
+        )?;
+        wal.flush_through(reservation)?;
+        Ok(())
+    })?;
+    let path =
+        std::env::temp_dir().join(format!("netbadb-generation-corpus-{}", std::process::id()));
+    let mut database = netbadb_core::Database::create(&path, fuzz_table())?;
+    let prepared = database.prepare_ddl_statement("CREATE INDEX reused ON fuzz_rows (id)")?;
+    let mut tx = database.begin_transaction()?;
+    database.execute_ddl_in(&mut tx, &prepared)?;
+    tx.rollback()?;
+    drop(tx);
+    database.execute_ddl(&prepared)?;
+    database.close()?;
+    let bytes = std::fs::read(wal_path(&path))?;
+    assert!(bytes.len() <= 128 * 1024);
+    std::fs::write(wal_output.join("valid-rollback-reuse-v3"), bytes)?;
+    std::fs::remove_file(wal_path(&path))?;
+    std::fs::remove_file(netbadb_storage::txn_status_path(&path))?;
     std::fs::remove_file(path)?;
     Ok(())
 }

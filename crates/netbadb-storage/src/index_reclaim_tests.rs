@@ -38,7 +38,7 @@ fn owned_merge_orphans_remain_discoverable_after_compaction_and_reopen() {
         inventory
             .observations
             .iter()
-            .all(|page| page.owner == Some(index.id))
+            .all(|page| page.owner == Some(index.id) && page.generation.is_some())
     );
     assert!(
         inventory
@@ -52,6 +52,46 @@ fn owned_merge_orphans_remain_discoverable_after_compaction_and_reopen() {
             .iter()
             .any(|page| !page.reachable && page.kind == PageType::BTreeLeaf)
     );
+    assert_eq!(report.allocations.len() as u64, owned_before);
+    let orphan = inventory
+        .observations
+        .iter()
+        .find(|page| !page.reachable && page.kind == PageType::BTreeLeaf)
+        .unwrap();
+    let original = storage
+        .buffer
+        .read_page(orphan.page_id)
+        .unwrap()
+        .page()
+        .clone();
+    let spec = storage.btree().read_meta(index.handle).unwrap().spec;
+    let legacy_payload = netbadb_index::encode_leaf_owned(
+        &spec,
+        &netbadb_index::LeafNode {
+            entries: Vec::new(),
+            next_leaf: None,
+        },
+        Some(index.id),
+    )
+    .unwrap();
+    storage
+        .buffer
+        .write_page(orphan.page_id)
+        .unwrap()
+        .page_mut()
+        .replace_single_payload(PageType::BTreeLeaf, &legacy_payload)
+        .unwrap();
+    assert!(matches!(
+        storage.inspect_index_reclaim(),
+        Err(StorageError::Index(
+            netbadb_index::IndexError::InvalidNodeType
+        ))
+    ));
+    *storage
+        .buffer
+        .write_page(orphan.page_id)
+        .unwrap()
+        .page_mut() = original;
     storage.drop_index(index.id).unwrap();
     storage.compact_index_catalog().unwrap();
     let snapshot = storage.read_index_catalog(PageId(1)).unwrap();
@@ -211,12 +251,12 @@ fn scanner_rejects_owned_corruption_and_overlap_without_catalog_writes() {
             if case == "raw-alias" {
                 let raw = storage.btree().create(meta.spec.clone()).unwrap();
                 let mut raw_meta = storage.btree().read_meta(raw).unwrap();
-                raw_meta.root_page = meta.root_page;
+                raw_meta.root_page = netbadb_index::BTreePageRef::Legacy(meta.root_page.page_id());
                 raw_meta.height = meta.height;
                 let payload = netbadb_index::encode_meta(&raw_meta).unwrap();
                 storage
                     .buffer
-                    .write_page(raw.meta_page)
+                    .write_page(raw.meta_page.page_id())
                     .unwrap()
                     .page_mut()
                     .replace_single_payload(PageType::BTreeMeta, &payload)
@@ -226,7 +266,7 @@ fn scanner_rejects_owned_corruption_and_overlap_without_catalog_writes() {
                     target = active.handle.meta_page;
                 }
                 if case == "child-owner" {
-                    let page = storage.buffer.read_page(meta.root_page).unwrap();
+                    let page = storage.buffer.read_page(meta.root_page.page_id()).unwrap();
                     let node = netbadb_index::decode_internal_owned(
                         &meta.spec,
                         page.page().single_payload(PageType::BTreeInternal).unwrap(),
@@ -237,7 +277,7 @@ fn scanner_rejects_owned_corruption_and_overlap_without_catalog_writes() {
                 }
                 if case == "leaf-owner" {
                     loop {
-                        let guard = storage.buffer.read_page(target).unwrap();
+                        let guard = storage.buffer.read_page(target.page_id()).unwrap();
                         if guard.page().header().unwrap().page_type == PageType::BTreeLeaf {
                             break;
                         }
@@ -260,14 +300,16 @@ fn scanner_rejects_owned_corruption_and_overlap_without_catalog_writes() {
                     storage.vacuum().unwrap();
                     let snapshot = storage.read_index_catalog(PageId(1)).unwrap();
                     let inventory = storage.index_page_inventory(&snapshot).unwrap();
-                    target = inventory
-                        .observations
-                        .iter()
-                        .find(|page| page.owner == Some(active.id) && !page.reachable)
-                        .unwrap()
-                        .page_id;
+                    target = netbadb_index::BTreePageRef::Legacy(
+                        inventory
+                            .observations
+                            .iter()
+                            .find(|page| page.owner == Some(active.id) && !page.reachable)
+                            .unwrap()
+                            .page_id,
+                    );
                 }
-                let mut guard = storage.buffer.write_page(target).unwrap();
+                let mut guard = storage.buffer.write_page(target.page_id()).unwrap();
                 let kind = guard.page().header().unwrap().page_type;
                 let mut bytes = guard.page().single_payload(kind).unwrap().to_vec();
                 let owner = if case == "zero-owner" {
@@ -386,9 +428,25 @@ fn provisional_owner_is_not_a_generation_after_rollback() {
     let committed = storage.create_index(ColumnId(1)).unwrap();
     // Concrete counterexample to Route A as a general generation protocol:
     // unpublished identity and allocation are restored together by rollback.
-    // Callers MUST discard provisional handles, as documented by BTreeHandle.
+    // Round 10 rejects the provisional handle even though the owner repeats.
     assert_eq!(provisional.id, committed.id);
-    assert_eq!(provisional.handle, committed.handle);
+    assert_eq!(
+        provisional.handle.meta_page.page_id(),
+        committed.handle.meta_page.page_id()
+    );
+    assert_ne!(
+        provisional.handle.meta_page.generation(),
+        committed.handle.meta_page.generation()
+    );
+    assert!(matches!(
+        storage.btree().height(provisional.handle),
+        Err(StorageError::Index(IndexError::GenerationMismatch { .. }))
+    ));
+    assert_eq!(storage.btree().height(committed.handle).unwrap(), 1);
+    eprintln!(
+        "ROUND10_REUSE owner={:?} old={:?} new={:?} stale=GenerationMismatch",
+        committed.id, provisional.handle.meta_page, committed.handle.meta_page
+    );
     storage.close().unwrap();
     cleanup(&path);
 }
@@ -425,13 +483,13 @@ fn owned_key_overflow_rolls_back_build_and_dml_without_mutation() {
     storage.vacuum().unwrap();
     let index = storage.create_index(ColumnId(1)).unwrap();
     let row = storage
-        .insert(&[ScalarValue::Text("x".repeat(4005))])
+        .insert(&[ScalarValue::Text("x".repeat(3981))])
         .unwrap();
     let wal = storage.wal_records().unwrap().len();
     let mut tx = storage.begin_transaction().unwrap();
     let after_begin = storage.wal_records().unwrap().len();
     assert!(matches!(
-        storage.insert_in(&mut tx, &[ScalarValue::Text("x".repeat(4006))]),
+        storage.insert_in(&mut tx, &[ScalarValue::Text("x".repeat(3982))]),
         Err(StorageError::Index(IndexError::KeyTooLarge { .. }))
     ));
     assert_eq!(storage.wal_records().unwrap().len(), after_begin);
@@ -441,7 +499,7 @@ fn owned_key_overflow_rolls_back_build_and_dml_without_mutation() {
     assert_eq!(
         storage
             .btree()
-            .lookup(index.handle, &ScalarValue::Text("x".repeat(4005)))
+            .lookup(index.handle, &ScalarValue::Text("x".repeat(3981)))
             .unwrap(),
         vec![row]
     );
@@ -501,7 +559,7 @@ fn pending_continuation_ids_are_checked_against_root_high_water() {
     let path = test_path("round9-pending-continuations");
     cleanup(&path);
     let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
-    storage.index_catalog_payload_capacity = Some(100);
+    storage.index_catalog_payload_capacity = Some(108);
     for _ in 0..10 {
         let index = storage.create_index(ColumnId(1)).unwrap();
         storage.drop_index(index.id).unwrap();

@@ -1,6 +1,6 @@
 # Storage decoding fuzzing
 
-`wal_recovery` accepts at most 64 KiB, replaces the WAL belonging to a fresh
+`wal_recovery` accepts at most 128 KiB, replaces the WAL belonging to a fresh
 minimal heap, and calls `HeapStorage::open`. That public path invokes the
 crate-private recovery decoder without adding a fuzz-only production API.
 Root, alternate WAL, and heap files are isolated by process ID and removed
@@ -14,15 +14,15 @@ record decoders. Its Heap seed uses `PageId(7)` because the CRC32C binds the
 expected logical page ID; a second seed is a valid page-1 IndexCatalog root.
 
 `btree_decode` accepts at most one 4060-byte index payload plus a one-byte node
-selector and directly exercises the public v1/v2 Meta, Leaf, and Internal
+selector and directly exercises the public v1/v2/v3 Meta, Leaf, and Internal
 decoders with a nullable UInt64 `IndexSpec`. Arbitrary bytes must return a node
 or typed `IndexError` without panicking, unbounded allocation, or traversal.
 
 `index_catalog_decode` accepts at most one 4060-byte `NBIC` payload and
-exercises the version-6 registry decoder with backward version-2/version-3/version-4/version-5 input.
+exercises the version-7 registry decoder with backward version-2 through version-6 input.
 Seeds cover active/retired registrations, invalid state and zero IDs, duplicate
 IDs, truncation, root high-water, compacted catalogs, invalid high-water, and
-legacy payloads. Successful decodes also canonicalize and round-trip through v6. Retirement is an in-place state, not a
+legacy payloads. Successful decodes also canonicalize and round-trip through v7. Retirement is an in-place state, not a
 DropIndex event: unknown/double-drop requests are covered by storage tests. Arbitrary counts and
 bytes must remain bounded and return either a catalog node or typed error.
 
@@ -80,3 +80,16 @@ updates. Cross-node mixed-owner graphs are exercised by deterministic storage
 corruption tests; the payload fuzzer cannot infer a whole tree from one page.
 Run fuzzing with a copied temporary corpus/artifact directory to avoid committing
 mutation-generated findings. Only small reviewed deterministic seeds belong here.
+
+Round 10 adds BTree v3 self-generation/root/child/leaf-next seeds, zero owner and
+zero generation, truncated PageRefs, v7 active/pending references, and WAL seeds
+for durable record-v4 reservations and actual rollback/reappend of the same
+PageId. The generator uses public Core transactional DDL for that lifecycle.
+The BTree harness retains the decoded allocation generation when re-encoding;
+legacy payloads keep their exact version. Successful WAL recovery still runs
+full ownership/generation inspection. Use temporary output/corpus directories;
+only reviewed deterministic seeds are committed.
+
+The WAL bound is 128 KiB because the real CREATE/rollback/re-CREATE seed contains
+eight full-page updates and exceeds 64 KiB. The generator asserts this bound;
+the seed is not silently skipped by the harness.

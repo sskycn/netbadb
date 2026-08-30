@@ -114,6 +114,24 @@ impl BufferState {
         Ok(page)
     }
 
+    fn validate_btree_frame(
+        &self,
+        reference: netbadb_index::BTreePageRef,
+    ) -> Result<(), StorageError> {
+        if let Some(index) = self.find_frame(reference.page_id()) {
+            let frame = &self.frames[index];
+            if frame.page.allocation_generation()? != reference.generation() && frame.pin_count != 0
+            {
+                return Err(BufferError::PagePinned {
+                    page_id: frame.page_id,
+                }
+                .into());
+            }
+            frame.page.validate_allocation(reference.generation())?;
+        }
+        Ok(())
+    }
+
     fn pin_write(&mut self, page_id: PageId) -> Result<Page, StorageError> {
         if let Some(index) = self.find_frame(page_id) {
             let frame = &self.frames[index];
@@ -192,7 +210,21 @@ impl BufferState {
         &mut self,
         page_id: PageId,
         before: &[u8; crate::PAGE_SIZE],
+        expected: Option<netbadb_types::PageGeneration>,
     ) -> Result<(), StorageError> {
+        if page_id.0 < self.disk.page_count() {
+            let current = if let Some(index) = self.find_frame(page_id) {
+                if self.frames[index].pin_count != 0 {
+                    return Err(BufferError::PagePinned { page_id }.into());
+                }
+                self.frames[index].page.clone()
+            } else {
+                self.disk.read_page(page_id)?
+            };
+            if current.bytes().iter().any(|b| *b != 0) {
+                current.validate_allocation(expected)?;
+            }
+        }
         match validate_before_image(page_id, before)? {
             ValidatedBeforeImage::Existing(page) => {
                 let page = *page;
@@ -242,7 +274,6 @@ impl BufferState {
                         return Err(BufferError::PagePinned { page_id }.into());
                     }
                 }
-                self.disk.remove_trailing_page(page_id)?;
                 if let Some(index) = self.find_frame(page_id) {
                     self.frames.remove(index);
                     self.next_victim = if self.frames.is_empty() {
@@ -251,7 +282,12 @@ impl BufferState {
                         self.next_victim.min(self.frames.len() - 1)
                     };
                 }
+                self.disk.remove_trailing_page(page_id)?;
                 self.disk.sync()?;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::RollbackAfterTrailingRemoval,
+                );
             }
         }
         Ok(())
@@ -332,6 +368,29 @@ impl BufferPool {
         })
     }
 
+    /// Exact allocation lookup. A slot hit is not an identity hit. The pool is
+    /// the sole runtime owner of PageManager, and only coordinated rollback can
+    /// remove/reappend slots; stale requests never evict a newer dirty frame.
+    pub(crate) fn read_btree_page(
+        &self,
+        reference: netbadb_index::BTreePageRef,
+    ) -> Result<ReadPageGuard, StorageError> {
+        self.state.borrow().validate_btree_frame(reference)?;
+        let guard = self.read_page(reference.page_id())?;
+        guard.page().validate_allocation(reference.generation())?;
+        Ok(guard)
+    }
+
+    pub(crate) fn write_btree_page(
+        &self,
+        reference: netbadb_index::BTreePageRef,
+    ) -> Result<WritePageGuard, StorageError> {
+        self.state.borrow().validate_btree_frame(reference)?;
+        let guard = self.write_page(reference.page_id())?;
+        guard.page().validate_allocation(reference.generation())?;
+        Ok(guard)
+    }
+
     pub(crate) fn write_page(&self, page_id: PageId) -> Result<WritePageGuard, StorageError> {
         let page = self.state.borrow_mut().pin_write(page_id)?;
         Ok(WritePageGuard {
@@ -377,8 +436,11 @@ impl BufferPool {
         &self,
         page_id: PageId,
         before: &[u8; crate::PAGE_SIZE],
+        expected: Option<netbadb_types::PageGeneration>,
     ) -> Result<(), StorageError> {
-        self.state.borrow_mut().undo_page_update(page_id, before)
+        self.state
+            .borrow_mut()
+            .undo_page_update(page_id, before, expected)
     }
 
     #[cfg(test)]

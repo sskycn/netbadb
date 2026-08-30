@@ -69,7 +69,10 @@ pub(crate) fn inspect_prepared_transactions(records: &[WalRecord]) -> Vec<Prepar
                     transaction.state = PreparedTransactionState::RolledBack;
                 }
             }
-            WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } | WalRecordKind::Abort => {}
+            WalRecordKind::Begin
+            | WalRecordKind::PageUpdate { .. }
+            | WalRecordKind::Abort
+            | WalRecordKind::PageGenerationReservation => {}
         }
     }
     let mut inspected = transactions.into_values().collect::<Vec<_>>();
@@ -374,6 +377,8 @@ impl RecoveryManager {
                     page_count,
                 });
             }
+            let after_page = Page::from_bytes(*page_id, **after);
+            let generation = after_page.allocation_generation()?;
             let current_lsn = if page_id.0 == page_count {
                 pages.allocate_page()?;
                 None
@@ -382,13 +387,15 @@ impl RecoveryManager {
                 if current.bytes().iter().all(|byte| *byte == 0) {
                     None
                 } else {
+                    // A high pageLSN never licenses crossing allocations. Old
+                    // completed rollback records were filtered before this point.
+                    current.validate_allocation(generation)?;
                     current.page_lsn()?
                 }
             };
             if current_lsn.is_some_and(|page_lsn| page_lsn >= record.lsn) {
                 continue;
             }
-            let after_page = Page::from_bytes(*page_id, **after);
             pages.write_page(&after_page)?;
             report.pages_redone += 1;
             operations += 1;
@@ -422,11 +429,21 @@ impl RecoveryManager {
                 });
             }
             if let WalRecordKind::PageUpdate {
-                page_id, before, ..
+                page_id,
+                before,
+                after,
             } = &record.kind
             {
                 Self::reject_metadata_page(*page_id, record.lsn)?;
                 let page_count = pages.page_count();
+                if page_id.0 < page_count {
+                    let current = pages.read_page(*page_id)?;
+                    if current.bytes().iter().any(|b| *b != 0) {
+                        current.validate_allocation(
+                            Page::from_bytes(*page_id, **after).allocation_generation()?,
+                        )?;
+                    }
+                }
                 match validate_before_image(*page_id, before)? {
                     ValidatedBeforeImage::NewPage => {
                         if page_id.0 > page_count {

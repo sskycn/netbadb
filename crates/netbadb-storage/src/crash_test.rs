@@ -14,6 +14,10 @@ pub(crate) const EXIT_CODE: i32 = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCrashPoint {
+    PageGenerationReserved,
+    RollbackAfterTrailingRemoval,
+    GenerationReuseBeforeCommit,
+    GenerationReuseAfterFlush,
     ActiveWriterAfterDurablePageFlush,
     CommittedWithoutDataFlush,
     CommitAfterAppend,
@@ -57,6 +61,10 @@ pub(crate) enum TestCrashPoint {
 impl TestCrashPoint {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::RollbackAfterTrailingRemoval => "rollback-after-trailing-removal",
+            Self::GenerationReuseBeforeCommit => "generation-reuse-before-commit",
+            Self::GenerationReuseAfterFlush => "generation-reuse-after-flush",
+            Self::PageGenerationReserved => "page-generation-reserved",
             Self::ActiveWriterAfterDurablePageFlush => "active-writer-after-durable-page-flush",
             Self::CommittedWithoutDataFlush => "committed-without-data-flush",
             Self::CommitAfterAppend => "commit-after-append",
@@ -101,8 +109,22 @@ impl TestCrashPoint {
     }
 }
 
+thread_local! { static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+pub(crate) fn without_crash<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SUPPRESSED.set(self.0);
+        }
+    }
+    let _reset = Reset(SUPPRESSED.replace(true));
+    operation()
+}
+
 pub(crate) fn is_enabled(point: TestCrashPoint) -> bool {
-    std::env::var_os(CHILD_ENV).as_deref() == Some(OsStr::new("1"))
+    !SUPPRESSED.get()
+        && std::env::var_os(CHILD_ENV).as_deref() == Some(OsStr::new("1"))
         && std::env::var_os(POINT_ENV).as_deref() == Some(OsStr::new(point.as_str()))
 }
 

@@ -5331,7 +5331,7 @@ mod tests {
         assert_eq!(
             planned_statement_index(&select),
             Some((
-                AccessPathId(team.handle.meta_page.0),
+                AccessPathId(team.handle.meta_page.page_id().0),
                 &ScalarValue::Int64(10)
             ))
         );
@@ -5352,7 +5352,7 @@ mod tests {
         assert_eq!(
             planned_statement_index(&deterministic),
             Some((
-                AccessPathId(team.handle.meta_page.0),
+                AccessPathId(team.handle.meta_page.page_id().0),
                 &ScalarValue::Int64(10)
             ))
         );
@@ -5363,7 +5363,10 @@ mod tests {
             .expect("plan IS NULL");
         assert_eq!(
             planned_statement_index(&is_null),
-            Some((AccessPathId(team.handle.meta_page.0), &ScalarValue::Null))
+            Some((
+                AccessPathId(team.handle.meta_page.page_id().0),
+                &ScalarValue::Null
+            ))
         );
         assert_eq!(
             database
@@ -5422,7 +5425,7 @@ mod tests {
         assert_eq!(
             planned_statement_index(&update),
             Some((
-                AccessPathId(team.handle.meta_page.0),
+                AccessPathId(team.handle.meta_page.page_id().0),
                 &ScalarValue::Int64(10)
             ))
         );
@@ -5465,7 +5468,7 @@ mod tests {
         assert_eq!(
             planned_statement_index(&delete),
             Some((
-                AccessPathId(team.handle.meta_page.0),
+                AccessPathId(team.handle.meta_page.page_id().0),
                 &ScalarValue::Int64(10)
             ))
         );
@@ -5501,7 +5504,7 @@ mod tests {
         assert_eq!(
             planned_statement_index(&reopened_plan),
             Some((
-                AccessPathId(name.handle.meta_page.0),
+                AccessPathId(name.handle.meta_page.page_id().0),
                 &ScalarValue::Text("Ada".into())
             ))
         );
@@ -5546,14 +5549,17 @@ mod tests {
         assert_eq!(
             planned_statement_index(&database.plan_source(source).expect("fallback plan")),
             Some((
-                AccessPathId(team.handle.meta_page.0),
+                AccessPathId(team.handle.meta_page.page_id().0),
                 &ScalarValue::Int64(0)
             ))
         );
         database.analyze(TableId(9)).expect("analyze table");
         assert_eq!(
             planned_statement_index(&database.plan_source(source).expect("costed plan")),
-            Some((AccessPathId(id.handle.meta_page.0), &ScalarValue::Int64(42)))
+            Some((
+                AccessPathId(id.handle.meta_page.page_id().0),
+                &ScalarValue::Int64(42)
+            ))
         );
 
         assert_eq!(
@@ -5571,7 +5577,10 @@ mod tests {
                     .plan_source(stale_source)
                     .expect("stale statistics plan")
             ),
-            Some((AccessPathId(id.handle.meta_page.0), &ScalarValue::Int64(1)))
+            Some((
+                AccessPathId(id.handle.meta_page.page_id().0),
+                &ScalarValue::Int64(1)
+            ))
         );
         assert_eq!(
             database

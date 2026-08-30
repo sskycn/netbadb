@@ -326,24 +326,27 @@ the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
-IndexCatalog payload v6 preserves the root-only durable `next_index_id` and
-active/retired definitions, and adds minimal pending ownership records. Versions
-2/3/4/5 remain readable; v1 is rejected. New registered indexes use owner-tagged
-BTree v2. Raw trees and existing v1 registered trees retain v1 semantics.
-DROP retires entries transactionally; only commit removes active paths.
-`Database::compact_index_catalog` preserves active names, identity, statistics,
-ID high-water, and pending `(IndexId, meta PageId)` ownership. Full-page WAL
-undo/redo protects the rewrite, including legacy expansion.
+IndexCatalog payload v7 preserves the root-only `next_index_id`, active/retired
+definitions, and pending roots with explicit legacy or generation-aware handles.
+Versions 2 through 6 remain readable; v1 is rejected. New registered indexes use
+BTree v3 with owner, allocation generation, and complete generation-bearing root,
+child, and leaf-next references. Existing v1/v2 trees remain read/write legacy;
+raw trees remain v1. No tree bytes are silently upgraded.
 
-Physical reclaim is **deferred**. New owned retirements are tracked durably,
-including unreachable merge pages; only legacy retirements and obsolete catalog
-continuations can still be permanently abandoned. No committed page is freed,
-truncated or reused. `Database::inspect_index_reclaim` provides a quiescent admin
-inventory with full page/payload validation, reachability and alias checks.
-Owner tags reject cross-owner stale handles but do not replace PageGeneration:
-provisional identities can repeat on rollback, and buffer/WAL references remain
-PageId-only. Historical pre-owner orphan pages remain permanent.
-See [the Round 9 ownership audit](docs/index-reclaim-round9.md).
+`PageId` is a physical slot, while `PageRef` identifies one allocation of it.
+Page generations come from synced WAL reservation records, survive rollback and
+checkpoint, and are checked before buffer access or recovery pageLSN comparison.
+Rollback/reappend of the same PageId and IndexId rejects old handles. Catalog
+compaction preserves full pending references and the independent IndexId boundary.
+`Database::inspect_index_reclaim` reports validated allocation identities,
+reachability and orphans; normal Inspection JSON and wire protocols are unchanged.
+
+Physical reclaim remains **deferred**. PageManager is append-only except existing
+rollback trailing removal, now coordinated with buffer invalidation. No retired
+page truncation, free-list, middle-hole reuse or Heap page reuse is implemented.
+Heap RowId slot generations and catalog PageId links do not provide general
+allocation reuse safety. See [the Round 10 architecture and proof](docs/page-generation-round10.md)
+and [the historical Round 9 ownership audit](docs/index-reclaim-round9.md).
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`, plus a durable append-only transaction-status file named

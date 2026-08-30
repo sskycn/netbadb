@@ -5,7 +5,8 @@ use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::{HeapStorage, wal_alternate_path, wal_path};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
-const MAX_INPUT_SIZE: usize = 64 * 1024;
+// A complete CREATE/rollback/re-CREATE history includes eight full-page images.
+const MAX_INPUT_SIZE: usize = 128 * 1024;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT_SIZE {

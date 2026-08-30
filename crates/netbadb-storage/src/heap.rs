@@ -29,7 +29,7 @@ use crate::{PreparedTransaction, PreparedTxnResolution};
 
 #[path = "index_ownership.rs"]
 mod ownership;
-pub use ownership::IndexReclaimReport;
+pub use ownership::{IndexPageAllocation, IndexReclaimReport};
 
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_MANAGED_PAGE: PageId = PageId(1);
@@ -455,7 +455,8 @@ impl HeapStorage {
                 WalRecordKind::Begin
                 | WalRecordKind::PageUpdate { .. }
                 | WalRecordKind::Abort
-                | WalRecordKind::Prepare { .. } => {}
+                | WalRecordKind::Prepare { .. }
+                | WalRecordKind::PageGenerationReservation => {}
             }
         }
         let (recovered_catalog_root, recovered_storage_id) =
@@ -1029,14 +1030,17 @@ impl HeapStorage {
                 return Err(IndexError::TableStatisticsOnContinuation { page_id }.into());
             }
             for record in node.pending {
-                if record.meta_page.0 >= page_count {
-                    return Err(IndexError::InvalidChild(record.meta_page).into());
+                if record.meta_page.page_id().0 >= page_count {
+                    return Err(IndexError::InvalidChild(record.meta_page.page_id()).into());
                 }
                 pending.push(record);
             }
             for entry in node.entries {
-                if entry.definition.handle.meta_page.0 >= page_count {
-                    return Err(IndexError::InvalidChild(entry.definition.handle.meta_page).into());
+                if entry.definition.handle.meta_page.page_id().0 >= page_count {
+                    return Err(IndexError::InvalidChild(
+                        entry.definition.handle.meta_page.page_id(),
+                    )
+                    .into());
                 }
                 if let Some(statistics) = entry.statistics.as_ref() {
                     validate_catalog_index_statistics(table_statistics.as_ref(), statistics)?;
@@ -1668,7 +1672,9 @@ impl HeapStorage {
                 &plan.spec,
                 &values[plan.column_position],
                 Page::single_payload_capacity()
-                    - if plan.definition.handle.owner.is_some() {
+                    - if plan.definition.handle.meta_page.generation().is_some() {
+                        32
+                    } else if plan.definition.handle.owner.is_some() {
                         netbadb_index::BTREE_OWNER_SIZE
                     } else {
                         0
@@ -1792,7 +1798,9 @@ impl HeapStorage {
                 &plan.spec,
                 new_key,
                 Page::single_payload_capacity()
-                    - if plan.definition.handle.owner.is_some() {
+                    - if plan.definition.handle.meta_page.generation().is_some() {
+                        32
+                    } else if plan.definition.handle.owner.is_some() {
                         netbadb_index::BTREE_OWNER_SIZE
                     } else {
                         0
@@ -3613,7 +3621,7 @@ mod tests {
             .expect("catalog payload")
             .to_vec();
         assert_eq!(u32::from_le_bytes(payload[16..20].try_into().unwrap()), 1);
-        let entry = payload[48..96].to_vec();
+        let entry = payload[48..104].to_vec();
         payload[16..20].copy_from_slice(&2_u32.to_le_bytes());
         payload.extend_from_slice(&entry);
         page.replace_single_payload(PageType::IndexCatalog, &payload)
@@ -3804,7 +3812,7 @@ mod tests {
         let schema = indexed_table();
         let mut storage = HeapStorage::create_with_buffer_pool_size(&path, schema.clone(), 1)
             .expect("create heap");
-        storage.index_catalog_payload_capacity = Some(96);
+        storage.index_catalog_payload_capacity = Some(104);
         for row in indexed_rows() {
             storage.insert(&row).expect("insert row");
         }
@@ -3843,7 +3851,7 @@ mod tests {
         let path = test_path("analyze-empty");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(96);
+        storage.index_catalog_payload_capacity = Some(104);
         storage.create_index(ColumnId(2)).expect("create index");
         storage
             .create_index(ColumnId(3))
@@ -3886,7 +3894,7 @@ mod tests {
         let path = test_path("catalog-table-stats-on-continuation");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(96);
+        storage.index_catalog_payload_capacity = Some(104);
         storage.create_index(ColumnId(2)).expect("first index");
         storage.create_index(ColumnId(3)).expect("overflow index");
         storage.close().expect("close catalog");
@@ -4440,7 +4448,7 @@ mod tests {
         );
         let mut storage = HeapStorage::create(&path, text_table.clone()).expect("create heap");
         storage
-            .insert(&[ScalarValue::Text("x".repeat(4_005))])
+            .insert(&[ScalarValue::Text("x".repeat(3_981))])
             .expect("insert valid heap row");
         let baseline_pages = storage.buffer.page_count();
         let baseline_wal = storage.wal_records().expect("baseline WAL").len();
@@ -4463,7 +4471,7 @@ mod tests {
         assert!(
             storage
                 .btree()
-                .lookup(definition.handle, &ScalarValue::Text("x".repeat(4_005)))
+                .lookup(definition.handle, &ScalarValue::Text("x".repeat(3_981)))
                 .expect("lookup maximum key")
                 .iter()
                 .any(|row_id| storage.read_row(*row_id).is_ok())
@@ -4512,7 +4520,7 @@ mod tests {
         let path = test_path("index-catalog-overflow");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(96);
+        storage.index_catalog_payload_capacity = Some(104);
         let first = storage.create_index(ColumnId(1)).expect("first index");
         let second = storage.create_index(ColumnId(2)).expect("overflow index");
         assert_eq!(storage.indexes(), &[first.clone(), second.clone()]);
@@ -4612,7 +4620,7 @@ mod tests {
                     "wrong-handle" => {
                         node.entries[0].definition.handle = BTreeHandle {
                             owner: None,
-                            meta_page: FIRST_HEAP_PAGE,
+                            meta_page: netbadb_index::BTreePageRef::Legacy(FIRST_HEAP_PAGE),
                         };
                     }
                     "cycle" => node.next_catalog = Some(PageId(1)),
@@ -8326,6 +8334,9 @@ mod tests {
                 let mut storage = HeapStorage::open(path, table()).expect("open child heap");
                 let _transaction = storage.begin_transaction().expect("append partial Begin");
             }
+            "page-generation-reserve" | "page-generation-reuse" | "page-generation-rollback" => {
+                maintenance::generation_crash_child(case, path)
+            }
             other => panic!("unknown process crash case `{other}`"),
         }
         panic!("process crash child `{case}` returned without reaching its crash point");
@@ -8413,7 +8424,7 @@ mod tests {
         storage.checkpoint().unwrap();
         storage.close().unwrap();
         let mut pages = PageManager::open(&path).unwrap();
-        let mut page = pages.read_page(index.handle.meta_page).unwrap();
+        let mut page = pages.read_page(index.handle.meta_page.page_id()).unwrap();
         page.replace_single_payload(PageType::BTreeMeta, b"unreachable malformed tree")
             .unwrap();
         page.refresh_checksum();
@@ -8488,7 +8499,7 @@ mod tests {
         let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
         let old = storage.indexes()[0].clone();
         assert_eq!(old.name.as_ref(), Some(&name));
-        assert_eq!(old.id.0, old.handle.meta_page.0);
+        assert_eq!(old.id.0, old.handle.meta_page.page_id().0);
         storage.drop_index(old.id).unwrap();
         storage.close().unwrap();
         let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
@@ -8520,7 +8531,7 @@ mod tests {
                 assert!(
                     original
                         .iter()
-                        .all(|index| index.id.0 == index.handle.meta_page.0)
+                        .all(|index| index.id.0 == index.handle.meta_page.page_id().0)
                 );
                 if analyze_first {
                     storage.analyze().unwrap();
@@ -8692,7 +8703,7 @@ mod tests {
         let path = test_path(case);
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(96);
+        storage.index_catalog_payload_capacity = Some(104);
         for row in indexed_rows() {
             storage.insert(&row).expect("insert baseline row");
         }
@@ -9291,5 +9302,6 @@ mod tests {
         use super::*;
         include!("index_maintenance_tests.rs");
         include!("index_reclaim_tests.rs");
+        include!("page_generation_tests.rs");
     }
 }

@@ -550,11 +550,23 @@ PostgreSQL-only metadata absent from NetbaDB remain unsupported.
   reclaim, arbitrary reuse, free-list and global PageGeneration migration are
   deferred; 100-cycle tests report retained growth honestly.
 
-Round 10 should be **Generation-Safe Page Reference Architecture**, covering
-durable allocation generation, rollback high-water, Page/WAL/recovery identity,
-BTree links, buffer invalidation, Heap references and migration. Do not begin
-table DDL until allocator/reclaim lifecycle is proven. See
-[the Round 9 implementation audit](index-reclaim-round9.md).
+### Storage Lifecycle Round 10 — generation-safe reference foundation
+
+- Durable WAL reservation LSNs provide strongly typed PageGeneration without a
+  second high-water. Reservations survive rollback/crash/checkpoint.
+- Registered BTree v3 pages carry owner/generation; handle/root/child/leaf links
+  persist full PageRef. Catalog v7 preserves active and pending refs.
+- Exact buffer reads, pin checks and invalidation protect rollback/reappend;
+  recovery checks allocation identity before pageLSN. Same-owner stale handles,
+  multi-level references, dirty frames, and process-crash reuse are tested.
+- Legacy BTree v1/v2 and catalogs v2-v6 remain supported with explicit legacy
+  references. Raw v1 trees and Heap/RowId allocation reuse remain outside scope.
+- No physical reclaim, tail reclamation, free-list or table DDL is added.
+
+Next: checkpoint-gated **owned retired BTree suffix** reclamation only, with
+explicit crash-safe truncation/publication ordering and buffer admission. Catalog
+or Heap suffix members must exclude a candidate; do not generalize to free-list
+reuse. See [Round 10](page-generation-round10.md).
 
 ## Phase 6 — SDK and tooling
 
