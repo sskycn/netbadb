@@ -11,7 +11,7 @@ use crate::{PAGE_SIZE, Page};
 
 const WAL_MAGIC: &[u8; 4] = b"NBWL";
 const RECORD_MAGIC: &[u8; 4] = b"WREC";
-const RECORD_FORMAT_VERSION: u16 = 3;
+const RECORD_FORMAT_VERSION: u16 = 4;
 const RECORD_HEADER_SIZE: usize = 40;
 const PAGE_UPDATE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE * 2;
 const PREPARE_PAYLOAD_SIZE: usize = 8;
@@ -261,6 +261,9 @@ impl From<std::io::Error> for WalError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecordKind {
     Begin,
+    /// The durable logical LSN of this record reserves one page generation.
+    /// No page image or physical undo; checkpoint preserves the logical end.
+    PageGenerationReservation,
     PageUpdate {
         page_id: PageId,
         before: Box<[u8; PAGE_SIZE]>,
@@ -279,6 +282,7 @@ impl WalRecordKind {
     const fn tag(&self) -> u8 {
         match self {
             Self::Begin => 1,
+            Self::PageGenerationReservation => 7,
             Self::PageUpdate { .. } => 2,
             Self::Commit => 3,
             Self::Abort => 4,
@@ -291,7 +295,11 @@ impl WalRecordKind {
         match self {
             Self::PageUpdate { .. } => PAGE_UPDATE_PAYLOAD_SIZE,
             Self::Prepare { .. } => PREPARE_PAYLOAD_SIZE,
-            Self::Begin | Self::Commit | Self::Abort | Self::RollbackComplete => 0,
+            Self::Begin
+            | Self::Commit
+            | Self::Abort
+            | Self::RollbackComplete
+            | Self::PageGenerationReservation => 0,
         }
     }
 }
@@ -742,6 +750,11 @@ impl WalManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_generation_exhaustion(&mut self) {
+        self.next_lsn = Lsn(u64::MAX);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_flush_failure(&mut self) {
         self.fail_next_flush = true;
     }
@@ -943,7 +956,14 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
         .ok_or(WalError::LsnOverflow)?;
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(RECORD_MAGIC);
-    bytes.extend_from_slice(&RECORD_FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(
+        &if matches!(record.kind, WalRecordKind::PageGenerationReservation) {
+            RECORD_FORMAT_VERSION
+        } else {
+            3_u16
+        }
+        .to_le_bytes(),
+    );
     bytes.push(record.kind.tag());
     bytes.push(0);
     bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
@@ -1112,6 +1132,7 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
             3 => WalRecordKind::Commit,
             4 => WalRecordKind::Abort,
             5 => WalRecordKind::RollbackComplete,
+            7 => WalRecordKind::PageGenerationReservation,
             6 => {
                 let payload = &record_bytes[RECORD_HEADER_SIZE..];
                 let database_txn_id = DatabaseTxnId(read_u64(payload, 0));
@@ -1156,7 +1177,7 @@ fn validate_record_framing(
         return Err(WalError::InvalidRecordMagic { lsn });
     }
     let record_version = read_u16(record_header, 4);
-    if record_version != RECORD_FORMAT_VERSION {
+    if !matches!(record_version, 3 | RECORD_FORMAT_VERSION) {
         return Err(WalError::UnsupportedRecordVersion {
             lsn,
             version: record_version,
@@ -1166,6 +1187,12 @@ fn validate_record_framing(
         return Err(WalError::InvalidReservedBytes);
     }
     let record_type = record_header[6];
+    if record_version < 4 && record_type == 7 {
+        return Err(WalError::UnknownRecordType {
+            lsn,
+            tag: record_type,
+        });
+    }
     let expected_payload = expected_payload_for_tag(lsn, record_type)?;
     let total_len = read_u32(record_header, 8);
     if total_len < RECORD_HEADER_SIZE as u32 {
@@ -1215,11 +1242,14 @@ fn validate_partial_record_header(lsn: Lsn, bytes: &[u8]) -> Result<(), WalError
     }
     if bytes.len() >= 6 {
         let version = read_u16(bytes, 4);
-        if version != RECORD_FORMAT_VERSION {
+        if !matches!(version, 3 | RECORD_FORMAT_VERSION) {
             return Err(WalError::UnsupportedRecordVersion { lsn, version });
         }
     }
     if bytes.len() >= 7 {
+        if read_u16(bytes, 4) < 4 && bytes[6] == 7 {
+            return Err(WalError::UnknownRecordType { lsn, tag: 7 });
+        }
         expected_payload_for_tag(lsn, bytes[6])?;
     }
     if bytes.len() >= 8 && bytes[7] != 0 {
@@ -1255,7 +1285,7 @@ fn validate_partial_record_header(lsn: Lsn, bytes: &[u8]) -> Result<(), WalError
 
 fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
     match tag {
-        1 | 3 | 4 | 5 => Ok(0),
+        1 | 3 | 4 | 5 | 7 => Ok(0),
         2 => Ok(PAGE_UPDATE_PAYLOAD_SIZE as u32),
         6 => Ok(PREPARE_PAYLOAD_SIZE as u32),
         tag => Err(WalError::UnknownRecordType { lsn, tag }),
@@ -1272,7 +1302,9 @@ enum WalTxnState {
 
 fn wal_state_after(kind: &WalRecordKind) -> WalTxnState {
     match kind {
-        WalRecordKind::Begin | WalRecordKind::PageUpdate { .. } => WalTxnState::Active,
+        WalRecordKind::Begin
+        | WalRecordKind::PageUpdate { .. }
+        | WalRecordKind::PageGenerationReservation => WalTxnState::Active,
         WalRecordKind::Prepare { .. } => WalTxnState::Prepared,
         WalRecordKind::Abort => WalTxnState::Aborting,
         WalRecordKind::Commit | WalRecordKind::RollbackComplete => WalTxnState::Complete,
@@ -1298,7 +1330,7 @@ fn validate_transaction_tag_sequence(
         (state, record_type),
         (None, 1)
             | (Some(WalTxnState::Active), 2..=4)
-            | (Some(WalTxnState::Active), 6)
+            | (Some(WalTxnState::Active), 6..=7)
             | (Some(WalTxnState::Prepared), 3..=4)
             | (Some(WalTxnState::Aborting), 5)
     );
@@ -1345,6 +1377,27 @@ fn validate_page_images(lsn: Lsn, kind: &WalRecordKind) -> Result<(), WalError> 
             lsn,
             image: "after",
         })?;
+    let generation =
+        after_page
+            .allocation_generation()
+            .map_err(|_| WalError::InvalidPageImage {
+                lsn,
+                image: "after allocation",
+            })?;
+    if generation.is_some_and(|generation| generation.0 >= lsn.0) {
+        return Err(WalError::InvalidPageImage {
+            lsn,
+            image: "unreserved allocation",
+        });
+    }
+    if before.iter().any(|byte| *byte != 0) {
+        Page::from_bytes(*page_id, **before)
+            .validate_allocation(generation)
+            .map_err(|_| WalError::InvalidPageImage {
+                lsn,
+                image: "changed allocation",
+            })?;
+    }
     if page_lsn != Some(lsn) {
         return Err(WalError::InvalidPageLsn {
             record_lsn: lsn,

@@ -186,6 +186,31 @@ pub(crate) fn validate_before_image(
 }
 
 impl Page {
+    /// Allocation identity exists only for generation-aware BTree pages. Heap,
+    /// catalog and legacy BTree pages do not claim allocation reuse safety.
+    pub(crate) fn allocation_generation(
+        &self,
+    ) -> Result<Option<netbadb_types::PageGeneration>, StorageError> {
+        if self.bytes().iter().all(|byte| *byte == 0) {
+            return Ok(None);
+        }
+        let kind = self.header()?.page_type;
+        match kind {
+            PageType::BTreeMeta | PageType::BTreeInternal | PageType::BTreeLeaf => Ok(
+                netbadb_index::btree_page_generation(self.single_payload(kind)?)?,
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn validate_allocation(
+        &self,
+        expected: Option<netbadb_types::PageGeneration>,
+    ) -> Result<(), StorageError> {
+        netbadb_index::validate_btree_generation(expected, self.allocation_generation()?)?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn zero(id: PageId) -> Self {
         Self {

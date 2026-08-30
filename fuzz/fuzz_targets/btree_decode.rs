@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use netbadb_index::{
-    IndexSpec, btree_page_owner, decode_internal_owned, decode_leaf_owned, decode_meta,
-    encode_internal_owned, encode_leaf_owned, encode_meta,
+    IndexSpec, btree_page_generation, btree_page_owner, decode_internal_owned, decode_leaf_owned,
+    decode_meta, encode_internal_generation, encode_leaf_generation, encode_meta,
 };
 use netbadb_types::{PhysicalType, SemanticType};
 
@@ -23,6 +23,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(owner) = btree_page_owner(payload) else {
         return;
     };
+    let generation = btree_page_generation(payload).expect("validated identity");
     match kind % 3 {
         0 => {
             if let Ok(node) = decode_meta(payload) {
@@ -34,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(
                     decode_leaf_owned(
                         &spec,
-                        &encode_leaf_owned(&spec, &node, owner).unwrap(),
+                        &encode_leaf_generation(&spec, &node, owner, generation).unwrap(),
                         owner
                     )
                     .unwrap(),
@@ -59,7 +60,7 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(
                     decode_internal_owned(
                         &spec,
-                        &encode_internal_owned(&spec, &node, owner).unwrap(),
+                        &encode_internal_generation(&spec, &node, owner, generation).unwrap(),
                         owner
                     )
                     .unwrap(),

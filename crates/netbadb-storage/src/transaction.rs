@@ -488,6 +488,35 @@ impl Transaction {
         }
     }
 
+    /// Reserve before publishing any pointer. Complete synced WAL records survive
+    /// rollback; a failed reservation may consume a generation but never returns it.
+    pub(crate) fn reserve_page_generation(
+        &mut self,
+    ) -> Result<netbadb_types::PageGeneration, StorageError> {
+        self.acquire_writer()?;
+        let mut wal = self
+            .wal
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?;
+        let lsn = wal
+            .append(
+                self.id,
+                Some(self.last_lsn),
+                WalRecordKind::PageGenerationReservation,
+            )
+            .map_err(|error| match error {
+                crate::WalError::LsnOverflow => {
+                    StorageError::Index(netbadb_index::IndexError::PageGenerationExhausted)
+                }
+                other => other.into(),
+            })?;
+        self.last_lsn = lsn;
+        wal.flush_through(lsn)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::PageGenerationReserved);
+        Ok(netbadb_types::PageGeneration(lsn.0))
+    }
+
     pub(crate) fn log_page_update(
         &mut self,
         before: &Page,
@@ -572,9 +601,15 @@ impl Transaction {
             match &record.kind {
                 WalRecordKind::Begin => break,
                 WalRecordKind::PageUpdate {
-                    page_id, before, ..
+                    page_id,
+                    before,
+                    after,
                 } => {
-                    self.buffer.undo_page_update(*page_id, before)?;
+                    self.buffer.undo_page_update(
+                        *page_id,
+                        before,
+                        Page::from_bytes(*page_id, **after).allocation_generation()?,
+                    )?;
                     #[cfg(test)]
                     crate::crash_test::maybe_crash(
                         crate::crash_test::TestCrashPoint::RollbackAfterPageUndo,
@@ -591,7 +626,7 @@ impl Transaction {
                         }
                     }
                 }
-                WalRecordKind::Prepare { .. } => {}
+                WalRecordKind::Prepare { .. } | WalRecordKind::PageGenerationReservation => {}
                 WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::RollbackComplete => {
                     return Err(TransactionError::InvalidRollbackChain {
                         txn_id: self.id,

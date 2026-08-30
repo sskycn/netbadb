@@ -2,8 +2,8 @@
 use std::collections::{HashMap, HashSet};
 
 use netbadb_index::{
-    BTreeHandle, IndexError, IndexSpec, MetaNode, btree_page_owner, decode_index_catalog,
-    decode_internal_owned, decode_leaf_owned, decode_meta,
+    BTreeHandle, BTreePageRef, IndexError, IndexSpec, MetaNode, btree_page_owner,
+    decode_index_catalog, decode_internal_owned, decode_leaf_owned, decode_meta,
 };
 use netbadb_types::{IndexId, PageId, PhysicalType, SemanticType};
 
@@ -14,6 +14,10 @@ use crate::{PageType, StorageError};
 /// observations, never permission to truncate. Physical reclamation is deferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReclaimReport {
+    /// Exact identities of all generation-aware owned pages, including orphans.
+    pub allocations: Vec<IndexPageAllocation>,
+    /// Pending roots retain explicit legacy versus generation-aware identity.
+    pub pending: Vec<netbadb_index::RetiredIndexOwnership>,
     pub catalog_pages: u64,
     pub database_pages: u64,
     pub active_indexes: u64,
@@ -37,6 +41,14 @@ pub struct IndexReclaimReport {
     pub obsolete_catalog_pages: u64,
 }
 
+/// One validated allocation in the unstable maintenance inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPageAllocation {
+    pub owner: IndexId,
+    pub page_ref: netbadb_types::PageRef,
+    pub reachable: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OwnershipClass {
     Active,
@@ -47,6 +59,7 @@ pub(super) enum OwnershipClass {
 
 #[derive(Debug)]
 pub(super) struct BTreePageOwnership {
+    pub generation: Option<netbadb_types::PageGeneration>,
     pub page_id: PageId,
     pub owner: Option<IndexId>,
     pub kind: PageType,
@@ -77,11 +90,18 @@ impl HeapStorage {
         let count = self.buffer.page_count();
         let mut reserved = HashSet::from([PageId(0)]);
         let mut metadata = HashMap::<PageId, MetaNode>::new();
-        let mut page_owners = HashMap::<PageId, (PageType, Option<IndexId>)>::new();
+        let mut page_owners = HashMap::<
+            PageId,
+            (
+                PageType,
+                Option<IndexId>,
+                Option<netbadb_types::PageGeneration>,
+            ),
+        >::new();
         let mut owner_roots = HashMap::<IndexId, PageId>::new();
         let mut obsolete_catalog_pages = 0;
         // First pass validates every Page CRC/layout and discovers full metadata
-        // payloads. A v2 orphan must resolve to an authoritative retained owner.
+        // payloads. An owned orphan must resolve to an authoritative retained owner.
         for number in 1..count {
             let id = PageId(number);
             let guard = self.buffer.read_page(id)?;
@@ -105,19 +125,26 @@ impl HeapStorage {
                             return Err(IndexError::DuplicateIndexId(owner).into());
                         }
                     }
-                    page_owners.insert(id, (kind, meta.owner));
+                    page_owners.insert(id, (kind, meta.owner, meta.generation));
                     metadata.insert(id, meta);
                 }
                 PageType::BTreeLeaf | PageType::BTreeInternal => {
                     let owner = btree_page_owner(page.single_payload(kind)?)?;
-                    page_owners.insert(id, (kind, owner));
+                    page_owners.insert(
+                        id,
+                        (
+                            kind,
+                            owner,
+                            netbadb_index::btree_page_generation(page.single_payload(kind)?)?,
+                        ),
+                    );
                 }
             }
         }
         let mut roots = HashMap::<PageId, (BTreeHandle, OwnershipClass)>::new();
         for entry in &catalog.entries {
             roots.insert(
-                entry.definition.handle.meta_page,
+                entry.definition.handle.meta_page.page_id(),
                 (
                     entry.definition.handle,
                     if entry.retired {
@@ -130,7 +157,7 @@ impl HeapStorage {
         }
         for record in &catalog.pending {
             roots.insert(
-                record.meta_page,
+                record.meta_page.page_id(),
                 (
                     BTreeHandle {
                         owner: Some(record.index_id),
@@ -150,7 +177,7 @@ impl HeapStorage {
                     (
                         BTreeHandle {
                             owner: None,
-                            meta_page: *id,
+                            meta_page: BTreePageRef::Legacy(*id),
                         },
                         OwnershipClass::UnregisteredLegacy,
                     ),
@@ -162,11 +189,11 @@ impl HeapStorage {
         let mut legacy_retired = HashSet::new();
         // Deterministic order makes malformed overlap diagnostics reproducible.
         let mut ordered_roots: Vec<_> = roots.values().cloned().collect();
-        ordered_roots.sort_by_key(|(handle, _)| handle.meta_page.0);
+        ordered_roots.sort_by_key(|(handle, _)| handle.meta_page.page_id().0);
         for (handle, class) in ordered_roots {
             let pages = self.btree().collect_owned_pages(handle, &mut reserved)?;
             let meta = metadata
-                .get(&handle.meta_page)
+                .get(&handle.meta_page.page_id())
                 .ok_or(IndexError::InvalidNodeType)?;
             if let Some(owner) = handle.owner {
                 classes.insert(owner, class);
@@ -209,6 +236,13 @@ impl HeapStorage {
                     .get(&owner)
                     .ok_or(IndexError::UnknownIndexId(owner))?;
                 let meta = metadata.get(root).ok_or(IndexError::InvalidNodeType)?;
+                // Orphans have no incoming ref, but cannot change the format
+                // of their owning tree. Every v3 orphan must self-identify.
+                if netbadb_index::btree_page_generation(payload)?.is_some()
+                    != meta.generation.is_some()
+                {
+                    return Err(IndexError::InvalidNodeType.into());
+                }
                 validate_node_payload(kind, payload, &meta.spec, Some(owner), &page_owners)?;
             } else if let Some((_, spec)) = reachable.get(&id) {
                 validate_node_payload(kind, payload, spec, None, &page_owners)?;
@@ -238,6 +272,7 @@ impl HeapStorage {
                 retired.insert(id);
             }
             observations.push(BTreePageOwnership {
+                generation: netbadb_index::btree_page_generation(payload)?,
                 page_id: id,
                 owner,
                 kind,
@@ -250,6 +285,20 @@ impl HeapStorage {
             suffix -= 1;
         }
         let report = IndexReclaimReport {
+            allocations: observations
+                .iter()
+                .filter_map(|page| {
+                    Some(IndexPageAllocation {
+                        owner: page.owner?,
+                        page_ref: netbadb_types::PageRef {
+                            page_id: page.page_id,
+                            generation: page.generation?,
+                        },
+                        reachable: page.reachable,
+                    })
+                })
+                .collect(),
+            pending: catalog.pending.clone(),
             catalog_pages: catalog.pages.len() as u64,
             database_pages: count,
             active_indexes: catalog
@@ -266,8 +315,15 @@ impl HeapStorage {
             legacy_unreclaimable_indexes: catalog
                 .entries
                 .iter()
-                .filter(|entry| entry.retired && entry.definition.handle.owner.is_none())
-                .count() as u64,
+                .filter(|entry| {
+                    entry.retired && entry.definition.handle.meta_page.generation().is_none()
+                })
+                .count() as u64
+                + catalog
+                    .pending
+                    .iter()
+                    .filter(|p| p.meta_page.generation().is_none())
+                    .count() as u64,
             next_index_id: catalog.next_index_id,
             owned_pages: observations
                 .iter()
@@ -324,16 +380,25 @@ fn validate_node_payload(
     payload: &[u8],
     spec: &IndexSpec,
     owner: Option<IndexId>,
-    pages: &HashMap<PageId, (PageType, Option<IndexId>)>,
+    pages: &HashMap<
+        PageId,
+        (
+            PageType,
+            Option<IndexId>,
+            Option<netbadb_types::PageGeneration>,
+        ),
+    >,
 ) -> Result<(), StorageError> {
-    let check = |id: PageId, leaf: bool| -> Result<(), StorageError> {
-        let (kind, actual) = pages.get(&id).ok_or(IndexError::InvalidChild(id))?;
+    let check = |reference: BTreePageRef, leaf: bool| -> Result<(), StorageError> {
+        let id = reference.page_id();
+        let (kind, actual, generation) = pages.get(&id).ok_or(IndexError::InvalidChild(id))?;
         if (leaf && *kind != PageType::BTreeLeaf)
             || (!leaf && !matches!(kind, PageType::BTreeLeaf | PageType::BTreeInternal))
         {
             return Err(IndexError::InvalidNodeType.into());
         }
         netbadb_index::validate_btree_owner(owner, *actual)?;
+        netbadb_index::validate_btree_generation(reference.generation(), *generation)?;
         Ok(())
     };
     match kind {

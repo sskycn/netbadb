@@ -99,7 +99,19 @@ impl std::error::Error for IndexNameError {}
 /// page, LSM structure, or columnar segment from its numeric representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AccessPathId(pub u64);
-id_type!(PageId, u64);
+/// Physical slot number in one file; not an allocation identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PageId(pub u64);
+/// Identity of one allocation incarnation. Zero is reserved and rejected by codecs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PageGeneration(pub u64);
+/// Generation-safe reference within one storage file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageRef {
+    pub page_id: PageId,
+    pub generation: PageGeneration,
+}
+
 id_type!(FrameId, u32);
 id_type!(TxnId, u64);
 id_type!(Lsn, u64);

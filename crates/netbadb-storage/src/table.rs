@@ -1249,7 +1249,7 @@ impl TableStorage {
 }
 
 fn access_path_id(handle: BTreeHandle) -> AccessPathId {
-    AccessPathId(handle.meta_page.0)
+    AccessPathId(handle.meta_page.page_id().0)
 }
 
 fn registered_handle(

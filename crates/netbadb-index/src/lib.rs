@@ -8,13 +8,14 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_types::{
-    ColumnId, IndexId, IndexName, PageId, PhysicalType, RowId, ScalarValue, SemanticType,
+    ColumnId, IndexId, IndexName, PageGeneration, PageId, PageRef, PhysicalType, RowId,
+    ScalarValue, SemanticType,
 };
 
-pub const BTREE_FORMAT_VERSION: u16 = 2;
+pub const BTREE_FORMAT_VERSION: u16 = 3;
 /// Additional bytes reserved on every owned BTree page.
 pub const BTREE_OWNER_SIZE: usize = 8;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 6;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 7;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -24,8 +25,8 @@ const ROW_ID_SIZE: usize = 8 + 2 + 4;
 const MIN_ENTRY_SIZE: usize = 1 + ROW_ID_SIZE;
 const INDEX_CATALOG_MAGIC: &[u8; 4] = b"NBIC";
 const INDEX_CATALOG_HEADER_SIZE: usize = 48;
-const INDEX_CATALOG_ENTRY_HEADER_SIZE: usize = 48;
-const INDEX_CATALOG_PENDING_SIZE: usize = 16;
+const INDEX_CATALOG_ENTRY_HEADER_SIZE: usize = 56;
+const INDEX_CATALOG_PENDING_SIZE: usize = 32;
 const LEGACY_INDEX_CATALOG_ENTRY_HEADER_SIZE: usize = 40;
 const LEGACY_INDEX_CATALOG_FORMAT_VERSION: u16 = 2;
 
@@ -51,14 +52,38 @@ pub struct IndexRange {
     pub upper: IndexBound,
 }
 
-/// Physical tree reference with an exact expected owner. Valid across reopen
-/// within the same storage file. It is not a generation-safe reference: handles
-/// returned in a transaction must be discarded on rollback.
+/// Persistent tree reference. Legacy is explicit and never assigned a fabricated
+/// generation. A generation-aware pointer cannot be downgraded during traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BTreePageRef {
+    Legacy(PageId),
+    Allocated(PageRef),
+}
+
+impl BTreePageRef {
+    #[must_use]
+    pub const fn page_id(self) -> PageId {
+        match self {
+            Self::Legacy(id) => id,
+            Self::Allocated(reference) => reference.page_id,
+        }
+    }
+    #[must_use]
+    pub const fn generation(self) -> Option<PageGeneration> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Allocated(reference) => Some(reference.generation),
+        }
+    }
+}
+
+/// Owner and exact allocation reference, valid across reopen in one storage.
+/// Legacy handles retain their historical non-generation-safe semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BTreeHandle {
-    /// None accepts only legacy v1, never an arbitrary owned page.
+    /// None accepts only unowned v1, never an arbitrary owned page.
     pub owner: Option<IndexId>,
-    pub meta_page: PageId,
+    pub meta_page: BTreePageRef,
 }
 
 /// Persistent single-column registered-index identity.
@@ -101,7 +126,7 @@ pub struct IndexCatalogEntry {
 
 /// One page in the persistent registration chain, with WAL-backed retirement.
 ///
-/// The version-6 `NBIC` payload uses a fixed-width little-endian header and
+/// The version-7 `NBIC` payload uses a fixed-width little-endian header and
 /// entry prefixes plus bounded optional names. Storage validates chain rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
@@ -127,12 +152,13 @@ impl IndexCatalogNode {
     }
 }
 
-/// A v2 tree pending physical reclamation. Presence means Pending; no names,
+/// An owned tree pending physical reclamation. Legacy refs remain unreclaimable.
+/// Presence means Pending; no names,
 /// columns or statistics survive catalog compaction. Both IDs are nonzero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetiredIndexOwnership {
     pub index_id: IndexId,
-    pub meta_page: PageId,
+    pub meta_page: BTreePageRef,
 }
 
 /// Complete ordered identity of one leaf entry or persistent internal fence.
@@ -148,39 +174,46 @@ pub struct IndexEntryKey {
 /// Alias emphasizing the leaf-entry role of [`IndexEntryKey`].
 pub type IndexEntry = IndexEntryKey;
 
-/// Decoded `NBTM` v1 (legacy) or v2 (owned) metadata payload.
+/// Decoded `NBTM` v1 (raw), v2 (owned legacy), or v3 (generation-aware) metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaNode {
+    pub generation: Option<PageGeneration>,
     pub owner: Option<IndexId>,
-    pub root_page: PageId,
+    pub root_page: BTreePageRef,
     pub height: u32,
     pub spec: IndexSpec,
 }
 
-/// Decoded `NBTL` version-1 leaf payload.
+/// Decoded `NBTL` v1/v2/v3 leaf payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafNode {
     pub entries: Vec<IndexEntry>,
-    pub next_leaf: Option<PageId>,
+    pub next_leaf: Option<BTreePageRef>,
 }
 
 /// One full-key routing boundary and its right child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InternalSeparator {
     pub key: IndexEntryKey,
-    pub right_child: PageId,
+    pub right_child: BTreePageRef,
 }
 
-/// Decoded `NBTI` version-1 internal payload.
+/// Decoded `NBTI` v1/v2/v3 internal payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InternalNode {
-    pub first_child: PageId,
+    pub first_child: BTreePageRef,
     pub separators: Vec<InternalSeparator>,
 }
 
 /// Typed failures from index validation, codecs, ordering, and split logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexError {
+    InvalidPageGeneration(PageGeneration),
+    PageGenerationExhausted,
+    GenerationMismatch {
+        expected: Option<PageGeneration>,
+        actual: Option<PageGeneration>,
+    },
     InvalidMagic {
         expected: [u8; 4],
         actual: [u8; 4],
@@ -288,6 +321,14 @@ pub enum IndexError {
 impl fmt::Display for IndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidPageGeneration(generation) => {
+                write!(formatter, "invalid page generation {}", generation.0)
+            }
+            Self::PageGenerationExhausted => formatter.write_str("page generation exhausted"),
+            Self::GenerationMismatch { expected, actual } => write!(
+                formatter,
+                "stale page reference: generation mismatch (expected {expected:?}, actual {actual:?})"
+            ),
             Self::InvalidMagic { expected, actual } => write!(
                 formatter,
                 "B+Tree payload magic {:?} does not match {:?}",
@@ -578,7 +619,7 @@ impl LeafNode {
 
 impl InternalNode {
     /// Returns the child at a separator boundary position.
-    pub fn child(&self, position: usize) -> Result<PageId, IndexError> {
+    pub fn child(&self, position: usize) -> Result<BTreePageRef, IndexError> {
         let child = if position == 0 {
             self.first_child
         } else {
@@ -602,7 +643,7 @@ impl InternalNode {
         &mut self,
         child_position: usize,
         key: IndexEntryKey,
-        right_child: PageId,
+        right_child: BTreePageRef,
     ) -> Result<(), IndexError> {
         validate_child(right_child)?;
         if child_position > self.separators.len() {
@@ -691,11 +732,11 @@ pub fn ensure_entry_fits(
     ensure_key_fits(spec, &entry.key, capacity)
 }
 
-/// Encodes one validated `NBTM` v1/v2 payload.
+/// Encodes one validated `NBTM` v1/v2/v3 payload.
 pub fn encode_meta(node: &MetaNode) -> Result<Vec<u8>, IndexError> {
     validate_meta(node)?;
-    let mut output = common_header(META_MAGIC, node.owner)?;
-    output.extend_from_slice(&node.root_page.0.to_le_bytes());
+    let mut output = common_header_generation(META_MAGIC, node.owner, node.generation)?;
+    encode_page_ref(&mut output, Some(node.root_page), node.generation.is_some())?;
     output.extend_from_slice(&node.height.to_le_bytes());
     output.push(physical_type_tag(node.spec.data_type.physical));
     output.push(u8::from(node.spec.nullable));
@@ -706,11 +747,14 @@ pub fn encode_meta(node: &MetaNode) -> Result<Vec<u8>, IndexError> {
     Ok(output)
 }
 
-/// Decodes and fully validates one `NBTM` v1/v2 payload.
+/// Decodes and fully validates one `NBTM` v1/v2/v3 payload.
 pub fn decode_meta(input: &[u8]) -> Result<MetaNode, IndexError> {
     let mut decoder = Decoder::new(input);
     let owner = decoder.common_header(META_MAGIC)?;
-    let root_page = PageId(decoder.u64()?);
+    let generation = decoder.generation;
+    let root_page = decoder
+        .page_ref(generation.is_some())?
+        .ok_or(IndexError::InvalidChild(PageId(0)))?;
     let height = decoder.u32()?;
     let physical = physical_type_from_tag(decoder.u8()?)?;
     let nullable = decode_bool_flag(decoder.u8()?).map_err(IndexError::InvalidNullable)?;
@@ -730,6 +774,7 @@ pub fn decode_meta(input: &[u8]) -> Result<MetaNode, IndexError> {
         )));
     }
     let node = MetaNode {
+        generation,
         owner,
         root_page,
         height,
@@ -756,11 +801,21 @@ pub fn encode_leaf_owned(
     node: &LeafNode,
     owner: Option<IndexId>,
 ) -> Result<Vec<u8>, IndexError> {
+    encode_leaf_generation(spec, node, owner, None)
+}
+
+/// Encodes an exact v1/v2/v3 identity; all links must match its format.
+pub fn encode_leaf_generation(
+    spec: &IndexSpec,
+    node: &LeafNode,
+    owner: Option<IndexId>,
+    generation: Option<PageGeneration>,
+) -> Result<Vec<u8>, IndexError> {
     validate_leaf(spec, node)?;
     let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
-    let mut output = common_header(LEAF_MAGIC, owner)?;
+    let mut output = common_header_generation(LEAF_MAGIC, owner, generation)?;
     output.extend_from_slice(&count.to_le_bytes());
-    output.extend_from_slice(&node.next_leaf.map_or(0, |page| page.0).to_le_bytes());
+    encode_page_ref(&mut output, node.next_leaf, generation.is_some())?;
     for entry in &node.entries {
         encode_entry(&mut output, entry)?;
     }
@@ -782,8 +837,7 @@ pub fn decode_leaf_owned(
     let actual = decoder.common_header(LEAF_MAGIC)?;
     validate_btree_owner(expected, actual)?;
     let count = decoder.count(MIN_ENTRY_SIZE)?;
-    let raw_next = decoder.u64()?;
-    let next_leaf = (raw_next != 0).then_some(PageId(raw_next));
+    let next_leaf = decoder.page_ref(decoder.generation.is_some())?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         entries.push(decoder.entry(spec)?);
@@ -805,14 +859,28 @@ pub fn encode_internal_owned(
     node: &InternalNode,
     owner: Option<IndexId>,
 ) -> Result<Vec<u8>, IndexError> {
+    encode_internal_generation(spec, node, owner, None)
+}
+
+/// Encodes an exact v1/v2/v3 identity; all links must match its format.
+pub fn encode_internal_generation(
+    spec: &IndexSpec,
+    node: &InternalNode,
+    owner: Option<IndexId>,
+    generation: Option<PageGeneration>,
+) -> Result<Vec<u8>, IndexError> {
     validate_internal(spec, node)?;
     let count = u32::try_from(node.separators.len()).map_err(|_| IndexError::LengthOverflow)?;
-    let mut output = common_header(INTERNAL_MAGIC, owner)?;
+    let mut output = common_header_generation(INTERNAL_MAGIC, owner, generation)?;
     output.extend_from_slice(&count.to_le_bytes());
-    output.extend_from_slice(&node.first_child.0.to_le_bytes());
+    encode_page_ref(&mut output, Some(node.first_child), generation.is_some())?;
     for separator in &node.separators {
         encode_entry(&mut output, &separator.key)?;
-        output.extend_from_slice(&separator.right_child.0.to_le_bytes());
+        encode_page_ref(
+            &mut output,
+            Some(separator.right_child),
+            generation.is_some(),
+        )?;
     }
     Ok(output)
 }
@@ -832,12 +900,16 @@ pub fn decode_internal_owned(
     let actual = decoder.common_header(INTERNAL_MAGIC)?;
     validate_btree_owner(expected, actual)?;
     let count = decoder.count(MIN_ENTRY_SIZE + 8)?;
-    let first_child = PageId(decoder.u64()?);
+    let first_child = decoder
+        .page_ref(decoder.generation.is_some())?
+        .ok_or(IndexError::InvalidChild(PageId(0)))?;
     let mut separators = Vec::with_capacity(count);
     for _ in 0..count {
         separators.push(InternalSeparator {
             key: decoder.entry(spec)?,
-            right_child: PageId(decoder.u64()?),
+            right_child: decoder
+                .page_ref(decoder.generation.is_some())?
+                .ok_or(IndexError::InvalidChild(PageId(0)))?,
         });
     }
     decoder.finish()?;
@@ -853,8 +925,8 @@ pub fn decode_internal_owned(
 pub fn split_leaf(
     spec: &IndexSpec,
     entries: Vec<IndexEntry>,
-    old_next: Option<PageId>,
-    right_page: PageId,
+    old_next: Option<BTreePageRef>,
+    right_page: BTreePageRef,
     capacity: usize,
 ) -> Result<(LeafNode, LeafNode, IndexEntryKey), IndexError> {
     validate_child(right_page)?;
@@ -874,8 +946,8 @@ pub fn split_leaf(
             entries: entries[split..].to_vec(),
             next_leaf: old_next,
         };
-        let left_size = encode_leaf(spec, &left)?.len();
-        let right_size = encode_leaf(spec, &right)?.len();
+        let left_size = leaf_encoded_len(spec, &left, right_page.generation().is_some())?;
+        let right_size = leaf_encoded_len(spec, &right, right_page.generation().is_some())?;
         if left_size <= capacity && right_size <= capacity {
             let imbalance = left_size.abs_diff(right_size);
             if best.is_none_or(|(best_imbalance, best_split)| {
@@ -916,7 +988,7 @@ pub fn split_internal(
     validate_internal(spec, &node)?;
     if node.separators.is_empty() {
         return Err(IndexError::NodeTooLarge {
-            size: encode_internal(spec, &node)?.len(),
+            size: internal_encoded_len(spec, &node)?,
             capacity,
         });
     }
@@ -931,8 +1003,8 @@ pub fn split_internal(
             first_child: promoted.right_child,
             separators: node.separators[middle + 1..].to_vec(),
         };
-        let left_size = encode_internal(spec, &left)?.len();
-        let right_size = encode_internal(spec, &right)?.len();
+        let left_size = internal_encoded_len(spec, &left)?;
+        let right_size = internal_encoded_len(spec, &right)?;
         if left_size <= capacity && right_size <= capacity {
             let imbalance = left_size.abs_diff(right_size);
             if best.is_none_or(|(best_imbalance, best_middle)| {
@@ -944,7 +1016,7 @@ pub fn split_internal(
     }
     let Some((_, middle)) = best else {
         return Err(IndexError::NodeTooLarge {
-            size: encode_internal(spec, &node)?.len(),
+            size: internal_encoded_len(spec, &node)?,
             capacity,
         });
     };
@@ -980,8 +1052,12 @@ pub fn merge_leaves_if_fits(
         entries,
         next_leaf: right.next_leaf,
     };
-    let payload = encode_leaf(spec, &merged)?;
-    Ok((payload.len() <= capacity).then_some(merged))
+    Ok((leaf_encoded_len(
+        spec,
+        &merged,
+        left.next_leaf.is_some_and(|p| p.generation().is_some()),
+    )? <= capacity)
+        .then_some(merged))
 }
 
 /// Merges adjacent internal nodes through their parent's persistent fence when
@@ -1013,11 +1089,10 @@ pub fn merge_internals_if_fits(
         first_child: left.first_child,
         separators,
     };
-    let payload = encode_internal(spec, &merged)?;
-    Ok((payload.len() <= capacity).then_some(merged))
+    Ok((internal_encoded_len(spec, &merged)? <= capacity).then_some(merged))
 }
 
-/// Encodes one explicit version-6 mutable index catalog page payload.
+/// Encodes one explicit version-7 mutable index catalog page payload.
 pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
     if let Some(next) = node.next_catalog {
         validate_child(next)?;
@@ -1095,7 +1170,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         )
         .map_err(|_| IndexError::LengthOverflow)?;
         output.extend_from_slice(&name_length.to_le_bytes());
-        output.extend_from_slice(&entry.definition.handle.meta_page.0.to_le_bytes());
+        output.extend_from_slice(&entry.definition.handle.meta_page.page_id().0.to_le_bytes());
         let statistics = entry.statistics.unwrap_or(IndexStatistics {
             distinct_non_null_keys: 0,
             null_count: 0,
@@ -1105,21 +1180,45 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         output.extend_from_slice(&statistics.null_count.to_le_bytes());
         output.extend_from_slice(&statistics.tree_height.to_le_bytes());
         output.push(u8::from(entry.retired));
-        output.push(u8::from(entry.definition.handle.owner.is_some()));
+        output.push(
+            if entry.definition.handle.meta_page.generation().is_some() {
+                2
+            } else {
+                u8::from(entry.definition.handle.owner.is_some())
+            },
+        );
         output.extend_from_slice(&[0; 2]);
         output.extend_from_slice(&entry.definition.id.0.to_le_bytes());
+        output.extend_from_slice(
+            &entry
+                .definition
+                .handle
+                .meta_page
+                .generation()
+                .map_or(0, |g| g.0)
+                .to_le_bytes(),
+        );
         if let Some(name) = &entry.definition.name {
             output.extend_from_slice(name.as_str().as_bytes());
         }
     }
     for pending in &node.pending {
         output.extend_from_slice(&pending.index_id.0.to_le_bytes());
-        output.extend_from_slice(&pending.meta_page.0.to_le_bytes());
+        output.extend_from_slice(&pending.meta_page.page_id().0.to_le_bytes());
+        output.extend_from_slice(
+            &pending
+                .meta_page
+                .generation()
+                .map_or(0, |g| g.0)
+                .to_le_bytes(),
+        );
+        output.push(u8::from(pending.meta_page.generation().is_some()));
+        output.extend_from_slice(&[0; 7]);
     }
     Ok(output)
 }
 
-/// Decodes legacy version-2/version-3/version-4/version-5 or current version-6 index catalog payloads.
+/// Decodes legacy version-2 through version-6 or current version-7 index catalog payloads.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -1131,7 +1230,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         });
     }
     let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
-    if !matches!(version, 2 | 3 | 4 | 5 | INDEX_CATALOG_FORMAT_VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | 6 | INDEX_CATALOG_FORMAT_VERSION) {
         return Err(IndexError::UnsupportedVersion(version));
     }
     let table_statistics_present = decode_statistics_presence(input[6])?;
@@ -1162,8 +1261,10 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
             .try_into()
             .map_err(|_| IndexError::Truncated)?,
     ) as usize;
-    let entry_header_size = if version >= 4 {
+    let entry_header_size = if version >= 7 {
         INDEX_CATALOG_ENTRY_HEADER_SIZE
+    } else if version >= 4 {
+        48
     } else {
         LEGACY_INDEX_CATALOG_ENTRY_HEADER_SIZE
     };
@@ -1307,12 +1408,29 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
                         match chunk[37] {
                             0 => None,
                             1 => Some(id),
+                            2 if version >= 7 => Some(id),
                             _ => return Err(IndexError::InvalidReservedBytes),
                         }
                     } else {
                         None
                     },
-                    meta_page,
+                    meta_page: if version >= 7 && chunk[37] == 2 {
+                        let generation = PageGeneration(u64::from_le_bytes(
+                            chunk[48..56]
+                                .try_into()
+                                .map_err(|_| IndexError::Truncated)?,
+                        ));
+                        validate_generation(generation)?;
+                        BTreePageRef::Allocated(PageRef {
+                            page_id: meta_page,
+                            generation,
+                        })
+                    } else {
+                        if version >= 7 && chunk[48..56].iter().any(|b| *b != 0) {
+                            return Err(IndexError::InvalidReservedBytes);
+                        }
+                        BTreePageRef::Legacy(meta_page)
+                    },
                 },
             },
             statistics,
@@ -1327,17 +1445,47 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
     } else {
         0
     };
-    if pending_count > input.len().saturating_sub(offset) / INDEX_CATALOG_PENDING_SIZE {
+    let pending_size = if version >= 7 {
+        INDEX_CATALOG_PENDING_SIZE
+    } else {
+        16
+    };
+    if pending_count > input.len().saturating_sub(offset) / pending_size {
         return Err(IndexError::Truncated);
     }
     let mut pending = Vec::with_capacity(pending_count);
     for _ in 0..pending_count {
-        let mut decoder = Decoder::new(&input[offset..offset + INDEX_CATALOG_PENDING_SIZE]);
+        let mut decoder = Decoder::new(&input[offset..offset + pending_size]);
         pending.push(RetiredIndexOwnership {
             index_id: IndexId(decoder.u64()?),
-            meta_page: PageId(decoder.u64()?),
+            meta_page: {
+                let page_id = PageId(decoder.u64()?);
+                let raw = if version >= 7 { decoder.u64()? } else { 0 };
+                let generated = if version >= 7 {
+                    let tag = decoder.u8()?;
+                    if decoder.array::<7>()? != [0; 7] || tag > 1 {
+                        return Err(IndexError::InvalidReservedBytes);
+                    }
+                    tag == 1
+                } else {
+                    false
+                };
+                if generated {
+                    let generation = PageGeneration(raw);
+                    validate_generation(generation)?;
+                    BTreePageRef::Allocated(PageRef {
+                        page_id,
+                        generation,
+                    })
+                } else {
+                    if raw != 0 {
+                        return Err(IndexError::InvalidReservedBytes);
+                    }
+                    BTreePageRef::Legacy(page_id)
+                }
+            },
         });
-        offset += INDEX_CATALOG_PENDING_SIZE;
+        offset += pending_size;
     }
     validate_pending_ownership(next_index_id, &entries, &pending)?;
     if offset != input.len() {
@@ -1396,12 +1544,12 @@ pub fn validate_pending_ownership(
         }
         if entries
             .iter()
-            .any(|entry| entry.definition.handle.meta_page == record.meta_page)
+            .any(|entry| entry.definition.handle.meta_page.page_id() == record.meta_page.page_id())
             || pending[..position]
                 .iter()
-                .any(|other| other.meta_page == record.meta_page)
+                .any(|other| other.meta_page.page_id() == record.meta_page.page_id())
         {
-            return Err(IndexError::DuplicateTreeHandle(record.meta_page));
+            return Err(IndexError::DuplicateTreeHandle(record.meta_page.page_id()));
         }
     }
     Ok(())
@@ -1479,6 +1627,9 @@ pub fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), Ind
     for (position, entry) in entries.iter().enumerate() {
         let definition = &entry.definition;
         validate_child(definition.handle.meta_page)?;
+        if definition.handle.meta_page.generation().is_some() && definition.handle.owner.is_none() {
+            return Err(IndexError::InvalidIndexId(definition.id));
+        }
         if definition.handle.owner.is_some() {
             validate_btree_owner(Some(definition.id), definition.handle.owner)?;
         }
@@ -1492,8 +1643,12 @@ pub fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), Ind
             if existing.definition.id == definition.id {
                 return Err(IndexError::DuplicateIndexId(definition.id));
             }
-            if existing.definition.handle.meta_page == definition.handle.meta_page {
-                return Err(IndexError::DuplicateTreeHandle(definition.handle.meta_page));
+            if existing.definition.handle.meta_page.page_id()
+                == definition.handle.meta_page.page_id()
+            {
+                return Err(IndexError::DuplicateTreeHandle(
+                    definition.handle.meta_page.page_id(),
+                ));
             }
             if !existing.retired && !entry.retired {
                 if existing.definition.column_id == definition.column_id {
@@ -1536,12 +1691,52 @@ pub fn validate_btree_owner(
     Ok(())
 }
 
-fn common_header(magic: &[u8; 4], owner: Option<IndexId>) -> Result<Vec<u8>, IndexError> {
-    let mut output = Vec::with_capacity(COMMON_HEADER_SIZE + BTREE_OWNER_SIZE);
+/// Reads the identity prefix; callers still decode the complete payload.
+pub fn btree_page_generation(input: &[u8]) -> Result<Option<PageGeneration>, IndexError> {
+    let magic = input.get(..4).ok_or(IndexError::Truncated)?;
+    let expected = match magic {
+        b"NBTM" => META_MAGIC,
+        b"NBTL" => LEAF_MAGIC,
+        b"NBTI" => INTERNAL_MAGIC,
+        _ => return Err(IndexError::InvalidNodeType),
+    };
+    let mut decoder = Decoder::new(input);
+    decoder.common_header(expected)?;
+    Ok(decoder.generation)
+}
+
+pub fn validate_btree_generation(
+    expected: Option<PageGeneration>,
+    actual: Option<PageGeneration>,
+) -> Result<(), IndexError> {
+    if expected != actual {
+        return Err(IndexError::GenerationMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+fn validate_generation(generation: PageGeneration) -> Result<(), IndexError> {
+    if generation.0 == 0 {
+        return Err(IndexError::InvalidPageGeneration(generation));
+    }
+    Ok(())
+}
+
+fn common_header_generation(
+    magic: &[u8; 4],
+    owner: Option<IndexId>,
+    generation: Option<PageGeneration>,
+) -> Result<Vec<u8>, IndexError> {
+    let mut output = Vec::with_capacity(24);
     output.extend_from_slice(magic);
+    if generation.is_some() && owner.is_none() {
+        return Err(IndexError::InvalidIndexId(IndexId(0)));
+    }
     output.extend_from_slice(
-        &if owner.is_some() {
-            BTREE_FORMAT_VERSION
+        &if generation.is_some() {
+            3_u16
+        } else if owner.is_some() {
+            2_u16
         } else {
             1_u16
         }
@@ -1554,7 +1749,73 @@ fn common_header(magic: &[u8; 4], owner: Option<IndexId>) -> Result<Vec<u8>, Ind
         }
         output.extend_from_slice(&owner.0.to_le_bytes());
     }
+    if let Some(generation) = generation {
+        validate_generation(generation)?;
+        output.extend_from_slice(&generation.0.to_le_bytes());
+    }
     Ok(output)
+}
+
+fn encode_page_ref(
+    output: &mut Vec<u8>,
+    reference: Option<BTreePageRef>,
+    generated: bool,
+) -> Result<(), IndexError> {
+    if let Some(reference) = reference {
+        validate_child(reference)?;
+        if reference.generation().is_some() != generated {
+            return Err(IndexError::InvalidNodeType);
+        }
+    }
+    output.extend_from_slice(&reference.map_or(0, |r| r.page_id().0).to_le_bytes());
+    if generated {
+        output.extend_from_slice(
+            &reference
+                .and_then(BTreePageRef::generation)
+                .map_or(0, |g| g.0)
+                .to_le_bytes(),
+        );
+    }
+    Ok(())
+}
+
+impl From<PageId> for BTreePageRef {
+    fn from(page: PageId) -> Self {
+        Self::Legacy(page)
+    }
+}
+
+/// Encoded size excluding owner/self-generation prefix, including pointer width.
+pub fn leaf_encoded_len(
+    spec: &IndexSpec,
+    node: &LeafNode,
+    generated: bool,
+) -> Result<usize, IndexError> {
+    validate_leaf(spec, node)?;
+    if node
+        .next_leaf
+        .is_some_and(|p| p.generation().is_some() != generated)
+    {
+        return Err(IndexError::InvalidNodeType);
+    }
+    Ok(if generated { 8 } else { 0 } + encoded_entries_size(&node.entries)?)
+}
+
+/// Encoded size excluding owner/self-generation prefix, including pointer widths.
+pub fn internal_encoded_len(spec: &IndexSpec, node: &InternalNode) -> Result<usize, IndexError> {
+    validate_internal(spec, node)?;
+    let width = if node.first_child.generation().is_some() {
+        16
+    } else {
+        8
+    };
+    node.separators
+        .iter()
+        .try_fold(COMMON_HEADER_SIZE + 4 + width, |size, separator| {
+            size.checked_add(encoded_entry_len(&separator.key)?)
+                .and_then(|size| size.checked_add(width))
+                .ok_or(IndexError::LengthOverflow)
+        })
 }
 
 fn validate_meta(node: &MetaNode) -> Result<(), IndexError> {
@@ -1575,7 +1836,7 @@ fn validate_meta(node: &MetaNode) -> Result<(), IndexError> {
 }
 
 fn validate_leaf(spec: &IndexSpec, node: &LeafNode) -> Result<(), IndexError> {
-    if node.next_leaf == Some(PageId(0)) {
+    if node.next_leaf.is_some_and(|p| p.page_id().0 == 0) {
         return Err(IndexError::InvalidChild(PageId(0)));
     }
     for entry in &node.entries {
@@ -1612,7 +1873,12 @@ fn validate_entry_order<'a>(
     Ok(())
 }
 
-fn validate_child(page: PageId) -> Result<(), IndexError> {
+fn validate_child(page: impl Into<BTreePageRef>) -> Result<(), IndexError> {
+    let reference = page.into();
+    if let Some(generation) = reference.generation() {
+        validate_generation(generation)?;
+    }
+    let page = reference.page_id();
     if page.0 == 0 {
         Err(IndexError::InvalidChild(page))
     } else {
@@ -1725,13 +1991,18 @@ fn decode_bool_flag(value: u8) -> Result<bool, u8> {
 }
 
 struct Decoder<'a> {
+    generation: Option<PageGeneration>,
     input: &'a [u8],
     offset: usize,
 }
 
 impl<'a> Decoder<'a> {
     fn new(input: &'a [u8]) -> Self {
-        Self { input, offset: 0 }
+        Self {
+            input,
+            offset: 0,
+            generation: None,
+        }
     }
 
     fn common_header(&mut self, expected: &[u8; 4]) -> Result<Option<IndexId>, IndexError> {
@@ -1743,7 +2014,7 @@ impl<'a> Decoder<'a> {
             });
         }
         let version = self.u16()?;
-        if !matches!(version, 1 | BTREE_FORMAT_VERSION) {
+        if !matches!(version, 1 | 2 | BTREE_FORMAT_VERSION) {
             return Err(IndexError::UnsupportedVersion(version));
         }
         if self.u16()? != 0 {
@@ -1756,7 +2027,33 @@ impl<'a> Decoder<'a> {
         if owner.0 == 0 {
             return Err(IndexError::InvalidIndexId(owner));
         }
+        if version >= 3 {
+            let generation = PageGeneration(self.u64()?);
+            validate_generation(generation)?;
+            self.generation = Some(generation);
+        }
         Ok(Some(owner))
+    }
+
+    fn page_ref(&mut self, generated: bool) -> Result<Option<BTreePageRef>, IndexError> {
+        let page_id = PageId(self.u64()?);
+        let raw_generation = if generated { self.u64()? } else { 0 };
+        if page_id.0 == 0 {
+            if raw_generation != 0 {
+                return Err(IndexError::InvalidChild(page_id));
+            }
+            return Ok(None);
+        }
+        if generated {
+            let generation = PageGeneration(raw_generation);
+            validate_generation(generation)?;
+            Ok(Some(BTreePageRef::Allocated(PageRef {
+                page_id,
+                generation,
+            })))
+        } else {
+            Ok(Some(BTreePageRef::Legacy(page_id)))
+        }
     }
 
     fn count(&mut self, minimum_size: usize) -> Result<usize, IndexError> {
@@ -1914,8 +2211,9 @@ mod tests {
             nullable: true,
         };
         let meta = MetaNode {
+            generation: None,
             owner: None,
-            root_page: PageId(9),
+            root_page: crate::BTreePageRef::Legacy(PageId(9)),
             height: 3,
             spec: named.clone(),
         };
@@ -1925,17 +2223,17 @@ mod tests {
                 entry(ScalarValue::Null, 1, 0),
                 entry(ScalarValue::UInt64(7), 2, 0),
             ],
-            next_leaf: Some(PageId(11)),
+            next_leaf: Some(crate::BTreePageRef::Legacy(PageId(11))),
         };
         assert_eq!(
             decode_leaf(&named, &encode_leaf(&named, &leaf).unwrap()).unwrap(),
             leaf
         );
         let internal = InternalNode {
-            first_child: PageId(5),
+            first_child: crate::BTreePageRef::Legacy(PageId(5)),
             separators: vec![InternalSeparator {
                 key: entry(ScalarValue::UInt64(7), 2, 0),
-                right_child: PageId(6),
+                right_child: crate::BTreePageRef::Legacy(PageId(6)),
             }],
         };
         assert_eq!(
@@ -2054,16 +2352,19 @@ mod tests {
         let spec = spec(PhysicalType::Text, false);
         let left = LeafNode {
             entries: vec![entry(ScalarValue::Text("a".into()), 1, 0)],
-            next_leaf: Some(PageId(9)),
+            next_leaf: Some(crate::BTreePageRef::Legacy(PageId(9))),
         };
         let right = LeafNode {
             entries: vec![entry(ScalarValue::Text("b".into()), 2, 0)],
-            next_leaf: Some(PageId(10)),
+            next_leaf: Some(crate::BTreePageRef::Legacy(PageId(10))),
         };
         let merged = merge_leaves_if_fits(&spec, &left, &right, 128)
             .unwrap()
             .unwrap();
-        assert_eq!(merged.next_leaf, Some(PageId(10)));
+        assert_eq!(
+            merged.next_leaf,
+            Some(crate::BTreePageRef::Legacy(PageId(10)))
+        );
         assert_eq!(merged.entries.len(), 2);
         assert!(
             merge_leaves_if_fits(&spec, &left, &right, 32)
@@ -2072,20 +2373,23 @@ mod tests {
         );
 
         let left_internal = InternalNode {
-            first_child: PageId(1),
+            first_child: crate::BTreePageRef::Legacy(PageId(1)),
             separators: vec![],
         };
         let right_internal = InternalNode {
-            first_child: PageId(2),
+            first_child: crate::BTreePageRef::Legacy(PageId(2)),
             separators: vec![],
         };
         let fence = entry(ScalarValue::Text("b".into()), 2, 0);
         let merged = merge_internals_if_fits(&spec, &left_internal, &fence, &right_internal, 128)
             .unwrap()
             .unwrap();
-        assert_eq!(merged.first_child, PageId(1));
+        assert_eq!(merged.first_child, crate::BTreePageRef::Legacy(PageId(1)));
         assert_eq!(merged.separators[0].key, fence);
-        assert_eq!(merged.separators[0].right_child, PageId(2));
+        assert_eq!(
+            merged.separators[0].right_child,
+            crate::BTreePageRef::Legacy(PageId(2))
+        );
     }
 
     #[test]
@@ -2100,7 +2404,7 @@ mod tests {
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
                     owner: None,
-                    meta_page: PageId(9),
+                    meta_page: crate::BTreePageRef::Legacy(PageId(9)),
                 },
             },
             statistics: None,
@@ -2139,14 +2443,14 @@ mod tests {
         let mut fresh = node.entries[0].clone();
         fresh.retired = false;
         fresh.definition.id = IndexId(18);
-        fresh.definition.handle.meta_page = PageId(19);
+        fresh.definition.handle.meta_page = crate::BTreePageRef::Legacy(PageId(19));
         node.entries.push(fresh.clone());
         assert_eq!(
             decode_index_catalog(&encode_index_catalog(&node).unwrap()).unwrap(),
             node
         );
         fresh.definition.id = IndexId(20);
-        fresh.definition.handle.meta_page = PageId(21);
+        fresh.definition.handle.meta_page = crate::BTreePageRef::Legacy(PageId(21));
         node.entries.push(fresh);
         assert!(matches!(
             encode_index_catalog(&node),
@@ -2178,7 +2482,7 @@ mod tests {
                     column_id: ColumnId(7),
                     handle: BTreeHandle {
                         owner: None,
-                        meta_page: PageId(11),
+                        meta_page: crate::BTreePageRef::Legacy(PageId(11)),
                     },
                 },
                 statistics: Some(IndexStatistics {
@@ -2194,7 +2498,7 @@ mod tests {
         legacy[4..6].copy_from_slice(&LEGACY_INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
         legacy[7] = 0;
         legacy[40..48].fill(0);
-        legacy.drain(88..96);
+        legacy.drain(88..104);
         let mut legacy_node = node.clone();
         legacy_node.next_index_id = None;
         assert_eq!(decode_index_catalog(&legacy).unwrap(), legacy_node);
@@ -2203,7 +2507,7 @@ mod tests {
         let named_bytes = encode_index_catalog(&named).unwrap();
         let named_golden = [
             b"NBIC".as_slice(),
-            &[6, 0, 1, 1],
+            &[7, 0, 1, 1],
             &[9, 0, 0, 0, 0, 0, 0, 0],
             &[1, 0, 0, 0],
             &[0, 0, 0, 0],
@@ -2218,6 +2522,7 @@ mod tests {
             &[2, 0, 0, 0],
             &[0, 0, 0, 0],
             &[11, 0, 0, 0, 0, 0, 0, 0],
+            &[0; 8],
             b"users_name_idx".as_slice(),
         ]
         .concat();
@@ -2225,7 +2530,7 @@ mod tests {
         v3_named[4..6].copy_from_slice(&3_u16.to_le_bytes());
         v3_named[7] = 0;
         v3_named[40..48].fill(0);
-        v3_named.drain(88..96);
+        v3_named.drain(88..104);
         let mut legacy_named = named.clone();
         legacy_named.next_index_id = None;
         assert_eq!(decode_index_catalog(&v3_named).unwrap(), legacy_named);
@@ -2369,7 +2674,14 @@ mod tests {
             entry(ScalarValue::Text("b".repeat(5)), 2, 0),
             entry(ScalarValue::Text("c".repeat(60)), 3, 0),
         ];
-        let (left, right, promoted) = split_leaf(&spec, entries, None, PageId(8), 125).unwrap();
+        let (left, right, promoted) = split_leaf(
+            &spec,
+            entries,
+            None,
+            crate::BTreePageRef::Legacy(PageId(8)),
+            125,
+        )
+        .unwrap();
         assert!(!left.entries.is_empty());
         assert!(!right.entries.is_empty());
         assert!(encode_leaf(&spec, &left).unwrap().len() <= 125);
@@ -2416,8 +2728,9 @@ mod tests {
         )
         .unwrap();
         let valid_meta = encode_meta(&MetaNode {
+            generation: None,
             owner: None,
-            root_page: PageId(1),
+            root_page: crate::BTreePageRef::Legacy(PageId(1)),
             height: 1,
             spec: uint_spec.clone(),
         })
@@ -2425,10 +2738,10 @@ mod tests {
         let valid_internal = encode_internal(
             &uint_spec,
             &InternalNode {
-                first_child: PageId(1),
+                first_child: crate::BTreePageRef::Legacy(PageId(1)),
                 separators: vec![InternalSeparator {
                     key: entry(ScalarValue::UInt64(1), 1, 0),
-                    right_child: PageId(2),
+                    right_child: crate::BTreePageRef::Legacy(PageId(2)),
                 }],
             },
         )
@@ -2482,7 +2795,7 @@ mod tests {
         let mut zero_child = encode_internal(
             &uint_spec,
             &InternalNode {
-                first_child: PageId(1),
+                first_child: crate::BTreePageRef::Legacy(PageId(1)),
                 separators: vec![],
             },
         )
@@ -2494,8 +2807,9 @@ mod tests {
         );
 
         let mut invalid_type = encode_meta(&MetaNode {
+            generation: None,
             owner: None,
-            root_page: PageId(1),
+            root_page: crate::BTreePageRef::Legacy(PageId(1)),
             height: 1,
             spec: uint_spec.clone(),
         })
@@ -2543,15 +2857,15 @@ mod tests {
         let mut duplicate_separator = encode_internal(
             &uint_spec,
             &InternalNode {
-                first_child: PageId(1),
+                first_child: crate::BTreePageRef::Legacy(PageId(1)),
                 separators: vec![
                     InternalSeparator {
                         key: entry(ScalarValue::UInt64(1), 1, 0),
-                        right_child: PageId(2),
+                        right_child: crate::BTreePageRef::Legacy(PageId(2)),
                     },
                     InternalSeparator {
                         key: entry(ScalarValue::UInt64(2), 2, 0),
-                        right_child: PageId(3),
+                        right_child: crate::BTreePageRef::Legacy(PageId(3)),
                     },
                 ],
             },
@@ -2608,8 +2922,9 @@ mod ownership_tests {
             },
         };
         let meta = MetaNode {
+            generation: None,
             owner,
-            root_page: PageId(2),
+            root_page: crate::BTreePageRef::Legacy(PageId(2)),
             height: 2,
             spec: spec.clone(),
         };
@@ -2618,10 +2933,10 @@ mod ownership_tests {
             next_leaf: None,
         };
         let internal = InternalNode {
-            first_child: PageId(2),
+            first_child: crate::BTreePageRef::Legacy(PageId(2)),
             separators: vec![InternalSeparator {
                 key: entry,
-                right_child: PageId(3),
+                right_child: crate::BTreePageRef::Legacy(PageId(3)),
             }],
         };
         let payloads = [
@@ -2690,13 +3005,13 @@ mod ownership_tests {
     fn v6_pending_records_are_minimal_bounded_and_disjoint() {
         let record = RetiredIndexOwnership {
             index_id: IndexId(17),
-            meta_page: PageId(99),
+            meta_page: crate::BTreePageRef::Legacy(PageId(99)),
         };
         let mut node = IndexCatalogNode::empty();
         node.next_index_id = Some(IndexId(18));
         node.pending.push(record);
         let bytes = encode_index_catalog(&node).unwrap();
-        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), 80);
         assert_eq!(&bytes[20..24], &1_u32.to_le_bytes());
         assert_eq!(&bytes[48..56], &17_u64.to_le_bytes());
         assert_eq!(&bytes[56..64], &99_u64.to_le_bytes());
@@ -2723,7 +3038,7 @@ mod ownership_tests {
         node.pending[1].index_id = IndexId(16);
         assert_eq!(
             encode_index_catalog(&node),
-            Err(IndexError::DuplicateTreeHandle(record.meta_page))
+            Err(IndexError::DuplicateTreeHandle(record.meta_page.page_id()))
         );
         node.pending.pop();
         node.next_index_id = Some(IndexId(17));
@@ -2742,5 +3057,168 @@ mod ownership_tests {
             decode_index_catalog(&v5).unwrap().next_index_id,
             Some(IndexId(900))
         );
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    fn reference(id: u64, generation: u64) -> BTreePageRef {
+        BTreePageRef::Allocated(PageRef {
+            page_id: PageId(id),
+            generation: PageGeneration(generation),
+        })
+    }
+    #[test]
+    fn v3_identity_and_all_link_codecs_reject_zero_and_truncation() {
+        let spec = IndexSpec {
+            data_type: SemanticType::physical(PhysicalType::UInt64),
+            nullable: false,
+        };
+        let owner = Some(IndexId(7));
+        let generation = Some(PageGeneration(41));
+        let meta = MetaNode {
+            owner,
+            generation,
+            root_page: reference(2, 42),
+            height: 2,
+            spec: spec.clone(),
+        };
+        let leaf = LeafNode {
+            entries: vec![],
+            next_leaf: Some(reference(3, 43)),
+        };
+        let internal = InternalNode {
+            first_child: reference(2, 42),
+            separators: vec![InternalSeparator {
+                key: IndexEntryKey {
+                    key: ScalarValue::UInt64(5),
+                    row_id: RowId {
+                        page: PageId(8),
+                        slot: 0,
+                        generation: 1,
+                    },
+                },
+                right_child: reference(3, 43),
+            }],
+        };
+        let meta_bytes = encode_meta(&meta).unwrap();
+        let leaf_bytes = encode_leaf_generation(&spec, &leaf, owner, generation).unwrap();
+        let internal_bytes =
+            encode_internal_generation(&spec, &internal, owner, generation).unwrap();
+        assert_eq!(decode_meta(&meta_bytes).unwrap(), meta);
+        assert_eq!(decode_leaf_owned(&spec, &leaf_bytes, owner).unwrap(), leaf);
+        assert_eq!(
+            decode_internal_owned(&spec, &internal_bytes, owner).unwrap(),
+            internal
+        );
+        for (kind, bytes, offsets) in [
+            (0, meta_bytes, vec![16, 32]),
+            (1, leaf_bytes, vec![16, 36]),
+            (2, internal_bytes, vec![16, 36, 75]),
+        ] {
+            let decode = |bytes: &[u8]| match kind {
+                0 => decode_meta(bytes).map(|_| ()),
+                1 => decode_leaf_owned(&spec, bytes, owner).map(|_| ()),
+                _ => decode_internal_owned(&spec, bytes, owner).map(|_| ()),
+            };
+            assert_eq!(&bytes[4..6], &3_u16.to_le_bytes());
+            assert_eq!(btree_page_generation(&bytes).unwrap(), generation);
+            for end in 0..bytes.len() {
+                assert!(decode(&bytes[..end]).is_err(), "kind={kind} end={end}");
+            }
+            for offset in offsets {
+                let mut corrupt = bytes.clone();
+                corrupt[offset..offset + 8].fill(0);
+                assert!(matches!(
+                    decode(&corrupt),
+                    Err(IndexError::InvalidPageGeneration(PageGeneration(0)))
+                ));
+            }
+            let mut owner_zero = bytes.clone();
+            owner_zero[8..16].fill(0);
+            assert!(matches!(
+                decode(&owner_zero),
+                Err(IndexError::InvalidIndexId(IndexId(0)))
+            ));
+        }
+        assert!(encode_leaf_generation(&spec, &leaf, None, generation).is_err());
+        assert!(encode_internal_owned(&spec, &internal, owner).is_err());
+        assert!(encode_leaf_generation(&spec, &leaf, owner, Some(PageGeneration(0))).is_err());
+    }
+
+    #[test]
+    fn v7_active_pending_refs_and_v6_legacy_are_explicit() {
+        let mut node = IndexCatalogNode::empty();
+        node.next_index_id = Some(IndexId(3));
+        node.entries.push(IndexCatalogEntry {
+            retired: false,
+            statistics: None,
+            definition: IndexDefinition {
+                id: IndexId(1),
+                name: None,
+                column_id: ColumnId(1),
+                handle: BTreeHandle {
+                    owner: Some(IndexId(1)),
+                    meta_page: reference(9, 101),
+                },
+            },
+        });
+        node.pending.push(RetiredIndexOwnership {
+            index_id: IndexId(2),
+            meta_page: reference(10, 102),
+        });
+        let bytes = encode_index_catalog(&node).unwrap();
+        assert_eq!(bytes.len(), 48 + 56 + 32);
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        for end in 0..bytes.len() {
+            assert!(decode_index_catalog(&bytes[..end]).is_err());
+        }
+        for offset in [96, 120] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset..offset + 8].fill(0);
+            assert!(matches!(
+                decode_index_catalog(&corrupt),
+                Err(IndexError::InvalidPageGeneration(PageGeneration(0)))
+            ));
+        }
+        // v6 has neither active nor pending generation, with no invented value.
+        let mut legacy = bytes[..48].to_vec();
+        legacy[4..6].copy_from_slice(&6_u16.to_le_bytes());
+        legacy.extend_from_slice(&bytes[48..96]);
+        legacy[85] = 1;
+        legacy.extend_from_slice(&bytes[104..120]);
+        let decoded = decode_index_catalog(&legacy).unwrap();
+        assert_eq!(
+            decoded.entries[0].definition.handle.meta_page,
+            BTreePageRef::Legacy(PageId(9))
+        );
+        assert_eq!(
+            decoded.pending[0].meta_page,
+            BTreePageRef::Legacy(PageId(10))
+        );
+        assert_eq!(
+            decode_index_catalog(&encode_index_catalog(&decoded).unwrap()).unwrap(),
+            decoded
+        );
+        // Active-to-active aliases must also compare physical geometry.
+        let mut alias = node.entries[0].clone();
+        alias.definition.id = IndexId(3);
+        alias.definition.column_id = ColumnId(2);
+        alias.definition.handle.owner = Some(IndexId(3));
+        alias.definition.handle.meta_page = reference(9, 999);
+        node.next_index_id = Some(IndexId(4));
+        node.entries.push(alias);
+        assert!(matches!(
+            encode_index_catalog(&node),
+            Err(IndexError::DuplicateTreeHandle(PageId(9)))
+        ));
+        node.entries.pop();
+        // Same physical slot is an alias even with a different expected generation.
+        node.pending[0].meta_page = reference(9, 999);
+        assert!(matches!(
+            encode_index_catalog(&node),
+            Err(IndexError::DuplicateTreeHandle(PageId(9)))
+        ));
     }
 }
