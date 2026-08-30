@@ -1205,6 +1205,17 @@ impl TableStorage {
         }
     }
 
+    /// Validates the full Heap file and reports pending retirement ownership.
+    pub fn inspect_index_reclaim(&mut self) -> Result<crate::IndexReclaimReport, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.inspect_index_reclaim(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "index reclaim inspection",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     /// Explicit Heap index metadata maintenance; LSM indexes are unsupported.
     pub fn compact_index_catalog(&mut self) -> Result<crate::IndexMaintenanceReport, StorageError> {
         match self {

@@ -16,17 +16,17 @@ fuzz_target!(|data: &[u8]| {
         std::env::temp_dir().join(format!("netbadb-wal-recovery-fuzz-{}", std::process::id()));
     cleanup(&database_path);
     let table = fuzz_table();
-    let Ok(storage) = HeapStorage::create(&database_path, table.clone()) else {
-        cleanup(&database_path);
-        return;
-    };
+    let storage = HeapStorage::create(&database_path, table.clone())
+        .expect("create isolated WAL fuzz fixture");
     drop(storage);
 
     let wal_file = wal_path(&database_path);
     if std::fs::write(&wal_file, data).is_ok() {
         // HeapStorage::open invokes the crate-private recovery WAL decoder,
         // including its partial-final-record path, through a production API.
-        let _ = HeapStorage::open(&database_path, table);
+        if let Ok(mut storage) = HeapStorage::open(&database_path, table) {
+            let _ = storage.inspect_index_reclaim();
+        }
     }
     cleanup(&database_path);
 });
@@ -47,4 +47,7 @@ fn cleanup(database_path: &std::path::Path) {
     let _ = std::fs::remove_file(wal_alternate_path(&wal_file));
     let _ = std::fs::remove_file(wal_file);
     let _ = std::fs::remove_file(database_path);
+    let mut status_path = database_path.as_os_str().to_os_string();
+    status_path.push("-txn-status");
+    let _ = std::fs::remove_file(status_path);
 }

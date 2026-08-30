@@ -11,8 +11,10 @@ use netbadb_types::{
     ColumnId, IndexId, IndexName, PageId, PhysicalType, RowId, ScalarValue, SemanticType,
 };
 
-pub const BTREE_FORMAT_VERSION: u16 = 1;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 5;
+pub const BTREE_FORMAT_VERSION: u16 = 2;
+/// Additional bytes reserved on every owned BTree page.
+pub const BTREE_OWNER_SIZE: usize = 8;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 6;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -23,6 +25,7 @@ const MIN_ENTRY_SIZE: usize = 1 + ROW_ID_SIZE;
 const INDEX_CATALOG_MAGIC: &[u8; 4] = b"NBIC";
 const INDEX_CATALOG_HEADER_SIZE: usize = 48;
 const INDEX_CATALOG_ENTRY_HEADER_SIZE: usize = 48;
+const INDEX_CATALOG_PENDING_SIZE: usize = 16;
 const LEGACY_INDEX_CATALOG_ENTRY_HEADER_SIZE: usize = 40;
 const LEGACY_INDEX_CATALOG_FORMAT_VERSION: u16 = 2;
 
@@ -48,9 +51,13 @@ pub struct IndexRange {
     pub upper: IndexBound,
 }
 
-/// Stable external identity of a tree's metadata page.
+/// Physical tree reference with an exact expected owner. Valid across reopen
+/// within the same storage file. It is not a generation-safe reference: handles
+/// returned in a transaction must be discarded on rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BTreeHandle {
+    /// None accepts only legacy v1, never an arbitrary owned page.
+    pub owner: Option<IndexId>,
     pub meta_page: PageId,
 }
 
@@ -94,10 +101,12 @@ pub struct IndexCatalogEntry {
 
 /// One page in the persistent registration chain, with WAL-backed retirement.
 ///
-/// The version-5 `NBIC` payload uses a fixed-width little-endian header and
+/// The version-6 `NBIC` payload uses a fixed-width little-endian header and
 /// entry prefixes plus bounded optional names. Storage validates chain rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
+    /// Minimal retired ownership, retained until physical reclamation completes.
+    pub pending: Vec<RetiredIndexOwnership>,
     /// Root-only durable allocator boundary; None on continuations and legacy decode.
     pub next_index_id: Option<IndexId>,
     pub next_catalog: Option<PageId>,
@@ -113,8 +122,17 @@ impl IndexCatalogNode {
             next_catalog: None,
             table_statistics: None,
             entries: Vec::new(),
+            pending: Vec::new(),
         }
     }
+}
+
+/// A v2 tree pending physical reclamation. Presence means Pending; no names,
+/// columns or statistics survive catalog compaction. Both IDs are nonzero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredIndexOwnership {
+    pub index_id: IndexId,
+    pub meta_page: PageId,
 }
 
 /// Complete ordered identity of one leaf entry or persistent internal fence.
@@ -130,9 +148,10 @@ pub struct IndexEntryKey {
 /// Alias emphasizing the leaf-entry role of [`IndexEntryKey`].
 pub type IndexEntry = IndexEntryKey;
 
-/// Decoded `NBTM` version-1 metadata payload.
+/// Decoded `NBTM` v1 (legacy) or v2 (owned) metadata payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaNode {
+    pub owner: Option<IndexId>,
     pub root_page: PageId,
     pub height: u32,
     pub spec: IndexSpec,
@@ -169,6 +188,10 @@ pub enum IndexError {
     UnsupportedVersion(u16),
     InvalidReservedBytes,
     InvalidNodeType,
+    OwnerMismatch {
+        expected: Option<IndexId>,
+        actual: Option<IndexId>,
+    },
     InvalidHeight(u32),
     InvalidChild(PageId),
     InvalidEntryOrder,
@@ -276,6 +299,10 @@ impl fmt::Display for IndexError {
             Self::InvalidReservedBytes => {
                 formatter.write_str("B+Tree payload reserved bytes are non-zero")
             }
+            Self::OwnerMismatch { expected, actual } => write!(
+                formatter,
+                "BTree owner {actual:?} does not match expected {expected:?}"
+            ),
             Self::InvalidNodeType => formatter.write_str("invalid B+Tree node type"),
             Self::InvalidHeight(height) => write!(formatter, "invalid B+Tree height {height}"),
             Self::InvalidChild(page) => write!(formatter, "invalid B+Tree child page {}", page.0),
@@ -664,10 +691,10 @@ pub fn ensure_entry_fits(
     ensure_key_fits(spec, &entry.key, capacity)
 }
 
-/// Encodes one validated `NBTM` version-1 payload.
+/// Encodes one validated `NBTM` v1/v2 payload.
 pub fn encode_meta(node: &MetaNode) -> Result<Vec<u8>, IndexError> {
     validate_meta(node)?;
-    let mut output = common_header(META_MAGIC);
+    let mut output = common_header(META_MAGIC, node.owner)?;
     output.extend_from_slice(&node.root_page.0.to_le_bytes());
     output.extend_from_slice(&node.height.to_le_bytes());
     output.push(physical_type_tag(node.spec.data_type.physical));
@@ -679,10 +706,10 @@ pub fn encode_meta(node: &MetaNode) -> Result<Vec<u8>, IndexError> {
     Ok(output)
 }
 
-/// Decodes and fully validates one `NBTM` version-1 payload.
+/// Decodes and fully validates one `NBTM` v1/v2 payload.
 pub fn decode_meta(input: &[u8]) -> Result<MetaNode, IndexError> {
     let mut decoder = Decoder::new(input);
-    decoder.common_header(META_MAGIC)?;
+    let owner = decoder.common_header(META_MAGIC)?;
     let root_page = PageId(decoder.u64()?);
     let height = decoder.u32()?;
     let physical = physical_type_from_tag(decoder.u8()?)?;
@@ -703,6 +730,7 @@ pub fn decode_meta(input: &[u8]) -> Result<MetaNode, IndexError> {
         )));
     }
     let node = MetaNode {
+        owner,
         root_page,
         height,
         spec: IndexSpec {
@@ -719,9 +747,18 @@ pub fn decode_meta(input: &[u8]) -> Result<MetaNode, IndexError> {
 
 /// Encodes one validated `NBTL` version-1 payload.
 pub fn encode_leaf(spec: &IndexSpec, node: &LeafNode) -> Result<Vec<u8>, IndexError> {
+    encode_leaf_owned(spec, node, None)
+}
+
+/// Encodes v1 for None or v2 for a nonzero durable owner.
+pub fn encode_leaf_owned(
+    spec: &IndexSpec,
+    node: &LeafNode,
+    owner: Option<IndexId>,
+) -> Result<Vec<u8>, IndexError> {
     validate_leaf(spec, node)?;
     let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
-    let mut output = common_header(LEAF_MAGIC);
+    let mut output = common_header(LEAF_MAGIC, owner)?;
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&node.next_leaf.map_or(0, |page| page.0).to_le_bytes());
     for entry in &node.entries {
@@ -732,8 +769,18 @@ pub fn encode_leaf(spec: &IndexSpec, node: &LeafNode) -> Result<Vec<u8>, IndexEr
 
 /// Decodes and fully validates one `NBTL` version-1 payload.
 pub fn decode_leaf(spec: &IndexSpec, input: &[u8]) -> Result<LeafNode, IndexError> {
+    decode_leaf_owned(spec, input, None)
+}
+
+/// Fully validates the payload and requires the exact expected owner/format.
+pub fn decode_leaf_owned(
+    spec: &IndexSpec,
+    input: &[u8],
+    expected: Option<IndexId>,
+) -> Result<LeafNode, IndexError> {
     let mut decoder = Decoder::new(input);
-    decoder.common_header(LEAF_MAGIC)?;
+    let actual = decoder.common_header(LEAF_MAGIC)?;
+    validate_btree_owner(expected, actual)?;
     let count = decoder.count(MIN_ENTRY_SIZE)?;
     let raw_next = decoder.u64()?;
     let next_leaf = (raw_next != 0).then_some(PageId(raw_next));
@@ -749,9 +796,18 @@ pub fn decode_leaf(spec: &IndexSpec, input: &[u8]) -> Result<LeafNode, IndexErro
 
 /// Encodes one validated `NBTI` version-1 payload.
 pub fn encode_internal(spec: &IndexSpec, node: &InternalNode) -> Result<Vec<u8>, IndexError> {
+    encode_internal_owned(spec, node, None)
+}
+
+/// Encodes v1 for None or v2 for a nonzero durable owner.
+pub fn encode_internal_owned(
+    spec: &IndexSpec,
+    node: &InternalNode,
+    owner: Option<IndexId>,
+) -> Result<Vec<u8>, IndexError> {
     validate_internal(spec, node)?;
     let count = u32::try_from(node.separators.len()).map_err(|_| IndexError::LengthOverflow)?;
-    let mut output = common_header(INTERNAL_MAGIC);
+    let mut output = common_header(INTERNAL_MAGIC, owner)?;
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&node.first_child.0.to_le_bytes());
     for separator in &node.separators {
@@ -763,8 +819,18 @@ pub fn encode_internal(spec: &IndexSpec, node: &InternalNode) -> Result<Vec<u8>,
 
 /// Decodes and fully validates one `NBTI` version-1 payload.
 pub fn decode_internal(spec: &IndexSpec, input: &[u8]) -> Result<InternalNode, IndexError> {
+    decode_internal_owned(spec, input, None)
+}
+
+/// Fully validates the payload and requires the exact expected owner/format.
+pub fn decode_internal_owned(
+    spec: &IndexSpec,
+    input: &[u8],
+    expected: Option<IndexId>,
+) -> Result<InternalNode, IndexError> {
     let mut decoder = Decoder::new(input);
-    decoder.common_header(INTERNAL_MAGIC)?;
+    let actual = decoder.common_header(INTERNAL_MAGIC)?;
+    validate_btree_owner(expected, actual)?;
     let count = decoder.count(MIN_ENTRY_SIZE + 8)?;
     let first_child = PageId(decoder.u64()?);
     let mut separators = Vec::with_capacity(count);
@@ -951,7 +1017,7 @@ pub fn merge_internals_if_fits(
     Ok((payload.len() <= capacity).then_some(merged))
 }
 
-/// Encodes one explicit version-5 mutable index catalog page payload.
+/// Encodes one explicit version-6 mutable index catalog page payload.
 pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
     if let Some(next) = node.next_catalog {
         validate_child(next)?;
@@ -971,7 +1037,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         }
     }
     validate_catalog_entries(&node.entries)?;
-    validate_index_high_water(node.next_index_id, &node.entries)?;
+    validate_pending_ownership(node.next_index_id, &node.entries, &node.pending)?;
     let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
     let capacity = node
         .entries
@@ -989,6 +1055,14 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
                 })
                 .ok_or(IndexError::LengthOverflow)
         })?;
+    let pending_size = node
+        .pending
+        .len()
+        .checked_mul(INDEX_CATALOG_PENDING_SIZE)
+        .ok_or(IndexError::LengthOverflow)?;
+    let capacity = capacity
+        .checked_add(pending_size)
+        .ok_or(IndexError::LengthOverflow)?;
     let mut output = Vec::with_capacity(capacity);
     output.extend_from_slice(INDEX_CATALOG_MAGIC);
     output.extend_from_slice(&INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
@@ -996,7 +1070,11 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     output.push(u8::from(node.next_index_id.is_some()));
     output.extend_from_slice(&node.next_catalog.map_or(0, |page| page.0).to_le_bytes());
     output.extend_from_slice(&count.to_le_bytes());
-    output.extend_from_slice(&0_u32.to_le_bytes());
+    output.extend_from_slice(
+        &u32::try_from(node.pending.len())
+            .map_err(|_| IndexError::LengthOverflow)?
+            .to_le_bytes(),
+    );
     let table_statistics = node.table_statistics.unwrap_or(TableStatistics {
         row_count: 0,
         managed_page_count: 0,
@@ -1027,16 +1105,21 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         output.extend_from_slice(&statistics.null_count.to_le_bytes());
         output.extend_from_slice(&statistics.tree_height.to_le_bytes());
         output.push(u8::from(entry.retired));
-        output.extend_from_slice(&[0; 3]);
+        output.push(u8::from(entry.definition.handle.owner.is_some()));
+        output.extend_from_slice(&[0; 2]);
         output.extend_from_slice(&entry.definition.id.0.to_le_bytes());
         if let Some(name) = &entry.definition.name {
             output.extend_from_slice(name.as_str().as_bytes());
         }
     }
+    for pending in &node.pending {
+        output.extend_from_slice(&pending.index_id.0.to_le_bytes());
+        output.extend_from_slice(&pending.meta_page.0.to_le_bytes());
+    }
     Ok(output)
 }
 
-/// Decodes legacy version-2/version-3/version-4 or current version-5 index catalog payloads.
+/// Decodes legacy version-2/version-3/version-4/version-5 or current version-6 index catalog payloads.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -1048,11 +1131,11 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         });
     }
     let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
-    if !matches!(version, 2 | 3 | 4 | INDEX_CATALOG_FORMAT_VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | INDEX_CATALOG_FORMAT_VERSION) {
         return Err(IndexError::UnsupportedVersion(version));
     }
     let table_statistics_present = decode_statistics_presence(input[6])?;
-    let next_index_id = if version == INDEX_CATALOG_FORMAT_VERSION {
+    let next_index_id = if version >= 5 {
         let value = IndexId(u64::from_le_bytes(
             input[40..48]
                 .try_into()
@@ -1069,7 +1152,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         }
         None
     };
-    if input[20..24].iter().any(|byte| *byte != 0) {
+    if version < 6 && input[20..24].iter().any(|byte| *byte != 0) {
         return Err(IndexError::InvalidReservedBytes);
     }
     let raw_next = u64::from_le_bytes(input[8..16].try_into().map_err(|_| IndexError::Truncated)?);
@@ -1147,7 +1230,10 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
             }
             false
         };
-        if chunk[37..40].iter().any(|byte| *byte != 0) {
+        if chunk[if version >= 6 { 38 } else { 37 }..40]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
             return Err(IndexError::InvalidReservedBytes);
         }
         let meta_page = PageId(u64::from_le_bytes(
@@ -1216,17 +1302,51 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
                 id,
                 name,
                 column_id,
-                handle: BTreeHandle { meta_page },
+                handle: BTreeHandle {
+                    owner: if version >= 6 {
+                        match chunk[37] {
+                            0 => None,
+                            1 => Some(id),
+                            _ => return Err(IndexError::InvalidReservedBytes),
+                        }
+                    } else {
+                        None
+                    },
+                    meta_page,
+                },
             },
             statistics,
         });
     }
+    let pending_count = if version >= 6 {
+        u32::from_le_bytes(
+            input[20..24]
+                .try_into()
+                .map_err(|_| IndexError::Truncated)?,
+        ) as usize
+    } else {
+        0
+    };
+    if pending_count > input.len().saturating_sub(offset) / INDEX_CATALOG_PENDING_SIZE {
+        return Err(IndexError::Truncated);
+    }
+    let mut pending = Vec::with_capacity(pending_count);
+    for _ in 0..pending_count {
+        let mut decoder = Decoder::new(&input[offset..offset + INDEX_CATALOG_PENDING_SIZE]);
+        pending.push(RetiredIndexOwnership {
+            index_id: IndexId(decoder.u64()?),
+            meta_page: PageId(decoder.u64()?),
+        });
+        offset += INDEX_CATALOG_PENDING_SIZE;
+    }
+    validate_pending_ownership(next_index_id, &entries, &pending)?;
     if offset != input.len() {
         return Err(IndexError::ExtraBytes);
     }
     validate_catalog_entries(&entries)?;
     validate_index_high_water(next_index_id, &entries)?;
     Ok(IndexCatalogNode {
+        pending,
         next_index_id,
         next_catalog,
         table_statistics,
@@ -1243,6 +1363,45 @@ pub fn validate_index_high_water(
     if let Some(next) = next {
         if next.0 == 0 || entries.iter().any(|entry| entry.definition.id.0 >= next.0) {
             return Err(IndexError::InvalidIndexHighWater(next));
+        }
+    }
+    Ok(())
+}
+
+/// Checks minimal pending records against the entire catalog identity domain.
+pub fn validate_pending_ownership(
+    next: Option<IndexId>,
+    entries: &[IndexCatalogEntry],
+    pending: &[RetiredIndexOwnership],
+) -> Result<(), IndexError> {
+    validate_index_high_water(next, entries)?;
+    for (position, record) in pending.iter().enumerate() {
+        if record.index_id.0 == 0 {
+            return Err(IndexError::InvalidIndexId(record.index_id));
+        }
+        validate_child(record.meta_page)?;
+        if let Some(next) = next {
+            if record.index_id.0 >= next.0 {
+                return Err(IndexError::InvalidIndexHighWater(next));
+            }
+        }
+        if entries
+            .iter()
+            .any(|entry| entry.definition.id == record.index_id)
+            || pending[..position]
+                .iter()
+                .any(|other| other.index_id == record.index_id)
+        {
+            return Err(IndexError::DuplicateIndexId(record.index_id));
+        }
+        if entries
+            .iter()
+            .any(|entry| entry.definition.handle.meta_page == record.meta_page)
+            || pending[..position]
+                .iter()
+                .any(|other| other.meta_page == record.meta_page)
+        {
+            return Err(IndexError::DuplicateTreeHandle(record.meta_page));
         }
     }
     Ok(())
@@ -1320,6 +1479,9 @@ pub fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), Ind
     for (position, entry) in entries.iter().enumerate() {
         let definition = &entry.definition;
         validate_child(definition.handle.meta_page)?;
+        if definition.handle.owner.is_some() {
+            validate_btree_owner(Some(definition.id), definition.handle.owner)?;
+        }
         if definition.id.0 == 0 {
             return Err(IndexError::InvalidIndexId(definition.id));
         }
@@ -1330,7 +1492,7 @@ pub fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), Ind
             if existing.definition.id == definition.id {
                 return Err(IndexError::DuplicateIndexId(definition.id));
             }
-            if existing.definition.handle == definition.handle {
+            if existing.definition.handle.meta_page == definition.handle.meta_page {
                 return Err(IndexError::DuplicateTreeHandle(definition.handle.meta_page));
             }
             if !existing.retired && !entry.retired {
@@ -1350,12 +1512,49 @@ pub fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), Ind
     Ok(())
 }
 
-fn common_header(magic: &[u8; 4]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(COMMON_HEADER_SIZE);
+/// Validates the versioned header only. Callers MUST fully decode the payload
+/// before treating a page as a valid ownership observation.
+pub fn btree_page_owner(input: &[u8]) -> Result<Option<IndexId>, IndexError> {
+    let magic = input.get(..4).ok_or(IndexError::Truncated)?;
+    let expected = match magic {
+        b"NBTM" => META_MAGIC,
+        b"NBTL" => LEAF_MAGIC,
+        b"NBTI" => INTERNAL_MAGIC,
+        _ => return Err(IndexError::InvalidNodeType),
+    };
+    Decoder::new(input).common_header(expected)
+}
+
+/// None is a strict legacy expectation, not a wildcard.
+pub fn validate_btree_owner(
+    expected: Option<IndexId>,
+    actual: Option<IndexId>,
+) -> Result<(), IndexError> {
+    if expected != actual {
+        return Err(IndexError::OwnerMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+fn common_header(magic: &[u8; 4], owner: Option<IndexId>) -> Result<Vec<u8>, IndexError> {
+    let mut output = Vec::with_capacity(COMMON_HEADER_SIZE + BTREE_OWNER_SIZE);
     output.extend_from_slice(magic);
-    output.extend_from_slice(&BTREE_FORMAT_VERSION.to_le_bytes());
+    output.extend_from_slice(
+        &if owner.is_some() {
+            BTREE_FORMAT_VERSION
+        } else {
+            1_u16
+        }
+        .to_le_bytes(),
+    );
     output.extend_from_slice(&0_u16.to_le_bytes());
-    output
+    if let Some(owner) = owner {
+        if owner.0 == 0 {
+            return Err(IndexError::InvalidIndexId(owner));
+        }
+        output.extend_from_slice(&owner.0.to_le_bytes());
+    }
+    Ok(output)
 }
 
 fn validate_meta(node: &MetaNode) -> Result<(), IndexError> {
@@ -1535,7 +1734,7 @@ impl<'a> Decoder<'a> {
         Self { input, offset: 0 }
     }
 
-    fn common_header(&mut self, expected: &[u8; 4]) -> Result<(), IndexError> {
+    fn common_header(&mut self, expected: &[u8; 4]) -> Result<Option<IndexId>, IndexError> {
         let actual = self.array::<4>()?;
         if &actual != expected {
             return Err(IndexError::InvalidMagic {
@@ -1544,13 +1743,20 @@ impl<'a> Decoder<'a> {
             });
         }
         let version = self.u16()?;
-        if version != BTREE_FORMAT_VERSION {
+        if !matches!(version, 1 | BTREE_FORMAT_VERSION) {
             return Err(IndexError::UnsupportedVersion(version));
         }
         if self.u16()? != 0 {
             return Err(IndexError::InvalidReservedBytes);
         }
-        Ok(())
+        if version == 1 {
+            return Ok(None);
+        }
+        let owner = IndexId(self.u64()?);
+        if owner.0 == 0 {
+            return Err(IndexError::InvalidIndexId(owner));
+        }
+        Ok(Some(owner))
     }
 
     fn count(&mut self, minimum_size: usize) -> Result<usize, IndexError> {
@@ -1708,6 +1914,7 @@ mod tests {
             nullable: true,
         };
         let meta = MetaNode {
+            owner: None,
             root_page: PageId(9),
             height: 3,
             spec: named.clone(),
@@ -1892,6 +2099,7 @@ mod tests {
                 name: Some(IndexName::new("old").unwrap()),
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
+                    owner: None,
                     meta_page: PageId(9),
                 },
             },
@@ -1955,6 +2163,7 @@ mod tests {
     #[test]
     fn index_catalog_codec_round_trips_and_rejects_corruption() {
         let node = IndexCatalogNode {
+            pending: Vec::new(),
             next_index_id: Some(IndexId(12)),
             next_catalog: Some(PageId(9)),
             table_statistics: Some(TableStatistics {
@@ -1968,6 +2177,7 @@ mod tests {
                     name: None,
                     column_id: ColumnId(7),
                     handle: BTreeHandle {
+                        owner: None,
                         meta_page: PageId(11),
                     },
                 },
@@ -1993,7 +2203,7 @@ mod tests {
         let named_bytes = encode_index_catalog(&named).unwrap();
         let named_golden = [
             b"NBIC".as_slice(),
-            &[5, 0, 1, 1],
+            &[6, 0, 1, 1],
             &[9, 0, 0, 0, 0, 0, 0, 0],
             &[1, 0, 0, 0],
             &[0, 0, 0, 0],
@@ -2026,10 +2236,7 @@ mod tests {
         }
         let mut reserved = bytes.clone();
         reserved[20] = 1;
-        assert_eq!(
-            decode_index_catalog(&reserved),
-            Err(IndexError::InvalidReservedBytes)
-        );
+        assert_eq!(decode_index_catalog(&reserved), Err(IndexError::Truncated));
         let mut extra = bytes.clone();
         extra.push(0);
         assert_eq!(decode_index_catalog(&extra), Err(IndexError::ExtraBytes));
@@ -2058,6 +2265,7 @@ mod tests {
             Err(IndexError::InvalidChild(PageId(0)))
         );
         let duplicate = IndexCatalogNode {
+            pending: Vec::new(),
             next_index_id: node.next_index_id,
             next_catalog: None,
             table_statistics: node.table_statistics,
@@ -2081,7 +2289,7 @@ mod tests {
             Err(IndexError::InvalidStatisticsPresence(3))
         );
         let mut entry_reserved = bytes.clone();
-        entry_reserved[85] = 1;
+        entry_reserved[86] = 1;
         assert_eq!(
             decode_index_catalog(&entry_reserved),
             Err(IndexError::InvalidReservedBytes)
@@ -2208,6 +2416,7 @@ mod tests {
         )
         .unwrap();
         let valid_meta = encode_meta(&MetaNode {
+            owner: None,
             root_page: PageId(1),
             height: 1,
             spec: uint_spec.clone(),
@@ -2285,6 +2494,7 @@ mod tests {
         );
 
         let mut invalid_type = encode_meta(&MetaNode {
+            owner: None,
             root_page: PageId(1),
             height: 1,
             spec: uint_spec.clone(),
@@ -2376,5 +2586,161 @@ mod tests {
         ));
         let nullable = spec(PhysicalType::UInt64, true);
         assert!(nullable.validate_key(&ScalarValue::Null).is_ok());
+    }
+}
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn v2_all_kinds_round_trip_and_reject_owner_corruption() {
+        let owner = Some(IndexId(91));
+        let spec = IndexSpec {
+            data_type: SemanticType::physical(PhysicalType::UInt64),
+            nullable: true,
+        };
+        let entry = IndexEntry {
+            key: ScalarValue::UInt64(7),
+            row_id: RowId {
+                page: PageId(8),
+                slot: 0,
+                generation: 1,
+            },
+        };
+        let meta = MetaNode {
+            owner,
+            root_page: PageId(2),
+            height: 2,
+            spec: spec.clone(),
+        };
+        let leaf = LeafNode {
+            entries: vec![entry.clone()],
+            next_leaf: None,
+        };
+        let internal = InternalNode {
+            first_child: PageId(2),
+            separators: vec![InternalSeparator {
+                key: entry,
+                right_child: PageId(3),
+            }],
+        };
+        let payloads = [
+            encode_meta(&meta).unwrap(),
+            encode_leaf_owned(&spec, &leaf, owner).unwrap(),
+            encode_internal_owned(&spec, &internal, owner).unwrap(),
+        ];
+        let decode = |kind, bytes: &[u8]| -> Result<(), IndexError> {
+            match kind {
+                0 => {
+                    let node = decode_meta(bytes)?;
+                    validate_btree_owner(owner, node.owner)?;
+                }
+                1 => {
+                    decode_leaf_owned(&spec, bytes, owner)?;
+                }
+                _ => {
+                    decode_internal_owned(&spec, bytes, owner)?;
+                }
+            }
+            Ok(())
+        };
+        for (kind, bytes) in payloads.iter().enumerate() {
+            assert_eq!(&bytes[4..6], &2_u16.to_le_bytes());
+            assert_eq!(&bytes[8..16], &91_u64.to_le_bytes());
+            decode(kind, bytes).unwrap();
+            for end in 0..bytes.len() {
+                assert!(decode(kind, &bytes[..end]).is_err());
+            }
+            let mut zero = bytes.clone();
+            zero[8..16].fill(0);
+            assert_eq!(
+                decode(kind, &zero),
+                Err(IndexError::InvalidIndexId(IndexId(0)))
+            );
+            let mut wrong = bytes.clone();
+            wrong[8..16].copy_from_slice(&92_u64.to_le_bytes());
+            assert!(matches!(
+                decode(kind, &wrong),
+                Err(IndexError::OwnerMismatch { .. })
+            ));
+            let mut extra = bytes.clone();
+            extra.push(0);
+            assert_eq!(decode(kind, &extra), Err(IndexError::ExtraBytes));
+        }
+        assert_eq!(decode_meta(&payloads[0]).unwrap(), meta);
+        assert_eq!(decode_leaf_owned(&spec, &payloads[1], owner).unwrap(), leaf);
+        assert_eq!(
+            decode_internal_owned(&spec, &payloads[2], owner).unwrap(),
+            internal
+        );
+        assert!(matches!(
+            decode_leaf(&spec, &payloads[1]),
+            Err(IndexError::OwnerMismatch { .. })
+        ));
+        assert!(matches!(
+            decode_internal(&spec, &payloads[2]),
+            Err(IndexError::OwnerMismatch { .. })
+        ));
+        let legacy = encode_leaf(&spec, &leaf).unwrap();
+        assert_eq!(decode_leaf(&spec, &legacy).unwrap(), leaf);
+        assert!(decode_leaf_owned(&spec, &legacy, owner).is_err());
+    }
+
+    #[test]
+    fn v6_pending_records_are_minimal_bounded_and_disjoint() {
+        let record = RetiredIndexOwnership {
+            index_id: IndexId(17),
+            meta_page: PageId(99),
+        };
+        let mut node = IndexCatalogNode::empty();
+        node.next_index_id = Some(IndexId(18));
+        node.pending.push(record);
+        let bytes = encode_index_catalog(&node).unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(&bytes[20..24], &1_u32.to_le_bytes());
+        assert_eq!(&bytes[48..56], &17_u64.to_le_bytes());
+        assert_eq!(&bytes[56..64], &99_u64.to_le_bytes());
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        for end in 0..bytes.len() {
+            assert!(decode_index_catalog(&bytes[..end]).is_err());
+        }
+        for offset in [48, 56] {
+            let mut zero = bytes.clone();
+            zero[offset..offset + 8].fill(0);
+            assert!(decode_index_catalog(&zero).is_err());
+        }
+        let mut excessive = bytes.clone();
+        excessive[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_index_catalog(&excessive), Err(IndexError::Truncated));
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(decode_index_catalog(&extra), Err(IndexError::ExtraBytes));
+        node.pending.push(record);
+        assert_eq!(
+            encode_index_catalog(&node),
+            Err(IndexError::DuplicateIndexId(record.index_id))
+        );
+        node.pending[1].index_id = IndexId(16);
+        assert_eq!(
+            encode_index_catalog(&node),
+            Err(IndexError::DuplicateTreeHandle(record.meta_page))
+        );
+        node.pending.pop();
+        node.next_index_id = Some(IndexId(17));
+        assert!(matches!(
+            encode_index_catalog(&node),
+            Err(IndexError::InvalidIndexHighWater(_))
+        ));
+        // v5's allocator must survive even after all entries have been removed.
+        let mut v5 = encode_index_catalog(&IndexCatalogNode {
+            next_index_id: Some(IndexId(900)),
+            ..IndexCatalogNode::empty()
+        })
+        .unwrap();
+        v5[4..6].copy_from_slice(&5_u16.to_le_bytes());
+        assert_eq!(
+            decode_index_catalog(&v5).unwrap().next_index_id,
+            Some(IndexId(900))
+        );
     }
 }

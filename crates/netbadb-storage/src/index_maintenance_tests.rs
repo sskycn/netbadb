@@ -3,20 +3,22 @@ use netbadb_types::IndexId;
 // Tests execute inside heap::tests::maintenance to exercise private ownership
 // and recovery boundaries without exporting physical maintenance handles.
 
-fn legacy_catalog(path: &std::path::Path, version: u16) {
+pub(super) fn legacy_catalog(path: &std::path::Path, version: u16) {
+    legacy_btrees(path);
     let mut pages = PageManager::open(path).unwrap();
     let mut id = PageId(1);
     loop {
         let mut page = pages.read_page(id).unwrap();
-        let payload = page.single_payload(PageType::IndexCatalog).unwrap();
-        let node = decode_index_catalog(payload).unwrap();
+        let mut node = decode_index_catalog(page.single_payload(PageType::IndexCatalog).unwrap()).unwrap();
+        assert!(node.pending.is_empty());
+        for entry in &mut node.entries { entry.definition.handle.owner = None; }
+        let payload = encode_index_catalog(&node).unwrap();
         let mut bytes = payload[..48].to_vec();
         bytes[4..6].copy_from_slice(&version.to_le_bytes());
-        bytes[7] = 0;
-        bytes[40..48].fill(0);
+        if version < 5 { bytes[7] = 0; bytes[40..48].fill(0); }
         let mut offset = 48;
         for entry in &node.entries {
-            assert!(!entry.retired || version == 4);
+            assert!(!entry.retired || version >= 4);
             let name_len = entry
                 .definition
                 .name
@@ -25,7 +27,7 @@ fn legacy_catalog(path: &std::path::Path, version: u16) {
             if version == 2 {
                 assert_eq!(name_len, 0);
             }
-            bytes.extend_from_slice(&payload[offset..offset + if version == 4 { 48 } else { 40 }]);
+            bytes.extend_from_slice(&payload[offset..offset + if version >= 4 { 48 } else { 40 }]);
             bytes.extend_from_slice(&payload[offset + 48..offset + 48 + name_len]);
             offset += 48 + name_len;
         }
@@ -70,7 +72,9 @@ fn compaction_bounds_catalog_growth_and_never_reuses_ids() {
     assert_eq!(report.retired_tree_pages_seen, 200);
     assert_eq!(report.pages_reclaimed, 0);
     assert_eq!(report.file_pages_before, report.file_pages_after);
-    assert_eq!(report.pages_abandoned, 200 + report.retired_catalog_pages);
+    assert_eq!(report.pages_abandoned, report.retired_catalog_pages);
+    assert_eq!(report.pending_reclaim_indexes, 100);
+    assert_eq!(storage.inspect_index_reclaim().unwrap().retired_owned_pages, 200);
     assert_eq!(report.next_index_id.0, last_id.0 + 1);
     assert_eq!(storage.indexes(), std::slice::from_ref(&active));
     assert!(storage.retired_indexes().is_empty());
@@ -330,7 +334,10 @@ fn process_crash_compaction_preserves_old_or_new_catalog() {
         storage.close().unwrap();
         spawn_crash_child(&path, "index-compact", point);
         for _ in 0..3 {
-            let storage = HeapStorage::open(&path, indexed_table()).unwrap();
+            let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+            assert_eq!(storage.inspect_index_reclaim().unwrap().pending_reclaim_indexes, 90);
+            let snapshot = storage.read_index_catalog(PageId(1)).unwrap();
+            assert_eq!(snapshot.pending.len(), if winner { 90 } else { 0 });
             assert_eq!(storage.indexes(), std::slice::from_ref(&active));
             assert_eq!(storage.retired_indexes().len(), if winner { 0 } else { 90 });
             assert_eq!(storage.table_statistics(), stats);
@@ -413,12 +420,13 @@ fn ownership_rejects_shared_cycles_wrong_kind_and_leaf_links_without_writes() {
         if case == "leaf-link" {
             page_id = meta.root_page;
             kind = PageType::BTreeLeaf;
-            payload = netbadb_index::encode_leaf(
+            payload = netbadb_index::encode_leaf_owned(
                 &meta.spec,
                 &netbadb_index::LeafNode {
                     entries: vec![],
                     next_leaf: Some(active_root),
                 },
+                meta.owner,
             )
             .unwrap();
         } else {
@@ -491,14 +499,15 @@ fn ownership_enumerates_multilevel_tree_and_detects_duplicate_children() {
         1
     );
     let page = storage.buffer.read_page(meta.root_page).unwrap();
-    let mut internal = netbadb_index::decode_internal(
+    let mut internal = netbadb_index::decode_internal_owned(
         &meta.spec,
         page.page().single_payload(PageType::BTreeInternal).unwrap(),
+        meta.owner,
     )
     .unwrap();
     drop(page);
     internal.separators[0].right_child = internal.first_child;
-    let payload = netbadb_index::encode_internal(&meta.spec, &internal).unwrap();
+    let payload = netbadb_index::encode_internal_owned(&meta.spec, &internal, meta.owner).unwrap();
     {
         let mut page = storage.buffer.write_page(meta.root_page).unwrap();
         page.page_mut()
@@ -588,7 +597,7 @@ fn open_checks_high_water_over_the_entire_chain_and_rejects_missing_authority() 
             "missing" => node.next_index_id = None,
             "continuation" => node.next_index_id = Some(IndexId(u64::MAX)),
             "behind-continuation" => node.next_index_id = Some(IndexId(2)),
-            _ => node.entries[0].definition.id = IndexId(u64::MAX),
+            _ => { node.entries[0].definition.id = IndexId(u64::MAX); node.entries[0].definition.handle.owner = Some(IndexId(u64::MAX)); },
         }
         page.replace_single_payload(
             PageType::IndexCatalog,
@@ -617,4 +626,25 @@ fn open_checks_high_water_over_the_entire_chain_and_rejects_missing_authority() 
         }
         cleanup(&path);
     }
+}
+
+// A compatibility fixture must downgrade the BTree payloads as well as catalog
+// records; merely relabeling a v2 tree as a legacy registration is corruption.
+pub(super) fn legacy_btrees(path: &std::path::Path) {
+    let mut pages = PageManager::open(path).unwrap();
+    for number in 1..pages.page_count() {
+        let mut page = pages.read_page(PageId(number)).unwrap();
+        let kind = page.header().unwrap().page_type;
+        if matches!(kind, PageType::BTreeMeta | PageType::BTreeLeaf | PageType::BTreeInternal) {
+            let mut bytes = page.single_payload(kind).unwrap().to_vec();
+            if netbadb_index::btree_page_owner(&bytes).unwrap().is_some() {
+                bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+                bytes.drain(8..16);
+                page.replace_single_payload(kind, &bytes).unwrap();
+                page.refresh_checksum();
+                pages.write_page(&page).unwrap();
+            }
+        }
+    }
+    pages.sync().unwrap();
 }

@@ -9,7 +9,10 @@ fuzz_target!(|data: &[u8]| {
     if data.len() <= MAX_PAYLOAD_SIZE {
         if let Ok(node) = decode_index_catalog(data) {
             let encoded = encode_index_catalog(&node).expect("decoded catalog must re-encode");
-            assert_eq!(decode_index_catalog(&encoded).expect("canonical catalog"), node);
+            assert_eq!(
+                decode_index_catalog(&encoded).expect("canonical catalog"),
+                node
+            );
         }
     }
 });

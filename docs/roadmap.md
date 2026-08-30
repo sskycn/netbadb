@@ -532,13 +532,29 @@ PostgreSQL-only metadata absent from NetbaDB remain unsupported.
   tests, high-water corruption/exhaustion checks, Core/PG identity regressions,
   and v2/v3/v4/v5 catalog fuzz seeds.
 
-Round 9 should audit storage ownership/generation and a durable allocator or
-whole-file rewrite before table DDL. Raw handles, merge-orphan ownership, old WAL,
-and buffer invalidation must be resolved before recycling any committed PageId.
-A separate Table Schema Lifecycle Architecture Audit remains later work, covering
-Canonical Schema authority, fingerprints, manifests, TableId high-water,
-transaction/recovery and SDK generation. Do not begin CREATE TABLE coding here.
-See [the Round 8 implementation audit](index-lifecycle-round8.md).
+### Storage Lifecycle Round 9 — durable ownership complete; physical reclaim deferred
+
+- BTree v2 persists file-local IndexId on every new registered meta/internal/leaf
+  page; handles/traversal require exact owners and splits inherit them;
+- v1 raw and registered trees stay readable/writable and non-reclaimable;
+- IndexCatalog v6 preserves v5 high-water and backward v2/v3/v4/v5 decoding,
+  while compaction retains minimal pending owner/meta records;
+- quiescent Heap/TableStorage/Core admin inventory validates complete page and
+  node payloads, global reachability/disjointness, and merge-orphan ownership;
+- unary internal deletion paths merge or rotate transactionally before leaf
+  deletion; grow/delete/collapse and subprocess undo/redo tests cover this case;
+- active-only inspection, planner paths, native Protocol v1 and PG CREATE/DROP
+  semantics are unchanged; raw/historical legacy pages are never guessed free;
+- Route B: owner mismatch protects cross-owner access, but rollback can repeat
+  provisional identity and buffer/WAL still lack allocation generations. Tail
+  reclaim, arbitrary reuse, free-list and global PageGeneration migration are
+  deferred; 100-cycle tests report retained growth honestly.
+
+Round 10 should be **Generation-Safe Page Reference Architecture**, covering
+durable allocation generation, rollback high-water, Page/WAL/recovery identity,
+BTree links, buffer invalidation, Heap references and migration. Do not begin
+table DDL until allocator/reclaim lifecycle is proven. See
+[the Round 9 implementation audit](index-reclaim-round9.md).
 
 ## Phase 6 — SDK and tooling
 

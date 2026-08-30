@@ -1707,7 +1707,8 @@ buffer pool, transaction manager, WAL generation, recovery, and checkpoint as
 heap mutation; there is no second file or durability domain.
 
 Every index page is a normal checksummed Page v5 with exactly one live slot 0,
-generation 1. The payload has its own version-1 semantic codec:
+generation 1. Payload v1 remains supported for raw/legacy trees. Newly
+registered trees use v2; the node bodies retain the same typed semantics:
 
 - `NBTM` metadata: stable `BTreeHandle` page, current root PageId, height,
   physical plus optional nominal semantic type, and nullability;
@@ -1717,6 +1718,15 @@ generation 1. The payload has its own version-1 semantic codec:
   and right children. A fence's RowId is only an ordering token: it need not
   identify a currently live heap row or leaf entry. Deleting the first live
   entry in a right subtree therefore does not rewrite or enlarge its fence.
+
+The common v1 header is magic[4], version u16=1, reserved u16=0. V2 uses
+magic[4], version u16=2, reserved u16=0, nonzero owner IndexId u64 at bytes
+8..16, followed by the unchanged v1 node body. Owner IDs are unique among
+committed registered trees in one physical Heap file. Meta, internal and leaf
+reads require exactly the handle's owner; None accepts only v1. Split allocation
+passes owner explicitly and reserves eight bytes before byte-size calculations.
+Merge orphans retain their original payload/owner. Page v5 and its CRC are
+unchanged. Raw tree APIs allocate v1 and cannot choose a registered owner.
 
 All integers are fixed-width little-endian. Decoders reject wrong magic or
 version, nonzero reserved fields, invalid UTF-8/type/value tags, zero child
@@ -1746,7 +1756,7 @@ existing pages and remove trailing new pages in reverse order.
 
 Exact `(key, RowId)` deletion uses a soft half-capacity encoded-byte threshold
 to attempt deterministic right-first merges, falling back to the left sibling
-for the last child. It never redistributes entries. A merge occurs only when
+for the last child. Leaf entries are not redistributed. A merge occurs only when
 the actual encoded leaf or internal payload fits; otherwise a sparse node
 remains valid. Parent separator removal recurses upward, and a zero-separator
 root collapses. The surviving physical page is always the left page, repairing
@@ -1755,32 +1765,37 @@ preflighted before WAL publication and logged bottom-up with metadata last.
 Delete never allocates or shrinks the file. Removed right pages and old roots
 remain valid but unreachable orphan index pages; reclamation is deferred.
 
-Phase 4C2 deliberately has no sibling redistribution or orphan-page
-reclamation. Uniqueness, SQL index DDL, and range lookup remain deferred.
+Round 9 handles a unary internal path before leaf deletion: it merges that
+internal node with its sibling if the combined payload fits, otherwise rotates
+one child through the parent fence. This prevents an empty leaf under a parent
+with no sibling separator. Normalization is bounded by file page count, uses
+the same owner, and logs full-page changes in the caller's transaction; errors
+after changes require rollback. Reopen/crash tests cover undo and committed
+collapse. Physical reclamation remains deferred.
 
 ## Persistent index registry
 
 Heap metadata points to a fixed `IndexCatalog` root. Catalog pages are
-checksummed Page v5 single-payload pages containing version-5 `NBIC` payloads.
+checksummed Page v5 single-payload pages containing version-6 `NBIC` payloads.
 Versions 2 (unnamed), 3 (optional name) and 4 (explicit logical identity and
-retirement) remain readable; v1 is rejected. Registration order is preserved.
+retirement) and 5 (durable high-water) remain readable; v1 is rejected. Registration order is preserved.
 The authoritative allocator high-water lives only in the root, never in Heap
 metadata or a cache reconstructed from surviving active entries.
 
 ```text
-v5 header (48 bytes, little endian)
+v6 header (48 bytes, little endian)
 0..4    NBIC magic
-4..6    u16 version (5; decoder also accepts 2, 3, 4)
+4..6    u16 version (6; decoder also accepts 2, 3, 4, 5)
 6       u8 table-statistics presence (0 or 1)
 7       u8 next_index_id presence (1 on root, 0 on continuations)
 8..16   u64 next catalog PageId (0 means none)
 16..20  u32 entry count
-20..24  reserved zero
+20..24  u32 pending ownership count (zero in v2-v5)
 24..32  u64 row_count (zero when absent)
 32..40  u64 managed_page_count (zero when absent)
 40..48  u64 next_index_id (nonzero on root, zero on continuations)
 
-v4/v5 entry prefix (48 bytes, little endian)
+v6 entry prefix (48 bytes, little endian; v4/v5 have the same size)
 0..4    u32 ColumnId
 4       u8 index-statistics presence (0 or 1)
 5       u8 logical-name presence (0 or 1)
@@ -1790,17 +1805,23 @@ v4/v5 entry prefix (48 bytes, little endian)
 24..32  u64 null_count (zero when absent)
 32..36  u32 tree_height (zero when absent)
 36      u8 lifecycle state (0 active, 1 retired)
-37..40  reserved zero
+37      u8 tree format (0 legacy v1, 1 owned v2; v4/v5 require zero)
+38..40  reserved zero
 40..48  u64 nonzero IndexId
 48..    logical-name UTF-8 bytes when present (maximum 255)
+
+Following all entries: pending ownership count * 16 bytes
+0..8    u64 nonzero IndexId
+8..16   u64 nonzero BTree meta PageId
+Presence means Pending; only v2 owned retirements may use this record.
 ```
 
-Legacy headers require byte 7 and bytes 40..48 to be zero. Versions 2/3 have a
+V2/v3/v4 headers require byte 7 and bytes 40..48 to be zero. Versions 2/3 have a
 40-byte entry prefix with bytes 36..40 zero; v2 also requires bytes 5..8 zero.
 Their IDs remain exactly their unique metadata PageIds. V4 IDs are decoded
-explicitly. Only a legacy root may infer `max(all active AND retired IDs) + 1`,
-because those formats never compacted. V5 roots must supply a boundary greater
-than every ID in the entire chain. Presence/zero mismatch, an absent v5 root
+explicitly. Only a v2/v3/v4 root may infer `max(all active AND retired IDs) + 1`,
+because those formats never compacted. V5/v6 roots must supply a boundary greater
+than every active, retired or pending ID in the entire chain. Presence/zero mismatch, an absent v5/v6 root
 boundary, or a boundary on a continuation is corrupt. `u64::MAX` is a valid
 exhausted next-ID boundary; CREATE returns typed IndexIdExhausted without
 allocating a tree, never wraps or issues that last value. Legacy MAX IDs also
@@ -1819,25 +1840,37 @@ boundary from the complete un-compacted chain, not just that page.
 An ordinary legacy update can spill a suffix into a new continuation when the
 explicit-ID representation no longer fits. New-page logging precedes link
 logging and WAL sync precedes allocation. Reverse undo restores links first.
-Explicit `compact_index_catalog` packs active entries and current snapshots into
-the smallest chain in creation order, reusing its existing prefix. Dense legacy
+Explicit `compact_index_catalog` packs active entries/current snapshots in
+creation order, followed by minimal pending records in IndexId order, reusing
+the existing chain prefix. Owned full retirements become pending records; names,
+columns and statistics are no longer retained for those retirements. Repeated
+compaction preserves pending records and is byte-idempotent. Dense legacy
 upgrades may need additional trailing catalog pages. All replacement images are
 preflighted and logged in one transaction, new allocations first and root last.
 Full-page recovery undo or redo resolves an interrupted rewrite; it does not rely
-on an atomic multi-page overwrite. Heap metadata, root PageId, Page/WAL/BTree
-formats and catalog_generation are unchanged.
+on an atomic multi-page overwrite. Compaction leaves Heap metadata, root PageId,
+Page/WAL formats, existing BTree payload versions and catalog_generation unchanged.
 
-Removed registrations and unused continuation pages follow **permanent physical
-abandonment**. There is no durable retired-page inventory after compaction and
-no promised future reclamation of those holes. No truncate/free/reuse occurs.
-The maintenance report counts this operation's abandoned tree and catalog pages
-separately and always reports zero reclaimed pages. Its geometric retired suffix
-is diagnostic only, not an authorization to truncate. See the full
-[Round 8 design and crash matrix](index-lifecycle-round8.md).
+Only removed **legacy** registrations and unused continuation pages follow
+permanent physical abandonment. New v2 retired trees remain in durable pending
+inventory, including middle holes and merge orphans. No truncate/free/reuse
+occurs. `inspect_index_reclaim` uses checkpoint admission plus no pinned pages,
+fully decodes every managed Page and BTree payload, traverses authoritative
+active/retired/raw roots, and rejects duplicate/overlapping ownership and
+cross-owner links. It identifies root-unreachable v2 pages by their validated
+owner; unreachable v1 pages remain explicitly unowned. Raw v1 trees cannot be
+distinguished from historically abandoned root-reachable v1 trees, so the admin
+report labels them unregistered legacy and never authorizes reclaim.
+
+Route B remains necessary: rollback can reuse a provisional (IndexId, PageId),
+same-owner references lack allocation generations, and buffer/WAL identities
+remain PageId-only. Completed checkpoints do retire old WAL generations but do
+not by themselves solve those reference lifetimes. No PageGeneration migration
+or general allocator is implemented. See [the Round 9 audit and crash matrix](index-reclaim-round9.md).
 
 A registered table index is distinct from a raw tree created through
-`HeapStorage::btree().create`: raw trees are never discovered by scanning page
-types. Open follows only the metadata root, separates retired ownership from active definitions, rejects cycles, duplicates,
+`HeapStorage::btree().create`: raw trees never enter the active index registry from page scans. Only admin
+ownership inventory validates and classifies their full payloads. Open follows only the metadata root, separates retired ownership from active definitions, rejects cycles, duplicates,
 out-of-range links, and wrong page kinds, then verifies every column against
 the canonical `TableDef` and every BTree metadata `IndexSpec` against that
 column's nominal type and nullability. Validated definitions and optional
@@ -1860,9 +1893,10 @@ DROP leaves the published active path usable and DML-maintained; rollback
 restores its catalog bytes. Existing prepared queries replan at execution.
 Retired definitions retain tree ownership in storage-only inspection but never
 enter ordinary CatalogInspection, access paths, ANALYZE, or vacuum. Explicit
-Round 8 compaction removes these definitions after validating page ownership,
-permanently abandoning their space. No free-list exists; repeated create/drop
-still grows the file. See [the lifecycle audit](index-lifecycle-round8.md).
+Round 9 compaction replaces owned retired definitions with minimal pending
+ownership after validating the full file. Legacy and historical pre-owner pages
+remain unreclaimable. No free-list exists; repeated CREATE/DROP still grows the
+file. See [the ownership audit](index-reclaim-round9.md).
 For every physical Heap version that has not been vacuumed and every registered
 index, one candidate entry `(version[column], version RowId)` exists. Raw
 B+Trees are outside this invariant. INSERT and UPDATE publish a new Heap version
@@ -2495,8 +2529,8 @@ Networking remains synchronous and must not leak async into parser, compiler,
 planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
 contract, not a database-file format. The current independent persistent
 contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
-transaction-status v1, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog
-v5 (backward decode v2/v3/v4). Deployment manifest v4 is configuration, not a database format or canonical
+transaction-status v1, Page v5, WAL v4/record v3, BTree v1/v2, and IndexCatalog
+v6 (backward decode v2/v3/v4/v5). Deployment manifest v4 is configuration, not a database format or canonical
 schema identity.
 
 Rust applications choose either the default embedded SDK or the optional

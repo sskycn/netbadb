@@ -137,6 +137,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-analyzed-root"),
         encode_index_catalog(&IndexCatalogNode {
+            pending: Vec::new(),
             next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: None,
             table_statistics: Some(TableStatistics {
@@ -147,7 +148,8 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
         })?,
     )?;
     let one = encode_index_catalog(&IndexCatalogNode {
-            next_index_id: Some(netbadb_types::IndexId(4)),
+        pending: Vec::new(),
+        next_index_id: Some(netbadb_types::IndexId(4)),
         next_catalog: None,
         table_statistics: None,
         entries: vec![IndexCatalogEntry {
@@ -157,6 +159,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
                 name: None,
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
+                    owner: None,
                     meta_page: PageId(3),
                 },
             },
@@ -165,7 +168,8 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     })?;
     let mut named = netbadb_index::decode_index_catalog(&one)?;
     named.entries[0].definition.name = Some(netbadb_types::IndexName::new("named_idx")?);
-    let named_v5 = encode_index_catalog(&named)?;
+    let mut named_v5 = encode_index_catalog(&named)?;
+    named_v5[4..6].copy_from_slice(&5_u16.to_le_bytes());
     std::fs::write(output.join("valid-named-v5"), &named_v5)?;
     let mut named_v4 = named_v5;
     named_v4[4..6].copy_from_slice(&4_u16.to_le_bytes());
@@ -178,6 +182,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(output.join("valid-named-v3"), named_v3)?;
     named.entries[0].retired = true;
     let mut retired_named = encode_index_catalog(&named)?;
+    retired_named[4..6].copy_from_slice(&5_u16.to_le_bytes());
     std::fs::write(output.join("valid-retired-named-v5"), &retired_named)?;
     retired_named[4..6].copy_from_slice(&4_u16.to_le_bytes());
     retired_named[7] = 0;
@@ -219,11 +224,17 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(output.join("valid-continuation-page"), continuation)?;
     let mut compacted = IndexCatalogNode::empty();
     compacted.next_index_id = Some(netbadb_types::IndexId(101));
-    std::fs::write(output.join("valid-compacted-high-water-v5"), encode_index_catalog(&compacted)?)?;
+    std::fs::write(
+        output.join("valid-compacted-high-water-v5"),
+        encode_index_catalog(&compacted)?,
+    )?;
     for value in [0_u64, 3] {
         let mut invalid = one.clone();
         invalid[40..48].copy_from_slice(&value.to_le_bytes());
-        std::fs::write(output.join(format!("invalid-high-water-{value}-v5")), invalid)?;
+        std::fs::write(
+            output.join(format!("invalid-high-water-{value}-v5")),
+            invalid,
+        )?;
     }
     let mut invalid_state = one.clone();
     invalid_state[84] = 2;
@@ -231,6 +242,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-analyzed-index-entry"),
         encode_index_catalog(&IndexCatalogNode {
+            pending: Vec::new(),
             next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: None,
             table_statistics: Some(TableStatistics {
@@ -244,6 +256,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
                     name: None,
                     column_id: ColumnId(1),
                     handle: BTreeHandle {
+                        owner: None,
                         meta_page: PageId(3),
                     },
                 },
@@ -258,6 +271,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-catalog-with-next"),
         encode_index_catalog(&IndexCatalogNode {
+            pending: Vec::new(),
             next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: Some(PageId(9)),
             table_statistics: None,
@@ -277,6 +291,24 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     version_one.extend_from_slice(&0_u32.to_le_bytes());
     version_one.resize(48, 0);
     std::fs::write(output.join("unsupported-v1"), version_one)?;
+    let mut pending = IndexCatalogNode::empty();
+    pending.next_index_id = Some(netbadb_types::IndexId(9));
+    pending.pending.push(netbadb_index::RetiredIndexOwnership {
+        index_id: netbadb_types::IndexId(7),
+        meta_page: PageId(2),
+    });
+    let pending_bytes = encode_index_catalog(&pending)?;
+    std::fs::write(output.join("valid-pending-v6"), &pending_bytes)?;
+    let mut invalid = pending_bytes.clone();
+    invalid[48..56].fill(0);
+    std::fs::write(output.join("invalid-pending-owner-v6"), invalid)?;
+    std::fs::write(output.join("truncated-pending-v6"), &pending_bytes[..63])?;
+    let mut owned = netbadb_index::decode_index_catalog(&one)?;
+    owned.entries[0].definition.handle.owner = Some(owned.entries[0].definition.id);
+    std::fs::write(output.join("valid-owned-v6"), encode_index_catalog(&owned)?)?;
+    let mut invalid = encode_index_catalog(&owned)?;
+    invalid[85] = 2;
+    std::fs::write(output.join("invalid-owner-format-v6"), invalid)?;
     Ok(())
 }
 
@@ -304,6 +336,7 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
         "valid-meta",
         0,
         &encode_meta(&MetaNode {
+            owner: None,
             root_page: PageId(2),
             height: 1,
             spec: spec.clone(),
@@ -339,6 +372,38 @@ fn write_btree_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error:
         )?,
     )?;
     write_btree_seed(&output, "truncated-leaf", 1, &leaf[..leaf.len() - 1])?;
+    let owner = Some(netbadb_types::IndexId(7));
+    let meta = encode_meta(&MetaNode {
+        owner,
+        root_page: PageId(2),
+        height: 2,
+        spec: spec.clone(),
+    })?;
+    let leaf = netbadb_index::encode_leaf_owned(&spec, &LeafNode::empty(), owner)?;
+    let internal = netbadb_index::encode_internal_owned(
+        &spec,
+        &InternalNode {
+            first_child: PageId(2),
+            separators: vec![],
+        },
+        owner,
+    )?;
+    for (kind, name, payload) in [
+        (0, "meta", meta),
+        (1, "leaf", leaf),
+        (2, "internal", internal),
+    ] {
+        write_btree_seed(&output, &format!("valid-owned-{name}-v2"), kind, &payload)?;
+        let mut zero = payload.clone();
+        zero[8..16].fill(0);
+        write_btree_seed(&output, &format!("invalid-owner-{name}-v2"), kind, &zero)?;
+        write_btree_seed(
+            &output,
+            &format!("truncated-owner-{name}-v2"),
+            kind,
+            &payload[..15],
+        )?;
+    }
     Ok(())
 }
 
@@ -387,8 +452,29 @@ fn write_page_update_seed(output: &Path) -> Result<(), Box<dyn std::error::Error
     let _ = std::fs::remove_file(&wal_file);
     let mut storage = HeapStorage::create(&database_path, fuzz_table())?;
     storage.insert(&[ScalarValue::UInt64(1)])?;
-    drop(storage);
+    storage.flush()?;
     std::fs::copy(&wal_file, output.join("valid-page-update"))?;
+    drop(storage);
+    // Keep the complete owned lifecycle below the harness's 64 KiB limit.
+    // A separate empty heap avoids including unrelated heap INSERT history.
+    let owned_path = database_path.with_extension("owned");
+    let owned_wal = wal_path(&owned_path);
+    let mut storage = HeapStorage::create(&owned_path, fuzz_table())?;
+    let index = storage.create_index(ColumnId(1))?;
+    storage.flush()?;
+    std::fs::copy(&owned_wal, output.join("valid-owned-btree-v2"))?;
+    storage.drop_index(index.id)?;
+    storage.compact_index_catalog()?;
+    storage.flush()?;
+    let pending_seed = std::fs::read(&owned_wal)?;
+    assert!(pending_seed.len() <= 64 * 1024);
+    std::fs::write(output.join("valid-pending-catalog-v6"), pending_seed)?;
+    drop(storage);
+    std::fs::remove_file(owned_wal)?;
+    std::fs::remove_file(&owned_path)?;
+    let mut status_path = owned_path.as_os_str().to_os_string();
+    status_path.push("-txn-status");
+    std::fs::remove_file(status_path)?;
     std::fs::remove_file(wal_file)?;
     std::fs::remove_file(database_path)?;
     Ok(())

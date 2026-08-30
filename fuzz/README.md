@@ -4,7 +4,9 @@
 minimal heap, and calls `HeapStorage::open`. That public path invokes the
 crate-private recovery decoder without adding a fuzz-only production API.
 Root, alternate WAL, and heap files are isolated by process ID and removed
-before and after every iteration.
+before and after every iteration, including the transaction-status sidecar.
+Fixture creation must succeed; it cannot silently turn later iterations into
+no-ops. Successful recovery also invokes the full ownership scanner.
 
 `page_decode` accepts at most one 4096-byte page, zero-pads shorter inputs,
 and exercises the public Page v5 header, generation-aware slot-state, and
@@ -12,15 +14,15 @@ record decoders. Its Heap seed uses `PageId(7)` because the CRC32C binds the
 expected logical page ID; a second seed is a valid page-1 IndexCatalog root.
 
 `btree_decode` accepts at most one 4060-byte index payload plus a one-byte node
-selector and directly exercises the public versioned Meta, Leaf, and Internal
+selector and directly exercises the public v1/v2 Meta, Leaf, and Internal
 decoders with a nullable UInt64 `IndexSpec`. Arbitrary bytes must return a node
 or typed `IndexError` without panicking, unbounded allocation, or traversal.
 
 `index_catalog_decode` accepts at most one 4060-byte `NBIC` payload and
-exercises the version-5 registry decoder with backward version-2/version-3/version-4 input.
+exercises the version-6 registry decoder with backward version-2/version-3/version-4/version-5 input.
 Seeds cover active/retired registrations, invalid state and zero IDs, duplicate
 IDs, truncation, root high-water, compacted catalogs, invalid high-water, and
-legacy payloads. Successful decodes also canonicalize and round-trip through v5. Retirement is an in-place state, not a
+legacy payloads. Successful decodes also canonicalize and round-trip through v6. Retirement is an in-place state, not a
 DropIndex event: unknown/double-drop requests are covered by storage tests. Arbitrary counts and
 bytes must remain bounded and return either a catalog node or typed error.
 
@@ -70,3 +72,11 @@ empty/one-entry leaves, one internal separator, and a truncated leaf. The
 index-catalog corpus covers an empty registry, one entry, a next-page link,
 truncation, and an impossible entry count. Do not commit generated findings or
 large corpora.
+
+Round 9 adds v2 meta/internal/leaf owners, zero/truncated owners, strict owner
+mismatch checks and round trips, v6 owned/pending records with malformed counts
+and ownership flags, and WAL seeds containing owned trees and pending catalog
+updates. Cross-node mixed-owner graphs are exercised by deterministic storage
+corruption tests; the payload fuzzer cannot infer a whole tree from one page.
+Run fuzzing with a copied temporary corpus/artifact directory to avoid committing
+mutation-generated findings. Only small reviewed deterministic seeds belong here.

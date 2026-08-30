@@ -1,13 +1,17 @@
+use netbadb_index::{
+    BTREE_OWNER_SIZE, btree_page_owner, decode_internal_owned, decode_leaf_owned,
+    encode_internal_owned, encode_leaf_owned, validate_btree_owner,
+};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use netbadb_index::{
     BTreeHandle, IndexBound, IndexEntry, IndexEntryKey, IndexError, IndexRange, IndexSpec,
     InternalNode, InternalSeparator, LeafNode, MetaNode, compare_entry_keys, compare_key_to_entry,
-    decode_internal, decode_leaf, decode_meta, encode_internal, encode_leaf, encode_meta,
-    ensure_entry_fits, merge_internals_if_fits, merge_leaves_if_fits, split_internal, split_leaf,
+    decode_meta, encode_internal, encode_leaf, encode_meta, ensure_entry_fits,
+    merge_internals_if_fits, merge_leaves_if_fits, split_internal, split_leaf,
 };
-use netbadb_types::{PageId, RowId, ScalarValue};
+use netbadb_types::{IndexId, PageId, RowId, ScalarValue};
 
 use crate::{HeapStorage, Page, PageType, StorageError, Transaction};
 
@@ -96,6 +100,25 @@ impl<'a> BTree<'a> {
         transaction: &mut Transaction,
         spec: IndexSpec,
     ) -> Result<BTreeHandle, StorageError> {
+        self.create_with_owner_in(transaction, spec, None)
+    }
+
+    /// Only the registered-index allocator may assign a durable owner.
+    pub(crate) fn create_owned_in(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: IndexSpec,
+        owner: IndexId,
+    ) -> Result<BTreeHandle, StorageError> {
+        self.create_with_owner_in(transaction, spec, Some(owner))
+    }
+
+    fn create_with_owner_in(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: IndexSpec,
+        owner: Option<IndexId>,
+    ) -> Result<BTreeHandle, StorageError> {
         self.storage.validate_transaction(transaction)?;
         transaction.acquire_writer()?;
         let capacity = Page::single_payload_capacity();
@@ -107,6 +130,7 @@ impl<'a> BTree<'a> {
                 .ok_or(IndexError::InvalidChild(meta_page))?,
         );
         let meta = MetaNode {
+            owner,
             root_page,
             height: 1,
             spec: spec.clone(),
@@ -119,13 +143,13 @@ impl<'a> BTree<'a> {
             }
             .into());
         }
-        let root_payload = encode_leaf(&spec, &LeafNode::empty())?;
+        let root_payload = encode_leaf_owned(&spec, &LeafNode::empty(), owner)?;
         let changes = vec![
-            prepare_new_page(meta_page, PageType::BTreeMeta, &meta_payload)?,
-            prepare_new_page(root_page, PageType::BTreeLeaf, &root_payload)?,
+            prepare_new_page(meta_page, PageType::BTreeMeta, &meta_payload, owner)?,
+            prepare_new_page(root_page, PageType::BTreeLeaf, &root_payload, owner)?,
         ];
         self.apply_changes(transaction, changes)?;
-        Ok(BTreeHandle { meta_page })
+        Ok(BTreeHandle { owner, meta_page })
     }
 
     /// Inserts and commits one complete `(key, RowId)` entry.
@@ -160,15 +184,19 @@ impl<'a> BTree<'a> {
         let meta = self.read_meta(handle)?;
         let entry = IndexEntry { key, row_id };
         let capacity = Page::single_payload_capacity();
-        ensure_entry_fits(&meta.spec, &entry, capacity)?;
+        ensure_entry_fits(&meta.spec, &entry, node_capacity(meta.owner))?;
         transaction.acquire_writer()?;
 
         let (leaf_page, mut leaf, mut path) = self.find_leaf_for_entry(&meta, &entry)?;
         leaf.insert(&meta.spec, entry)?;
-        let leaf_payload = encode_leaf(&meta.spec, &leaf)?;
+        let leaf_payload = encode_leaf_for(&meta, &leaf)?;
         if leaf_payload.len() <= capacity {
-            let change =
-                self.prepare_existing_page(leaf_page, PageType::BTreeLeaf, &leaf_payload)?;
+            let change = self.prepare_existing_page(
+                leaf_page,
+                PageType::BTreeLeaf,
+                &leaf_payload,
+                meta.owner,
+            )?;
             return self.apply_changes(transaction, vec![change]);
         }
 
@@ -179,18 +207,20 @@ impl<'a> BTree<'a> {
             leaf.entries,
             leaf.next_leaf,
             right_leaf_page,
-            capacity,
+            node_capacity(meta.owner),
         )?;
         let mut changes = vec![
             prepare_new_page(
                 right_leaf_page,
                 PageType::BTreeLeaf,
-                &encode_leaf(&meta.spec, &right_leaf)?,
+                &encode_leaf_for(&meta, &right_leaf)?,
+                meta.owner,
             )?,
             self.prepare_existing_page(
                 leaf_page,
                 PageType::BTreeLeaf,
-                &encode_leaf(&meta.spec, &left_leaf)?,
+                &encode_leaf_for(&meta, &left_leaf)?,
+                meta.owner,
             )?,
         ];
         let mut left_page = leaf_page;
@@ -200,28 +230,31 @@ impl<'a> BTree<'a> {
             parent
                 .node
                 .insert_separator(parent.child_position, promoted, right_page)?;
-            let payload = encode_internal(&meta.spec, &parent.node)?;
+            let payload = encode_internal_for(&meta, &parent.node)?;
             if payload.len() <= capacity {
                 changes.push(self.prepare_existing_page(
                     parent.page_id,
                     PageType::BTreeInternal,
                     &payload,
+                    meta.owner,
                 )?);
                 return self.apply_changes(transaction, changes);
             }
 
             let parent_right_page = take_page_id(&mut next_page_id)?;
             let (left_parent, next_promoted, right_parent) =
-                split_internal(&meta.spec, parent.node, capacity)?;
+                split_internal(&meta.spec, parent.node, node_capacity(meta.owner))?;
             changes.push(prepare_new_page(
                 parent_right_page,
                 PageType::BTreeInternal,
-                &encode_internal(&meta.spec, &right_parent)?,
+                &encode_internal_for(&meta, &right_parent)?,
+                meta.owner,
             )?);
             changes.push(self.prepare_existing_page(
                 parent.page_id,
                 PageType::BTreeInternal,
-                &encode_internal(&meta.spec, &left_parent)?,
+                &encode_internal_for(&meta, &left_parent)?,
+                meta.owner,
             )?);
             promoted = next_promoted;
             left_page = parent.page_id;
@@ -239,13 +272,15 @@ impl<'a> BTree<'a> {
         changes.push(prepare_new_page(
             new_root_page,
             PageType::BTreeInternal,
-            &encode_internal(&meta.spec, &new_root)?,
+            &encode_internal_for(&meta, &new_root)?,
+            meta.owner,
         )?);
         let new_height = meta
             .height
             .checked_add(1)
             .ok_or(IndexError::InvalidHeight(meta.height))?;
         let updated_meta = MetaNode {
+            owner: meta.owner,
             root_page: new_root_page,
             height: new_height,
             spec: meta.spec.clone(),
@@ -254,6 +289,7 @@ impl<'a> BTree<'a> {
             handle.meta_page,
             PageType::BTreeMeta,
             &encode_meta(&updated_meta)?,
+            meta.owner,
         )?);
         self.apply_changes(transaction, changes)
     }
@@ -290,16 +326,56 @@ impl<'a> BTree<'a> {
     ) -> Result<(), StorageError> {
         self.storage.validate_transaction(transaction)?;
         let meta = self.read_meta(handle)?;
+        let entry = IndexEntryKey {
+            key: key.clone(),
+            row_id,
+        };
+        meta.spec.validate_key(&entry.key)?;
+        let (_, leaf, path) = self.find_leaf_for_entry(&meta, &entry)?;
+        if !leaf.contains_exact(&meta.spec, &entry)? {
+            return Err(IndexError::EntryNotFound.into());
+        }
+        let needs_normalization = path.iter().any(|node| node.node.separators.is_empty());
+        transaction.acquire_writer()?;
+        if needs_normalization {
+            if let Err(error) = self.normalize_delete_path(transaction, handle, &entry) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+        }
+        #[cfg(test)]
+        if needs_normalization {
+            crate::crash_test::maybe_crash(
+                crate::crash_test::TestCrashPoint::BTreeAfterUnaryNormalization,
+            );
+        }
+        let result = self.delete_balanced_in(transaction, handle, key, row_id);
+        if needs_normalization && result.is_err() {
+            transaction.require_rollback();
+        }
+        result
+    }
+
+    fn delete_balanced_in(
+        &mut self,
+        transaction: &mut Transaction,
+        handle: BTreeHandle,
+        key: ScalarValue,
+        row_id: RowId,
+    ) -> Result<(), StorageError> {
+        self.storage.validate_transaction(transaction)?;
+        let meta = self.read_meta(handle)?;
         let entry = IndexEntry { key, row_id };
         meta.spec.validate_key(&entry.key)?;
         transaction.acquire_writer()?;
 
         let (leaf_page, mut leaf, mut path) = self.find_leaf_for_entry(&meta, &entry)?;
         leaf.remove(&meta.spec, &entry)?;
-        let capacity = Page::single_payload_capacity();
+        let capacity = node_capacity(meta.owner);
         if meta.height == 1 {
-            let payload = encode_leaf(&meta.spec, &leaf)?;
-            let change = self.prepare_existing_page(leaf_page, PageType::BTreeLeaf, &payload)?;
+            let payload = encode_leaf_for(&meta, &leaf)?;
+            let change =
+                self.prepare_existing_page(leaf_page, PageType::BTreeLeaf, &payload, meta.owner)?;
             return self.apply_changes(transaction, vec![change]);
         }
 
@@ -311,13 +387,13 @@ impl<'a> BTree<'a> {
         loop {
             let current_size = current.encoded_len(&meta.spec)?;
             if current_size >= soft_min {
-                changes.push(self.prepare_delete_node(current_page, &meta.spec, &current)?);
+                changes.push(self.prepare_delete_node(current_page, &meta, &current)?);
                 return self.apply_changes(transaction, changes);
             }
 
             let mut parent = path.pop().ok_or(IndexError::InvalidHeight(meta.height))?;
             let merge = self.preflight_merge(
-                &meta.spec,
+                &meta,
                 &parent.node,
                 parent.child_position,
                 current_page,
@@ -325,11 +401,11 @@ impl<'a> BTree<'a> {
                 capacity,
             )?;
             let Some((retained_page, merged, separator_position)) = merge else {
-                changes.push(self.prepare_delete_node(current_page, &meta.spec, &current)?);
+                changes.push(self.prepare_delete_node(current_page, &meta, &current)?);
                 return self.apply_changes(transaction, changes);
             };
 
-            changes.push(self.prepare_delete_node(retained_page, &meta.spec, &merged)?);
+            changes.push(self.prepare_delete_node(retained_page, &meta, &merged)?);
             parent.node.remove_separator(separator_position)?;
 
             if path.is_empty() {
@@ -340,6 +416,7 @@ impl<'a> BTree<'a> {
                         .filter(|height| *height >= 1)
                         .ok_or(IndexError::InvalidHeight(meta.height))?;
                     let updated_meta = MetaNode {
+                        owner: meta.owner,
                         root_page: retained_page,
                         height,
                         spec: meta.spec.clone(),
@@ -348,11 +425,12 @@ impl<'a> BTree<'a> {
                         handle.meta_page,
                         PageType::BTreeMeta,
                         &encode_meta(&updated_meta)?,
+                        meta.owner,
                     )?);
                 } else {
                     changes.push(self.prepare_delete_node(
                         parent.page_id,
-                        &meta.spec,
+                        &meta,
                         &DeleteNode::Internal(parent.node),
                     )?);
                 }
@@ -473,7 +551,7 @@ impl<'a> BTree<'a> {
             key: key.clone(),
             row_id,
         };
-        ensure_entry_fits(&meta.spec, &entry, Page::single_payload_capacity())?;
+        ensure_entry_fits(&meta.spec, &entry, node_capacity(meta.owner))?;
         let (_, leaf, _) = self.find_leaf_for_entry(&meta, &entry)?;
         Ok(leaf.contains_exact(&meta.spec, &entry)?)
     }
@@ -515,7 +593,7 @@ impl<'a> BTree<'a> {
         while let Some((page_id, height)) = pending.pop() {
             pages.insert(page_id);
             if height == 1 {
-                let leaf = self.read_leaf(page_id, &meta.spec)?;
+                let leaf = self.read_leaf(page_id, &meta)?;
                 if let Some((previous, next)) = previous_link {
                     if next != Some(page_id) {
                         return Err(IndexError::InvalidLeafChain(previous).into());
@@ -531,7 +609,7 @@ impl<'a> BTree<'a> {
                 }
                 previous_link = Some((page_id, leaf.next_leaf));
             } else {
-                let node = self.read_internal(page_id, &meta.spec)?;
+                let node = self.read_internal(page_id, &meta)?;
                 let children = std::iter::once(node.first_child).chain(
                     node.separators
                         .iter()
@@ -559,6 +637,7 @@ impl<'a> BTree<'a> {
             return Err(IndexError::InvalidNodeType.into());
         }
         let meta = decode_meta(page.page().single_payload(PageType::BTreeMeta)?)?;
+        validate_btree_owner(handle.owner, meta.owner)?;
         let page_count = self.storage.buffer().page_count();
         if u64::from(meta.height) >= page_count {
             return Err(IndexError::InvalidHeight(meta.height).into());
@@ -567,29 +646,34 @@ impl<'a> BTree<'a> {
         Ok(meta)
     }
 
-    fn read_leaf(&self, page_id: PageId, spec: &IndexSpec) -> Result<LeafNode, StorageError> {
+    fn read_leaf(&self, page_id: PageId, meta: &MetaNode) -> Result<LeafNode, StorageError> {
         self.validate_child(page_id)?;
         let page = self.storage.buffer().read_page(page_id)?;
         if page.page().header()?.page_type != PageType::BTreeLeaf {
             return Err(IndexError::InvalidNodeType.into());
         }
-        Ok(decode_leaf(
-            spec,
+        Ok(decode_leaf_owned(
+            &meta.spec,
             page.page().single_payload(PageType::BTreeLeaf)?,
+            meta.owner,
         )?)
     }
 
     fn read_internal(
         &self,
         page_id: PageId,
-        spec: &IndexSpec,
+        meta: &MetaNode,
     ) -> Result<InternalNode, StorageError> {
         self.validate_child(page_id)?;
         let page = self.storage.buffer().read_page(page_id)?;
         if page.page().header()?.page_type != PageType::BTreeInternal {
             return Err(IndexError::InvalidNodeType.into());
         }
-        let node = decode_internal(spec, page.page().single_payload(PageType::BTreeInternal)?)?;
+        let node = decode_internal_owned(
+            &meta.spec,
+            page.page().single_payload(PageType::BTreeInternal)?,
+            meta.owner,
+        )?;
         self.validate_child(node.first_child)?;
         for separator in &node.separators {
             self.validate_child(separator.right_child)?;
@@ -606,9 +690,9 @@ impl<'a> BTree<'a> {
         let mut path = Vec::new();
         for level in 1..=meta.height {
             if level == meta.height {
-                return Ok((page_id, self.read_leaf(page_id, &meta.spec)?, path));
+                return Ok((page_id, self.read_leaf(page_id, meta)?, path));
             }
-            let node = self.read_internal(page_id, &meta.spec)?;
+            let node = self.read_internal(page_id, meta)?;
             let child_position = node.child_position(entry);
             let child = node.child(child_position)?;
             self.validate_child(child)?;
@@ -630,10 +714,10 @@ impl<'a> BTree<'a> {
         let mut page_id = meta.root_page;
         for level in 1..=meta.height {
             if level == meta.height {
-                self.read_leaf(page_id, &meta.spec)?;
+                self.read_leaf(page_id, meta)?;
                 return Ok(page_id);
             }
-            let node = self.read_internal(page_id, &meta.spec)?;
+            let node = self.read_internal(page_id, meta)?;
             let position = node.separators.partition_point(|separator| {
                 compare_key_to_entry(key, &separator.key) == Ordering::Greater
             });
@@ -647,10 +731,10 @@ impl<'a> BTree<'a> {
         let mut page_id = meta.root_page;
         for level in 1..=meta.height {
             if level == meta.height {
-                self.read_leaf(page_id, &meta.spec)?;
+                self.read_leaf(page_id, meta)?;
                 return Ok(page_id);
             }
-            let node = self.read_internal(page_id, &meta.spec)?;
+            let node = self.read_internal(page_id, meta)?;
             page_id = node.first_child;
             self.validate_child(page_id)?;
         }
@@ -666,7 +750,7 @@ impl<'a> BTree<'a> {
         if !chain.visited.insert(page_id) || chain.visited.len() as u64 > chain.page_count {
             return Err(IndexError::LeafChainCycle { page_id }.into());
         }
-        let leaf = self.read_leaf(page_id, &meta.spec)?;
+        let leaf = self.read_leaf(page_id, meta)?;
         if leaf.entries.is_empty() && (meta.height > 1 || leaf.next_leaf.is_some()) {
             return Err(IndexError::EmptyLeaf { page_id }.into());
         }
@@ -697,9 +781,160 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
+    /// A byte-balanced split/merge may leave a non-root internal node with
+    /// one child. Give every internal node on the deletion path a sibling
+    /// boundary before removing the leaf entry. Otherwise the bottom-up merge
+    /// cannot merge an empty leaf whose parent has no separator.
+    fn normalize_delete_path(
+        &mut self,
+        transaction: &mut Transaction,
+        handle: BTreeHandle,
+        entry: &IndexEntryKey,
+    ) -> Result<(), StorageError> {
+        // Each merge removes a reachable internal page; each redistribution
+        // resolves one unary node on the path without allocating pages.
+        let limit = self.storage.buffer().page_count();
+        for _ in 0..limit {
+            let meta = self.read_meta(handle)?;
+            let (_, leaf, path) = self.find_leaf_for_entry(&meta, entry)?;
+            if !leaf.contains_exact(&meta.spec, entry)? {
+                return Err(IndexError::EntryNotFound.into());
+            }
+            let Some(position) = path
+                .iter()
+                .position(|parent| parent.node.separators.is_empty())
+            else {
+                return Ok(());
+            };
+            let current = &path[position];
+            let mut changes = Vec::new();
+            if position == 0 {
+                let updated = MetaNode {
+                    root_page: current.node.first_child,
+                    height: meta
+                        .height
+                        .checked_sub(1)
+                        .filter(|height| *height > 0)
+                        .ok_or(IndexError::InvalidHeight(meta.height))?,
+                    ..meta.clone()
+                };
+                changes.push(self.prepare_existing_page(
+                    handle.meta_page,
+                    PageType::BTreeMeta,
+                    &encode_meta(&updated)?,
+                    meta.owner,
+                )?);
+            } else {
+                let parent = &path[position - 1];
+                let mut parent_node = parent.node.clone();
+                let child_position = parent.child_position;
+                let current_is_left = child_position < parent_node.separators.len();
+                let separator_position = if current_is_left {
+                    child_position
+                } else {
+                    child_position
+                        .checked_sub(1)
+                        .ok_or(IndexError::InvalidNodeType)?
+                };
+                let left_page = parent_node.child(separator_position)?;
+                let right_page = parent_node.child(separator_position + 1)?;
+                if left_page == right_page {
+                    return Err(IndexError::SharedTreePage(left_page).into());
+                }
+                let mut left = if current_is_left {
+                    current.node.clone()
+                } else {
+                    self.read_internal(left_page, &meta)?
+                };
+                let mut right = if current_is_left {
+                    self.read_internal(right_page, &meta)?
+                } else {
+                    current.node.clone()
+                };
+                let fence = parent_node.separators[separator_position].key.clone();
+                if let Some(merged) = merge_internals_if_fits(
+                    &meta.spec,
+                    &left,
+                    &fence,
+                    &right,
+                    node_capacity(meta.owner),
+                )? {
+                    changes.push(self.prepare_delete_node(
+                        left_page,
+                        &meta,
+                        &DeleteNode::Internal(merged),
+                    )?);
+                    parent_node.remove_separator(separator_position)?;
+                    if position == 1 && parent_node.separators.is_empty() {
+                        let updated = MetaNode {
+                            root_page: left_page,
+                            height: meta.height - 1,
+                            ..meta.clone()
+                        };
+                        changes.push(self.prepare_existing_page(
+                            handle.meta_page,
+                            PageType::BTreeMeta,
+                            &encode_meta(&updated)?,
+                            meta.owner,
+                        )?);
+                    } else {
+                        changes.push(self.prepare_delete_node(
+                            parent.page_id,
+                            &meta,
+                            &DeleteNode::Internal(parent_node),
+                        )?);
+                    }
+                } else {
+                    // A full sibling cannot merge; rotate one child through
+                    // the parent fence. The promoted fence retains its RowId
+                    // ordering token, even when that heap version is dead.
+                    if current_is_left {
+                        let promoted = right.remove_separator(0)?;
+                        left.separators.push(InternalSeparator {
+                            key: fence,
+                            right_child: right.first_child,
+                        });
+                        right.first_child = promoted.right_child;
+                        parent_node.separators[separator_position].key = promoted.key;
+                    } else {
+                        let promoted = left.separators.pop().ok_or(IndexError::InvalidNodeType)?;
+                        right.separators.insert(
+                            0,
+                            InternalSeparator {
+                                key: fence,
+                                right_child: right.first_child,
+                            },
+                        );
+                        right.first_child = promoted.right_child;
+                        parent_node.separators[separator_position].key = promoted.key;
+                    }
+                    changes.push(self.prepare_delete_node(
+                        left_page,
+                        &meta,
+                        &DeleteNode::Internal(left),
+                    )?);
+                    changes.push(self.prepare_delete_node(
+                        right_page,
+                        &meta,
+                        &DeleteNode::Internal(right),
+                    )?);
+                    changes.push(self.prepare_delete_node(
+                        parent.page_id,
+                        &meta,
+                        &DeleteNode::Internal(parent_node),
+                    )?);
+                }
+            }
+            // The caller marks a normalization error rollback-required: even
+            // earlier successful iterations belong to the same transaction.
+            self.apply_changes(transaction, changes)?;
+        }
+        Err(IndexError::InvalidHeight(self.read_meta(handle)?.height).into())
+    }
+
     fn preflight_merge(
         &self,
-        spec: &IndexSpec,
+        meta: &MetaNode,
         parent: &InternalNode,
         child_position: usize,
         current_page: PageId,
@@ -734,9 +969,9 @@ impl<'a> BTree<'a> {
         let merged = match current {
             DeleteNode::Leaf(current_leaf) => {
                 let (left, right) = if current_is_left {
-                    (current_leaf.clone(), self.read_leaf(right_page, spec)?)
+                    (current_leaf.clone(), self.read_leaf(right_page, meta)?)
                 } else {
-                    (self.read_leaf(left_page, spec)?, current_leaf.clone())
+                    (self.read_leaf(left_page, meta)?, current_leaf.clone())
                 };
                 if left.entries.is_empty() && left_page != current_page {
                     return Err(IndexError::EmptyLeaf { page_id: left_page }.into());
@@ -755,21 +990,21 @@ impl<'a> BTree<'a> {
                     }
                     .into());
                 }
-                merge_leaves_if_fits(spec, &left, &right, capacity)?.map(DeleteNode::Leaf)
+                merge_leaves_if_fits(&meta.spec, &left, &right, capacity)?.map(DeleteNode::Leaf)
             }
             DeleteNode::Internal(current_internal) => {
                 let (left, right) = if current_is_left {
                     (
                         current_internal.clone(),
-                        self.read_internal(right_page, spec)?,
+                        self.read_internal(right_page, meta)?,
                     )
                 } else {
                     (
-                        self.read_internal(left_page, spec)?,
+                        self.read_internal(left_page, meta)?,
                         current_internal.clone(),
                     )
                 };
-                merge_internals_if_fits(spec, &left, fence, &right, capacity)?
+                merge_internals_if_fits(&meta.spec, &left, fence, &right, capacity)?
                     .map(DeleteNode::Internal)
             }
         };
@@ -779,17 +1014,21 @@ impl<'a> BTree<'a> {
     fn prepare_delete_node(
         &self,
         page_id: PageId,
-        spec: &IndexSpec,
+        meta: &MetaNode,
         node: &DeleteNode,
     ) -> Result<PreparedPage, StorageError> {
         match node {
-            DeleteNode::Leaf(leaf) => {
-                self.prepare_existing_page(page_id, PageType::BTreeLeaf, &encode_leaf(spec, leaf)?)
-            }
+            DeleteNode::Leaf(leaf) => self.prepare_existing_page(
+                page_id,
+                PageType::BTreeLeaf,
+                &encode_leaf_for(meta, leaf)?,
+                meta.owner,
+            ),
             DeleteNode::Internal(internal) => self.prepare_existing_page(
                 page_id,
                 PageType::BTreeInternal,
-                &encode_internal(spec, internal)?,
+                &encode_internal_for(meta, internal)?,
+                meta.owner,
             ),
         }
     }
@@ -799,11 +1038,17 @@ impl<'a> BTree<'a> {
         page_id: PageId,
         page_type: PageType,
         payload: &[u8],
+        owner: Option<IndexId>,
     ) -> Result<PreparedPage, StorageError> {
         let page = self.storage.buffer().read_page(page_id)?;
         if page.page().header()?.page_type != page_type {
             return Err(IndexError::InvalidNodeType.into());
         }
+        validate_btree_owner(
+            owner,
+            btree_page_owner(page.page().single_payload(page_type)?)?,
+        )?;
+        validate_btree_owner(owner, btree_page_owner(payload)?)?;
         let before = page.page().clone();
         drop(page);
         let mut after = before.clone();
@@ -916,7 +1161,9 @@ fn prepare_new_page(
     page_id: PageId,
     page_type: PageType,
     payload: &[u8],
+    owner: Option<IndexId>,
 ) -> Result<PreparedPage, StorageError> {
+    validate_btree_owner(owner, btree_page_owner(payload)?)?;
     let before = Page::zero(page_id);
     let mut after = Page::new(page_id, page_type);
     after.initialize_single_payload(page_type, payload)?;
@@ -935,6 +1182,18 @@ fn take_page_id(next: &mut PageId) -> Result<PageId, IndexError> {
         .checked_add(1)
         .ok_or(IndexError::InvalidChild(current))?;
     Ok(current)
+}
+
+fn node_capacity(owner: Option<IndexId>) -> usize {
+    Page::single_payload_capacity() - if owner.is_some() { BTREE_OWNER_SIZE } else { 0 }
+}
+
+fn encode_leaf_for(meta: &MetaNode, node: &LeafNode) -> Result<Vec<u8>, IndexError> {
+    encode_leaf_owned(&meta.spec, node, meta.owner)
+}
+
+fn encode_internal_for(meta: &MetaNode, node: &InternalNode) -> Result<Vec<u8>, IndexError> {
+    encode_internal_owned(&meta.spec, node, meta.owner)
 }
 
 #[cfg(test)]
@@ -1486,7 +1745,7 @@ mod tests {
         assert!(
             storage
                 .btree()
-                .read_leaf(meta.root_page, &meta.spec)
+                .read_leaf(meta.root_page, &meta)
                 .expect("root leaf")
                 .entries
                 .is_empty()
@@ -1532,7 +1791,7 @@ mod tests {
         assert!(
             storage
                 .btree()
-                .read_leaf(meta.root_page, &meta.spec)
+                .read_leaf(meta.root_page, &meta)
                 .expect("empty root")
                 .entries
                 .is_empty()
@@ -1584,9 +1843,7 @@ mod tests {
         let (meta, root_before, fence) = {
             let tree = storage.btree();
             let meta = tree.read_meta(handle).expect("meta");
-            let root = tree
-                .read_internal(meta.root_page, &meta.spec)
-                .expect("root");
+            let root = tree.read_internal(meta.root_page, &meta).expect("root");
             let fence = root.separators[0].key.clone();
             (meta, root, fence)
         };
@@ -1596,7 +1853,7 @@ mod tests {
             .expect("delete live fence entry");
         let root_after = storage
             .btree()
-            .read_internal(meta.root_page, &meta.spec)
+            .read_internal(meta.root_page, &meta)
             .expect("root after delete");
         assert_eq!(root_after, root_before, "delete must not rewrite the fence");
         assert!(
@@ -1688,6 +1945,7 @@ mod tests {
         assert!(matches!(
             storage.btree().lookup(
                 BTreeHandle {
+                    owner: None,
                     meta_page: PageId(0)
                 },
                 &ScalarValue::UInt64(1)
@@ -2076,7 +2334,7 @@ mod tests {
             let tree = storage.btree();
             let meta = tree.read_meta(handle).expect("read metadata");
             let root = tree
-                .read_internal(meta.root_page, &meta.spec)
+                .read_internal(meta.root_page, &meta)
                 .expect("read root");
             (meta, root)
         };
@@ -2121,7 +2379,7 @@ mod tests {
                 let tree = storage.btree();
                 let meta = tree.read_meta(handle).expect("read metadata");
                 let root = tree
-                    .read_internal(meta.root_page, &meta.spec)
+                    .read_internal(meta.root_page, &meta)
                     .expect("read root");
                 let left_page = root.first_child;
                 let right_page = root
@@ -2129,12 +2387,8 @@ mod tests {
                     .first()
                     .expect("split root separator")
                     .right_child;
-                let left = tree
-                    .read_leaf(left_page, &meta.spec)
-                    .expect("read left leaf");
-                let right = tree
-                    .read_leaf(right_page, &meta.spec)
-                    .expect("read right leaf");
+                let left = tree.read_leaf(left_page, &meta).expect("read left leaf");
+                let right = tree.read_leaf(right_page, &meta).expect("read right leaf");
                 let left_last = left.entries.last().cloned().expect("non-empty left leaf");
                 (meta, left_page, right_page, left_last, right.next_leaf)
             };
@@ -2221,12 +2475,10 @@ mod tests {
                 let tree = storage.btree();
                 let meta = tree.read_meta(handle).expect("read metadata");
                 let root = tree
-                    .read_internal(meta.root_page, &meta.spec)
+                    .read_internal(meta.root_page, &meta)
                     .expect("read root");
                 let left_page = root.first_child;
-                let left = tree
-                    .read_leaf(left_page, &meta.spec)
-                    .expect("read left leaf");
+                let left = tree.read_leaf(left_page, &meta).expect("read left leaf");
                 (meta, left_page, left)
             };
             let invalid = PageId(storage.buffer().page_count() + 10);
@@ -2281,6 +2533,7 @@ mod tests {
     fn run_crash_child(case: &str, path: &std::path::Path) {
         let trigger = split_trigger_ordinal();
         let handle = BTreeHandle {
+            owner: None,
             meta_page: PageId(3),
         };
         let mut storage =

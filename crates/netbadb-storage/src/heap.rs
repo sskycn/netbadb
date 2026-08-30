@@ -6,8 +6,9 @@ use std::rc::Rc;
 
 use netbadb_index::{
     BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexError, IndexSpec,
-    IndexStatistics, TableStatistics, decode_index_catalog, encode_index_catalog, ensure_key_fits,
-    validate_catalog_entries, validate_catalog_index_statistics, validate_index_high_water,
+    IndexStatistics, RetiredIndexOwnership, TableStatistics, decode_index_catalog,
+    encode_index_catalog, ensure_key_fits, validate_catalog_entries,
+    validate_catalog_index_statistics, validate_pending_ownership,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{
@@ -25,6 +26,10 @@ use crate::{
     WalRecordKind, wal_path,
 };
 use crate::{PreparedTransaction, PreparedTxnResolution};
+
+#[path = "index_ownership.rs"]
+mod ownership;
+pub use ownership::IndexReclaimReport;
 
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_MANAGED_PAGE: PageId = PageId(1);
@@ -86,10 +91,12 @@ pub struct IndexMaintenanceReport {
     pub active_indexes: u64,
     pub retired_indexes_removed: u64,
     pub next_index_id: IndexId,
-    /// Reachable metadata/root/internal/leaf pages, excluding historical merge orphans.
+    /// Retired v2 pages (including orphans/pending) plus reachable legacy retirements.
     pub retired_tree_pages_seen: u64,
     pub retired_catalog_pages: u64,
     pub pages_reclaimed: u64,
+    /// Owned retirements retained durably after this compaction.
+    pub pending_reclaim_indexes: u64,
     /// Permanently abandoned by this operation, NOT a future free-page inventory.
     pub pages_abandoned: u64,
     /// Geometric retired suffix only. It is NOT safe to truncate/reuse these IDs.
@@ -98,9 +105,14 @@ pub struct IndexMaintenanceReport {
 
 struct IndexPageInventory {
     retired: HashSet<PageId>,
+    legacy_retired: HashSet<PageId>,
+    report: IndexReclaimReport,
+    #[cfg(test)]
+    observations: Vec<ownership::BTreePageOwnership>,
 }
 
 struct CatalogSnapshot {
+    pending: Vec<RetiredIndexOwnership>,
     table_statistics: Option<TableStatistics>,
     entries: Vec<IndexCatalogEntry>,
     next_index_id: IndexId,
@@ -616,7 +628,9 @@ impl HeapStorage {
             drop(page);
             node.next_index_id = Some(next);
             self.write_catalog_node_in(transaction, self.index_catalog_root, before, node)?;
-            let handle = self.btree().create_in(transaction, spec.clone())?;
+            let handle = self
+                .btree()
+                .create_owned_in(transaction, spec.clone(), id)?;
             // Writer ownership is already held. Capture the stable heap view
             // before further BTree growth extends shared PageIds, then keep
             // backfill memory bounded to one validated Heap page at a time.
@@ -985,6 +999,7 @@ impl HeapStorage {
         let mut pages = Vec::new();
         let mut next_index_id = None;
         let mut current_format = true;
+        let mut pending = Vec::new();
         loop {
             if !visited.insert(page_id) || visited.len() as u64 > page_count {
                 return Err(IndexError::CatalogCycle { page_id }.into());
@@ -995,15 +1010,15 @@ impl HeapStorage {
             }
             let payload = page.page().single_payload(PageType::IndexCatalog)?;
             let node = decode_index_catalog(payload)?;
-            let is_current = u16::from_le_bytes([payload[4], payload[5]])
-                == netbadb_index::INDEX_CATALOG_FORMAT_VERSION;
+            let version = u16::from_le_bytes([payload[4], payload[5]]);
+            let is_current = version == netbadb_index::INDEX_CATALOG_FORMAT_VERSION;
             current_format &= is_current;
             pages.push(page_id);
             drop(page);
             if root {
                 table_statistics = node.table_statistics;
                 next_index_id = node.next_index_id;
-                if is_current && next_index_id.is_none() {
+                if version >= 5 && next_index_id.is_none() {
                     return Err(IndexError::InvalidIndexHighWater(IndexId(0)).into());
                 }
             } else if node.next_index_id.is_some() {
@@ -1012,6 +1027,12 @@ impl HeapStorage {
                 ));
             } else if node.table_statistics.is_some() {
                 return Err(IndexError::TableStatisticsOnContinuation { page_id }.into());
+            }
+            for record in node.pending {
+                if record.meta_page.0 >= page_count {
+                    return Err(IndexError::InvalidChild(record.meta_page).into());
+                }
+                pending.push(record);
             }
             for entry in node.entries {
                 if entry.definition.handle.meta_page.0 >= page_count {
@@ -1048,8 +1069,9 @@ impl HeapStorage {
                     .ok_or(IndexError::IndexIdExhausted)?,
             ),
         };
-        validate_index_high_water(Some(next_index_id), &entries)?;
+        validate_pending_ownership(Some(next_index_id), &entries, &pending)?;
         Ok(CatalogSnapshot {
+            pending,
             table_statistics,
             entries,
             next_index_id,
@@ -1099,7 +1121,7 @@ impl HeapStorage {
         Ok(())
     }
 
-    /// Writes a v5 image, spilling a suffix if upgrading a full v2/v3 page.
+    /// Writes a v6 image, spilling entries/pending records if the page overflows.
     /// New-page WAL precedes the incoming link; reverse undo removes the link
     /// before truncating the newly allocated trailing page.
     fn write_catalog_node_in(
@@ -1118,20 +1140,26 @@ impl HeapStorage {
             }
             let capacity = self.index_catalog_payload_capacity();
             let mut overflow = IndexCatalogNode {
+                pending: Vec::new(),
                 next_index_id: None,
                 next_catalog: node.next_catalog,
                 table_statistics: None,
                 entries: Vec::new(),
             };
             while encode_index_catalog(&node)?.len() > capacity {
-                overflow
-                    .entries
-                    .push(node.entries.pop().ok_or(IndexError::LengthOverflow)?);
+                if let Some(record) = node.pending.pop() {
+                    overflow.pending.push(record);
+                } else {
+                    overflow
+                        .entries
+                        .push(node.entries.pop().ok_or(IndexError::LengthOverflow)?);
+                }
             }
             overflow.entries.reverse();
+            overflow.pending.reverse();
             let new_page_id = PageId(self.buffer.page_count());
             let mut new_after = None;
-            if !overflow.entries.is_empty() {
+            if !overflow.entries.is_empty() || !overflow.pending.is_empty() {
                 let payload = encode_index_catalog(&overflow)?;
                 if payload.len() > capacity {
                     return Err(IndexError::NodeTooLarge {
@@ -1180,8 +1208,8 @@ impl HeapStorage {
     /// Full-page WAL undo/redo protects the existing root and chain. Active
     /// identities and ANALYZE snapshots do not change.
     ///
-    /// Physical reclamation is unsupported: removed registrations and obsolete
-    /// continuation pages are permanently abandoned, not retained for later GC.
+    /// Physical reclamation is deferred. Owned retirements become minimal durable
+    /// pending records. Only legacy retirements and obsolete catalog pages are abandoned.
     /// No PageId is truncated or reused, including a geometric retired suffix.
     pub fn compact_index_catalog(&mut self) -> Result<IndexMaintenanceReport, StorageError> {
         self.transactions.ensure_checkpoint_safe()?;
@@ -1190,6 +1218,7 @@ impl HeapStorage {
         let inventory = self.index_page_inventory(&catalog)?;
         let file_pages_before = self.buffer.page_count();
         let mut nodes = vec![IndexCatalogNode {
+            pending: Vec::new(),
             next_index_id: Some(catalog.next_index_id),
             next_catalog: None,
             table_statistics: catalog.table_statistics,
@@ -1202,10 +1231,43 @@ impl HeapStorage {
             if encode_index_catalog(node)?.len() > capacity {
                 let entry = node.entries.pop().ok_or(IndexError::LengthOverflow)?;
                 let continuation = IndexCatalogNode {
+                    pending: Vec::new(),
                     next_index_id: None,
                     next_catalog: None,
                     table_statistics: None,
                     entries: vec![entry],
+                };
+                if encode_index_catalog(&continuation)?.len() > capacity {
+                    return Err(IndexError::LengthOverflow.into());
+                }
+                nodes.push(continuation);
+            }
+        }
+        let mut pending = catalog.pending.clone();
+        pending.extend(
+            catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.retired && entry.definition.handle.owner.is_some())
+                .map(|entry| RetiredIndexOwnership {
+                    index_id: entry.definition.id,
+                    meta_page: entry.definition.handle.meta_page,
+                }),
+        );
+        // Canonical ID order makes repeated compaction byte-idempotent even if
+        // records originally occupied different catalog continuation pages.
+        pending.sort_by_key(|record| record.index_id);
+        for record in &pending {
+            let node = nodes.last_mut().ok_or(IndexError::LengthOverflow)?;
+            node.pending.push(*record);
+            if encode_index_catalog(node)?.len() > capacity {
+                node.pending.pop();
+                let continuation = IndexCatalogNode {
+                    pending: vec![*record],
+                    next_index_id: None,
+                    next_catalog: None,
+                    table_statistics: None,
+                    entries: Vec::new(),
                 };
                 if encode_index_catalog(&continuation)?.len() > capacity {
                     return Err(IndexError::LengthOverflow.into());
@@ -1230,11 +1292,12 @@ impl HeapStorage {
             ));
         }
         let retired_catalog_pages = catalog.pages.len().saturating_sub(nodes.len()) as u64;
-        let mut abandoned = inventory.retired;
-        let retired_tree_pages_seen = abandoned.len() as u64;
+        let retired_tree_pages_seen =
+            (inventory.retired.len() + inventory.legacy_retired.len()) as u64;
+        let mut abandoned = inventory.legacy_retired;
         abandoned.extend(catalog.pages.iter().skip(nodes.len()).copied());
         let mut suffix_start = file_pages_before;
-        while suffix_start > 0 && abandoned.contains(&PageId(suffix_start - 1)) {
+        while suffix_start > 0 && inventory.retired.contains(&PageId(suffix_start - 1)) {
             suffix_start -= 1;
         }
         let mut report = IndexMaintenanceReport {
@@ -1253,6 +1316,7 @@ impl HeapStorage {
             retired_tree_pages_seen,
             retired_catalog_pages,
             pages_reclaimed: 0,
+            pending_reclaim_indexes: pending.len() as u64,
             pages_abandoned: abandoned.len() as u64,
             retired_suffix_pages: file_pages_before - suffix_start,
         };
@@ -1362,49 +1426,6 @@ impl HeapStorage {
         self.retired_indexes.clear();
         report.file_pages_after = self.buffer.page_count();
         Ok(report)
-    }
-
-    /// Read-only ownership proof for registered and raw trees. Unknown pages
-    /// stay unknown; orphan page kinds are never promoted to reclaimable pages.
-    fn index_page_inventory(
-        &mut self,
-        catalog: &CatalogSnapshot,
-    ) -> Result<IndexPageInventory, StorageError> {
-        let mut owned = HashSet::from([HEADER_PAGE]);
-        owned.extend(catalog.pages.iter().copied());
-        let mut raw_roots = Vec::new();
-        let registered_roots: HashSet<_> = catalog
-            .entries
-            .iter()
-            .map(|entry| entry.definition.handle.meta_page)
-            .collect();
-        for number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
-            let id = PageId(number);
-            let page = self.buffer.read_page(id)?;
-            let kind = page.page().validated()?.header().page_type;
-            match kind {
-                PageType::Heap | PageType::IndexCatalog => {
-                    owned.insert(id);
-                }
-                PageType::BTreeMeta if !registered_roots.contains(&id) => {
-                    raw_roots.push(BTreeHandle { meta_page: id })
-                }
-                _ => {}
-            }
-        }
-        let mut retired = HashSet::new();
-        for entry in &catalog.entries {
-            let pages = self
-                .btree()
-                .collect_owned_pages(entry.definition.handle, &mut owned)?;
-            if entry.retired {
-                retired.extend(pages);
-            }
-        }
-        for handle in raw_roots {
-            self.btree().collect_owned_pages(handle, &mut owned)?;
-        }
-        Ok(IndexPageInventory { retired })
     }
 
     /// Unstable physical ownership inspection. Retired trees are never reused,
@@ -1646,7 +1667,12 @@ impl HeapStorage {
             ensure_key_fits(
                 &plan.spec,
                 &values[plan.column_position],
-                Page::single_payload_capacity(),
+                Page::single_payload_capacity()
+                    - if plan.definition.handle.owner.is_some() {
+                        netbadb_index::BTREE_OWNER_SIZE
+                    } else {
+                        0
+                    },
             )?;
         }
 
@@ -1762,7 +1788,16 @@ impl HeapStorage {
         for plan in &plans {
             let old_key = &old_values[plan.column_position];
             let new_key = &values[plan.column_position];
-            ensure_key_fits(&plan.spec, new_key, Page::single_payload_capacity())?;
+            ensure_key_fits(
+                &plan.spec,
+                new_key,
+                Page::single_payload_capacity()
+                    - if plan.definition.handle.owner.is_some() {
+                        netbadb_index::BTREE_OWNER_SIZE
+                    } else {
+                        0
+                    },
+            )?;
             if !self
                 .btree()
                 .contains_exact(plan.definition.handle, old_key, row_id)?
@@ -4391,7 +4426,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_column_leaves_no_registry_and_maximum_row_backfills() {
+    fn unknown_column_leaves_no_registry_and_owned_key_boundary_backfills() {
         let path = test_path("index-build-rollback");
         cleanup(&path);
         let text_table = TableDef::new(
@@ -4405,7 +4440,7 @@ mod tests {
         );
         let mut storage = HeapStorage::create(&path, text_table.clone()).expect("create heap");
         storage
-            .insert(&[ScalarValue::Text("x".repeat(4_007))])
+            .insert(&[ScalarValue::Text("x".repeat(4_005))])
             .expect("insert valid heap row");
         let baseline_pages = storage.buffer.page_count();
         let baseline_wal = storage.wal_records().expect("baseline WAL").len();
@@ -4423,12 +4458,12 @@ mod tests {
 
         let definition = storage
             .create_index(ColumnId(1))
-            .expect("maximum heap row fits index backfill");
+            .expect("maximum owned key fits index backfill");
         assert_eq!(storage.indexes(), std::slice::from_ref(&definition));
         assert!(
             storage
                 .btree()
-                .lookup(definition.handle, &ScalarValue::Text("x".repeat(4_007)))
+                .lookup(definition.handle, &ScalarValue::Text("x".repeat(4_005)))
                 .expect("lookup maximum key")
                 .iter()
                 .any(|row_id| storage.read_row(*row_id).is_ok())
@@ -4576,6 +4611,7 @@ mod tests {
                     "unknown-column" => node.entries[0].definition.column_id = ColumnId(99),
                     "wrong-handle" => {
                         node.entries[0].definition.handle = BTreeHandle {
+                            owner: None,
                             meta_page: FIRST_HEAP_PAGE,
                         };
                     }
@@ -8262,6 +8298,16 @@ mod tests {
                 }
                 crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
+            "owned-vacuum" => {
+                let mut storage = HeapStorage::open(path, indexed_table()).unwrap();
+                storage.vacuum().unwrap();
+            }
+            "index-pending-checkpoint" => {
+                let mut storage = HeapStorage::open(path, indexed_table()).unwrap();
+                storage.checkpoint().unwrap();
+                storage.inspect_index_reclaim().unwrap();
+                crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
+            }
             "index-compact" | "index-compact-legacy" => {
                 let mut storage = HeapStorage::open(path, indexed_table()).unwrap();
                 if case == "index-compact-legacy" {
@@ -8438,22 +8484,7 @@ mod tests {
             .unwrap();
         storage.checkpoint().unwrap();
         storage.close().unwrap();
-        let mut pages = PageManager::open(&path).unwrap();
-        let mut page = pages.read_page(PageId(1)).unwrap();
-        let mut payload = page
-            .single_payload(PageType::IndexCatalog)
-            .unwrap()
-            .to_vec();
-        payload[4..6].copy_from_slice(&3_u16.to_le_bytes());
-        payload[7] = 0;
-        payload[40..48].fill(0);
-        payload.drain(88..96);
-        page.replace_single_payload(PageType::IndexCatalog, &payload)
-            .unwrap();
-        page.refresh_checksum();
-        pages.write_page(&page).unwrap();
-        pages.sync().unwrap();
-        drop(pages);
+        maintenance::legacy_catalog(&path, 3);
         let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
         let old = storage.indexes()[0].clone();
         assert_eq!(old.name.as_ref(), Some(&name));
@@ -8481,22 +8512,7 @@ mod tests {
                 storage.create_index(ColumnId(3)).unwrap();
                 storage.checkpoint().unwrap();
                 storage.close().unwrap();
-                let mut pages = PageManager::open(&path).unwrap();
-                let mut page = pages.read_page(PageId(1)).unwrap();
-                let payload = page.single_payload(PageType::IndexCatalog).unwrap();
-                let mut legacy = payload[..48].to_vec();
-                legacy[4..6].copy_from_slice(&version.to_le_bytes());
-                legacy[7] = 0;
-                legacy[40..48].fill(0);
-                for entry in payload[48..].chunks_exact(48) {
-                    legacy.extend_from_slice(&entry[..40]);
-                }
-                page.replace_single_payload(PageType::IndexCatalog, &legacy)
-                    .unwrap();
-                page.refresh_checksum();
-                pages.write_page(&page).unwrap();
-                pages.sync().unwrap();
-                drop(pages);
+                maintenance::legacy_catalog(&path, version);
                 let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
                 // A full legacy-size page must split when adding the explicit ID.
                 storage.index_catalog_payload_capacity = Some(48 + 3 * 40);
@@ -9274,5 +9290,6 @@ mod tests {
     mod maintenance {
         use super::*;
         include!("index_maintenance_tests.rs");
+        include!("index_reclaim_tests.rs");
     }
 }

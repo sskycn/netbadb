@@ -326,22 +326,24 @@ the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
-IndexCatalog payload version 5 adds a root-only durable `next_index_id` to
-version 4's nonzero logical IndexId and active/retired state. Versions 2
-(unnamed), 3 (optional names), and 4 remain readable; version 1 is rejected.
-DROP still retires entries transactionally; only commit removes active paths.
-Statistics remain explicit ANALYZE snapshots. `Database::compact_index_catalog`
-(and the Heap/Storage counterparts) explicitly compact the active registration
-chain under quiescence, preserving names, identity, statistics and ID high-water.
-Existing full-page WAL undo/redo protects the rewrite, including legacy expansion.
+IndexCatalog payload v6 preserves the root-only durable `next_index_id` and
+active/retired definitions, and adds minimal pending ownership records. Versions
+2/3/4/5 remain readable; v1 is rejected. New registered indexes use owner-tagged
+BTree v2. Raw trees and existing v1 registered trees retain v1 semantics.
+DROP retires entries transactionally; only commit removes active paths.
+`Database::compact_index_catalog` preserves active names, identity, statistics,
+ID high-water, and pending `(IndexId, meta PageId)` ownership. Full-page WAL
+undo/redo protects the rewrite, including legacy expansion.
 
-Physical reclaim is **deferred**. Removed tree registrations and obsolete
-catalog continuations are **permanently abandoned**, not saved for future GC.
-No page is freed, truncated or reused. Maintenance bounds the reachable catalog,
-not the database file, which still grows with CREATE/DROP cycles. Raw handles
-lack PageId generations; BTree merges also leave untracked orphan pages.
-See [the Round 8 storage audit](docs/index-lifecycle-round8.md) for the explicit
-space-leak policy, ownership validation, crash proof and maintenance report.
+Physical reclaim is **deferred**. New owned retirements are tracked durably,
+including unreachable merge pages; only legacy retirements and obsolete catalog
+continuations can still be permanently abandoned. No committed page is freed,
+truncated or reused. `Database::inspect_index_reclaim` provides a quiescent admin
+inventory with full page/payload validation, reachability and alias checks.
+Owner tags reject cross-owner stale handles but do not replace PageGeneration:
+provisional identities can repeat on rollback, and buffer/WAL references remain
+PageId-only. Historical pre-owner orphan pages remain permanent.
+See [the Round 9 ownership audit](docs/index-reclaim-round9.md).
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`, plus a durable append-only transaction-status file named
@@ -500,11 +502,14 @@ Heap, BTreeMeta, BTreeInternal, BTreeLeaf, and IndexCatalog pages. Non-heap
 pages contain exactly one generation-1 payload slot; heap scans and first-fit
 allocation validate and skip them, while RowId access rejects them as non-heap.
 
-`BTreeHandle` is a stable metadata-page identity. Its `NBTM` version-1 payload
+`BTreeHandle` contains metadata PageId and an exact expected owner (None only
+for v1). Its `NBTM` v1/v2 payload
 stores the current root, height, and `IndexSpec`; root splits can therefore
 replace the root without changing the handle. Leaf (`NBTL`) and internal
-(`NBTI`) version-1 payloads encode fixed-width little-endian fields and typed
-keys. Supported keys are Bool, Int64, UInt64, Text, and nullable NULL. Ordering
+(`NBTI`) v1/v2 payloads encode fixed-width little-endian fields and typed
+keys. Every v2 payload has a nonzero file-local IndexId owner, including split
+and orphan pages. The extra eight bytes reduce the safe Text key bound from
+4013 to 4005 bytes; oversized new builds and DML return typed errors. Supported keys are Bool, Int64, UInt64, Text, and nullable NULL. Ordering
 is typed value order with NULL first, followed by explicit
 `(PageId, SlotId, generation)` RowId order. Equal keys are supported; only an
 exact `(key, RowId)` duplicate is rejected. Insert splits by encoded byte size,
@@ -516,7 +521,8 @@ Internal separators are persistent lower-bound fence keys. Their RowId is an
 ordering token and need not remain a live leaf entry or heap locator; delete
 therefore does not rewrite a fence merely because a right-subtree minimum
 changed. Exact delete uses encoded-byte soft underflow, deterministic
-merge-only rebalance, recursive parent compaction, and root collapse. Removed
+leaf merging, recursive parent compaction, and root collapse. Unary internal
+paths first merge or rotate a child through the parent fence transactionally. Removed
 right pages and old roots remain valid, unreachable index pages and are not
 reclaimed or reused yet.
 
@@ -525,8 +531,8 @@ The registry persists `ColumnId -> BTreeHandle` separately from raw B+Trees.
 full build; reopen discovers and validates the mapping. Later Heap and SQL DML
 maintains all registered indexes in the same transaction by adding new-version
 candidates and retaining older candidates until vacuum. Raw B+Trees remain independent. Raw BTree lookup alone does
-not validate referenced Heap rows or enforce uniqueness, and SQL index DDL
-remains deferred. Core maps registered definitions and their cached optimizer
+not validate referenced Heap rows or enforce uniqueness. Single-column
+non-unique SQL CREATE/DROP INDEX uses the registered lifecycle. Core maps registered definitions and their cached optimizer
 snapshots into an ordered, read-only planner context. Eligible
 `column = non-NULL literal`, commuted equality, and nullable `column IS NULL`
 predicates use exact point `IndexScan`; analyzed two-sided Int64/UInt64 bounds
