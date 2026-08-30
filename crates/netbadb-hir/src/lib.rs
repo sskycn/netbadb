@@ -13,8 +13,8 @@ use netbadb_parser::{
 };
 use netbadb_schema::{Schema, TableDef};
 use netbadb_types::{
-    ColumnId, ExprType, IndexName, ParameterId, PhysicalType, RelationBindingId, ScalarValue,
-    SemanticType, TableId,
+    ColumnId, ExprType, IndexId, IndexName, ParameterId, PhysicalType, RelationBindingId,
+    ScalarValue, SemanticType, TableId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,58 @@ pub struct TypedCreateIndex {
     pub column_id: ColumnId,
     pub column_name: String,
     pub if_not_exists: bool,
+}
+
+/// Resolved generic identity, independent of PostgreSQL naming and storage pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropIndexTarget {
+    pub table_id: TableId,
+    pub index_id: IndexId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexNameBinding {
+    pub name: IndexName,
+    pub target: DropIndexTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedDropIndex {
+    pub name: Option<IndexName>,
+    pub target: Option<DropIndexTarget>,
+    pub if_exists: bool,
+}
+
+pub fn lower_drop_index(
+    statement: &netbadb_parser::DropIndexStatement,
+    indexes: &[IndexNameBinding],
+) -> Result<TypedDropIndex, HirError> {
+    if statement
+        .name
+        .qualifier
+        .as_ref()
+        .is_some_and(|schema| schema.name != "public")
+    {
+        return Err(HirError::InvalidIndexDefinition {
+            message: "only the public index namespace is supported",
+            span: statement.name.span,
+        });
+    }
+    let name = IndexName::new(statement.name.name.name.clone()).map_err(|_| {
+        HirError::InvalidIndexDefinition {
+            message: "invalid index name",
+            span: statement.name.span,
+        }
+    })?;
+    let target = indexes
+        .iter()
+        .find(|binding| binding.name == name)
+        .map(|binding| binding.target);
+    Ok(TypedDropIndex {
+        name: Some(name),
+        target,
+        if_exists: statement.if_exists,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,6 +607,12 @@ pub fn lower_statement_with_parameters(
         }
         AstStatement::Delete(delete) => {
             lower_delete(schema, delete, &mut parameters).map(TypedStatement::Delete)
+        }
+        AstStatement::DropIndex(drop) => {
+            return Err(HirError::InvalidIndexDefinition {
+                message: "DROP INDEX requires the schema-mutation compiler boundary",
+                span: drop.span,
+            });
         }
         AstStatement::CreateIndex(create) => {
             return Err(HirError::InvalidIndexDefinition {

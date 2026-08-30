@@ -3,6 +3,8 @@
 use std::error::Error;
 use std::fmt;
 
+pub use netbadb_hir::{DropIndexTarget, IndexNameBinding, TypedDropIndex};
+
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
     NullOrder as HirNullOrder, ParameterMetadata, SortDirection as HirSortDirection,
@@ -40,6 +42,7 @@ pub struct PreparedParameter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompiledDdlStatement {
     CreateIndex(TypedCreateIndex),
+    DropIndex(TypedDropIndex),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,8 +207,14 @@ pub fn compile_statement_with_parameters(
 pub fn compile_ddl_statement(
     schema: &Schema,
     source: &str,
+    indexes: &[IndexNameBinding],
 ) -> Result<CompiledDdlStatement, CompileError> {
     match parse_statement(source)? {
+        netbadb_parser::Statement::DropIndex(statement) => {
+            netbadb_hir::lower_drop_index(&statement, indexes)
+                .map(CompiledDdlStatement::DropIndex)
+                .map_err(CompileError::from)
+        }
         netbadb_parser::Statement::CreateIndex(statement) => {
             netbadb_hir::lower_create_index(schema, &statement)
                 .map(CompiledDdlStatement::CreateIndex)
@@ -219,6 +228,7 @@ pub fn compile_ddl_statement(
                 netbadb_parser::Statement::Update(value) => value.span,
                 netbadb_parser::Statement::Delete(value) => value.span,
                 netbadb_parser::Statement::CreateIndex(value) => value.span,
+                netbadb_parser::Statement::DropIndex(value) => value.span,
             },
         })),
     }

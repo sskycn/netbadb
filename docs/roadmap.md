@@ -493,8 +493,34 @@ PostgreSQL-only metadata absent from NetbaDB remain unsupported.
 - verified psql, SQLAlchemy `Index.create()`, guarded Alembic add-index apply,
   immediate cross-connection reflection, planner discovery, and later DML
   maintenance;
-- retained `DROP INDEX` as `0A000` because registry removal and safe physical
-  reclamation do not yet exist.
+- at Round 6, retained `DROP INDEX` as `0A000`; Round 7 below implements durable
+  retirement while deferring physical reclamation.
+
+### PostgreSQL Compatibility Round 7 — transactional index retirement (complete)
+
+- implemented generic DROP AST/typed HIR/compiler resolution and Core DDL with
+  stable registry-scoped IndexId, table write access, IF EXISTS, and commit-only
+  active publication;
+- introduced IndexCatalog v4 retained active/retired registrations, backward
+  v2/v3 decoding and overflow-safe lazy upgrade, without changing Heap/Page/WAL,
+  txn-status, CoordinatorLog, LSM, partition, BTree, or inspection JSON formats;
+- added real process crash loser/winner tests, commit/rollback failure retention,
+  checkpoint/reopen/idempotence, and create/drop/recreate with fresh trees/stats;
+- verified point/range and Phase 73 IndexNestedLoopJoin paths disappear,
+  prepared queries replan, DML stops touching retired pages, and ANALYZE/vacuum
+  cannot revive the index;
+- verified psql, SQLAlchemy Index.drop, named and legacy Alembic DropIndexOp apply,
+  with empty subsequent comparisons and cross-client existing-connection refresh;
+- retain retired definitions/physical ownership in storage inspection. No page
+  free/reuse primitive exists; repeated create/drop grows catalog and database
+  files. Quiescent reclamation and catalog compaction are intentionally deferred.
+
+Round 8 should first audit a storage lifecycle boundary for retired-tree
+reclamation, existing BTree merge orphans, and catalog compaction with preserved
+IndexId high-water marks. A separate table-schema lifecycle audit can then cover
+Canonical Schema authority/fingerprints, table manifests, transaction/recovery,
+and SDK generation. Do not begin CREATE TABLE as a parser-only extension.
+See [the Round 7 implementation audit](index-lifecycle-round7.md).
 
 ## Phase 6 — SDK and tooling
 

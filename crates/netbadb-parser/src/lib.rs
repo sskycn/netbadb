@@ -83,6 +83,14 @@ pub enum Statement {
     Update(UpdateStatement),
     Delete(DeleteStatement),
     CreateIndex(CreateIndexStatement),
+    DropIndex(DropIndexStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndexStatement {
+    pub name: ColumnName,
+    pub if_exists: bool,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +270,7 @@ enum TokenKind {
     Set,
     Delete,
     Create,
+    Drop,
     Index,
     If,
     Exists,
@@ -483,6 +492,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     "SET" => TokenKind::Set,
                     "DELETE" => TokenKind::Delete,
                     "CREATE" => TokenKind::Create,
+                    "DROP" => TokenKind::Drop,
                     "INDEX" => TokenKind::Index,
                     "IF" => TokenKind::If,
                     "EXISTS" => TokenKind::Exists,
@@ -541,10 +551,11 @@ impl Parser {
             TokenKind::Update => Statement::Update(self.parse_update()?),
             TokenKind::Delete => Statement::Delete(self.parse_delete()?),
             TokenKind::Create => Statement::CreateIndex(self.parse_create_index()?),
+            TokenKind::Drop => Statement::DropIndex(self.parse_drop_index()?),
             _ => {
-                return Err(
-                    self.error_here("expected SELECT, INSERT, UPDATE, DELETE, or CREATE INDEX")
-                );
+                return Err(self.error_here(
+                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE INDEX, or DROP INDEX",
+                ));
             }
         };
         if self.matches(&TokenKind::Semicolon) {
@@ -552,6 +563,45 @@ impl Parser {
         }
         self.expect_simple(TokenKind::Eof)?;
         Ok(statement)
+    }
+
+    fn parse_drop_index(&mut self) -> Result<DropIndexStatement, ParseError> {
+        let start = self.expect_simple(TokenKind::Drop)?.span.start;
+        self.expect_simple(TokenKind::Index)?;
+        let if_exists = if self.matches(&TokenKind::If) {
+            self.position += 1;
+            self.expect_simple(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
+        let first = self.expect_ident()?;
+        let name = if self.matches(&TokenKind::Dot) {
+            self.position += 1;
+            let name = self.expect_ident()?;
+            ColumnName {
+                span: Span {
+                    start: first.span.start,
+                    end: name.span.end,
+                },
+                qualifier: Some(first),
+                name,
+            }
+        } else {
+            ColumnName {
+                span: first.span,
+                qualifier: None,
+                name: first,
+            }
+        };
+        Ok(DropIndexStatement {
+            name,
+            if_exists,
+            span: Span {
+                start,
+                end: self.current().span.start,
+            },
+        })
     }
 
     fn parse_create_index(&mut self) -> Result<CreateIndexStatement, ParseError> {
@@ -1242,6 +1292,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::Update(statement) => statement.span,
         Statement::Delete(statement) => statement.span,
         Statement::CreateIndex(statement) => statement.span,
+        Statement::DropIndex(statement) => statement.span,
     }
 }
 
@@ -1695,6 +1746,30 @@ mod tests {
                 ..
             } if column.name.name == "id" && alias.name == "users_id"
         ));
+    }
+
+    #[test]
+    fn parses_drop_index_and_rejects_unimplemented_clauses() {
+        for sql in [
+            "DROP INDEX users_name_idx",
+            "DROP INDEX IF EXISTS public.users_name_idx;",
+        ] {
+            let Statement::DropIndex(drop) = parse_statement(sql).unwrap() else {
+                panic!("DROP AST");
+            };
+            assert_eq!(drop.name.name.name, "users_name_idx");
+        }
+        for sql in [
+            "DROP INDEX CONCURRENTLY idx",
+            "DROP INDEX a, b",
+            "DROP INDEX idx CASCADE",
+            "DROP INDEX idx RESTRICT",
+            "DROP INDEX $1",
+            "DROP INDEX \"idx\"",
+            "DROP TABLE users",
+        ] {
+            assert!(parse_statement(sql).is_err(), "{sql}");
+        }
     }
 
     #[test]

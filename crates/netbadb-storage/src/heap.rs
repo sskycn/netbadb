@@ -7,11 +7,11 @@ use std::rc::Rc;
 use netbadb_index::{
     BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexError, IndexSpec,
     IndexStatistics, TableStatistics, decode_index_catalog, encode_index_catalog, ensure_key_fits,
-    validate_catalog_index_statistics,
+    validate_catalog_entries, validate_catalog_index_statistics,
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{
-    ColumnId, IndexName, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId,
+    ColumnId, IndexId, IndexName, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId,
 };
 
 use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
@@ -52,6 +52,7 @@ pub struct HeapStorage {
     transactions: TransactionManager,
     statuses: SharedTxnStatus,
     indexes: Vec<IndexDefinition>,
+    retired_indexes: Vec<IndexDefinition>,
     index_plans: Vec<RegisteredIndexPlan>,
     table_statistics: Option<TableStatistics>,
     index_statistics: Vec<Option<IndexStatistics>>,
@@ -164,13 +165,6 @@ struct PreparedInsert {
     after: Page,
     slot_ref: SlotRef,
     new_page: bool,
-}
-
-#[derive(Debug)]
-struct PreparedCatalogUpdate {
-    page_id: PageId,
-    before: Page,
-    after: Page,
 }
 
 impl PreparedInsert {
@@ -296,6 +290,7 @@ impl HeapStorage {
             transactions,
             statuses,
             indexes: Vec::new(),
+            retired_indexes: Vec::new(),
             index_plans: Vec::new(),
             table_statistics: None,
             index_statistics: Vec::new(),
@@ -443,6 +438,7 @@ impl HeapStorage {
             transactions,
             statuses,
             indexes: Vec::new(),
+            retired_indexes: Vec::new(),
             index_plans: Vec::new(),
             table_statistics: None,
             index_statistics: Vec::new(),
@@ -566,8 +562,19 @@ impl HeapStorage {
     ) -> Result<RegisteredIndexPlan, StorageError> {
         let (column_position, spec) = self.validate_index_creation(name.as_ref(), column_id)?;
 
+        self.validate_transaction(transaction)?;
         transaction.acquire_writer()?;
         (|| {
+            let (_, entries) = self.read_index_catalog(self.index_catalog_root)?;
+            let id = IndexId(
+                entries
+                    .iter()
+                    .map(|entry| entry.definition.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(IndexError::LengthOverflow)?,
+            );
             let handle = self.btree().create_in(transaction, spec.clone())?;
             // Writer ownership is already held. Capture the stable heap view
             // before further BTree growth extends shared PageIds, then keep
@@ -575,6 +582,7 @@ impl HeapStorage {
             let view = transaction.current_read_view()?;
             self.backfill_index_in(transaction, handle, column_id, &view)?;
             let definition = IndexDefinition {
+                id,
                 name,
                 column_id,
                 handle,
@@ -825,6 +833,9 @@ impl HeapStorage {
             drop(page);
             node.table_statistics = root.then_some(table_statistics);
             for entry in &mut node.entries {
+                if entry.retired {
+                    continue;
+                }
                 let expected = self.indexes.get(index_position).ok_or_else(|| {
                     crate::invalid_format("catalog contains more indexes than the registry cache")
                 })?;
@@ -838,13 +849,8 @@ impl HeapStorage {
                 index_position += 1;
             }
             let next_catalog = node.next_catalog;
-            let mut after = before.clone();
-            after.replace_single_payload(PageType::IndexCatalog, &encode_index_catalog(&node)?)?;
-            updates.push(PreparedCatalogUpdate {
-                page_id,
-                before,
-                after,
-            });
+            encode_index_catalog(&node)?;
+            updates.push((page_id, before, node));
             root = false;
             match next_catalog {
                 Some(next) => {
@@ -862,16 +868,9 @@ impl HeapStorage {
             ));
         }
 
-        for (completed, mut update) in updates.into_iter().enumerate() {
+        for (completed, (page_id, before, node)) in updates.into_iter().enumerate() {
             self.maybe_fail_analyze(transaction, completed);
-            if let Err(error) = transaction.log_page_update(&update.before, &mut update.after) {
-                transaction.require_rollback();
-                return Err(error);
-            }
-            if let Err(error) = self.publish_page_image(update.page_id, update.after) {
-                transaction.require_rollback();
-                return Err(error);
-            }
+            self.write_catalog_node_in(transaction, page_id, before, node)?;
         }
         #[cfg(test)]
         if crate::crash_test::is_enabled(
@@ -900,6 +899,40 @@ impl HeapStorage {
         &mut self,
         root_page: PageId,
     ) -> Result<(Option<TableStatistics>, Vec<IndexCatalogEntry>), StorageError> {
+        let (table_statistics, entries) = self.read_index_catalog(root_page)?;
+        let mut active = Vec::new();
+        for entry in entries {
+            if entry.retired {
+                // Retained metadata is ownership accounting, never an active
+                // tree to open or validate. Reclamation is a separate phase.
+                self.retired_indexes.push(entry.definition);
+                continue;
+            }
+            let definition = &entry.definition;
+            let column = self.table.column_by_id(definition.column_id).ok_or(
+                IndexError::UnknownIndexColumn {
+                    column_id: definition.column_id,
+                },
+            )?;
+            let expected = IndexSpec {
+                data_type: column.semantic_type(),
+                nullable: column.nullable,
+            };
+            if self.btree().spec(definition.handle)? != expected {
+                return Err(IndexError::CatalogSpecMismatch {
+                    column_id: definition.column_id,
+                }
+                .into());
+            }
+            active.push(entry);
+        }
+        Ok((table_statistics, active))
+    }
+
+    fn read_index_catalog(
+        &mut self,
+        root_page: PageId,
+    ) -> Result<(Option<TableStatistics>, Vec<IndexCatalogEntry>), StorageError> {
         let page_count = self.buffer.page_count();
         if root_page.0 == 0 || root_page.0 >= page_count {
             return Err(IndexError::InvalidChild(root_page).into());
@@ -925,41 +958,8 @@ impl HeapStorage {
                 return Err(IndexError::TableStatisticsOnContinuation { page_id }.into());
             }
             for entry in node.entries {
-                let definition = &entry.definition;
-                if entries
-                    .iter()
-                    .any(|existing| existing.definition.column_id == definition.column_id)
-                {
-                    return Err(IndexError::DuplicateRegisteredColumn {
-                        column_id: definition.column_id,
-                    }
-                    .into());
-                }
-                if let Some(name) = &definition.name {
-                    if entries
-                        .iter()
-                        .any(|existing| existing.definition.name.as_ref() == Some(name))
-                    {
-                        return Err(
-                            IndexError::IndexNameAlreadyExists { name: name.clone() }.into()
-                        );
-                    }
-                }
-                let column = self.table.column_by_id(definition.column_id).ok_or(
-                    IndexError::UnknownIndexColumn {
-                        column_id: definition.column_id,
-                    },
-                )?;
-                let expected = IndexSpec {
-                    data_type: column.semantic_type(),
-                    nullable: column.nullable,
-                };
-                let actual = self.btree().spec(definition.handle)?;
-                if actual != expected {
-                    return Err(IndexError::CatalogSpecMismatch {
-                        column_id: definition.column_id,
-                    }
-                    .into());
+                if entry.definition.handle.meta_page.0 >= page_count {
+                    return Err(IndexError::InvalidChild(entry.definition.handle.meta_page).into());
                 }
                 if let Some(statistics) = entry.statistics.as_ref() {
                     validate_catalog_index_statistics(table_statistics.as_ref(), statistics)?;
@@ -977,6 +977,7 @@ impl HeapStorage {
                 None => break,
             }
         }
+        validate_catalog_entries(&entries)?;
         Ok((table_statistics, entries))
     }
 
@@ -1011,87 +1012,180 @@ impl HeapStorage {
         };
 
         tail_node.entries.push(IndexCatalogEntry {
+            retired: false,
             definition: definition.clone(),
             statistics: None,
         });
-        let payload = encode_index_catalog(&tail_node)?;
-        if payload.len() <= self.index_catalog_payload_capacity() {
-            let mut after = tail_page.clone();
-            after.replace_single_payload(PageType::IndexCatalog, &payload)?;
+        self.write_catalog_node_in(transaction, page_id, tail_page, tail_node)?;
+        #[cfg(test)]
+        self.crash_after_catalog_publish()?;
+        Ok(())
+    }
+
+    /// Writes a v4 image, spilling a suffix if upgrading a full v2/v3 page.
+    /// New-page WAL precedes the incoming link; reverse undo removes the link
+    /// before truncating the newly allocated trailing page.
+    fn write_catalog_node_in(
+        &mut self,
+        transaction: &mut Transaction,
+        page_id: PageId,
+        before: Page,
+        mut node: IndexCatalogNode,
+    ) -> Result<(), StorageError> {
+        let result = (|| {
+            let capacity = self.index_catalog_payload_capacity();
+            let mut overflow = IndexCatalogNode {
+                next_catalog: node.next_catalog,
+                table_statistics: None,
+                entries: Vec::new(),
+            };
+            while encode_index_catalog(&node)?.len() > capacity {
+                overflow
+                    .entries
+                    .push(node.entries.pop().ok_or(IndexError::LengthOverflow)?);
+            }
+            overflow.entries.reverse();
+            let new_page_id = PageId(self.buffer.page_count());
+            let mut new_after = None;
+            if !overflow.entries.is_empty() {
+                let payload = encode_index_catalog(&overflow)?;
+                if payload.len() > capacity {
+                    return Err(IndexError::NodeTooLarge {
+                        size: payload.len(),
+                        capacity,
+                    }
+                    .into());
+                }
+                let mut page = Page::new(new_page_id, PageType::IndexCatalog);
+                page.initialize_single_payload(PageType::IndexCatalog, &payload)?;
+                new_after = Some(page);
+                node.next_catalog = Some(new_page_id);
+            }
+            let mut after = before.clone();
+            after.replace_single_payload(PageType::IndexCatalog, &encode_index_catalog(&node)?)?;
             #[cfg(test)]
             if std::mem::take(&mut self.fail_index_catalog_log) {
                 transaction.inject_partial_append_failure(0);
             }
-            if let Err(error) = transaction.log_page_update(&tail_page, &mut after) {
-                transaction.require_rollback();
-                return Err(error);
+            if let Some(page) = new_after.as_mut() {
+                transaction.log_page_update(&Page::zero(new_page_id), page)?;
             }
+            let lsn = transaction.log_page_update(&before, &mut after)?;
             #[cfg(test)]
             crate::crash_test::maybe_crash(
                 crate::crash_test::TestCrashPoint::IndexBuildAfterCatalogLog,
             );
-            if let Err(error) = self.publish_page_image(page_id, after) {
-                transaction.require_rollback();
-                return Err(error);
+            if let Some(page) = new_after {
+                transaction.flush_through(lsn)?;
+                let mut guard = self.buffer.new_page()?;
+                if guard.page_id() != new_page_id {
+                    return Err(IndexError::InvalidChild(guard.page_id()).into());
+                }
+                *guard.page_mut() = page;
             }
-            #[cfg(test)]
-            self.crash_after_catalog_publish()?;
-            return Ok(());
+            self.publish_page_image(page_id, after)
+        })();
+        if result.is_err() {
+            transaction.require_rollback();
         }
+        result
+    }
 
-        tail_node.entries.pop();
-        let new_page_id = PageId(page_count);
-        let new_node = IndexCatalogNode {
-            next_catalog: None,
-            table_statistics: None,
-            entries: vec![IndexCatalogEntry {
-                definition: definition.clone(),
-                statistics: None,
-            }],
-        };
-        let mut new_after = Page::new(new_page_id, PageType::IndexCatalog);
-        new_after
-            .initialize_single_payload(PageType::IndexCatalog, &encode_index_catalog(&new_node)?)?;
-        if let Err(error) = transaction.log_page_update(&Page::zero(new_page_id), &mut new_after) {
-            transaction.require_rollback();
-            return Err(error);
-        }
+    /// Unstable physical ownership inspection. Retired trees are never reused,
+    /// maintained, or returned through the ordinary active index registry.
+    #[must_use]
+    pub fn retired_indexes(&self) -> &[IndexDefinition] {
+        &self.retired_indexes
+    }
 
-        tail_node.next_catalog = Some(new_page_id);
-        let mut tail_after = tail_page.clone();
-        tail_after
-            .replace_single_payload(PageType::IndexCatalog, &encode_index_catalog(&tail_node)?)?;
-        let tail_lsn = match transaction.log_page_update(&tail_page, &mut tail_after) {
-            Ok(lsn) => lsn,
-            Err(error) => {
-                transaction.require_rollback();
-                return Err(error);
+    /// Retires one committed registration atomically; physical pages remain owned.
+    pub fn drop_index(&mut self, id: IndexId) -> Result<(), StorageError> {
+        let mut transaction = self.begin_transaction()?;
+        match self.drop_index_in(&mut transaction, id) {
+            Ok(()) => {
+                transaction.commit()?;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::IndexDropAfterCommit,
+                );
+                self.publish_committed_index_drop(id);
+                Ok(())
             }
-        };
-        if let Err(error) = transaction.flush_through(tail_lsn) {
-            transaction.require_rollback();
-            return Err(error);
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
         }
-        let mut new_page = match self.buffer.new_page() {
-            Ok(page) => page,
-            Err(error) => {
-                transaction.require_rollback();
-                return Err(error);
+    }
+
+    pub(crate) fn drop_index_in(
+        &mut self,
+        transaction: &mut Transaction,
+        id: IndexId,
+    ) -> Result<(), StorageError> {
+        self.validate_transaction(transaction)?;
+        transaction.acquire_writer()?;
+        let mut page_id = self.index_catalog_root;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(page_id) {
+                return Err(IndexError::CatalogCycle { page_id }.into());
             }
-        };
-        if new_page.page_id() != new_page_id {
-            transaction.require_rollback();
-            return Err(IndexError::InvalidChild(new_page.page_id()).into());
+            let page = self.buffer.read_page(page_id)?;
+            let before = page.page().clone();
+            let mut node =
+                decode_index_catalog(page.page().single_payload(PageType::IndexCatalog)?)?;
+            drop(page);
+            if let Some(entry) = node
+                .entries
+                .iter_mut()
+                .find(|entry| entry.definition.id == id)
+            {
+                if entry.retired {
+                    return Err(IndexError::IndexAlreadyRetired(id).into());
+                }
+                if !self.indexes.iter().any(|index| index.id == id) {
+                    return Err(IndexError::UnknownIndexId(id).into());
+                }
+                entry.retired = true;
+                entry.statistics = None;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::IndexDropBeforeCatalogLog,
+                );
+                self.write_catalog_node_in(transaction, page_id, before, node)?;
+                #[cfg(test)]
+                {
+                    crate::crash_test::maybe_crash(
+                        crate::crash_test::TestCrashPoint::IndexDropAfterCatalogLog,
+                    );
+                    if crate::crash_test::is_enabled(
+                        crate::crash_test::TestCrashPoint::IndexDropAfterWalDurable,
+                    ) {
+                        self.buffer.flush_all()?;
+                        crate::crash_test::maybe_crash(
+                            crate::crash_test::TestCrashPoint::IndexDropAfterWalDurable,
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            match node.next_catalog {
+                Some(next) => page_id = next,
+                None => return Err(IndexError::UnknownIndexId(id).into()),
+            }
         }
-        *new_page.page_mut() = new_after;
-        drop(new_page);
-        if let Err(error) = self.publish_page_image(page_id, tail_after) {
-            transaction.require_rollback();
-            return Err(error);
-        }
-        #[cfg(test)]
-        self.crash_after_catalog_publish()?;
-        Ok(())
+    }
+
+    pub(crate) fn publish_committed_index_drop(&mut self, id: IndexId) {
+        let position = self
+            .indexes
+            .iter()
+            .position(|index| index.id == id)
+            .expect("committed retirement was validated under the writer lease");
+        self.retired_indexes.push(self.indexes.remove(position));
+        self.index_plans.remove(position);
+        self.index_statistics.remove(position);
     }
 
     fn index_catalog_payload_capacity(&self) -> usize {
@@ -3168,7 +3262,7 @@ mod tests {
             .expect("catalog payload")
             .to_vec();
         assert_eq!(u32::from_le_bytes(payload[16..20].try_into().unwrap()), 1);
-        let entry = payload[48..88].to_vec();
+        let entry = payload[48..96].to_vec();
         payload[16..20].copy_from_slice(&2_u32.to_le_bytes());
         payload.extend_from_slice(&entry);
         page.replace_single_payload(PageType::IndexCatalog, &payload)
@@ -3359,7 +3453,7 @@ mod tests {
         let schema = indexed_table();
         let mut storage = HeapStorage::create_with_buffer_pool_size(&path, schema.clone(), 1)
             .expect("create heap");
-        storage.index_catalog_payload_capacity = Some(88);
+        storage.index_catalog_payload_capacity = Some(96);
         for row in indexed_rows() {
             storage.insert(&row).expect("insert row");
         }
@@ -3398,7 +3492,7 @@ mod tests {
         let path = test_path("analyze-empty");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(88);
+        storage.index_catalog_payload_capacity = Some(96);
         storage.create_index(ColumnId(2)).expect("create index");
         storage
             .create_index(ColumnId(3))
@@ -3441,7 +3535,7 @@ mod tests {
         let path = test_path("catalog-table-stats-on-continuation");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(88);
+        storage.index_catalog_payload_capacity = Some(96);
         storage.create_index(ColumnId(2)).expect("first index");
         storage.create_index(ColumnId(3)).expect("overflow index");
         storage.close().expect("close catalog");
@@ -4067,7 +4161,7 @@ mod tests {
         let path = test_path("index-catalog-overflow");
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(36);
+        storage.index_catalog_payload_capacity = Some(96);
         let first = storage.create_index(ColumnId(1)).expect("first index");
         let second = storage.create_index(ColumnId(2)).expect("overflow index");
         assert_eq!(storage.indexes(), &[first.clone(), second.clone()]);
@@ -4183,7 +4277,7 @@ mod tests {
                 )),
                 "duplicate-column" => assert!(matches!(
                     error,
-                    StorageError::Index(IndexError::DuplicateRegisteredColumn { .. })
+                    StorageError::Index(IndexError::DuplicateIndexId(_))
                 )),
                 "wrong-handle" => assert!(matches!(
                     error,
@@ -7726,6 +7820,11 @@ mod tests {
                 transaction.commit().expect("commit relocation");
                 crash_test::maybe_crash(TestCrashPoint::CommittedWithoutDataFlush);
             }
+            "index-drop" => {
+                let mut storage = HeapStorage::open(path, indexed_table()).unwrap();
+                let id = storage.indexes()[0].id;
+                storage.drop_index(id).expect("drop until crash point");
+            }
             "index-build-loser" => {
                 let mut storage =
                     HeapStorage::open(path, indexed_table()).expect("open index heap");
@@ -7899,6 +7998,335 @@ mod tests {
         cleanup(&path);
     }
 
+    #[test]
+    fn process_crash_index_drop_has_only_active_or_retired_outcomes() {
+        for (point, winner) in [
+            (TestCrashPoint::IndexDropBeforeCatalogLog, false),
+            (TestCrashPoint::IndexDropAfterCatalogLog, false),
+            (TestCrashPoint::IndexDropAfterWalDurable, false),
+            (TestCrashPoint::CommitAfterWalSync, true),
+            (TestCrashPoint::IndexDropAfterCommit, true),
+        ] {
+            let path = prepare_index_build_crash_baseline(point.as_str());
+            let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+            let index = storage
+                .create_named_index(IndexName::new("drop_idx").unwrap(), ColumnId(2))
+                .unwrap();
+            storage.close().unwrap();
+            spawn_crash_child(&path, "index-drop", point);
+            for _ in 0..3 {
+                let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+                assert_eq!(storage.indexes().is_empty(), winner);
+                assert_eq!(storage.retired_indexes().is_empty(), !winner);
+                assert_eq!(storage.scan().unwrap().len(), 4);
+                if winner {
+                    assert_eq!(storage.retired_indexes(), std::slice::from_ref(&index));
+                } else {
+                    assert_eq!(storage.indexes(), std::slice::from_ref(&index));
+                }
+                storage.close().unwrap();
+            }
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn retired_tree_payload_is_not_reopened_validated_or_maintained() {
+        let path = prepare_index_build_crash_baseline("retired-unreachable");
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let index = storage.create_index(ColumnId(2)).unwrap();
+        let mut tx = storage.begin_transaction().unwrap();
+        storage.inject_index_catalog_log_failure();
+        assert!(storage.drop_index_in(&mut tx, index.id).is_err());
+        tx.rollback().unwrap();
+        assert_eq!(storage.indexes(), std::slice::from_ref(&index));
+        storage.drop_index(index.id).unwrap();
+        storage.checkpoint().unwrap();
+        storage.close().unwrap();
+        let mut pages = PageManager::open(&path).unwrap();
+        let mut page = pages.read_page(index.handle.meta_page).unwrap();
+        page.replace_single_payload(PageType::BTreeMeta, b"unreachable malformed tree")
+            .unwrap();
+        page.refresh_checksum();
+        pages.write_page(&page).unwrap();
+        pages.sync().unwrap();
+        drop(pages);
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        assert!(storage.indexes().is_empty());
+        storage
+            .insert(&[
+                ScalarValue::UInt64(8),
+                ScalarValue::UInt64(80),
+                ScalarValue::Text("still works".into()),
+            ])
+            .unwrap();
+        storage.analyze().unwrap();
+        storage.vacuum().unwrap();
+        let fresh = storage.create_index(ColumnId(2)).unwrap();
+        assert_ne!(fresh.handle, index.handle);
+        storage.close().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn retirement_commit_and_rollback_failures_retain_writer_and_registry() {
+        let path = prepare_index_build_crash_baseline("drop-retry");
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let index = storage.create_index(ColumnId(2)).unwrap();
+        let mut tx = storage.begin_transaction().unwrap();
+        storage.drop_index_in(&mut tx, index.id).unwrap();
+        tx.inject_rollback_interruption_after(1);
+        assert!(tx.rollback().is_err());
+        assert_eq!(storage.indexes(), std::slice::from_ref(&index));
+        let competing = storage.begin_transaction().unwrap();
+        assert!(competing.acquire_writer().is_err());
+        tx.rollback().unwrap();
+        drop(competing);
+        let mut tx = storage.begin_transaction().unwrap();
+        storage.drop_index_in(&mut tx, index.id).unwrap();
+        storage
+            .transactions
+            .wal()
+            .borrow_mut()
+            .inject_flush_failure();
+        assert!(tx.commit().is_err());
+        assert_eq!(storage.indexes(), std::slice::from_ref(&index));
+        let competing = storage.begin_transaction().unwrap();
+        assert!(competing.acquire_writer().is_err());
+        tx.commit().unwrap();
+        storage.publish_committed_index_drop(index.id);
+        assert!(storage.indexes().is_empty());
+        drop(competing);
+        drop(tx);
+        storage.close().unwrap();
+        let storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        assert!(storage.indexes().is_empty());
+        storage.close().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn legacy_named_v3_reopens_retires_and_reuses_name() {
+        let path = prepare_index_build_crash_baseline("named-v3-drop");
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let name = IndexName::new("legacy_named").unwrap();
+        storage
+            .create_named_index(name.clone(), ColumnId(2))
+            .unwrap();
+        storage.checkpoint().unwrap();
+        storage.close().unwrap();
+        let mut pages = PageManager::open(&path).unwrap();
+        let mut page = pages.read_page(PageId(1)).unwrap();
+        let mut payload = page
+            .single_payload(PageType::IndexCatalog)
+            .unwrap()
+            .to_vec();
+        payload[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        payload.drain(88..96);
+        page.replace_single_payload(PageType::IndexCatalog, &payload)
+            .unwrap();
+        page.refresh_checksum();
+        pages.write_page(&page).unwrap();
+        pages.sync().unwrap();
+        drop(pages);
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let old = storage.indexes()[0].clone();
+        assert_eq!(old.name.as_ref(), Some(&name));
+        assert_eq!(old.id.0, old.handle.meta_page.0);
+        storage.drop_index(old.id).unwrap();
+        storage.close().unwrap();
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        assert!(storage.indexes().is_empty());
+        let fresh = storage.create_named_index(name, ColumnId(2)).unwrap();
+        assert_ne!(old.id, fresh.id);
+        assert_ne!(old.handle, fresh.handle);
+        storage.close().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn legacy_full_catalog_upgrade_splits_and_preserves_retired_ownership() {
+        for version in [2_u16, 3] {
+            for analyze_first in [false, true] {
+                let path = test_path(&format!("legacy-drop-{version}-{analyze_first}"));
+                cleanup(&path);
+                let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+                storage.create_index(ColumnId(1)).unwrap();
+                storage.create_index(ColumnId(2)).unwrap();
+                storage.create_index(ColumnId(3)).unwrap();
+                storage.checkpoint().unwrap();
+                storage.close().unwrap();
+                let mut pages = PageManager::open(&path).unwrap();
+                let mut page = pages.read_page(PageId(1)).unwrap();
+                let payload = page.single_payload(PageType::IndexCatalog).unwrap();
+                let mut legacy = payload[..48].to_vec();
+                legacy[4..6].copy_from_slice(&version.to_le_bytes());
+                for entry in payload[48..].chunks_exact(48) {
+                    legacy.extend_from_slice(&entry[..40]);
+                }
+                page.replace_single_payload(PageType::IndexCatalog, &legacy)
+                    .unwrap();
+                page.refresh_checksum();
+                pages.write_page(&page).unwrap();
+                pages.sync().unwrap();
+                drop(pages);
+                let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+                // A full legacy-size page must split when adding the v4 ID.
+                storage.index_catalog_payload_capacity = Some(48 + 3 * 40);
+                let original = storage.indexes().to_vec();
+                assert!(
+                    original
+                        .iter()
+                        .all(|index| index.id.0 == index.handle.meta_page.0)
+                );
+                if analyze_first {
+                    storage.analyze().unwrap();
+                }
+                storage.drop_index(original[1].id).unwrap();
+                storage.analyze().unwrap();
+                let fresh = storage
+                    .create_named_index(IndexName::new("fresh").unwrap(), ColumnId(2))
+                    .unwrap();
+                assert!(original.iter().all(|index| index.id != fresh.id));
+                storage.checkpoint().unwrap();
+                storage.close().unwrap();
+                let storage = HeapStorage::open(&path, indexed_table()).unwrap();
+                assert_eq!(
+                    storage.indexes(),
+                    &[original[0].clone(), original[2].clone(), fresh]
+                );
+                assert_eq!(storage.retired_indexes(), &[original[1].clone()]);
+                storage.close().unwrap();
+                cleanup(&path);
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_rollback_dml_analyze_vacuum_and_recreate() {
+        let path = prepare_index_build_crash_baseline("drop-lifecycle");
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let name = IndexName::new("reusable_idx").unwrap();
+        let old = storage
+            .create_named_index(name.clone(), ColumnId(2))
+            .unwrap();
+        storage.analyze().unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage.drop_index_in(&mut transaction, old.id).unwrap();
+        assert_eq!(storage.indexes(), std::slice::from_ref(&old));
+        assert!(matches!(
+            storage.drop_index_in(&mut transaction, old.id),
+            Err(StorageError::Index(IndexError::IndexAlreadyRetired(_)))
+        ));
+        transaction.rollback().unwrap();
+        assert_eq!(storage.indexes(), std::slice::from_ref(&old));
+        assert!(
+            storage
+                .create_named_index(name.clone(), ColumnId(2))
+                .is_err()
+        );
+        storage.drop_index(old.id).unwrap();
+        assert!(storage.indexes().is_empty());
+        let old_tree_pages = (1..storage.buffer.page_count())
+            .filter_map(|id| {
+                let page = storage.buffer.read_page(PageId(id)).unwrap();
+                matches!(
+                    page.page().header().unwrap().page_type,
+                    PageType::BTreeMeta | PageType::BTreeInternal | PageType::BTreeLeaf
+                )
+                .then(|| (PageId(id), page.page().bytes().to_vec()))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(storage.index_statistics(ColumnId(2)).is_none());
+        let tree_before = storage
+            .btree()
+            .lookup_range(
+                old.handle,
+                &netbadb_index::IndexRange {
+                    lower: netbadb_index::IndexBound::Unbounded,
+                    upper: netbadb_index::IndexBound::Unbounded,
+                },
+            )
+            .unwrap();
+        let row = storage
+            .insert(&[
+                ScalarValue::UInt64(5),
+                ScalarValue::UInt64(50),
+                ScalarValue::Text("new".into()),
+            ])
+            .unwrap();
+        let row = storage
+            .update(
+                row,
+                &[
+                    ScalarValue::UInt64(5),
+                    ScalarValue::UInt64(60),
+                    ScalarValue::Text("changed".into()),
+                ],
+            )
+            .unwrap();
+        storage.delete(row).unwrap();
+        storage.analyze().unwrap();
+        storage.vacuum().unwrap();
+        for (page_id, before) in old_tree_pages {
+            assert_eq!(
+                storage
+                    .buffer
+                    .read_page(page_id)
+                    .unwrap()
+                    .page()
+                    .bytes()
+                    .as_slice(),
+                before
+            );
+        }
+
+        assert_eq!(
+            storage
+                .btree()
+                .lookup_range(
+                    old.handle,
+                    &netbadb_index::IndexRange {
+                        lower: netbadb_index::IndexBound::Unbounded,
+                        upper: netbadb_index::IndexBound::Unbounded
+                    }
+                )
+                .unwrap(),
+            tree_before
+        );
+        storage.checkpoint().unwrap();
+        storage.close().unwrap();
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        assert!(storage.indexes().is_empty());
+        assert_eq!(storage.retired_indexes(), std::slice::from_ref(&old));
+        storage
+            .insert(&[
+                ScalarValue::UInt64(6),
+                ScalarValue::UInt64(70),
+                ScalarValue::Text("backfill".into()),
+            ])
+            .unwrap();
+        let new = storage.create_named_index(name, ColumnId(2)).unwrap();
+        assert_ne!(new.id, old.id);
+        assert_ne!(new.handle, old.handle);
+        assert!(storage.index_statistics(ColumnId(2)).is_none());
+        assert_eq!(
+            storage
+                .btree()
+                .lookup(new.handle, &ScalarValue::UInt64(70))
+                .unwrap()
+                .len(),
+            1
+        );
+        storage.close().unwrap();
+        let storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        assert_eq!(storage.indexes(), &[new]);
+        assert_eq!(storage.retired_indexes(), &[old]);
+        storage.close().unwrap();
+        cleanup(&path);
+    }
+
     fn prepare_index_build_crash_baseline(case: &str) -> std::path::PathBuf {
         let path = test_path(case);
         cleanup(&path);
@@ -7921,7 +8349,7 @@ mod tests {
         let path = test_path(case);
         cleanup(&path);
         let mut storage = HeapStorage::create(&path, indexed_table()).expect("create heap");
-        storage.index_catalog_payload_capacity = Some(88);
+        storage.index_catalog_payload_capacity = Some(96);
         for row in indexed_rows() {
             storage.insert(&row).expect("insert baseline row");
         }

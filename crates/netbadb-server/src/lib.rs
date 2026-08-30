@@ -629,7 +629,9 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::InspectionIndexColumnMissing { .. }
         | DatabaseError::InspectionRegistrationOrderOverflow { .. }
         | DatabaseError::CreateTablesRollback { .. }
-        | DatabaseError::DuplicateIndexName(_) => ProtocolErrorCode::Database,
+        | DatabaseError::DuplicateIndexName(_)
+        | DatabaseError::UndefinedIndex
+        | DatabaseError::UnsupportedDdlCombination => ProtocolErrorCode::Database,
     }
 }
 

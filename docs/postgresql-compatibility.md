@@ -1,8 +1,8 @@
 # Experimental PostgreSQL wire compatibility
 
-Round 6 adds the first mutable DDL slice: transactional, durable `CREATE INDEX`
-for one non-unique Heap BTree column. It is exercised by psql, SQLAlchemy
-`Index.create()`, and a guarded Alembic add-index operation.
+Round 7 supports transactional, durable `CREATE INDEX` and `DROP INDEX` for
+single-column non-unique Heap BTree indexes. It is exercised by psql, SQLAlchemy
+`Index.create()` / `Index.drop()`, and guarded Alembic CreateIndexOp/DropIndexOp apply.
 The feature remains experimental: it is a real path through NetbaDB's compiler, Canonical
 Schema, index registry, and storage engine, not a claim of complete PostgreSQL
 dialect, catalog, or migration compatibility.
@@ -173,9 +173,32 @@ Unique, composite, partial, expression, INCLUDE, non-BTree, and concurrent
 forms return `0A000`. Quoted identifiers are not part of the current generic
 SQL identifier grammar and fail closed rather than being partially parsed;
 missing tables and columns retain `42P01` and `42703`.
-LSM and partitioned-table secondary-index DDL is unsupported. `DROP INDEX`
-remains `0A000`: the registry is append-only and BTree page reclamation has no
-safe removal lifecycle, so hiding reflection would be a false drop.
+LSM and partitioned-table secondary-index DDL remains unsupported.
+`DROP INDEX [IF EXISTS] [public.]name` resolves a durable named index or, in
+this adapter only, an authorized legacy synthetic alias to `(TableId, IndexId)`.
+It writes a v4 retired catalog state in the existing transaction and publishes
+registry removal after commit. Missing indexes return `42704`; IF EXISTS is a
+successful no-op. Table write permission is required (`42501`). CONCURRENTLY,
+multiple targets, CASCADE, RESTRICT, parameters as identifiers, and quoted
+identifiers fail closed (`0A000`). Table DDL remains unsupported.
+
+Uncommitted DROP keeps the published planner/reflection view active, like
+uncommitted CREATE keeps its registration unpublished. This is an experimental
+compatibility boundary, not PostgreSQL catalog MVCC. CREATE and DROP cannot be
+combined within one explicit transaction (`0A000`); no transaction-local DDL
+overlay is implemented. DML after staged DROP still maintains the old tree until
+commit. Any DDL error fails the transaction (`E` / `25P02`) until rollback.
+Prepared DROP is bound to the resolved ID and never drops a replacement index
+that reused the same name. Prepared queries replan using current active paths.
+
+Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
+definitions. Inspection JSON is unchanged and active-only. Existing connections
+refresh through committed catalog_generation; neither psql nor SQLAlchemy needs
+to reconnect (a cached SQLAlchemy Inspector must be refreshed through its normal
+API, or recreated over the same connection). Retired tree definitions are retained
+for storage ownership inspection. Physical pages are not reclaimed or reused;
+repeated create/drop grows the file. Reclamation/compaction is a separate storage
+phase; SQL DROP does not promise file shrinkage.
 The same Canonical Schema/index registry therefore produces the same names and
 OIDs across queries, connections, and restarts. They are not persisted or
 stable across schema/index changes and remain private to the adapter.
@@ -380,7 +403,7 @@ Compatibility results actually exercised in this environment:
 | psql 17.11 | yes | libpq query path | yes | scalar profile and ordinary table SELECT |
 | psycopg 3.2.13 | yes | explicit `prepare=True`, repeated reuse, binary result cursor | commit, rollback, failed transaction recovery | SQLAlchemy transport |
 | SQLAlchemy 2.0.52 + psycopg | yes | generated typed parameters | Core rollback and ORM transactions | Inspector, autoload, reflected SELECT, Core and ORM CRUD |
-| Alembic 1.16.5 | yes | SQLAlchemy transport | read-only rollback | inspect and `compare_metadata`; no migration execution |
+| Alembic 1.16.5 | yes | SQLAlchemy transport | index-only commit/rollback | guarded CreateIndexOp/DropIndexOp apply and empty subsequent comparison |
 | pgx v5.7.6 | yes (Round 2) | prepared CRUD and repeated binds | yes | not tested |
 
 The TCP integration suite performs SSL refusal, startup with known and unknown
@@ -396,8 +419,8 @@ real secondary indexes, a zero-index table, missing-table lookup, repeated and
 qualified reflection, reopen-stable names/OIDs, autoloaded Index objects,
 explicit prepared reuse, selected binary formats, CRUD, transaction/error
 rollback, NULL, Core-generated SQL, reflected SELECT, mapped ORM SELECT/CRUD,
-and Alembic read-only comparison. Matching metadata has no diff; omitting the
-indexes proposes two `remove_index` operations without executing them. See
+and Alembic guarded index-only apply. Matching metadata has no diff; named and
+legacy synthetic index removal executes DropIndexOp and leaves an empty comparison. See
 `postgresql-client-matrix.md` for captured blockers and exact reproduction.
 
 ## Remaining work

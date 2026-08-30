@@ -16,8 +16,8 @@ use std::rc::Rc;
 
 use netbadb_compiler::{
     BindError, CompileError, CompileErrorKind, CompiledDdlStatement, CompiledStatement,
-    PreparedParameter, bind_statement, compile_ddl_statement, compile_statement,
-    compile_statement_with_parameters,
+    DropIndexTarget, IndexNameBinding, PreparedParameter, TypedDropIndex, bind_statement,
+    compile_ddl_statement, compile_statement, compile_statement_with_parameters,
 };
 use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
@@ -215,6 +215,7 @@ pub struct PreparedDdlStatement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DdlOutcome {
     Created,
+    Dropped,
     Unchanged,
 }
 
@@ -222,10 +223,39 @@ impl PreparedDdlStatement {
     #[must_use]
     pub fn access(&self) -> StatementAccess {
         match &self.compiled {
+            CompiledDdlStatement::DropIndex(statement) => StatementAccess {
+                read_tables: Vec::new(),
+                write_tables: statement
+                    .target
+                    .map(|target| target.table_id)
+                    .into_iter()
+                    .collect(),
+            },
             CompiledDdlStatement::CreateIndex(statement) => StatementAccess {
                 read_tables: Vec::new(),
                 write_tables: vec![statement.table_id],
             },
+        }
+    }
+    /// Frontend command kind, with no protocol-specific completion tag.
+    #[must_use]
+    pub fn is_index_drop(&self) -> bool {
+        matches!(self.compiled, CompiledDdlStatement::DropIndex(_))
+    }
+
+    #[must_use]
+    pub fn index_drop_if_exists(&self) -> bool {
+        matches!(&self.compiled, CompiledDdlStatement::DropIndex(statement) if statement.if_exists)
+    }
+
+    /// Allows an adapter to resolve its own legacy alias before authorization.
+    #[must_use]
+    pub fn unresolved_index_name(&self) -> Option<&IndexName> {
+        match &self.compiled {
+            CompiledDdlStatement::DropIndex(statement) if statement.target.is_none() => {
+                statement.name.as_ref()
+            }
+            _ => None,
         }
     }
 }
@@ -321,6 +351,8 @@ pub enum DatabaseError {
         position: usize,
     },
     DuplicateIndexName(IndexName),
+    UndefinedIndex,
+    UnsupportedDdlCombination,
     CreateTablesRollback {
         creation: StorageError,
         cleanup_path: PathBuf,
@@ -344,6 +376,7 @@ pub enum DatabaseErrorKind {
     NotNullViolation,
     FeatureNotSupported,
     DuplicateObject,
+    UndefinedObject,
     TransactionState,
     Operational,
     Internal,
@@ -382,6 +415,12 @@ impl DatabaseError {
                 DatabaseErrorKind::FeatureNotSupported
             }
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
+            Self::UndefinedIndex => DatabaseErrorKind::UndefinedObject,
+            Self::UnsupportedDdlCombination => DatabaseErrorKind::FeatureNotSupported,
+            Self::Storage(StorageError::Index(
+                netbadb_index::IndexError::UnknownIndexId(_)
+                | netbadb_index::IndexError::IndexAlreadyRetired(_),
+            )) => DatabaseErrorKind::UndefinedObject,
             Self::DuplicateIndexName(_) => DatabaseErrorKind::DuplicateObject,
             Self::Registry(StorageRegistryError::DuplicateIndexName { .. }) => {
                 DatabaseErrorKind::DuplicateObject
@@ -483,6 +522,10 @@ impl fmt::Display for DatabaseError {
                 "inspection index registration position {position} for table {} exceeds u32",
                 table_id.0
             ),
+            Self::UndefinedIndex => formatter.write_str("index does not exist"),
+            Self::UnsupportedDdlCombination => {
+                formatter.write_str("CREATE and DROP INDEX cannot be combined in one transaction")
+            }
             Self::DuplicateIndexName(name) => write!(formatter, "index `{name}` already exists"),
             Self::CreateTablesRollback {
                 creation,
@@ -520,7 +563,9 @@ impl Error for DatabaseError {
             | Self::InspectionStorageMissing { .. }
             | Self::InspectionIndexColumnMissing { .. }
             | Self::InspectionRegistrationOrderOverflow { .. } => None,
-            Self::DuplicateIndexName(_) => None,
+            Self::DuplicateIndexName(_)
+            | Self::UndefinedIndex
+            | Self::UnsupportedDdlCombination => None,
         }
     }
 }
@@ -1398,6 +1443,53 @@ impl Database {
         Ok(definition)
     }
 
+    /// Durably retires one table-scoped logical index. Physical tree space is
+    /// retained; ordinary inspection, planning, and DML expose only active trees.
+    pub fn drop_index(
+        &mut self,
+        table_id: TableId,
+        id: netbadb_types::IndexId,
+    ) -> Result<(), DatabaseError> {
+        let storage_id = self.index_ddl_storage(table_id)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .drop_index(id)?;
+        self.catalog_generation = self.catalog_generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Stages retirement without changing published paths. The caller must use
+    /// Database::commit_transaction to publish, or roll back the transaction.
+    pub fn drop_index_in(
+        &mut self,
+        transaction: &mut Transaction,
+        table_id: TableId,
+        id: netbadb_types::IndexId,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        if transaction.has_pending_index_creations() {
+            return Err(DatabaseError::UnsupportedDdlCombination);
+        }
+        let storage_id = self.index_ddl_storage(table_id)?;
+        let context = transaction.write_context(storage_id, &mut self.registry)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .drop_index_in(context, id)?;
+        transaction.stage_index_drop(storage_id, id);
+        Ok(())
+    }
+
+    fn index_ddl_storage(&self, table_id: TableId) -> Result<StorageId, DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(*storage_id),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
+    }
+
     #[must_use]
     pub const fn catalog_generation(&self) -> u64 {
         self.catalog_generation
@@ -1527,9 +1619,70 @@ impl Database {
         &self,
         source: &str,
     ) -> Result<PreparedDdlStatement, DatabaseError> {
+        let indexes = self
+            .registry
+            .iter()
+            .flat_map(|entry| {
+                entry.storage.indexes().iter().filter_map(|index| {
+                    index.name.as_ref().map(|name| IndexNameBinding {
+                        name: name.clone(),
+                        target: DropIndexTarget {
+                            table_id: entry.storage.table().id,
+                            index_id: index.id,
+                        },
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(PreparedDdlStatement {
-            compiled: compile_ddl_statement(&self.schema, source)?,
+            compiled: compile_ddl_statement(&self.schema, source, &indexes)?,
         })
+    }
+
+    /// Prepares an already resolved generic identity, including unnamed legacy
+    /// indexes. Compatibility aliases and OIDs must be resolved by the caller.
+    pub fn prepare_drop_index(
+        &self,
+        table_id: TableId,
+        index_id: netbadb_types::IndexId,
+        if_exists: bool,
+    ) -> Result<PreparedDdlStatement, DatabaseError> {
+        if !self
+            .indexes(table_id)?
+            .iter()
+            .any(|index| index.id == index_id)
+        {
+            return Err(DatabaseError::UndefinedIndex);
+        }
+        Ok(PreparedDdlStatement {
+            compiled: CompiledDdlStatement::DropIndex(TypedDropIndex {
+                name: None,
+                target: Some(DropIndexTarget { table_id, index_id }),
+                if_exists,
+            }),
+        })
+    }
+
+    fn validate_drop_target(
+        &self,
+        statement: &TypedDropIndex,
+    ) -> Result<Option<DropIndexTarget>, DatabaseError> {
+        if let Some(target) = statement.target {
+            if self
+                .indexes(target.table_id)?
+                .iter()
+                .any(|index| index.id == target.index_id)
+            {
+                return Ok(Some(target));
+            }
+        }
+        // A prepared DROP never resolves a replacement registration by name:
+        // its original table authorization and logical identity remain binding.
+        if statement.if_exists {
+            Ok(None)
+        } else {
+            Err(DatabaseError::UndefinedIndex)
+        }
     }
 
     /// Executes one prepared generic DDL statement in its storage-owned atomic
@@ -1539,6 +1692,14 @@ impl Database {
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
         match &prepared.compiled {
+            CompiledDdlStatement::DropIndex(statement) => {
+                let Some(target) = self.validate_drop_target(statement)? else {
+                    return Ok(DdlOutcome::Unchanged);
+                };
+                self.drop_index(target.table_id, target.index_id)?;
+                Ok(DdlOutcome::Dropped)
+            }
+
             CompiledDdlStatement::CreateIndex(statement) => {
                 if let Some((existing_table_id, existing)) =
                     self.registry.iter().find_map(|entry| {
@@ -1568,9 +1729,9 @@ impl Database {
         }
     }
 
-    /// Executes generic DDL inside an existing database transaction. Durable
-    /// registry bytes remain invisible to other sessions until commit, and a
-    /// rollback removes the tree, backfill, and catalog entry together.
+    /// Executes generic DDL inside an existing database transaction. Active
+    /// registry publication is deferred until commit; rollback undoes CREATE
+    /// tree/backfill/registration or restores DROP catalog state together.
     pub fn execute_ddl_in(
         &mut self,
         transaction: &mut Transaction,
@@ -1578,7 +1739,21 @@ impl Database {
     ) -> Result<DdlOutcome, DatabaseError> {
         self.validate_transaction(transaction)?;
         match &prepared.compiled {
+            CompiledDdlStatement::DropIndex(statement) => {
+                if transaction.has_pending_index_creations() {
+                    return Err(DatabaseError::UnsupportedDdlCombination);
+                }
+                let Some(target) = self.validate_drop_target(statement)? else {
+                    return Ok(DdlOutcome::Unchanged);
+                };
+                self.drop_index_in(transaction, target.table_id, target.index_id)?;
+                Ok(DdlOutcome::Dropped)
+            }
+
             CompiledDdlStatement::CreateIndex(statement) => {
+                if transaction.has_pending_index_drops() {
+                    return Err(DatabaseError::UnsupportedDdlCombination);
+                }
                 if let Some((existing_table_id, existing)) =
                     self.registry.iter().find_map(|entry| {
                         entry
@@ -1643,10 +1818,17 @@ impl Database {
         &mut self,
         transaction: &mut Transaction,
     ) -> Result<(), DatabaseError> {
-        self.validate_transaction(transaction)?;
+        transaction.validate_commit_owner(&self.transaction_owner)?;
         transaction.commit_with_schema_mutations()?;
         let pending = transaction.take_pending_indexes();
-        if !pending.is_empty() {
+        let drops = transaction.take_pending_index_drops();
+        if !pending.is_empty() || !drops.is_empty() {
+            for (storage_id, id) in drops {
+                self.registry
+                    .get_mut(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                    .publish_committed_index_drop(id);
+            }
             for (storage_id, definition) in pending {
                 self.registry
                     .get_mut(storage_id)
@@ -1809,7 +1991,7 @@ impl Database {
                 .execute_query_plan(plan, &view)
                 .map(ExecutionResult::Query);
         }
-        if transaction.has_pending_schema_mutations() {
+        if transaction.has_pending_index_creations() {
             return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
@@ -1844,7 +2026,7 @@ impl Database {
                 .execute_query_plan(plan, &view)
                 .map(ExecutionResult::Query);
         }
-        if transaction.has_pending_schema_mutations() {
+        if transaction.has_pending_index_creations() {
             return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
@@ -3533,6 +3715,57 @@ mod tests {
         );
         database.close().expect("close rollback fixture");
         cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn drop_publication_retries_coordinator_decision_and_finalize_failures() {
+        for failure in ["decision", "finalize"] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-drop-retry-{failure}-{}",
+                std::process::id()
+            ));
+            cleanup_coordinator_fixture(&root);
+            let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+            let mut database = Database::create_tables_with_coordinator(
+                tables,
+                DatabaseCoordinatorConfig::new(coordinator_path),
+            )
+            .unwrap();
+            let users = database.create_index(TableId(1), ColumnId(2)).unwrap();
+            let teams = database.create_index(TableId(2), ColumnId(1)).unwrap();
+            let mut tx = database.begin_transaction_for(TableId(1)).unwrap();
+            database
+                .drop_index_in(&mut tx, TableId(1), users.id)
+                .unwrap();
+            database
+                .drop_index_in(&mut tx, TableId(2), teams.id)
+                .unwrap();
+            let generation = database.catalog_generation();
+            let coordinator = database.coordinator.as_ref().unwrap();
+            if failure == "decision" {
+                coordinator.borrow_mut().inject_decision_sync_failure();
+            } else {
+                coordinator.borrow_mut().inject_complete_sync_failure();
+            }
+            assert!(database.commit_transaction(&mut tx).is_err());
+            assert!(tx.rollback().is_err());
+            assert_eq!(database.catalog_generation(), generation);
+            assert_eq!(
+                database.indexes(TableId(1)).unwrap(),
+                std::slice::from_ref(&users)
+            );
+            assert_eq!(
+                database.indexes(TableId(2)).unwrap(),
+                std::slice::from_ref(&teams)
+            );
+            database.commit_transaction(&mut tx).unwrap();
+            assert_eq!(database.catalog_generation(), generation + 1);
+            assert!(database.indexes(TableId(1)).unwrap().is_empty());
+            assert!(database.indexes(TableId(2)).unwrap().is_empty());
+            drop(tx);
+            database.close().unwrap();
+            cleanup_coordinator_fixture(&root);
+        }
     }
 
     #[test]

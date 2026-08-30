@@ -17,7 +17,10 @@ decoders with a nullable UInt64 `IndexSpec`. Arbitrary bytes must return a node
 or typed `IndexError` without panicking, unbounded allocation, or traversal.
 
 `index_catalog_decode` accepts at most one 4060-byte `NBIC` payload and
-exercises the independent version-1 registry decoder. Arbitrary counts and
+exercises the version-4 registry decoder with backward version-2/version-3 input.
+Seeds cover active/retired registrations, invalid state and zero IDs, duplicate
+IDs, truncation, and legacy payloads. Retirement is an in-place state, not a
+DropIndex event: unknown/double-drop requests are covered by storage tests. Arbitrary counts and
 bytes must remain bounded and return either a catalog node or typed error.
 
 `coordinator_log_decode` accepts at most 64 KiB and opens it through the

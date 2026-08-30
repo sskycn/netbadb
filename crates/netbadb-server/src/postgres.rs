@@ -1157,17 +1157,17 @@ impl PgWorkerSession {
         }
         let normalized = normalize_sql(&query);
         if is_index_ddl(&normalized) {
-            if !normalized.starts_with("create index ") {
+            if !normalized.starts_with("create index ") && !normalized.starts_with("drop index ") {
                 return self.extended_error(unsupported_index_ddl());
             }
-            let prepared = match database.prepare_ddl_statement(&query) {
+            let prepared = match self.prepare_index_ddl(database, &query) {
                 Ok(prepared) => prepared,
-                Err(error) => return self.extended_error(map_create_index_error(&error)),
+                Err(error) => return self.extended_error(error),
             };
             if !parameter_types.is_empty() {
                 return self.extended_error(fixed_error(
                     "08P01",
-                    "CREATE INDEX does not accept bind parameters",
+                    "index DDL does not accept bind parameters",
                 ));
             }
             if statement.is_empty() {
@@ -1476,12 +1476,17 @@ impl PgWorkerSession {
                     .execution
                     .execute_ddl(database, prepared)
                     .map_err(|error| self.record_error(&error))?;
-                if outcome == DdlOutcome::Created {
+                if outcome != DdlOutcome::Unchanged {
                     self.mutation_generation = self.mutation_generation.saturating_add(1);
                 }
                 self.refresh_catalog(database)?;
                 return Ok(PortalResult::Command {
-                    tag: "CREATE INDEX".into(),
+                    tag: if prepared.is_index_drop() {
+                        "DROP INDEX"
+                    } else {
+                        "CREATE INDEX"
+                    }
+                    .into(),
                 });
             }
             PreparedExecution::Compatibility(statement) => {
@@ -1506,6 +1511,50 @@ impl PgWorkerSession {
                 })
             }
         }
+    }
+
+    fn prepare_index_ddl(
+        &mut self,
+        database: &Database,
+        sql: &str,
+    ) -> Result<CorePreparedDdl, ErrorResponse> {
+        let prepared = database
+            .prepare_ddl_statement(sql)
+            .map_err(|error| map_create_index_error(&error))?;
+        if let Some(name) = prepared.unresolved_index_name() {
+            self.refresh_catalog(database)?;
+            // Compatibility aliases are resolved only within visible tables.
+            // A guessed alias for a denied table behaves exactly like absence.
+            for table in self
+                .catalog
+                .tables
+                .iter()
+                .filter(|table| self.authorization.can_see(table.table_id))
+            {
+                if let Some(index) = table
+                    .indexes
+                    .iter()
+                    .find(|index| index.name == name.as_str())
+                {
+                    let definition = database
+                        .indexes(table.table_id)
+                        .map_err(|error| map_database_error(&error))?
+                        .iter()
+                        .find(|definition| {
+                            definition.column_id == index.column_id && definition.name.is_none()
+                        })
+                        .ok_or_else(|| fixed_error("42704", "index does not exist"))?;
+                    return database
+                        .prepare_drop_index(
+                            table.table_id,
+                            definition.id,
+                            prepared.index_drop_if_exists(),
+                        )
+                        .map_err(|error| map_database_error(&error));
+                }
+            }
+        }
+        Ok(prepared)
     }
 
     fn refresh_catalog(&mut self, database: &Database) -> Result<(), ErrorResponse> {
@@ -1623,22 +1672,29 @@ impl PgWorkerSession {
             ));
         }
         if is_index_ddl(&normalized) {
-            if !normalized.starts_with("create index ") {
+            if !normalized.starts_with("create index ") && !normalized.starts_with("drop index ") {
                 return Err(self.record_protocol_error(unsupported_index_ddl()));
             }
-            let prepared = database
-                .prepare_ddl_statement(sql)
-                .map_err(|error| self.record_protocol_error(map_create_index_error(&error)))?;
+            let prepared = self
+                .prepare_index_ddl(database, sql)
+                .map_err(|error| self.record_protocol_error(error))?;
             self.authorize_access(&prepared.access())?;
             let outcome = self
                 .execution
                 .execute_ddl(database, &prepared)
                 .map_err(|error| self.record_error(&error))?;
-            if outcome == DdlOutcome::Created {
+            if outcome != DdlOutcome::Unchanged {
                 self.mutation_generation = self.mutation_generation.saturating_add(1);
             }
             self.refresh_catalog(database)?;
-            return Ok(vec![BackendMessage::CommandComplete("CREATE INDEX".into())]);
+            return Ok(vec![BackendMessage::CommandComplete(
+                if prepared.is_index_drop() {
+                    "DROP INDEX"
+                } else {
+                    "CREATE INDEX"
+                }
+                .into(),
+            )]);
         }
         if is_unsupported_schema_ddl(&normalized) {
             return Err(self.record_protocol_error(unsupported_schema_ddl()));
@@ -2731,13 +2787,14 @@ fn unsupported_schema_ddl() -> ErrorResponse {
 fn unsupported_index_ddl() -> ErrorResponse {
     fixed_error(
         "0A000",
-        "only single-column non-unique non-concurrent BTree CREATE INDEX is supported",
+        "only single-column non-unique non-concurrent BTree CREATE/DROP INDEX is supported",
     )
 }
 
 fn map_create_index_error(error: &DatabaseError) -> ErrorResponse {
     match error.kind() {
-        DatabaseErrorKind::UndefinedTable
+        DatabaseErrorKind::UndefinedObject
+        | DatabaseErrorKind::UndefinedTable
         | DatabaseErrorKind::UndefinedColumn
         | DatabaseErrorKind::DuplicateObject
         | DatabaseErrorKind::TransactionState
@@ -4443,6 +4500,7 @@ fn map_database_error(error: &DatabaseError) -> ErrorResponse {
     let (sqlstate, safe_message) = match error.kind() {
         DatabaseErrorKind::Syntax => ("42601", Some(error.to_string())),
         DatabaseErrorKind::UndefinedTable => ("42P01", Some(error.to_string())),
+        DatabaseErrorKind::UndefinedObject => ("42704", Some(error.to_string())),
         DatabaseErrorKind::UndefinedColumn => ("42703", Some(error.to_string())),
         DatabaseErrorKind::AmbiguousColumn => ("42702", Some(error.to_string())),
         DatabaseErrorKind::DatatypeMismatch => ("42804", Some(error.to_string())),
@@ -4630,6 +4688,53 @@ mod tests {
         .expect("authorization policy")
         .admit(&ClientIdentity::LocalPlaintext)
         .expect("principal")
+    }
+
+    #[test]
+    fn guessed_legacy_alias_for_hidden_table_is_not_resolved() {
+        let root = test_path("drop-hidden-alias");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let tables = catalog_tables()
+            .into_iter()
+            .map(|table| (root.join(&table.name), table))
+            .collect::<Vec<_>>();
+        let mut database = Database::create_tables(tables).unwrap();
+        database.create_index(TableId(1), ColumnId(2)).unwrap();
+        let catalog = PgCompatibilityCatalog::derive(&database).unwrap();
+        let alias = catalog
+            .tables
+            .iter()
+            .find(|table| table.table_id == TableId(1))
+            .unwrap()
+            .indexes[0]
+            .name
+            .clone();
+        let (mut session, _) = PgWorkerSession::new(
+            &database,
+            SessionPolicy::default(),
+            principal(&[TableId(1), TableId(2), TableId(3)], &[TableId(2)]),
+            StartupMessage {
+                parameters: Default::default(),
+            },
+            1,
+        )
+        .unwrap();
+        let hidden = session
+            .prepare_index_ddl(&database, &format!("DROP INDEX {alias}"))
+            .unwrap();
+        assert!(hidden.access().write_tables().is_empty());
+        assert_eq!(
+            database.execute_ddl(&hidden).unwrap_err().kind(),
+            DatabaseErrorKind::UndefinedObject
+        );
+        let no_op = session
+            .prepare_index_ddl(&database, &format!("DROP INDEX IF EXISTS {alias}"))
+            .unwrap();
+        assert_eq!(database.execute_ddl(&no_op).unwrap(), DdlOutcome::Unchanged);
+        assert_eq!(database.indexes(TableId(1)).unwrap().len(), 1);
+        database.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

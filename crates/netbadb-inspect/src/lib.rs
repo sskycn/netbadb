@@ -63,9 +63,9 @@ pub struct ColumnInspection {
 /// One registered single-column index without its physical tree handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInspection {
-    /// Stable logical identity. Registered indexes are currently unique by
-    /// `(table_id, column_id)`; physical B+Tree page handles are deliberately
-    /// excluded from this observation boundary.
+    /// Table membership of an active index. The active view is unique by
+    /// `(table_id, column_id)`; lifecycle IndexId and physical handles are
+    /// deliberately excluded from this observation/JSON boundary.
     pub table_id: TableId,
     /// Durable logical name, absent only for legacy pre-DDL registry entries.
     pub name: Option<IndexName>,

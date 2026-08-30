@@ -543,3 +543,125 @@ fn parameter_errors_recover_at_sync_and_preserve_failed_transaction_state() {
     server.shutdown().unwrap();
     cleanup(&directory);
 }
+
+#[test]
+fn transactional_drop_index_simple_extended_and_failed_transaction() {
+    let (directory, server) = start_server("drop-index");
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let created = query(&mut stream, "CREATE INDEX users_name_idx ON users (name)");
+    assert!(
+        created
+            .iter()
+            .any(|(tag, value)| *tag == b'C' && value == b"CREATE INDEX\0")
+    );
+    let rolled_back = query(&mut stream, "BEGIN; DROP INDEX users_name_idx; ROLLBACK");
+    assert!(
+        rolled_back
+            .iter()
+            .any(|(tag, value)| *tag == b'C' && value == b"DROP INDEX\0")
+    );
+    let duplicate = query(&mut stream, "CREATE INDEX users_name_idx ON users (name)");
+    assert_eq!(
+        error_sqlstate(&duplicate.iter().find(|(tag, _)| *tag == b'E').unwrap().1),
+        Some("42P07")
+    );
+
+    let mut parse = b"drop_idx\0DROP INDEX public.users_name_idx\0".to_vec();
+    parse.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'P', &parse)).unwrap();
+    let mut bind = b"drop_portal\0drop_idx\0".to_vec();
+    bind.extend_from_slice(&[0; 6]);
+    stream.write_all(&frontend(b'B', &bind)).unwrap();
+    stream
+        .write_all(&frontend(b'D', b"Pdrop_portal\0"))
+        .unwrap();
+    let mut execute = b"drop_portal\0".to_vec();
+    execute.extend_from_slice(&0_u32.to_be_bytes());
+    stream.write_all(&frontend(b'E', &execute)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let messages = read_until_ready(&mut stream);
+    assert_eq!(
+        messages.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'1', b'2', b'n', b'C', b'Z']
+    );
+    assert_eq!(messages[3].1, b"DROP INDEX\0");
+    let no_op = query(
+        &mut stream,
+        "BEGIN; DROP INDEX IF EXISTS missing; SELECT 1; COMMIT",
+    );
+    assert!(!no_op.iter().any(|(tag, _)| *tag == b'E'));
+    let missing = query(&mut stream, "BEGIN; DROP INDEX missing");
+    assert_eq!(
+        error_sqlstate(&missing.iter().find(|(tag, _)| *tag == b'E').unwrap().1),
+        Some("42704")
+    );
+    assert_eq!(missing.last().unwrap().1, [b'E']);
+    let failed = query(&mut stream, "SELECT 1");
+    assert_eq!(
+        error_sqlstate(&failed.iter().find(|(tag, _)| *tag == b'E').unwrap().1),
+        Some("25P02")
+    );
+    query(&mut stream, "ROLLBACK");
+    for sql in [
+        "DROP INDEX CONCURRENTLY idx",
+        "DROP INDEX a, b",
+        "DROP INDEX idx CASCADE",
+        "DROP INDEX idx RESTRICT",
+        "DROP INDEX $1",
+    ] {
+        let messages = query(&mut stream, sql);
+        assert_eq!(
+            error_sqlstate(&messages.iter().find(|(tag, _)| *tag == b'E').unwrap().1),
+            Some("0A000"),
+            "{sql}"
+        );
+    }
+    query(&mut stream, "CREATE INDEX users_name_idx ON users (name)");
+    query(&mut stream, "BEGIN; DROP INDEX users_name_idx; COMMIT");
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    server.shutdown().unwrap();
+    let database = Database::open(directory.join("users.ndb"), users_table()).unwrap();
+    assert!(database.indexes(TableId(1)).unwrap().is_empty());
+    database.close().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn drop_index_requires_table_write_authorization() {
+    let (directory, server) = start_server("drop-authorization");
+    server.shutdown().unwrap();
+    let mut database = Database::open(directory.join("users.ndb"), users_table()).unwrap();
+    database
+        .create_named_index(
+            netbadb_types::IndexName::new("protected_idx").unwrap(),
+            TableId(1),
+            ColumnId(1),
+        )
+        .unwrap();
+    database.create_index(TableId(1), ColumnId(2)).unwrap();
+    database.close().unwrap();
+    let manifest = directory.join("server.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    config["authorization"]["local_plaintext"]["tables"][0]["write"] = false.into();
+    std::fs::write(&manifest, serde_json::to_vec(&config).unwrap()).unwrap();
+    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .start()
+        .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let denied = query(&mut stream, "DROP INDEX protected_idx");
+    assert_eq!(
+        error_sqlstate(&denied.iter().find(|(tag, _)| *tag == b'E').unwrap().1),
+        Some("42501")
+    );
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    server.shutdown().unwrap();
+    let database = Database::open(directory.join("users.ndb"), users_table()).unwrap();
+    assert_eq!(database.indexes(TableId(1)).unwrap().len(), 2);
+    database.close().unwrap();
+    cleanup(&directory);
+}

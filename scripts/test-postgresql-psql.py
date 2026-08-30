@@ -170,6 +170,19 @@ def main() -> int:
         require(describe("CREATE INDEX users_id_round6_idx ON users (id);"), "CREATE INDEX")
         require(describe(r"\di *round6*"), "users_id_round6_idx", "users")
         require(describe(r"\d users"), "users_id_round6_idx")
+        require(describe("BEGIN; DROP INDEX users_id_round6_idx; ROLLBACK;"), "DROP INDEX", "ROLLBACK")
+        require(describe(r"\di *round6*"), "users_id_round6_idx")
+        require(describe("BEGIN; DROP INDEX public.users_id_round6_idx; COMMIT;"), "DROP INDEX", "COMMIT")
+        for command in [r"\di", r"\d users"]:
+            assert "users_id_round6_idx" not in describe(command)
+        require(describe("DROP INDEX IF EXISTS users_id_round6_idx;"), "DROP INDEX")
+        require(describe("CREATE INDEX users_id_round7_idx ON users (id);"), "CREATE INDEX")
+        require(describe(r"\di *round7*"), "users_id_round7_idx")
+        require(describe(r"\d users"), "users_id_round7_idx")
+        require(describe("DROP INDEX users_id_round7_idx;"), "DROP INDEX")
+        for command in [r"\di", r"\d users"]:
+            assert "users_id_round7_idx" not in describe(command)
+
     finally:
         if fixture.stdin is not None:
             fixture.stdin.close()

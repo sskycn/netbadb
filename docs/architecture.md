@@ -1760,21 +1760,20 @@ reclamation. Uniqueness, SQL index DDL, and range lookup remain deferred.
 
 ## Persistent index registry
 
-Heap metadata v4 points to a fixed `IndexCatalog` root. Catalog pages are
-ordinary checksummed Page v5 single-payload pages containing version-3 `NBIC`
-payloads. The decoder retains version 2 for legacy unnamed entries; v1 is
-rejected without migration. They form an append-only,
-cycle-checked linked chain in creation order. Overflow logs the new catalog
-page before the old tail link, flushes through both records before extending
-the file, and therefore follows the existing reverse-order rollback contract.
+Heap metadata points to a fixed `IndexCatalog` root. Catalog pages are
+ordinary checksummed Page v5 single-payload pages containing version-4 `NBIC`
+payloads. Versions 2 (legacy unnamed) and 3 (optional name) remain readable;
+v1 is explicitly rejected. The cycle-checked linked chain preserves registration
+order. Registrations append; statistics and retirement update existing entries
+using WAL-backed full-page before/after images.
 
-The v3 payload keeps the v2 header and fixed entry prefix little-endian, then
-appends the bounded UTF-8 logical name when present:
+The v4 payload keeps the 48-byte v2/v3 header, adds lifecycle state in the old
+entry reserved area, and extends each entry prefix with a logical IndexId:
 
 ```text
-header (48 bytes)
+header (48 bytes, little endian)
 0..4    NBIC magic
-4..6    u16 version (3; decoder also accepts legacy 2)
+4..6    u16 version (4; decoder also accepts 2 and 3)
 6       u8 table-statistics presence (0 or 1)
 7       reserved zero
 8..16   u64 next catalog PageId (0 means none)
@@ -1784,7 +1783,7 @@ header (48 bytes)
 32..40  u64 managed_page_count (zero when absent)
 40..48  reserved zero
 
-entry prefix (40 bytes)
+v4 entry prefix (48 bytes, little endian)
 0..4    u32 ColumnId
 4       u8 index-statistics presence (0 or 1)
 5       u8 logical-name presence (0 or 1)
@@ -1793,25 +1792,40 @@ entry prefix (40 bytes)
 16..24  u64 distinct_non_null_keys (zero when absent)
 24..32  u64 null_count (zero when absent)
 32..36  u32 tree_height (zero when absent)
-36..40  reserved zero
-40..    logical-name UTF-8 bytes when present (maximum 255)
+36      u8 lifecycle state (0 active, 1 retired)
+37..40  reserved zero
+40..48  u64 nonzero IndexId
+48..    logical-name UTF-8 bytes when present (maximum 255)
 ```
 
-Only the root may contain table statistics. Index statistics on any page
-require root table statistics. Loading checks nonzero managed-page count, NULL
-count at most row count, a valid distinct count for the non-NULL population,
-and tree height at least one. It deliberately does not compare a persisted
-snapshot with current rows or current tree height.
+Versions 2/3 have a 40-byte prefix and require bytes 36..40 to be zero;
+v2 additionally requires bytes 5..8 to be zero. Legacy entries decode as active,
+with IndexId initialized from their unique metadata PageId. This is a one-time
+migration assignment: new registrations allocate `max(all retained IDs) + 1`,
+independent of page allocation. Retired IDs and handles remain reserved.
+IDs are scoped to one physical registry, exposed as `(TableId, IndexId)` for
+supported single-storage tables. Logical partition-index DDL remains unsupported.
+A future catalog compaction must retain the ID high-water mark.
 
-Round 6 changes only IndexCatalog v2 to v3 to persist explicit generic index
-names. Legacy v2 entries decode with no name and continue to receive stable
-synthetic PostgreSQL reflection names. The later MVCC phase changes Heap
-metadata to v4 and tuple payloads to `NBMV` v1; Canonical Schema v1, Page v5,
-BTree payload v1, WAL v3, and WAL record v2 remain unchanged.
+Only the root may contain table statistics. Active index statistics require
+root statistics and validate population counts and nonzero height. Retired
+entries must have no index statistics. Rebuild rejects duplicate IDs/handles
+across the entire chain, duplicate active columns/names, unknown state tags,
+invalid IDs, malformed lengths, trailing bytes, cycles, bad links, and invalid
+statistics. It does not interpret history as last-writer-wins events: each
+retirement mutates exactly one retained registration. Unknown and double-drop
+requests are errors before logging. ANALYZE skips retired entries entirely.
+
+Writing a full legacy page may overflow its expanded v4 representation. The
+writer moves a suffix to a new continuation page, logs its new-page image before
+the existing page/link update, and flushes WAL before file extension. The original
+next link is retained on the new page. Reverse undo restores the link before
+truncating the new trailing page. The same helper handles registration growth,
+statistics upgrades, and retirement. No other persistent format changes.
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees are never discovered by scanning page
-types. Open follows only the metadata root, rejects cycles, duplicates,
+types. Open follows only the metadata root, separates retired ownership from active definitions, rejects cycles, duplicates,
 out-of-range links, and wrong page kinds, then verifies every column against
 the canonical `TableDef` and every BTree metadata `IndexSpec` against that
 column's nominal type and nullability. Validated definitions and optional
@@ -1826,6 +1840,16 @@ registry, so crashes or errors before commit leave no visible partial index.
 Generic named CREATE INDEX uses the same build. Inside an explicit database
 transaction, Core publishes planner and inspection caches only after durable
 commit; rollback leaves no visible registration.
+Round 7 DROP mirrors that publication contract: it logs a retired state and
+clears index statistics, then removes the active definition, DML plan, and
+statistics cache only after durable commit. Core increments catalog_generation
+only on publication. PG sessions refresh on the next metadata query. Uncommitted
+DROP leaves the published active path usable and DML-maintained; rollback
+restores its catalog bytes. Existing prepared queries replan at execution.
+Retired definitions retain tree ownership in storage-only inspection but never
+enter ordinary CatalogInspection, access paths, ANALYZE, or vacuum. No allocator
+free-list exists, so retired pages are neither reused nor reclaimed, and repeated
+create/drop grows the file. See [the lifecycle audit](index-lifecycle-round7.md).
 For every physical Heap version that has not been vacuumed and every registered
 index, one candidate entry `(version[column], version RowId)` exists. Raw
 B+Trees are outside this invariant. INSERT and UPDATE publish a new Heap version
@@ -2306,7 +2330,8 @@ or execute user-table SQL. Each session derives a bounded read-only snapshot
 from `Database::inspect_catalog()`. The Core DTO combines Canonical Schema
 table/column identity with registered index definitions while excluding B+Tree
 handles, PageIds, optimizer policy, and storage variants. A registered index
-has logical identity `(TableId, ColumnId)`, ordered single-column membership,
+has durable lifecycle identity `(TableId, IndexId)`. The unchanged inspection
+DTO exposes only active `(TableId, ColumnId)` membership,
 `BTree` kind, and `unique=false`; LSM clustering access is not a secondary
 index. Partition-local physical indexes are not projected as logical indexes
 because the current registry cannot prove they form one logical definition.

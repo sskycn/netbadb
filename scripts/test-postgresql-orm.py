@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import argparse
 import re
+import os
+import shutil
+import subprocess
+from pathlib import Path
 
 import psycopg
 import sqlalchemy
@@ -74,6 +78,44 @@ def psycopg_smoke(dsn: str) -> None:
             cursor.execute("SELECT %s::BIGINT", (8,))
             assert cursor.fetchone() == (8,)
         connection.rollback()
+
+
+def cross_client_index_visibility(engine: sqlalchemy.Engine, users: Table, dsn: str) -> None:
+    default = Path("/opt/local/lib/pgsql/bin/psql")
+    psql = os.environ.get("PSQL") or (str(default) if default.is_file() else shutil.which("psql"))
+    if not psql:
+        raise RuntimeError("psql is required for the existing-connection cross-client check")
+    observer = subprocess.Popen(
+        [psql, "-X", "-qA", "-v", "ON_ERROR_STOP=1", dsn.replace("postgresql+psycopg://", "postgresql://", 1)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+    def observe(command: str) -> str:
+        observer.stdin.write(command + "\n\\echo ROUND7_DONE\n")
+        observer.stdin.flush()
+        output = []
+        for line in observer.stdout:
+            if line.strip() == "ROUND7_DONE":
+                return "".join(output)
+            output.append(line)
+        raise RuntimeError("psql observer exited: " + observer.stderr.read())
+
+    index = Index("users_id_cross_idx", users.c.id)
+    try:
+        assert "users_id_cross_idx" not in observe(r"\di")
+        with engine.connect() as sqlalchemy_observer:
+            assert "users_id_cross_idx" not in {item["name"] for item in inspect(sqlalchemy_observer).get_indexes("users")}
+            index.create(engine)
+            assert "users_id_cross_idx" in observe(r"\di")
+            index.drop(engine)
+            assert "users_id_cross_idx" not in observe(r"\di")
+            index.create(engine)
+            assert "users_id_cross_idx" in observe(r"\d users")
+            observe("DROP INDEX users_id_cross_idx;")
+            assert "users_id_cross_idx" not in {item["name"] for item in inspect(sqlalchemy_observer).get_indexes("users")}
+    finally:
+        observer.stdin.close()
+        observer.wait(timeout=10)
 
 
 def sqlalchemy_smoke(dsn: str) -> None:
@@ -216,6 +258,16 @@ def sqlalchemy_smoke(dsn: str) -> None:
         assert "users_id_round6_idx" in {
             index["name"] for index in inspect(existing_observer).get_indexes("users")
         }
+        created_index.drop(engine)
+        assert "users_id_round6_idx" not in {
+            index["name"] for index in inspect(existing_observer).get_indexes("users")
+        }
+        created_index.create(engine)
+        assert "users_id_round6_idx" in {
+            index["name"] for index in inspect(existing_observer).get_indexes("users")
+        }
+        created_index.drop(engine)
+    cross_client_index_visibility(engine, users, dsn)
     second_engine.dispose()
     engine.dispose()
 

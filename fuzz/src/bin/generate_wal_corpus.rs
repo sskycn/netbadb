@@ -149,7 +149,9 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
         next_catalog: None,
         table_statistics: None,
         entries: vec![IndexCatalogEntry {
+            retired: false,
             definition: IndexDefinition {
+                id: netbadb_types::IndexId(3),
                 name: None,
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
@@ -159,7 +161,43 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
             statistics: None,
         }],
     })?;
+    let mut named = netbadb_index::decode_index_catalog(&one)?;
+    named.entries[0].definition.name = Some(netbadb_types::IndexName::new("named_idx")?);
+    let named_v4 = encode_index_catalog(&named)?;
+    std::fs::write(output.join("valid-named-v4"), &named_v4)?;
+    let mut named_v3 = named_v4;
+    named_v3[4..6].copy_from_slice(&3_u16.to_le_bytes());
+    named_v3.drain(88..96);
+    std::fs::write(output.join("valid-named-v3"), named_v3)?;
+    named.entries[0].retired = true;
+    std::fs::write(
+        output.join("valid-retired-named-v4"),
+        encode_index_catalog(&named)?,
+    )?;
     std::fs::write(output.join("valid-one-entry"), &one)?;
+    let mut retired = one.clone();
+    retired[84] = 1;
+    std::fs::write(output.join("valid-retired-v4"), &retired)?;
+    std::fs::write(
+        output.join("truncated-retired-v4"),
+        &retired[..retired.len() - 1],
+    )?;
+    retired[84] = 2;
+    std::fs::write(output.join("invalid-state-v4"), &retired)?;
+    let mut invalid_id = one.clone();
+    invalid_id[88..96].fill(0);
+    std::fs::write(output.join("invalid-zero-id-v4"), invalid_id)?;
+    let mut duplicate_id = one.clone();
+    duplicate_id[16..20].copy_from_slice(&2_u32.to_le_bytes());
+    duplicate_id.extend_from_slice(&one[48..]);
+    std::fs::write(output.join("duplicate-ids-v4"), duplicate_id)?;
+    for version in [2_u16, 3] {
+        let mut legacy = one.clone();
+        legacy[4..6].copy_from_slice(&version.to_le_bytes());
+        legacy.drain(88..96);
+        std::fs::write(output.join(format!("valid-legacy-v{version}")), legacy)?;
+    }
+
     std::fs::write(output.join("valid-missing-stats-entry"), &one)?;
     std::fs::write(output.join("valid-continuation-page"), &one)?;
     std::fs::write(
@@ -171,7 +209,9 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
                 managed_page_count: 4,
             }),
             entries: vec![IndexCatalogEntry {
+                retired: false,
                 definition: IndexDefinition {
+                    id: netbadb_types::IndexId(3),
                     name: None,
                     column_id: ColumnId(1),
                     handle: BTreeHandle {
@@ -205,6 +245,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     version_one.extend_from_slice(&0_u64.to_le_bytes());
     version_one.extend_from_slice(&0_u32.to_le_bytes());
     version_one.extend_from_slice(&0_u32.to_le_bytes());
+    version_one.resize(48, 0);
     std::fs::write(output.join("unsupported-v1"), version_one)?;
     Ok(())
 }

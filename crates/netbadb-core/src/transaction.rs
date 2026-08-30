@@ -97,6 +97,7 @@ pub struct DatabaseTransaction {
     write_participants: BTreeSet<StorageId>,
     coordinator: Option<SharedCoordinatorLog>,
     pending_indexes: Vec<(StorageId, IndexDefinition)>,
+    pending_index_drops: Vec<(StorageId, netbadb_types::IndexId)>,
 }
 
 impl DatabaseTransaction {
@@ -115,6 +116,7 @@ impl DatabaseTransaction {
             write_participants: BTreeSet::new(),
             coordinator,
             pending_indexes: Vec::new(),
+            pending_index_drops: Vec::new(),
         }
     }
 
@@ -166,12 +168,19 @@ impl DatabaseTransaction {
     }
 
     pub(crate) fn validate_owner(&self, owner: &Rc<()>) -> Result<(), CoordinatorError> {
+        self.validate_commit_owner(owner)?;
+        self.ensure_active()
+    }
+
+    /// Commit retries must validate ownership without requiring Active again;
+    /// the commit state machine owns validation of pending decision states.
+    pub(crate) fn validate_commit_owner(&self, owner: &Rc<()>) -> Result<(), CoordinatorError> {
         if !Rc::ptr_eq(&self.owner, owner) {
             return Err(CoordinatorError::ForeignDatabaseTransaction {
                 transaction_id: self.id,
             });
         }
-        self.ensure_active()
+        Ok(())
     }
 
     pub(crate) fn begin_read_view(
@@ -233,7 +242,7 @@ impl DatabaseTransaction {
     }
 
     pub fn commit(&mut self) -> Result<(), CoordinatorError> {
-        if !self.pending_indexes.is_empty() {
+        if self.has_pending_schema_mutations() {
             return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit);
         }
         self.commit_with_schema_mutations()
@@ -308,7 +317,20 @@ impl DatabaseTransaction {
     }
 
     pub(crate) fn has_pending_schema_mutations(&self) -> bool {
+        !self.pending_indexes.is_empty() || !self.pending_index_drops.is_empty()
+    }
+
+    pub(crate) fn has_pending_index_creations(&self) -> bool {
         !self.pending_indexes.is_empty()
+    }
+    pub(crate) fn has_pending_index_drops(&self) -> bool {
+        !self.pending_index_drops.is_empty()
+    }
+    pub(crate) fn stage_index_drop(&mut self, storage: StorageId, id: netbadb_types::IndexId) {
+        self.pending_index_drops.push((storage, id));
+    }
+    pub(crate) fn take_pending_index_drops(&mut self) -> Vec<(StorageId, netbadb_types::IndexId)> {
+        std::mem::take(&mut self.pending_index_drops)
     }
 
     fn commit_multi_write(&mut self) -> Result<(), CoordinatorError> {

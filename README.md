@@ -218,7 +218,7 @@ The current code genuinely supports:
 - persistent transactional B+Tree create, insert, exact delete, merge-only
   rebalance/root collapse, and duplicate-preserving point lookup with typed
   keys, arbitrary height, and buffer capacity one;
-- a persistent append-only index registry plus atomic existing-row backfill,
+- a persistent index registry with durable retirement plus atomic existing-row backfill,
   reopen discovery, automatic Heap/registered-index DML maintenance, and
   `TableId`/`ColumnId` embedded APIs;
 - explicit `Database::analyze` optimizer snapshots with persisted table/index
@@ -275,14 +275,14 @@ Experimental PostgreSQL wire mode is documented in
 [`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
 `netbadbd --manifest server.json --postgres` to use the manifest's listen
 address as a loopback PostgreSQL endpoint. This experimental profile is not a
-claim of general PostgreSQL compatibility. Round 6 adds transactional
-single-column non-unique Heap BTree `CREATE INDEX` through psql, SQLAlchemy,
-and guarded Alembic add-index apply. This builds on Round 5's psql 17.11 `\d`,
+claim of general PostgreSQL compatibility. Round 7 supports the transactional
+single-column non-unique Heap BTree `CREATE INDEX` / `DROP INDEX` subset through
+psql, SQLAlchemy, and guarded Alembic index-only apply. This builds on Round 5's psql 17.11 `\d`,
 `\dt`, and `\di` support, including schema/name patterns, and the
 psycopg 3 and SQLAlchemy 2 Core/ORM profile. The PostgreSQL adapter consumes
 stable Core metadata, preserves explicit durable index names while synthesizing
-legacy names/OIDs, and supports index-only Alembic add migration. `DROP INDEX`,
-table DDL, general migration execution, a complete `pg_catalog` or `information_schema`,
+legacy names/OIDs, and supports index-only Alembic add/remove migration.
+Table DDL, general migration execution, a complete `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
@@ -326,10 +326,15 @@ the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
-IndexCatalog payload version 3 adds a bounded durable logical index name to the
-version-2 optimizer fields. The decoder retains version 2 as legacy unnamed
-metadata; version 1 is rejected without migration. Statistics remain snapshots created only by explicit
-`ANALYZE`; ordinary DML deliberately does not update or invalidate them.
+IndexCatalog payload version 4 adds a nonzero registry-scoped `IndexId` and
+active/retired state to version 3's bounded logical name and optimizer fields.
+Versions 2 (unnamed) and 3 remain readable; version 1 is explicitly rejected.
+DROP retires the catalog entry through the existing WAL transaction and removes
+all active access paths only after commit. Statistics remain explicit `ANALYZE`
+snapshots; retirement discards the index snapshot, and recreation starts fresh.
+Retired BTree pages are not reclaimed or reused. Repeated create/drop grows the
+file; safe physical reclamation and catalog compaction are deferred to a separate
+storage lifecycle phase. See [the Round 7 audit](docs/index-lifecycle-round7.md).
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`, plus a durable append-only transaction-status file named

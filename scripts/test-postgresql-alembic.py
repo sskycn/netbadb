@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Alembic's schema comparison without executing migration DDL."""
+"""Compare schemas and apply strictly guarded CreateIndexOp/DropIndexOp changes."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ import argparse
 
 import alembic
 import sqlalchemy
-from alembic.autogenerate import compare_metadata
+from alembic.autogenerate import compare_metadata, produce_migrations
 from alembic.migration import MigrationContext
-from alembic.operations import Operations
+from alembic.operations import Operations, ops
 from sqlalchemy import BigInteger, Boolean, Column, Index, MetaData, Table, Text, inspect
 
 
@@ -56,6 +56,29 @@ def compare(engine: sqlalchemy.Engine, metadata: MetaData) -> list[object]:
         return differences
 
 
+def apply_index_changes(engine: sqlalchemy.Engine, metadata: MetaData) -> list[str]:
+    with engine.begin() as connection:
+        context = MigrationContext.configure(connection, opts={"compare_type": True, "include_schemas": False})
+        migration = produce_migrations(context, metadata)
+        pending = []
+
+        def guard(container: object) -> None:
+            for operation in container.ops:
+                if isinstance(operation, ops.ModifyTableOps):
+                    guard(operation)
+                elif isinstance(operation, (ops.CreateIndexOp, ops.DropIndexOp)):
+                    pending.append(operation)
+                else:
+                    raise AssertionError(f"refusing non-index migration: {operation!r}")
+
+        guard(migration.upgrade_ops)
+        # Validate the entire proposal before invoking any mutation.
+        operations = Operations(context)
+        for operation in pending:
+            operations.invoke(operation)
+        return [type(operation).__name__ for operation in pending]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dsn", required=True)
@@ -91,21 +114,23 @@ def main() -> None:
     assert [column.name for column in proposed.columns] == ["id"]
     assert not proposed.unique
 
-    with engine.begin() as connection:
-        context = MigrationContext.configure(connection)
-        Operations(context).create_index(
-            "users_id_alembic_idx",
-            "users",
-            ["id"],
-            unique=False,
-        )
+    assert apply_index_changes(engine, target) == ["CreateIndexOp"]
     assert compare(engine, target) == []
+    baseline = existing_schema(names, with_indexes=True)
+    named_removal = compare(engine, baseline)
+    assert len(named_removal) == 1 and named_removal[0][0] == "remove_index", named_removal
+    assert apply_index_changes(engine, baseline) == ["DropIndexOp"]
+    assert compare(engine, baseline) == []
+    # Legacy synthetic aliases must resolve in the PG adapter to generic IDs.
+    no_indexes = existing_schema(names, with_indexes=False)
+    assert apply_index_changes(engine, no_indexes) == ["DropIndexOp", "DropIndexOp"]
+    assert compare(engine, no_indexes) == []
     engine.dispose()
     print(
         "Alembic guarded index-only mutation passed: "
         f"Python, psycopg, SQLAlchemy {sqlalchemy.__version__}, "
         f"Alembic {alembic.__version__}; baseline differences=0, "
-        f"remove_index differences={len(remove_indexes)}, add_index applied=1"
+        f"remove_index differences={len(remove_indexes)}, add_index applied=1, named remove_index applied=1, legacy remove_index applied=2, final differences=0"
     )
 
 

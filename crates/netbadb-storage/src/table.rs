@@ -4,7 +4,7 @@ use std::path::Path;
 use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, TableStatistics};
 use netbadb_schema::TableDef;
 use netbadb_types::{
-    AccessPathId, ColumnId, DatabaseTxnId, IndexName, Lsn, RowId, ScalarRef, ScalarValue,
+    AccessPathId, ColumnId, DatabaseTxnId, IndexId, IndexName, Lsn, RowId, ScalarRef, ScalarValue,
     StorageId, TableId, TxnId,
 };
 
@@ -1130,6 +1130,40 @@ impl TableStorage {
     pub fn publish_committed_index(&mut self, definition: IndexDefinition) {
         if let Self::Heap(storage) = self {
             storage.publish_committed_index(definition);
+        }
+    }
+
+    pub fn drop_index(&mut self, id: IndexId) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => storage.drop_index(id),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "drop B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    pub fn drop_index_in(
+        &mut self,
+        transaction: &mut StorageTransaction,
+        id: IndexId,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                storage.drop_index_in(transaction.heap_transaction_mut(table_id)?, id)
+            }
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "drop B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn publish_committed_index_drop(&mut self, id: IndexId) {
+        if let Self::Heap(storage) = self {
+            storage.publish_committed_index_drop(id);
         }
     }
 
