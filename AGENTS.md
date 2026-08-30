@@ -300,6 +300,17 @@ Potentially destructive operations MUST resolve exact targets first and SHOULD
 prefer recoverable actions. Planning, inspection, and explanation MUST remain
 distinct from mutation.
 
+The user has authorized this default completion workflow for repository changes:
+after implementation, validation and final diff review, commit the task changes,
+merge the task branch into `main`, and push `main` to `origin`. Fetch and inspect
+the remote state before integrating; do not force-push or overwrite unrelated
+work. Only after confirming the pushed main contains the task commits, remove
+this task's clean temporary worktree and delete its merged local branch (and its
+remote branch if one was published). Do not clean up unrelated branches or
+worktrees. This is standing authorization for these completion steps; a later
+explicit task instruction can override the default. If integration or push is
+blocked, preserve the task branch/worktree and report the blocker.
+
 ## 10. Definition of done
 
 A change is complete when:
