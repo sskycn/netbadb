@@ -147,7 +147,7 @@ fn tail_multiple_complete_trees_reclaim_together_and_middle_owner_remains() {
         inventory.pending,
         vec![netbadb_index::RetiredIndexOwnership {
             index_id: middle.id,
-            meta_page: middle.handle.meta_page
+            meta_page: None
         }]
     );
     assert_eq!(inventory.retired_owned_pages, 2);
@@ -643,6 +643,13 @@ fn tail_whole_tree_keeps_split_middle_owner_and_reclaims_only_later_complete_tre
     *storage.buffer.new_page().unwrap().page_mut() = after;
     tx.commit().unwrap();
     drop(tx);
+    assert_eq!(
+        storage
+            .inspect_index_reclaim()
+            .unwrap()
+            .retired_orphan_pages,
+        1
+    );
     storage.compact_index_catalog().unwrap();
     let no = storage.reclaim_retired_index_tail().unwrap();
     assert_eq!(
@@ -666,7 +673,8 @@ fn tail_whole_tree_keeps_split_middle_owner_and_reclaims_only_later_complete_tre
     );
     let inventory = storage.inspect_index_reclaim().unwrap();
     assert_eq!(inventory.retired_owned_pages, 3);
-    assert_eq!(inventory.retired_orphan_pages, 1);
+    assert_eq!(inventory.retired_orphan_pages, 0);
+    assert_eq!(inventory.owner_only_pages, 3);
     assert_eq!(inventory.pending[0].index_id, a.id);
     storage.close().unwrap();
     cleanup(&path);

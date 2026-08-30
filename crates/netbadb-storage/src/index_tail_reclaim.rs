@@ -42,7 +42,7 @@ fn retired_identities(catalog: &CatalogSnapshot) -> Vec<RetiredIndexOwnership> {
                 .filter(|entry| entry.retired && entry.definition.handle.owner.is_some())
                 .map(|entry| RetiredIndexOwnership {
                     index_id: entry.definition.id,
-                    meta_page: entry.definition.handle.meta_page,
+                    meta_page: Some(entry.definition.handle.meta_page),
                 }),
         )
         .collect()
@@ -52,7 +52,7 @@ fn plan_tail(catalog: &CatalogSnapshot, inventory: &IndexPageInventory) -> TailP
     let identities = retired_identities(catalog);
     let owners: HashSet<_> = identities
         .iter()
-        .filter(|r| r.meta_page.generation().is_some())
+        .filter(|r| r.is_generation_safe())
         .map(|r| r.index_id)
         .collect();
     let pages: BTreeMap<_, _> = inventory
@@ -279,6 +279,12 @@ impl HeapStorage {
         let count = self.buffer.validated_page_count()?;
         if count == intent.old_page_count {
             let inventory = self.index_page_inventory(&catalog)?;
+            if inventory.report.allocations.iter().any(|page| {
+                page.page_ref.page_id.0 >= intent.truncate_from
+                    && page.page_ref.generation.0 >= intent.checkpoint_lsn.0
+            }) {
+                return Err(IndexError::InvalidReclaimIntent.into());
+            }
             let plan = plan_tail(&catalog, &inventory);
             if plan.report.truncate_from != Some(PageId(intent.truncate_from))
                 || plan.covered != intent.covered
@@ -385,14 +391,16 @@ impl HeapStorage {
                 && (!entry.retired
                     || !intent.covered.contains(&RetiredIndexOwnership {
                         index_id: entry.definition.id,
-                        meta_page: entry.definition.handle.meta_page,
+                        meta_page: Some(entry.definition.handle.meta_page),
                     }))
             {
                 return Err(IndexError::InvalidReclaimIntent.into());
             }
         }
         for record in &catalog.pending {
-            if record.meta_page.page_id().0 >= intent.truncate_from
+            if record
+                .meta_page
+                .is_some_and(|page| page.page_id().0 >= intent.truncate_from)
                 && !intent.covered.contains(record)
             {
                 return Err(IndexError::InvalidReclaimIntent.into());

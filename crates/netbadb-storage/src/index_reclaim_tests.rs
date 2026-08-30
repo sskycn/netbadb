@@ -100,7 +100,7 @@ fn owned_merge_orphans_remain_discoverable_after_compaction_and_reopen() {
         snapshot.pending,
         vec![netbadb_index::RetiredIndexOwnership {
             index_id: index.id,
-            meta_page: index.handle.meta_page
+            meta_page: None
         }]
     );
     storage.checkpoint().unwrap();
@@ -108,7 +108,8 @@ fn owned_merge_orphans_remain_discoverable_after_compaction_and_reopen() {
     let mut storage = HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 1).unwrap();
     let report = storage.inspect_index_reclaim().unwrap();
     assert_eq!(report.retired_owned_pages, owned_before);
-    assert_eq!(report.retired_orphan_pages, owned_before - 2);
+    assert_eq!(report.retired_orphan_pages, 0);
+    assert_eq!(report.owner_only_pages, owned_before);
     assert_eq!(report.pending_reclaim_indexes, 1);
     assert_eq!(report.pages_reclaimed, 0);
     storage.compact_index_catalog().unwrap();
@@ -241,7 +242,7 @@ fn scanner_rejects_owned_corruption_and_overlap_without_catalog_writes() {
             let mut catalog = storage.read_index_catalog(PageId(1)).unwrap();
             catalog.pending.push(netbadb_index::RetiredIndexOwnership {
                 index_id: active.id,
-                meta_page: active.handle.meta_page,
+                meta_page: Some(active.handle.meta_page),
             });
             assert!(matches!(
                 storage.index_page_inventory(&catalog),
@@ -376,6 +377,13 @@ fn legacy_and_raw_pages_remain_outside_owned_reclaim_inventory() {
     let report = storage.inspect_index_reclaim().unwrap();
     assert_eq!(report.unregistered_legacy_pages, 2);
     assert_eq!(report.retired_owned_pages, 0);
+    assert!(
+        storage
+            .inspect_reusable_pages()
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
     storage.checkpoint().unwrap();
     storage.close().unwrap();
     let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();

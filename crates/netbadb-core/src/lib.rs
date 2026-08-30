@@ -51,7 +51,8 @@ pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacement
 pub use netbadb_storage::{
     IndexDefinition, IndexMaintenanceReport, IndexReclaimReport, IndexStatistics,
     IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
-    LsmReadAmplification, LsmWriteAmplification, StorageKind, TableStatistics,
+    LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
+    ReusablePageInspection, StorageKind, TableStatistics,
 };
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
@@ -1415,6 +1416,30 @@ impl Database {
                 .map_err(Into::into),
             TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
                 operation: "index reclaim inspection",
+                storage_kind: "range-partitioned table",
+            }
+            .into()),
+        }
+    }
+
+    /// Quiescent retired-owner candidate inspection; no allocation permission,
+    /// SQL result or ordinary catalog metadata is exposed by this DTO.
+    pub fn inspect_reusable_pages(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<PageReuseInspection, DatabaseError> {
+        self.ensure_index_maintenance_quiescent()?;
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .inspect_reusable_pages()
+                .map_err(Into::into),
+            TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
+                operation: "reusable page inspection",
                 storage_kind: "range-partitioned table",
             }
             .into()),
@@ -5117,6 +5142,7 @@ mod tests {
         let lazy_reader = database.begin_transaction().unwrap();
         assert!(database.compact_index_catalog(TableId(1)).is_err());
         assert!(database.inspect_index_reclaim(TableId(1)).is_err());
+        assert!(database.inspect_reusable_pages(TableId(1)).is_err());
         assert!(database.reclaim_retired_index_tail(TableId(1)).is_err());
         drop(lazy_reader);
         let mut retained_terminal = database.begin_transaction().unwrap();
@@ -5132,6 +5158,14 @@ mod tests {
         assert_eq!(reclaim.active_indexes, 1);
         assert_eq!(reclaim.pending_reclaim_indexes, 1);
         assert_eq!(reclaim.pages_reclaimed, 0);
+        let reusable = database.inspect_reusable_pages(TableId(1)).unwrap();
+        assert_eq!(reusable.candidates.len(), 2);
+        assert!(
+            reusable
+                .candidates
+                .iter()
+                .all(|page| page.retired_index_id == retired.id)
+        );
         let tail = database.reclaim_retired_index_tail(TableId(1)).unwrap();
         assert_eq!((tail.reclaimed_pages, tail.reclaimed_indexes), (2, 1));
         assert_eq!(
@@ -5140,6 +5174,13 @@ mod tests {
                 .unwrap()
                 .pending_reclaim_indexes,
             0
+        );
+        assert!(
+            database
+                .inspect_reusable_pages(TableId(1))
+                .unwrap()
+                .candidates
+                .is_empty()
         );
         assert_eq!(database.inspect_catalog().unwrap(), inspection_before);
         assert_eq!(database.catalog_generation(), generation_after_drop);

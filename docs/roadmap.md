@@ -580,14 +580,28 @@ PostgreSQL-only metadata absent from NetbaDB remain unsupported.
   0 pending, 99 repeated meta PageIds. Interleaving raw trees retains 200 retired
   pages, 100 pending owners and a 404-page file; general compaction is not claimed.
 
-Next: **General Free-Page Allocator Architecture audit**. Tail reclamation solves
-append/drop growth in favorable layouts, but measured interleaved growth remains.
-Evaluate durable remaining-page inventory, allocator identity, middle retired
-holes, active-tree merge orphans and catalog orphans before implementing reuse.
-Do not jump to CREATE TABLE. A later Table Schema Lifecycle Architecture Audit
-must cover canonical schema authority, TableId high-water, fingerprint evolution,
-manifest ownership, table storage lifecycle and transaction/recovery/SDK contracts.
-See [Round 11](index-tail-reclaim-round11.md).
+### Storage Lifecycle Round 12 — reusable capability and owner inventory (P0)
+
+- Full allocator/page-kind audit selects retired-owner-derived inventory instead
+  of a second durable free catalog. Only retired registered BTree v3 qualifies.
+- IndexCatalog v9 adds owner-only pending records; v2-v8 remain readable and v8
+  tail intents recover. Partial inventory survives loss of meta/root, including
+  orphan-only remainders. Zero-owner cleanup uses ordinary catalog transactions.
+- Quiescent Core/Heap candidate inspection validates the full file, excludes
+  active/legacy/raw/Heap/catalog pages, and orders old PageRefs by lowest PageId.
+- Production hole reuse is **not implemented**. Existing WAL rejects nonzero
+  generation transitions; checkpoint alone cannot fix redo/undo identity rules.
+- Measured interleaved fixture: 404 pages, 200 candidates, 100 retired owners.
+  Another 100 CREATE/DROP operations still append 200 BTree pages (606 total,
+  including catalog growth). This is a P0 safety gate, not bounded-growth success.
+- Active-owner merge orphans and abandoned catalog pages remain excluded.
+
+Next: **Generation-transition WAL/recovery and BTree-v3 reusable allocator**.
+Prove physical before-image restoration, idempotent winner redo/loser undo,
+clean-frame claims, and cache invalidation before enabling middle-hole allocation.
+A new durable general free-list is not indicated by the inventory audit. Complete
+P1's crash/stress gates before active-orphan reclamation or Heap/RowId migration;
+do not jump to CREATE TABLE. See [Round 12](page-reuse-round12.md).
 
 ## Phase 6 — SDK and tooling
 
