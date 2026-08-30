@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_protocol_decode_seeds(&output)?;
     write_generation_seeds(&output)?;
     write_tail_intent_seeds(&output)?;
+    write_owner_only_seeds(&output)?;
     Ok(())
 }
 
@@ -302,7 +303,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     pending.next_index_id = Some(netbadb_types::IndexId(9));
     pending.pending.push(netbadb_index::RetiredIndexOwnership {
         index_id: netbadb_types::IndexId(7),
-        meta_page: netbadb_index::BTreePageRef::Legacy(PageId(2)),
+        meta_page: Some(netbadb_index::BTreePageRef::Legacy(PageId(2))),
     });
     let pending_bytes = encode_index_catalog(&pending)?;
     std::fs::write(output.join("valid-pending-v6"), &pending_bytes)?;
@@ -534,7 +535,11 @@ fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, netbadb_inde
         offset += 56 + length;
     }
     for pending in &node.pending {
-        assert!(pending.meta_page.generation().is_none());
+        assert!(
+            pending
+                .meta_page
+                .is_some_and(|page| page.generation().is_none())
+        );
         legacy.extend_from_slice(&current[offset..offset + 16]);
         offset += 32;
     }
@@ -634,7 +639,7 @@ fn write_generation_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::E
     });
     catalog.pending.push(RetiredIndexOwnership {
         index_id: IndexId(8),
-        meta_page: refs(3, 102),
+        meta_page: Some(refs(3, 102)),
     });
     let bytes = encode_current_index_catalog(&catalog)?;
     let output = root.join("index_catalog_decode");
@@ -708,13 +713,16 @@ fn write_tail_intent_seeds(output: &Path) -> Result<(), Box<dyn std::error::Erro
     let root = disk.read_page(PageId(1))?;
     let mut node =
         netbadb_index::decode_index_catalog(root.read_record(netbadb_types::SlotId(0))?)?;
+    // Keep Round 11 seeds genuinely v8/root-dependent after v9 compaction.
+    node.pending[0].meta_page = Some(index.handle.meta_page);
     node.reclaim_intent = Some(netbadb_index::TailReclaimIntent {
         old_page_count: 5,
         truncate_from: 3,
         checkpoint_lsn,
         covered: node.pending.clone(),
     });
-    let valid = encode_current_index_catalog(&node)?;
+    let mut valid = encode_current_index_catalog(&node)?;
+    valid[4..6].copy_from_slice(&8_u16.to_le_bytes());
     let catalog_output = output
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -730,6 +738,7 @@ fn write_tail_intent_seeds(output: &Path) -> Result<(), Box<dyn std::error::Erro
         definition: index,
     });
     let mut active_bytes = encode_current_index_catalog(&active)?;
+    active_bytes[4..6].copy_from_slice(&8_u16.to_le_bytes());
     active_bytes[7] = 2;
     active_bytes.extend_from_slice(&valid[80..]);
     payloads.push(("active-in-intent", active_bytes));
@@ -822,6 +831,17 @@ fn write_tail_snapshot(
         assert_eq!(report.database_pages, 3);
         assert_eq!(report.pending_reclaim_indexes, 0);
         storage.close()?;
+    } else if name.starts_with("round12-valid-") {
+        let mut storage = reopened?;
+        let ownership = storage.inspect_index_reclaim()?;
+        let candidates = storage.inspect_reusable_pages()?;
+        assert_eq!(ownership.pending.len(), 1);
+        assert!(ownership.pending[0].meta_page.is_none());
+        assert_eq!(
+            candidates.candidates.len(),
+            if name.ends_with("partial") { 1 } else { 2 }
+        );
+        storage.close()?;
     } else {
         assert!(reopened.is_err(), "malformed fixture must fail: {name}");
     }
@@ -830,6 +850,107 @@ fn write_tail_snapshot(
         &wal_path(&probe),
         &wal_alternate_path(wal_path(&probe)),
         &netbadb_storage::txn_status_path(&probe),
+    ] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_owner_only_seeds(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::temp_dir().join(format!("netbadb-round12-corpus-{}", std::process::id()));
+    let mut storage = HeapStorage::create(&path, fuzz_table())?;
+    let old = storage.create_index(ColumnId(1))?;
+    storage.drop_index(old.id)?;
+    storage.compact_index_catalog()?;
+    let active = storage.create_index(ColumnId(1))?;
+    storage.checkpoint()?;
+    storage.close()?;
+    let mut disk = PageManager::open(&path)?;
+    let root = disk.read_page(PageId(1))?;
+    let node = netbadb_index::decode_index_catalog(root.read_record(netbadb_types::SlotId(0))?)?;
+    let valid = encode_current_index_catalog(&node)?;
+    let catalog_output = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("index_catalog_decode");
+    std::fs::write(catalog_output.join("round12-valid-owner-only-v9"), &valid)?;
+    // The active entry occupies 56 bytes, followed by one 32-byte pending owner.
+    for (name, offset, value) in [
+        ("nonzero-root", 112, 3),
+        ("nonzero-generation", 120, 9),
+        ("unknown-class", 128, 3),
+        ("reserved", 129, 1),
+    ] {
+        let mut bad = valid.clone();
+        bad[offset] = value;
+        assert!(netbadb_index::decode_index_catalog(&bad).is_err());
+        std::fs::write(catalog_output.join(format!("round12-{name}-v9")), bad)?;
+    }
+    let mut old_format = valid.clone();
+    old_format[4..6].copy_from_slice(&8_u16.to_le_bytes());
+    assert!(netbadb_index::decode_index_catalog(&old_format).is_err());
+    std::fs::write(
+        catalog_output.join("round12-owner-only-forbidden-v8"),
+        old_format,
+    )?;
+    std::fs::write(
+        catalog_output.join("round12-truncated-owner-only-v9"),
+        &valid[..valid.len() - 1],
+    )?;
+    // Burn a real durable reservation through the ordinary WAL API; no page
+    // update is fabricated or admitted through the production allocator.
+    let mut wal = WalManager::open(wal_path(&path))?;
+    let begin = wal.append(TxnId(9000), None, WalRecordKind::Begin)?;
+    let reservation = wal.append(
+        TxnId(9000),
+        Some(begin),
+        WalRecordKind::PageGenerationReservation,
+    )?;
+    let commit = wal.append(TxnId(9000), Some(reservation), WalRecordKind::Commit)?;
+    wal.flush_through(commit)?;
+    let generation = netbadb_types::PageGeneration(reservation.0);
+    let wal_bytes = std::fs::read(wal.path())?;
+    drop(wal);
+    let mut heap = std::fs::read(&path)?;
+    write_tail_snapshot(output, "round12-valid-owner-only", &heap, &wal_bytes)?;
+    let spec = IndexSpec {
+        data_type: SemanticType::physical(PhysicalType::UInt64),
+        nullable: true,
+    };
+    let payload = netbadb_index::encode_leaf_generation(
+        &spec,
+        &LeafNode::empty(),
+        Some(active.id),
+        Some(generation),
+    )?;
+    let id = old.handle.meta_page.page_id();
+    let mut page = Page::new(id, PageType::Heap);
+    page.insert_record(&payload)?;
+    let mut bytes = *page.bytes();
+    // PageType has explicit persistent tags; obtain the leaf tag from a real
+    // leaf page instead of relying on Rust enum representation.
+    let active_leaf = disk.read_page(PageId(active.handle.meta_page.page_id().0 + 1))?;
+    bytes[6] = active_leaf.bytes()[6];
+    bytes[24..28].fill(0);
+    let checksum = crc32c::crc32c_append(crc32c::crc32c(&id.0.to_le_bytes()), &bytes);
+    bytes[24..28].copy_from_slice(&checksum.to_le_bytes());
+    Page::from_bytes(id, bytes).header()?;
+    let start = usize::try_from(id.0)? * 4096;
+    heap[start..start + 4096].copy_from_slice(&bytes);
+    write_tail_snapshot(
+        output,
+        "round12-valid-owner-only-partial",
+        &heap,
+        &wal_bytes,
+    )?;
+    drop(disk);
+    for file in [
+        &path,
+        &wal_path(&path),
+        &wal_alternate_path(wal_path(&path)),
+        &netbadb_storage::txn_status_path(&path),
     ] {
         if file.exists() {
             std::fs::remove_file(file)?;

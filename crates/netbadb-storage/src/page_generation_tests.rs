@@ -176,7 +176,8 @@ fn generation_corrupt_root_child_leaf_and_pending_fail_closed() {
             let mut node =
                 decode_index_catalog(page.page().single_payload(PageType::IndexCatalog).unwrap())
                     .unwrap();
-            node.pending[0].meta_page = generation_ref(node.pending[0].meta_page, 1);
+            // A retained pre-v9 root still requires its exact generation.
+            node.pending[0].meta_page = Some(generation_ref(index.handle.meta_page, 1));
             page.page_mut()
                 .replace_single_payload(
                     PageType::IndexCatalog,
@@ -486,8 +487,21 @@ fn generation_legacy_v2_remains_read_write_and_explicitly_unreclaimable() {
     let report = storage.inspect_index_reclaim().unwrap();
     assert_eq!(report.legacy_unreclaimable_indexes, 1);
     assert!(report.allocations.is_empty());
-    assert_eq!(report.pending[0].meta_page, legacy.handle.meta_page);
-    assert_eq!(storage.reclaim_retired_index_tail().unwrap().reclaimed_pages, 0);
+    assert_eq!(report.pending[0].meta_page, Some(legacy.handle.meta_page));
+    assert!(
+        storage
+            .inspect_reusable_pages()
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .reclaim_retired_index_tail()
+            .unwrap()
+            .reclaimed_pages,
+        0
+    );
     assert_eq!(storage.inspect_index_reclaim().unwrap(), report);
     storage.checkpoint().unwrap();
     storage.close().unwrap();

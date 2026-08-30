@@ -31,7 +31,10 @@ use crate::{PreparedTransaction, PreparedTxnResolution};
 mod ownership;
 #[path = "index_tail_reclaim.rs"]
 mod tail_reclaim;
-pub use ownership::{IndexPageAllocation, IndexReclaimReport};
+pub use ownership::{
+    IndexPageAllocation, IndexReclaimReport, PageReuseClass, PageReuseInspection,
+    ReusablePageInspection,
+};
 pub use tail_reclaim::IndexTailReclaimReport;
 
 const HEADER_PAGE: PageId = PageId(0);
@@ -1045,14 +1048,22 @@ impl HeapStorage {
                 return Err(IndexError::TableStatisticsOnContinuation { page_id }.into());
             }
             for record in node.pending {
-                if record.meta_page.page_id().0 >= page_count
+                if record
+                    .meta_page
+                    .is_some_and(|page| page.page_id().0 >= page_count)
                     && !reclaim_intent.as_ref().is_some_and(
                         |intent: &netbadb_index::TailReclaimIntent| {
                             intent.covered.contains(&record)
                         },
                     )
                 {
-                    return Err(IndexError::InvalidChild(record.meta_page.page_id()).into());
+                    return Err(IndexError::InvalidChild(
+                        record
+                            .meta_page
+                            .ok_or(IndexError::InvalidNodeType)?
+                            .page_id(),
+                    )
+                    .into());
                 }
                 pending.push(record);
             }
@@ -1062,7 +1073,7 @@ impl HeapStorage {
                         && reclaim_intent.as_ref().is_some_and(|intent| {
                             intent.covered.contains(&RetiredIndexOwnership {
                                 index_id: entry.definition.id,
-                                meta_page: entry.definition.handle.meta_page,
+                                meta_page: Some(entry.definition.handle.meta_page),
                             })
                         }))
                 {
@@ -1292,9 +1303,24 @@ impl HeapStorage {
                 .filter(|entry| entry.retired && entry.definition.handle.owner.is_some())
                 .map(|entry| RetiredIndexOwnership {
                     index_id: entry.definition.id,
-                    meta_page: entry.definition.handle.meta_page,
+                    meta_page: Some(entry.definition.handle.meta_page),
                 }),
         );
+        // A successful complete scan is the only authority for removing an
+        // empty owner. Conversion drops the root dependency, never the owner.
+        pending.retain(|record| {
+            !record.is_generation_safe()
+                || inventory
+                    .report
+                    .allocations
+                    .iter()
+                    .any(|page| page.owner == record.index_id)
+        });
+        for record in &mut pending {
+            if record.is_generation_safe() {
+                record.meta_page = None;
+            }
+        }
         // Canonical ID order makes repeated compaction byte-idempotent even if
         // records originally occupied different catalog continuation pages.
         pending.sort_by_key(|record| record.index_id);
@@ -9343,5 +9369,6 @@ mod tests {
         include!("index_reclaim_tests.rs");
         include!("page_generation_tests.rs");
         include!("index_tail_reclaim_tests.rs");
+        include!("page_reuse_tests.rs");
     }
 }

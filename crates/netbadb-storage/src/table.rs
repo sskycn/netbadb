@@ -1219,6 +1219,17 @@ impl TableStorage {
         }
     }
 
+    /// Quiescent candidate inspection, not allocation permission.
+    pub fn inspect_reusable_pages(&mut self) -> Result<crate::PageReuseInspection, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.inspect_reusable_pages(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "reusable page inspection",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     /// Validates the full Heap file and reports pending retirement ownership.
     pub fn inspect_index_reclaim(&mut self) -> Result<crate::IndexReclaimReport, StorageError> {
         match self {

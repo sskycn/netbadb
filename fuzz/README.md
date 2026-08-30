@@ -19,10 +19,10 @@ decoders with a nullable UInt64 `IndexSpec`. Arbitrary bytes must return a node
 or typed `IndexError` without panicking, unbounded allocation, or traversal.
 
 `index_catalog_decode` accepts at most one 4060-byte `NBIC` payload and
-exercises the version-8 registry decoder with backward version-2 through version-7 input.
+exercises the version-9 registry decoder with backward version-2 through version-8 input.
 Seeds cover active/retired registrations, invalid state and zero IDs, duplicate
 IDs, truncation, root high-water, compacted catalogs, invalid high-water, and
-legacy payloads. Successful decodes also canonicalize and round-trip through v8. Retirement is an in-place state, not a
+legacy payloads. Successful decodes also canonicalize and round-trip through v9. Retirement is an in-place state, not a
 DropIndex event: unknown/double-drop requests are covered by storage tests. Arbitrary counts and
 bytes must remain bounded and return either a catalog node or typed error.
 
@@ -105,3 +105,14 @@ is sufficient. Synthetic post-checkpoint root images use the existing Page v5
 CRC32C library and the exact selected WAL base. Each successful decode/open still
 runs the production scanner. Random mutations and artifacts stay in temporary
 corpus directories; only deterministic `round11-*` seeds are committed.
+
+
+Round 12 adds seven v9 owner-only pending payload seeds (including an explicit
+v8 rejection) and two recovery snapshots with whole and partial owner inventory.
+The partial fixture replaces a former meta with a new active-owner orphan using
+an otherwise unused durable WAL reservation. It models a post-consumption state,
+not production hole allocation. Successful recovery plus full ownership scan
+must agree with candidate owner/generation identities, sorted order and pending
+high-water. A lazy scan may still report typed dormant-page corruption after
+open; that is not counted as successful inventory validation. Round 11 seeds
+remain explicitly v8 with root-dependent records.

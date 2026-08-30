@@ -51,7 +51,36 @@ fuzz_target!(|data: &[u8]| {
         // HeapStorage::open invokes the crate-private recovery WAL decoder,
         // including its partial-final-record path, through a production API.
         if let Ok(mut storage) = HeapStorage::open(&database_path, table) {
-            let _ = storage.inspect_index_reclaim();
+            // Corrupt dormant pages can be rejected by the lazy full-file scan
+            // even when registry open succeeds. A successful scan must agree
+            // with candidate generation/owner classification, not merely open.
+            if let Ok(ownership) = storage.inspect_index_reclaim() {
+                let reuse = storage
+                    .inspect_reusable_pages()
+                    .expect("validated candidate scan");
+                assert_eq!(reuse.file_pages, ownership.database_pages);
+                assert_eq!(reuse.pending_owners, ownership.pending_reclaim_indexes);
+                assert!(
+                    reuse
+                        .candidates
+                        .windows(2)
+                        .all(|pair| pair[0].page_ref.page_id < pair[1].page_ref.page_id)
+                );
+                for candidate in reuse.candidates {
+                    assert!(candidate.page_ref.generation.0 > 0);
+                    assert!(candidate.retired_index_id < ownership.next_index_id);
+                    assert!(
+                        ownership
+                            .allocations
+                            .iter()
+                            .any(|page| page.page_ref == candidate.page_ref
+                                && page.owner == candidate.retired_index_id)
+                    );
+                }
+                for pending in ownership.pending {
+                    assert!(pending.index_id.0 > 0 && pending.index_id < ownership.next_index_id);
+                }
+            }
         }
     }
     cleanup(&database_path);

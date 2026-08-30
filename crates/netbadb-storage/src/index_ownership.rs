@@ -17,7 +17,7 @@ use crate::{PageType, StorageError};
 pub struct IndexReclaimReport {
     /// Exact identities of all generation-aware owned pages, including orphans.
     pub allocations: Vec<IndexPageAllocation>,
-    /// Pending roots retain explicit legacy versus generation-aware identity.
+    /// Pending records retain either owner-only v3 or explicit root identity.
     pub pending: Vec<netbadb_index::RetiredIndexOwnership>,
     pub catalog_pages: u64,
     pub database_pages: u64,
@@ -28,7 +28,10 @@ pub struct IndexReclaimReport {
     pub next_index_id: IndexId,
     pub owned_pages: u64,
     pub retired_owned_pages: u64,
+    /// Proven orphans of still root-dependent retirements only.
     pub retired_orphan_pages: u64,
+    /// Owner-only pages whose former reachability is no longer authoritative.
+    pub owner_only_pages: u64,
     pub active_orphan_pages: u64,
     /// Pure geometry; generation/buffer/WAL reuse is NOT authorized.
     pub retired_suffix_pages: u64,
@@ -47,7 +50,8 @@ pub struct IndexReclaimReport {
 pub struct IndexPageAllocation {
     pub owner: IndexId,
     pub page_ref: netbadb_types::PageRef,
-    pub reachable: bool,
+    /// None means owner-only retirement: historical reachability is unknown.
+    pub reachable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +72,34 @@ pub(super) struct BTreePageOwnership {
     pub reachable: bool,
 }
 
+/// Storage capability, not a page-kind tag or global free-list membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageReuseClass {
+    /// Retired registered BTree v3 allocations; never Heap/Catalog/raw pages.
+    GenerationSafeBTreeV3,
+}
+
+/// Validated old identity. Inspection is not an allocation or buffer claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusablePageInspection {
+    pub page_ref: netbadb_types::PageRef,
+    pub retired_index_id: IndexId,
+    pub class: PageReuseClass,
+}
+
+/// Unstable quiescent maintenance DTO. Production overwrite remains disabled
+/// until WAL identity transitions and single-hole buffer claims are proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageReuseInspection {
+    /// Lowest physical PageId first, including eligible tail pages.
+    pub candidates: Vec<ReusablePageInspection>,
+    pub file_pages: u64,
+    pub middle_candidates: u64,
+    pub pending_owners: u64,
+    pub blocked_legacy_indexes: u64,
+    pub blocked_active_orphans: u64,
+}
+
 impl HeapStorage {
     /// Reads and fully validates the managed file under checkpoint admission.
     /// No checkpoint, catalog rewrite, frame discard or physical reclaim occurs.
@@ -76,6 +108,52 @@ impl HeapStorage {
         self.buffer.ensure_unpinned()?;
         let catalog = self.read_index_catalog(self.index_catalog_root)?;
         Ok(self.index_page_inventory(&catalog)?.report)
+    }
+
+    /// Builds a disposable, fully validated candidate inventory without
+    /// checkpointing, reserving generations, or modifying persistent metadata.
+    /// No caller may treat this result as permission to overwrite a page.
+    pub fn inspect_reusable_pages(&mut self) -> Result<PageReuseInspection, StorageError> {
+        self.transactions.ensure_checkpoint_safe()?;
+        self.buffer.ensure_unpinned()?;
+        self.buffer.validated_page_count()?;
+        let catalog = self.read_index_catalog(self.index_catalog_root)?;
+        if catalog.reclaim_intent.is_some() {
+            return Err(IndexError::InvalidReclaimIntent.into());
+        }
+        let inventory = self.index_page_inventory(&catalog)?;
+        let candidates: Vec<_> = inventory
+            .report
+            .allocations
+            .iter()
+            .filter(|page| inventory.retired.contains(&page.page_ref.page_id))
+            .map(|page| ReusablePageInspection {
+                page_ref: page.page_ref,
+                retired_index_id: page.owner,
+                class: PageReuseClass::GenerationSafeBTreeV3,
+            })
+            .collect();
+        // The older geometric report includes retired v2 pages. Only this
+        // capability's candidates can form a reusable suffix; legacy tails are
+        // blockers, so generated pages below them remain middle holes.
+        let mut suffix_start = inventory.report.database_pages;
+        for candidate in candidates.iter().rev() {
+            if candidate.page_ref.page_id.0 != suffix_start - 1 {
+                break;
+            }
+            suffix_start -= 1;
+        }
+        Ok(PageReuseInspection {
+            middle_candidates: candidates
+                .iter()
+                .filter(|page| page.page_ref.page_id.0 < suffix_start)
+                .count() as u64,
+            candidates,
+            file_pages: inventory.report.database_pages,
+            pending_owners: inventory.report.pending_reclaim_indexes,
+            blocked_legacy_indexes: inventory.report.legacy_unreclaimable_indexes,
+            blocked_active_orphans: inventory.report.active_orphan_pages,
+        })
     }
 
     pub(super) fn index_page_inventory(
@@ -88,7 +166,13 @@ impl HeapStorage {
             &catalog.entries,
             &catalog.pending,
         )?;
-        let count = self.buffer.page_count();
+        let count = self.buffer.validated_page_count()?;
+        let owner_only: HashSet<_> = catalog
+            .pending
+            .iter()
+            .filter(|record| record.meta_page.is_none())
+            .map(|record| record.index_id)
+            .collect();
         let mut reserved = HashSet::from([PageId(0)]);
         let mut metadata = HashMap::<PageId, MetaNode>::new();
         let mut page_owners = HashMap::<
@@ -157,12 +241,15 @@ impl HeapStorage {
             );
         }
         for record in &catalog.pending {
+            let Some(reference) = record.meta_page else {
+                continue;
+            };
             roots.insert(
-                record.meta_page.page_id(),
+                reference.page_id(),
                 (
                     BTreeHandle {
                         owner: Some(record.index_id),
-                        meta_page: record.meta_page,
+                        meta_page: reference,
                     },
                     OwnershipClass::Retired,
                 ),
@@ -171,6 +258,9 @@ impl HeapStorage {
         for (id, meta) in &metadata {
             if !roots.contains_key(id) {
                 if let Some(owner) = meta.owner {
+                    if owner_only.contains(&owner) {
+                        continue;
+                    }
                     return Err(IndexError::UnknownIndexId(owner).into());
                 }
                 roots.insert(
@@ -186,7 +276,10 @@ impl HeapStorage {
             }
         }
         let mut reachable = HashMap::<PageId, (OwnershipClass, IndexSpec)>::new();
-        let mut classes = HashMap::<IndexId, OwnershipClass>::new();
+        let mut classes: HashMap<_, _> = owner_only
+            .iter()
+            .map(|owner| (*owner, OwnershipClass::Retired))
+            .collect();
         let mut legacy_retired = HashSet::new();
         // Deterministic order makes malformed overlap diagnostics reproducible.
         let mut ordered_roots: Vec<_> = roots.values().cloned().collect();
@@ -230,7 +323,14 @@ impl HeapStorage {
                     .get(&id)
                     .map_or(OwnershipClass::UnownedLegacy, |(class, _)| *class)
             };
-            if kind == PageType::BTreeMeta {
+            if owner.is_some_and(|owner| owner_only.contains(&owner)) {
+                if netbadb_index::btree_page_generation(payload)?.is_none() {
+                    return Err(IndexError::InvalidNodeType.into());
+                }
+                validate_owner_only_payload(id, kind, payload, owner, &page_owners)?;
+                // Outgoing dormant refs are not allocation ownership. Active
+                // and raw traversals above still reject incoming aliases.
+            } else if kind == PageType::BTreeMeta {
                 decode_meta(payload)?;
             } else if let Some(owner) = owner {
                 let root = owner_roots
@@ -295,7 +395,7 @@ impl HeapStorage {
                             page_id: page.page_id,
                             generation: page.generation?,
                         },
-                        reachable: page.reachable,
+                        reachable: (!owner_only.contains(&page.owner?)).then_some(page.reachable),
                     })
                 })
                 .collect(),
@@ -323,7 +423,7 @@ impl HeapStorage {
                 + catalog
                     .pending
                     .iter()
-                    .filter(|p| p.meta_page.generation().is_none())
+                    .filter(|p| !p.is_generation_safe())
                     .count() as u64,
             next_index_id: catalog.next_index_id,
             owned_pages: observations
@@ -334,8 +434,15 @@ impl HeapStorage {
             retired_orphan_pages: observations
                 .iter()
                 .filter(|page| {
-                    page.owner.is_some() && page.class == OwnershipClass::Retired && !page.reachable
+                    page.owner.is_some()
+                        && page.class == OwnershipClass::Retired
+                        && !page.reachable
+                        && !page.owner.is_some_and(|owner| owner_only.contains(&owner))
                 })
+                .count() as u64,
+            owner_only_pages: observations
+                .iter()
+                .filter(|page| page.owner.is_some_and(|owner| owner_only.contains(&owner)))
                 .count() as u64,
             active_orphan_pages: observations
                 .iter()
@@ -358,7 +465,10 @@ impl HeapStorage {
         };
         if observations
             .iter()
-            .filter(|page| page.kind == PageType::BTreeMeta)
+            .filter(|page| {
+                page.kind == PageType::BTreeMeta
+                    && !page.owner.is_some_and(|owner| owner_only.contains(&owner))
+            })
             .count()
             != roots.len()
         {
@@ -419,4 +529,88 @@ fn validate_node_payload(
         _ => return Err(IndexError::InvalidNodeType.into()),
     }
     Ok(())
+}
+
+/// A retired owner no longer has a canonical live tree spec. The homogeneous
+/// physical key representation is self-describing; decode the complete payload
+/// with each supported physical family. Nominal identity is not a free-page
+/// authority. Required and optional PageRefs still undergo intrinsic decoding,
+/// but historical outgoing edges may name allocations already consumed.
+fn validate_owner_only_payload(
+    page_id: PageId,
+    kind: PageType,
+    payload: &[u8],
+    owner: Option<IndexId>,
+    pages: &HashMap<
+        PageId,
+        (
+            PageType,
+            Option<IndexId>,
+            Option<netbadb_types::PageGeneration>,
+        ),
+    >,
+) -> Result<(), StorageError> {
+    let check_refs = |references: Vec<BTreePageRef>| -> Result<(), StorageError> {
+        let mut seen = HashSet::from([page_id]);
+        for reference in references {
+            if !seen.insert(reference.page_id()) {
+                return Err(IndexError::SharedTreePage(reference.page_id()).into());
+            }
+            if let Some((target_kind, target_owner, generation)) = pages.get(&reference.page_id()) {
+                if *generation == reference.generation() {
+                    netbadb_index::validate_btree_owner(owner, *target_owner)?;
+                    if *target_kind == PageType::BTreeMeta
+                        || (kind == PageType::BTreeLeaf && *target_kind != PageType::BTreeLeaf)
+                    {
+                        return Err(IndexError::InvalidNodeType.into());
+                    }
+                }
+            }
+            // Missing or non-BTree targets can be historical: a consumed page's
+            // new owner may later be tail-reclaimed, then EOF appended as Heap
+            // or Catalog. Dormant outgoing edges never claim those new pages.
+            // Live incoming aliases are rejected by the root traversals.
+        }
+        Ok(())
+    };
+    if kind == PageType::BTreeMeta {
+        return check_refs(vec![decode_meta(payload)?.root_page]);
+    }
+    let mut result = Err(IndexError::InvalidNodeType.into());
+    for physical in [
+        PhysicalType::Bool,
+        PhysicalType::Int64,
+        PhysicalType::UInt64,
+        PhysicalType::Text,
+    ] {
+        let spec = IndexSpec {
+            data_type: SemanticType::physical(physical),
+            nullable: true,
+        };
+        result = match kind {
+            PageType::BTreeLeaf => match decode_leaf_owned(&spec, payload, owner) {
+                Ok(node) => return check_refs(node.next_leaf.into_iter().collect()),
+                Err(error) => Err(error.into()),
+            },
+            PageType::BTreeInternal => match decode_internal_owned(&spec, payload, owner) {
+                Ok(node) => {
+                    return check_refs(
+                        std::iter::once(node.first_child)
+                            .chain(
+                                node.separators
+                                    .into_iter()
+                                    .map(|separator| separator.right_child),
+                            )
+                            .collect(),
+                    );
+                }
+                Err(error) => Err(error.into()),
+            },
+            _ => Err(IndexError::InvalidNodeType.into()),
+        };
+        if result.is_ok() {
+            break;
+        }
+    }
+    result
 }

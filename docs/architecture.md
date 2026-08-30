@@ -1786,16 +1786,16 @@ Round 11 may reclaim the complete tree when all its pages occupy the tail.
 ## Persistent index registry
 
 Heap metadata points to a fixed `IndexCatalog` root. Catalog pages are
-checksummed Page v5 single-payload pages containing version-8 `NBIC` payloads.
+checksummed Page v5 single-payload pages containing version-9 `NBIC` payloads.
 Versions 2 (unnamed), 3 (optional name) and 4 (explicit logical identity and
-retirement) and 5 (durable high-water) and 6 (owned pending roots) and 7 (generation-bearing handles) remain readable; v1 is rejected. Registration order is preserved.
+retirement) and 5 (durable high-water) and 6 (owned pending roots) and 7 (generation-bearing handles) and 8 (tail intent) remain readable; v1 is rejected. Registration order is preserved.
 The authoritative allocator high-water lives only in the root, never in Heap
 metadata or a cache reconstructed from surviving active entries.
 
 ```text
-v8 header (48 bytes, little endian)
+v9 header (48 bytes, little endian)
 0..4    NBIC magic
-4..6    u16 version (8; decoder also accepts 2, 3, 4, 5, 6, 7)
+4..6    u16 version (9; decoder also accepts 2, 3, 4, 5, 6, 7, 8)
 6       u8 table-statistics presence (0 or 1)
 7       u8 root state (0 continuation, 1 root without intent, 2 root with intent)
 8..16   u64 next catalog PageId (0 means none)
@@ -1805,7 +1805,7 @@ v8 header (48 bytes, little endian)
 32..40  u64 managed_page_count (zero when absent)
 40..48  u64 next_index_id (nonzero on root, zero on continuations)
 
-v7/v8 entry prefix (56 bytes, little endian; v4/v5/v6 use 48 bytes)
+v7/v8/v9 entry prefix (56 bytes, little endian; v4/v5/v6 use 48 bytes)
 0..4    u32 ColumnId
 4       u8 index-statistics presence (0 or 1)
 5       u8 logical-name presence (0 or 1)
@@ -1823,11 +1823,11 @@ v7/v8 entry prefix (56 bytes, little endian; v4/v5/v6 use 48 bytes)
 
 Following all entries: pending ownership count * 32 bytes
 0..8    u64 nonzero IndexId
-8..16   u64 nonzero BTree meta PageId
-16..24  u64 generation (nonzero for tag 1, zero for legacy)
-24      u8 reference tag (0 legacy, 1 generation-aware)
+8..16   u64 BTree meta PageId (nonzero for tags 0/1, zero for tag 2)
+16..24  u64 generation (nonzero for tag 1, zero for tags 0/2)
+24      u8 reference tag (0 legacy, 1 generated root, 2 owner-only v3)
 25..32  reserved zero
-Presence means Pending; legacy v2 pending roots remain unreclaimable.
+Presence means Pending; tag 2 is v9-only. Legacy v2 roots remain unreclaimable.
 V6 pending records are 16 bytes and decode to explicit legacy references.
 
 When root state = 2, following pending records: reclaim intent
@@ -1837,19 +1837,21 @@ When root state = 2, following pending records: reclaim intent
 24..28  u32 covered identity count (nonzero, bounded by payload)
 28..32  reserved zero
 32..    count * (u64 IndexId, u64 meta PageId, u64 PageGeneration)
-Covered IDs are strictly increasing; every generation is nonzero and below
-checkpoint base; every covered meta is in [M,N). Storage matches identities
+Covered IDs are strictly increasing. V9 owner-only records use (IndexId,0,0);
+root-dependent records require nonzero generation below checkpoint base and a
+meta in [M,N). V8 rejects zero identities. Storage additionally checks every
+remaining covered allocation precedes the checkpoint base, and matches identities
 against the entire retired catalog (full entries or minimal pending records).
 Unknown, active, legacy, duplicate or mismatching identities are rejected.
-V2-v7 reject state 2. V8 has no extension when state is 0 or 1.
+V2-v7 reject state 2. V8/v9 have no extension when state is 0 or 1.
 ```
 
 V2/v3/v4 headers require byte 7 and bytes 40..48 to be zero. Versions 2/3 have a
 40-byte entry prefix with bytes 36..40 zero; v2 also requires bytes 5..8 zero.
 Their IDs remain exactly their unique metadata PageIds. V4 IDs are decoded
 explicitly. Only a v2/v3/v4 root may infer `max(all active AND retired IDs) + 1`,
-because those formats never compacted. V5/v6/v7/v8 roots must supply a boundary greater
-than every active, retired or pending ID in the entire chain. Presence/zero mismatch, an absent v5/v6/v7/v8 root
+because those formats never compacted. V5/v6/v7/v8/v9 roots must supply a boundary greater
+than every active, retired or pending ID in the entire chain. Presence/zero mismatch, an absent v5/v6/v7/v8/v9 root
 boundary, or a boundary on a continuation is corrupt. `u64::MAX` is a valid
 exhausted next-ID boundary; CREATE returns typed IndexIdExhausted without
 allocating a tree, never wraps or issues that last value. Legacy MAX IDs also
@@ -1870,9 +1872,11 @@ explicit-ID representation no longer fits. New-page logging precedes link
 logging and WAL sync precedes allocation. Reverse undo restores links first.
 Explicit `compact_index_catalog` packs active entries/current snapshots in
 creation order, followed by minimal pending records in IndexId order, reusing
-the existing chain prefix. Owned full retirements become pending records; names,
-columns and statistics are no longer retained for those retirements. Repeated
-compaction preserves pending records and is byte-idempotent. Dense legacy
+the existing chain prefix. After a complete ownership proof, v3 full retirements
+and generated-root pending records become owner-only pending records. Legacy
+owned retirements retain roots; names, columns and statistics are discarded.
+Compaction removes owner-only records only when a complete scan finds zero owned
+pages. Other pending records are retained; repeated compaction is byte-idempotent. Dense legacy
 upgrades may need additional trailing catalog pages. All replacement images are
 preflighted and logged in one transaction, new allocations first and root last.
 Full-page recovery undo or redo resolves an interrupted rewrite; it does not rely
@@ -1884,9 +1888,14 @@ permanent physical abandonment. New v3 retired trees remain in durable pending
 inventory, including middle holes and merge orphans. Catalog compaction itself
 never truncates. `inspect_index_reclaim` uses checkpoint admission plus no pinned pages,
 fully decodes every managed Page and BTree payload, traverses authoritative
-active/retired/raw roots, and rejects duplicate/overlapping ownership and
-cross-owner links. It identifies root-unreachable v2/v3 pages by their validated
-owner; unreachable v1 pages remain explicitly unowned. Raw v1 trees cannot be
+active/root-dependent-retired/raw roots, and rejects duplicate/overlapping
+ownership and cross-owner live links. Owner-only retirements require full v3
+payload validation without root reachability. Historical outgoing PageRefs may
+be stale, but intrinsic structure, duplicate children and current-generation
+owner conflicts still fail. Live incoming aliases from active/raw trees fail;
+dormant outgoing links do not claim current Heap/catalog allocations. Their reachability is explicitly
+unknown, reported as `None` and `owner_only_pages`, not counted as proven orphans.
+Root-dependent v2/v3 orphans retain validated owners; v1 orphans remain unowned. Raw v1 trees cannot be
 distinguished from historically abandoned root-reachable v1 trees, so the admin
 report labels them unregistered legacy and never authorizes reclaim.
 
@@ -1936,11 +1945,17 @@ corruption. Finalization undo restores the intent after a loser/STEAL crash;
 winner redo completes record removal. Normal active registry load happens last.
 This is an abrupt-process-crash contract, not a power-loss claim.
 
-The whole-tree restriction includes unreachable owned orphans; a tree with any
-page below the suffix cannot be finalized. Middle-hole owners remain pending.
+The whole-owner restriction includes every remaining allocation, including
+orphans after a meta/root has disappeared; an owner with any page below the
+suffix cannot be finalized. Middle-hole owners remain pending.
 Active trees, Heap, raw/v1/v2, unknown/corrupt, and catalog pages cannot be crossed.
-See [Round 11](index-tail-reclaim-round11.md) and
-[the Round 10 generation proof](page-generation-round10.md).
+Round 12 adds `inspect_reusable_pages`: a disposable, ascending-PageId inventory
+with old PageRef, retired IndexId and `GenerationSafeBTreeV3` capability. This
+is not allocation permission. No second durable free catalog or production
+hole allocator exists: current WAL image validation forbids changed allocation
+identities, and redo/undo require a transition-aware protocol before overwrite.
+See [Round 12](page-reuse-round12.md), [Round 11](index-tail-reclaim-round11.md)
+and [the Round 10 generation proof](page-generation-round10.md).
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees never enter the active index registry from page scans. Only admin
@@ -2608,7 +2623,7 @@ planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
 contract, not a database-file format. The current independent persistent
 contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
 transaction-status v1, Page v5, WAL v4/record v3 plus v4 reservations, BTree
-v1/v2/v3, and IndexCatalog v8 (backward decode v2 through v7). Deployment manifest v4 is configuration, not a database format or canonical
+v1/v2/v3, and IndexCatalog v9 (backward decode v2 through v8). Deployment manifest v4 is configuration, not a database format or canonical
 schema identity.
 
 Rust applications choose either the default embedded SDK or the optional

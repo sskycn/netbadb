@@ -326,9 +326,10 @@ the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
-IndexCatalog payload v8 preserves the root-only `next_index_id`, active/retired
-definitions, and pending roots with explicit legacy or generation-aware handles.
-Versions 2 through 7 remain readable; v1 is rejected. New registered indexes use
+IndexCatalog payload v9 preserves the root-only `next_index_id`, active/retired
+definitions, and legacy/generation-aware pending roots. Validated v3 retirements
+compact into owner-only pending records; remaining pages do not require a live
+meta/root. Versions 2 through 8 remain readable; v1 is rejected. New registered indexes use
 BTree v3 with owner, allocation generation, and complete generation-bearing root,
 child, and leaf-next references. Existing v1/v2 trees remain read/write legacy;
 raw trees remain v1. No tree bytes are silently upgraded.
@@ -337,13 +338,13 @@ raw trees remain v1. No tree bytes are silently upgraded.
 Page generations come from synced WAL reservation records, survive rollback and
 checkpoint, and are checked before buffer access or recovery pageLSN comparison.
 Rollback/reappend of the same PageId and IndexId rejects old handles. Catalog
-compaction preserves full pending references and the independent IndexId boundary.
+compaction preserves retired ownership and the independent IndexId boundary.
 `Database::inspect_index_reclaim` reports validated allocation identities,
 reachability and orphans; normal Inspection JSON and wire protocols are unchanged.
 
 `Database::reclaim_retired_index_tail(TableId)` physically removes only the
-maximal file suffix consisting of complete retired registered BTree v3 trees.
-It validates ownership, checkpoints, scans again, commits a checksummed v8 root
+maximal file suffix containing all remaining pages of retired registered BTree v3 owners.
+It validates ownership, checkpoints, scans again, commits a checksummed v9 root
 intent, invalidates clean unpinned suffix frames, truncates/syncs, then atomically
 removes covered pending ownership and clears intent. Open finishes interrupted
 intent before resolving removed roots. Failures after logging starts require
@@ -352,9 +353,14 @@ rejected without allocating a catalog page. No candidate causes no WAL/catalog
 mutation or checkpoint.
 
 Later append can reuse the numeric PageId with a fresh PageGeneration; old v3
-handles fail. Middle holes, active-tree orphans, catalog/Heap pages, raw/legacy
-trees, free-lists and table DDL remain outside scope. See
-[Round 11's protocol, crash matrix and growth evidence](docs/index-tail-reclaim-round11.md),
+handles fail. `Database::inspect_reusable_pages(TableId)` reports validated
+retired-v3 candidates in ascending PageId order, including middle holes, without
+allocating or changing persistent metadata. Round 12 implements this P0 foundation;
+production middle-hole reuse remains disabled because WAL validation/recovery
+currently reject nonzero allocation-generation transitions. No free catalog is
+added. Heap, Catalog, raw/legacy and active-owner orphan reuse remain unsupported.
+See [Round 12's audit, owner-only format and safety gate](docs/page-reuse-round12.md),
+[Round 11's protocol and crash matrix](docs/index-tail-reclaim-round11.md),
 [the Round 10 generation proof](docs/page-generation-round10.md), and
 [the historical Round 9 ownership audit](docs/index-reclaim-round9.md).
 

@@ -15,7 +15,7 @@ use netbadb_types::{
 pub const BTREE_FORMAT_VERSION: u16 = 3;
 /// Additional bytes reserved on every owned BTree page.
 pub const BTREE_OWNER_SIZE: usize = 8;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 8;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 9;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -126,7 +126,7 @@ pub struct IndexCatalogEntry {
 
 /// One page in the persistent registration chain, with WAL-backed retirement.
 ///
-/// The version-8 `NBIC` payload uses a fixed-width little-endian header and
+/// The version-9 `NBIC` payload uses a fixed-width little-endian header and
 /// entry prefixes plus bounded optional names. Storage validates chain rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
@@ -156,12 +156,23 @@ impl IndexCatalogNode {
 }
 
 /// An owned tree pending physical reclamation. Legacy refs remain unreclaimable.
-/// Presence means Pending; no names,
-/// columns or statistics survive catalog compaction. Both IDs are nonzero.
+/// Presence means Pending; no names, columns or statistics survive compaction.
+/// IndexId is nonzero and is never reused after committed retirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetiredIndexOwnership {
     pub index_id: IndexId,
-    pub meta_page: BTreePageRef,
+    /// None is an owner-only v3 retirement. Some retains a legacy or pre-v9
+    /// root-dependent identity until validated catalog compaction converts it.
+    pub meta_page: Option<BTreePageRef>,
+}
+
+impl RetiredIndexOwnership {
+    /// Only owner-only v3 retirements and explicit generated roots qualify.
+    #[must_use]
+    pub fn is_generation_safe(self) -> bool {
+        self.meta_page
+            .is_none_or(|page| page.generation().is_some())
+    }
 }
 
 /// A validated whole-tree suffix decision, persisted before file truncation.
@@ -195,9 +206,11 @@ impl TailReclaimIntent {
             return Err(IndexError::InvalidReclaimIntent);
         }
         for record in &self.covered {
-            let page = record.meta_page.page_id().0;
-            let generation = record
-                .meta_page
+            let Some(reference) = record.meta_page else {
+                continue;
+            };
+            let page = reference.page_id().0;
+            let generation = reference
                 .generation()
                 .ok_or(IndexError::InvalidReclaimIntent)?;
             validate_generation(generation)?;
@@ -1268,15 +1281,23 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     }
     for pending in &node.pending {
         output.extend_from_slice(&pending.index_id.0.to_le_bytes());
-        output.extend_from_slice(&pending.meta_page.page_id().0.to_le_bytes());
         output.extend_from_slice(
             &pending
                 .meta_page
-                .generation()
+                .map_or(0, |page| page.page_id().0)
+                .to_le_bytes(),
+        );
+        output.extend_from_slice(
+            &pending
+                .meta_page
+                .and_then(BTreePageRef::generation)
                 .map_or(0, |g| g.0)
                 .to_le_bytes(),
         );
-        output.push(u8::from(pending.meta_page.generation().is_some()));
+        output.push(match pending.meta_page {
+            None => 2,
+            Some(page) => u8::from(page.generation().is_some()),
+        });
         output.extend_from_slice(&[0; 7]);
     }
     if let Some(intent) = &node.reclaim_intent {
@@ -1291,13 +1312,17 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         output.extend_from_slice(&[0; 4]);
         for record in &intent.covered {
             output.extend_from_slice(&record.index_id.0.to_le_bytes());
-            output.extend_from_slice(&record.meta_page.page_id().0.to_le_bytes());
             output.extend_from_slice(
                 &record
                     .meta_page
-                    .generation()
-                    .ok_or(IndexError::InvalidReclaimIntent)?
-                    .0
+                    .map_or(0, |page| page.page_id().0)
+                    .to_le_bytes(),
+            );
+            output.extend_from_slice(
+                &record
+                    .meta_page
+                    .and_then(BTreePageRef::generation)
+                    .map_or(0, |generation| generation.0)
                     .to_le_bytes(),
             );
         }
@@ -1305,7 +1330,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     Ok(output)
 }
 
-/// Decodes legacy version-2 through version-7 or current version-8 index catalog payloads.
+/// Decodes legacy version-2 through version-8 or current version-9 index catalog payloads.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -1319,7 +1344,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
     let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
     if !matches!(
         version,
-        2 | 3 | 4 | 5 | 6 | 7 | INDEX_CATALOG_FORMAT_VERSION
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | INDEX_CATALOG_FORMAT_VERSION
     ) {
         return Err(IndexError::UnsupportedVersion(version));
     }
@@ -1547,34 +1572,34 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
     let mut pending = Vec::with_capacity(pending_count);
     for _ in 0..pending_count {
         let mut decoder = Decoder::new(&input[offset..offset + pending_size]);
+        let index_id = IndexId(decoder.u64()?);
+        let page_id = PageId(decoder.u64()?);
+        let raw = if version >= 7 { decoder.u64()? } else { 0 };
+        let tag = if version >= 7 {
+            let tag = decoder.u8()?;
+            if decoder.array::<7>()? != [0; 7] {
+                return Err(IndexError::InvalidReservedBytes);
+            }
+            tag
+        } else {
+            0
+        };
+        let meta_page = match tag {
+            0 if raw == 0 => Some(BTreePageRef::Legacy(page_id)),
+            1 => {
+                let generation = PageGeneration(raw);
+                validate_generation(generation)?;
+                Some(BTreePageRef::Allocated(PageRef {
+                    page_id,
+                    generation,
+                }))
+            }
+            2 if version >= 9 && page_id.0 == 0 && raw == 0 => None,
+            _ => return Err(IndexError::InvalidReservedBytes),
+        };
         pending.push(RetiredIndexOwnership {
-            index_id: IndexId(decoder.u64()?),
-            meta_page: {
-                let page_id = PageId(decoder.u64()?);
-                let raw = if version >= 7 { decoder.u64()? } else { 0 };
-                let generated = if version >= 7 {
-                    let tag = decoder.u8()?;
-                    if decoder.array::<7>()? != [0; 7] || tag > 1 {
-                        return Err(IndexError::InvalidReservedBytes);
-                    }
-                    tag == 1
-                } else {
-                    false
-                };
-                if generated {
-                    let generation = PageGeneration(raw);
-                    validate_generation(generation)?;
-                    BTreePageRef::Allocated(PageRef {
-                        page_id,
-                        generation,
-                    })
-                } else {
-                    if raw != 0 {
-                        return Err(IndexError::InvalidReservedBytes);
-                    }
-                    BTreePageRef::Legacy(page_id)
-                }
-            },
+            index_id,
+            meta_page,
         });
         offset += pending_size;
     }
@@ -1593,12 +1618,20 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         }
         let mut covered = Vec::with_capacity(count);
         for _ in 0..count {
+            let index_id = IndexId(decoder.u64()?);
+            let page_id = PageId(decoder.u64()?);
+            let generation = PageGeneration(decoder.u64()?);
+            let meta_page = if version >= 9 && page_id.0 == 0 && generation.0 == 0 {
+                None
+            } else {
+                Some(BTreePageRef::Allocated(PageRef {
+                    page_id,
+                    generation,
+                }))
+            };
             covered.push(RetiredIndexOwnership {
-                index_id: IndexId(decoder.u64()?),
-                meta_page: BTreePageRef::Allocated(PageRef {
-                    page_id: PageId(decoder.u64()?),
-                    generation: PageGeneration(decoder.u64()?),
-                }),
+                index_id,
+                meta_page,
             });
         }
         offset += 32 + count * 24;
@@ -1645,7 +1678,7 @@ fn validate_local_reclaim_intent(node: &IndexCatalogNode) -> Result<(), IndexErr
             {
                 if !entry.retired
                     || entry.definition.handle.owner != Some(record.index_id)
-                    || entry.definition.handle.meta_page != record.meta_page
+                    || Some(entry.definition.handle.meta_page) != record.meta_page
                 {
                     return Err(IndexError::InvalidReclaimIntent);
                 }
@@ -1689,7 +1722,9 @@ pub fn validate_pending_ownership(
         if record.index_id.0 == 0 {
             return Err(IndexError::InvalidIndexId(record.index_id));
         }
-        validate_child(record.meta_page)?;
+        if let Some(page) = record.meta_page {
+            validate_child(page)?;
+        }
         if let Some(next) = next {
             if record.index_id.0 >= next.0 {
                 return Err(IndexError::InvalidIndexHighWater(next));
@@ -1704,14 +1739,18 @@ pub fn validate_pending_ownership(
         {
             return Err(IndexError::DuplicateIndexId(record.index_id));
         }
-        if entries
-            .iter()
-            .any(|entry| entry.definition.handle.meta_page.page_id() == record.meta_page.page_id())
-            || pending[..position]
+        if let Some(page) = record.meta_page {
+            if entries
                 .iter()
-                .any(|other| other.meta_page.page_id() == record.meta_page.page_id())
-        {
-            return Err(IndexError::DuplicateTreeHandle(record.meta_page.page_id()));
+                .any(|entry| entry.definition.handle.meta_page.page_id() == page.page_id())
+                || pending[..position].iter().any(|other| {
+                    other
+                        .meta_page
+                        .is_some_and(|other| other.page_id() == page.page_id())
+                })
+            {
+                return Err(IndexError::DuplicateTreeHandle(page.page_id()));
+            }
         }
     }
     Ok(())
@@ -2670,7 +2709,7 @@ mod tests {
         let named_bytes = encode_index_catalog(&named).unwrap();
         let named_golden = [
             b"NBIC".as_slice(),
-            &[8, 0, 1, 1],
+            &[9, 0, 1, 1],
             &[9, 0, 0, 0, 0, 0, 0, 0],
             &[1, 0, 0, 0],
             &[0, 0, 0, 0],
@@ -3169,7 +3208,7 @@ mod ownership_tests {
     fn v6_pending_records_are_minimal_bounded_and_disjoint() {
         let record = RetiredIndexOwnership {
             index_id: IndexId(17),
-            meta_page: crate::BTreePageRef::Legacy(PageId(99)),
+            meta_page: Some(crate::BTreePageRef::Legacy(PageId(99))),
         };
         let mut node = IndexCatalogNode::empty();
         node.next_index_id = Some(IndexId(18));
@@ -3202,7 +3241,9 @@ mod ownership_tests {
         node.pending[1].index_id = IndexId(16);
         assert_eq!(
             encode_index_catalog(&node),
-            Err(IndexError::DuplicateTreeHandle(record.meta_page.page_id()))
+            Err(IndexError::DuplicateTreeHandle(
+                record.meta_page.unwrap().page_id()
+            ))
         );
         node.pending.pop();
         node.next_index_id = Some(IndexId(17));
@@ -3331,7 +3372,7 @@ mod generation_tests {
         });
         node.pending.push(RetiredIndexOwnership {
             index_id: IndexId(2),
-            meta_page: reference(10, 102),
+            meta_page: Some(reference(10, 102)),
         });
         let bytes = encode_index_catalog(&node).unwrap();
         assert_eq!(bytes.len(), 48 + 56 + 32);
@@ -3360,7 +3401,7 @@ mod generation_tests {
         );
         assert_eq!(
             decoded.pending[0].meta_page,
-            BTreePageRef::Legacy(PageId(10))
+            Some(BTreePageRef::Legacy(PageId(10)))
         );
         assert_eq!(
             decode_index_catalog(&encode_index_catalog(&decoded).unwrap()).unwrap(),
@@ -3380,7 +3421,7 @@ mod generation_tests {
         ));
         node.entries.pop();
         // Same physical slot is an alias even with a different expected generation.
-        node.pending[0].meta_page = reference(9, 999);
+        node.pending[0].meta_page = Some(reference(9, 999));
         assert!(matches!(
             encode_index_catalog(&node),
             Err(IndexError::DuplicateTreeHandle(PageId(9)))
@@ -3395,10 +3436,10 @@ mod tail_intent_tests {
     fn node() -> IndexCatalogNode {
         let record = RetiredIndexOwnership {
             index_id: IndexId(1),
-            meta_page: BTreePageRef::Allocated(PageRef {
+            meta_page: Some(BTreePageRef::Allocated(PageRef {
                 page_id: PageId(3),
                 generation: PageGeneration(7),
-            }),
+            })),
         };
         IndexCatalogNode {
             next_index_id: Some(IndexId(2)),
@@ -3456,7 +3497,7 @@ mod tail_intent_tests {
             .push(node.pending[0]);
         assert!(encode_index_catalog(&duplicate).is_err());
         let mut legacy = node.clone();
-        legacy.pending[0].meta_page = BTreePageRef::Legacy(PageId(3));
+        legacy.pending[0].meta_page = Some(BTreePageRef::Legacy(PageId(3)));
         assert!(encode_index_catalog(&legacy).is_err());
         let mut active = node.clone();
         active.pending.clear();
@@ -3469,7 +3510,7 @@ mod tail_intent_tests {
                 column_id: ColumnId(1),
                 handle: BTreeHandle {
                     owner: Some(IndexId(1)),
-                    meta_page: node.pending[0].meta_page,
+                    meta_page: node.pending[0].meta_page.unwrap(),
                 },
             },
         });
@@ -3477,10 +3518,10 @@ mod tail_intent_tests {
         active.entries[0].retired = true;
         assert!(encode_index_catalog(&active).is_ok());
         active.reclaim_intent.as_mut().unwrap().covered[0].meta_page =
-            BTreePageRef::Allocated(PageRef {
+            Some(BTreePageRef::Allocated(PageRef {
                 page_id: PageId(3),
                 generation: PageGeneration(8),
-            });
+            }));
         assert!(encode_index_catalog(&active).is_err());
     }
 
@@ -3510,5 +3551,99 @@ mod tail_intent_tests {
             decode_index_catalog(&bytes),
             Err(IndexError::UnsupportedVersion(1))
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_only_tests {
+    use super::*;
+
+    #[test]
+    fn v9_owner_only_pending_has_one_authority_and_bounded_encoding() {
+        let mut node = IndexCatalogNode::empty();
+        node.next_index_id = Some(IndexId(3));
+        node.pending = vec![
+            RetiredIndexOwnership {
+                index_id: IndexId(1),
+                meta_page: None,
+            },
+            RetiredIndexOwnership {
+                index_id: IndexId(2),
+                meta_page: None,
+            },
+        ];
+        let bytes = encode_index_catalog(&node).unwrap();
+        assert_eq!(bytes.len(), 48 + 2 * 32);
+        assert_eq!(&bytes[4..6], &9_u16.to_le_bytes());
+        assert_eq!(bytes[72], 2);
+        assert!(bytes[56..72].iter().all(|byte| *byte == 0));
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        for end in 0..bytes.len() {
+            assert!(decode_index_catalog(&bytes[..end]).is_err());
+        }
+        for offset in [56, 64, 73] {
+            let mut bad = bytes.clone();
+            bad[offset] = 1;
+            assert!(decode_index_catalog(&bad).is_err());
+        }
+        for tag in [0, 1, 3, 255] {
+            let mut bad = bytes.clone();
+            bad[72] = tag;
+            assert!(decode_index_catalog(&bad).is_err());
+        }
+        for version in [7_u16, 8] {
+            let mut bad = bytes.clone();
+            bad[4..6].copy_from_slice(&version.to_le_bytes());
+            assert!(decode_index_catalog(&bad).is_err());
+        }
+        node.pending[1].index_id = IndexId(1);
+        assert!(matches!(
+            encode_index_catalog(&node),
+            Err(IndexError::DuplicateIndexId(IndexId(1)))
+        ));
+        node.pending.pop();
+        node.next_index_id = Some(IndexId(1));
+        assert!(matches!(
+            encode_index_catalog(&node),
+            Err(IndexError::InvalidIndexHighWater(IndexId(1)))
+        ));
+    }
+
+    #[test]
+    fn v9_owner_only_tail_intent_and_v8_exact_root_intent_remain_distinct() {
+        let record = RetiredIndexOwnership {
+            index_id: IndexId(1),
+            meta_page: None,
+        };
+        let mut node = IndexCatalogNode::empty();
+        node.next_index_id = Some(IndexId(2));
+        node.pending.push(record);
+        node.reclaim_intent = Some(TailReclaimIntent {
+            old_page_count: 7,
+            truncate_from: 6,
+            checkpoint_lsn: netbadb_types::Lsn(100),
+            covered: vec![record],
+        });
+        let bytes = encode_index_catalog(&node).unwrap();
+        assert_eq!(bytes.len(), 136);
+        assert!(bytes[120..136].iter().all(|byte| *byte == 0));
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        for offset in [120, 128] {
+            let mut bad = bytes.clone();
+            bad[offset] = 1;
+            assert!(decode_index_catalog(&bad).is_err());
+        }
+        let root = BTreePageRef::Allocated(PageRef {
+            page_id: PageId(6),
+            generation: PageGeneration(50),
+        });
+        node.pending[0].meta_page = Some(root);
+        node.reclaim_intent.as_mut().unwrap().covered[0].meta_page = Some(root);
+        let mut old = encode_index_catalog(&node).unwrap();
+        old[4..6].copy_from_slice(&8_u16.to_le_bytes());
+        assert_eq!(decode_index_catalog(&old).unwrap(), node);
+        let mut forbidden = old;
+        forbidden[120..136].fill(0);
+        assert!(decode_index_catalog(&forbidden).is_err());
     }
 }

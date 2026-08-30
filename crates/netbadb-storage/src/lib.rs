@@ -19,7 +19,8 @@ pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IndexMaintenanceReport,
-    IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport, PresenceCountSummary,
+    IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport, PageReuseClass,
+    PageReuseInspection, PresenceCountSummary, ReusablePageInspection,
 };
 pub(crate) use lsm::LsmRowHandle;
 pub use lsm::{
