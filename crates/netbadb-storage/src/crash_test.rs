@@ -14,6 +14,17 @@ pub(crate) const EXIT_CODE: i32 = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCrashPoint {
+    TailAfterCheckpoint,
+    TailIntentAfterLogs,
+    TailIntentDurable,
+    TailAfterInvalidation,
+    TailAfterSetLen,
+    TailAfterFileSync,
+    TailFinalizeAfterLogs,
+    TailFinalizeAfterPagePublish,
+    TailFinalizeDurable,
+    TailAfterCompletion,
+
     PageGenerationReserved,
     RollbackAfterTrailingRemoval,
     GenerationReuseBeforeCommit,
@@ -61,6 +72,17 @@ pub(crate) enum TestCrashPoint {
 impl TestCrashPoint {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::TailAfterCheckpoint => "TailAfterCheckpoint",
+            Self::TailIntentAfterLogs => "TailIntentAfterLogs",
+            Self::TailIntentDurable => "TailIntentDurable",
+            Self::TailAfterInvalidation => "TailAfterInvalidation",
+            Self::TailAfterSetLen => "TailAfterSetLen",
+            Self::TailAfterFileSync => "TailAfterFileSync",
+            Self::TailFinalizeAfterPagePublish => "TailFinalizeAfterPagePublish",
+            Self::TailFinalizeAfterLogs => "TailFinalizeAfterLogs",
+            Self::TailFinalizeDurable => "TailFinalizeDurable",
+            Self::TailAfterCompletion => "TailAfterCompletion",
+
             Self::RollbackAfterTrailingRemoval => "rollback-after-trailing-removal",
             Self::GenerationReuseBeforeCommit => "generation-reuse-before-commit",
             Self::GenerationReuseAfterFlush => "generation-reuse-after-flush",

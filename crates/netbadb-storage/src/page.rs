@@ -892,6 +892,36 @@ impl PageManager {
         Ok(page)
     }
 
+    /// Authoritative file geometry, rejecting partial/out-of-band changes.
+    pub(crate) fn validated_page_count(&self) -> Result<u64, StorageError> {
+        let length = self.file.metadata()?.len();
+        if length % PAGE_SIZE as u64 != 0 || length / PAGE_SIZE as u64 != self.page_count {
+            return Err(invalid_format(
+                "file length disagrees with managed page count",
+            ));
+        }
+        Ok(self.page_count)
+    }
+
+    /// Retired-tree maintenance only: protect the header, catalog root and first
+    /// Heap page. Caller proves ownership and invalidates the exact buffer suffix.
+    /// On sync failure the new length remains installed; callers must retry sync
+    /// or reopen, never restore the old allocation boundary.
+    pub(crate) fn truncate_to_page_count(
+        &mut self,
+        expected_old: u64,
+        new: u64,
+    ) -> Result<(), StorageError> {
+        if self.validated_page_count()? != expected_old || new < 3 || new >= expected_old {
+            return Err(invalid_format("invalid expected tail truncation geometry"));
+        }
+        self.file.set_len(self.page_offset(PageId(new))?)?;
+        self.page_count = new;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::TailAfterSetLen);
+        self.sync()
+    }
+
     pub(crate) fn remove_trailing_page(&mut self, id: PageId) -> Result<bool, StorageError> {
         if id.0 == self.page_count {
             // `allocate_page` may have extended the file partially before an
@@ -1619,5 +1649,40 @@ mod tests {
 
         assert!(PageManager::open(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    #[test]
+    fn tail_truncate_exact_length_sync_reopen_and_append() {
+        let path =
+            std::env::temp_dir().join(format!("netbadb-round11-page-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut disk = PageManager::create(&path).unwrap();
+        for _ in 1..6 {
+            disk.allocate_page().unwrap();
+        }
+        disk.sync().unwrap();
+        for (old, new) in [(5, 3), (6, 2), (6, 6), (6, 7)] {
+            assert!(disk.truncate_to_page_count(old, new).is_err());
+            assert_eq!(disk.validated_page_count().unwrap(), 6);
+        }
+        disk.inject_sync_failure();
+        assert!(disk.truncate_to_page_count(6, 3).is_err());
+        assert_eq!(disk.validated_page_count().unwrap(), 3);
+        disk.sync().unwrap();
+        drop(disk);
+        let mut disk = PageManager::open(&path).unwrap();
+        assert_eq!(disk.allocate_page().unwrap().id, PageId(3));
+        disk.sync().unwrap();
+        // Out-of-band growth cannot be mistaken for the expected old count.
+        disk.file.set_len(5 * PAGE_SIZE as u64).unwrap();
+        assert!(disk.truncate_to_page_count(4, 3).is_err());
+        assert_eq!(disk.file.metadata().unwrap().len(), 5 * PAGE_SIZE as u64);
+        drop(disk);
+        std::fs::remove_file(path).unwrap();
     }
 }

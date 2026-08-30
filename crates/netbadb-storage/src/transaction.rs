@@ -679,6 +679,9 @@ impl Drop for Transaction {
 
 #[derive(Debug)]
 pub(crate) struct TransactionManager {
+    /// Maintenance has an unresolved physical allocation decision. Unlike an
+    /// ordinary dropped writer, it rejects even read-only BEGIN until reopen.
+    maintenance_pending: bool,
     wal: SharedWal,
     buffer: BufferPool,
     next_txn_id: TxnId,
@@ -697,6 +700,7 @@ impl TransactionManager {
             return Err(TransactionError::IdExhausted.into());
         }
         Ok(Self {
+            maintenance_pending: false,
             wal,
             buffer,
             next_txn_id,
@@ -716,6 +720,9 @@ impl TransactionManager {
         &mut self,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, StorageError> {
+        if self.maintenance_pending {
+            return Err(TransactionError::RecoveryRequired.into());
+        }
         let id = self.next_txn_id;
         let next = id.0.checked_add(1).ok_or(TransactionError::IdExhausted)?;
         let outstanding = self
@@ -763,6 +770,13 @@ impl TransactionManager {
 
     pub(crate) fn next_txn_id(&self) -> TxnId {
         self.next_txn_id
+    }
+
+    /// A failed maintenance decision may already be durable. Only startup
+    /// recovery can resolve it; do not admit ordinary writes or another checkpoint.
+    pub(crate) fn require_maintenance_recovery(&mut self) {
+        self.maintenance_pending = true;
+        self.runtime.writer.set(WriterState::RecoveryRequired);
     }
 
     pub(crate) fn ensure_checkpoint_safe(&self) -> Result<(), crate::CheckpointError> {

@@ -19,7 +19,7 @@ pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub use heap::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IndexMaintenanceReport,
-    IndexPageAllocation, IndexReclaimReport, PresenceCountSummary,
+    IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport, PresenceCountSummary,
 };
 pub(crate) use lsm::LsmRowHandle;
 pub use lsm::{
@@ -249,6 +249,9 @@ impl Error for PageError {}
 /// Errors raised by the in-memory buffer pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferError {
+    PageDirty {
+        page_id: PageId,
+    },
     InvalidCapacity,
     Exhausted {
         capacity: usize,
@@ -271,6 +274,11 @@ pub enum BufferError {
 impl fmt::Display for BufferError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PageDirty { page_id } => write!(
+                formatter,
+                "page {} is dirty during suffix invalidation",
+                page_id.0
+            ),
             Self::InvalidCapacity => formatter.write_str("buffer pool capacity must be non-zero"),
             Self::Exhausted { capacity } => write!(
                 formatter,

@@ -29,7 +29,10 @@ use crate::{PreparedTransaction, PreparedTxnResolution};
 
 #[path = "index_ownership.rs"]
 mod ownership;
+#[path = "index_tail_reclaim.rs"]
+mod tail_reclaim;
 pub use ownership::{IndexPageAllocation, IndexReclaimReport};
+pub use tail_reclaim::IndexTailReclaimReport;
 
 const HEADER_PAGE: PageId = PageId(0);
 const FIRST_MANAGED_PAGE: PageId = PageId(1);
@@ -78,6 +81,8 @@ pub struct HeapStorage {
     fail_analyze_after_catalog_updates: Option<usize>,
     #[cfg(test)]
     fail_index_compaction_after_logs: Option<usize>,
+    #[cfg(test)]
+    fail_tail: Option<&'static str>,
 }
 
 /// Result of explicit catalog maintenance, not an Inspection JSON or SQL result.
@@ -112,6 +117,7 @@ struct IndexPageInventory {
 }
 
 struct CatalogSnapshot {
+    reclaim_intent: Option<netbadb_index::TailReclaimIntent>,
     pending: Vec<RetiredIndexOwnership>,
     table_statistics: Option<TableStatistics>,
     entries: Vec<IndexCatalogEntry>,
@@ -358,6 +364,8 @@ impl HeapStorage {
             fail_analyze_after_catalog_updates: None,
             #[cfg(test)]
             fail_index_compaction_after_logs: None,
+            #[cfg(test)]
+            fail_tail: None,
         })
     }
 
@@ -509,7 +517,10 @@ impl HeapStorage {
             fail_analyze_after_catalog_updates: None,
             #[cfg(test)]
             fail_index_compaction_after_logs: None,
+            #[cfg(test)]
+            fail_tail: None,
         };
+        storage.recover_tail_intent()?;
         let (table_statistics, entries) = storage.load_index_registry(catalog_root)?;
         storage.table_statistics = table_statistics;
         storage.indexes = entries
@@ -1001,6 +1012,7 @@ impl HeapStorage {
         let mut next_index_id = None;
         let mut current_format = true;
         let mut pending = Vec::new();
+        let mut reclaim_intent = None;
         loop {
             if !visited.insert(page_id) || visited.len() as u64 > page_count {
                 return Err(IndexError::CatalogCycle { page_id }.into());
@@ -1017,11 +1029,14 @@ impl HeapStorage {
             pages.push(page_id);
             drop(page);
             if root {
+                reclaim_intent = node.reclaim_intent;
                 table_statistics = node.table_statistics;
                 next_index_id = node.next_index_id;
                 if version >= 5 && next_index_id.is_none() {
                     return Err(IndexError::InvalidIndexHighWater(IndexId(0)).into());
                 }
+            } else if node.reclaim_intent.is_some() {
+                return Err(IndexError::InvalidReclaimIntent.into());
             } else if node.next_index_id.is_some() {
                 return Err(crate::invalid_format(
                     "index high-water on continuation page",
@@ -1030,13 +1045,27 @@ impl HeapStorage {
                 return Err(IndexError::TableStatisticsOnContinuation { page_id }.into());
             }
             for record in node.pending {
-                if record.meta_page.page_id().0 >= page_count {
+                if record.meta_page.page_id().0 >= page_count
+                    && !reclaim_intent.as_ref().is_some_and(
+                        |intent: &netbadb_index::TailReclaimIntent| {
+                            intent.covered.contains(&record)
+                        },
+                    )
+                {
                     return Err(IndexError::InvalidChild(record.meta_page.page_id()).into());
                 }
                 pending.push(record);
             }
             for entry in node.entries {
-                if entry.definition.handle.meta_page.page_id().0 >= page_count {
+                if entry.definition.handle.meta_page.page_id().0 >= page_count
+                    && !(entry.retired
+                        && reclaim_intent.as_ref().is_some_and(|intent| {
+                            intent.covered.contains(&RetiredIndexOwnership {
+                                index_id: entry.definition.id,
+                                meta_page: entry.definition.handle.meta_page,
+                            })
+                        }))
+                {
                     return Err(IndexError::InvalidChild(
                         entry.definition.handle.meta_page.page_id(),
                     )
@@ -1074,14 +1103,19 @@ impl HeapStorage {
             ),
         };
         validate_pending_ownership(Some(next_index_id), &entries, &pending)?;
-        Ok(CatalogSnapshot {
+        let snapshot = CatalogSnapshot {
+            reclaim_intent,
             pending,
             table_statistics,
             entries,
             next_index_id,
             pages,
             current_format,
-        })
+        };
+        if let Some(intent) = &snapshot.reclaim_intent {
+            self.validate_tail_intent_catalog(intent, &snapshot)?;
+        }
+        Ok(snapshot)
     }
 
     fn append_index_definition(
@@ -1144,6 +1178,7 @@ impl HeapStorage {
             }
             let capacity = self.index_catalog_payload_capacity();
             let mut overflow = IndexCatalogNode {
+                reclaim_intent: None,
                 pending: Vec::new(),
                 next_index_id: None,
                 next_catalog: node.next_catalog,
@@ -1222,6 +1257,7 @@ impl HeapStorage {
         let inventory = self.index_page_inventory(&catalog)?;
         let file_pages_before = self.buffer.page_count();
         let mut nodes = vec![IndexCatalogNode {
+            reclaim_intent: None,
             pending: Vec::new(),
             next_index_id: Some(catalog.next_index_id),
             next_catalog: None,
@@ -1235,6 +1271,7 @@ impl HeapStorage {
             if encode_index_catalog(node)?.len() > capacity {
                 let entry = node.entries.pop().ok_or(IndexError::LengthOverflow)?;
                 let continuation = IndexCatalogNode {
+                    reclaim_intent: None,
                     pending: Vec::new(),
                     next_index_id: None,
                     next_catalog: None,
@@ -1267,6 +1304,7 @@ impl HeapStorage {
             if encode_index_catalog(node)?.len() > capacity {
                 node.pending.pop();
                 let continuation = IndexCatalogNode {
+                    reclaim_intent: None,
                     pending: vec![*record],
                     next_index_id: None,
                     next_catalog: None,
@@ -8334,6 +8372,7 @@ mod tests {
                 let mut storage = HeapStorage::open(path, table()).expect("open child heap");
                 let _transaction = storage.begin_transaction().expect("append partial Begin");
             }
+            "tail-reclaim" | "tail-reappend" => maintenance::tail_crash_child(case, path),
             "page-generation-reserve" | "page-generation-reuse" | "page-generation-rollback" => {
                 maintenance::generation_crash_child(case, path)
             }
@@ -9303,5 +9342,6 @@ mod tests {
         include!("index_maintenance_tests.rs");
         include!("index_reclaim_tests.rs");
         include!("page_generation_tests.rs");
+        include!("index_tail_reclaim_tests.rs");
     }
 }

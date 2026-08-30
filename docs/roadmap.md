@@ -563,10 +563,31 @@ PostgreSQL-only metadata absent from NetbaDB remain unsupported.
   references. Raw v1 trees and Heap/RowId allocation reuse remain outside scope.
 - No physical reclaim, tail reclamation, free-list or table DDL is added.
 
-Next: checkpoint-gated **owned retired BTree suffix** reclamation only, with
-explicit crash-safe truncation/publication ordering and buffer admission. Catalog
-or Heap suffix members must exclude a candidate; do not generalize to free-list
-reuse. See [Round 10](page-generation-round10.md).
+### Storage Lifecycle Round 11 — checkpoint-gated retired tail reclamation
+
+- Core-first API selects the maximal suffix made of whole retired BTree v3 trees,
+  including owned orphans. Middle-hole ownership stays pending.
+- Shared quiescent admission, internal checkpoint and authoritative rescan precede
+  a checksummed IndexCatalog v8 root intent (backward decode v2-v7).
+- Clean/unpinned range invalidation, expected-count truncate and file sync precede
+  transactional covered-record removal and intent clear. Open accepts only the
+  exact old/new lengths and resolves interrupted intent before loading roots.
+- Logging failures require reopen; normal mutations/checkpoint/catalog compaction
+  are blocked. Root capacity is bounded; intent never adds pages into its target.
+- Actual PageId reuse with fresh generation, stale-reference rejection, winner
+  redo/loser undo, process-crash boundaries and whole-tree orphan tests are covered.
+- Tail-friendly 100-cycle stress: initial/final 3 pages, peak 5, 200 pages reclaimed,
+  0 pending, 99 repeated meta PageIds. Interleaving raw trees retains 200 retired
+  pages, 100 pending owners and a 404-page file; general compaction is not claimed.
+
+Next: **General Free-Page Allocator Architecture audit**. Tail reclamation solves
+append/drop growth in favorable layouts, but measured interleaved growth remains.
+Evaluate durable remaining-page inventory, allocator identity, middle retired
+holes, active-tree merge orphans and catalog orphans before implementing reuse.
+Do not jump to CREATE TABLE. A later Table Schema Lifecycle Architecture Audit
+must cover canonical schema authority, TableId high-water, fingerprint evolution,
+manifest ownership, table storage lifecycle and transaction/recovery/SDK contracts.
+See [Round 11](index-tail-reclaim-round11.md).
 
 ## Phase 6 — SDK and tooling
 
