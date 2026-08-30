@@ -65,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_index_catalog_decode_seeds(&output)?;
     write_protocol_decode_seeds(&output)?;
     write_generation_seeds(&output)?;
+    write_tail_intent_seeds(&output)?;
     Ok(())
 }
 
@@ -139,6 +140,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-analyzed-root"),
         encode_index_catalog(&IndexCatalogNode {
+            reclaim_intent: None,
             pending: Vec::new(),
             next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: None,
@@ -150,6 +152,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
         })?,
     )?;
     let one = encode_index_catalog(&IndexCatalogNode {
+        reclaim_intent: None,
         pending: Vec::new(),
         next_index_id: Some(netbadb_types::IndexId(4)),
         next_catalog: None,
@@ -244,6 +247,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-analyzed-index-entry"),
         encode_index_catalog(&IndexCatalogNode {
+            reclaim_intent: None,
             pending: Vec::new(),
             next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: None,
@@ -273,6 +277,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-catalog-with-next"),
         encode_index_catalog(&IndexCatalogNode {
+            reclaim_intent: None,
             pending: Vec::new(),
             next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: Some(PageId(9)),
@@ -669,5 +674,166 @@ fn write_generation_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::E
     std::fs::remove_file(wal_path(&path))?;
     std::fs::remove_file(netbadb_storage::txn_status_path(&path))?;
     std::fs::remove_file(path)?;
+    Ok(())
+}
+
+// Synthetic post-checkpoint snapshots exercise open-time intent recovery without
+// depending on test-only process hooks. CRCs use the production Page boundary.
+fn write_tail_intent_seeds(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::temp_dir().join(format!(
+        "netbadb-round11-fuzz-generator-{}",
+        std::process::id()
+    ));
+    for file in [
+        &path,
+        &wal_path(&path),
+        &wal_alternate_path(wal_path(&path)),
+        &netbadb_storage::txn_status_path(&path),
+    ] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
+    let mut storage = HeapStorage::create(&path, fuzz_table())?;
+    let index = storage.create_index(ColumnId(1))?;
+    storage.drop_index(index.id)?;
+    storage.compact_index_catalog()?;
+    storage.checkpoint()?;
+    storage.close()?;
+    let wal = WalManager::open(wal_path(&path))?;
+    let wal_bytes = std::fs::read(wal.path())?;
+    let checkpoint_lsn = wal.base_lsn();
+    drop(wal);
+    let mut disk = PageManager::open(&path)?;
+    let root = disk.read_page(PageId(1))?;
+    let mut node =
+        netbadb_index::decode_index_catalog(root.read_record(netbadb_types::SlotId(0))?)?;
+    node.reclaim_intent = Some(netbadb_index::TailReclaimIntent {
+        old_page_count: 5,
+        truncate_from: 3,
+        checkpoint_lsn,
+        covered: node.pending.clone(),
+    });
+    let valid = encode_current_index_catalog(&node)?;
+    let catalog_output = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("index_catalog_decode");
+    std::fs::create_dir_all(&catalog_output)?;
+    let mut payloads = vec![("valid-intent", valid.clone())];
+    let mut active = node.clone();
+    active.reclaim_intent = None;
+    active.pending.clear();
+    active.entries.push(IndexCatalogEntry {
+        retired: false,
+        statistics: None,
+        definition: index,
+    });
+    let mut active_bytes = encode_current_index_catalog(&active)?;
+    active_bytes[7] = 2;
+    active_bytes.extend_from_slice(&valid[80..]);
+    payloads.push(("active-in-intent", active_bytes));
+    let mut legacy = valid.clone();
+    legacy[48 + 16..48 + 32].fill(0);
+    payloads.push(("legacy-in-intent", legacy));
+    payloads.push(("truncated-intent", valid[..valid.len() - 1].to_vec()));
+    let mut unknown = valid.clone();
+    unknown[40..48].copy_from_slice(&99_u64.to_le_bytes());
+    unknown[112..120].copy_from_slice(&98_u64.to_le_bytes());
+    payloads.push(("unknown-in-intent", unknown));
+    let mut wrong = valid.clone();
+    wrong[128..136].copy_from_slice(&1_u64.to_le_bytes());
+    payloads.push(("wrong-ref-intent", wrong));
+    let heap = std::fs::read(&path)?;
+    for (name, payload) in payloads {
+        std::fs::write(catalog_output.join(format!("round11-{name}-v8")), &payload)?;
+        // A fixture-only Page v5 encoding retains the root's kind and pageLSN;
+        // no raw mutation API is exported from storage for corpus generation.
+        let mut page = Page::new(PageId(1), PageType::Heap);
+        page.insert_record(&payload)?;
+        let mut bytes = *page.bytes();
+        bytes[6] = root.bytes()[6];
+        bytes[16..24].copy_from_slice(&root.bytes()[16..24]);
+        bytes[24..28].fill(0);
+        let checksum = crc32c::crc32c_append(crc32c::crc32c(&1_u64.to_le_bytes()), &bytes);
+        bytes[24..28].copy_from_slice(&checksum.to_le_bytes());
+        Page::from_bytes(PageId(1), bytes).header()?;
+        let mut image = heap.clone();
+        image[4096..8192].copy_from_slice(&bytes);
+        write_tail_snapshot(
+            output,
+            &format!("round11-{name}-old-length"),
+            &image,
+            &wal_bytes,
+        )?;
+        if name == "valid-intent" {
+            write_tail_snapshot(
+                output,
+                "round11-valid-intent-new-length",
+                &image[..3 * 4096],
+                &wal_bytes,
+            )?;
+            write_tail_snapshot(
+                output,
+                "round11-invalid-partial-length",
+                &image[..4 * 4096],
+                &wal_bytes,
+            )?;
+        }
+    }
+    drop(disk);
+    for file in [
+        &path,
+        &wal_path(&path),
+        &wal_alternate_path(wal_path(&path)),
+        &netbadb_storage::txn_status_path(&path),
+    ] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_tail_snapshot(
+    output: &Path,
+    name: &str,
+    heap: &[u8],
+    wal: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = b"NBRF".to_vec();
+    bytes.extend_from_slice(&u32::try_from(heap.len())?.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(wal.len())?.to_le_bytes());
+    bytes.extend_from_slice(heap);
+    bytes.extend_from_slice(wal);
+    assert!(bytes.len() <= 128 * 1024);
+    std::fs::write(output.join(name), bytes)?;
+    let probe = std::env::temp_dir().join(format!(
+        "netbadb-round11-seed-probe-{}-{name}",
+        std::process::id()
+    ));
+    HeapStorage::create(&probe, fuzz_table())?.close()?;
+    std::fs::write(&probe, heap)?;
+    std::fs::write(wal_path(&probe), wal)?;
+    let reopened = HeapStorage::open(&probe, fuzz_table());
+    if name.starts_with("round11-valid-intent") {
+        let mut storage = reopened?;
+        let report = storage.inspect_index_reclaim()?;
+        assert_eq!(report.database_pages, 3);
+        assert_eq!(report.pending_reclaim_indexes, 0);
+        storage.close()?;
+    } else {
+        assert!(reopened.is_err(), "malformed fixture must fail: {name}");
+    }
+    for file in [
+        &probe,
+        &wal_path(&probe),
+        &wal_alternate_path(wal_path(&probe)),
+        &netbadb_storage::txn_status_path(&probe),
+    ] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
     Ok(())
 }

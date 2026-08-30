@@ -49,9 +49,9 @@ pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_storage::{
-    IndexDefinition, IndexMaintenanceReport, IndexReclaimReport, IndexStatistics, IsolationLevel,
-    LsmInspection, LsmLevelInspection, LsmReadAmplification, LsmWriteAmplification, StorageKind,
-    TableStatistics,
+    IndexDefinition, IndexMaintenanceReport, IndexReclaimReport, IndexStatistics,
+    IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
+    LsmReadAmplification, LsmWriteAmplification, StorageKind, TableStatistics,
 };
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
@@ -1356,6 +1356,19 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_index_maintenance_quiescent(&self) -> Result<(), DatabaseError> {
+        let handles = Rc::strong_count(&self.transaction_owner) - 1;
+        if handles != 0 {
+            return Err(StorageError::from(
+                netbadb_storage::CheckpointError::OutstandingTransactions {
+                    count: handles as u64,
+                },
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Explicit quiescent maintenance of one single-storage Heap index catalog.
     /// Drop all DatabaseTransaction handles first (including lazy participants);
     /// the Heap also enforces its existing checkpoint admission gate. Active
@@ -1366,15 +1379,7 @@ impl Database {
         &mut self,
         table_id: TableId,
     ) -> Result<IndexMaintenanceReport, DatabaseError> {
-        let handles = Rc::strong_count(&self.transaction_owner) - 1;
-        if handles != 0 {
-            return Err(StorageError::from(
-                netbadb_storage::CheckpointError::OutstandingTransactions {
-                    count: handles as u64,
-                },
-            )
-            .into());
-        }
+        self.ensure_index_maintenance_quiescent()?;
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => self
                 .registry
@@ -1398,15 +1403,7 @@ impl Database {
         &mut self,
         table_id: TableId,
     ) -> Result<IndexReclaimReport, DatabaseError> {
-        let handles = Rc::strong_count(&self.transaction_owner) - 1;
-        if handles != 0 {
-            return Err(StorageError::from(
-                netbadb_storage::CheckpointError::OutstandingTransactions {
-                    count: handles as u64,
-                },
-            )
-            .into());
-        }
+        self.ensure_index_maintenance_quiescent()?;
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => self
                 .registry
@@ -1418,6 +1415,31 @@ impl Database {
                 .map_err(Into::into),
             TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
                 operation: "index reclaim inspection",
+                storage_kind: "range-partitioned table",
+            }
+            .into()),
+        }
+    }
+
+    /// Reclaims a validated complete-retired-v3 suffix through an internal
+    /// checkpoint and durable intent. All database handles must first be dropped.
+    /// On a persistence failure reopen the database before any further mutation.
+    pub fn reclaim_retired_index_tail(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<IndexTailReclaimReport, DatabaseError> {
+        self.ensure_index_maintenance_quiescent()?;
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .reclaim_retired_index_tail()
+                .map_err(Into::into),
+            TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
+                operation: "retired index tail reclamation",
                 storage_kind: "range-partitioned table",
             }
             .into()),
@@ -5095,7 +5117,12 @@ mod tests {
         let lazy_reader = database.begin_transaction().unwrap();
         assert!(database.compact_index_catalog(TableId(1)).is_err());
         assert!(database.inspect_index_reclaim(TableId(1)).is_err());
+        assert!(database.reclaim_retired_index_tail(TableId(1)).is_err());
         drop(lazy_reader);
+        let mut retained_terminal = database.begin_transaction().unwrap();
+        database.commit_transaction(&mut retained_terminal).unwrap();
+        assert!(database.reclaim_retired_index_tail(TableId(1)).is_err());
+        drop(retained_terminal);
         let retired = database.create_index(TableId(1), ColumnId(1)).unwrap();
         database.drop_index(TableId(1), retired.id).unwrap();
         let generation_after_drop = database.catalog_generation();
@@ -5105,6 +5132,15 @@ mod tests {
         assert_eq!(reclaim.active_indexes, 1);
         assert_eq!(reclaim.pending_reclaim_indexes, 1);
         assert_eq!(reclaim.pages_reclaimed, 0);
+        let tail = database.reclaim_retired_index_tail(TableId(1)).unwrap();
+        assert_eq!((tail.reclaimed_pages, tail.reclaimed_indexes), (2, 1));
+        assert_eq!(
+            database
+                .inspect_index_reclaim(TableId(1))
+                .unwrap()
+                .pending_reclaim_indexes,
+            0
+        );
         assert_eq!(database.inspect_catalog().unwrap(), inspection_before);
         assert_eq!(database.catalog_generation(), generation_after_drop);
         let indexes = database.indexes(TableId(1)).unwrap();

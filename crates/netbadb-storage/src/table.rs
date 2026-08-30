@@ -1205,6 +1205,20 @@ impl TableStorage {
         }
     }
 
+    /// Reclaims a whole retired-v3 Heap suffix using checkpoint and durable intent.
+    /// Persistence failures require reopen before further mutations.
+    pub fn reclaim_retired_index_tail(
+        &mut self,
+    ) -> Result<crate::IndexTailReclaimReport, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.reclaim_retired_index_tail(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "retired index tail reclamation",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     /// Validates the full Heap file and reports pending retirement ownership.
     pub fn inspect_index_reclaim(&mut self) -> Result<crate::IndexReclaimReport, StorageError> {
         match self {

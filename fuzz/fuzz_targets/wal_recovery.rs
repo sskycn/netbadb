@@ -13,6 +13,25 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
+    // NBRF is a fuzz-fixture envelope, not a database format. It supplies a
+    // checkpointed file plus selected WAL so intent old/new length paths are
+    // actually reachable; ordinary seeds remain raw WAL bytes.
+    let fixture = if data.starts_with(b"NBRF") {
+        if data.len() < 12 {
+            return;
+        }
+        let heap_length = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let wal_length = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let Some(end) = 12_usize.checked_add(heap_length) else {
+            return;
+        };
+        if end.checked_add(wal_length) != Some(data.len()) {
+            return;
+        }
+        Some((&data[12..end], &data[end..]))
+    } else {
+        None
+    };
     let database_path =
         std::env::temp_dir().join(format!("netbadb-wal-recovery-fuzz-{}", std::process::id()));
     cleanup(&database_path);
@@ -22,7 +41,13 @@ fuzz_target!(|data: &[u8]| {
     drop(storage);
 
     let wal_file = wal_path(&database_path);
-    if std::fs::write(&wal_file, data).is_ok() {
+    let wal_bytes = if let Some((heap, wal)) = fixture {
+        std::fs::write(&database_path, heap).expect("install isolated heap fixture");
+        wal
+    } else {
+        data
+    };
+    if std::fs::write(&wal_file, wal_bytes).is_ok() {
         // HeapStorage::open invokes the crate-private recovery WAL decoder,
         // including its partial-final-record path, through a production API.
         if let Ok(mut storage) = HeapStorage::open(&database_path, table) {

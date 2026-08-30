@@ -19,10 +19,10 @@ decoders with a nullable UInt64 `IndexSpec`. Arbitrary bytes must return a node
 or typed `IndexError` without panicking, unbounded allocation, or traversal.
 
 `index_catalog_decode` accepts at most one 4060-byte `NBIC` payload and
-exercises the version-7 registry decoder with backward version-2 through version-6 input.
+exercises the version-8 registry decoder with backward version-2 through version-7 input.
 Seeds cover active/retired registrations, invalid state and zero IDs, duplicate
 IDs, truncation, root high-water, compacted catalogs, invalid high-water, and
-legacy payloads. Successful decodes also canonicalize and round-trip through v7. Retirement is an in-place state, not a
+legacy payloads. Successful decodes also canonicalize and round-trip through v8. Retirement is an in-place state, not a
 DropIndex event: unknown/double-drop requests are covered by storage tests. Arbitrary counts and
 bytes must remain bounded and return either a catalog node or typed error.
 
@@ -93,3 +93,15 @@ only reviewed deterministic seeds are committed.
 The WAL bound is 128 KiB because the real CREATE/rollback/re-CREATE seed contains
 eight full-page updates and exceeds 64 KiB. The generator asserts this bound;
 the seed is not silently skipped by the harness.
+
+Round 11 adds six v8 intent payload seeds and eight open/recovery snapshot seeds.
+The generator verifies old/new-length valid snapshots converge to three pages,
+and invalid partial length, unknown/active/legacy owner, wrong reference and
+truncated intent snapshots fail. `wal_recovery` retains raw WAL inputs and also
+accepts a bounded fixture envelope: `NBRF`, little-endian u32 heap length, u32 WAL
+length, exact heap bytes, selected WAL bytes. This is only a fuzz input container,
+not a persistent NetbaDB format. Fixtures contain no rows; the fresh status sidecar
+is sufficient. Synthetic post-checkpoint root images use the existing Page v5
+CRC32C library and the exact selected WAL base. Each successful decode/open still
+runs the production scanner. Random mutations and artifacts stay in temporary
+corpus directories; only deterministic `round11-*` seeds are committed.

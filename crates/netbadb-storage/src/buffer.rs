@@ -26,6 +26,31 @@ struct BufferState {
 }
 
 impl BufferState {
+    /// Shared removal mechanics. Rollback may discard its own dirty allocation;
+    /// maintenance must preflight clean, unpinned frames before calling this.
+    fn remove_frame(&mut self, index: usize) {
+        self.frames.remove(index);
+        self.next_victim = self.next_victim.min(self.frames.len().saturating_sub(1));
+    }
+
+    fn ensure_clean_suffix(&self, start: u64) -> Result<(), StorageError> {
+        for frame in self.frames.iter().filter(|frame| frame.page_id.0 >= start) {
+            if frame.pin_count != 0 || frame.writer {
+                return Err(BufferError::PagePinned {
+                    page_id: frame.page_id,
+                }
+                .into());
+            }
+            if frame.dirty {
+                return Err(BufferError::PageDirty {
+                    page_id: frame.page_id,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     fn find_frame(&self, page_id: PageId) -> Option<usize> {
         self.frames
             .iter()
@@ -275,12 +300,7 @@ impl BufferState {
                     }
                 }
                 if let Some(index) = self.find_frame(page_id) {
-                    self.frames.remove(index);
-                    self.next_victim = if self.frames.is_empty() {
-                        0
-                    } else {
-                        self.next_victim.min(self.frames.len() - 1)
-                    };
+                    self.remove_frame(index);
                 }
                 self.disk.remove_trailing_page(page_id)?;
                 self.disk.sync()?;
@@ -355,6 +375,33 @@ impl BufferPool {
         self.state.borrow().disk.page_count()
     }
 
+    pub(crate) fn validated_page_count(&self) -> Result<u64, StorageError> {
+        self.state.borrow().disk.validated_page_count()
+    }
+
+    pub(crate) fn ensure_clean_suffix(&self, start: u64) -> Result<(), StorageError> {
+        self.state.borrow().ensure_clean_suffix(start)
+    }
+
+    pub(crate) fn invalidate_suffix(&self, start: u64) -> Result<(), StorageError> {
+        let mut state = self.state.borrow_mut();
+        state.ensure_clean_suffix(start)?;
+        for index in (0..state.frames.len()).rev() {
+            if state.frames[index].page_id.0 >= start {
+                state.remove_frame(index);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn truncate_to_page_count(&self, old: u64, new: u64) -> Result<(), StorageError> {
+        let mut state = self.state.borrow_mut();
+        if state.frames.iter().any(|frame| frame.page_id.0 >= new) {
+            return Err(crate::invalid_format("tail frames remain before truncate"));
+        }
+        state.disk.truncate_to_page_count(old, new)
+    }
+
     pub fn fetch_page(&self, page_id: PageId) -> Result<ReadPageGuard, StorageError> {
         self.read_page(page_id)
     }
@@ -369,7 +416,7 @@ impl BufferPool {
     }
 
     /// Exact allocation lookup. A slot hit is not an identity hit. The pool is
-    /// the sole runtime owner of PageManager, and only coordinated rollback can
+    /// the sole runtime owner of PageManager, and only coordinated rollback or tail maintenance can
     /// remove/reappend slots; stale requests never evict a newer dirty frame.
     pub(crate) fn read_btree_page(
         &self,
@@ -753,5 +800,62 @@ mod tests {
         pool.flush_all().expect("retry page flush");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(wal_path);
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    #[test]
+    fn tail_invalidation_preflights_every_frame_and_preserves_prefix() {
+        for cached in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "netbadb-round11-buffer-{cached}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let mut disk = PageManager::create(&path).unwrap();
+            for number in 1..6 {
+                let page = disk.allocate_page().unwrap();
+                disk.write_page(&Page::new(page.id, crate::PageType::Heap))
+                    .unwrap();
+                assert_eq!(page.id, PageId(number));
+            }
+            disk.sync().unwrap();
+            let pool = BufferPool::new(disk, 6).unwrap();
+            drop(pool.read_page(PageId(2)).unwrap());
+            if cached {
+                drop(pool.read_page(PageId(3)).unwrap());
+                let pin = pool.read_page(PageId(5)).unwrap();
+                assert!(matches!(
+                    pool.invalidate_suffix(3),
+                    Err(StorageError::Buffer(BufferError::PagePinned { .. }))
+                ));
+                assert!(pool.state.borrow().find_frame(PageId(3)).is_some());
+                drop(pin);
+                pool.write_page(PageId(4))
+                    .unwrap()
+                    .page_mut()
+                    .insert_record(b"dirty")
+                    .unwrap();
+                assert!(matches!(
+                    pool.invalidate_suffix(3),
+                    Err(StorageError::Buffer(BufferError::PageDirty { .. }))
+                ));
+                assert_eq!(pool.validated_page_count().unwrap(), 6);
+                assert!(pool.state.borrow().find_frame(PageId(3)).is_some());
+                pool.flush_all().unwrap();
+            }
+            pool.invalidate_suffix(3).unwrap();
+            assert!(pool.state.borrow().frames.iter().all(|f| f.page_id.0 < 3));
+            assert!(pool.state.borrow().find_frame(PageId(2)).is_some());
+            pool.truncate_to_page_count(6, 3).unwrap();
+            assert!(pool.read_page(PageId(3)).is_err());
+            assert!(pool.read_page(PageId(2)).is_ok());
+            drop(pool);
+            assert_eq!(PageManager::open(&path).unwrap().page_count(), 3);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }

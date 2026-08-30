@@ -11,7 +11,8 @@ use super::{CatalogSnapshot, HeapStorage, IndexPageInventory};
 use crate::{PageType, StorageError};
 
 /// Unstable admin inventory, not ordinary catalog/Inspection JSON. Counts are
-/// observations, never permission to truncate. Physical reclamation is deferred.
+/// observations, never standalone permission to truncate. Tail maintenance also
+/// requires whole-tree, checkpoint, buffer and durable-intent validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReclaimReport {
     /// Exact identities of all generation-aware owned pages, including orphans.

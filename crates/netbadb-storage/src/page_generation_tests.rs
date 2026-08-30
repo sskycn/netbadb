@@ -487,6 +487,8 @@ fn generation_legacy_v2_remains_read_write_and_explicitly_unreclaimable() {
     assert_eq!(report.legacy_unreclaimable_indexes, 1);
     assert!(report.allocations.is_empty());
     assert_eq!(report.pending[0].meta_page, legacy.handle.meta_page);
+    assert_eq!(storage.reclaim_retired_index_tail().unwrap().reclaimed_pages, 0);
+    assert_eq!(storage.inspect_index_reclaim().unwrap(), report);
     storage.checkpoint().unwrap();
     storage.close().unwrap();
     let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();

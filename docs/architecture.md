@@ -1780,23 +1780,24 @@ one child through the parent fence. This prevents an empty leaf under a parent
 with no sibling separator. Normalization is bounded by file page count, uses
 the same owner, and logs full-page changes in the caller's transaction; errors
 after changes require rollback. Reopen/crash tests cover undo and committed
-collapse. Physical reclamation remains deferred.
+collapse. Active-tree orphan reclamation remains deferred; after retirement,
+Round 11 may reclaim the complete tree when all its pages occupy the tail.
 
 ## Persistent index registry
 
 Heap metadata points to a fixed `IndexCatalog` root. Catalog pages are
-checksummed Page v5 single-payload pages containing version-7 `NBIC` payloads.
+checksummed Page v5 single-payload pages containing version-8 `NBIC` payloads.
 Versions 2 (unnamed), 3 (optional name) and 4 (explicit logical identity and
-retirement) and 5 (durable high-water) and 6 (owned pending roots) remain readable; v1 is rejected. Registration order is preserved.
+retirement) and 5 (durable high-water) and 6 (owned pending roots) and 7 (generation-bearing handles) remain readable; v1 is rejected. Registration order is preserved.
 The authoritative allocator high-water lives only in the root, never in Heap
 metadata or a cache reconstructed from surviving active entries.
 
 ```text
-v7 header (48 bytes, little endian)
+v8 header (48 bytes, little endian)
 0..4    NBIC magic
-4..6    u16 version (7; decoder also accepts 2, 3, 4, 5, 6)
+4..6    u16 version (8; decoder also accepts 2, 3, 4, 5, 6, 7)
 6       u8 table-statistics presence (0 or 1)
-7       u8 next_index_id presence (1 on root, 0 on continuations)
+7       u8 root state (0 continuation, 1 root without intent, 2 root with intent)
 8..16   u64 next catalog PageId (0 means none)
 16..20  u32 entry count
 20..24  u32 pending ownership count (zero in v2-v5)
@@ -1804,7 +1805,7 @@ v7 header (48 bytes, little endian)
 32..40  u64 managed_page_count (zero when absent)
 40..48  u64 next_index_id (nonzero on root, zero on continuations)
 
-v7 entry prefix (56 bytes, little endian; v4/v5/v6 use 48 bytes)
+v7/v8 entry prefix (56 bytes, little endian; v4/v5/v6 use 48 bytes)
 0..4    u32 ColumnId
 4       u8 index-statistics presence (0 or 1)
 5       u8 logical-name presence (0 or 1)
@@ -1828,14 +1829,27 @@ Following all entries: pending ownership count * 32 bytes
 25..32  reserved zero
 Presence means Pending; legacy v2 pending roots remain unreclaimable.
 V6 pending records are 16 bytes and decode to explicit legacy references.
+
+When root state = 2, following pending records: reclaim intent
+0..8    u64 old_page_count N
+8..16   u64 truncate_from M (3 <= M < N)
+16..24  u64 checkpoint logical WAL base LSN
+24..28  u32 covered identity count (nonzero, bounded by payload)
+28..32  reserved zero
+32..    count * (u64 IndexId, u64 meta PageId, u64 PageGeneration)
+Covered IDs are strictly increasing; every generation is nonzero and below
+checkpoint base; every covered meta is in [M,N). Storage matches identities
+against the entire retired catalog (full entries or minimal pending records).
+Unknown, active, legacy, duplicate or mismatching identities are rejected.
+V2-v7 reject state 2. V8 has no extension when state is 0 or 1.
 ```
 
 V2/v3/v4 headers require byte 7 and bytes 40..48 to be zero. Versions 2/3 have a
 40-byte entry prefix with bytes 36..40 zero; v2 also requires bytes 5..8 zero.
 Their IDs remain exactly their unique metadata PageIds. V4 IDs are decoded
 explicitly. Only a v2/v3/v4 root may infer `max(all active AND retired IDs) + 1`,
-because those formats never compacted. V5/v6/v7 roots must supply a boundary greater
-than every active, retired or pending ID in the entire chain. Presence/zero mismatch, an absent v5/v6/v7 root
+because those formats never compacted. V5/v6/v7/v8 roots must supply a boundary greater
+than every active, retired or pending ID in the entire chain. Presence/zero mismatch, an absent v5/v6/v7/v8 root
 boundary, or a boundary on a continuation is corrupt. `u64::MAX` is a valid
 exhausted next-ID boundary; CREATE returns typed IndexIdExhausted without
 allocating a tree, never wraps or issues that last value. Legacy MAX IDs also
@@ -1867,8 +1881,8 @@ Page/WAL formats, existing BTree payload versions and catalog_generation unchang
 
 Only removed **legacy** registrations and unused continuation pages follow
 permanent physical abandonment. New v3 retired trees remain in durable pending
-inventory, including middle holes and merge orphans. No truncate/free/reuse
-occurs. `inspect_index_reclaim` uses checkpoint admission plus no pinned pages,
+inventory, including middle holes and merge orphans. Catalog compaction itself
+never truncates. `inspect_index_reclaim` uses checkpoint admission plus no pinned pages,
 fully decodes every managed Page and BTree payload, traverses authoritative
 active/retired/raw roots, and rejects duplicate/overlapping ownership and
 cross-owner links. It identifies root-unreachable v2/v3 pages by their validated
@@ -1890,8 +1904,43 @@ BTree v3 identities. No separate generation allocator or high-water exists.
 
 General reuse remains forbidden: Heap RowId has slot generation, not page
 allocation generation; catalog root/continuation links are still physical PageIds.
-No retired tail reclamation or free-list is implemented. See
-[the Round 10 audit, format matrix and crash proof](page-generation-round10.md).
+A dedicated Round 11 operation permits only whole retired v3 tails. The shared
+Core maintenance admission rejects every retained database transaction handle;
+Heap reuses checkpoint admission and pin checks. Two complete inventory scans
+surround an internal checkpoint. No candidate skips all persistent mutation.
+The fixed catalog root holds a bounded intent; capacity failure occurs before
+checkpoint and never appends a catalog continuation into the suffix. Only
+existing affected catalog pages are used for finalization, preflighted before
+persisting intent; unrelated legacy continuation bytes are preserved.
+
+Intent is an ordinary catalog PageUpdate transaction, synced through Commit and
+then the data file before truncation. The selected checkpoint WAL generation has
+no older tree updates: only catalog pages below M are touched until completion.
+Clean, unpinned suffix frames are removed without writeback; PageManager checks
+actual file length against the expected count, protects pages 0..3, calls set_len,
+updates its count, and sync_all. A sync failure cannot restore the allocation.
+
+Finalization logs removal of only covered full-retired/pending records and root
+intent clear in one transaction, with root publication last. Commit is the
+completion decision and data pages are synced before return. An error after
+logging begins poisons the existing transaction runtime as RecoveryRequired;
+no ordinary mutation, checkpoint or catalog compaction can continue. Reopen is
+the retry entry; no second transaction state machine is introduced.
+
+Open recovers ordinary WAL first (only retained catalog pages can be affected),
+then decodes root intent before pending bounds/dereference. Exact covered refs
+may be outside current length only while a validated intent is present. N means
+revalidate the complete inventory and finish truncate; M means sync and finalize
+without reading removed roots. Any other length or WAL base mismatch is hard
+corruption. Finalization undo restores the intent after a loser/STEAL crash;
+winner redo completes record removal. Normal active registry load happens last.
+This is an abrupt-process-crash contract, not a power-loss claim.
+
+The whole-tree restriction includes unreachable owned orphans; a tree with any
+page below the suffix cannot be finalized. Middle-hole owners remain pending.
+Active trees, Heap, raw/v1/v2, unknown/corrupt, and catalog pages cannot be crossed.
+See [Round 11](index-tail-reclaim-round11.md) and
+[the Round 10 generation proof](page-generation-round10.md).
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees never enter the active index registry from page scans. Only admin
@@ -2559,7 +2608,7 @@ planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
 contract, not a database-file format. The current independent persistent
 contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
 transaction-status v1, Page v5, WAL v4/record v3 plus v4 reservations, BTree
-v1/v2/v3, and IndexCatalog v7 (backward decode v2 through v6). Deployment manifest v4 is configuration, not a database format or canonical
+v1/v2/v3, and IndexCatalog v8 (backward decode v2 through v7). Deployment manifest v4 is configuration, not a database format or canonical
 schema identity.
 
 Rust applications choose either the default embedded SDK or the optional

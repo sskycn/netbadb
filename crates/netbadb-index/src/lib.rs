@@ -15,7 +15,7 @@ use netbadb_types::{
 pub const BTREE_FORMAT_VERSION: u16 = 3;
 /// Additional bytes reserved on every owned BTree page.
 pub const BTREE_OWNER_SIZE: usize = 8;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 7;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 8;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -126,10 +126,12 @@ pub struct IndexCatalogEntry {
 
 /// One page in the persistent registration chain, with WAL-backed retirement.
 ///
-/// The version-7 `NBIC` payload uses a fixed-width little-endian header and
+/// The version-8 `NBIC` payload uses a fixed-width little-endian header and
 /// entry prefixes plus bounded optional names. Storage validates chain rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
+    /// Root-only crash recovery intent; never stored on a newly allocated page.
+    pub reclaim_intent: Option<TailReclaimIntent>,
     /// Minimal retired ownership, retained until physical reclamation completes.
     pub pending: Vec<RetiredIndexOwnership>,
     /// Root-only durable allocator boundary; None on continuations and legacy decode.
@@ -148,6 +150,7 @@ impl IndexCatalogNode {
             table_statistics: None,
             entries: Vec::new(),
             pending: Vec::new(),
+            reclaim_intent: None,
         }
     }
 }
@@ -159,6 +162,54 @@ impl IndexCatalogNode {
 pub struct RetiredIndexOwnership {
     pub index_id: IndexId,
     pub meta_page: BTreePageRef,
+}
+
+/// A validated whole-tree suffix decision, persisted before file truncation.
+/// Covered identities duplicate retained catalog ownership until finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailReclaimIntent {
+    pub old_page_count: u64,
+    pub truncate_from: u64,
+    /// Logical WAL generation base established by the immediately preceding checkpoint.
+    pub checkpoint_lsn: netbadb_types::Lsn,
+    pub covered: Vec<RetiredIndexOwnership>,
+}
+
+impl TailReclaimIntent {
+    /// Validates intrinsic geometry and exact allocation identities. Storage also
+    /// checks every covered identity against the complete retained catalog chain.
+    pub fn validate(&self) -> Result<(), IndexError> {
+        if self.truncate_from < 3
+            || self.truncate_from >= self.old_page_count
+            || self.checkpoint_lsn.0 == 0
+            || self.covered.is_empty()
+        {
+            return Err(IndexError::InvalidReclaimIntent);
+        }
+        validate_pending_ownership(None, &[], &self.covered)?;
+        if self
+            .covered
+            .windows(2)
+            .any(|pair| pair[0].index_id >= pair[1].index_id)
+        {
+            return Err(IndexError::InvalidReclaimIntent);
+        }
+        for record in &self.covered {
+            let page = record.meta_page.page_id().0;
+            let generation = record
+                .meta_page
+                .generation()
+                .ok_or(IndexError::InvalidReclaimIntent)?;
+            validate_generation(generation)?;
+            if page < self.truncate_from
+                || page >= self.old_page_count
+                || generation.0 >= self.checkpoint_lsn.0
+            {
+                return Err(IndexError::InvalidReclaimIntent);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Complete ordered identity of one leaf entry or persistent internal fence.
@@ -208,6 +259,7 @@ pub struct InternalNode {
 /// Typed failures from index validation, codecs, ordering, and split logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexError {
+    InvalidReclaimIntent,
     InvalidPageGeneration(PageGeneration),
     PageGenerationExhausted,
     GenerationMismatch {
@@ -321,6 +373,7 @@ pub enum IndexError {
 impl fmt::Display for IndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidReclaimIntent => formatter.write_str("invalid tail reclaim intent"),
             Self::InvalidPageGeneration(generation) => {
                 write!(formatter, "invalid page generation {}", generation.0)
             }
@@ -1092,8 +1145,9 @@ pub fn merge_internals_if_fits(
     Ok((internal_encoded_len(spec, &merged)? <= capacity).then_some(merged))
 }
 
-/// Encodes one explicit version-7 mutable index catalog page payload.
+/// Encodes one explicit version-8 mutable index catalog page payload.
 pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
+    validate_local_reclaim_intent(node)?;
     if let Some(next) = node.next_catalog {
         validate_child(next)?;
     }
@@ -1109,6 +1163,12 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
             if let Some(statistics) = entry.statistics {
                 validate_index_statistics_intrinsic(&statistics)?;
             }
+        }
+    }
+    if let Some(intent) = &node.reclaim_intent {
+        intent.validate()?;
+        if node.next_index_id.is_none() {
+            return Err(IndexError::InvalidReclaimIntent);
         }
     }
     validate_catalog_entries(&node.entries)?;
@@ -1142,7 +1202,11 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     output.extend_from_slice(INDEX_CATALOG_MAGIC);
     output.extend_from_slice(&INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
     output.push(u8::from(node.table_statistics.is_some()));
-    output.push(u8::from(node.next_index_id.is_some()));
+    output.push(if node.reclaim_intent.is_some() {
+        2
+    } else {
+        u8::from(node.next_index_id.is_some())
+    });
     output.extend_from_slice(&node.next_catalog.map_or(0, |page| page.0).to_le_bytes());
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(
@@ -1215,10 +1279,33 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         output.push(u8::from(pending.meta_page.generation().is_some()));
         output.extend_from_slice(&[0; 7]);
     }
+    if let Some(intent) = &node.reclaim_intent {
+        output.extend_from_slice(&intent.old_page_count.to_le_bytes());
+        output.extend_from_slice(&intent.truncate_from.to_le_bytes());
+        output.extend_from_slice(&intent.checkpoint_lsn.0.to_le_bytes());
+        output.extend_from_slice(
+            &u32::try_from(intent.covered.len())
+                .map_err(|_| IndexError::LengthOverflow)?
+                .to_le_bytes(),
+        );
+        output.extend_from_slice(&[0; 4]);
+        for record in &intent.covered {
+            output.extend_from_slice(&record.index_id.0.to_le_bytes());
+            output.extend_from_slice(&record.meta_page.page_id().0.to_le_bytes());
+            output.extend_from_slice(
+                &record
+                    .meta_page
+                    .generation()
+                    .ok_or(IndexError::InvalidReclaimIntent)?
+                    .0
+                    .to_le_bytes(),
+            );
+        }
+    }
     Ok(output)
 }
 
-/// Decodes legacy version-2 through version-6 or current version-7 index catalog payloads.
+/// Decodes legacy version-2 through version-7 or current version-8 index catalog payloads.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -1230,7 +1317,10 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         });
     }
     let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
-    if !matches!(version, 2 | 3 | 4 | 5 | 6 | INDEX_CATALOG_FORMAT_VERSION) {
+    if !matches!(
+        version,
+        2 | 3 | 4 | 5 | 6 | 7 | INDEX_CATALOG_FORMAT_VERSION
+    ) {
         return Err(IndexError::UnsupportedVersion(version));
     }
     let table_statistics_present = decode_statistics_presence(input[6])?;
@@ -1243,6 +1333,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         match (input[7], value.0) {
             (0, 0) => None,
             (1, 1..) => Some(value),
+            (2, 1..) if version >= 8 => Some(value),
             _ => return Err(IndexError::InvalidIndexHighWater(value)),
         }
     } else {
@@ -1488,18 +1579,89 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         offset += pending_size;
     }
     validate_pending_ownership(next_index_id, &entries, &pending)?;
+    let reclaim_intent = if version >= 8 && input[7] == 2 {
+        let mut decoder = Decoder::new(&input[offset..]);
+        let old_page_count = decoder.u64()?;
+        let truncate_from = decoder.u64()?;
+        let checkpoint_lsn = netbadb_types::Lsn(decoder.u64()?);
+        let count = decoder.u32()? as usize;
+        if decoder.array::<4>()? != [0; 4] {
+            return Err(IndexError::InvalidReservedBytes);
+        }
+        if count > input.len().saturating_sub(offset + 32) / 24 {
+            return Err(IndexError::Truncated);
+        }
+        let mut covered = Vec::with_capacity(count);
+        for _ in 0..count {
+            covered.push(RetiredIndexOwnership {
+                index_id: IndexId(decoder.u64()?),
+                meta_page: BTreePageRef::Allocated(PageRef {
+                    page_id: PageId(decoder.u64()?),
+                    generation: PageGeneration(decoder.u64()?),
+                }),
+            });
+        }
+        offset += 32 + count * 24;
+        let intent = TailReclaimIntent {
+            old_page_count,
+            truncate_from,
+            checkpoint_lsn,
+            covered,
+        };
+        intent.validate()?;
+        Some(intent)
+    } else {
+        None
+    };
     if offset != input.len() {
         return Err(IndexError::ExtraBytes);
     }
     validate_catalog_entries(&entries)?;
     validate_index_high_water(next_index_id, &entries)?;
-    Ok(IndexCatalogNode {
+    let node = IndexCatalogNode {
+        reclaim_intent,
         pending,
         next_index_id,
         next_catalog,
         table_statistics,
         entries,
-    })
+    };
+    validate_local_reclaim_intent(&node)?;
+    Ok(node)
+}
+
+fn validate_local_reclaim_intent(node: &IndexCatalogNode) -> Result<(), IndexError> {
+    if let Some(intent) = &node.reclaim_intent {
+        intent.validate()?;
+        let next = node.next_index_id.ok_or(IndexError::InvalidReclaimIntent)?;
+        for record in &intent.covered {
+            if record.index_id >= next {
+                return Err(IndexError::InvalidReclaimIntent);
+            }
+            if let Some(entry) = node
+                .entries
+                .iter()
+                .find(|entry| entry.definition.id == record.index_id)
+            {
+                if !entry.retired
+                    || entry.definition.handle.owner != Some(record.index_id)
+                    || entry.definition.handle.meta_page != record.meta_page
+                {
+                    return Err(IndexError::InvalidReclaimIntent);
+                }
+            }
+            if let Some(pending) = node
+                .pending
+                .iter()
+                .find(|pending| pending.index_id == record.index_id)
+            {
+                if pending != record {
+                    return Err(IndexError::InvalidReclaimIntent);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Checks a root allocator boundary against all supplied registrations.
@@ -2467,6 +2629,7 @@ mod tests {
     #[test]
     fn index_catalog_codec_round_trips_and_rejects_corruption() {
         let node = IndexCatalogNode {
+            reclaim_intent: None,
             pending: Vec::new(),
             next_index_id: Some(IndexId(12)),
             next_catalog: Some(PageId(9)),
@@ -2507,7 +2670,7 @@ mod tests {
         let named_bytes = encode_index_catalog(&named).unwrap();
         let named_golden = [
             b"NBIC".as_slice(),
-            &[7, 0, 1, 1],
+            &[8, 0, 1, 1],
             &[9, 0, 0, 0, 0, 0, 0, 0],
             &[1, 0, 0, 0],
             &[0, 0, 0, 0],
@@ -2570,6 +2733,7 @@ mod tests {
             Err(IndexError::InvalidChild(PageId(0)))
         );
         let duplicate = IndexCatalogNode {
+            reclaim_intent: None,
             pending: Vec::new(),
             next_index_id: node.next_index_id,
             next_catalog: None,
@@ -3048,6 +3212,7 @@ mod ownership_tests {
         ));
         // v5's allocator must survive even after all entries have been removed.
         let mut v5 = encode_index_catalog(&IndexCatalogNode {
+            reclaim_intent: None,
             next_index_id: Some(IndexId(900)),
             ..IndexCatalogNode::empty()
         })
@@ -3220,5 +3385,130 @@ mod generation_tests {
             encode_index_catalog(&node),
             Err(IndexError::DuplicateTreeHandle(PageId(9)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod tail_intent_tests {
+    use super::*;
+
+    fn node() -> IndexCatalogNode {
+        let record = RetiredIndexOwnership {
+            index_id: IndexId(1),
+            meta_page: BTreePageRef::Allocated(PageRef {
+                page_id: PageId(3),
+                generation: PageGeneration(7),
+            }),
+        };
+        IndexCatalogNode {
+            next_index_id: Some(IndexId(2)),
+            pending: vec![record],
+            reclaim_intent: Some(TailReclaimIntent {
+                old_page_count: 5,
+                truncate_from: 3,
+                checkpoint_lsn: netbadb_types::Lsn(100),
+                covered: vec![record],
+            }),
+            ..IndexCatalogNode::empty()
+        }
+    }
+
+    #[test]
+    fn tail_intent_roundtrip_and_corrupt_fields_are_bounded() {
+        let node = node();
+        let bytes = encode_index_catalog(&node).unwrap();
+        assert_eq!(bytes.len(), 48 + 32 + 32 + 24);
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
+        for length in 0..bytes.len() {
+            assert!(decode_index_catalog(&bytes[..length]).is_err());
+        }
+        for (offset, value) in [
+            (80, 0_u64),
+            (88, 5),
+            (88, 2),
+            (96, 0),
+            (112, 0),
+            (120, 2),
+            (128, 0),
+            (128, 100),
+        ] {
+            let mut bad = bytes.clone();
+            bad[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                decode_index_catalog(&bad).is_err(),
+                "offset={offset} value={value}"
+            );
+        }
+        for value in [3, 255] {
+            let mut bad = bytes.clone();
+            bad[7] = value;
+            assert!(decode_index_catalog(&bad).is_err());
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(decode_index_catalog(&extra), Err(IndexError::ExtraBytes));
+        let mut duplicate = node.clone();
+        duplicate
+            .reclaim_intent
+            .as_mut()
+            .unwrap()
+            .covered
+            .push(node.pending[0]);
+        assert!(encode_index_catalog(&duplicate).is_err());
+        let mut legacy = node.clone();
+        legacy.pending[0].meta_page = BTreePageRef::Legacy(PageId(3));
+        assert!(encode_index_catalog(&legacy).is_err());
+        let mut active = node.clone();
+        active.pending.clear();
+        active.entries.push(IndexCatalogEntry {
+            retired: false,
+            statistics: None,
+            definition: IndexDefinition {
+                id: IndexId(1),
+                name: None,
+                column_id: ColumnId(1),
+                handle: BTreeHandle {
+                    owner: Some(IndexId(1)),
+                    meta_page: node.pending[0].meta_page,
+                },
+            },
+        });
+        assert!(encode_index_catalog(&active).is_err());
+        active.entries[0].retired = true;
+        assert!(encode_index_catalog(&active).is_ok());
+        active.reclaim_intent.as_mut().unwrap().covered[0].meta_page =
+            BTreePageRef::Allocated(PageRef {
+                page_id: PageId(3),
+                generation: PageGeneration(8),
+            });
+        assert!(encode_index_catalog(&active).is_err());
+    }
+
+    #[test]
+    fn tail_no_intent_v2_through_v8_decode_and_v7_refs_upgrade_exactly() {
+        for version in 2_u16..=8 {
+            let mut bytes = encode_index_catalog(&IndexCatalogNode::empty()).unwrap();
+            bytes[4..6].copy_from_slice(&version.to_le_bytes());
+            if version < 5 {
+                bytes[7] = 0;
+                bytes[40..48].fill(0);
+            }
+            let decoded = decode_index_catalog(&bytes).unwrap();
+            assert!(decoded.reclaim_intent.is_none());
+            assert_eq!(
+                decode_index_catalog(&encode_index_catalog(&decoded).unwrap()).unwrap(),
+                decoded
+            );
+        }
+        let mut old = node();
+        old.reclaim_intent = None;
+        let mut bytes = encode_index_catalog(&old).unwrap();
+        bytes[4..6].copy_from_slice(&7_u16.to_le_bytes());
+        assert_eq!(decode_index_catalog(&bytes).unwrap(), old);
+        bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            decode_index_catalog(&bytes),
+            Err(IndexError::UnsupportedVersion(1))
+        );
     }
 }

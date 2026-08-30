@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 cargo-fuzz = true
 
 [dependencies]
+crc32c = "0.6.8"
 libfuzzer-sys = "0.4"
 netbadb-core = { path = "../crates/netbadb-core" }
 netbadb-index = { path = "../crates/netbadb-index" }
