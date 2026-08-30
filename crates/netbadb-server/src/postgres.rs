@@ -5196,6 +5196,52 @@ mod tests {
             .map(|index| (index.oid, index.name.clone(), index.column_id))
             .collect::<Vec<_>>();
 
+        // Exercise the Core-only maintenance boundary; no new PG SQL surface.
+        let retired = database.create_index(TableId(1), ColumnId(1)).unwrap();
+        database.drop_index(TableId(1), retired.id).unwrap();
+        let named = database
+            .prepare_ddl_statement("CREATE INDEX teams_id_named ON teams (id)")
+            .unwrap();
+        database.execute_ddl(&named).unwrap();
+        let named_catalog = PgCompatibilityCatalog::derive(&database).unwrap();
+        let named_identity = named_catalog
+            .table("teams")
+            .unwrap()
+            .indexes
+            .iter()
+            .map(|index| (index.oid, index.name.clone(), index.column_id))
+            .collect::<Vec<_>>();
+        let inspection = database.inspect_catalog().unwrap();
+        let generation = database.catalog_generation();
+        let report = database.compact_index_catalog(TableId(1)).unwrap();
+        assert_eq!(report.retired_indexes_removed, 1);
+        assert_eq!(database.inspect_catalog().unwrap(), inspection);
+        assert_eq!(database.catalog_generation(), generation);
+        let compacted = PgCompatibilityCatalog::derive(&database).unwrap();
+        assert_eq!(
+            compacted
+                .table("users")
+                .unwrap()
+                .indexes
+                .iter()
+                .map(|index| (index.oid, index.name.clone(), index.column_id))
+                .collect::<Vec<_>>(),
+            stable_indexes
+        );
+
+        database.compact_index_catalog(TableId(2)).unwrap();
+        let compacted = PgCompatibilityCatalog::derive(&database).unwrap();
+        assert_eq!(
+            compacted
+                .table("teams")
+                .unwrap()
+                .indexes
+                .iter()
+                .map(|index| (index.oid, index.name.clone(), index.column_id))
+                .collect::<Vec<_>>(),
+            named_identity
+        );
+
         database.close().expect("close catalog fixture");
         let reopened = Database::open_tables(paths.iter().cloned().zip(tables).collect::<Vec<_>>())
             .expect("reopen catalog fixture");
@@ -5210,6 +5256,16 @@ mod tests {
                 .map(|index| (index.oid, index.name.clone(), index.column_id))
                 .collect::<Vec<_>>(),
             stable_indexes
+        );
+        assert_eq!(
+            reopened_catalog
+                .table("teams")
+                .unwrap()
+                .indexes
+                .iter()
+                .map(|index| (index.oid, index.name.clone(), index.column_id))
+                .collect::<Vec<_>>(),
+            named_identity
         );
         reopened.close().expect("close reopened catalog fixture");
         cleanup(&[&paths[0], &paths[1], &paths[2]]);

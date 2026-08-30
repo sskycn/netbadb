@@ -25,6 +25,16 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
     let mut database = Database::create_tables(tables.clone())?;
     database.create_index(TableId(1), ColumnId(2))?;
     database.create_index(TableId(1), ColumnId(3))?;
+    // All real-client probes start from a checkpointed compacted catalog.
+    // Maintenance stays a Core operation, never an invented PG SQL command.
+    let retired = database.create_index(TableId(1), ColumnId(1))?;
+    database.drop_index(TableId(1), retired.id)?;
+    let before = database.inspect_catalog()?;
+    let report = database.compact_index_catalog(TableId(1))?;
+    if report.retired_indexes_removed != 1 || database.inspect_catalog()? != before {
+        return Err("catalog compaction changed the fixture's active metadata".into());
+    }
+    database.checkpoint()?;
     database.close()?;
     let reopened = Database::open_tables(tables)?;
     let indexes = &reopened.inspect_catalog()?.tables[0].indexes;

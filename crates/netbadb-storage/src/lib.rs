@@ -17,7 +17,10 @@ mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
-pub use heap::{HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, PresenceCountSummary};
+pub use heap::{
+    HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IndexMaintenanceReport,
+    PresenceCountSummary,
+};
 pub(crate) use lsm::LsmRowHandle;
 pub use lsm::{
     DEFAULT_LSM_MEMTABLE_FLUSH_BYTES, LSM_MANIFEST_FORMAT_VERSION, LSM_MAX_LEVELS,

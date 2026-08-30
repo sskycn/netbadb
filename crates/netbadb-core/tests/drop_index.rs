@@ -89,6 +89,27 @@ fn drop_commit_rollback_replan_index_join_and_reopen() {
         .execute_prepared(&prepared, &[ScalarValue::Int64(3)])
         .unwrap();
     let expected_join = db.execute_prepared(&prepared_join, &[]).unwrap();
+    ddl(&mut db, "CREATE INDEX disposable ON users (name)").unwrap();
+    ddl(&mut db, "DROP INDEX disposable").unwrap();
+    let inspection_before = db.inspect_catalog().unwrap();
+    let plans_before = [point, range, join].map(|sql| db.inspect_statement(sql).unwrap());
+    let generation_before = db.catalog_generation();
+    let maintenance = db.compact_index_catalog(TableId(1)).unwrap();
+    assert_eq!(maintenance.retired_indexes_removed, 1);
+    assert_eq!(db.inspect_catalog().unwrap(), inspection_before);
+    assert_eq!(db.catalog_generation(), generation_before);
+    for (sql, before) in [point, range, join].into_iter().zip(plans_before) {
+        assert_eq!(db.inspect_statement(sql).unwrap(), before);
+    }
+    assert_eq!(
+        db.execute_prepared(&prepared, &[ScalarValue::Int64(3)])
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.execute_prepared(&prepared_join, &[]).unwrap(),
+        expected_join
+    );
     let old = db.indexes(TableId(1)).unwrap()[0].clone();
     let drop = db
         .prepare_ddl_statement("DROP INDEX public.users_id_idx")

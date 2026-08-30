@@ -360,6 +360,19 @@ impl BufferPool {
         self.state.borrow_mut().flush_all()
     }
 
+    /// Maintenance admission preflight; no live guard may span a catalog rewrite.
+    pub(crate) fn ensure_unpinned(&self) -> Result<(), StorageError> {
+        for frame in &self.state.borrow().frames {
+            if frame.pin_count != 0 {
+                return Err(BufferError::PagePinned {
+                    page_id: frame.page_id,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn undo_page_update(
         &self,
         page_id: PageId,

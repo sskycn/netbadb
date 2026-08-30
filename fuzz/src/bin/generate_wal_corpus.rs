@@ -137,6 +137,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-analyzed-root"),
         encode_index_catalog(&IndexCatalogNode {
+            next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: None,
             table_statistics: Some(TableStatistics {
                 row_count: 10,
@@ -146,6 +147,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
         })?,
     )?;
     let one = encode_index_catalog(&IndexCatalogNode {
+            next_index_id: Some(netbadb_types::IndexId(4)),
         next_catalog: None,
         table_statistics: None,
         entries: vec![IndexCatalogEntry {
@@ -163,19 +165,31 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     })?;
     let mut named = netbadb_index::decode_index_catalog(&one)?;
     named.entries[0].definition.name = Some(netbadb_types::IndexName::new("named_idx")?);
-    let named_v4 = encode_index_catalog(&named)?;
+    let named_v5 = encode_index_catalog(&named)?;
+    std::fs::write(output.join("valid-named-v5"), &named_v5)?;
+    let mut named_v4 = named_v5;
+    named_v4[4..6].copy_from_slice(&4_u16.to_le_bytes());
+    named_v4[7] = 0;
+    named_v4[40..48].fill(0);
     std::fs::write(output.join("valid-named-v4"), &named_v4)?;
     let mut named_v3 = named_v4;
     named_v3[4..6].copy_from_slice(&3_u16.to_le_bytes());
     named_v3.drain(88..96);
     std::fs::write(output.join("valid-named-v3"), named_v3)?;
     named.entries[0].retired = true;
-    std::fs::write(
-        output.join("valid-retired-named-v4"),
-        encode_index_catalog(&named)?,
-    )?;
+    let mut retired_named = encode_index_catalog(&named)?;
+    std::fs::write(output.join("valid-retired-named-v5"), &retired_named)?;
+    retired_named[4..6].copy_from_slice(&4_u16.to_le_bytes());
+    retired_named[7] = 0;
+    retired_named[40..48].fill(0);
+    std::fs::write(output.join("valid-retired-named-v4"), retired_named)?;
     std::fs::write(output.join("valid-one-entry"), &one)?;
-    let mut retired = one.clone();
+    let mut v4 = one.clone();
+    v4[4..6].copy_from_slice(&4_u16.to_le_bytes());
+    v4[7] = 0;
+    v4[40..48].fill(0);
+    std::fs::write(output.join("valid-legacy-v4"), &v4)?;
+    let mut retired = v4.clone();
     retired[84] = 1;
     std::fs::write(output.join("valid-retired-v4"), &retired)?;
     std::fs::write(
@@ -184,25 +198,40 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     )?;
     retired[84] = 2;
     std::fs::write(output.join("invalid-state-v4"), &retired)?;
-    let mut invalid_id = one.clone();
+    let mut invalid_id = v4.clone();
     invalid_id[88..96].fill(0);
     std::fs::write(output.join("invalid-zero-id-v4"), invalid_id)?;
-    let mut duplicate_id = one.clone();
+    let mut duplicate_id = v4.clone();
     duplicate_id[16..20].copy_from_slice(&2_u32.to_le_bytes());
     duplicate_id.extend_from_slice(&one[48..]);
     std::fs::write(output.join("duplicate-ids-v4"), duplicate_id)?;
     for version in [2_u16, 3] {
-        let mut legacy = one.clone();
+        let mut legacy = v4.clone();
         legacy[4..6].copy_from_slice(&version.to_le_bytes());
         legacy.drain(88..96);
         std::fs::write(output.join(format!("valid-legacy-v{version}")), legacy)?;
     }
 
     std::fs::write(output.join("valid-missing-stats-entry"), &one)?;
-    std::fs::write(output.join("valid-continuation-page"), &one)?;
+    let mut continuation = one.clone();
+    continuation[7] = 0;
+    continuation[40..48].fill(0);
+    std::fs::write(output.join("valid-continuation-page"), continuation)?;
+    let mut compacted = IndexCatalogNode::empty();
+    compacted.next_index_id = Some(netbadb_types::IndexId(101));
+    std::fs::write(output.join("valid-compacted-high-water-v5"), encode_index_catalog(&compacted)?)?;
+    for value in [0_u64, 3] {
+        let mut invalid = one.clone();
+        invalid[40..48].copy_from_slice(&value.to_le_bytes());
+        std::fs::write(output.join(format!("invalid-high-water-{value}-v5")), invalid)?;
+    }
+    let mut invalid_state = one.clone();
+    invalid_state[84] = 2;
+    std::fs::write(output.join("invalid-state-v5"), invalid_state)?;
     std::fs::write(
         output.join("valid-analyzed-index-entry"),
         encode_index_catalog(&IndexCatalogNode {
+            next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: None,
             table_statistics: Some(TableStatistics {
                 row_count: 10,
@@ -229,6 +258,7 @@ fn write_index_catalog_decode_seeds(wal_output: &Path) -> Result<(), Box<dyn std
     std::fs::write(
         output.join("valid-catalog-with-next"),
         encode_index_catalog(&IndexCatalogNode {
+            next_index_id: Some(netbadb_types::IndexId(4)),
             next_catalog: Some(PageId(9)),
             table_statistics: None,
             entries: vec![],

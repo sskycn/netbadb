@@ -1761,29 +1761,26 @@ reclamation. Uniqueness, SQL index DDL, and range lookup remain deferred.
 ## Persistent index registry
 
 Heap metadata points to a fixed `IndexCatalog` root. Catalog pages are
-ordinary checksummed Page v5 single-payload pages containing version-4 `NBIC`
-payloads. Versions 2 (legacy unnamed) and 3 (optional name) remain readable;
-v1 is explicitly rejected. The cycle-checked linked chain preserves registration
-order. Registrations append; statistics and retirement update existing entries
-using WAL-backed full-page before/after images.
-
-The v4 payload keeps the 48-byte v2/v3 header, adds lifecycle state in the old
-entry reserved area, and extends each entry prefix with a logical IndexId:
+checksummed Page v5 single-payload pages containing version-5 `NBIC` payloads.
+Versions 2 (unnamed), 3 (optional name) and 4 (explicit logical identity and
+retirement) remain readable; v1 is rejected. Registration order is preserved.
+The authoritative allocator high-water lives only in the root, never in Heap
+metadata or a cache reconstructed from surviving active entries.
 
 ```text
-header (48 bytes, little endian)
+v5 header (48 bytes, little endian)
 0..4    NBIC magic
-4..6    u16 version (4; decoder also accepts 2 and 3)
+4..6    u16 version (5; decoder also accepts 2, 3, 4)
 6       u8 table-statistics presence (0 or 1)
-7       reserved zero
+7       u8 next_index_id presence (1 on root, 0 on continuations)
 8..16   u64 next catalog PageId (0 means none)
 16..20  u32 entry count
 20..24  reserved zero
 24..32  u64 row_count (zero when absent)
 32..40  u64 managed_page_count (zero when absent)
-40..48  reserved zero
+40..48  u64 next_index_id (nonzero on root, zero on continuations)
 
-v4 entry prefix (48 bytes, little endian)
+v4/v5 entry prefix (48 bytes, little endian)
 0..4    u32 ColumnId
 4       u8 index-statistics presence (0 or 1)
 5       u8 logical-name presence (0 or 1)
@@ -1798,30 +1795,45 @@ v4 entry prefix (48 bytes, little endian)
 48..    logical-name UTF-8 bytes when present (maximum 255)
 ```
 
-Versions 2/3 have a 40-byte prefix and require bytes 36..40 to be zero;
-v2 additionally requires bytes 5..8 to be zero. Legacy entries decode as active,
-with IndexId initialized from their unique metadata PageId. This is a one-time
-migration assignment: new registrations allocate `max(all retained IDs) + 1`,
-independent of page allocation. Retired IDs and handles remain reserved.
-IDs are scoped to one physical registry, exposed as `(TableId, IndexId)` for
-supported single-storage tables. Logical partition-index DDL remains unsupported.
-A future catalog compaction must retain the ID high-water mark.
+Legacy headers require byte 7 and bytes 40..48 to be zero. Versions 2/3 have a
+40-byte entry prefix with bytes 36..40 zero; v2 also requires bytes 5..8 zero.
+Their IDs remain exactly their unique metadata PageIds. V4 IDs are decoded
+explicitly. Only a legacy root may infer `max(all active AND retired IDs) + 1`,
+because those formats never compacted. V5 roots must supply a boundary greater
+than every ID in the entire chain. Presence/zero mismatch, an absent v5 root
+boundary, or a boundary on a continuation is corrupt. `u64::MAX` is a valid
+exhausted next-ID boundary; CREATE returns typed IndexIdExhausted without
+allocating a tree, never wraps or issues that last value. Legacy MAX IDs also
+fail checked boundary derivation. A committed ID is never reused; rollback may
+reuse an unpublished ID.
 
-Only the root may contain table statistics. Active index statistics require
-root statistics and validate population counts and nonzero height. Retired
-entries must have no index statistics. Rebuild rejects duplicate IDs/handles
-across the entire chain, duplicate active columns/names, unknown state tags,
-invalid IDs, malformed lengths, trailing bytes, cycles, bad links, and invalid
-statistics. It does not interpret history as last-writer-wins events: each
-retirement mutates exactly one retained registration. Unknown and double-drop
-requests are errors before logging. ANALYZE skips retired entries entirely.
+Only the root contains table statistics. Active index statistics require root
+statistics, valid population counts and nonzero height. Retired entries cannot
+contain statistics. Rebuild rejects duplicate IDs/handles across the entire
+chain, duplicate active names/columns, bad bounds/kinds/links, cycles, malformed
+names, counts and state tags. ANALYZE preserves the high-water and ignores retired
+entries. CREATE reserves the next ID in the root in the same transaction as tree
+allocation, backfill and final registration. Legacy root writes initialize the
+boundary from the complete un-compacted chain, not just that page.
 
-Writing a full legacy page may overflow its expanded v4 representation. The
-writer moves a suffix to a new continuation page, logs its new-page image before
-the existing page/link update, and flushes WAL before file extension. The original
-next link is retained on the new page. Reverse undo restores the link before
-truncating the new trailing page. The same helper handles registration growth,
-statistics upgrades, and retirement. No other persistent format changes.
+An ordinary legacy update can spill a suffix into a new continuation when the
+explicit-ID representation no longer fits. New-page logging precedes link
+logging and WAL sync precedes allocation. Reverse undo restores links first.
+Explicit `compact_index_catalog` packs active entries and current snapshots into
+the smallest chain in creation order, reusing its existing prefix. Dense legacy
+upgrades may need additional trailing catalog pages. All replacement images are
+preflighted and logged in one transaction, new allocations first and root last.
+Full-page recovery undo or redo resolves an interrupted rewrite; it does not rely
+on an atomic multi-page overwrite. Heap metadata, root PageId, Page/WAL/BTree
+formats and catalog_generation are unchanged.
+
+Removed registrations and unused continuation pages follow **permanent physical
+abandonment**. There is no durable retired-page inventory after compaction and
+no promised future reclamation of those holes. No truncate/free/reuse occurs.
+The maintenance report counts this operation's abandoned tree and catalog pages
+separately and always reports zero reclaimed pages. Its geometric retired suffix
+is diagnostic only, not an authorization to truncate. See the full
+[Round 8 design and crash matrix](index-lifecycle-round8.md).
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees are never discovered by scanning page
@@ -1847,9 +1859,10 @@ only on publication. PG sessions refresh on the next metadata query. Uncommitted
 DROP leaves the published active path usable and DML-maintained; rollback
 restores its catalog bytes. Existing prepared queries replan at execution.
 Retired definitions retain tree ownership in storage-only inspection but never
-enter ordinary CatalogInspection, access paths, ANALYZE, or vacuum. No allocator
-free-list exists, so retired pages are neither reused nor reclaimed, and repeated
-create/drop grows the file. See [the lifecycle audit](index-lifecycle-round7.md).
+enter ordinary CatalogInspection, access paths, ANALYZE, or vacuum. Explicit
+Round 8 compaction removes these definitions after validating page ownership,
+permanently abandoning their space. No free-list exists; repeated create/drop
+still grows the file. See [the lifecycle audit](index-lifecycle-round8.md).
 For every physical Heap version that has not been vacuumed and every registered
 index, one candidate entry `(version[column], version RowId)` exists. Raw
 B+Trees are outside this invariant. INSERT and UPDATE publish a new Heap version
@@ -2481,9 +2494,9 @@ client-address labels.
 Networking remains synchronous and must not leak async into parser, compiler,
 planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
 contract, not a database-file format. The current independent persistent
-contracts are Canonical Schema v1, Heap metadata v4, MVCC tuple v1,
+contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
 transaction-status v1, Page v5, WAL v3/record v2, BTree v1, and IndexCatalog
-v2. Deployment manifest v4 is configuration, not a database format or canonical
+v5 (backward decode v2/v3/v4). Deployment manifest v4 is configuration, not a database format or canonical
 schema identity.
 
 Rust applications choose either the default embedded SDK or the optional

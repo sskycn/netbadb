@@ -128,6 +128,10 @@ for Index.drop is used.
 
 ## Physical lifetime and Round 8
 
+This section records the Round 7 baseline. [Round 8](index-lifecycle-round8.md)
+now compacts catalog history with durable high-water; physical reclaim remains
+deferred, with an explicit permanent-abandonment policy.
+
 DROP is logically and durably complete. Reclamation is deferred: retired tree
 pages remain in the file, are not reused, and are not accessed by active planning,
 DML, ANALYZE, vacuum, or registry rebuild. `HeapStorage::retired_indexes()` is an

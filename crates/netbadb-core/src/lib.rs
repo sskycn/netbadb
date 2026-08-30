@@ -49,8 +49,8 @@ pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_storage::{
-    IndexDefinition, IndexStatistics, IsolationLevel, LsmInspection, LsmLevelInspection,
-    LsmReadAmplification, LsmWriteAmplification, StorageKind, TableStatistics,
+    IndexDefinition, IndexMaintenanceReport, IndexStatistics, IsolationLevel, LsmInspection,
+    LsmLevelInspection, LsmReadAmplification, LsmWriteAmplification, StorageKind, TableStatistics,
 };
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
@@ -1353,6 +1353,41 @@ impl Database {
             entry.storage.checkpoint()?;
         }
         Ok(())
+    }
+
+    /// Explicit quiescent maintenance of one single-storage Heap index catalog.
+    /// Drop all DatabaseTransaction handles first (including lazy participants);
+    /// the Heap also enforces its existing checkpoint admission gate. Active
+    /// indexes, statistics, reflection and catalog_generation remain unchanged.
+    /// Physical pages are permanently abandoned, never truncated or reused.
+    pub fn compact_index_catalog(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<IndexMaintenanceReport, DatabaseError> {
+        let handles = Rc::strong_count(&self.transaction_owner) - 1;
+        if handles != 0 {
+            return Err(StorageError::from(
+                netbadb_storage::CheckpointError::OutstandingTransactions {
+                    count: handles as u64,
+                },
+            )
+            .into());
+        }
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .compact_index_catalog()
+                .map_err(Into::into),
+            TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
+                operation: "index catalog compaction",
+                storage_kind: "range-partitioned table",
+            }
+            .into()),
+        }
     }
 
     /// Drives synchronous history-preserving leveled compaction for one LSM.
@@ -5019,6 +5054,20 @@ mod tests {
         database
             .commit_transaction(&mut committed)
             .expect("commit DDL through database");
+        drop(rolled_back);
+        drop(committed);
+        let inspection_before = database.inspect_catalog().unwrap();
+        let generation_before = database.catalog_generation();
+        let lazy_reader = database.begin_transaction().unwrap();
+        assert!(database.compact_index_catalog(TableId(1)).is_err());
+        drop(lazy_reader);
+        let retired = database.create_index(TableId(1), ColumnId(1)).unwrap();
+        database.drop_index(TableId(1), retired.id).unwrap();
+        let generation_after_drop = database.catalog_generation();
+        assert!(generation_after_drop > generation_before);
+        database.compact_index_catalog(TableId(1)).unwrap();
+        assert_eq!(database.inspect_catalog().unwrap(), inspection_before);
+        assert_eq!(database.catalog_generation(), generation_after_drop);
         let indexes = database.indexes(TableId(1)).unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(

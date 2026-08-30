@@ -326,15 +326,22 @@ the pre-Foundation sequential `HEAP` page prototype are likewise not migrated.
 The legacy metadata page 0 retains its separate version-5 layout and is not a
 checksummed Page v5 data page.
 
-IndexCatalog payload version 4 adds a nonzero registry-scoped `IndexId` and
-active/retired state to version 3's bounded logical name and optimizer fields.
-Versions 2 (unnamed) and 3 remain readable; version 1 is explicitly rejected.
-DROP retires the catalog entry through the existing WAL transaction and removes
-all active access paths only after commit. Statistics remain explicit `ANALYZE`
-snapshots; retirement discards the index snapshot, and recreation starts fresh.
-Retired BTree pages are not reclaimed or reused. Repeated create/drop grows the
-file; safe physical reclamation and catalog compaction are deferred to a separate
-storage lifecycle phase. See [the Round 7 audit](docs/index-lifecycle-round7.md).
+IndexCatalog payload version 5 adds a root-only durable `next_index_id` to
+version 4's nonzero logical IndexId and active/retired state. Versions 2
+(unnamed), 3 (optional names), and 4 remain readable; version 1 is rejected.
+DROP still retires entries transactionally; only commit removes active paths.
+Statistics remain explicit ANALYZE snapshots. `Database::compact_index_catalog`
+(and the Heap/Storage counterparts) explicitly compact the active registration
+chain under quiescence, preserving names, identity, statistics and ID high-water.
+Existing full-page WAL undo/redo protects the rewrite, including legacy expansion.
+
+Physical reclaim is **deferred**. Removed tree registrations and obsolete
+catalog continuations are **permanently abandoned**, not saved for future GC.
+No page is freed, truncated or reused. Maintenance bounds the reachable catalog,
+not the database file, which still grows with CREATE/DROP cycles. Raw handles
+lack PageId generations; BTree merges also leave untracked orphan pages.
+See [the Round 8 storage audit](docs/index-lifecycle-round8.md) for the explicit
+space-leak policy, ownership validation, crash proof and maintenance report.
 
 Each database uses two alternating WAL slots named `<database>-wal` and
 `<database>-wal.next`, plus a durable append-only transaction-status file named

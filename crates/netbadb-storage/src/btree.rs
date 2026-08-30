@@ -490,6 +490,68 @@ impl<'a> BTree<'a> {
         Ok(self.read_meta(handle)?.height)
     }
 
+    /// Enumerates only pages reachable from the authoritative metadata root.
+    /// Merge orphans are deliberately excluded: page kind is not ownership.
+    /// `owned` spans all trees and reserved pages, detecting aliases as well
+    /// as within-tree cycles/duplicate child edges. No guards escape.
+    pub(crate) fn collect_owned_pages(
+        &self,
+        handle: BTreeHandle,
+        owned: &mut HashSet<PageId>,
+    ) -> Result<HashSet<PageId>, StorageError> {
+        let meta = self.read_meta(handle)?;
+        if !owned.insert(handle.meta_page) {
+            return Err(IndexError::SharedTreePage(handle.meta_page).into());
+        }
+        let mut pages = HashSet::from([handle.meta_page]);
+        let mut pending = vec![(meta.root_page, meta.height)];
+        // Mark at enqueue time so malformed fanout cannot grow the worklist
+        // beyond the database's page count before discovering duplicates.
+        if !owned.insert(meta.root_page) {
+            return Err(IndexError::SharedTreePage(meta.root_page).into());
+        }
+        let mut previous_link: Option<(PageId, Option<PageId>)> = None;
+        let mut previous_key: Option<IndexEntryKey> = None;
+        while let Some((page_id, height)) = pending.pop() {
+            pages.insert(page_id);
+            if height == 1 {
+                let leaf = self.read_leaf(page_id, &meta.spec)?;
+                if let Some((previous, next)) = previous_link {
+                    if next != Some(page_id) {
+                        return Err(IndexError::InvalidLeafChain(previous).into());
+                    }
+                }
+                if let (Some(previous), Some(first)) = (&previous_key, leaf.entries.first()) {
+                    if compare_entry_keys(previous, first) != Ordering::Less {
+                        return Err(IndexError::InvalidEntryOrder.into());
+                    }
+                }
+                if let Some(last) = leaf.entries.last() {
+                    previous_key = Some(last.clone());
+                }
+                previous_link = Some((page_id, leaf.next_leaf));
+            } else {
+                let node = self.read_internal(page_id, &meta.spec)?;
+                let children = std::iter::once(node.first_child).chain(
+                    node.separators
+                        .iter()
+                        .map(|separator| separator.right_child),
+                );
+                let children: Vec<_> = children.collect();
+                for child in children.into_iter().rev() {
+                    if !owned.insert(child) {
+                        return Err(IndexError::SharedTreePage(child).into());
+                    }
+                    pending.push((child, height - 1));
+                }
+            }
+        }
+        if let Some((last, Some(_))) = previous_link {
+            return Err(IndexError::InvalidLeafChain(last).into());
+        }
+        Ok(pages)
+    }
+
     pub(crate) fn read_meta(&self, handle: BTreeHandle) -> Result<MetaNode, StorageError> {
         self.validate_child(handle.meta_page)?;
         let page = self.storage.buffer().read_page(handle.meta_page)?;

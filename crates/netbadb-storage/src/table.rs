@@ -1205,6 +1205,17 @@ impl TableStorage {
         }
     }
 
+    /// Explicit Heap index metadata maintenance; LSM indexes are unsupported.
+    pub fn compact_index_catalog(&mut self) -> Result<crate::IndexMaintenanceReport, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.compact_index_catalog(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "index catalog compaction",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     pub fn compact(&mut self) -> Result<(), StorageError> {
         match self {
             Self::Heap(_) => Err(StorageError::UnsupportedOperation {

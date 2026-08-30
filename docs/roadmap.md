@@ -515,12 +515,30 @@ PostgreSQL-only metadata absent from NetbaDB remain unsupported.
   free/reuse primitive exists; repeated create/drop grows catalog and database
   files. Quiescent reclamation and catalog compaction are intentionally deferred.
 
-Round 8 should first audit a storage lifecycle boundary for retired-tree
-reclamation, existing BTree merge orphans, and catalog compaction with preserved
-IndexId high-water marks. A separate table-schema lifecycle audit can then cover
-Canonical Schema authority/fingerprints, table manifests, transaction/recovery,
-and SDK generation. Do not begin CREATE TABLE as a parser-only extension.
-See [the Round 7 implementation audit](index-lifecycle-round7.md).
+### Storage Lifecycle Round 8 — catalog compaction complete; physical reclaim deferred
+
+- introduced IndexCatalog v5 root-only durable next_index_id; v2/v3 IDs retain
+  metadata-page derivation, v4 IDs remain explicit, and v1 remains rejected;
+- added explicit synchronous Heap/TableStorage/Core catalog compaction, using
+  checkpoint admission and full-page WAL rollback/recovery rather than unlogged
+  destructive writes; active identities, names, statistics and reflection stay
+  unchanged, and repeated maintenance is a no-op;
+- added root-to-leaf ownership enumeration with duplicate/cycle, alias, kind,
+  bound and leaf-link validation for active, retired and raw trees;
+- chose permanent abandonment of dropped-tree pages and obsolete continuation
+  pages after compaction. No physical reclamation, file truncation or arbitrary
+  PageId reuse is implemented; the database file and status history still grow;
+- added deterministic CREATE/DROP stress, legacy expansion and process-crash
+  tests, high-water corruption/exhaustion checks, Core/PG identity regressions,
+  and v2/v3/v4/v5 catalog fuzz seeds.
+
+Round 9 should audit storage ownership/generation and a durable allocator or
+whole-file rewrite before table DDL. Raw handles, merge-orphan ownership, old WAL,
+and buffer invalidation must be resolved before recycling any committed PageId.
+A separate Table Schema Lifecycle Architecture Audit remains later work, covering
+Canonical Schema authority, fingerprints, manifests, TableId high-water,
+transaction/recovery and SDK generation. Do not begin CREATE TABLE coding here.
+See [the Round 8 implementation audit](index-lifecycle-round8.md).
 
 ## Phase 6 — SDK and tooling
 

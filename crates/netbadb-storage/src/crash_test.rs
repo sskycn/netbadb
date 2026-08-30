@@ -44,6 +44,12 @@ pub(crate) enum TestCrashPoint {
     RegisteredInsertAfterHeapPublish,
     RegisteredUpdateAfterHeapPublish,
     RegisteredDeleteAfterFirstIndexPublish,
+    IndexCompactAfterLogs,
+    IndexCompactAfterAllocation,
+    IndexCompactBeforeRootPublish,
+    IndexCompactAfterPagePublish,
+    IndexCompactAfterPagesDurable,
+    IndexCompactAfterCommit,
     WalPartialFinalRecord,
 }
 
@@ -82,6 +88,12 @@ impl TestCrashPoint {
             Self::RegisteredDeleteAfterFirstIndexPublish => {
                 "registered-delete-after-first-index-publish"
             }
+            Self::IndexCompactAfterLogs => "IndexCompactAfterLogs",
+            Self::IndexCompactAfterAllocation => "IndexCompactAfterAllocation",
+            Self::IndexCompactBeforeRootPublish => "IndexCompactBeforeRootPublish",
+            Self::IndexCompactAfterPagePublish => "IndexCompactAfterPagePublish",
+            Self::IndexCompactAfterPagesDurable => "IndexCompactAfterPagesDurable",
+            Self::IndexCompactAfterCommit => "IndexCompactAfterCommit",
             Self::WalPartialFinalRecord => "wal-partial-final-record",
         }
     }

@@ -12,7 +12,7 @@ use netbadb_types::{
 };
 
 pub const BTREE_FORMAT_VERSION: u16 = 1;
-pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 4;
+pub const INDEX_CATALOG_FORMAT_VERSION: u16 = 5;
 const META_MAGIC: &[u8; 4] = b"NBTM";
 const LEAF_MAGIC: &[u8; 4] = b"NBTL";
 const INTERNAL_MAGIC: &[u8; 4] = b"NBTI";
@@ -94,10 +94,12 @@ pub struct IndexCatalogEntry {
 
 /// One page in the persistent registration chain, with WAL-backed retirement.
 ///
-/// The version-4 `NBIC` payload uses a fixed-width little-endian header and
+/// The version-5 `NBIC` payload uses a fixed-width little-endian header and
 /// entry prefixes plus bounded optional names. Storage validates chain rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatalogNode {
+    /// Root-only durable allocator boundary; None on continuations and legacy decode.
+    pub next_index_id: Option<IndexId>,
     pub next_catalog: Option<PageId>,
     pub table_statistics: Option<TableStatistics>,
     pub entries: Vec<IndexCatalogEntry>,
@@ -107,6 +109,7 @@ impl IndexCatalogNode {
     #[must_use]
     pub fn empty() -> Self {
         Self {
+            next_index_id: Some(IndexId(1)),
             next_catalog: None,
             table_statistics: None,
             entries: Vec::new(),
@@ -177,6 +180,10 @@ pub enum IndexError {
     InvalidIndexName,
     InvalidIndexState(u8),
     InvalidIndexId(IndexId),
+    InvalidIndexHighWater(IndexId),
+    IndexIdExhausted,
+    SharedTreePage(PageId),
+    InvalidLeafChain(PageId),
     DuplicateIndexId(IndexId),
     DuplicateTreeHandle(PageId),
     UnknownIndexId(IndexId),
@@ -292,6 +299,16 @@ impl fmt::Display for IndexError {
             }
             Self::InvalidIndexState(value) => {
                 write!(formatter, "invalid index lifecycle state {value}")
+            }
+            Self::InvalidIndexHighWater(id) => {
+                write!(formatter, "invalid index high-water {}", id.0)
+            }
+            Self::IndexIdExhausted => formatter.write_str("index identity space exhausted"),
+            Self::SharedTreePage(page) => {
+                write!(formatter, "duplicate or shared tree page {}", page.0)
+            }
+            Self::InvalidLeafChain(page) => {
+                write!(formatter, "invalid leaf chain at page {}", page.0)
             }
             Self::InvalidIndexId(id) => write!(formatter, "invalid index identity {}", id.0),
             Self::DuplicateIndexId(id) => write!(formatter, "duplicate index identity {}", id.0),
@@ -934,7 +951,7 @@ pub fn merge_internals_if_fits(
     Ok((payload.len() <= capacity).then_some(merged))
 }
 
-/// Encodes one explicit version-4 mutable index catalog page payload.
+/// Encodes one explicit version-5 mutable index catalog page payload.
 pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexError> {
     if let Some(next) = node.next_catalog {
         validate_child(next)?;
@@ -954,6 +971,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
         }
     }
     validate_catalog_entries(&node.entries)?;
+    validate_index_high_water(node.next_index_id, &node.entries)?;
     let count = u32::try_from(node.entries.len()).map_err(|_| IndexError::LengthOverflow)?;
     let capacity = node
         .entries
@@ -975,7 +993,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     output.extend_from_slice(INDEX_CATALOG_MAGIC);
     output.extend_from_slice(&INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
     output.push(u8::from(node.table_statistics.is_some()));
-    output.push(0);
+    output.push(u8::from(node.next_index_id.is_some()));
     output.extend_from_slice(&node.next_catalog.map_or(0, |page| page.0).to_le_bytes());
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&0_u32.to_le_bytes());
@@ -985,7 +1003,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     });
     output.extend_from_slice(&table_statistics.row_count.to_le_bytes());
     output.extend_from_slice(&table_statistics.managed_page_count.to_le_bytes());
-    output.extend_from_slice(&0_u64.to_le_bytes());
+    output.extend_from_slice(&node.next_index_id.map_or(0, |id| id.0).to_le_bytes());
     for entry in &node.entries {
         output.extend_from_slice(&entry.definition.column_id.0.to_le_bytes());
         output.push(u8::from(entry.statistics.is_some()));
@@ -1018,7 +1036,7 @@ pub fn encode_index_catalog(node: &IndexCatalogNode) -> Result<Vec<u8>, IndexErr
     Ok(output)
 }
 
-/// Decodes legacy version-2/version-3 or current version-4 index catalog payloads.
+/// Decodes legacy version-2/version-3/version-4 or current version-5 index catalog payloads.
 pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError> {
     if input.len() < INDEX_CATALOG_HEADER_SIZE {
         return Err(IndexError::Truncated);
@@ -1030,14 +1048,28 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         });
     }
     let version = u16::from_le_bytes(input[4..6].try_into().map_err(|_| IndexError::Truncated)?);
-    if !matches!(version, 2 | 3 | INDEX_CATALOG_FORMAT_VERSION) {
+    if !matches!(version, 2 | 3 | 4 | INDEX_CATALOG_FORMAT_VERSION) {
         return Err(IndexError::UnsupportedVersion(version));
     }
     let table_statistics_present = decode_statistics_presence(input[6])?;
-    if input[7] != 0
-        || input[20..24].iter().any(|byte| *byte != 0)
-        || input[40..48].iter().any(|byte| *byte != 0)
-    {
+    let next_index_id = if version == INDEX_CATALOG_FORMAT_VERSION {
+        let value = IndexId(u64::from_le_bytes(
+            input[40..48]
+                .try_into()
+                .map_err(|_| IndexError::Truncated)?,
+        ));
+        match (input[7], value.0) {
+            (0, 0) => None,
+            (1, 1..) => Some(value),
+            _ => return Err(IndexError::InvalidIndexHighWater(value)),
+        }
+    } else {
+        if input[7] != 0 || input[40..48].iter().any(|byte| *byte != 0) {
+            return Err(IndexError::InvalidReservedBytes);
+        }
+        None
+    };
+    if input[20..24].iter().any(|byte| *byte != 0) {
         return Err(IndexError::InvalidReservedBytes);
     }
     let raw_next = u64::from_le_bytes(input[8..16].try_into().map_err(|_| IndexError::Truncated)?);
@@ -1047,7 +1079,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
             .try_into()
             .map_err(|_| IndexError::Truncated)?,
     ) as usize;
-    let entry_header_size = if version == INDEX_CATALOG_FORMAT_VERSION {
+    let entry_header_size = if version >= 4 {
         INDEX_CATALOG_ENTRY_HEADER_SIZE
     } else {
         LEGACY_INDEX_CATALOG_ENTRY_HEADER_SIZE
@@ -1103,7 +1135,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
             }
             (present, length)
         };
-        let retired = if version == INDEX_CATALOG_FORMAT_VERSION {
+        let retired = if version >= 4 {
             match chunk[36] {
                 0 => false,
                 1 => true,
@@ -1125,7 +1157,7 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         // Legacy registrations had no logical ID. Metadata pages were unique
         // and never reused; freeze that value as the migration ID, then allocate
         // subsequent IDs independently above all active AND retired identities.
-        let id = if version == INDEX_CATALOG_FORMAT_VERSION {
+        let id = if version >= 4 {
             IndexId(u64::from_le_bytes(
                 chunk[40..48]
                     .try_into()
@@ -1193,11 +1225,27 @@ pub fn decode_index_catalog(input: &[u8]) -> Result<IndexCatalogNode, IndexError
         return Err(IndexError::ExtraBytes);
     }
     validate_catalog_entries(&entries)?;
+    validate_index_high_water(next_index_id, &entries)?;
     Ok(IndexCatalogNode {
+        next_index_id,
         next_catalog,
         table_statistics,
         entries,
     })
+}
+
+/// Checks a root allocator boundary against all supplied registrations.
+/// Storage supplies the complete chain; codecs can validate only one page.
+pub fn validate_index_high_water(
+    next: Option<IndexId>,
+    entries: &[IndexCatalogEntry],
+) -> Result<(), IndexError> {
+    if let Some(next) = next {
+        if next.0 == 0 || entries.iter().any(|entry| entry.definition.id.0 >= next.0) {
+            return Err(IndexError::InvalidIndexHighWater(next));
+        }
+    }
+    Ok(())
 }
 
 fn decode_index_name_presence(value: u8) -> Result<bool, IndexError> {
@@ -1836,6 +1884,7 @@ mod tests {
     #[test]
     fn catalog_retirement_codec_validates_state_identity_and_statistics() {
         let mut node = IndexCatalogNode::empty();
+        node.next_index_id = Some(IndexId(100));
         node.entries.push(IndexCatalogEntry {
             retired: true,
             definition: IndexDefinition {
@@ -1906,6 +1955,7 @@ mod tests {
     #[test]
     fn index_catalog_codec_round_trips_and_rejects_corruption() {
         let node = IndexCatalogNode {
+            next_index_id: Some(IndexId(12)),
             next_catalog: Some(PageId(9)),
             table_statistics: Some(TableStatistics {
                 row_count: 10,
@@ -1932,20 +1982,24 @@ mod tests {
         assert_eq!(decode_index_catalog(&bytes).unwrap(), node);
         let mut legacy = bytes.clone();
         legacy[4..6].copy_from_slice(&LEGACY_INDEX_CATALOG_FORMAT_VERSION.to_le_bytes());
+        legacy[7] = 0;
+        legacy[40..48].fill(0);
         legacy.drain(88..96);
-        assert_eq!(decode_index_catalog(&legacy).unwrap(), node);
+        let mut legacy_node = node.clone();
+        legacy_node.next_index_id = None;
+        assert_eq!(decode_index_catalog(&legacy).unwrap(), legacy_node);
         let mut named = node.clone();
         named.entries[0].definition.name = Some(IndexName::new("users_name_idx").unwrap());
         let named_bytes = encode_index_catalog(&named).unwrap();
         let named_golden = [
             b"NBIC".as_slice(),
-            &[4, 0, 1, 0],
+            &[5, 0, 1, 1],
             &[9, 0, 0, 0, 0, 0, 0, 0],
             &[1, 0, 0, 0],
             &[0, 0, 0, 0],
             &[10, 0, 0, 0, 0, 0, 0, 0],
             &[4, 0, 0, 0, 0, 0, 0, 0],
-            &[0, 0, 0, 0, 0, 0, 0, 0],
+            &[12, 0, 0, 0, 0, 0, 0, 0],
             &[7, 0, 0, 0],
             &[1, 1, 14, 0],
             &[11, 0, 0, 0, 0, 0, 0, 0],
@@ -1959,8 +2013,12 @@ mod tests {
         .concat();
         let mut v3_named = named_golden.clone();
         v3_named[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        v3_named[7] = 0;
+        v3_named[40..48].fill(0);
         v3_named.drain(88..96);
-        assert_eq!(decode_index_catalog(&v3_named).unwrap(), named);
+        let mut legacy_named = named.clone();
+        legacy_named.next_index_id = None;
+        assert_eq!(decode_index_catalog(&v3_named).unwrap(), legacy_named);
         assert_eq!(named_bytes, named_golden);
         assert_eq!(decode_index_catalog(&named_bytes).unwrap(), named);
         for end in 0..bytes.len() {
@@ -2000,6 +2058,7 @@ mod tests {
             Err(IndexError::InvalidChild(PageId(0)))
         );
         let duplicate = IndexCatalogNode {
+            next_index_id: node.next_index_id,
             next_catalog: None,
             table_statistics: node.table_statistics,
             entries: vec![node.entries[0].clone(), node.entries[0].clone()],
