@@ -662,12 +662,28 @@ flush histories converge across three reopens. No startup repair, raw/v1/v2,
 unknown-owner, Heap/Catalog adoption or NBTR tail truncation is implemented.
 See [Round 15](historical-orphan-round15.md).
 
-Next recommendation: **Table Schema Lifecycle Architecture Audit**, not CREATE
-TABLE implementation. Establish canonical schema authority versus manifests,
-durable TableId/ColumnId lifecycles, fingerprint/version evolution, prepared and
-planner cache invalidation, physical Heap/LSM/partition creation and deletion,
-transactional DDL/WAL recovery, reopen/migration, authorization, Protocol v1/SDK
-schema impact and PostgreSQL catalog reflection before choosing a DDL slice.
+### Table Schema Lifecycle Round 16 — architecture audit
+
+Completed audit/design only: [Round 16](table-schema-lifecycle-round16.md) traces
+current schema authority, manifest startup, logical/physical identity,
+fingerprints, transactions, prepared statements, authorization and SDK/PG
+contracts. Targeted tests pin external-schema reopen behavior and the legacy
+anonymous-index generation notification gap. No runtime schema writes, table
+DDL, catalog format, or protocol change is implemented.
+
+Chosen target: bootstrap once, then a persistent per-database SchemaCatalog is
+the sole logical authority. SDK/application schemas are exact subset expectations.
+Use durable independent ID reservations, immutable publication, transaction-local
+schema overlays, a quiescent schema writer lease, and a versioned schema
+participant with recoverable physical creation intents. DROP retires logically;
+physical deletion waits for recovery-log retention gates.
+
+Next recommendation: **Runtime Schema Catalog Foundation** (Round 17): persist
+current committed schema, bootstrap/migrate legacy inputs, reopen from persisted
+catalog, preserve identities/high-waters, define generation/fingerprints and
+inspection. Continue to exclude CREATE TABLE, DROP TABLE and ALTER TABLE. Later
+phases add Core transactional Heap creation before SQL syntax; PK declarations
+must wait for real constraint enforcement.
 
 ## Phase 6 — SDK and tooling
 

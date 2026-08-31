@@ -175,6 +175,21 @@ name, nullability, and primary-key booleans. Strings are UTF-8 with little-endia
 `SchemaFingerprint`; no Rust enum discriminant, layout, `Debug` output, or map
 iteration order participates.
 
+## Table schema lifecycle decision (Round 16)
+
+Current `Database` owns a caller-supplied live `Schema`; Heap/LSM fingerprints
+verify that external definition but cannot reconstruct it. PartitionCatalog owns
+placement, not complete table/column definitions. Manifest v4 embeds schema and
+opens existing Heap files, while SDK fingerprints are subset expectations.
+
+The [Round 16 audit](table-schema-lifecycle-round16.md) chooses bootstrap followed
+by one persistent per-database SchemaCatalog, immutable committed publication,
+independent durable ID allocation, transaction-local schema overlays and a
+versioned schema participant in coordinator recovery. It documents current
+identity/PK/cache limitations and crash-safe CREATE/DROP design. These are chosen
+future contracts, not implemented APIs or formats. The next foundation phase
+persists and reopens existing canonical schema; table DDL remains deferred.
+
 ## Compiler and plans
 
 The first query subset follows:

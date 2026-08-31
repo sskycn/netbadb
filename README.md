@@ -92,6 +92,11 @@ Canonical Schema remains the source of semantic meaning. Each validated table
 also has a versioned canonical byte encoding and SHA-256 schema fingerprint.
 Heap metadata persists that fingerprint, and reopen requires the caller's full
 table identity—including semantic types and column order—to match.
+Current create/open APIs still obtain the live logical schema from callers;
+physical fingerprints cannot reconstruct it. The
+[Round 16 schema lifecycle audit](docs/table-schema-lifecycle-round16.md) chooses
+bootstrap followed by a persistent database schema authority as the prerequisite
+for table DDL. That catalog and table DDL are not implemented yet.
 
 ## Repository layout
 
