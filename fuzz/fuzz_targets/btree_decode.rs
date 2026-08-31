@@ -24,6 +24,19 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let generation = btree_page_generation(payload).expect("validated identity");
+    if let Some(marker) = netbadb_index::retired_btree_page(payload).expect("validated marker") {
+        assert_eq!(
+            netbadb_index::decode_retired_btree(
+                &netbadb_index::encode_retired_btree(marker).unwrap()
+            )
+            .unwrap(),
+            marker
+        );
+        assert!(decode_meta(payload).is_err());
+        assert!(decode_leaf_owned(&spec, payload, owner).is_err());
+        assert!(decode_internal_owned(&spec, payload, owner).is_err());
+        return;
+    }
     match kind % 3 {
         0 => {
             if let Ok(node) = decode_meta(payload) {

@@ -52,6 +52,80 @@ fn transition(before: &Page, after: &Page) -> WalRecordKind {
         after: Box::new(*after.bytes()),
     }
 }
+
+#[test]
+fn retirement_p0_update_identity_and_marker_crc_guards() {
+    let path = path("round14-update-guards");
+    cleanup(&path);
+    let mut wal = WalManager::create(wal_path(&path)).unwrap();
+    let begin = wal.append(TxnId(1), None, WalRecordKind::Begin).unwrap();
+    let old = leaf(2, 1, 2);
+    let mut marker = old.clone();
+    let payload = netbadb_index::encode_retired_btree(netbadb_index::RetiredBTreePage {
+        owner: IndexId(1),
+        page_ref: PageRef {
+            page_id: old.id,
+            generation: PageGeneration(2),
+        },
+    })
+    .unwrap();
+    marker
+        .replace_single_payload(PageType::BTreeLeaf, &payload)
+        .unwrap();
+    marker.set_page_lsn(wal.next_lsn());
+    for mut bad in [leaf(3, 1, 2), leaf(2, 2, 2)] {
+        bad.set_page_lsn(wal.next_lsn());
+        assert!(
+            wal.append(TxnId(1), Some(begin), page_update_kind(&old, &bad))
+                .is_err()
+        );
+    }
+    let logged = wal
+        .append(TxnId(1), Some(begin), page_update_kind(&old, &marker))
+        .unwrap();
+    let mut repeat = marker.clone();
+    repeat.set_page_lsn(wal.next_lsn());
+    assert!(
+        wal.append(TxnId(1), Some(logged), page_update_kind(&marker, &repeat))
+            .is_err()
+    );
+    let mut wrong_id = marker.clone();
+    wrong_id.id = PageId(2);
+    assert!(wrong_id.allocation_generation().is_err());
+    let mut bytes = *marker.bytes();
+    bytes[100] ^= 1;
+    assert!(Page::from_bytes(marker.id, bytes).validated().is_err());
+    drop(wal);
+    cleanup(&path);
+}
+
+#[test]
+fn retirement_transition_requires_marker_for_same_owner_and_active_destination() {
+    let active = leaf(2, 1, 1);
+    let mut marker = active.clone();
+    let payload = netbadb_index::encode_retired_btree(netbadb_index::RetiredBTreePage {
+        owner: IndexId(1),
+        page_ref: PageRef {
+            page_id: active.id,
+            generation: PageGeneration(2),
+        },
+    })
+    .unwrap();
+    marker
+        .replace_single_payload(PageType::BTreeLeaf, &payload)
+        .unwrap();
+    for owner in [1, 2] {
+        let new = leaf(200, owner, 2);
+        validate(&marker, &new).unwrap();
+        assert!(undo(&new, &marker, &new).unwrap());
+        assert!(!undo(&marker, &marker, &new).unwrap());
+        assert!(redo(&leaf(300, owner, 2), &marker, &new, Lsn(250)).is_err());
+    }
+    assert!(validate(&active, &leaf(200, 1, 1)).is_err());
+    assert!(validate(&marker, &active).is_err());
+    assert!(validate(&active, &marker).is_err());
+    assert!(validate(&marker, &marker).is_err());
+}
 fn recover(path: &std::path::Path, limit: Option<usize>) -> Result<(), crate::RecoveryError> {
     let mut pages = PageManager::open(path)?;
     let (mut wal, records, tail) = WalManager::open_for_recovery(wal_path(path))?;

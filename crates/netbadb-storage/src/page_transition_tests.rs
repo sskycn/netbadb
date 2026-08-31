@@ -676,7 +676,7 @@ fn transition_production_meta_first_then_orphan_only_inventory() {
         for (row, _) in storage.scan().unwrap() {
             storage.delete(row).unwrap();
         }
-        storage.vacuum().unwrap();
+        historical_unmarked_vacuum(&mut storage);
         let active = storage.inspect_index_reclaim().unwrap();
         assert_eq!(active.active_orphan_pages, 81);
         assert!(

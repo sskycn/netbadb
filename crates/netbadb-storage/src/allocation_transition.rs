@@ -6,9 +6,9 @@ use netbadb_types::{IndexId, Lsn, PageRef, PhysicalType, SemanticType};
 
 use crate::{Page, PageType, StorageError};
 
-/// Fully decode a self-identifying registered v3 page, without following dormant
-/// outgoing edges. The payload's physical keys are self-describing; nominal
-/// schema identity is not allocation authority.
+/// Fully decode a self-identifying registered v3 node or NBTR retirement,
+/// without following dormant outgoing edges. Physical keys are self-describing;
+/// nominal schema identity is not allocation authority.
 pub(crate) fn identity(page: &Page) -> Result<(PageRef, IndexId), StorageError> {
     let kind = page.validated()?.header().page_type;
     if !matches!(
@@ -26,6 +26,9 @@ pub(crate) fn identity(page: &Page) -> Result<(PageRef, IndexId), StorageError> 
         page_id: page.id,
         generation,
     };
+    if netbadb_index::retired_btree_page(payload)?.is_some() {
+        return Ok((reference, owner));
+    }
     if kind == PageType::BTreeMeta {
         decode_meta(payload)?;
         return Ok((reference, owner));
@@ -55,12 +58,25 @@ pub(crate) fn identity(page: &Page) -> Result<(PageRef, IndexId), StorageError> 
 pub(crate) fn validate(before: &Page, after: &Page) -> Result<(), StorageError> {
     let (old, old_owner) = identity(before)?;
     let (new, new_owner) = identity(after)?;
-    if old.page_id != new.page_id || old.generation >= new.generation || old_owner == new_owner {
+    let old_marker = is_retired(before)?;
+    if old.page_id != new.page_id
+        || old.generation >= new.generation
+        || (!old_marker && old_owner == new_owner)
+        || is_retired(after)?
+    {
         return Err(crate::invalid_format(
             "invalid BTree allocation transition identities",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn is_retired(page: &Page) -> Result<bool, StorageError> {
+    identity(page)?;
+    Ok(
+        netbadb_index::retired_btree_page(page.single_payload(page.header()?.page_type)?)?
+            .is_some(),
+    )
 }
 
 /// Returns whether redo must install the after image. An old incarnation never

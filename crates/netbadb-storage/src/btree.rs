@@ -418,12 +418,13 @@ impl<'a> BTree<'a> {
         let mut current_page = leaf_page;
         let mut current = DeleteNode::Leaf(leaf);
         let mut changes = Vec::new();
+        let mut retired = Vec::new();
 
         loop {
             let current_size = current.encoded_len(&meta)?;
             if current_size >= soft_min {
                 changes.push(self.prepare_delete_node(current_page, &meta, &current)?);
-                return self.apply_changes(transaction, changes);
+                return self.apply_unlinks_and_retire(transaction, changes, retired, meta.owner);
             }
 
             let mut parent = path.pop().ok_or(IndexError::InvalidHeight(meta.height))?;
@@ -437,14 +438,16 @@ impl<'a> BTree<'a> {
             )?;
             let Some((retained_page, merged, separator_position)) = merge else {
                 changes.push(self.prepare_delete_node(current_page, &meta, &current)?);
-                return self.apply_changes(transaction, changes);
+                return self.apply_unlinks_and_retire(transaction, changes, retired, meta.owner);
             };
 
+            retired.push(parent.node.child(separator_position + 1)?);
             changes.push(self.prepare_delete_node(retained_page, &meta, &merged)?);
             parent.node.remove_separator(separator_position)?;
 
             if path.is_empty() {
                 if parent.node.separators.is_empty() {
+                    retired.push(parent.page_id);
                     let height = meta
                         .height
                         .checked_sub(1)
@@ -470,7 +473,7 @@ impl<'a> BTree<'a> {
                         &DeleteNode::Internal(parent.node),
                     )?);
                 }
-                return self.apply_changes(transaction, changes);
+                return self.apply_unlinks_and_retire(transaction, changes, retired, meta.owner);
             }
 
             current_page = parent.page_id;
@@ -854,7 +857,9 @@ impl<'a> BTree<'a> {
             };
             let current = &path[position];
             let mut changes = Vec::new();
+            let mut retired = Vec::new();
             if position == 0 {
+                retired.push(current.page_id);
                 let updated = MetaNode {
                     root_page: current.node.first_child,
                     height: meta
@@ -910,8 +915,10 @@ impl<'a> BTree<'a> {
                         &meta,
                         &DeleteNode::Internal(merged),
                     )?);
+                    retired.push(right_page);
                     parent_node.remove_separator(separator_position)?;
                     if position == 1 && parent_node.separators.is_empty() {
+                        retired.push(parent.page_id);
                         let updated = MetaNode {
                             root_page: left_page,
                             height: meta.height - 1,
@@ -973,7 +980,7 @@ impl<'a> BTree<'a> {
             }
             // The caller marks a normalization error rollback-required: even
             // earlier successful iterations belong to the same transaction.
-            self.apply_changes(transaction, changes)?;
+            self.apply_unlinks_and_retire(transaction, changes, retired, meta.owner)?;
         }
         Err(IndexError::InvalidHeight(self.read_meta(handle)?.height).into())
     }
@@ -1058,6 +1065,81 @@ impl<'a> BTree<'a> {
             }
         };
         Ok(merged.map(|node| (left_page, node, separator_position)))
+    }
+
+    /// Log and publish the entire structural batch before any marker log.
+    /// Reverse undo restores nodes before incoming links.
+    fn apply_unlinks_and_retire(
+        &mut self,
+        transaction: &mut Transaction,
+        changes: Vec<PreparedPage>,
+        retired: Vec<BTreePageRef>,
+        owner: Option<IndexId>,
+    ) -> Result<(), StorageError> {
+        self.apply_changes(transaction, changes)?;
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        for reference in retired {
+            // Raw/legacy removals have no generation-safe retirement authority.
+            let BTreePageRef::Allocated(reference) = reference else {
+                continue;
+            };
+            if let Err(error) = self.retire_btree_page_in(transaction, reference, owner) {
+                transaction.require_rollback();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_btree_page_in(
+        &mut self,
+        transaction: &mut Transaction,
+        expected: PageRef,
+        owner: IndexId,
+    ) -> Result<(), StorageError> {
+        self.storage.validate_transaction(transaction)?;
+        let guard = self
+            .storage
+            .buffer()
+            .read_btree_page(BTreePageRef::Allocated(expected))?;
+        let before = guard.page().clone();
+        drop(guard);
+        let kind = before.validated()?.header().page_type;
+        if !matches!(kind, PageType::BTreeLeaf | PageType::BTreeInternal) {
+            return Err(IndexError::InvalidNodeType.into());
+        }
+        if netbadb_index::retired_btree_page(before.single_payload(kind)?)?.is_some() {
+            return Err(IndexError::AlreadyRetired(expected).into());
+        }
+        let (actual, actual_owner) = crate::allocation_transition::identity(&before)?;
+        if actual != expected {
+            return Err(IndexError::InvalidChild(expected.page_id).into());
+        }
+        validate_btree_owner(Some(owner), Some(actual_owner))?;
+        let payload = netbadb_index::encode_retired_btree(netbadb_index::RetiredBTreePage {
+            page_ref: expected,
+            owner,
+        })?;
+        let mut after = before.clone();
+        after.replace_single_payload(kind, &payload)?;
+        // Register before logging: partial failures also exclude this identity
+        // until rollback. A scan cannot publish it in this transaction.
+        transaction.retired_btree_pages.insert(expected);
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::RetirementBeforeLog);
+        transaction.log_page_update(&before, &mut after)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::RetirementAfterLog);
+        *self
+            .storage
+            .buffer()
+            .write_btree_page(BTreePageRef::Allocated(expected))?
+            .page_mut() = after;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::RetirementAfterPublish);
+        Ok(())
     }
 
     fn prepare_delete_node(
@@ -1228,6 +1310,19 @@ impl<'a> BTree<'a> {
             #[cfg(test)]
             {
                 drop(page);
+                if !has_new_pages {
+                    match change.after.header()?.page_type {
+                        PageType::BTreeLeaf => crate::crash_test::maybe_crash(
+                            crate::crash_test::TestCrashPoint::RetirementAfterLeafUnlink,
+                        ),
+                        PageType::BTreeInternal | PageType::BTreeMeta => {
+                            crate::crash_test::maybe_crash(
+                                crate::crash_test::TestCrashPoint::RetirementAfterParentUnlink,
+                            )
+                        }
+                        _ => {}
+                    }
+                }
                 if has_new_pages {
                     match change.after.header()?.page_type {
                         PageType::BTreeLeaf => crate::crash_test::maybe_crash(

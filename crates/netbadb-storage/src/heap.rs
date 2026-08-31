@@ -116,6 +116,7 @@ pub struct IndexMaintenanceReport {
 
 struct IndexPageInventory {
     retired: HashSet<PageId>,
+    markers: HashSet<PageId>,
     legacy_retired: HashSet<PageId>,
     report: IndexReclaimReport,
     #[cfg(test)]
@@ -1318,11 +1319,10 @@ impl HeapStorage {
         // empty owner. Conversion drops the root dependency, never the owner.
         pending.retain(|record| {
             !record.is_generation_safe()
-                || inventory
-                    .report
-                    .allocations
-                    .iter()
-                    .any(|page| page.owner == record.index_id)
+                || inventory.report.allocations.iter().any(|page| {
+                    page.owner == record.index_id
+                        && !inventory.markers.contains(&page.page_ref.page_id)
+                })
         });
         for record in &mut pending {
             if record.is_generation_safe() {
@@ -9392,5 +9392,6 @@ mod tests {
         include!("index_tail_reclaim_tests.rs");
         include!("page_reuse_tests.rs");
         include!("page_transition_tests.rs");
+        include!("btree_retirement_tests.rs");
     }
 }

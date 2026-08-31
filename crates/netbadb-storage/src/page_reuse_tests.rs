@@ -48,7 +48,7 @@ fn reusable_inventory_survives_meta_first_and_orphan_only_remainders() {
         for (row, _) in storage.scan().unwrap() {
             storage.delete(row).unwrap();
         }
-        storage.vacuum().unwrap();
+        historical_unmarked_vacuum(&mut storage);
         let old_meta = storage.btree().read_meta(old.handle).unwrap();
         let active_inventory = storage.inspect_index_reclaim().unwrap();
         assert_eq!(old_meta.height, 1);

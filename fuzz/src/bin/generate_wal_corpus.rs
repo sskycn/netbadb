@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+include!("../retirement_seeds.rs");
 
 use netbadb_index::{
     BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexEntry, IndexSpec,
@@ -69,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_owner_only_seeds(&output)?;
     write_transition_seeds(&output)?;
     write_transition_split_seeds(&output)?;
+    write_retirement_seeds(&output)?;
     Ok(())
 }
 
@@ -844,7 +846,7 @@ fn write_tail_snapshot(
             if name.ends_with("partial") { 1 } else { 2 }
         );
         storage.close()?;
-    } else if name.starts_with("round13-valid-") {
+    } else if name.starts_with("round13-valid-") || name.starts_with("round14-valid-") {
         let mut storage = reopened?;
         storage.inspect_index_reclaim()?;
         storage.inspect_reusable_pages()?;

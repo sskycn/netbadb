@@ -1518,6 +1518,55 @@ fn validate_page_images(lsn: Lsn, kind: &WalRecordKind) -> Result<(), WalError> 
                 lsn,
                 image: "changed allocation",
             })?;
+        let old = Page::from_bytes(*page_id, **before);
+        let old_kind = old
+            .header()
+            .map_err(|_| WalError::InvalidPageImage {
+                lsn,
+                image: "before kind",
+            })?
+            .page_type;
+        let new_kind = after_page
+            .header()
+            .map_err(|_| WalError::InvalidPageImage {
+                lsn,
+                image: "after kind",
+            })?
+            .page_type;
+        if old_kind != new_kind {
+            return Err(WalError::InvalidPageImage {
+                lsn,
+                image: "changed page kind",
+            });
+        }
+        if matches!(
+            new_kind,
+            crate::PageType::BTreeMeta
+                | crate::PageType::BTreeLeaf
+                | crate::PageType::BTreeInternal
+        ) {
+            let validate = || -> Result<(), crate::StorageError> {
+                let old_payload = old.single_payload(old_kind)?;
+                let new_payload = after_page.single_payload(new_kind)?;
+                netbadb_index::validate_btree_owner(
+                    netbadb_index::btree_page_owner(old_payload)?,
+                    netbadb_index::btree_page_owner(new_payload)?,
+                )?;
+                if netbadb_index::retired_btree_page(old_payload)?.is_some() {
+                    return Err(crate::invalid_format(
+                        "retired allocation requires transition",
+                    ));
+                }
+                if netbadb_index::retired_btree_page(new_payload)?.is_some() {
+                    crate::allocation_transition::identity(&old)?;
+                }
+                Ok(())
+            };
+            validate().map_err(|_| WalError::InvalidPageImage {
+                lsn,
+                image: "changed BTree ownership or retired state",
+            })?;
+        }
     }
     if page_lsn != Some(lsn) {
         return Err(WalError::InvalidPageLsn {

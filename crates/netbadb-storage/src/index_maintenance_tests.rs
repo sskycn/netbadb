@@ -1,5 +1,31 @@
 use netbadb_types::IndexId;
 
+/// Historical fixture only: recreate pre-Round14 unmarked orphans using the
+/// exact active before images from retirement WAL, then checkpoint that state.
+/// Production never adopts or reconstructs these historical pages.
+fn historical_unmarked_vacuum(storage: &mut HeapStorage) {
+    storage.vacuum().unwrap();
+    let mut images = std::collections::BTreeMap::new();
+    for record in storage.wal_records().unwrap() {
+        if let crate::WalRecordKind::PageUpdate { page_id, before, after } = record.kind {
+            let page = Page::from_bytes(page_id, *after);
+            let kind = page.header().unwrap().page_type;
+            if matches!(kind, PageType::BTreeLeaf | PageType::BTreeInternal)
+                && netbadb_index::retired_btree_page(page.single_payload(kind).unwrap()).unwrap().is_some() {
+                images.insert(page_id, Page::from_bytes(page_id, *before));
+            }
+        }
+    }
+    for (id, original) in images {
+        *storage.buffer.write_page(id).unwrap().page_mut() = original;
+    }
+    storage.checkpoint().unwrap();
+    // Subsequent corruption fixtures dirty old-LSN images. Keep a written WAL
+    // horizon in this fresh container so those test-only writes can flush.
+    storage.begin_transaction().unwrap().commit().unwrap();
+    storage.buffer.invalidate_reuse_inventory();
+}
+
 // Tests execute inside heap::tests::maintenance to exercise private ownership
 // and recovery boundaries without exporting physical maintenance handles.
 

@@ -196,9 +196,15 @@ impl Page {
         }
         let kind = self.header()?.page_type;
         match kind {
-            PageType::BTreeMeta | PageType::BTreeInternal | PageType::BTreeLeaf => Ok(
-                netbadb_index::btree_page_generation(self.single_payload(kind)?)?,
-            ),
+            PageType::BTreeMeta | PageType::BTreeInternal | PageType::BTreeLeaf => {
+                let payload = self.single_payload(kind)?;
+                if let Some(marker) = netbadb_index::retired_btree_page(payload)? {
+                    if marker.page_ref.page_id != self.id || kind == PageType::BTreeMeta {
+                        return Err(netbadb_index::IndexError::InvalidNodeType.into());
+                    }
+                }
+                Ok(netbadb_index::btree_page_generation(payload)?)
+            }
             _ => Ok(None),
         }
     }

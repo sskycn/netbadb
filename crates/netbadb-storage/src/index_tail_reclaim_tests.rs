@@ -707,7 +707,7 @@ fn tail_complete_merged_tree_reclaims_reachable_and_orphan_pages() {
     for row in rows {
         storage.delete(row).unwrap();
     }
-    storage.vacuum().unwrap();
+    historical_unmarked_vacuum(&mut storage);
     let inventory = storage.inspect_index_reclaim().unwrap();
     assert!(inventory.active_orphan_pages > 0);
     storage.drop_index(index.id).unwrap();

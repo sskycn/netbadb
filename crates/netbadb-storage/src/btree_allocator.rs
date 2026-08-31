@@ -1,5 +1,6 @@
-//! Registered-v3 allocation policy. Persistent truth is catalog retirement plus
-//! self-identifying pages; this cache is disposable, including its empty state.
+//! Registered-v3 allocation policy. Persistent truth is whole-owner catalog
+//! retirement or individual NBTR pages; this cache, including empty, is disposable.
+use super::ownership::PageReuseClass;
 use super::{HeapStorage, IndexPageInventory};
 use crate::{Page, PageType, StorageError, Transaction};
 use netbadb_index::{IndexError, RetiredIndexOwnership, decode_index_catalog};
@@ -10,6 +11,7 @@ use std::collections::{BTreeMap, HashSet};
 pub(super) struct ReusableBTreePage {
     pub old_page_ref: PageRef,
     pub retired_index_id: IndexId,
+    pub source: PageReuseClass,
 }
 #[derive(Debug, Default)]
 pub(super) struct ReusableBTreePageCache {
@@ -22,16 +24,27 @@ impl IndexPageInventory {
         self.report
             .allocations
             .iter()
-            .filter(|page| self.retired.contains(&page.page_ref.page_id))
+            .filter(|page| {
+                self.retired.contains(&page.page_ref.page_id)
+                    || self.markers.contains(&page.page_ref.page_id)
+            })
             .map(|page| ReusableBTreePage {
                 old_page_ref: page.page_ref,
                 retired_index_id: page.owner,
+                source: if self.markers.contains(&page.page_ref.page_id) {
+                    PageReuseClass::RetiredBTreeMarker
+                } else {
+                    PageReuseClass::GenerationSafeBTreeV3
+                },
             })
             .collect()
     }
 }
 impl HeapStorage {
-    fn ensure_reusable_btree_pages(&mut self) -> Result<(), StorageError> {
+    fn ensure_reusable_btree_pages(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<(), StorageError> {
         if self.buffer.take_reuse_invalidation() {
             self.reusable_btree_pages = None;
         }
@@ -58,15 +71,15 @@ impl HeapStorage {
             )
             .filter(|owner| !self.indexes.iter().any(|index| index.id == *owner))
             .collect();
-        if retired.is_empty() {
-            self.reusable_btree_pages = Some(ReusableBTreePageCache::default());
-            return Ok(());
-        }
         let inventory = self.index_page_inventory(&catalog)?;
         let candidates = inventory
             .reusable_btree_pages()
             .into_iter()
-            .filter(|page| retired.contains(&page.retired_index_id))
+            .filter(|page| {
+                !transaction.retired_btree_pages.contains(&page.old_page_ref)
+                    && (page.source == PageReuseClass::RetiredBTreeMarker
+                        || retired.contains(&page.retired_index_id))
+            })
             .map(|page| (page.old_page_ref.page_id, page))
             .collect();
         let root_dependent = catalog
@@ -104,15 +117,22 @@ impl HeapStorage {
         {
             return Err(IndexError::UnknownIndexId(owner).into());
         }
-        self.ensure_reusable_btree_pages()?;
+        self.ensure_reusable_btree_pages(transaction)?;
         let cache = self
             .reusable_btree_pages
             .as_mut()
             .ok_or(IndexError::InvalidNodeType)?;
         let mut chosen = None;
         for (id, candidate) in &cache.candidates {
-            if !cache.retired.contains(&candidate.retired_index_id)
-                || candidate.retired_index_id == owner
+            if transaction
+                .retired_btree_pages
+                .contains(&candidate.old_page_ref)
+            {
+                continue;
+            }
+            if candidate.source == PageReuseClass::GenerationSafeBTreeV3
+                && (!cache.retired.contains(&candidate.retired_index_id)
+                    || candidate.retired_index_id == owner)
             {
                 return Err(IndexError::InvalidNodeType.into());
             }
@@ -120,18 +140,23 @@ impl HeapStorage {
                 continue;
             };
             let (actual, actual_owner) = crate::allocation_transition::identity(&page)?;
-            if actual != candidate.old_page_ref || actual_owner != candidate.retired_index_id {
+            if actual != candidate.old_page_ref
+                || actual_owner != candidate.retired_index_id
+                || crate::allocation_transition::is_retired(&page)?
+                    != (candidate.source == PageReuseClass::RetiredBTreeMarker)
+            {
                 return Err(crate::invalid_format(
                     "reusable BTree candidate identity changed",
                 ));
             }
-            chosen = Some((page, candidate.retired_index_id));
+            chosen = Some((page, candidate.retired_index_id, candidate.source));
             break;
         }
-        let Some((page, retired_owner)) = chosen else {
+        let Some((page, retired_owner, source)) = chosen else {
             return Ok(None);
         };
-        let convert = cache.root_dependent.contains(&retired_owner);
+        let convert = source == PageReuseClass::GenerationSafeBTreeV3
+            && cache.root_dependent.contains(&retired_owner);
         if convert {
             self.detach_retired_owner_root(transaction, retired_owner)?;
         }
@@ -139,7 +164,9 @@ impl HeapStorage {
             .reusable_btree_pages
             .as_mut()
             .ok_or(IndexError::InvalidNodeType)?;
-        cache.root_dependent.remove(&retired_owner);
+        if convert {
+            cache.root_dependent.remove(&retired_owner);
+        }
         cache.candidates.remove(&page.id);
         Ok(Some(page))
     }

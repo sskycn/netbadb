@@ -22,7 +22,7 @@ fn owned_merge_orphans_remain_discoverable_after_compaction_and_reopen() {
     for row in rows {
         storage.delete(row).unwrap();
     }
-    storage.vacuum().unwrap();
+    historical_unmarked_vacuum(&mut storage);
     assert_eq!(storage.btree().height(index.handle).unwrap(), 1);
     assert!(storage.scan().unwrap().is_empty());
     let report = storage.inspect_index_reclaim().unwrap();
@@ -299,7 +299,7 @@ fn scanner_rejects_owned_corruption_and_overlap_without_catalog_writes() {
                     for (row, _) in storage.scan().unwrap() {
                         storage.delete(row).unwrap();
                     }
-                    storage.vacuum().unwrap();
+                    historical_unmarked_vacuum(&mut storage);
                     let snapshot = storage.read_index_catalog(PageId(1)).unwrap();
                     let inventory = storage.index_page_inventory(&snapshot).unwrap();
                     target = netbadb_index::BTreePageRef::Legacy(
@@ -489,7 +489,7 @@ fn owned_key_overflow_rolls_back_build_and_dml_without_mutation() {
         IndexId(1)
     );
     storage.delete(row).unwrap();
-    storage.vacuum().unwrap();
+    historical_unmarked_vacuum(&mut storage);
     let index = storage.create_index(ColumnId(1)).unwrap();
     let row = storage
         .insert(&[ScalarValue::Text("x".repeat(3981))])
@@ -552,7 +552,8 @@ fn process_crash_owned_unary_merge_rolls_back_or_commits_all_pages() {
             assert_eq!(report.owned_pages, before.owned_pages);
             if point == TestCrashPoint::CommitAfterWalSync {
                 assert_eq!(storage.btree().height(index.handle).unwrap(), 1);
-                assert_eq!(report.active_orphan_pages, before.owned_pages - 2);
+                assert_eq!(report.active_orphan_pages, 0);
+                assert_eq!(report.retired_marker_pages, before.owned_pages - 2);
             } else {
                 assert!(storage.btree().height(index.handle).unwrap() >= 3);
                 assert_eq!(report.active_orphan_pages, before.active_orphan_pages);
@@ -625,7 +626,7 @@ fn legacy_merge_orphans_are_validated_but_never_invented_as_owned() {
     for (row, _) in storage.scan().unwrap() {
         storage.delete(row).unwrap();
     }
-    storage.vacuum().unwrap();
+    historical_unmarked_vacuum(&mut storage);
     let report = storage.inspect_index_reclaim().unwrap();
     assert_eq!(report.owned_pages, 0);
     assert!(report.unowned_legacy_pages > 0);

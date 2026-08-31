@@ -14,6 +14,13 @@ pub(crate) const EXIT_CODE: i32 = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCrashPoint {
+    RetirementBeforeCommit,
+    RetirementBeforeLog,
+    RetirementAfterLog,
+    RetirementAfterPublish,
+    RetirementAfterLeafUnlink,
+    RetirementAfterParentUnlink,
+
     BTreeAfterInternalSplit,
     BTreeAfterSiblingUpdate,
     BTreeAfterParentUpdate,
@@ -78,6 +85,13 @@ pub(crate) enum TestCrashPoint {
 impl TestCrashPoint {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::RetirementBeforeCommit => "RetirementBeforeCommit",
+            Self::RetirementBeforeLog => "RetirementBeforeLog",
+            Self::RetirementAfterLog => "RetirementAfterLog",
+            Self::RetirementAfterPublish => "RetirementAfterPublish",
+            Self::RetirementAfterLeafUnlink => "RetirementAfterLeafUnlink",
+            Self::RetirementAfterParentUnlink => "RetirementAfterParentUnlink",
+
             Self::BTreeAfterInternalSplit => "btree-after-internal-split",
             Self::BTreeAfterSiblingUpdate => "btree-after-sibling-update",
             Self::BTreeAfterParentUpdate => "btree-after-parent-update",

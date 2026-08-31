@@ -1,5 +1,13 @@
 # Storage decoding fuzzing
 
+Round 14 adds nine strict NBTR v1 payload seeds and eight WAL snapshots covering
+real retirement plus same-owner/different-owner marker splits, winner/loser
+recovery, a third generation and a corrupted nested marker before image. The
+generator validates snapshot recovery and active-tree ownership; all seventeen
+seeds reproduce byte-for-byte. Existing Round 11/13 snapshots remain unchanged.
+`btree_decode` round-trips markers and asserts that active decoders reject them.
+Markers retain the existing Page v5 CRC and WAL binary framing.
+
 `wal_recovery` accepts at most 256 KiB, replaces the WAL belonging to a fresh
 minimal heap, and calls `HeapStorage::open`. That public path invokes the
 crate-private recovery decoder without adding a fuzz-only production API.

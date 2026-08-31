@@ -61,6 +61,8 @@ pub struct Transaction {
     registered: bool,
     has_page_updates: bool,
     pub(crate) building_indexes: std::collections::HashSet<netbadb_types::IndexId>,
+    /// Never reusable by this transaction, even after steal or cache rebuild.
+    pub(crate) retired_btree_pages: std::collections::HashSet<netbadb_types::PageRef>,
     rollback_start_lsn: Option<Lsn>,
     rollback_complete_lsn: Option<Lsn>,
     prepared_database_txn_id: Option<DatabaseTxnId>,
@@ -88,6 +90,12 @@ impl Transaction {
     /// the transaction in `CommitPending`; calling `commit` again retries the
     /// same record without releasing an owned writer.
     pub fn commit(&mut self) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if !self.retired_btree_pages.is_empty() {
+            crate::crash_test::maybe_crash(
+                crate::crash_test::TestCrashPoint::RetirementBeforeCommit,
+            );
+        }
         let commit_lsn = match self.state {
             TransactionState::Active => {
                 let mut wal = self
@@ -331,6 +339,9 @@ impl Transaction {
             .map_err(|_| TransactionError::StatusBusy)?
             .record_committed(self.id, CommitSeq(commit_lsn.0))?;
         self.state = TransactionState::Committed;
+        if !self.retired_btree_pages.is_empty() {
+            self.buffer.invalidate_reuse_inventory();
+        }
         self.release_writer();
         self.unregister();
         Ok(())
@@ -827,6 +838,7 @@ impl TransactionManager {
             registered: true,
             has_page_updates: false,
             building_indexes: std::collections::HashSet::new(),
+            retired_btree_pages: std::collections::HashSet::new(),
             rollback_start_lsn: None,
             rollback_complete_lsn: None,
             prepared_database_txn_id: None,

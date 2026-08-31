@@ -7,6 +7,12 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
+mod retired;
+pub use retired::{
+    RETIRED_BTREE_FORMAT_VERSION, RetiredBTreePage, decode_retired_btree, encode_retired_btree,
+    retired_btree_page,
+};
+
 use netbadb_types::{
     ColumnId, IndexId, IndexName, PageGeneration, PageId, PageRef, PhysicalType, RowId,
     ScalarValue, SemanticType,
@@ -273,6 +279,7 @@ pub struct InternalNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexError {
     InvalidReclaimIntent,
+    AlreadyRetired(PageRef),
     InvalidPageGeneration(PageGeneration),
     PageGenerationExhausted,
     GenerationMismatch {
@@ -409,6 +416,10 @@ impl fmt::Display for IndexError {
             Self::OwnerMismatch { expected, actual } => write!(
                 formatter,
                 "BTree owner {actual:?} does not match expected {expected:?}"
+            ),
+            Self::AlreadyRetired(reference) => write!(
+                formatter,
+                "BTree allocation {reference:?} is already retired"
             ),
             Self::InvalidNodeType => formatter.write_str("invalid B+Tree node type"),
             Self::InvalidHeight(height) => write!(formatter, "invalid B+Tree height {height}"),
@@ -1871,6 +1882,9 @@ pub fn validate_catalog_entries(entries: &[IndexCatalogEntry]) -> Result<(), Ind
 /// Validates the versioned header only. Callers MUST fully decode the payload
 /// before treating a page as a valid ownership observation.
 pub fn btree_page_owner(input: &[u8]) -> Result<Option<IndexId>, IndexError> {
+    if let Some(marker) = retired_btree_page(input)? {
+        return Ok(Some(marker.owner));
+    }
     let magic = input.get(..4).ok_or(IndexError::Truncated)?;
     let expected = match magic {
         b"NBTM" => META_MAGIC,
@@ -1894,6 +1908,9 @@ pub fn validate_btree_owner(
 
 /// Reads the identity prefix; callers still decode the complete payload.
 pub fn btree_page_generation(input: &[u8]) -> Result<Option<PageGeneration>, IndexError> {
+    if let Some(marker) = retired_btree_page(input)? {
+        return Ok(Some(marker.page_ref.generation));
+    }
     let magic = input.get(..4).ok_or(IndexError::Truncated)?;
     let expected = match magic {
         b"NBTM" => META_MAGIC,

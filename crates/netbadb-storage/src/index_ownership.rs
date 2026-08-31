@@ -33,6 +33,8 @@ pub struct IndexReclaimReport {
     /// Owner-only pages whose former reachability is no longer authoritative.
     pub owner_only_pages: u64,
     pub active_orphan_pages: u64,
+    /// Explicit NBTR v1 states, independent of whole-index pending ownership.
+    pub retired_marker_pages: u64,
     /// Pure geometry; generation/buffer/WAL reuse is NOT authorized.
     pub retired_suffix_pages: u64,
     pub retained_middle_pages: u64,
@@ -58,6 +60,7 @@ pub struct IndexPageAllocation {
 pub(super) enum OwnershipClass {
     Active,
     Retired,
+    RetiredMarker,
     UnregisteredLegacy,
     UnownedLegacy,
 }
@@ -77,6 +80,8 @@ pub(super) struct BTreePageOwnership {
 pub enum PageReuseClass {
     /// Retired registered BTree v3 allocations; never Heap/Catalog/raw pages.
     GenerationSafeBTreeV3,
+    /// NBTR v1 independently proves retirement, including for an active owner.
+    RetiredBTreeMarker,
 }
 
 /// Validated old identity. Inspection is not an allocation or buffer claim.
@@ -128,7 +133,7 @@ impl HeapStorage {
             .map(|page| ReusablePageInspection {
                 page_ref: page.old_page_ref,
                 retired_index_id: page.retired_index_id,
-                class: PageReuseClass::GenerationSafeBTreeV3,
+                class: page.source,
             })
             .collect();
         // The older geometric report includes retired v2 pages. Only this
@@ -212,6 +217,7 @@ impl HeapStorage {
                     metadata.insert(id, meta);
                 }
                 PageType::BTreeLeaf | PageType::BTreeInternal => {
+                    page.allocation_generation()?;
                     let owner = btree_page_owner(page.single_payload(kind)?)?;
                     page_owners.insert(
                         id,
@@ -299,6 +305,7 @@ impl HeapStorage {
         }
         let mut observations = Vec::new();
         let mut retired = HashSet::new();
+        let mut markers = HashSet::new();
         for number in 1..count {
             let id = PageId(number);
             let guard = self.buffer.read_page(id)?;
@@ -311,6 +318,22 @@ impl HeapStorage {
                 continue;
             }
             let payload = page.single_payload(kind)?;
+            if let Some(marker) = netbadb_index::retired_btree_page(payload)? {
+                page.allocation_generation()?;
+                if marker.owner >= catalog.next_index_id || reachable.contains_key(&id) {
+                    return Err(IndexError::InvalidNodeType.into());
+                }
+                markers.insert(id);
+                observations.push(BTreePageOwnership {
+                    generation: Some(marker.page_ref.generation),
+                    page_id: id,
+                    owner: Some(marker.owner),
+                    kind,
+                    class: OwnershipClass::RetiredMarker,
+                    reachable: false,
+                });
+                continue;
+            }
             let owner = btree_page_owner(payload)?;
             let class = if let Some(owner) = owner {
                 *classes
@@ -440,7 +463,10 @@ impl HeapStorage {
                 .count() as u64,
             owner_only_pages: observations
                 .iter()
-                .filter(|page| page.owner.is_some_and(|owner| owner_only.contains(&owner)))
+                .filter(|page| {
+                    page.class != OwnershipClass::RetiredMarker
+                        && page.owner.is_some_and(|owner| owner_only.contains(&owner))
+                })
                 .count() as u64,
             active_orphan_pages: observations
                 .iter()
@@ -448,6 +474,7 @@ impl HeapStorage {
                     page.owner.is_some() && page.class == OwnershipClass::Active && !page.reachable
                 })
                 .count() as u64,
+            retired_marker_pages: markers.len() as u64,
             retired_suffix_pages: count - suffix,
             retained_middle_pages: retired.len() as u64 - (count - suffix),
             pages_reclaimed: 0,
@@ -476,6 +503,7 @@ impl HeapStorage {
         debug_assert!(observations.iter().all(|page| page.page_id.0 < count));
         Ok(IndexPageInventory {
             retired,
+            markers,
             legacy_retired,
             report,
             #[cfg(test)]

@@ -618,9 +618,37 @@ owners. Page/BTree/Catalog/Heap and WAL container versions remain unchanged.
 Real subprocess crash coverage and the 83-hole backfill preserve the 117-page
 file; 500 CREATE/DROP cycles after a 404-page hole fixture remain at 404 pages,
 with 1000 transitions and zero BTree appends. Active-owner orphans, Heap, Catalog,
-raw/legacy and cross-kind reuse remain excluded. Next: Active BTree Orphan
-Retirement with an explicit durable merge/root-collapse horizon, then a separate
-Heap/RowId or Table Schema Lifecycle audit. See [Round 13](page-transition-round13.md).
+raw/legacy and cross-kind reuse remain excluded in that round. Its next step,
+explicit Active BTree Orphan Retirement, is implemented below.
+See [Round 13](page-transition-round13.md).
+
+### Storage Lifecycle Round 14 — explicit active-node retirement and reuse
+
+Implemented: audited leaf/internal merge, root-collapse and unary-normalization
+paths retire only explicitly unlinked generation-aware nodes. Independent NBTR
+v1 payloads retain PageRef/owner and remove every outgoing structural field.
+Same-allocation PageUpdate logs unlink before retirement; rollback restores exact
+active bytes. Durable commit is the candidate-publication horizon; a transaction
+cannot reuse its own new retirements even after steal/cache rebuild.
+
+The existing allocator consumes whole-owner pages and independent markers in
+PageId order. Same-owner generation transitions require a marker before image;
+ordinary updates still reject generation, owner and kind changes. Marker reuse
+rollback restores exact marker bytes. Page v5, active BTree v3, IndexCatalog v9,
+WAL container/record layouts and Heap metadata v5 are unchanged.
+
+The height-5 fixture shrinks from 83 active pages to two reachable pages plus
+81 markers, with zero new unmarked orphans. At capacities 1/8, later same-index
+DML consumes all 81 with fresh generations and no file growth. A 100-cycle
+workload stays at 115 pages with 8,100 retirements and 8,100 reuse transitions.
+Retirement and reuse have separate real-process winner/loser crash matrices.
+See [Round 14](btree-orphan-round14.md).
+
+Next recommendation: a separately designed **Historical / Quiescent Active-Orphan
+Adoption** protocol for pre-Round14 unmarked orphans. It needs quiescence,
+checkpoint, complete structural proof and durable adoption. Table Schema
+Lifecycle Architecture Audit is the alternative after measuring that historical
+backlog. Neither direction authorizes Heap reuse or direct CREATE TABLE work.
 
 ## Phase 6 — SDK and tooling
 

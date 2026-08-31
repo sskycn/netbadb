@@ -59,7 +59,7 @@ fn plan_tail(catalog: &CatalogSnapshot, inventory: &IndexPageInventory) -> TailP
         .report
         .allocations
         .iter()
-        .filter(|p| owners.contains(&p.owner))
+        .filter(|p| owners.contains(&p.owner) && !inventory.markers.contains(&p.page_ref.page_id))
         .map(|p| (p.page_ref.page_id.0, p.owner))
         .collect();
     let count = inventory.report.database_pages;

@@ -360,8 +360,14 @@ for registered BTree-v3 CREATE, backfill and split allocations. Explicit WAL rec
 v5/tag 8 transitions preserve ordinary PageUpdate generation checks, restore exact
 old images on rollback, and recover committed reuse without a checkpoint. Clean
 unpinned candidates are selected by lowest PageId before EOF append; no free catalog
-is added. Heap, Catalog, raw/legacy and active-owner orphan reuse remain unsupported.
-See [Round 13's transition, crash and growth proof](docs/page-transition-round13.md),
+is added. Round 14 marks newly unlinked registered nodes with independent NBTR v1
+retirement payloads, after every structural unlink in the same transaction.
+Only committed markers enter reuse; same-owner transitions require a marker
+before image and a fresh generation. Historical unmarked active orphans, Heap,
+Catalog and raw/legacy reuse remain unsupported. A 100-cycle same-index
+grow/shrink workload stays at 115 pages with 8,100 marker reuses and no appends.
+See [Round 14's retirement and reuse proof](docs/btree-orphan-round14.md),
+[Round 13's transition, crash and growth proof](docs/page-transition-round13.md),
 [Round 12's audit and owner-only format](docs/page-reuse-round12.md),
 [Round 11's protocol and crash matrix](docs/index-tail-reclaim-round11.md),
 [the Round 10 generation proof](docs/page-generation-round10.md), and

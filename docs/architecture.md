@@ -1961,7 +1961,20 @@ lineage before excluding superseded old-generation prefixes, then executes
 ordered redo/reverse undo with generation-first LSN checks and exact old-image
 restoration. Reopen, DROP, rollback, compaction and tail maintenance invalidate
 the disposable cache. No durable general free catalog or cross-kind reuse exists.
-See [Round 13](page-transition-round13.md), [Round 12](page-reuse-round12.md),
+Round 14 adds an independent NBTR v1 payload for explicitly retired individual
+nodes. The enclosing Page v5 retains its former leaf/internal kind; the payload
+contains only owner, generation and PageId, with no active-node semantics.
+Deletion/normalization logs and publishes all unlink updates before retirement
+PageUpdates. Reverse undo restores original nodes before incoming pointers.
+Commit invalidates the cache; the single writer's transaction-local retirement
+set excludes uncommitted markers from both rebuild and claim, including stolen
+pages. Active traversals reject marker payloads through strict node decoders.
+The ordered cache distinguishes whole-owner v3 and individual-marker authority;
+same-owner transitions are allowed only from the latter with a fresh generation.
+Markers are independent of pending owner records and excluded from whole-owner
+zero-page accounting and tail intents. Historical unmarked active orphans remain
+non-reusable. No full reachability subtraction authorizes retirement.
+See [Round 14](btree-orphan-round14.md), [Round 13](page-transition-round13.md), [Round 12](page-reuse-round12.md),
 [Round 11](index-tail-reclaim-round11.md) and [Round 10](page-generation-round10.md).
 
 A registered table index is distinct from a raw tree created through
