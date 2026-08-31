@@ -60,6 +60,9 @@ pub(crate) struct PhysicalBindings {
 }
 
 impl PhysicalBindings {
+    pub(crate) fn publish_created(&mut self, placement: TablePlacement) {
+        self.placements.push(placement);
+    }
     pub(crate) fn new(
         placements: Vec<TablePlacement>,
         registry: &StorageRegistry,
@@ -153,6 +156,12 @@ pub(crate) struct StorageRegistry {
 }
 
 impl StorageRegistry {
+    pub(crate) fn publish_created(&mut self, storage: TableStorage) {
+        self.entries.push(StorageRegistryEntry {
+            id: storage.storage_id(),
+            storage,
+        });
+    }
     pub(crate) fn from_catalog_order(
         storages: Vec<TableStorage>,
     ) -> Result<(Self, PhysicalBindings), StorageRegistryError> {

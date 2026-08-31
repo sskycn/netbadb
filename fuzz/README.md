@@ -165,3 +165,23 @@ Core test `schema_catalog_tests::codec_reviewed_seed_export` deterministically
 exports these seeds only when `NETBADB_SCHEMA_SEED_DIR` is explicitly set.
 `btree_decode`, `index_catalog_decode`, `wal_recovery` and `pgwire_decode` remain
 required companion regression targets because catalog loading precedes recovery.
+
+## Round 18 mutation journal and coordinator
+
+`schema_mutation_decode` validates the bounded NBSJ/NBSR v1 codec and replay order,
+then requires byte-identical canonical re-encoding. Four deterministic seeds cover
+reservation, intent, loser resolution and winner resolution. The coordinator corpus
+adds CORD v2 schema decision, Complete and structurally incomplete-tail seeds.
+
+Generate reviewed seeds into a temporary directory (never run mutations in the
+tracked corpus):
+
+```bash
+NETBADB_ROUND18_CORPUS=/private/tmp/netbadb-round18-reviewed-corpus \
+CARGO_TARGET_DIR=/private/tmp/netbadb-round18-target \
+cargo test -p netbadb-core write_schema_mutation_fuzz_corpus --offline -- --ignored
+cargo +nightly fuzz run schema_mutation_decode /private/tmp/netbadb-round18-fuzz-corpus/schema_mutation_decode -- -runs=1000
+```
+
+Copy only the reviewed deterministic output into the repository; use temporary
+corpus and artifact directories for all seven Round 18 smoke fuzz targets.

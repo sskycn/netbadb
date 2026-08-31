@@ -203,10 +203,18 @@ manifest. Catalog loading precedes physical identity validation and WAL recovery
 Legacy adoption is explicit and requires a separately attested complete physical
 inventory; old arbitrary filenames cannot independently establish completeness.
 Physical metadata validates TableId, StorageId, fingerprint, engine and partition
-identity. Table/column DDL, non-rollback reservations, schema overlays, staged
-physical creation, coordinator schema participants and prepared-schema invalidation
-remain future work. The current index runtime revision remains separate from
-persistent logical schema generations.
+identity. [Round 18](core-create-table-round18.md) adds Core transactional Heap
+creation: exclusive schema-writer admission, non-rollback reservations, a private
+materialized transaction SchemaView and Heap binding, typed same-transaction DML,
+prepared NBSC snapshots, CORD v2 schema references and winner-driven promotion.
+The committed bundle publishes only after physical/catalog durability. Statement
+dependencies preserve unrelated prepared queries; private statements carry exact
+transaction scope. Startup resolves journal/coordinator obligations before validating
+the active NBSC/state pair. The immutable partition catalog remains baseline evidence;
+NBSC includes newly created single Heaps without rewriting that evidence.
+SchemaGeneration advances once per creation commit; table versions stay 1 and the
+runtime revision increments with checked arithmetic. SQL table DDL, DROP/ALTER,
+constraint enforcement and non-Heap runtime creation remain future work.
 
 ## Compiler and plans
 

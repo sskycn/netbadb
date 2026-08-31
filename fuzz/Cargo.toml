@@ -117,3 +117,10 @@ all = "warn"
 unsafe_code = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+
+[[bin]]
+name = "schema_mutation_decode"
+path = "fuzz_targets/schema_mutation_decode.rs"
+test = false
+doc = false
+bench = false

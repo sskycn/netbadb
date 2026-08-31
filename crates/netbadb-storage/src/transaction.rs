@@ -879,6 +879,14 @@ impl TransactionManager {
         Ok(())
     }
 
+    pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
+        if self.maintenance_pending || self.runtime.writer.get() == WriterState::RecoveryRequired {
+            Err(TransactionError::RecoveryRequired.into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn ensure_clean_close(&self) -> Result<(), StorageError> {
         match self.runtime.writer.get() {
             WriterState::Idle if self.runtime.outstanding.get() == 0 => Ok(()),

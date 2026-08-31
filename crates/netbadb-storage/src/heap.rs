@@ -1692,6 +1692,10 @@ impl HeapStorage {
         self.transactions.begin_with_isolation(isolation_level)
     }
 
+    pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
+        self.transactions.ensure_recovery_ready()
+    }
+
     /// Pins a committed statement snapshot for a read that is not associated
     /// with an explicit transaction.
     pub fn read_view(&self) -> Result<ReadView, StorageError> {

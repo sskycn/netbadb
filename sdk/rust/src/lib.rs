@@ -2,10 +2,11 @@
 
 #[cfg(feature = "embedded")]
 pub use netbadb_core::{
-    CompleteLegacyInventory, Database, DatabaseCoordinatorConfig, DatabaseError, ExecutionResult,
-    LegacyStorageLocation, PartitionCatalogConfig, QueryResult, RangePartitionSpec, ResultColumn,
-    SchemaCatalogError, SchemaGeneration, TablePlacementSpec, TableSchemaVersion,
-    TableStorageCreateSpec, Transaction, TransactionState,
+    CompleteLegacyInventory, CreateColumnSpec, CreateTableSpec, Database,
+    DatabaseCoordinatorConfig, DatabaseError, ExecutionResult, LegacyStorageLocation,
+    PartitionCatalogConfig, QueryResult, RangePartitionSpec, ResultColumn, SchemaCatalogError,
+    SchemaDependency, SchemaGeneration, SchemaMutationError, TablePlacementSpec,
+    TableSchemaVersion, TableStorageCreateSpec, Transaction, TransactionState,
 };
 pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,

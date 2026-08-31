@@ -60,7 +60,8 @@ impl CompleteLegacyInventory {
 impl Database {
     /// Creates a database at an explicit database-level catalog location. The
     /// supplied schema/placements are bootstrap input exactly once. Empty input
-    /// is supported by this explicit-root API. No runtime table DDL is exposed.
+    /// is supported by this explicit-root API. Runtime Heap creation uses
+    /// `create_heap_table_in`; SQL table DDL remains unsupported.
     pub fn create_catalog(
         catalog_path: impl AsRef<Path>,
         specs: Vec<TableStorageCreateSpec>,
@@ -367,7 +368,11 @@ impl Database {
     /// None denotes exhausted identity space, not permission to recompute it.
     #[must_use]
     pub fn next_table_id(&self) -> Option<TableId> {
-        self.committed.next_table_id
+        self.mutation_journal
+            .as_ref()
+            .map_or(self.committed.next_table_id, |j| {
+                j.borrow().effective_table(self.committed.next_table_id)
+            })
     }
     /// Inspection only: None means unknown table or exhausted column identity.
     /// Use table_schema_version to distinguish absence; this is not allocation.
@@ -381,7 +386,11 @@ impl Database {
     }
     #[must_use]
     pub fn next_storage_id(&self) -> Option<StorageId> {
-        self.committed.next_storage_id
+        self.mutation_journal
+            .as_ref()
+            .map_or(self.committed.next_storage_id, |j| {
+                j.borrow().effective_storage(self.committed.next_storage_id)
+            })
     }
     #[must_use]
     pub fn next_partition_id(&self) -> Option<PartitionId> {
@@ -592,6 +601,7 @@ fn finish_install(
     // Publication transfers a freshly decoded committed Schema, never the
     // caller's TableDefs. Physical handles have already validated against it.
     database.committed = file::install_initial(path, &snapshot)?.committed;
+    database.catalog_path = Some(path.to_owned());
     Ok(database)
 }
 
@@ -645,6 +655,7 @@ fn open_authority(
     partition: Option<&Path>,
 ) -> Result<Database, DatabaseError> {
     let path = file::absolute(path)?;
+    let journal = crate::schema_mutation::recover(&path)?;
     let snapshot = file::load(&path)?;
     preflight_paths(&path, &snapshot, false)?;
     if let Some(expectation) = expectation {
@@ -670,6 +681,25 @@ fn open_authority(
     validate_physical(&path, &snapshot, overrides)?;
     let mut database = recover_physical(&path, &snapshot, overrides)?;
     database.committed = snapshot.committed;
+    database.catalog_path = Some(path);
+    if let Some(journal) = journal {
+        if let Some(id) = journal.reservations.keys().next_back() {
+            let next =
+                id.0.checked_add(1)
+                    .ok_or(crate::CoordinatorError::TransactionIdExhausted)?;
+            database.next_transaction_id.0 = database.next_transaction_id.0.max(next);
+        }
+        database.mutation_journal = Some(std::rc::Rc::new(std::cell::RefCell::new(journal)));
+    } else if database
+        .coordinator
+        .as_ref()
+        .is_some_and(|c| c.borrow().decisions().any(|d| d.schema.is_some()))
+    {
+        return Err(crate::SchemaMutationError::Corrupt(
+            "schema coordinator has no mutation journal",
+        )
+        .into());
+    }
     Ok(database)
 }
 
@@ -679,7 +709,23 @@ fn validate_partition_evidence(
 ) -> Result<(), DatabaseError> {
     if let Some(locator) = &snapshot.partition_evidence {
         let evidence = PartitionCatalog::open(&file::resolve(path, locator))?;
-        if evidence.tables.len() != snapshot.placements.tables.len()
+        let journal = crate::schema_mutation_journal::SchemaMutationJournal::open(
+            path,
+            snapshot.incarnation,
+        )?;
+        let created = snapshot
+            .placements
+            .tables
+            .iter()
+            .filter(|table| {
+                journal.as_ref().is_some_and(|j| {
+                    j.reservations
+                        .values()
+                        .any(|r| r.table == table.table_id && r.intent.is_some())
+                })
+            })
+            .count();
+        if evidence.tables.len() + created != snapshot.placements.tables.len()
             || evidence
                 .tables
                 .iter()
@@ -831,41 +877,46 @@ fn inspect_location(
         }
     })
 }
-fn recover_physical(
+pub(crate) fn recover_physical(
     path: &Path,
     snapshot: &SchemaCatalogSnapshot,
     overrides: &[TableStorageOpenSpec],
 ) -> Result<Database, DatabaseError> {
     let specs = materialize(path, snapshot, overrides)?;
-    if let Some(partition) = &snapshot.partition_evidence {
-        let coordinator =
-            snapshot
-                .coordinator
-                .as_ref()
-                .ok_or(SchemaCatalogError::InventoryMismatch(
-                    "partition coordinator absent",
-                ))?;
-        return Database::physical_open_with_placements(
-            snapshot.committed.schema.tables().to_vec(),
-            specs.iter().map(|s| s.path().to_owned()).collect(),
-            PartitionCatalogConfig::new(
-                file::resolve(path, partition),
-                file::resolve(path, coordinator),
-            ),
-            snapshot.committed.clone(),
-        );
+    let journal =
+        crate::schema_mutation_journal::SchemaMutationJournal::open(path, snapshot.incarnation)?;
+    let coordinator_locator = snapshot.coordinator.as_ref().or_else(|| {
+        journal
+            .as_ref()
+            .filter(|j| !j.reservations.is_empty())
+            .map(|j| &j.coordinator)
+    });
+    let coordinator =
+        coordinator_locator.map(|p| DatabaseCoordinatorConfig::new(file::resolve(path, p)));
+    if let (Some(partition), Some(coordinator)) = (&snapshot.partition_evidence, &coordinator) {
+        if snapshot.committed.generation.0 == 1 {
+            return Database::physical_open_with_placements(
+                snapshot.committed.schema.tables().to_vec(),
+                specs.iter().map(|s| s.path().to_owned()).collect(),
+                PartitionCatalogConfig::new(file::resolve(path, partition), coordinator.log_path()),
+                snapshot.committed.clone(),
+            );
+        }
     }
-    let coordinator = snapshot
-        .coordinator
-        .as_ref()
-        .map(|p| DatabaseCoordinatorConfig::new(file::resolve(path, p)));
     if specs.is_empty() {
         let coordinator = coordinator
             .map(|config| {
                 let log = crate::CoordinatorLog::open(config.log_path())?;
                 let decisions = log.decisions().cloned().collect::<Vec<_>>();
                 crate::validate_generic_coordinator_recovery(&decisions, &[])?;
-                Ok::<_, DatabaseError>((log, netbadb_types::DatabaseTxnId(1)))
+                let next = decisions
+                    .iter()
+                    .map(|d| d.database_txn_id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(crate::CoordinatorError::TransactionIdExhausted)?;
+                Ok::<_, DatabaseError>((log, netbadb_types::DatabaseTxnId(next)))
             })
             .transpose()?;
         return Database::compose_recovered(
@@ -875,9 +926,10 @@ fn recover_physical(
             None,
         );
     }
-    if specs
-        .iter()
-        .all(|s| matches!(s, TableStorageOpenSpec::Heap { .. }))
+    if snapshot.partition_evidence.is_none()
+        && specs
+            .iter()
+            .all(|s| matches!(s, TableStorageOpenSpec::Heap { .. }))
     {
         let tables = specs
             .into_iter()
@@ -889,23 +941,23 @@ fn recover_physical(
                 } => (path, table),
             })
             .collect();
-        match coordinator {
-            None => Database::physical_open_tables(tables, snapshot.committed.clone()),
+        return match coordinator {
             Some(config) => Database::physical_open_tables_with_coordinator(
                 tables,
                 config,
                 snapshot.committed.clone(),
             ),
-        }
-    } else {
-        match coordinator {
-            None => Database::physical_open_storages(specs, snapshot.committed.clone()),
-            Some(config) => Database::physical_open_storages_with_coordinator(
-                specs,
-                config,
-                snapshot.committed.clone(),
-            ),
-        }
+            None => Database::physical_open_tables(tables, snapshot.committed.clone()),
+        };
+    }
+    match coordinator {
+        Some(config) => Database::physical_open_storages_with_coordinator(
+            specs,
+            config,
+            snapshot.committed.clone(),
+            Some(snapshot.placements.clone()),
+        ),
+        None => Database::physical_open_storages(specs, snapshot.committed.clone()),
     }
 }
 
@@ -925,6 +977,14 @@ fn preflight_paths(
     for p in [path.to_owned(), file::marker_path(path)] {
         claim(p.clone())?;
         claim(file::suffix(&p, ".next"))?;
+    }
+    for suffix in [
+        ".mutations",
+        ".mutations.next",
+        ".mutations.state",
+        ".mutations.state.next",
+    ] {
+        claim(file::suffix(path, suffix))?;
     }
     for storage in &snapshot.storages {
         let physical = file::resolve(path, &storage.locator);

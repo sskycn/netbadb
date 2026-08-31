@@ -13,6 +13,7 @@ use netbadb_types::{DatabaseTxnId, StorageId};
 
 use crate::coordinator_log::{CoordinatorLog, CoordinatorLogError, CoordinatorParticipant};
 use crate::registry::{StorageRegistry, StorageRegistryError};
+use crate::schema_mutation::{SchemaMutation, SchemaMutationError};
 
 pub(crate) type SharedCoordinatorLog = Rc<RefCell<CoordinatorLog>>;
 
@@ -96,6 +97,8 @@ pub struct DatabaseTransaction {
     participants: BTreeMap<StorageId, StorageParticipant>,
     write_participants: BTreeSet<StorageId>,
     coordinator: Option<SharedCoordinatorLog>,
+    pub(crate) schema_mutation: Option<SchemaMutation>,
+    pub(crate) preparation_scope: Rc<()>,
     pending_indexes: Vec<(StorageId, IndexDefinition)>,
     pending_index_drops: Vec<(StorageId, netbadb_types::IndexId)>,
 }
@@ -115,6 +118,8 @@ impl DatabaseTransaction {
             participants: BTreeMap::new(),
             write_participants: BTreeSet::new(),
             coordinator,
+            schema_mutation: None,
+            preparation_scope: Rc::new(()),
             pending_indexes: Vec::new(),
             pending_index_drops: Vec::new(),
         }
@@ -249,7 +254,7 @@ impl DatabaseTransaction {
     }
 
     pub(crate) fn commit_with_schema_mutations(&mut self) -> Result<(), CoordinatorError> {
-        if self.write_participants.len() > 1 {
+        if self.write_participants.len() > 1 || self.schema_mutation.is_some() {
             return self.commit_multi_write();
         }
         match self.state {
@@ -317,7 +322,9 @@ impl DatabaseTransaction {
     }
 
     pub(crate) fn has_pending_schema_mutations(&self) -> bool {
-        !self.pending_indexes.is_empty() || !self.pending_index_drops.is_empty()
+        self.schema_mutation.is_some()
+            || !self.pending_indexes.is_empty()
+            || !self.pending_index_drops.is_empty()
     }
 
     pub(crate) fn has_pending_index_creations(&self) -> bool {
@@ -381,6 +388,11 @@ impl DatabaseTransaction {
             }
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash("after-all-prepares");
+            if let Some(mutation) = &self.schema_mutation {
+                crate::schema_mutation::crash("participants-prepared");
+                mutation.prepare()?;
+                crate::schema_mutation::crash("before-coordinator-decision");
+            }
             self.state = TransactionState::DecisionPending;
         }
 
@@ -401,13 +413,26 @@ impl DatabaseTransaction {
                     })
                 })
                 .collect::<Result<Vec<_>, CoordinatorError>>()?;
-            self.coordinator
+            let mut log = self
+                .coordinator
                 .as_ref()
                 .ok_or(CoordinatorError::DurableCoordinatorRequired)?
                 .try_borrow_mut()
-                .map_err(|_| CoordinatorError::CoordinatorBusy)?
-                .commit_decision(self.id, &decision_participants)?;
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?;
+            if let Some(mutation) = &self.schema_mutation {
+                log.commit_schema_decision(
+                    self.id,
+                    &decision_participants,
+                    Some(&mutation.reference),
+                )?;
+            } else {
+                log.commit_decision(self.id, &decision_participants)?;
+            }
+            drop(log);
             self.state = TransactionState::CommitDecided;
+            if self.schema_mutation.is_some() {
+                crate::schema_mutation::crash("coordinator-durable");
+            }
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash("after-durable-decision");
         }
@@ -433,8 +458,14 @@ impl DatabaseTransaction {
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash("after-all-commits");
             self.state = TransactionState::FinalizePending;
+            if self.schema_mutation.is_some() {
+                crate::schema_mutation::crash("staged-heap-committed");
+            }
         }
 
+        if self.schema_mutation.is_some() {
+            return Ok(());
+        }
         self.coordinator
             .as_ref()
             .ok_or(CoordinatorError::DurableCoordinatorRequired)?
@@ -480,6 +511,120 @@ impl DatabaseTransaction {
         self.rollback()
     }
 
+    pub(crate) fn require_schema_rollback(&mut self) {
+        self.state = TransactionState::RollbackRequired;
+    }
+    pub(crate) fn set_coordinator(&mut self, coordinator: SharedCoordinatorLog) {
+        self.coordinator = Some(coordinator);
+    }
+    pub(crate) fn shared_coordinator(&self) -> Option<SharedCoordinatorLog> {
+        self.coordinator.as_ref().map(Rc::clone)
+    }
+    pub(crate) fn coordinator_decisions(
+        &self,
+    ) -> Result<Vec<crate::CoordinatorDecision>, CoordinatorError> {
+        Ok(self
+            .coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+            .try_borrow()
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?
+            .decisions()
+            .cloned()
+            .collect())
+    }
+    pub(crate) fn enlist_staged(
+        &mut self,
+        mut storage: netbadb_storage::TableStorage,
+    ) -> Result<(), CoordinatorError> {
+        let id = storage.storage_id();
+        let context = storage.begin_transaction_with_isolation(self.isolation_level)?;
+        let mutation = self
+            .schema_mutation
+            .as_mut()
+            .ok_or(SchemaMutationError::Corrupt(
+                "enlist without schema mutation",
+            ))?;
+        if self.participants.contains_key(&id) {
+            return Err(SchemaMutationError::Corrupt("duplicate staged participant").into());
+        }
+        mutation.staged = Some(storage);
+        self.participants.insert(
+            id,
+            StorageParticipant {
+                mode: ParticipantMode::Write,
+                context,
+            },
+        );
+        self.write_participants.insert(id);
+        Ok(())
+    }
+    pub(crate) fn staged_storage_mut(&mut self) -> Option<&mut netbadb_storage::TableStorage> {
+        self.schema_mutation
+            .as_mut()
+            .and_then(|m| m.staged.as_mut())
+    }
+    pub(crate) fn staged_binding(&self, table: netbadb_types::TableId) -> Option<StorageId> {
+        self.schema_mutation
+            .as_ref()
+            .filter(|m| m.reservation.table == table && m.staged.is_some())
+            .map(|m| m.reservation.storage)
+    }
+    pub(crate) fn visible_schema<'a>(
+        &'a self,
+        committed: &'a netbadb_schema::Schema,
+    ) -> &'a netbadb_schema::Schema {
+        self.schema_mutation
+            .as_ref()
+            .filter(|m| m.staged.is_some())
+            .map_or(committed, |m| &m.target.committed.schema)
+    }
+    pub(crate) fn release_staged_context(&mut self, id: StorageId) {
+        self.participants.remove(&id);
+        self.write_participants.remove(&id);
+    }
+    pub(crate) fn finish_schema_decision(&mut self) -> Result<(), CoordinatorError> {
+        self.coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?
+            .complete(self.id)?;
+        Ok(())
+    }
+    pub(crate) fn complete_schema_publication(&mut self) {
+        self.schema_mutation = None;
+        self.state = TransactionState::Committed;
+    }
+    pub(crate) fn with_write_storage<T>(
+        &mut self,
+        storage_id: StorageId,
+        registry: &mut StorageRegistry,
+        operation: impl FnOnce(
+            &mut netbadb_storage::TableStorage,
+            &mut StorageTransaction,
+        ) -> Result<T, StorageError>,
+    ) -> Result<T, CoordinatorError> {
+        let _ = self.write_context(storage_id, registry)?;
+        let context = &mut self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?
+            .context;
+        let storage = match self
+            .schema_mutation
+            .as_mut()
+            .and_then(|m| m.staged.as_mut())
+            .filter(|s| s.storage_id() == storage_id)
+        {
+            Some(storage) => storage,
+            None => registry
+                .get_mut(storage_id)
+                .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+        };
+        Ok(operation(storage, context)?)
+    }
+
     fn ensure_active(&self) -> Result<(), CoordinatorError> {
         if self.state != TransactionState::Active {
             return Err(CoordinatorError::NotActive {
@@ -507,6 +652,14 @@ impl DatabaseTransaction {
         {
             rollback_participant(self.id, *storage_id, participant)?;
         }
+        if let Some(mutation) = &mut self.schema_mutation {
+            self.participants.remove(&mutation.reservation.storage);
+            self.write_participants
+                .remove(&mutation.reservation.storage);
+            crate::schema_mutation::crash("rollback-participants-durable");
+            mutation.cleanup_loser()?;
+        }
+        self.schema_mutation = None;
         self.state = TransactionState::RolledBack;
         Ok(())
     }
@@ -645,6 +798,7 @@ fn storage_commit_state_reason(state: StorageTransactionState) -> &'static str {
 
 #[derive(Debug)]
 pub enum CoordinatorError {
+    SchemaMutation(SchemaMutationError),
     Storage(StorageError),
     Registry(StorageRegistryError),
     CoordinatorLog(CoordinatorLogError),
@@ -683,6 +837,7 @@ pub enum CoordinatorError {
 impl fmt::Display for CoordinatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SchemaMutation(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Registry(error) => error.fmt(formatter),
             Self::CoordinatorLog(error) => error.fmt(formatter),
@@ -750,6 +905,7 @@ impl fmt::Display for CoordinatorError {
 impl Error for CoordinatorError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::SchemaMutation(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Registry(error) => Some(error),
             Self::CoordinatorLog(error) => Some(error),
@@ -783,5 +939,11 @@ impl From<StorageRegistryError> for CoordinatorError {
 impl From<CoordinatorLogError> for CoordinatorError {
     fn from(error: CoordinatorLogError) -> Self {
         Self::CoordinatorLog(error)
+    }
+}
+
+impl From<SchemaMutationError> for CoordinatorError {
+    fn from(error: SchemaMutationError) -> Self {
+        Self::SchemaMutation(error)
     }
 }

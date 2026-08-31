@@ -4691,6 +4691,94 @@ mod tests {
     }
 
     #[test]
+    fn existing_pg_session_refreshes_core_created_tables_without_granting_access() {
+        let root = test_path("core-created-table");
+        std::fs::create_dir(&root).unwrap();
+        let mut database =
+            Database::create_tables(vec![(root.join("users"), catalog_tables().remove(0))])
+                .unwrap();
+        let (mut session, _) = PgWorkerSession::new(
+            &database,
+            SessionPolicy::default(),
+            principal(&[TableId(1)], &[TableId(1)]),
+            StartupMessage {
+                parameters: Default::default(),
+            },
+            1,
+        )
+        .unwrap();
+        let mut txn = database.begin_transaction().unwrap();
+        let id = database
+            .create_heap_table_in(
+                &mut txn,
+                netbadb_core::CreateTableSpec::new(
+                    "projects",
+                    vec![netbadb_core::CreateColumnSpec::new(
+                        "id",
+                        netbadb_types::SemanticType::physical(PhysicalType::Int64),
+                        false,
+                    )],
+                ),
+            )
+            .unwrap();
+        session.refresh_catalog(&database).unwrap();
+        assert!(session.catalog.table("projects").is_none());
+        database.commit_transaction(&mut txn).unwrap();
+        drop(txn);
+        // The very same session refreshes through its normal next-command path.
+        let query = "SELECT ns.nspname AS \"Schema\", rel.relname AS \"Name\", CASE rel.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' END AS \"Type\", pg_catalog.pg_get_userbyid(rel.relowner) AS \"Owner\" FROM pg_catalog.pg_class AS rel LEFT JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace LEFT JOIN pg_catalog.pg_am AS method ON method.oid = rel.relam WHERE rel.relkind IN ('r', 'p', '') AND pg_catalog.pg_table_is_visible(rel.oid)";
+        let messages = session.handle(&mut database, FrontendMessage::Query(query.into()));
+        assert!(session.catalog.table("projects").is_some());
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse(_)))
+        );
+        let visible = execute_compatibility_statement_for_owner(
+            &session.catalog,
+            &session.authorization,
+            "reader",
+            CompatibilityStatement::PsqlTableList,
+            &[ScalarValue::Null, ScalarValue::Null],
+        )
+        .unwrap();
+        assert!(
+            visible
+                .rows
+                .iter()
+                .all(|row| row[1] != ScalarValue::Text("projects".into()))
+        );
+        // A separately configured fixture authorization can observe the generic
+        // projection; production's preexisting grants remain default-deny.
+        let admin = principal(&[TableId(1), id], &[TableId(1), id]);
+        let visible = execute_compatibility_statement_for_owner(
+            &session.catalog,
+            &admin,
+            "admin",
+            CompatibilityStatement::PsqlTableList,
+            &[ScalarValue::Null, ScalarValue::Null],
+        )
+        .unwrap();
+        assert!(
+            visible
+                .rows
+                .iter()
+                .any(|row| row[1] == ScalarValue::Text("projects".into()))
+        );
+        assert!(
+            session
+                .catalog
+                .table("projects")
+                .unwrap()
+                .columns
+                .iter()
+                .all(|c| !c.primary_key)
+        );
+        database.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn guessed_legacy_alias_for_hidden_table_is_not_resolved() {
         let root = test_path("drop-hidden-alias");
         let _ = std::fs::remove_dir_all(&root);

@@ -733,7 +733,11 @@ impl<'a> Reader<'a> {
             Ok(None)
         }
     }
-    fn count(&mut self, maximum: usize, min_bytes: usize) -> Result<usize, SchemaCatalogError> {
+    pub(crate) fn count(
+        &mut self,
+        maximum: usize,
+        min_bytes: usize,
+    ) -> Result<usize, SchemaCatalogError> {
         let count = self.u32()? as usize;
         if count > maximum || count > self.0.len() / min_bytes {
             return Err(corrupt("count out of bounds"));

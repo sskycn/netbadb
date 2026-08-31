@@ -98,8 +98,10 @@ TableDefs. Optional application/manifest schemas are exact subset expectations;
 missing or corrupt initialized catalogs fail without fallback. Semantic types,
 declaration order, placements, IDs, high-waters and schema versions survive reopen.
 The [SchemaCatalog v1 format](docs/schema-catalog-v1.md) documents the independent
-installation marker and crash-safe publication. Runtime CREATE/DROP/ALTER TABLE
-remain unsupported.
+installation marker and crash-safe publication. [Core transactional Heap table
+creation](docs/core-create-table-round18.md) adds durable identity reservations,
+private transaction schema/DML, coordinator-backed commit, and catalog-only recovery.
+SQL CREATE TABLE, DROP TABLE and ALTER TABLE remain unsupported.
 
 ## Repository layout
 

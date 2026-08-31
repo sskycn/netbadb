@@ -73,3 +73,33 @@ CommitDecision + partial Commit records -> finish every participant commit
 The decision tuple must match the Heap metadata StorageId and the prepared WAL
 DatabaseTxnId/physical TxnId exactly. Missing or extra participants fail the
 whole database open.
+
+## Round 18 schema participant records (CORD v2)
+
+The NBCO file header stays v1. Existing CORD v1 records are still read and written
+for storage-only decisions and Complete. CORD **record version 2, tag 3** adds a
+schema CommitDecision. The same 32-byte header and 1..1024 sorted physical
+participant tuples are followed by exactly 56 bytes:
+
+| Width | Meaning |
+| --- | --- |
+| 16 | Nonzero database incarnation |
+| 8 | Nonzero prepared NBSC target epoch |
+| 32 | SHA-256 of the complete prepared NBSC bytes |
+
+Total size is `32 + count * 16 + 56` (maximum 16,472). CRC32C covers the whole
+record with the checksum field zeroed, as for v1. Version/tag combinations other
+than `(1,1)`, `(1,2)`, `(2,3)` are rejected. Repeated decisions must match both the
+physical tuple set and the complete schema reference. No full schema is copied
+into CoordinatorLog. DatabaseTxnId locates the corresponding reservation/intent
+and prepared relative locator in [SchemaMutationJournal v1](schema-mutation-journal-v1.md).
+
+A schema transaction takes this path even when the new Heap is its only physical
+writer or has no rows. Existing Heap/LSM/partition writes participate normally.
+Storage prepare and prepared NBSC sync precede the sole commit decision. Physical
+commits, staged promotion, and NBSC/state publication must all finish before the
+Complete record is synchronized. DecisionPending/FinalizePending retain retry-only
+semantics; the live committed schema remains old until complete publication.
+
+Old readers correctly reject CORD v2; do not downgrade a database that has used
+runtime schema creation. Existing v1-only databases remain readable by Round 18.

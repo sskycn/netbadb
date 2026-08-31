@@ -1184,6 +1184,15 @@ impl TableStorage {
         }
     }
 
+    /// Reject admission when a dropped writer or failed maintenance requires
+    /// startup recovery, while permitting the caller's active transaction.
+    pub fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => storage.ensure_recovery_ready(),
+            Self::Lsm(storage) => storage.ensure_recovery_ready(),
+        }
+    }
+
     pub fn flush(&self) -> Result<(), StorageError> {
         match self {
             Self::Heap(storage) => storage.flush(),

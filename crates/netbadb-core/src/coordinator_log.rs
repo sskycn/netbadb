@@ -16,9 +16,12 @@ const RECORD_HEADER_SIZE: usize = 32;
 const RECORD_CHECKSUM_OFFSET: usize = 12;
 const COMMIT_DECISION_TAG: u8 = 1;
 const COMPLETE_TAG: u8 = 2;
+const SCHEMA_COMMIT_TAG: u8 = 3;
+const SCHEMA_REFERENCE_SIZE: usize = 56;
 pub(crate) const MAX_COORDINATOR_PARTICIPANTS: usize = 1_024;
 const PARTICIPANT_SIZE: usize = 16;
-const MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE + MAX_COORDINATOR_PARTICIPANTS * PARTICIPANT_SIZE;
+const MAX_RECORD_SIZE: usize =
+    RECORD_HEADER_SIZE + MAX_COORDINATOR_PARTICIPANTS * PARTICIPANT_SIZE + SCHEMA_REFERENCE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CoordinatorParticipant {
@@ -26,11 +29,20 @@ pub(crate) struct CoordinatorParticipant {
     pub(crate) physical_txn_id: TxnId,
 }
 
+/// CORD v2 reference; the full schema remains in a separately synced NBSC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaParticipantReference {
+    pub(crate) incarnation: [u8; 16],
+    pub(crate) target_epoch: u64,
+    pub(crate) digest: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoordinatorDecision {
     pub(crate) database_txn_id: DatabaseTxnId,
     pub(crate) participants: Vec<CoordinatorParticipant>,
     pub(crate) complete: bool,
+    pub(crate) schema: Option<SchemaParticipantReference>,
 }
 
 #[derive(Debug)]
@@ -105,9 +117,18 @@ impl CoordinatorLog {
         database_txn_id: DatabaseTxnId,
         participants: &[CoordinatorParticipant],
     ) -> Result<(), CoordinatorLogError> {
+        self.commit_schema_decision(database_txn_id, participants, None)
+    }
+
+    pub(crate) fn commit_schema_decision(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        participants: &[CoordinatorParticipant],
+        schema: Option<&SchemaParticipantReference>,
+    ) -> Result<(), CoordinatorLogError> {
         let participants = canonical_participants(database_txn_id, participants)?;
         if let Some(existing) = self.decisions.get(&database_txn_id) {
-            if existing.participants != participants {
+            if existing.participants != participants || existing.schema.as_ref() != schema {
                 return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
             }
             self.file.sync_data()?;
@@ -115,7 +136,10 @@ impl CoordinatorLog {
         }
         let bytes = encode_record(
             database_txn_id,
-            CoordinatorRecord::CommitDecision(&participants),
+            match schema {
+                Some(reference) => CoordinatorRecord::SchemaCommit(&participants, reference),
+                None => CoordinatorRecord::CommitDecision(&participants),
+            },
         )?;
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_decision_append) {
@@ -136,6 +160,7 @@ impl CoordinatorLog {
                 database_txn_id,
                 participants,
                 complete: false,
+                schema: schema.cloned(),
             },
         );
         #[cfg(test)]
@@ -209,6 +234,7 @@ impl CoordinatorLog {
 
 enum CoordinatorRecord<'a> {
     CommitDecision(&'a [CoordinatorParticipant]),
+    SchemaCommit(&'a [CoordinatorParticipant], &'a SchemaParticipantReference),
     Complete,
 }
 
@@ -302,7 +328,7 @@ fn apply_decoded_record(
         return Err(CoordinatorLogError::InvalidReservedBytes { offset });
     }
     match bytes[6] {
-        COMMIT_DECISION_TAG => {
+        COMMIT_DECISION_TAG | SCHEMA_COMMIT_TAG => {
             if participant_count == 0 || participant_count > MAX_COORDINATOR_PARTICIPANTS {
                 return Err(CoordinatorLogError::InvalidParticipantCount {
                     offset,
@@ -326,8 +352,26 @@ fn apply_decoded_record(
                 });
             }
             let participants = canonical_participants(database_txn_id, &participants)?;
+            let schema = if bytes[6] == SCHEMA_COMMIT_TAG {
+                let base = RECORD_HEADER_SIZE + participant_count * PARTICIPANT_SIZE;
+                let mut incarnation = [0; 16];
+                incarnation.copy_from_slice(&bytes[base..base + 16]);
+                let target_epoch = read_u64(bytes, base + 16);
+                let mut digest = [0; 32];
+                digest.copy_from_slice(&bytes[base + 24..base + 56]);
+                if incarnation == [0; 16] || target_epoch == 0 {
+                    return Err(CoordinatorLogError::InvalidReservedBytes { offset });
+                }
+                Some(SchemaParticipantReference {
+                    incarnation,
+                    target_epoch,
+                    digest,
+                })
+            } else {
+                None
+            };
             if let Some(existing) = decisions.get(&database_txn_id) {
-                if existing.participants != participants {
+                if existing.participants != participants || existing.schema != schema {
                     return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
                 }
             } else {
@@ -337,6 +381,7 @@ fn apply_decoded_record(
                         database_txn_id,
                         participants,
                         complete: false,
+                        schema,
                     },
                 );
             }
@@ -428,28 +473,53 @@ fn encode_record(
     database_txn_id: DatabaseTxnId,
     record: CoordinatorRecord<'_>,
 ) -> Result<Vec<u8>, CoordinatorLogError> {
+    let schema = match &record {
+        CoordinatorRecord::SchemaCommit(_, reference) => Some(*reference),
+        _ => None,
+    };
     let (tag, participants) = match record {
         CoordinatorRecord::CommitDecision(participants) => (
             COMMIT_DECISION_TAG,
             canonical_participants(database_txn_id, participants)?,
         ),
+        CoordinatorRecord::SchemaCommit(participants, reference) => {
+            if reference.incarnation == [0; 16] || reference.target_epoch == 0 {
+                return Err(CoordinatorLogError::InvalidReservedBytes { offset: 0 });
+            }
+            (
+                SCHEMA_COMMIT_TAG,
+                canonical_participants(database_txn_id, participants)?,
+            )
+        }
         CoordinatorRecord::Complete => (COMPLETE_TAG, Vec::new()),
     };
-    let total_len = RECORD_HEADER_SIZE
-        .checked_add(
-            participants
-                .len()
-                .checked_mul(PARTICIPANT_SIZE)
-                .ok_or(CoordinatorLogError::RecordSizeOverflow)?,
-        )
-        .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
+    let total_len = (RECORD_HEADER_SIZE
+        + if schema.is_some() {
+            SCHEMA_REFERENCE_SIZE
+        } else {
+            0
+        })
+    .checked_add(
+        participants
+            .len()
+            .checked_mul(PARTICIPANT_SIZE)
+            .ok_or(CoordinatorLogError::RecordSizeOverflow)?,
+    )
+    .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
     let total_len_u32 =
         u32::try_from(total_len).map_err(|_| CoordinatorLogError::RecordSizeOverflow)?;
     let participant_count = u32::try_from(participants.len())
         .map_err(|_| CoordinatorLogError::ParticipantCountOverflow { offset: 0 })?;
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(RECORD_MAGIC);
-    bytes.extend_from_slice(&RECORD_VERSION.to_le_bytes());
+    bytes.extend_from_slice(
+        &(if schema.is_some() {
+            2_u16
+        } else {
+            RECORD_VERSION
+        })
+        .to_le_bytes(),
+    );
     bytes.push(tag);
     bytes.push(0);
     bytes.extend_from_slice(&total_len_u32.to_le_bytes());
@@ -460,6 +530,11 @@ fn encode_record(
     for participant in participants {
         bytes.extend_from_slice(&participant.storage_id.0.to_le_bytes());
         bytes.extend_from_slice(&participant.physical_txn_id.0.to_le_bytes());
+    }
+    if let Some(reference) = schema {
+        bytes.extend_from_slice(&reference.incarnation);
+        bytes.extend_from_slice(&reference.target_epoch.to_le_bytes());
+        bytes.extend_from_slice(&reference.digest);
     }
     let checksum = crc32c::crc32c(&bytes);
     bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + 4]
@@ -472,13 +547,18 @@ fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorL
     if bytes[..magic_len] != RECORD_MAGIC[..magic_len] {
         return Err(CoordinatorLogError::InvalidRecordMagic { offset });
     }
-    if bytes.len() >= 6 && read_u16(bytes, 4) != RECORD_VERSION {
+    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1 | 2) {
         return Err(CoordinatorLogError::UnsupportedRecordVersion {
             offset,
             version: read_u16(bytes, 4),
         });
     }
-    if bytes.len() >= 7 && !matches!(bytes[6], COMMIT_DECISION_TAG | COMPLETE_TAG) {
+    if bytes.len() >= 7
+        && !matches!(
+            (read_u16(bytes, 4), bytes[6]),
+            (1, COMMIT_DECISION_TAG | COMPLETE_TAG) | (2, SCHEMA_COMMIT_TAG)
+        )
+    {
         return Err(CoordinatorLogError::UnknownRecordTag {
             offset,
             tag: bytes[6],
@@ -511,7 +591,13 @@ fn validate_record_header(
         return Err(CoordinatorLogError::InvalidParticipantCount { offset, count });
     }
     let expected = match tag {
-        COMMIT_DECISION_TAG => RECORD_HEADER_SIZE.checked_add(
+        COMMIT_DECISION_TAG | SCHEMA_COMMIT_TAG => (RECORD_HEADER_SIZE
+            + if tag == SCHEMA_COMMIT_TAG {
+                SCHEMA_REFERENCE_SIZE
+            } else {
+                0
+            })
+        .checked_add(
             count
                 .checked_mul(PARTICIPANT_SIZE)
                 .ok_or(CoordinatorLogError::RecordSizeOverflow)?,

@@ -696,11 +696,22 @@ and prepared statements are unchanged. Runtime index revision saturation and the
 anonymous-index notification gap remain follow-up work. Incomplete physical
 creation and writable clone/downgrade workflows are not solved by catalog import.
 
-Next: **Core Transactional Heap CREATE TABLE Foundation** (Round 18), gated on
-catalog review: non-rollback durable identity reservations, a transaction schema
-overlay, private Heap storage, prepared snapshots tied to the coordinator decision,
-commit publication/rollback cleanup, crash tests, and prepared/schema invalidation.
-Do not add SQL CREATE TABLE until those Core contracts work; DROP/ALTER stay deferred.
+### Core Transactional Heap CREATE TABLE Foundation — Round 18
+
+[Round 18](core-create-table-round18.md) implements one Core Heap creation per
+transaction, including same-transaction typed INSERT/SELECT and existing-table
+DML. NBSC floors plus a bounded versioned reservation journal preserve identities
+through rollback/crash. Private schema/bindings remain invisible globally until
+coordinator-backed physical promotion and catalog publication complete. Recovery
+resolves winners and losers before ordinary catalog open; subprocess crash tests
+assert identities, rows, generation and repeated reopen. Prepared table dependencies
+survive unrelated creation; transaction-local statements cannot execute globally.
+PG/Protocol metadata remains a Core projection with existing authorization.
+
+Next: generic SQL CREATE TABLE may map a small typed syntax to this Core API.
+Reject PRIMARY KEY/UNIQUE/DEFAULT/CHECK/REFERENCES/GENERATED/PARTITION/CTAS/TEMP/
+UNLOGGED/INHERITS/LIKE until their semantics exist. DROP/ALTER, non-Heap creation,
+journal compaction, and general aborted-resource garbage collection remain deferred.
 
 ## Phase 6 — SDK and tooling
 

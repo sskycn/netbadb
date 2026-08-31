@@ -11,6 +11,11 @@ mod schema_catalog_api;
 mod schema_catalog_file;
 #[cfg(test)]
 mod schema_catalog_tests;
+mod schema_mutation;
+mod schema_mutation_journal;
+#[cfg(test)]
+mod schema_mutation_tests;
+mod schema_view;
 mod transaction;
 
 use std::cell::RefCell;
@@ -67,6 +72,9 @@ pub use partition_catalog::{
 pub use registry::StorageRegistryError;
 pub use schema_catalog::SchemaCatalogError;
 pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
+pub use schema_mutation::{
+    CreateColumnSpec, CreateTableSpec, SchemaDependency, SchemaMutationError,
+};
 
 impl From<SchemaCatalogError> for DatabaseError {
     fn from(error: SchemaCatalogError) -> Self {
@@ -83,6 +91,17 @@ pub fn fuzz_schema_catalog_bytes(bytes: &[u8]) {
         }
     }
 }
+/// Strict bounded mutation journal decoder entry point for fuzzing.
+#[doc(hidden)]
+pub fn fuzz_schema_mutation_bytes(bytes: &[u8]) {
+    if let Ok(journal) = schema_mutation_journal::SchemaMutationJournal::decode(bytes) {
+        assert_eq!(
+            journal.encode().expect("decoded journal must encode"),
+            bytes
+        );
+    }
+}
+
 pub use transaction::{
     CoordinatorError, DatabaseReadView, DatabaseTransaction, ParticipantMode, TransactionState,
 };
@@ -232,6 +251,8 @@ pub struct StatementDescription {
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     compiled: CompiledStatement,
+    dependencies: Vec<SchemaDependency>,
+    scope: Option<std::rc::Weak<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +309,10 @@ impl PreparedDdlStatement {
 }
 
 impl PreparedStatement {
+    #[must_use]
+    pub fn schema_dependencies(&self) -> &[SchemaDependency] {
+        &self.dependencies
+    }
     #[must_use]
     pub fn parameters(&self) -> &[PreparedParameter] {
         &self.compiled.parameters
@@ -346,6 +371,7 @@ pub enum DatabaseError {
     Bind(BindError),
     Schema(SchemaError),
     SchemaCatalog(SchemaCatalogError),
+    SchemaMutation(SchemaMutationError),
     Storage(StorageError),
     Execution(ExecutionError),
     Registry(StorageRegistryError),
@@ -442,6 +468,17 @@ impl DatabaseError {
             | Self::Partition(PartitionError::PartitionedIndexCreationNotSupported(_)) => {
                 DatabaseErrorKind::FeatureNotSupported
             }
+            Self::SchemaMutation(
+                SchemaMutationError::UnsupportedConstraint
+                | SchemaMutationError::UnsupportedPlacement
+                | SchemaMutationError::MultipleCreatesUnsupported,
+            ) => DatabaseErrorKind::FeatureNotSupported,
+            Self::SchemaMutation(
+                SchemaMutationError::SchemaBusy
+                | SchemaMutationError::StalePreparedStatement
+                | SchemaMutationError::RecoveryRequired,
+            ) => DatabaseErrorKind::TransactionState,
+            Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
             Self::UndefinedIndex => DatabaseErrorKind::UndefinedObject,
             Self::UnsupportedDdlCombination => DatabaseErrorKind::FeatureNotSupported,
@@ -494,6 +531,7 @@ impl fmt::Display for DatabaseError {
             Self::Bind(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
             Self::SchemaCatalog(error) => error.fmt(formatter),
+            Self::SchemaMutation(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
             Self::Registry(error) => error.fmt(formatter),
@@ -577,6 +615,7 @@ impl Error for DatabaseError {
             Self::Bind(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::SchemaCatalog(error) => Some(error),
+            Self::SchemaMutation(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
             Self::Registry(error) => Some(error),
@@ -666,6 +705,9 @@ pub struct Database {
     next_transaction_id: DatabaseTxnId,
     coordinator: Option<SharedCoordinatorLog>,
     catalog_generation: u64,
+    catalog_path: Option<PathBuf>,
+    mutation_journal: Option<schema_mutation::SharedMutationJournal>,
+    schema_writer: schema_mutation::SchemaWriter,
 }
 
 impl Database {
@@ -723,6 +765,7 @@ impl Database {
         specs: Vec<TableStorageOpenSpec>,
         config: DatabaseCoordinatorConfig,
         committed: CommittedCatalogState,
+        placements: Option<PartitionCatalog>,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
         if specs.iter().any(|spec| spec.path() == config.log_path()) {
@@ -784,7 +827,7 @@ impl Database {
             });
         }
         for decision in &decisions {
-            if !decision.complete {
+            if !decision.complete && decision.schema.is_none() {
                 coordinator.complete(decision.database_txn_id)?;
             }
         }
@@ -797,7 +840,7 @@ impl Database {
             committed,
             storages,
             Some((coordinator, next_transaction_id)),
-            None,
+            placements,
         )
     }
 
@@ -963,7 +1006,7 @@ impl Database {
             )?);
         }
         for decision in &decisions {
-            if !decision.complete {
+            if !decision.complete && decision.schema.is_none() {
                 coordinator.complete(decision.database_txn_id)?;
             }
         }
@@ -1184,7 +1227,7 @@ impl Database {
             )?);
         }
         for decision in &decisions {
-            if !decision.complete {
+            if !decision.complete && decision.schema.is_none() {
                 coordinator.complete(decision.database_txn_id)?;
             }
         }
@@ -1214,6 +1257,9 @@ impl Database {
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
             catalog_generation: 0,
+            catalog_path: None,
+            mutation_journal: None,
+            schema_writer: Rc::new(std::cell::Cell::new(None)),
         })
     }
 
@@ -1235,6 +1281,9 @@ impl Database {
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
             catalog_generation: 0,
+            catalog_path: None,
+            mutation_journal: None,
+            schema_writer: Rc::new(std::cell::Cell::new(None)),
         })
     }
 
@@ -1273,6 +1322,9 @@ impl Database {
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
             catalog_generation: 0,
+            catalog_path: None,
+            mutation_journal: None,
+            schema_writer: Rc::new(std::cell::Cell::new(None)),
         })
     }
 
@@ -1334,10 +1386,14 @@ impl Database {
             next_transaction_id,
             coordinator,
             catalog_generation: 0,
+            catalog_path: None,
+            mutation_journal: None,
+            schema_writer: Rc::new(std::cell::Cell::new(None)),
         })
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         let storage_id = self.primary_storage_id()?;
         let table_id = self
             .registry
@@ -1354,7 +1410,6 @@ impl Database {
     }
 
     pub fn begin_transaction(&mut self) -> Result<Transaction, DatabaseError> {
-        let _ = self.primary_storage_id()?;
         self.begin_database_transaction(IsolationLevel::ReadCommitted)
     }
 
@@ -1362,7 +1417,6 @@ impl Database {
         &mut self,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, DatabaseError> {
-        let _ = self.primary_storage_id()?;
         self.begin_database_transaction(isolation_level)
     }
 
@@ -1420,6 +1474,7 @@ impl Database {
         table_id: TableId,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         let storage_id = self.route_storage_for_values(table_id, values)?;
         self.registry
             .get_mut(storage_id)
@@ -1438,17 +1493,16 @@ impl Database {
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
-        let storage_id = self.route_storage_for_values(table_id, values)?;
-        let context = transaction.write_context(storage_id, &mut self.registry)?;
-        self.registry
-            .get_mut(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-            .insert_in(context, values)?;
+        let storage_id = self.route_storage_for_values_in(table_id, values, transaction)?;
+        transaction.with_write_storage(storage_id, &mut self.registry, |storage, context| {
+            storage.insert_in(context, values)
+        })?;
         Ok(())
     }
 
     /// Flushes dirty pages and reports any write or sync failure.
     pub fn flush(&self) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         for entry in self.registry.iter() {
             entry.storage.flush()?;
         }
@@ -1457,6 +1511,7 @@ impl Database {
 
     /// Creates a quiescent checkpoint and recycles the previous WAL history.
     pub fn checkpoint(&mut self) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         for entry in self.registry.iter_mut() {
             entry.storage.checkpoint()?;
         }
@@ -1608,6 +1663,7 @@ impl Database {
     /// Drives synchronous history-preserving leveled compaction for one LSM.
     /// Heap and partitioned layouts return a typed unsupported error.
     pub fn compact(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => self
                 .registry
@@ -1625,6 +1681,7 @@ impl Database {
 
     /// Runs synchronous quiescent full-history LSM compaction and safe GC.
     pub fn compact_full(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => self
                 .registry
@@ -1647,6 +1704,7 @@ impl Database {
         table_id: TableId,
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
+        self.ensure_schema_available(None)?;
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => Ok(self
                 .registry
@@ -1668,6 +1726,7 @@ impl Database {
         table_id: TableId,
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
+        self.ensure_schema_available(None)?;
         if self.registry.iter().any(|entry| {
             entry
                 .storage
@@ -1717,6 +1776,9 @@ impl Database {
         table_id: TableId,
         id: netbadb_types::IndexId,
     ) -> Result<(), DatabaseError> {
+        if transaction.schema_mutation.is_some() {
+            return Err(DatabaseError::UnsupportedDdlCombination);
+        }
         self.validate_transaction(transaction)?;
         if transaction.has_pending_index_creations() {
             return Err(DatabaseError::UnsupportedDdlCombination);
@@ -1753,6 +1815,7 @@ impl Database {
         partition_id: netbadb_types::PartitionId,
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
+        self.ensure_schema_available(None)?;
         let storage_id = match self.bindings.placement(table_id)? {
             TablePlacement::RangePartitioned { partitions, .. } => partitions
                 .iter()
@@ -1789,6 +1852,7 @@ impl Database {
     /// Persists a fresh optimizer snapshot for one table and all of its
     /// registered indexes. DML does not maintain this snapshot automatically.
     pub fn analyze(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         let storage_ids = self
             .bindings
             .placement(table_id)?
@@ -1804,6 +1868,7 @@ impl Database {
     }
 
     pub fn vacuum(&mut self, table_id: TableId) -> Result<u64, DatabaseError> {
+        self.ensure_schema_available(None)?;
         let storage_ids = self
             .bindings
             .placement(table_id)?
@@ -1825,6 +1890,7 @@ impl Database {
 
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(None)?;
         for entry in self.registry.into_entries() {
             entry.storage.close()?;
         }
@@ -1838,7 +1904,7 @@ impl Database {
         };
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
-        self.execute_query_plan(&plan, &view)
+        self.execute_query_plan(&plan, &view, None)
     }
 
     /// Compiles SQL and reports its canonical table access without planning,
@@ -1859,8 +1925,12 @@ impl Database {
         source: &str,
         declared: &[Option<PhysicalType>],
     ) -> Result<PreparedStatement, DatabaseError> {
+        let compiled = compile_statement_with_parameters(&self.committed.schema, source, declared)?;
+        let dependencies = self.statement_dependencies(&compiled, None)?;
         Ok(PreparedStatement {
-            compiled: compile_statement_with_parameters(&self.committed.schema, source, declared)?,
+            compiled,
+            dependencies,
+            scope: None,
         })
     }
 
@@ -1987,6 +2057,9 @@ impl Database {
         transaction: &mut Transaction,
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
+        if transaction.schema_mutation.is_some() {
+            return Err(DatabaseError::UnsupportedDdlCombination);
+        }
         self.validate_transaction(transaction)?;
         match &prepared.compiled {
             CompiledDdlStatement::DropIndex(statement) => {
@@ -2070,6 +2143,9 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         transaction.validate_commit_owner(&self.transaction_owner)?;
         transaction.commit_with_schema_mutations()?;
+        if transaction.schema_mutation.is_some() {
+            return self.finish_schema_commit(transaction);
+        }
         let pending = transaction.take_pending_indexes();
         let drops = transaction.take_pending_index_drops();
         if !pending.is_empty() || !drops.is_empty() {
@@ -2174,7 +2250,7 @@ impl Database {
                 self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
             let view = self.autocommit_read_view(&storage_ids)?;
             return self
-                .execute_query_plan(plan, &view)
+                .execute_query_plan(plan, &view, None)
                 .map(ExecutionResult::Query);
         }
 
@@ -2198,13 +2274,14 @@ impl Database {
         prepared: &PreparedStatement,
         values: &[ScalarValue],
     ) -> Result<ExecutionResult, DatabaseError> {
+        self.validate_prepared_dependencies(prepared, None)?;
         let logical = bind_statement(&prepared.compiled, values)?;
         let physical = self.plan_logical_statement(&logical);
         if let PhysicalStatement::Query(plan) = &physical {
             let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
             let view = self.autocommit_read_view(&storage_ids)?;
             return self
-                .execute_query_plan(plan, &view)
+                .execute_query_plan(plan, &view, None)
                 .map(ExecutionResult::Query);
         }
 
@@ -2232,24 +2309,26 @@ impl Database {
         source: &str,
     ) -> Result<ExecutionResult, DatabaseError> {
         self.validate_transaction(transaction)?;
-        let (compiled, physical) = self.compile_and_plan(source)?;
+        let compiled =
+            compile_statement(transaction.visible_schema(&self.committed.schema), source)?;
+        let physical = self.plan_logical_statement(&compiled.logical_statement);
         if let PhysicalStatement::Query(plan) = &physical {
-            let storage_ids =
-                self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
+            let storage_ids = self
+                .storage_ids_for_tables_in(compiled.logical_statement.read_tables(), transaction)?;
             let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
             return self
-                .execute_query_plan(plan, &view)
+                .execute_query_plan(plan, &view, transaction.staged_storage_mut())
                 .map(ExecutionResult::Query);
         }
         if transaction.has_pending_index_creations() {
             return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
-        if let TablePlacement::Single { storage_id, .. } = self.bindings.placement(table_id)? {
+        if let Some(storage_id) = self.single_storage_in(table_id, transaction)? {
             // Preserve the legacy one-writer preflight boundary: rejecting a
             // second physical writer mutates no row and leaves the explicit
             // transaction active for its caller to roll back.
-            let _ = transaction.write_context(*storage_id, &mut self.registry)?;
+            let _ = transaction.write_context(storage_id, &mut self.registry)?;
         }
         match self.execute_mutation_in(transaction, &physical) {
             Ok(result) => Ok(result),
@@ -2267,21 +2346,22 @@ impl Database {
         values: &[ScalarValue],
     ) -> Result<ExecutionResult, DatabaseError> {
         self.validate_transaction(transaction)?;
+        self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
         let physical = self.plan_logical_statement(&logical);
         if let PhysicalStatement::Query(plan) = &physical {
-            let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
+            let storage_ids = self.storage_ids_for_tables_in(logical.read_tables(), transaction)?;
             let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
             return self
-                .execute_query_plan(plan, &view)
+                .execute_query_plan(plan, &view, transaction.staged_storage_mut())
                 .map(ExecutionResult::Query);
         }
         if transaction.has_pending_index_creations() {
             return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
         }
         let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
-        if let TablePlacement::Single { storage_id, .. } = self.bindings.placement(table_id)? {
-            let _ = transaction.write_context(*storage_id, &mut self.registry)?;
+        if let Some(storage_id) = self.single_storage_in(table_id, transaction)? {
+            let _ = transaction.write_context(storage_id, &mut self.registry)?;
         }
         match self.execute_mutation_in(transaction, &physical) {
             Ok(result) => Ok(result),
@@ -2434,6 +2514,7 @@ impl Database {
         &mut self,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, DatabaseError> {
+        self.ensure_schema_available(None)?;
         let id = self.next_transaction_id;
         let next =
             id.0.checked_add(1)
@@ -2451,6 +2532,7 @@ impl Database {
         &self,
         storage_ids: &[StorageId],
     ) -> Result<DatabaseReadView, DatabaseError> {
+        self.ensure_schema_available(None)?;
         let mut views = Vec::with_capacity(storage_ids.len());
         for storage_id in storage_ids {
             let storage =
@@ -2471,8 +2553,9 @@ impl Database {
         &mut self,
         plan: &netbadb_planner::PhysicalPlan,
         view: &DatabaseReadView,
+        staged: Option<&mut TableStorage>,
     ) -> Result<QueryResult, DatabaseError> {
-        let bindings = self
+        let mut bindings = self
             .bindings
             .iter()
             .filter_map(|placement| match placement {
@@ -2486,6 +2569,12 @@ impl Database {
                 TablePlacement::RangePartitioned { .. } => None,
             })
             .collect::<Vec<_>>();
+        if let Some(storage) = staged.as_ref() {
+            bindings.push(ExecutionStorageBinding {
+                table_id: storage.table().id,
+                storage_id: storage.storage_id(),
+            });
+        }
         let read_views = view
             .iter()
             .map(|(storage_id, view)| ExecutionReadView { storage_id, view })
@@ -2497,6 +2586,10 @@ impl Database {
                 storage_id: entry.id,
                 storage: &mut entry.storage,
             })
+            .chain(staged.into_iter().map(|storage| ExecutionStorage {
+                storage_id: storage.storage_id(),
+                storage,
+            }))
             .collect::<Vec<_>>();
         Ok(execute_with_storage_context(
             plan,
@@ -2512,13 +2605,9 @@ impl Database {
         physical: &PhysicalStatement,
     ) -> Result<ExecutionResult, DatabaseError> {
         let table_id = statement_table_id(physical).ok_or(DatabaseError::ExpectedQuery)?;
-        let storage_ids = self
-            .bindings
-            .placement(table_id)?
-            .storage_ids()
-            .collect::<Vec<_>>();
+        let storage_ids = self.storage_ids_for_tables_in(vec![table_id], transaction)?;
         let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
-        let bindings = self
+        let mut bindings = self
             .bindings
             .iter()
             .filter_map(|placement| match placement {
@@ -2532,6 +2621,12 @@ impl Database {
                 TablePlacement::RangePartitioned { .. } => None,
             })
             .collect::<Vec<_>>();
+        if let Some(storage) = transaction.staged_storage_mut() {
+            bindings.push(ExecutionStorageBinding {
+                table_id: storage.table().id,
+                storage_id: storage.storage_id(),
+            });
+        }
         let read_views = view
             .iter()
             .map(|(storage_id, view)| ExecutionReadView { storage_id, view })
@@ -2544,6 +2639,12 @@ impl Database {
                     storage_id: entry.id,
                     storage: &mut entry.storage,
                 })
+                .chain(transaction.staged_storage_mut().into_iter().map(|storage| {
+                    ExecutionStorage {
+                        storage_id: storage.storage_id(),
+                        storage,
+                    }
+                }))
                 .collect::<Vec<_>>();
             prepare_mutation_with_storage_context(physical, &bindings, &mut storages, &read_views)?
         };
@@ -2557,13 +2658,13 @@ impl Database {
     ) -> Result<ExecutionResult, DatabaseError> {
         match prepared {
             PreparedMutation::Insert { table_id, values } => {
-                let storage_id = self.route_storage_for_values(table_id, &values)?;
-                let context = transaction.write_context(storage_id, &mut self.registry)?;
-                self.registry
-                    .get_mut(storage_id)
-                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-                    .insert_in(context, &values)
-                    .map_err(ExecutionError::Storage)?;
+                let storage_id =
+                    self.route_storage_for_values_in(table_id, &values, transaction)?;
+                transaction
+                    .with_write_storage(storage_id, &mut self.registry, |storage, context| {
+                        storage.insert_in(context, &values)
+                    })
+                    .map_err(dml_storage_error)?;
                 Ok(ExecutionResult::AffectedRows(1))
             }
             PreparedMutation::Update { table_id, rows } => {
@@ -2572,34 +2673,32 @@ impl Database {
                 let routed = rows
                     .into_iter()
                     .map(|row| {
-                        let destination = self.route_storage_for_values(table_id, &row.values)?;
+                        let destination =
+                            self.route_storage_for_values_in(table_id, &row.values, transaction)?;
                         Ok((row, destination))
                     })
                     .collect::<Result<Vec<_>, DatabaseError>>()?;
                 for (row, destination) in routed {
                     let source = row.row.storage_id();
                     if source == destination {
-                        let context = transaction.write_context(source, &mut self.registry)?;
-                        self.registry
-                            .get_mut(source)
-                            .ok_or(StorageRegistryError::UnknownStorageId { storage_id: source })?
-                            .update_in(context, row.row, &row.values)
-                            .map_err(ExecutionError::Storage)?;
+                        transaction
+                            .with_write_storage(source, &mut self.registry, |storage, context| {
+                                storage.update_in(context, row.row, &row.values)
+                            })
+                            .map_err(dml_storage_error)?;
                     } else {
-                        let context = transaction.write_context(source, &mut self.registry)?;
-                        self.registry
-                            .get_mut(source)
-                            .ok_or(StorageRegistryError::UnknownStorageId { storage_id: source })?
-                            .delete_in(context, row.row)
-                            .map_err(ExecutionError::Storage)?;
-                        let context = transaction.write_context(destination, &mut self.registry)?;
-                        self.registry
-                            .get_mut(destination)
-                            .ok_or(StorageRegistryError::UnknownStorageId {
-                                storage_id: destination,
-                            })?
-                            .insert_in(context, &row.values)
-                            .map_err(ExecutionError::Storage)?;
+                        transaction
+                            .with_write_storage(source, &mut self.registry, |storage, context| {
+                                storage.delete_in(context, row.row)
+                            })
+                            .map_err(dml_storage_error)?;
+                        transaction
+                            .with_write_storage(
+                                destination,
+                                &mut self.registry,
+                                |storage, context| storage.insert_in(context, &row.values),
+                            )
+                            .map_err(dml_storage_error)?;
                     }
                 }
                 Ok(ExecutionResult::AffectedRows(affected))
@@ -2609,12 +2708,11 @@ impl Database {
                     u64::try_from(rows.len()).map_err(|_| ExecutionError::AffectedRowsOverflow)?;
                 for row in rows {
                     let storage_id = row.storage_id();
-                    let context = transaction.write_context(storage_id, &mut self.registry)?;
-                    self.registry
-                        .get_mut(storage_id)
-                        .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-                        .delete_in(context, row)
-                        .map_err(ExecutionError::Storage)?;
+                    transaction
+                        .with_write_storage(storage_id, &mut self.registry, |storage, context| {
+                            storage.delete_in(context, row)
+                        })
+                        .map_err(dml_storage_error)?;
                 }
                 Ok(ExecutionResult::AffectedRows(affected))
             }
@@ -2697,9 +2795,19 @@ impl Database {
     }
 
     fn validate_transaction(&self, transaction: &Transaction) -> Result<(), DatabaseError> {
+        self.ensure_schema_available(Some(transaction.id()))?;
         transaction
             .validate_owner(&self.transaction_owner)
             .map_err(DatabaseError::from)
+    }
+}
+
+fn dml_storage_error(error: CoordinatorError) -> DatabaseError {
+    match error {
+        CoordinatorError::Storage(error) => {
+            DatabaseError::Execution(ExecutionError::Storage(error))
+        }
+        other => other.into(),
     }
 }
 
@@ -4321,6 +4429,9 @@ mod tests {
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
             catalog_generation: 0,
+            catalog_path: None,
+            mutation_journal: None,
+            schema_writer: Rc::new(std::cell::Cell::new(None)),
         };
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")

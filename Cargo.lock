@@ -248,6 +248,7 @@ dependencies = [
  "netbadb-schema",
  "netbadb-storage",
  "netbadb-types",
+ "sha2",
 ]
 
 [[package]]

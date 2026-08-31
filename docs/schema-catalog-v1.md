@@ -229,3 +229,12 @@ Old uninitialized databases require explicit import, never missing-file fallback
 Old binaries do not enforce the new database marker and are unsupported after
 adoption. No CREATE/DROP/ALTER TABLE, schema transaction participant, transaction
 schema overlay or physical table cleanup is implemented.
+
+## Runtime publication (Round 18)
+
+NBSC, NBSM and NBSL keep their v1 byte layouts. Runtime creation writes a separate
+prepared NBSC and uses the [mutation journal](schema-mutation-journal-v1.md) and
+CORD v2 decision to complete physical promotion before replacing active NBSC/state.
+An initialized pair mismatch during that winner window is resolved from the exact
+prepared digest, never by choosing an old schema or adopting an arbitrary shadow.
+Ordinary successful reopen does not rewrite catalog/state or increment generation.

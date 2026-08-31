@@ -1022,6 +1022,14 @@ impl LsmStorage {
         }
     }
 
+    pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
+        if self.shared.borrow().runtime.recovery_required.get() {
+            Err(TransactionError::RecoveryRequired.into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn read_view(&self) -> Result<LsmReadView, StorageError> {
         let shared = self.shared.borrow();
         new_read_view(&shared, None, BTreeMap::new(), shared.maximum_commit_seq())

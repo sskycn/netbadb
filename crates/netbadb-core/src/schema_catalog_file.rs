@@ -1,4 +1,4 @@
-//! Atomic initial installation only; no runtime schema replacement API.
+//! Atomic initial installation and coordinator-authorized runtime publication.
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -212,7 +212,11 @@ pub(crate) fn install_initial(
     Ok(committed)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], snapshot: bool) -> Result<(), SchemaCatalogError> {
+pub(crate) fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    snapshot: bool,
+) -> Result<(), SchemaCatalogError> {
     let shadow = suffix(path, ".next");
     if let Ok(metadata) = std::fs::symlink_metadata(&shadow) {
         if !metadata.is_file() {
@@ -237,6 +241,9 @@ fn atomic_write(path: &Path, bytes: &[u8], snapshot: bool) -> Result<(), SchemaC
     }
     file.write_all(&bytes[split..])
         .map_err(|e| io("write shadow metadata", &shadow, e))?;
+    if path.file_name().and_then(|n| n.to_str()) == Some("catalog.nbsc") {
+        crate::schema_mutation::crash("prepared-catalog-written");
+    }
     file.sync_all()
         .map_err(|e| io("sync shadow metadata", &shadow, e))?;
     if snapshot {
@@ -321,7 +328,7 @@ pub(crate) fn resolve(catalog: &Path, locator: &str) -> PathBuf {
     parent(catalog).join(locator)
 }
 
-fn write_link(
+pub(crate) fn write_link(
     storage: &Path,
     catalog: &Path,
     incarnation: [u8; 16],
@@ -371,3 +378,37 @@ fn crash(point: &str) {
 }
 #[cfg(not(test))]
 fn crash(_: &str) {}
+
+/// Only called for a validated coordinator winner with its retained prepared NBSC.
+/// The marker byte format stays v1; recovery can finish either rename.
+pub(crate) fn publish_runtime(
+    catalog: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+) -> Result<SchemaCatalogSnapshot, SchemaCatalogError> {
+    let bytes = snapshot.encode()?;
+    let current = marker(catalog)?
+        .filter(|m| m.initialized)
+        .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
+    if current.incarnation != snapshot.incarnation
+        || current.epoch > snapshot.epoch
+        || (current.epoch != snapshot.epoch && current.epoch.checked_add(1) != Some(snapshot.epoch))
+    {
+        return Err(corrupt(
+            "runtime publication marker epoch/incarnation mismatch",
+        ));
+    }
+    for storage in &snapshot.storages {
+        write_link(
+            &resolve(catalog, &storage.locator),
+            catalog,
+            snapshot.incarnation,
+        )?;
+    }
+    atomic_write(catalog, &bytes, false)?;
+    crate::schema_mutation::crash("during-nbsc-publication");
+    let mut marker = InstallMarker::for_snapshot(snapshot, &bytes);
+    marker.initialized = true;
+    atomic_write(&marker_path(catalog), &marker.encode()?, false)?;
+    crate::schema_mutation::crash("nbsc-state-durable");
+    load(catalog)
+}
