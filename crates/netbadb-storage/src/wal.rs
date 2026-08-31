@@ -11,7 +11,7 @@ use crate::{PAGE_SIZE, Page};
 
 const WAL_MAGIC: &[u8; 4] = b"NBWL";
 const RECORD_MAGIC: &[u8; 4] = b"WREC";
-const RECORD_FORMAT_VERSION: u16 = 4;
+const RECORD_FORMAT_VERSION: u16 = 5;
 const RECORD_HEADER_SIZE: usize = 40;
 const PAGE_UPDATE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE * 2;
 const PREPARE_PAYLOAD_SIZE: usize = 8;
@@ -269,6 +269,13 @@ pub enum WalRecordKind {
         before: Box<[u8; PAGE_SIZE]>,
         after: Box<[u8; PAGE_SIZE]>,
     },
+    /// Registered BTree v3 incarnation change, with exact old/new PageRefs and
+    /// owners encoded in the complete Page v5 images. Never a zero-page append.
+    PageAllocationTransition {
+        page_id: PageId,
+        before: Box<[u8; PAGE_SIZE]>,
+        after: Box<[u8; PAGE_SIZE]>,
+    },
     Commit,
     Abort,
     RollbackComplete,
@@ -284,6 +291,7 @@ impl WalRecordKind {
             Self::Begin => 1,
             Self::PageGenerationReservation => 7,
             Self::PageUpdate { .. } => 2,
+            Self::PageAllocationTransition { .. } => 8,
             Self::Commit => 3,
             Self::Abort => 4,
             Self::RollbackComplete => 5,
@@ -293,7 +301,9 @@ impl WalRecordKind {
 
     const fn payload_len(&self) -> usize {
         match self {
-            Self::PageUpdate { .. } => PAGE_UPDATE_PAYLOAD_SIZE,
+            Self::PageUpdate { .. } | Self::PageAllocationTransition { .. } => {
+                PAGE_UPDATE_PAYLOAD_SIZE
+            }
             Self::Prepare { .. } => PREPARE_PAYLOAD_SIZE,
             Self::Begin
             | Self::Commit
@@ -327,6 +337,7 @@ pub struct WalManager {
     durable_lsn: Option<Lsn>,
     last_by_txn: HashMap<TxnId, Lsn>,
     txn_states: HashMap<TxnId, WalTxnState>,
+    reservations: HashMap<Lsn, TxnId>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_flush: bool,
@@ -509,6 +520,11 @@ impl WalManager {
             durable_lsn: None,
             last_by_txn,
             txn_states,
+            reservations: records
+                .iter()
+                .filter(|record| matches!(record.kind, WalRecordKind::PageGenerationReservation))
+                .map(|record| (record.lsn, record.txn_id))
+                .collect(),
             poisoned: false,
             #[cfg(test)]
             fail_next_flush: false,
@@ -577,6 +593,16 @@ impl WalManager {
         }
         validate_transaction_sequence(lsn, txn_id, self.txn_states.get(&txn_id).copied(), &kind)?;
         validate_page_images(lsn, &kind)?;
+        if let Some(reservation) =
+            validate_transition_reservation(lsn, txn_id, &kind, &self.reservations)?
+        {
+            if self.durable_lsn < Some(reservation) {
+                return Err(WalError::InvalidPageImage {
+                    lsn,
+                    image: "transition reservation not durable",
+                });
+            }
+        }
         let begin_next_txn_id = if matches!(kind, WalRecordKind::Begin) {
             Some(
                 txn_id
@@ -625,6 +651,9 @@ impl WalManager {
         self.next_lsn = next_lsn;
         self.written_lsn = Some(lsn);
         self.last_by_txn.insert(txn_id, lsn);
+        if matches!(record.kind, WalRecordKind::PageGenerationReservation) {
+            self.reservations.insert(lsn, txn_id);
+        }
         self.txn_states
             .insert(txn_id, wal_state_after(&record.kind));
         if let Some(next_txn_id) = begin_next_txn_id {
@@ -725,6 +754,7 @@ impl WalManager {
         self.durable_lsn = None;
         self.last_by_txn.clear();
         self.txn_states.clear();
+        self.reservations.clear();
         drop(old_file);
         if let Err(error) = std::fs::remove_file(&old_path) {
             self.poisoned = true;
@@ -957,10 +987,10 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(RECORD_MAGIC);
     bytes.extend_from_slice(
-        &if matches!(record.kind, WalRecordKind::PageGenerationReservation) {
-            RECORD_FORMAT_VERSION
-        } else {
-            3_u16
+        &match record.kind {
+            WalRecordKind::PageAllocationTransition { .. } => RECORD_FORMAT_VERSION,
+            WalRecordKind::PageGenerationReservation => 4_u16,
+            _ => 3_u16,
         }
         .to_le_bytes(),
     );
@@ -972,6 +1002,11 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
     bytes.extend_from_slice(&record.txn_id.0.to_le_bytes());
     bytes.extend_from_slice(&record.prev_lsn.map_or(0, |lsn| lsn.0).to_le_bytes());
     if let WalRecordKind::PageUpdate {
+        page_id,
+        before,
+        after,
+    }
+    | WalRecordKind::PageAllocationTransition {
         page_id,
         before,
         after,
@@ -1051,6 +1086,7 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
     let mut offset = WAL_HEADER_SIZE as u64;
     let mut txn_last_lsn = HashMap::<TxnId, Lsn>::new();
     let mut txn_states = HashMap::<TxnId, WalTxnState>::new();
+    let mut reservations = HashMap::<Lsn, TxnId>::new();
     while offset < length {
         let lsn = logical_lsn(header.base_lsn, offset)?;
         let remaining = length - offset;
@@ -1116,17 +1152,25 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
 
         let kind = match record_type {
             1 => WalRecordKind::Begin,
-            2 => {
+            2 | 8 => {
                 let payload = &record_bytes[RECORD_HEADER_SIZE..];
                 let page_id = PageId(read_u64(payload, 0));
                 let mut before = Box::new([0_u8; PAGE_SIZE]);
                 before.copy_from_slice(&payload[8..8 + PAGE_SIZE]);
                 let mut after = Box::new([0_u8; PAGE_SIZE]);
                 after.copy_from_slice(&payload[8 + PAGE_SIZE..]);
-                WalRecordKind::PageUpdate {
-                    page_id,
-                    before,
-                    after,
+                if record_type == 8 {
+                    WalRecordKind::PageAllocationTransition {
+                        page_id,
+                        before,
+                        after,
+                    }
+                } else {
+                    WalRecordKind::PageUpdate {
+                        page_id,
+                        before,
+                        after,
+                    }
                 }
             }
             3 => WalRecordKind::Commit,
@@ -1150,6 +1194,10 @@ fn scan_file(file: &mut File, tail_policy: TailPolicy) -> Result<ScanResult, Wal
             }
         };
         validate_page_images(lsn, &kind)?;
+        validate_transition_reservation(lsn, txn_id, &kind, &reservations)?;
+        if matches!(kind, WalRecordKind::PageGenerationReservation) {
+            reservations.insert(lsn, txn_id);
+        }
         txn_last_lsn.insert(txn_id, lsn);
         txn_states.insert(txn_id, wal_state_after(&kind));
         records.push(WalRecord {
@@ -1177,7 +1225,7 @@ fn validate_record_framing(
         return Err(WalError::InvalidRecordMagic { lsn });
     }
     let record_version = read_u16(record_header, 4);
-    if !matches!(record_version, 3 | RECORD_FORMAT_VERSION) {
+    if !matches!(record_version, 3 | 4 | RECORD_FORMAT_VERSION) {
         return Err(WalError::UnsupportedRecordVersion {
             lsn,
             version: record_version,
@@ -1187,7 +1235,7 @@ fn validate_record_framing(
         return Err(WalError::InvalidReservedBytes);
     }
     let record_type = record_header[6];
-    if record_version < 4 && record_type == 7 {
+    if (record_version < 4 && record_type == 7) || (record_version < 5 && record_type == 8) {
         return Err(WalError::UnknownRecordType {
             lsn,
             tag: record_type,
@@ -1242,13 +1290,13 @@ fn validate_partial_record_header(lsn: Lsn, bytes: &[u8]) -> Result<(), WalError
     }
     if bytes.len() >= 6 {
         let version = read_u16(bytes, 4);
-        if !matches!(version, 3 | RECORD_FORMAT_VERSION) {
+        if !matches!(version, 3 | 4 | RECORD_FORMAT_VERSION) {
             return Err(WalError::UnsupportedRecordVersion { lsn, version });
         }
     }
     if bytes.len() >= 7 {
-        if read_u16(bytes, 4) < 4 && bytes[6] == 7 {
-            return Err(WalError::UnknownRecordType { lsn, tag: 7 });
+        if (read_u16(bytes, 4) < 4 && bytes[6] == 7) || (read_u16(bytes, 4) < 5 && bytes[6] == 8) {
+            return Err(WalError::UnknownRecordType { lsn, tag: bytes[6] });
         }
         expected_payload_for_tag(lsn, bytes[6])?;
     }
@@ -1286,7 +1334,7 @@ fn validate_partial_record_header(lsn: Lsn, bytes: &[u8]) -> Result<(), WalError
 fn expected_payload_for_tag(lsn: Lsn, tag: u8) -> Result<u32, WalError> {
     match tag {
         1 | 3 | 4 | 5 | 7 => Ok(0),
-        2 => Ok(PAGE_UPDATE_PAYLOAD_SIZE as u32),
+        2 | 8 => Ok(PAGE_UPDATE_PAYLOAD_SIZE as u32),
         6 => Ok(PREPARE_PAYLOAD_SIZE as u32),
         tag => Err(WalError::UnknownRecordType { lsn, tag }),
     }
@@ -1304,6 +1352,7 @@ fn wal_state_after(kind: &WalRecordKind) -> WalTxnState {
     match kind {
         WalRecordKind::Begin
         | WalRecordKind::PageUpdate { .. }
+        | WalRecordKind::PageAllocationTransition { .. }
         | WalRecordKind::PageGenerationReservation => WalTxnState::Active,
         WalRecordKind::Prepare { .. } => WalTxnState::Prepared,
         WalRecordKind::Abort => WalTxnState::Aborting,
@@ -1330,7 +1379,7 @@ fn validate_transaction_tag_sequence(
         (state, record_type),
         (None, 1)
             | (Some(WalTxnState::Active), 2..=4)
-            | (Some(WalTxnState::Active), 6..=7)
+            | (Some(WalTxnState::Active), 6..=8)
             | (Some(WalTxnState::Prepared), 3..=4)
             | (Some(WalTxnState::Aborting), 5)
     );
@@ -1344,7 +1393,79 @@ fn validate_transaction_tag_sequence(
     Ok(())
 }
 
+fn validate_transition_reservation(
+    lsn: Lsn,
+    txn_id: TxnId,
+    kind: &WalRecordKind,
+    reservations: &HashMap<Lsn, TxnId>,
+) -> Result<Option<Lsn>, WalError> {
+    if let WalRecordKind::PageAllocationTransition { page_id, after, .. } = kind {
+        let generation = Page::from_bytes(*page_id, **after)
+            .allocation_generation()
+            .map_err(|_| WalError::InvalidPageImage {
+                lsn,
+                image: "transition generation",
+            })?
+            .ok_or(WalError::InvalidPageImage {
+                lsn,
+                image: "transition generation",
+            })?;
+        let reservation = Lsn(generation.0);
+        if reservations.get(&reservation) != Some(&txn_id) {
+            return Err(WalError::InvalidPageImage {
+                lsn,
+                image: "transition reservation missing or foreign",
+            });
+        }
+        return Ok(Some(reservation));
+    }
+    Ok(None)
+}
+
 fn validate_page_images(lsn: Lsn, kind: &WalRecordKind) -> Result<(), WalError> {
+    if let WalRecordKind::PageAllocationTransition {
+        page_id,
+        before,
+        after,
+    } = kind
+    {
+        let before = Page::from_bytes(*page_id, **before);
+        let after = Page::from_bytes(*page_id, **after);
+        crate::allocation_transition::validate(&before, &after).map_err(|_| {
+            WalError::InvalidPageImage {
+                lsn,
+                image: "allocation transition",
+            }
+        })?;
+        if before.page_lsn().map_err(|_| WalError::InvalidPageImage {
+            lsn,
+            image: "before",
+        })? >= Some(lsn)
+            || after
+                .allocation_generation()
+                .map_err(|_| WalError::InvalidPageImage {
+                    lsn,
+                    image: "after allocation",
+                })?
+                .is_some_and(|g| g.0 >= lsn.0)
+        {
+            return Err(WalError::InvalidPageImage {
+                lsn,
+                image: "transition chronology",
+            });
+        }
+        let page_lsn = after.page_lsn().map_err(|_| WalError::InvalidPageImage {
+            lsn,
+            image: "after",
+        })?;
+        if page_lsn != Some(lsn) {
+            return Err(WalError::InvalidPageLsn {
+                record_lsn: lsn,
+                page_lsn,
+            });
+        }
+        return Ok(());
+    }
     let WalRecordKind::PageUpdate {
         page_id,
         before,

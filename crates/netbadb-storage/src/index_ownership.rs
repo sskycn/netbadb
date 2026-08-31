@@ -87,8 +87,8 @@ pub struct ReusablePageInspection {
     pub class: PageReuseClass,
 }
 
-/// Unstable quiescent maintenance DTO. Production overwrite remains disabled
-/// until WAL identity transitions and single-hole buffer claims are proven.
+/// Unstable quiescent maintenance DTO. Claims independently revalidate identity,
+/// committed retirement and buffer eligibility before logging a transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageReuseInspection {
     /// Lowest physical PageId first, including eligible tail pages.
@@ -123,13 +123,11 @@ impl HeapStorage {
         }
         let inventory = self.index_page_inventory(&catalog)?;
         let candidates: Vec<_> = inventory
-            .report
-            .allocations
-            .iter()
-            .filter(|page| inventory.retired.contains(&page.page_ref.page_id))
+            .reusable_btree_pages()
+            .into_iter()
             .map(|page| ReusablePageInspection {
-                page_ref: page.page_ref,
-                retired_index_id: page.owner,
+                page_ref: page.old_page_ref,
+                retired_index_id: page.retired_index_id,
                 class: PageReuseClass::GenerationSafeBTreeV3,
             })
             .collect();

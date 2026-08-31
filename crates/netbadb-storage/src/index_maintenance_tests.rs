@@ -52,16 +52,15 @@ pub(super) fn legacy_catalog(path: &std::path::Path, version: u16) {
 fn compaction_bounds_catalog_growth_and_never_reuses_ids() {
     let path = test_path("round8-stress");
     cleanup(&path);
-    let mut storage = HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 1).unwrap();
-    let active = storage
-        .create_named_index(IndexName::new("keep").unwrap(), ColumnId(1))
-        .unwrap();
+    let mut storage =
+        HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
+    let active =
+        historical_append_named_index(&mut storage, IndexName::new("keep").unwrap(), ColumnId(1))
+            .unwrap();
     let name = IndexName::new("reusable").unwrap();
     let mut last_id = active.id;
     for _ in 0..100 {
-        let index = storage
-            .create_named_index(name.clone(), ColumnId(2))
-            .unwrap();
+        let index = historical_append_named_index(&mut storage, name.clone(), ColumnId(2)).unwrap();
         assert!(index.id.0 > last_id.0);
         last_id = index.id;
         storage.drop_index(index.id).unwrap();
@@ -79,7 +78,10 @@ fn compaction_bounds_catalog_growth_and_never_reuses_ids() {
     assert_eq!(report.file_pages_before, report.file_pages_after);
     assert_eq!(report.pages_abandoned, report.retired_catalog_pages);
     assert_eq!(report.pending_reclaim_indexes, 100);
-    assert_eq!(storage.inspect_index_reclaim().unwrap().retired_owned_pages, 200);
+    assert_eq!(
+        storage.inspect_index_reclaim().unwrap().retired_owned_pages,
+        200
+    );
     assert_eq!(report.next_index_id.0, last_id.0 + 1);
     assert_eq!(storage.indexes(), std::slice::from_ref(&active));
     assert!(storage.retired_indexes().is_empty());
@@ -96,8 +98,8 @@ fn compaction_bounds_catalog_growth_and_never_reuses_ids() {
     }
     storage.checkpoint().unwrap();
     storage.close().unwrap();
-    let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
-    let fresh = storage.create_named_index(name, ColumnId(2)).unwrap();
+    let mut storage = HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
+    let fresh = historical_append_named_index(&mut storage, name, ColumnId(2)).unwrap();
     assert_eq!(fresh.id.0, last_id.0 + 1);
     assert_eq!(storage.index_statistics(ColumnId(2)), None);
     let row = storage.insert(&indexed_rows()[0]).unwrap();
@@ -143,25 +145,26 @@ fn compaction_upgrades_real_v2_v3_and_v4_preserving_identity() {
     for version in [2_u16, 3, 4] {
         let path = test_path(&format!("round8-upgrade-{version}"));
         cleanup(&path);
-        let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
         if version == 4 {
-            storage.create_index(ColumnId(1)).unwrap(); // active 1
-            let retired = storage.create_index(ColumnId(2)).unwrap();
+            historical_append_index(&mut storage, ColumnId(1)).unwrap(); // active 1
+            let retired = historical_append_index(&mut storage, ColumnId(2)).unwrap();
             storage.drop_index(retired.id).unwrap(); // retired 2
-            storage.create_index(ColumnId(3)).unwrap(); // active 3
-            let retired = storage.create_index(ColumnId(2)).unwrap();
+            historical_append_index(&mut storage, ColumnId(3)).unwrap(); // active 3
+            let retired = historical_append_index(&mut storage, ColumnId(2)).unwrap();
             storage.drop_index(retired.id).unwrap(); // retired 4
         } else {
             for col in 1..=3 {
                 if version == 3 {
-                    storage
-                        .create_named_index(
-                            IndexName::new(format!("legacy_{col}")).unwrap(),
-                            ColumnId(col),
-                        )
-                        .unwrap();
+                    historical_append_named_index(
+                        &mut storage,
+                        IndexName::new(format!("legacy_{col}")).unwrap(),
+                        ColumnId(col),
+                    )
+                    .unwrap();
                 } else {
-                    storage.create_index(ColumnId(col)).unwrap();
+                    historical_append_index(&mut storage, ColumnId(col)).unwrap();
                 }
             }
         }
@@ -189,7 +192,8 @@ fn compaction_upgrades_real_v2_v3_and_v4_preserving_identity() {
         assert_eq!(storage.table_statistics(), stats);
         storage.checkpoint().unwrap();
         storage.close().unwrap();
-        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let mut storage =
+            HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
         assert_eq!(storage.indexes(), active);
         assert_eq!(storage.table_statistics(), stats);
         assert_eq!(storage.index_statistics, index_stats);
@@ -202,7 +206,13 @@ fn compaction_upgrades_real_v2_v3_and_v4_preserving_identity() {
                 active.iter().map(|entry| entry.id.0).collect::<Vec<_>>(),
                 vec![1, 3]
             );
-            assert_eq!(storage.create_index(ColumnId(2)).unwrap().id.0, 5);
+            assert_eq!(
+                historical_append_index(&mut storage, ColumnId(2))
+                    .unwrap()
+                    .id
+                    .0,
+                5
+            );
         }
         storage.close().unwrap();
         cleanup(&path);
@@ -323,14 +333,21 @@ fn process_crash_compaction_preserves_old_or_new_catalog() {
     ] {
         let path = test_path(&format!("round8-crash-{}", point.as_str()));
         cleanup(&path);
-        let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
-        let active = storage
-            .create_named_index(IndexName::new("kept").unwrap(), ColumnId(1))
-            .unwrap();
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
+        let active = historical_append_named_index(
+            &mut storage,
+            IndexName::new("kept").unwrap(),
+            ColumnId(1),
+        )
+        .unwrap();
         for _ in 0..90 {
-            let index = storage
-                .create_named_index(IndexName::new("again").unwrap(), ColumnId(2))
-                .unwrap();
+            let index = historical_append_named_index(
+                &mut storage,
+                IndexName::new("again").unwrap(),
+                ColumnId(2),
+            )
+            .unwrap();
             storage.drop_index(index.id).unwrap();
         }
         storage.analyze().unwrap();
@@ -339,8 +356,15 @@ fn process_crash_compaction_preserves_old_or_new_catalog() {
         storage.close().unwrap();
         spawn_crash_child(&path, "index-compact", point);
         for _ in 0..3 {
-            let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
-            assert_eq!(storage.inspect_index_reclaim().unwrap().pending_reclaim_indexes, 90);
+            let mut storage =
+                HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
+            assert_eq!(
+                storage
+                    .inspect_index_reclaim()
+                    .unwrap()
+                    .pending_reclaim_indexes,
+                90
+            );
             let snapshot = storage.read_index_catalog(PageId(1)).unwrap();
             assert_eq!(snapshot.pending.len(), if winner { 90 } else { 0 });
             assert_eq!(storage.indexes(), std::slice::from_ref(&active));
@@ -348,8 +372,15 @@ fn process_crash_compaction_preserves_old_or_new_catalog() {
             assert_eq!(storage.table_statistics(), stats);
             storage.close().unwrap();
         }
-        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
-        assert_eq!(storage.create_index(ColumnId(2)).unwrap().id.0, 92);
+        let mut storage =
+            HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
+        assert_eq!(
+            historical_append_index(&mut storage, ColumnId(2))
+                .unwrap()
+                .id
+                .0,
+            92
+        );
         storage.close().unwrap();
         cleanup(&path);
     }
@@ -547,13 +578,14 @@ fn ownership_enumerates_multilevel_tree_and_detects_duplicate_children() {
 fn compaction_partial_log_failure_rolls_back_and_pins_block_before_logging() {
     let path = test_path("round8-compaction-failure");
     cleanup(&path);
-    let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+    let mut storage =
+        HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
     storage.index_catalog_payload_capacity = Some(108);
-    storage.create_index(ColumnId(1)).unwrap();
-    let retired = storage.create_index(ColumnId(2)).unwrap();
+    historical_append_index(&mut storage, ColumnId(1)).unwrap();
+    let retired = historical_append_index(&mut storage, ColumnId(2)).unwrap();
     storage.drop_index(retired.id).unwrap();
-    storage.create_index(ColumnId(2)).unwrap();
-    storage.create_index(ColumnId(3)).unwrap();
+    historical_append_index(&mut storage, ColumnId(2)).unwrap();
+    historical_append_index(&mut storage, ColumnId(3)).unwrap();
     let baseline = storage.read_index_catalog(PageId(1)).unwrap();
     let pinned = storage.buffer.read_page(PageId(1)).unwrap();
     let wal_length = storage.wal_records().unwrap().len();
@@ -579,7 +611,7 @@ fn compaction_partial_log_failure_rolls_back_and_pins_block_before_logging() {
         1
     );
     storage.close().unwrap();
-    let storage = HeapStorage::open(&path, indexed_table()).unwrap();
+    let storage = HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
     assert_eq!(storage.indexes().len(), 3);
     assert!(storage.retired_indexes().is_empty());
     storage.close().unwrap();
@@ -709,4 +741,42 @@ pub(super) fn legacy_btrees(path: &std::path::Path) {
         pages.write_page(&page).unwrap();
     }
     pages.sync().unwrap();
+}
+
+// Reproduce pre-Round-13 append histories for catalog/legacy-format regression.
+// This uses real pins and the production skip policy, never an allocator bypass.
+// Fixture builders using this helper need enough frames for the retained pins.
+fn historical_append_index(
+    storage: &mut HeapStorage,
+    column: ColumnId,
+) -> Result<crate::IndexDefinition, StorageError> {
+    historical_append(storage, None, column)
+}
+fn historical_append_named_index(
+    storage: &mut HeapStorage,
+    name: IndexName,
+    column: ColumnId,
+) -> Result<crate::IndexDefinition, StorageError> {
+    historical_append(storage, Some(name), column)
+}
+fn historical_append(
+    storage: &mut HeapStorage,
+    name: Option<IndexName>,
+    column: ColumnId,
+) -> Result<crate::IndexDefinition, StorageError> {
+    let candidates = storage.inspect_reusable_pages()?.candidates;
+    let pins = candidates
+        .iter()
+        .map(|p| storage.buffer.read_page(p.page_ref.page_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = storage.buffer.page_count();
+    let result = match name {
+        Some(name) => storage.create_named_index(name, column),
+        None => storage.create_index(column),
+    };
+    if let Ok(index) = &result {
+        assert!(index.handle.meta_page.page_id().0 >= count);
+    }
+    drop(pins);
+    result
 }

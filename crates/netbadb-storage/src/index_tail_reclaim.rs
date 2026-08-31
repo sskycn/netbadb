@@ -113,6 +113,7 @@ impl HeapStorage {
     /// persistence failure this instance requires reopen; it cannot resume writes.
     pub fn reclaim_retired_index_tail(&mut self) -> Result<IndexTailReclaimReport, StorageError> {
         self.transactions.ensure_checkpoint_safe()?;
+        self.buffer.invalidate_reuse_inventory();
         self.buffer.ensure_unpinned()?;
         self.buffer.validated_page_count()?;
         let catalog = self.read_index_catalog(self.index_catalog_root)?;

@@ -22,6 +22,7 @@ struct BufferState {
     frames: Vec<BufferFrame>,
     capacity: usize,
     next_victim: usize,
+    reuse_inventory_invalid: bool,
     wal: Option<SharedWal>,
 }
 
@@ -356,6 +357,7 @@ impl BufferPool {
                 frames: Vec::with_capacity(capacity),
                 capacity,
                 next_victim: 0,
+                reuse_inventory_invalid: true,
                 wal,
             })),
         })
@@ -476,6 +478,91 @@ impl BufferPool {
                 .into());
             }
         }
+        Ok(())
+    }
+
+    /// Snapshot without installing/evicting a frame. Used for allocation
+    /// preflight and retryable physical undo under the single writer lease.
+    pub(crate) fn allocation_snapshot(&self, page_id: PageId) -> Result<Page, StorageError> {
+        let mut state = self.state.borrow_mut();
+        if let Some(index) = state.find_frame(page_id) {
+            if state.frames[index].pin_count != 0 {
+                return Err(BufferError::PagePinned { page_id }.into());
+            }
+            return Ok(state.frames[index].page.clone());
+        }
+        state.disk.read_page(page_id)
+    }
+
+    pub(crate) fn invalidate_reuse_inventory(&self) {
+        self.state.borrow_mut().reuse_inventory_invalid = true;
+    }
+
+    pub(crate) fn take_reuse_invalidation(&self) -> bool {
+        std::mem::take(&mut self.state.borrow_mut().reuse_inventory_invalid)
+    }
+
+    pub(crate) fn reusable_page_snapshot(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<Page>, StorageError> {
+        let mut state = self.state.borrow_mut();
+        if let Some(index) = state.find_frame(page_id) {
+            let frame = &state.frames[index];
+            if frame.pin_count != 0 || frame.writer || frame.dirty {
+                return Ok(None);
+            }
+        }
+        Ok(Some(state.disk.read_page(page_id)?))
+    }
+
+    /// Only after the explicit transition was logged. Never retain an old
+    /// allocation frame: remove it, then install the new identity as dirty.
+    pub(crate) fn publish_page_transition(
+        &self,
+        before: &Page,
+        after: &Page,
+    ) -> Result<(), StorageError> {
+        crate::allocation_transition::validate(before, after)?;
+        let current = self
+            .reusable_page_snapshot(before.id)?
+            .ok_or(BufferError::PageDirty { page_id: before.id })?;
+        if current.bytes() != before.bytes() {
+            return Err(crate::invalid_format(
+                "transition candidate changed before publication",
+            ));
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(index) = state.find_frame(before.id) {
+            state.remove_frame(index);
+        }
+        let index = state.prepare_frame()?;
+        state.install_frame(index, after.clone(), false);
+        state.frames[index].pin_count = 0;
+        state.frames[index].dirty = true;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::TransitionAfterPublish);
+        Ok(())
+    }
+
+    pub(crate) fn undo_page_transition(
+        &self,
+        before: &Page,
+        after: &Page,
+    ) -> Result<(), StorageError> {
+        let current = self.allocation_snapshot(before.id)?;
+        if !crate::allocation_transition::undo(&current, before, after)? {
+            return Ok(());
+        }
+        let mut state = self.state.borrow_mut();
+        // This dirty frame belongs to the transaction being physically undone.
+        if let Some(index) = state.find_frame(before.id) {
+            state.remove_frame(index);
+        }
+        state.disk.write_page(before)?;
+        state.disk.sync()?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::TransitionAfterUndo);
         Ok(())
     }
 

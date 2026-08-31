@@ -67,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_generation_seeds(&output)?;
     write_tail_intent_seeds(&output)?;
     write_owner_only_seeds(&output)?;
+    write_transition_seeds(&output)?;
+    write_transition_split_seeds(&output)?;
     Ok(())
 }
 
@@ -674,7 +676,7 @@ fn write_generation_seeds(wal_output: &Path) -> Result<(), Box<dyn std::error::E
     database.execute_ddl(&prepared)?;
     database.close()?;
     let bytes = std::fs::read(wal_path(&path))?;
-    assert!(bytes.len() <= 128 * 1024);
+    assert!(bytes.len() <= 256 * 1024);
     std::fs::write(wal_output.join("valid-rollback-reuse-v3"), bytes)?;
     std::fs::remove_file(wal_path(&path))?;
     std::fs::remove_file(netbadb_storage::txn_status_path(&path))?;
@@ -815,7 +817,7 @@ fn write_tail_snapshot(
     bytes.extend_from_slice(&u32::try_from(wal.len())?.to_le_bytes());
     bytes.extend_from_slice(heap);
     bytes.extend_from_slice(wal);
-    assert!(bytes.len() <= 128 * 1024);
+    assert!(bytes.len() <= 256 * 1024);
     std::fs::write(output.join(name), bytes)?;
     let probe = std::env::temp_dir().join(format!(
         "netbadb-round11-seed-probe-{}-{name}",
@@ -842,6 +844,11 @@ fn write_tail_snapshot(
             if name.ends_with("partial") { 1 } else { 2 }
         );
         storage.close()?;
+    } else if name.starts_with("round13-valid-") {
+        let mut storage = reopened?;
+        storage.inspect_index_reclaim()?;
+        storage.inspect_reusable_pages()?;
+        storage.close()?;
     } else {
         assert!(reopened.is_err(), "malformed fixture must fail: {name}");
     }
@@ -863,8 +870,10 @@ fn write_owner_only_seeds(output: &Path) -> Result<(), Box<dyn std::error::Error
     let mut storage = HeapStorage::create(&path, fuzz_table())?;
     let old = storage.create_index(ColumnId(1))?;
     storage.drop_index(old.id)?;
-    storage.compact_index_catalog()?;
+    // Create Y while X's frames are dirty and therefore ineligible. Compact
+    // afterward, preserving an unconsumed historical X inventory for the seed.
     let active = storage.create_index(ColumnId(1))?;
+    storage.compact_index_catalog()?;
     storage.checkpoint()?;
     storage.close()?;
     let mut disk = PageManager::open(&path)?;
@@ -951,6 +960,287 @@ fn write_owner_only_seeds(output: &Path) -> Result<(), Box<dyn std::error::Error
         &wal_path(&path),
         &wal_alternate_path(wal_path(&path)),
         &netbadb_storage::txn_status_path(&path),
+    ] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
+    Ok(())
+}
+
+// P0 snapshots exercise real transition records before production allocation is
+// enabled. The target is an active owner's orphan, so no dangling live pointer
+// is hidden by this fixture. Round 13 production split seeds supplement these.
+fn transition_leaf(
+    id: PageId,
+    generation: u64,
+    owner: netbadb_types::IndexId,
+    lsn: netbadb_types::Lsn,
+    count: u16,
+) -> Result<Page, Box<dyn std::error::Error>> {
+    let spec = IndexSpec {
+        data_type: SemanticType::physical(PhysicalType::UInt64),
+        nullable: true,
+    };
+    let payload = netbadb_index::encode_leaf_generation(
+        &spec,
+        &LeafNode {
+            next_leaf: None,
+            entries: (0..count)
+                .map(|n| IndexEntry {
+                    key: ScalarValue::UInt64(u64::from(n)),
+                    row_id: RowId {
+                        page: PageId(2),
+                        slot: n,
+                        generation: 1,
+                    },
+                })
+                .collect(),
+        },
+        Some(owner),
+        Some(netbadb_types::PageGeneration(generation)),
+    )?;
+    let mut page = Page::new(id, PageType::Heap);
+    page.insert_record(&payload)?;
+    let mut bytes = *page.bytes();
+    bytes[6] = Page::new(id, PageType::BTreeLeaf).bytes()[6];
+    bytes[16..24].copy_from_slice(&lsn.0.to_le_bytes());
+    bytes[24..28].fill(0);
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&id.0.to_le_bytes()), &bytes);
+    bytes[24..28].copy_from_slice(&crc.to_le_bytes());
+    Ok(Page::from_bytes(id, bytes))
+}
+fn write_transition_seeds(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::temp_dir().join(format!("netbadb-round13-seed-{}", std::process::id()));
+    let mut storage = HeapStorage::create(&path, fuzz_table())?;
+    let old = storage.create_index(ColumnId(1))?;
+    storage.drop_index(old.id)?;
+    // Create Y while X's frames are dirty and therefore ineligible. Compact
+    // afterward, preserving an unconsumed historical X inventory for the seed.
+    let active = storage.create_index(ColumnId(1))?;
+    storage.compact_index_catalog()?;
+    storage.close()?;
+    let mut pages = PageManager::open(&path)?;
+    let before = pages.read_page(old.handle.meta_page.page_id())?;
+    let mut wal = WalManager::open(wal_path(&path))?;
+    let tx = TxnId(9000);
+    let b = wal.append(tx, None, WalRecordKind::Begin)?;
+    let r = wal.append(tx, Some(b), WalRecordKind::PageGenerationReservation)?;
+    wal.flush_through(r)?;
+    let new = transition_leaf(before.id, r.0, active.id, wal.next_lsn(), 0)?;
+    let t = wal.append(
+        tx,
+        Some(r),
+        WalRecordKind::PageAllocationTransition {
+            page_id: before.id,
+            before: Box::new(*before.bytes()),
+            after: Box::new(*new.bytes()),
+        },
+    )?;
+    wal.flush_through(t)?;
+    let original_heap = std::fs::read(&path)?;
+    write_tail_snapshot(
+        output,
+        "round13-valid-transition-loser",
+        &original_heap,
+        &std::fs::read(wal.path())?,
+    )?;
+    let mut final_page = new.clone();
+    let mut last = t;
+    for count in 1..=2 {
+        let after = transition_leaf(before.id, r.0, active.id, wal.next_lsn(), count)?;
+        last = wal.append(
+            tx,
+            Some(last),
+            WalRecordKind::PageUpdate {
+                page_id: before.id,
+                before: Box::new(*final_page.bytes()),
+                after: Box::new(*after.bytes()),
+            },
+        )?;
+        final_page = after;
+    }
+    wal.flush_through(last)?;
+    let loser_wal = std::fs::read(wal.path())?;
+    let mut published = original_heap.clone();
+    let start = before.id.0 as usize * 4096;
+    published[start..start + 4096].copy_from_slice(final_page.bytes());
+    write_tail_snapshot(
+        output,
+        "round13-valid-transition-updates-loser",
+        &published,
+        &loser_wal,
+    )?;
+    let rollback_path = path.with_extension("rollback-wal");
+    std::fs::write(&rollback_path, &loser_wal)?;
+    let mut rollback_wal = WalManager::open(&rollback_path)?;
+    let abort = rollback_wal.append(tx, Some(last), WalRecordKind::Abort)?;
+    let complete = rollback_wal.append(tx, Some(abort), WalRecordKind::RollbackComplete)?;
+    rollback_wal.flush_through(complete)?;
+    write_tail_snapshot(
+        output,
+        "round13-valid-transition-rollback-complete",
+        &original_heap,
+        &std::fs::read(rollback_wal.path())?,
+    )?;
+    drop(rollback_wal);
+    std::fs::remove_file(&rollback_path)?;
+    let c = wal.append(tx, Some(last), WalRecordKind::Commit)?;
+    wal.flush_through(c)?;
+    let committed = std::fs::read(wal.path())?;
+    write_tail_snapshot(
+        output,
+        "round13-valid-transition-winner-unflushed",
+        &original_heap,
+        &committed,
+    )?;
+    write_tail_snapshot(
+        output,
+        "round13-valid-transition-winner-published",
+        &published,
+        &committed,
+    )?;
+    // Simulate a rollback interrupted immediately after restoring the boundary.
+    write_tail_snapshot(
+        output,
+        "round13-valid-transition-undo-retry",
+        &original_heap,
+        &loser_wal,
+    )?;
+    for (name, relative) in [("before", 48 + 60), ("after", 48 + 4096 + 60)] {
+        let mut corrupt = committed.clone();
+        let offset = 48 + t.0 as usize - 1;
+        corrupt[offset + relative] ^= 128;
+        // Recompute record CRC so the nested page validation is reached.
+        let length = u32::from_le_bytes(corrupt[offset + 8..offset + 12].try_into()?) as usize;
+        corrupt[offset + 12..offset + 16].fill(0);
+        let crc = crc32c::crc32c(&corrupt[offset..offset + length]);
+        corrupt[offset + 12..offset + 16].copy_from_slice(&crc.to_le_bytes());
+        write_tail_snapshot(
+            output,
+            &format!("round13-corrupt-transition-{name}"),
+            &original_heap,
+            &corrupt,
+        )?;
+    }
+    let third = transition_leaf(
+        before.id,
+        r.0 + 1,
+        active.id,
+        final_page.page_lsn()?.unwrap(),
+        2,
+    )?;
+    published[start..start + 4096].copy_from_slice(third.bytes());
+    write_tail_snapshot(
+        output,
+        "round13-transition-third-generation",
+        &published,
+        &committed,
+    )?;
+    drop(wal);
+    drop(pages);
+    for file in [
+        path.clone(),
+        wal_path(&path),
+        wal_alternate_path(wal_path(&path)),
+        netbadb_storage::txn_status_path(&path),
+    ] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_transition_split_seeds(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path =
+        std::env::temp_dir().join(format!("netbadb-round13-split-seed-{}", std::process::id()));
+    let mut storage = HeapStorage::create_with_buffer_pool_size(&path, fuzz_table(), 512)?;
+    let old = storage.create_index(ColumnId(1))?;
+    storage.drop_index(old.id)?;
+    // Old dirty frames are ineligible, so Y appends. Once checkpoint cleans
+    // them, the next real Y split must consume both holes via transition WAL.
+    let active = storage.create_index(ColumnId(1))?;
+    storage.compact_index_catalog()?;
+    let spec = storage.btree().spec(active.handle)?;
+    let mut entries = Vec::new();
+    loop {
+        let number = entries.len() as u16;
+        let entry = IndexEntry {
+            key: ScalarValue::UInt64(u64::from(number)),
+            row_id: RowId {
+                page: PageId(2),
+                slot: number,
+                generation: 1,
+            },
+        };
+        entries.push(entry.clone());
+        let payload = netbadb_index::encode_leaf_generation(
+            &spec,
+            &LeafNode {
+                next_leaf: None,
+                entries: entries.clone(),
+            },
+            Some(active.id),
+            active.handle.meta_page.generation(),
+        )?;
+        if payload.len() > 4096 - netbadb_storage::PAGE_HEADER_SIZE - netbadb_storage::SLOT_SIZE {
+            entries.pop();
+            break;
+        }
+        storage
+            .btree()
+            .insert(active.handle, entry.key, entry.row_id)?;
+    }
+    assert_eq!(storage.btree().height(active.handle)?, 1);
+    storage.checkpoint()?;
+    assert_eq!(storage.inspect_reusable_pages()?.candidates.len(), 2);
+    let before = std::fs::read(&path)?;
+    let number = entries.len() as u16;
+    storage.btree().insert(
+        active.handle,
+        ScalarValue::UInt64(u64::from(number)),
+        RowId {
+            page: PageId(2),
+            slot: number,
+            generation: 1,
+        },
+    )?;
+    assert_eq!(storage.btree().height(active.handle)?, 2);
+    let mut wal = WalManager::open(wal_path(&path))?;
+    let records = wal.scan()?;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| matches!(r.kind, WalRecordKind::PageAllocationTransition { .. }))
+            .count(),
+        2
+    );
+    let bytes = std::fs::read(wal.path())?;
+    let last = records.last().ok_or("split commit missing")?;
+    assert!(matches!(last.kind, WalRecordKind::Commit));
+    let end = usize::try_from(last.lsn.0 - wal.base_lsn().0)? + netbadb_storage::WAL_HEADER_SIZE;
+    write_tail_snapshot(output, "round13-valid-split-parent-winner", &before, &bytes)?;
+    write_tail_snapshot(
+        output,
+        "round13-valid-split-parent-loser",
+        &before,
+        &bytes[..end],
+    )?;
+    storage.flush()?;
+    write_tail_snapshot(
+        output,
+        "round13-valid-split-parent-published-loser",
+        &std::fs::read(&path)?,
+        &bytes[..end],
+    )?;
+    drop(wal);
+    storage.close()?;
+    for file in [
+        path.clone(),
+        wal_path(&path),
+        wal_alternate_path(wal_path(&path)),
+        netbadb_storage::txn_status_path(&path),
     ] {
         if file.exists() {
             std::fs::remove_file(file)?;

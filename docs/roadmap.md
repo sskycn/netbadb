@@ -601,7 +601,26 @@ Prove physical before-image restoration, idempotent winner redo/loser undo,
 clean-frame claims, and cache invalidation before enabling middle-hole allocation.
 A new durable general free-list is not indicated by the inventory audit. Complete
 P1's crash/stress gates before active-orphan reclamation or Heap/RowId migration;
-do not jump to CREATE TABLE. See [Round 12](page-reuse-round12.md).
+do not jump to CREATE TABLE. These P1 gates are now completed by Round 13 below.
+See [Round 12](page-reuse-round12.md).
+
+### Storage Lifecycle Round 13 — generation transitions and middle-hole reuse
+
+Implemented: explicit full-image WAL record v5/tag 8 for registered BTree-v3
+allocation transitions; ordinary PageUpdate remains strict. Generation-first
+redo/undo, certified superseded-history filtering, synced reservation authority,
+exact rollback and retry semantics are tested without a checkpoint. A lazy
+owner-derived cache revalidates candidates and skips pinned/dirty frames; CREATE,
+backfill, leaf/internal split and DML consume holes before append. Owner-only
+pending survives meta-first and orphan-only consumption; compaction cleans zero
+owners. Page/BTree/Catalog/Heap and WAL container versions remain unchanged.
+
+Real subprocess crash coverage and the 83-hole backfill preserve the 117-page
+file; 500 CREATE/DROP cycles after a 404-page hole fixture remain at 404 pages,
+with 1000 transitions and zero BTree appends. Active-owner orphans, Heap, Catalog,
+raw/legacy and cross-kind reuse remain excluded. Next: Active BTree Orphan
+Retirement with an explicit durable merge/root-collapse horizon, then a separate
+Heap/RowId or Table Schema Lifecycle audit. See [Round 13](page-transition-round13.md).
 
 ## Phase 6 — SDK and tooling
 

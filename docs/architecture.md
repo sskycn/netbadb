@@ -1950,12 +1950,19 @@ orphans after a meta/root has disappeared; an owner with any page below the
 suffix cannot be finalized. Middle-hole owners remain pending.
 Active trees, Heap, raw/v1/v2, unknown/corrupt, and catalog pages cannot be crossed.
 Round 12 adds `inspect_reusable_pages`: a disposable, ascending-PageId inventory
-with old PageRef, retired IndexId and `GenerationSafeBTreeV3` capability. This
-is not allocation permission. No second durable free catalog or production
-hole allocator exists: current WAL image validation forbids changed allocation
-identities, and redo/undo require a transition-aware protocol before overwrite.
-See [Round 12](page-reuse-round12.md), [Round 11](index-tail-reclaim-round11.md)
-and [the Round 10 generation proof](page-generation-round10.md).
+with old PageRef, retired IndexId and `GenerationSafeBTreeV3` capability. Round 13
+shares its candidate builder with the production registered-BTree allocator.
+A lazy ordered cache retains empty and blocked states; claims locally revalidate
+retirement, CRC, owner/generation and clean/unpinned frame eligibility. Root-dependent
+retirement converts to owner-only pending in the same transaction before reuse.
+Fresh synced reservations precede WAL record v5/tag 8 allocation transitions;
+normal PageUpdate stays within one incarnation. Recovery validates full image
+lineage before excluding superseded old-generation prefixes, then executes
+ordered redo/reverse undo with generation-first LSN checks and exact old-image
+restoration. Reopen, DROP, rollback, compaction and tail maintenance invalidate
+the disposable cache. No durable general free catalog or cross-kind reuse exists.
+See [Round 13](page-transition-round13.md), [Round 12](page-reuse-round12.md),
+[Round 11](index-tail-reclaim-round11.md) and [Round 10](page-generation-round10.md).
 
 A registered table index is distinct from a raw tree created through
 `HeapStorage::btree().create`: raw trees never enter the active index registry from page scans. Only admin
@@ -2161,15 +2168,17 @@ transaction high-water mark trusted. WAL versions 1 through 3 are rejected
 explicitly; this experimental format has no migration framework. PageUpdate
 remains a pair of complete page images. Page v5 and WAL container v4 are
 unchanged in Round 10. Ordinary records retain version 3; the new generation
-reservation uses record version 4. Both record versions are decoded.
+reservation uses record version 4. Round 13 transitions use record version 5;
+record versions 3, 4 and 5 are decoded.
 
 Every record has a 40-byte fixed header followed by a bounded payload:
 
 ```text
 0..4    WREC magic
-4..6    u16 record format version (3 ordinary, 4 generation reservation)
+4..6    u16 record format version (3 ordinary, 4 reservation, 5 transition)
 6       u8 record type (Begin=1, PageUpdate=2, Commit=3, Abort=4,
-                        RollbackComplete=5, Prepare=6, PageGenerationReservation=7)
+                        RollbackComplete=5, Prepare=6, PageGenerationReservation=7,
+                        PageAllocationTransition=8)
 7       reserved byte (zero)
 8..12   u32 total record length
 12..16  u32 CRC32C (little-endian)
@@ -2181,10 +2190,12 @@ Every record has a 40-byte fixed header followed by a bounded payload:
 
 `Begin`, `Commit`, `Abort`, `RollbackComplete`, and `PageGenerationReservation`
 have no payload. Tag 7 is rejected in record version 3, including partial
-headers. `Prepare` contains one nonzero u64 DatabaseTxnId. A reservation is synced
+headers; tag 8 requires record version 5. `Prepare` contains one nonzero u64 DatabaseTxnId. A reservation is synced
 before its logical LSN may become a PageGeneration and is never physically undone.
 `PageUpdate` stores an explicit u64 page ID, one 4 KiB before-image, and one 4
-KiB after-image. Consequently, the maximum accepted record is 8,240 bytes. The
+KiB after-image. `PageAllocationTransition` uses the same bounded image layout
+with strictly different registered-v3 generations and owners; its after pageLSN
+is the transition LSN. Consequently, the maximum accepted record is 8,240 bytes. The
 record type determines the only valid total length; there is no stored payload
 length. The CRC32C covers the complete header and payload with bytes 12..16
 treated as zero. The scanner first validates framing and bounded type-derived
@@ -2271,7 +2282,7 @@ Analysis
     └── Losers (incomplete or Abort-only)
     │
     ▼
-Redo non-rolled-back PageUpdates in ascending LSN
+Validate transition lineages; redo retained page operations in ascending LSN
     │
     ▼
 Undo losers in descending global LSN
@@ -2280,7 +2291,9 @@ Undo losers in descending global LSN
 Sync undo + durably finalize recovered losers
 ```
 
-Analysis builds transaction lastLSNs and an LSN lookup. Redo repeats history,
+Analysis builds transaction lastLSNs and an LSN lookup. For transitioned slots it
+also certifies continuous full-image lineage and the redo start justified by
+the current incarnation; see [Round 13](page-transition-round13.md). Redo repeats history,
 including loser updates, but skips transactions with durable
 RollbackComplete: an existing page first requires the same allocation
 generation, then is skipped only when its pageLSN is at least the update LSN, and that pageLSN is trusted only after full page validation;
@@ -2622,7 +2635,7 @@ Networking remains synchronous and must not leak async into parser, compiler,
 planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
 contract, not a database-file format. The current independent persistent
 contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
-transaction-status v1, Page v5, WAL v4/record v3 plus v4 reservations, BTree
+transaction-status v1, Page v5, WAL v4/record v3 plus v4 reservations and v5 transitions, BTree
 v1/v2/v3, and IndexCatalog v9 (backward decode v2 through v8). Deployment manifest v4 is configuration, not a database format or canonical
 schema identity.
 

@@ -27,6 +27,8 @@ use crate::{
 };
 use crate::{PreparedTransaction, PreparedTxnResolution};
 
+#[path = "btree_allocator.rs"]
+mod btree_allocator;
 #[path = "index_ownership.rs"]
 mod ownership;
 #[path = "index_tail_reclaim.rs"]
@@ -64,6 +66,7 @@ pub struct HeapStorage {
     statuses: SharedTxnStatus,
     indexes: Vec<IndexDefinition>,
     retired_indexes: Vec<IndexDefinition>,
+    reusable_btree_pages: Option<btree_allocator::ReusableBTreePageCache>,
     index_plans: Vec<RegisteredIndexPlan>,
     table_statistics: Option<TableStatistics>,
     index_statistics: Vec<Option<IndexStatistics>>,
@@ -347,6 +350,7 @@ impl HeapStorage {
             statuses,
             indexes: Vec::new(),
             retired_indexes: Vec::new(),
+            reusable_btree_pages: None,
             index_plans: Vec::new(),
             table_statistics: None,
             index_statistics: Vec::new(),
@@ -465,6 +469,7 @@ impl HeapStorage {
                 }
                 WalRecordKind::Begin
                 | WalRecordKind::PageUpdate { .. }
+                | WalRecordKind::PageAllocationTransition { .. }
                 | WalRecordKind::Abort
                 | WalRecordKind::Prepare { .. }
                 | WalRecordKind::PageGenerationReservation => {}
@@ -500,6 +505,7 @@ impl HeapStorage {
             statuses,
             indexes: Vec::new(),
             retired_indexes: Vec::new(),
+            reusable_btree_pages: None,
             index_plans: Vec::new(),
             table_statistics: None,
             index_statistics: Vec::new(),
@@ -643,6 +649,7 @@ impl HeapStorage {
             drop(page);
             node.next_index_id = Some(next);
             self.write_catalog_node_in(transaction, self.index_catalog_root, before, node)?;
+            transaction.building_indexes.insert(id);
             let handle = self
                 .btree()
                 .create_owned_in(transaction, spec.clone(), id)?;
@@ -1262,6 +1269,7 @@ impl HeapStorage {
     /// pending records. Only legacy retirements and obsolete catalog pages are abandoned.
     /// No PageId is truncated or reused, including a geometric retired suffix.
     pub fn compact_index_catalog(&mut self) -> Result<IndexMaintenanceReport, StorageError> {
+        self.reusable_btree_pages = None;
         self.transactions.ensure_checkpoint_safe()?;
         self.buffer.ensure_unpinned()?;
         let catalog = self.read_index_catalog(self.index_catalog_root)?;
@@ -1583,6 +1591,7 @@ impl HeapStorage {
     }
 
     pub(crate) fn publish_committed_index_drop(&mut self, id: IndexId) {
+        self.reusable_btree_pages = None;
         let position = self
             .indexes
             .iter()
@@ -8476,7 +8485,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_tree_payload_is_not_reopened_validated_or_maintained() {
+    fn retired_corruption_is_lazy_on_open_but_blocks_allocation() {
         let path = prepare_index_build_crash_baseline("retired-unreachable");
         let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
         let index = storage.create_index(ColumnId(2)).unwrap();
@@ -8507,8 +8516,10 @@ mod tests {
             .unwrap();
         storage.analyze().unwrap();
         storage.vacuum().unwrap();
-        let fresh = storage.create_index(ColumnId(2)).unwrap();
-        assert_ne!(fresh.handle, index.handle);
+        let count = storage.buffer.page_count();
+        assert!(storage.create_index(ColumnId(2)).is_err());
+        assert_eq!(storage.buffer.page_count(), count);
+        assert!(storage.indexes().is_empty());
         storage.close().unwrap();
         cleanup(&path);
     }
@@ -8739,9 +8750,19 @@ mod tests {
             1
         );
         storage.close().unwrap();
-        let storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
         assert_eq!(storage.indexes(), &[new]);
-        assert_eq!(storage.retired_indexes(), &[old]);
+        assert!(storage.retired_indexes().is_empty());
+        let ownership = storage.inspect_index_reclaim().unwrap();
+        assert_eq!(ownership.pending.len(), 1);
+        assert_eq!(ownership.pending[0].index_id, old.id);
+        assert!(ownership.pending[0].meta_page.is_none());
+        assert!(
+            ownership
+                .allocations
+                .iter()
+                .all(|page| page.owner != old.id)
+        );
         storage.close().unwrap();
         cleanup(&path);
     }
@@ -9370,5 +9391,6 @@ mod tests {
         include!("page_generation_tests.rs");
         include!("index_tail_reclaim_tests.rs");
         include!("page_reuse_tests.rs");
+        include!("page_transition_tests.rs");
     }
 }

@@ -14,6 +14,12 @@ pub(crate) const EXIT_CODE: i32 = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCrashPoint {
+    BTreeAfterInternalSplit,
+    BTreeAfterSiblingUpdate,
+    BTreeAfterParentUpdate,
+    TransitionAfterLog,
+    TransitionAfterPublish,
+    TransitionAfterUndo,
     TailAfterCheckpoint,
     TailIntentAfterLogs,
     TailIntentDurable,
@@ -72,6 +78,12 @@ pub(crate) enum TestCrashPoint {
 impl TestCrashPoint {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::BTreeAfterInternalSplit => "btree-after-internal-split",
+            Self::BTreeAfterSiblingUpdate => "btree-after-sibling-update",
+            Self::BTreeAfterParentUpdate => "btree-after-parent-update",
+            Self::TransitionAfterLog => "transition-after-log",
+            Self::TransitionAfterPublish => "transition-after-publish",
+            Self::TransitionAfterUndo => "transition-after-undo",
             Self::TailAfterCheckpoint => "TailAfterCheckpoint",
             Self::TailIntentAfterLogs => "TailIntentAfterLogs",
             Self::TailIntentDurable => "TailIntentDurable",

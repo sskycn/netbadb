@@ -60,6 +60,7 @@ pub struct Transaction {
     repeatable_read_view: Option<ReadView>,
     registered: bool,
     has_page_updates: bool,
+    pub(crate) building_indexes: std::collections::HashSet<netbadb_types::IndexId>,
     rollback_start_lsn: Option<Lsn>,
     rollback_complete_lsn: Option<Lsn>,
     prepared_database_txn_id: Option<DatabaseTxnId>,
@@ -220,6 +221,7 @@ impl Transaction {
     }
 
     fn rollback_internal(&mut self, allow_prepared: bool) -> Result<(), StorageError> {
+        self.buffer.invalidate_reuse_inventory();
         match self.state {
             TransactionState::Active | TransactionState::RollbackRequired => {
                 let rollback_start_lsn = self.last_lsn;
@@ -540,6 +542,35 @@ impl Transaction {
         Ok(actual)
     }
 
+    pub(crate) fn log_page_transition(
+        &mut self,
+        before: &Page,
+        after: &mut Page,
+    ) -> Result<Lsn, StorageError> {
+        self.acquire_writer()?;
+        crate::allocation_transition::validate(before, after)?;
+        let mut wal = self
+            .wal
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?;
+        let lsn = wal.next_lsn();
+        after.set_page_lsn(lsn);
+        let actual = wal.append(
+            self.id,
+            Some(self.last_lsn),
+            WalRecordKind::PageAllocationTransition {
+                page_id: after.id,
+                before: Box::new(*before.bytes()),
+                after: Box::new(*after.bytes()),
+            },
+        )?;
+        self.last_lsn = actual;
+        self.has_page_updates = true;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::TransitionAfterLog);
+        Ok(actual)
+    }
+
     pub(crate) fn flush_through(&self, lsn: Lsn) -> Result<(), StorageError> {
         self.wal
             .try_borrow_mut()
@@ -579,6 +610,25 @@ impl Transaction {
             .iter()
             .map(|record| (record.lsn, record))
             .collect::<HashMap<_, _>>();
+        // A previous rollback attempt may already have crossed a transition.
+        // Certify exact old images once, so later updates of that incarnation
+        // are not re-applied to it while retrying the reverse chain.
+        let mut undone_allocations = std::collections::HashSet::new();
+        for record in records.iter().filter(|record| record.txn_id == self.id) {
+            if let WalRecordKind::PageAllocationTransition {
+                page_id,
+                before,
+                after,
+            } = &record.kind
+            {
+                let current = self.buffer.allocation_snapshot(*page_id)?;
+                let before = Page::from_bytes(*page_id, **before);
+                let after = Page::from_bytes(*page_id, **after);
+                if !crate::allocation_transition::undo(&current, &before, &after)? {
+                    undone_allocations.insert(crate::allocation_transition::identity(&after)?.0);
+                }
+            }
+        }
         let mut next_lsn = Some(rollback_start_lsn);
         #[cfg(test)]
         let mut operations = 0_usize;
@@ -605,6 +655,16 @@ impl Transaction {
                     before,
                     after,
                 } => {
+                    let after_ref = Page::from_bytes(*page_id, **after)
+                        .allocation_generation()?
+                        .map(|generation| netbadb_types::PageRef {
+                            page_id: *page_id,
+                            generation,
+                        });
+                    if after_ref.is_some_and(|reference| undone_allocations.contains(&reference)) {
+                        next_lsn = record.prev_lsn;
+                        continue;
+                    }
                     self.buffer.undo_page_update(
                         *page_id,
                         before,
@@ -625,6 +685,16 @@ impl Transaction {
                             return Err(TransactionError::RollbackInterrupted.into());
                         }
                     }
+                }
+                WalRecordKind::PageAllocationTransition {
+                    page_id,
+                    before,
+                    after,
+                } => {
+                    self.buffer.undo_page_transition(
+                        &Page::from_bytes(*page_id, **before),
+                        &Page::from_bytes(*page_id, **after),
+                    )?;
                 }
                 WalRecordKind::Prepare { .. } | WalRecordKind::PageGenerationReservation => {}
                 WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::RollbackComplete => {
@@ -756,6 +826,7 @@ impl TransactionManager {
             repeatable_read_view: None,
             registered: true,
             has_page_updates: false,
+            building_indexes: std::collections::HashSet::new(),
             rollback_start_lsn: None,
             rollback_complete_lsn: None,
             prepared_database_txn_id: None,

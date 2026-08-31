@@ -71,6 +71,7 @@ pub(crate) fn inspect_prepared_transactions(records: &[WalRecord]) -> Vec<Prepar
             }
             WalRecordKind::Begin
             | WalRecordKind::PageUpdate { .. }
+            | WalRecordKind::PageAllocationTransition { .. }
             | WalRecordKind::Abort
             | WalRecordKind::PageGenerationReservation => {}
         }
@@ -344,6 +345,7 @@ impl RecoveryManager {
             &losers,
             pages.page_count(),
         )?;
+        let redo_starts = Self::transition_redo_starts(pages, records, &transactions)?;
         let mut report = RecoveryReport {
             records_scanned: records.len(),
             committed_transactions,
@@ -366,9 +368,20 @@ impl RecoveryManager {
             {
                 continue;
             }
-            let WalRecordKind::PageUpdate { page_id, after, .. } = &record.kind else {
+            let (WalRecordKind::PageUpdate { page_id, after, .. }
+            | WalRecordKind::PageAllocationTransition { page_id, after, .. }) = &record.kind
+            else {
                 continue;
             };
+            // Analysis certified this prefix through an explicit, continuous
+            // transition chain, before any page mutation. This is not a
+            // generation-mismatch skip in the ordinary update operation.
+            if redo_starts
+                .get(page_id)
+                .is_some_and(|start| record.lsn < *start)
+            {
+                continue;
+            }
             Self::reject_metadata_page(*page_id, record.lsn)?;
             let page_count = pages.page_count();
             if page_id.0 > page_count {
@@ -378,6 +391,26 @@ impl RecoveryManager {
                 });
             }
             let after_page = Page::from_bytes(*page_id, **after);
+            if let WalRecordKind::PageAllocationTransition { before, .. } = &record.kind {
+                let current = pages.read_page(*page_id)?;
+                if !crate::allocation_transition::redo(
+                    &current,
+                    &Page::from_bytes(*page_id, **before),
+                    &after_page,
+                    record.lsn,
+                )? {
+                    continue;
+                }
+                pages.write_page(&after_page)?;
+                report.pages_redone += 1;
+                operations += 1;
+                #[cfg(test)]
+                crate::crash_test::maybe_crash(
+                    crate::crash_test::TestCrashPoint::RecoveryAfterPageOperation,
+                );
+                Self::maybe_interrupt(operations, operation_limit)?;
+                continue;
+            }
             let generation = after_page.allocation_generation()?;
             let current_lsn = if page_id.0 == page_count {
                 pages.allocate_page()?;
@@ -427,6 +460,26 @@ impl RecoveryManager {
                     actual: record.txn_id,
                     lsn,
                 });
+            }
+            if let WalRecordKind::PageAllocationTransition {
+                page_id,
+                before,
+                after,
+            } = &record.kind
+            {
+                let before = Page::from_bytes(*page_id, **before);
+                let after = Page::from_bytes(*page_id, **after);
+                if crate::allocation_transition::undo(&pages.read_page(*page_id)?, &before, &after)?
+                {
+                    pages.write_page(&before)?;
+                    report.pages_undone += 1;
+                    operations += 1;
+                    #[cfg(test)]
+                    crate::crash_test::maybe_crash(
+                        crate::crash_test::TestCrashPoint::TransitionAfterUndo,
+                    );
+                    Self::maybe_interrupt(operations, operation_limit)?;
+                }
             }
             if let WalRecordKind::PageUpdate {
                 page_id,
@@ -516,6 +569,81 @@ impl RecoveryManager {
             wal.flush_through(lsn)?;
         }
         Ok(report)
+    }
+
+    /// Validate the complete retained image lineage for each transitioned slot.
+    /// A disk incarnation installed by transition T certifies only records
+    /// preceding T, and only with a valid LSN and matching full decoded identity.
+    /// All later records still execute their strict two-state/update checks.
+    fn transition_redo_starts(
+        pages: &mut PageManager,
+        records: &[WalRecord],
+        transactions: &HashMap<TxnId, TransactionAnalysis>,
+    ) -> Result<HashMap<PageId, Lsn>, RecoveryError> {
+        let mut histories = HashMap::<PageId, Vec<&WalRecord>>::new();
+        for record in records {
+            if matches!(record.kind, WalRecordKind::PageAllocationTransition { .. })
+                && !transactions[&record.txn_id].rolled_back
+            {
+                if let WalRecordKind::PageAllocationTransition { page_id, .. } = record.kind {
+                    histories.entry(page_id).or_default();
+                }
+            }
+        }
+        for record in records {
+            if transactions[&record.txn_id].rolled_back {
+                continue;
+            }
+            if let WalRecordKind::PageUpdate { page_id, .. }
+            | WalRecordKind::PageAllocationTransition { page_id, .. } = record.kind
+            {
+                if let Some(history) = histories.get_mut(&page_id) {
+                    history.push(record);
+                }
+            }
+        }
+        let mut starts = HashMap::new();
+        for (page_id, history) in histories {
+            let current = pages.read_page(page_id)?;
+            let actual = crate::allocation_transition::identity(&current)?;
+            let mut previous: Option<&[u8; crate::PAGE_SIZE]> = None;
+            let mut recognized = false;
+            for record in history {
+                let (before, after) = match &record.kind {
+                    WalRecordKind::PageUpdate { before, after, .. }
+                    | WalRecordKind::PageAllocationTransition { before, after, .. } => {
+                        (before, after)
+                    }
+                    _ => continue,
+                };
+                if previous.is_some_and(|image| image != before.as_ref()) {
+                    return Err(crate::invalid_format(
+                        "discontinuous WAL allocation image lineage",
+                    )
+                    .into());
+                }
+                previous = Some(after);
+                if let WalRecordKind::PageAllocationTransition { .. } = record.kind {
+                    let old = Page::from_bytes(page_id, **before);
+                    let new = Page::from_bytes(page_id, **after);
+                    if actual == crate::allocation_transition::identity(&old)? {
+                        recognized = true;
+                    }
+                    if actual == crate::allocation_transition::identity(&new)? {
+                        crate::allocation_transition::redo(&current, &old, &new, record.lsn)?;
+                        starts.insert(page_id, record.lsn);
+                        recognized = true;
+                    }
+                }
+            }
+            if !recognized {
+                return Err(crate::invalid_format(
+                    "disk allocation is outside retained transition lineage",
+                )
+                .into());
+            }
+        }
+        Ok(starts)
     }
 
     fn apply_prepared_resolutions(
@@ -634,11 +762,16 @@ impl RecoveryManager {
             {
                 continue;
             }
-            let WalRecordKind::PageUpdate { page_id, .. } = &record.kind else {
+            let (WalRecordKind::PageUpdate { page_id, .. }
+            | WalRecordKind::PageAllocationTransition { page_id, .. }) = &record.kind
+            else {
                 continue;
             };
             Self::reject_metadata_page(*page_id, record.lsn)?;
-            if page_id.0 > simulated_page_count {
+            if page_id.0 > simulated_page_count
+                || (page_id.0 == simulated_page_count
+                    && matches!(record.kind, WalRecordKind::PageAllocationTransition { .. }))
+            {
                 return Err(RecoveryError::PageGap {
                     page_id: *page_id,
                     page_count: simulated_page_count,
@@ -763,7 +896,9 @@ impl RecoveryManager {
     ) -> Result<(), RecoveryError> {
         let mut latest_loser_by_page = HashMap::<PageId, (TxnId, Lsn)>::new();
         for record in records {
-            let WalRecordKind::PageUpdate { page_id, .. } = &record.kind else {
+            let (WalRecordKind::PageUpdate { page_id, .. }
+            | WalRecordKind::PageAllocationTransition { page_id, .. }) = &record.kind
+            else {
                 continue;
             };
             let Some(transaction) = transactions.get(&record.txn_id) else {

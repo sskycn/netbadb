@@ -451,7 +451,11 @@ fn tail_stress_quantifies_physical_reclamation_and_retained_holes() {
             inventory.pending_reclaim_indexes,
             if interleaved { 100 } else { 0 }
         );
-        assert_eq!(reused, if interleaved { 0 } else { 99 });
+        assert_eq!(reused, if interleaved { 97 } else { 99 });
+        if interleaved {
+            assert_eq!(inventory.database_pages, 207);
+            assert_eq!(inventory.retained_middle_pages, 4);
+        }
         if !interleaved {
             assert_eq!(inventory.database_pages, initial);
         }
@@ -660,7 +664,7 @@ fn tail_whole_tree_keeps_split_middle_owner_and_reclaims_only_later_complete_tre
         ),
         (1, 0, 1)
     );
-    let b = storage.create_index(ColumnId(3)).unwrap();
+    let b = historical_append_index(&mut storage, ColumnId(3)).unwrap();
     storage.drop_index(b.id).unwrap();
     let yes = storage.reclaim_retired_index_tail().unwrap();
     assert_eq!(

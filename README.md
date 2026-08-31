@@ -355,11 +355,14 @@ mutation or checkpoint.
 Later append can reuse the numeric PageId with a fresh PageGeneration; old v3
 handles fail. `Database::inspect_reusable_pages(TableId)` reports validated
 retired-v3 candidates in ascending PageId order, including middle holes, without
-allocating or changing persistent metadata. Round 12 implements this P0 foundation;
-production middle-hole reuse remains disabled because WAL validation/recovery
-currently reject nonzero allocation-generation transitions. No free catalog is
-added. Heap, Catalog, raw/legacy and active-owner orphan reuse remain unsupported.
-See [Round 12's audit, owner-only format and safety gate](docs/page-reuse-round12.md),
+allocating or changing persistent metadata. Round 13 uses the same derived inventory
+for registered BTree-v3 CREATE, backfill and split allocations. Explicit WAL record
+v5/tag 8 transitions preserve ordinary PageUpdate generation checks, restore exact
+old images on rollback, and recover committed reuse without a checkpoint. Clean
+unpinned candidates are selected by lowest PageId before EOF append; no free catalog
+is added. Heap, Catalog, raw/legacy and active-owner orphan reuse remain unsupported.
+See [Round 13's transition, crash and growth proof](docs/page-transition-round13.md),
+[Round 12's audit and owner-only format](docs/page-reuse-round12.md),
 [Round 11's protocol and crash matrix](docs/index-tail-reclaim-round11.md),
 [the Round 10 generation proof](docs/page-generation-round10.md), and
 [the historical Round 9 ownership audit](docs/index-reclaim-round9.md).

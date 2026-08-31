@@ -1,5 +1,6 @@
 //! Synchronous page, buffer, and heap storage for the embedded vertical slice.
 
+mod allocation_transition;
 mod btree;
 mod buffer;
 #[cfg(test)]

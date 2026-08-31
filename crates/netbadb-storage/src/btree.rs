@@ -25,6 +25,12 @@ struct PreparedPage {
     before: Page,
     after: Page,
     new_page: bool,
+    transition: bool,
+}
+
+struct NewBTreePage {
+    reference: BTreePageRef,
+    before: Page,
 }
 
 #[derive(Debug)]
@@ -127,8 +133,12 @@ impl<'a> BTree<'a> {
         transaction.acquire_writer()?;
         let capacity = Page::single_payload_capacity();
         let mut next_page_id = PageId(self.storage.buffer().page_count());
-        let meta_page = take_page_ref(&mut next_page_id, transaction, owner.is_some())?;
-        let root_page = take_page_ref(&mut next_page_id, transaction, owner.is_some())?;
+        let meta_allocation =
+            self.take_page_ref(&mut next_page_id, transaction, owner, owner.is_some())?;
+        let meta_page = meta_allocation.reference;
+        let root_allocation =
+            self.take_page_ref(&mut next_page_id, transaction, owner, owner.is_some())?;
+        let root_page = root_allocation.reference;
         let meta = MetaNode {
             generation: meta_page.generation(),
             owner,
@@ -147,8 +157,8 @@ impl<'a> BTree<'a> {
         let root_payload =
             encode_leaf_generation(&spec, &LeafNode::empty(), owner, root_page.generation())?;
         let changes = vec![
-            prepare_new_page(meta_page, PageType::BTreeMeta, &meta_payload, owner)?,
-            prepare_new_page(root_page, PageType::BTreeLeaf, &root_payload, owner)?,
+            prepare_new_page(meta_allocation, PageType::BTreeMeta, &meta_payload, owner)?,
+            prepare_new_page(root_allocation, PageType::BTreeLeaf, &root_payload, owner)?,
         ];
         self.apply_changes(transaction, changes)?;
         Ok(BTreeHandle { owner, meta_page })
@@ -207,8 +217,13 @@ impl<'a> BTree<'a> {
         }
 
         let mut next_page_id = PageId(self.storage.buffer().page_count());
-        let right_leaf_page =
-            take_page_ref(&mut next_page_id, transaction, meta.generation.is_some())?;
+        let right_leaf_allocation = self.take_page_ref(
+            &mut next_page_id,
+            transaction,
+            meta.owner,
+            meta.generation.is_some(),
+        )?;
+        let right_leaf_page = right_leaf_allocation.reference;
         let (left_leaf, right_leaf, mut promoted) = split_leaf(
             &meta.spec,
             leaf.entries,
@@ -218,7 +233,7 @@ impl<'a> BTree<'a> {
         )?;
         let mut changes = vec![
             prepare_new_page(
-                right_leaf_page,
+                right_leaf_allocation,
                 PageType::BTreeLeaf,
                 &encode_leaf_for(&meta, &right_leaf, right_leaf_page)?,
                 meta.owner,
@@ -248,12 +263,17 @@ impl<'a> BTree<'a> {
                 return self.apply_changes(transaction, changes);
             }
 
-            let parent_right_page =
-                take_page_ref(&mut next_page_id, transaction, meta.generation.is_some())?;
+            let parent_right_allocation = self.take_page_ref(
+                &mut next_page_id,
+                transaction,
+                meta.owner,
+                meta.generation.is_some(),
+            )?;
+            let parent_right_page = parent_right_allocation.reference;
             let (left_parent, next_promoted, right_parent) =
                 split_internal(&meta.spec, parent.node, node_capacity(&meta))?;
             changes.push(prepare_new_page(
-                parent_right_page,
+                parent_right_allocation,
                 PageType::BTreeInternal,
                 &encode_internal_for(&meta, &right_parent, parent_right_page)?,
                 meta.owner,
@@ -269,8 +289,13 @@ impl<'a> BTree<'a> {
             right_page = parent_right_page;
         }
 
-        let new_root_page =
-            take_page_ref(&mut next_page_id, transaction, meta.generation.is_some())?;
+        let new_root_allocation = self.take_page_ref(
+            &mut next_page_id,
+            transaction,
+            meta.owner,
+            meta.generation.is_some(),
+        )?;
+        let new_root_page = new_root_allocation.reference;
         let new_root = InternalNode {
             first_child: left_page,
             separators: vec![InternalSeparator {
@@ -279,7 +304,7 @@ impl<'a> BTree<'a> {
             }],
         };
         changes.push(prepare_new_page(
-            new_root_page,
+            new_root_allocation,
             PageType::BTreeInternal,
             &encode_internal_for(&meta, &new_root, new_root_page)?,
             meta.owner,
@@ -1083,6 +1108,7 @@ impl<'a> BTree<'a> {
             before,
             after,
             new_page: false,
+            transition: false,
         })
     }
 
@@ -1091,7 +1117,22 @@ impl<'a> BTree<'a> {
         transaction: &mut Transaction,
         mut changes: Vec<PreparedPage>,
     ) -> Result<(), StorageError> {
-        let has_new_pages = changes.iter().any(|change| change.new_page);
+        let has_new_pages = changes
+            .iter()
+            .any(|change| change.new_page || change.transition);
+        #[cfg(test)]
+        let internal_split = changes.iter().any(|p| {
+            (p.new_page || p.transition)
+                && p.after
+                    .header()
+                    .is_ok_and(|h| h.page_type == PageType::BTreeInternal)
+        }) && changes.iter().any(|p| {
+            !p.new_page
+                && !p.transition
+                && p.after
+                    .header()
+                    .is_ok_and(|h| h.page_type == PageType::BTreeInternal)
+        });
         let mut logged = 0_usize;
         let mut last_lsn = None;
         for change in &mut changes {
@@ -1100,7 +1141,12 @@ impl<'a> BTree<'a> {
                 self.fail_after_logs = None;
                 transaction.inject_partial_append_failure(0);
             }
-            match transaction.log_page_update(&change.before, &mut change.after) {
+            let result = if change.transition {
+                transaction.log_page_transition(&change.before, &mut change.after)
+            } else {
+                transaction.log_page_update(&change.before, &mut change.after)
+            };
+            match result {
                 Ok(lsn) => {
                     logged += 1;
                     last_lsn = Some(lsn);
@@ -1129,7 +1175,21 @@ impl<'a> BTree<'a> {
 
         #[cfg(test)]
         let mut published = 0_usize;
-        for change in changes.iter().filter(|change| change.new_page) {
+        for change in changes
+            .iter()
+            .filter(|change| change.new_page || change.transition)
+        {
+            if change.transition {
+                if let Err(error) = self
+                    .storage
+                    .buffer()
+                    .publish_page_transition(&change.before, &change.after)
+                {
+                    transaction.require_rollback();
+                    return Err(error);
+                }
+                continue;
+            }
             let mut page = match self.storage.buffer().new_page() {
                 Ok(page) => page,
                 Err(error) => {
@@ -1153,7 +1213,10 @@ impl<'a> BTree<'a> {
                 }
             }
         }
-        for change in changes.iter().filter(|change| !change.new_page) {
+        for change in changes
+            .iter()
+            .filter(|change| !change.new_page && !change.transition)
+        {
             let mut page = match self.storage.buffer().write_btree_page(change.page_id) {
                 Ok(page) => page,
                 Err(error) => {
@@ -1165,6 +1228,19 @@ impl<'a> BTree<'a> {
             #[cfg(test)]
             {
                 drop(page);
+                if has_new_pages {
+                    match change.after.header()?.page_type {
+                        PageType::BTreeLeaf => crate::crash_test::maybe_crash(
+                            crate::crash_test::TestCrashPoint::BTreeAfterSiblingUpdate,
+                        ),
+                        PageType::BTreeInternal | PageType::BTreeMeta => {
+                            crate::crash_test::maybe_crash(
+                                crate::crash_test::TestCrashPoint::BTreeAfterParentUpdate,
+                            )
+                        }
+                        _ => {}
+                    }
+                }
                 published += 1;
                 if published == 1 {
                     crate::crash_test::maybe_crash(
@@ -1173,7 +1249,48 @@ impl<'a> BTree<'a> {
                 }
             }
         }
+        #[cfg(test)]
+        if internal_split {
+            crate::crash_test::maybe_crash(
+                crate::crash_test::TestCrashPoint::BTreeAfterInternalSplit,
+            );
+        }
         Ok(())
+    }
+
+    fn take_page_ref(
+        &mut self,
+        next: &mut PageId,
+        transaction: &mut Transaction,
+        owner: Option<IndexId>,
+        generated: bool,
+    ) -> Result<NewBTreePage, StorageError> {
+        let before = if generated {
+            self.storage
+                .claim_reusable_btree_page(transaction, owner.ok_or(IndexError::InvalidNodeType)?)?
+        } else {
+            None
+        };
+        let before = match before {
+            Some(page) => page,
+            None => {
+                let current = *next;
+                next.0 = next
+                    .0
+                    .checked_add(1)
+                    .ok_or(IndexError::InvalidChild(current))?;
+                Page::zero(current)
+            }
+        };
+        let reference = if generated {
+            BTreePageRef::Allocated(PageRef {
+                page_id: before.id,
+                generation: transaction.reserve_page_generation()?,
+            })
+        } else {
+            BTreePageRef::Legacy(before.id)
+        };
+        Ok(NewBTreePage { reference, before })
     }
 
     #[cfg(test)]
@@ -1183,42 +1300,25 @@ impl<'a> BTree<'a> {
 }
 
 fn prepare_new_page(
-    page_id: BTreePageRef,
+    allocation: NewBTreePage,
     page_type: PageType,
     payload: &[u8],
     owner: Option<IndexId>,
 ) -> Result<PreparedPage, StorageError> {
+    let page_id = allocation.reference;
     validate_btree_owner(owner, btree_page_owner(payload)?)?;
     validate_btree_generation(page_id.generation(), btree_page_generation(payload)?)?;
-    let before = Page::zero(page_id.page_id());
+    let before = allocation.before;
+    let new_page = before.bytes().iter().all(|byte| *byte == 0);
     let mut after = Page::new(page_id.page_id(), page_type);
     after.initialize_single_payload(page_type, payload)?;
     Ok(PreparedPage {
         page_id,
         before,
         after,
-        new_page: true,
+        new_page,
+        transition: !new_page,
     })
-}
-
-fn take_page_ref(
-    next: &mut PageId,
-    transaction: &mut Transaction,
-    generated: bool,
-) -> Result<BTreePageRef, StorageError> {
-    let current = *next;
-    next.0 = next
-        .0
-        .checked_add(1)
-        .ok_or(IndexError::InvalidChild(current))?;
-    if generated {
-        Ok(BTreePageRef::Allocated(PageRef {
-            page_id: current,
-            generation: transaction.reserve_page_generation()?,
-        }))
-    } else {
-        Ok(BTreePageRef::Legacy(current))
-    }
 }
 
 fn node_capacity(meta: &MetaNode) -> usize {

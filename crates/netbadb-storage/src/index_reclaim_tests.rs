@@ -124,12 +124,12 @@ fn round9_tail_and_interleaved_stress_preserve_every_pending_owner() {
         let path = test_path(&format!("round9-stress-{interleaved}"));
         cleanup(&path);
         let mut storage =
-            HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 1).unwrap();
+            HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
         let before = storage.buffer.page_count();
         let mut last_id = IndexId(0);
         let mut after_drop = before;
         for _ in 0..100 {
-            let index = storage.create_index(ColumnId(2)).unwrap();
+            let index = historical_append_index(&mut storage, ColumnId(2)).unwrap();
             assert!(index.id.0 > last_id.0);
             last_id = index.id;
             storage.drop_index(index.id).unwrap();
@@ -154,7 +154,7 @@ fn round9_tail_and_interleaved_stress_preserve_every_pending_owner() {
         let after_cycle_maintenance = storage.buffer.page_count();
         if interleaved {
             // Active allocations above all retired pages also exclude a suffix.
-            storage.create_index(ColumnId(1)).unwrap();
+            historical_append_index(&mut storage, ColumnId(1)).unwrap();
         }
         let report = storage.inspect_index_reclaim().unwrap();
         eprintln!(
@@ -173,7 +173,8 @@ fn round9_tail_and_interleaved_stress_preserve_every_pending_owner() {
         assert_eq!(storage.wal_records().unwrap().len(), wal);
         storage.checkpoint().unwrap();
         storage.close().unwrap();
-        let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+        let mut storage =
+            HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
         assert_eq!(storage.inspect_index_reclaim().unwrap(), report);
         storage.close().unwrap();
         cleanup(&path);
@@ -566,10 +567,11 @@ fn process_crash_owned_unary_merge_rolls_back_or_commits_all_pages() {
 fn pending_continuation_ids_are_checked_against_root_high_water() {
     let path = test_path("round9-pending-continuations");
     cleanup(&path);
-    let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+    let mut storage =
+        HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
     storage.index_catalog_payload_capacity = Some(108);
     for _ in 0..10 {
-        let index = storage.create_index(ColumnId(1)).unwrap();
+        let index = historical_append_index(&mut storage, ColumnId(1)).unwrap();
         storage.drop_index(index.id).unwrap();
         storage.compact_index_catalog().unwrap();
     }
@@ -593,7 +595,7 @@ fn pending_continuation_ids_are_checked_against_root_high_water() {
     pages.sync().unwrap();
     drop(pages);
     assert!(matches!(
-        HeapStorage::open(&path, indexed_table()),
+        HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 512),
         Err(StorageError::Index(IndexError::InvalidIndexHighWater(
             IndexId(5)
         )))

@@ -1,6 +1,6 @@
 # Storage decoding fuzzing
 
-`wal_recovery` accepts at most 128 KiB, replaces the WAL belonging to a fresh
+`wal_recovery` accepts at most 256 KiB, replaces the WAL belonging to a fresh
 minimal heap, and calls `HeapStorage::open`. That public path invokes the
 crate-private recovery decoder without adding a fuzz-only production API.
 Root, alternate WAL, and heap files are isolated by process ID and removed
@@ -90,9 +90,10 @@ legacy payloads keep their exact version. Successful WAL recovery still runs
 full ownership/generation inspection. Use temporary output/corpus directories;
 only reviewed deterministic seeds are committed.
 
-The WAL bound is 128 KiB because the real CREATE/rollback/re-CREATE seed contains
-eight full-page updates and exceeds 64 KiB. The generator asserts this bound;
-the seed is not silently skipped by the harness.
+Round 10 raised the WAL bound to 128 KiB because its real
+CREATE/rollback/re-CREATE seed contains eight full-page updates and exceeds
+64 KiB. Round 13 raises it to 256 KiB for retained transition snapshots; the
+generator asserts the current bound so seeds cannot be silently skipped.
 
 Round 11 adds six v8 intent payload seeds and eight open/recovery snapshot seeds.
 The generator verifies old/new-length valid snapshots converge to three pages,
@@ -116,3 +117,16 @@ must agree with candidate owner/generation identities, sorted order and pending
 high-water. A lazy scan may still report typed dormant-page corruption after
 open; that is not counted as successful inventory validation. Round 11 seeds
 remain explicitly v8 with root-dependent records.
+
+Round 13 adds twelve reviewed snapshots: transition winner/loser, subsequent
+updates, interrupted undo, durable rollback completion, third generation,
+corrupted nested before/after images,
+and real production split/parent update winner plus unflushed/published losers.
+The original PageUpdate/reservation/tail corpora remain inputs. Complete retained
+no-checkpoint transition history requires a 256 KiB envelope bound (record bounds
+are unchanged). Generation, ownership and pending scans still follow successful
+open. The historical owner-only fixture now creates its active tree before
+compaction while old dirty pages are ineligible, so production reuse does not
+consume the pages the fixture is intended to preserve. Generate twice in temporary
+directories, compare deterministic snapshots, and copy only reviewed seeds; keep
+random mutations and findings outside Git.

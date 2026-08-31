@@ -70,9 +70,9 @@ fn reusable_inventory_survives_meta_first_and_orphan_only_remainders() {
                 .blocked_active_orphans,
             active_inventory.active_orphan_pages
         );
+        let active = storage.create_index(ColumnId(1)).unwrap();
         storage.drop_index(old.id).unwrap();
         storage.compact_index_catalog().unwrap();
-        let active = storage.create_index(ColumnId(1)).unwrap();
         let initial = storage.inspect_reusable_pages().unwrap();
         assert!(initial.candidates.len() > 20);
         assert_eq!(initial.middle_candidates as usize, initial.candidates.len());
@@ -292,6 +292,7 @@ fn reusable_scan_excludes_raw_heap_catalog_and_refuses_corruption() {
         let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
         storage.insert(&indexed_rows()[0]).unwrap();
         let old = storage.create_index(ColumnId(2)).unwrap();
+        let active = storage.create_index(ColumnId(1)).unwrap();
         storage.drop_index(old.id).unwrap();
         storage.compact_index_catalog().unwrap();
         let raw = storage
@@ -301,7 +302,6 @@ fn reusable_scan_excludes_raw_heap_catalog_and_refuses_corruption() {
                 nullable: false,
             })
             .unwrap();
-        let active = storage.create_index(ColumnId(1)).unwrap();
         let valid = storage.inspect_reusable_pages().unwrap();
         assert_eq!(valid.candidates.len(), 2);
         assert_eq!(valid.middle_candidates, 2);
@@ -370,10 +370,11 @@ fn reusable_scan_excludes_raw_heap_catalog_and_refuses_corruption() {
 }
 
 #[test]
-fn reusable_inspection_is_quiescent_and_production_allocators_remain_append_only() {
+fn reusable_inspection_is_quiescent_and_cross_kind_allocations_remain_excluded() {
     let path = test_path("round12-no-cross-kind");
     cleanup(&path);
-    let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+    let mut storage =
+        HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 64).unwrap();
     let old = storage.create_index(ColumnId(1)).unwrap();
     storage.drop_index(old.id).unwrap();
     storage.compact_index_catalog().unwrap();
@@ -413,7 +414,7 @@ fn reusable_inspection_is_quiescent_and_production_allocators_remain_append_only
     }
     storage.index_catalog_payload_capacity = Some(108);
     for _ in 0..5 {
-        let index = storage.create_index(ColumnId(1)).unwrap();
+        let index = historical_append_index(&mut storage, ColumnId(1)).unwrap();
         assert!(index.handle.meta_page.page_id().0 >= count);
         storage.drop_index(index.id).unwrap();
         storage.compact_index_catalog().unwrap();
@@ -433,12 +434,15 @@ fn reusable_inspection_is_quiescent_and_production_allocators_remain_append_only
 }
 
 #[test]
-fn round12_stress_measures_inventory_and_closed_production_gate() {
-    let path = test_path("round12-stress");
+fn round13_stress_consumes_round12_holes_without_linear_growth() {
+    let path = test_path("round13-stress");
     cleanup(&path);
-    let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+    // Real pin blockers reproduce the Round 12 404-page layout; release all
+    // blockers before measuring the ordinary production allocator.
+    let mut storage =
+        HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 512).unwrap();
     for _ in 0..100 {
-        let index = storage.create_index(ColumnId(2)).unwrap();
+        let index = historical_append_index(&mut storage, ColumnId(2)).unwrap();
         storage.drop_index(index.id).unwrap();
         storage
             .btree()
@@ -462,44 +466,51 @@ fn round12_stress_measures_inventory_and_closed_production_gate() {
     assert_eq!(initial.pending_owners, 100);
     assert_eq!(initial.file_pages, 404);
     let wal = storage.wal_records().unwrap().len();
-    let same = storage.inspect_reusable_pages().unwrap();
-    assert_eq!(same, initial);
+    assert_eq!(storage.inspect_reusable_pages().unwrap(), initial);
     assert_eq!(storage.wal_records().unwrap().len(), wal);
     storage.checkpoint().unwrap();
     storage.close().unwrap();
-    let started = std::time::Instant::now();
-    let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
-    let open_us = started.elapsed().as_micros();
-    let started = std::time::Instant::now();
-    assert_eq!(storage.inspect_reusable_pages().unwrap(), initial);
-    let scan_us = started.elapsed().as_micros();
-    let mut appended = 0;
-    for _ in 0..100 {
+    let mut storage = HeapStorage::open_with_buffer_pool_size(&path, indexed_table(), 8).unwrap();
+    let mut hundred = 0;
+    for cycle in 1..=500 {
         let index = storage.create_index(ColumnId(2)).unwrap();
-        assert!(index.handle.meta_page.page_id().0 >= initial.file_pages);
-        appended += 2;
+        assert!(index.handle.meta_page.page_id().0 < initial.file_pages);
         storage.drop_index(index.id).unwrap();
         storage.compact_index_catalog().unwrap();
+        assert_eq!(storage.buffer.page_count(), initial.file_pages);
+        if cycle == 100 {
+            hundred = storage.buffer.page_count();
+        }
     }
+    let records = storage.wal_records().unwrap();
+    let transitions = records
+        .iter()
+        .filter(|r| matches!(r.kind, WalRecordKind::PageAllocationTransition { .. }))
+        .count();
+    let appends = records.iter().filter(|r| matches!(&r.kind, WalRecordKind::PageUpdate { before, after, page_id } if before.iter().all(|b| *b == 0) && matches!(Page::from_bytes(*page_id, **after).header().unwrap().page_type, PageType::BTreeMeta | PageType::BTreeLeaf | PageType::BTreeInternal))).count();
+    assert_eq!(transitions, 1000);
+    assert_eq!(appends, 0);
     let after = storage.inspect_reusable_pages().unwrap();
-    assert_eq!(after.candidates.len(), 400);
-    assert_eq!(after.pending_owners, 200);
-    assert!(
-        initial
-            .candidates
-            .iter()
-            .all(|p| after.candidates.contains(p))
-    );
-    eprintln!(
-        "ROUND12_STRESS phaseA_file={} middle={} candidates={} pending={} open_us={open_us} scan_us={scan_us} phaseC_file={} reused=0 btree_appended={appended} remaining_candidates={} pending_after={}",
+    let owners: std::collections::HashSet<_> = after
+        .candidates
+        .iter()
+        .map(|c| c.retired_index_id)
+        .collect();
+    assert_eq!(after.candidates.len(), 200);
+    assert_eq!(owners.len(), 100);
+    println!(
+        "ROUND13_STRESS initial={} candidates={} pending={} after100={hundred} after500={} transitions={transitions} btree_appends={appends} pending_total={} pending_with_pages={} zero_page_pending={}",
         initial.file_pages,
-        initial.middle_candidates,
         initial.candidates.len(),
         initial.pending_owners,
         after.file_pages,
-        after.candidates.len(),
-        after.pending_owners
+        after.pending_owners,
+        owners.len(),
+        after.pending_owners - owners.len() as u64
     );
+    storage.close().unwrap();
+    let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+    assert_eq!(storage.inspect_reusable_pages().unwrap(), after);
     storage.close().unwrap();
     cleanup(&path);
 }
@@ -553,9 +564,10 @@ fn owner_only_cleanup_crash_matrix_preserves_partial_or_empty_inventory() {
             cleanup(&path);
             let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
             let old = storage.create_index(ColumnId(1)).unwrap();
+            let active = storage.create_index(ColumnId(3)).unwrap();
+            let other = storage.create_index(ColumnId(2)).unwrap();
             storage.drop_index(old.id).unwrap();
             storage.compact_index_catalog().unwrap();
-            let active = storage.create_index(ColumnId(1)).unwrap();
             let candidates = storage.inspect_reusable_pages().unwrap().candidates;
             let mut tx = storage.begin_transaction().unwrap();
             let generations = [
@@ -578,7 +590,6 @@ fn owner_only_cleanup_crash_matrix_preserves_partial_or_empty_inventory() {
                 // Make compaction perform a real metadata transaction while the
                 // partial owner remains; retiring a second tree is sufficient.
                 let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
-                let other = storage.create_index(ColumnId(2)).unwrap();
                 storage.drop_index(other.id).unwrap();
                 storage.checkpoint().unwrap();
                 storage.close().unwrap();
@@ -625,9 +636,9 @@ fn retired_v2_suffix_does_not_hide_v3_middle_candidates() {
     cleanup(&path);
     let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
     let old = storage.create_index(ColumnId(1)).unwrap();
+    let legacy = storage.create_index(ColumnId(2)).unwrap();
     storage.drop_index(old.id).unwrap();
     storage.compact_index_catalog().unwrap();
-    let legacy = storage.create_index(ColumnId(2)).unwrap();
     let mut meta = storage.btree().read_meta(legacy.handle).unwrap();
     storage.checkpoint().unwrap();
     storage.close().unwrap();
@@ -730,10 +741,10 @@ fn dormant_ref_does_not_claim_heap_appended_after_other_owner_tail_reclaim() {
     assert_eq!(storage.btree().height(old.handle).unwrap(), 2);
     let old_root = storage.btree().read_meta(old.handle).unwrap().root_page;
     assert_eq!(old_root.page_id().0, storage.buffer.page_count() - 1);
+    let next = storage.create_index(ColumnId(1)).unwrap();
     storage.drop_index(old.id).unwrap();
     storage.compact_index_catalog().unwrap();
     let old_count = storage.inspect_reusable_pages().unwrap().candidates.len();
-    let next = storage.create_index(ColumnId(1)).unwrap();
     let mut tx = storage.begin_transaction().unwrap();
     let generation = tx.reserve_page_generation().unwrap();
     tx.commit().unwrap();
