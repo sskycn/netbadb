@@ -1230,6 +1230,19 @@ impl TableStorage {
         }
     }
 
+    /// Explicit checkpoint-gated historical v3 adoption for a physical Heap.
+    pub fn adopt_historical_btree_orphans(
+        &mut self,
+    ) -> Result<crate::HistoricalOrphanAdoptionReport, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.adopt_historical_btree_orphans(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "historical BTree orphan adoption",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     /// Validates the full Heap file and reports pending retirement ownership.
     pub fn inspect_index_reclaim(&mut self) -> Result<crate::IndexReclaimReport, StorageError> {
         match self {

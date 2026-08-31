@@ -6,7 +6,7 @@ use netbadb_storage::{HeapStorage, wal_alternate_path, wal_path};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
 // Retained no-checkpoint transition histories include both complete heap and WAL.
-const MAX_INPUT_SIZE: usize = 256 * 1024;
+const MAX_INPUT_SIZE: usize = 2 * 1024 * 1024;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT_SIZE {
@@ -16,19 +16,28 @@ fuzz_target!(|data: &[u8]| {
     // NBRF is a fuzz-fixture envelope, not a database format. It supplies a
     // checkpointed file plus selected WAL so intent old/new length paths are
     // actually reachable; ordinary seeds remain raw WAL bytes.
-    let fixture = if data.starts_with(b"NBRF") {
-        if data.len() < 12 {
+    let fixture = if data.starts_with(b"NBRF") || data.starts_with(b"NBRH") {
+        let header = if data.starts_with(b"NBRH") { 16 } else { 12 };
+        if data.len() < header {
             return;
         }
         let heap_length = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
         let wal_length = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-        let Some(end) = 12_usize.checked_add(heap_length) else {
+        let old_length = if header == 16 {
+            u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        let Some(end) = header.checked_add(heap_length) else {
             return;
         };
-        if end.checked_add(wal_length) != Some(data.len()) {
+        let Some(wal_end) = end.checked_add(wal_length) else {
+            return;
+        };
+        if wal_end.checked_add(old_length) != Some(data.len()) {
             return;
         }
-        Some((&data[12..end], &data[end..]))
+        Some((&data[header..end], &data[end..wal_end], &data[wal_end..]))
     } else {
         None
     };
@@ -41,8 +50,12 @@ fuzz_target!(|data: &[u8]| {
     drop(storage);
 
     let wal_file = wal_path(&database_path);
-    let wal_bytes = if let Some((heap, wal)) = fixture {
+    let wal_bytes = if let Some((heap, wal, old)) = fixture {
         std::fs::write(&database_path, heap).expect("install isolated heap fixture");
+        if !old.is_empty() {
+            std::fs::write(wal_alternate_path(&wal_file), old)
+                .expect("install older structural WAL");
+        }
         wal
     } else {
         data
@@ -60,6 +73,15 @@ fuzz_target!(|data: &[u8]| {
                     .expect("validated candidate scan");
                 assert_eq!(reuse.file_pages, ownership.database_pages);
                 assert_eq!(reuse.pending_owners, ownership.pending_reclaim_indexes);
+                assert_eq!(reuse.blocked_active_orphans, ownership.active_orphan_pages);
+                assert_eq!(
+                    reuse
+                        .candidates
+                        .iter()
+                        .filter(|p| p.class == netbadb_storage::PageReuseClass::RetiredBTreeMarker)
+                        .count() as u64,
+                    ownership.retired_marker_pages
+                );
                 assert!(
                     reuse
                         .candidates
@@ -69,13 +91,12 @@ fuzz_target!(|data: &[u8]| {
                 for candidate in reuse.candidates {
                     assert!(candidate.page_ref.generation.0 > 0);
                     assert!(candidate.retired_index_id < ownership.next_index_id);
-                    assert!(
-                        ownership
-                            .allocations
-                            .iter()
-                            .any(|page| page.page_ref == candidate.page_ref
-                                && page.owner == candidate.retired_index_id)
-                    );
+                    assert!(ownership.allocations.iter().any(|page| page.page_ref
+                        == candidate.page_ref
+                        && page.owner == candidate.retired_index_id
+                        && (candidate.class
+                            != netbadb_storage::PageReuseClass::RetiredBTreeMarker
+                            || page.reachable != Some(true))));
                 }
                 for pending in ownership.pending {
                     assert!(pending.index_id.0 > 0 && pending.index_id < ownership.next_index_id);

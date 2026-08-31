@@ -644,11 +644,30 @@ workload stays at 115 pages with 8,100 retirements and 8,100 reuse transitions.
 Retirement and reuse have separate real-process winner/loser crash matrices.
 See [Round 14](btree-orphan-round14.md).
 
-Next recommendation: a separately designed **Historical / Quiescent Active-Orphan
-Adoption** protocol for pre-Round14 unmarked orphans. It needs quiescence,
-checkpoint, complete structural proof and durable adoption. Table Schema
-Lifecycle Architecture Audit is the alternative after measuring that historical
-backlog. Neither direction authorizes Heap reuse or direct CREATE TABLE work.
+### Storage Lifecycle Round 15 — quiescent historical orphan adoption
+
+Implemented: explicit `Database::adopt_historical_btree_orphans(TableId)` for all
+active registered v3 indexes in a single Heap. Existing maintenance admission,
+internal checkpoint, complete post-checkpoint tree/file validation and exact
+clean/unpinned candidate proofs precede one all-or-none PageUpdate transaction.
+The checkpoint WAL generation becomes the recovery baseline; even deliberately
+retained older structural WAL cannot reintroduce a reference to an adopted page.
+NBTR, Page, BTree, Catalog and WAL formats are unchanged. Adoption preserves
+PageRef/owner; subsequent same/different-owner reuse reserves fresh generations.
+
+The historical fixture converts 81 ordinary orphans to 81 markers and consumes
+all 81 without growing its 115-page file. A real 1,186-candidate fixture uses one
+transaction. Runtime byte-exact rollback, process-loss winner/loser and partial
+flush histories converge across three reopens. No startup repair, raw/v1/v2,
+unknown-owner, Heap/Catalog adoption or NBTR tail truncation is implemented.
+See [Round 15](historical-orphan-round15.md).
+
+Next recommendation: **Table Schema Lifecycle Architecture Audit**, not CREATE
+TABLE implementation. Establish canonical schema authority versus manifests,
+durable TableId/ColumnId lifecycles, fingerprint/version evolution, prepared and
+planner cache invalidation, physical Heap/LSM/partition creation and deletion,
+transactional DDL/WAL recovery, reopen/migration, authorization, Protocol v1/SDK
+schema impact and PostgreSQL catalog reflection before choosing a DDL slice.
 
 ## Phase 6 — SDK and tooling
 

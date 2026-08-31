@@ -1973,8 +1973,35 @@ The ordered cache distinguishes whole-owner v3 and individual-marker authority;
 same-owner transitions are allowed only from the latter with a fresh generation.
 Markers are independent of pending owner records and excluded from whole-owner
 zero-page accounting and tail intents. Historical unmarked active orphans remain
-non-reusable. No full reachability subtraction authorizes retirement.
-See [Round 14](btree-orphan-round14.md), [Round 13](page-transition-round13.md), [Round 12](page-reuse-round12.md),
+non-reusable until explicit Round 15 maintenance. Reachability subtraction alone
+never authorizes retirement.
+
+`Database::adopt_historical_btree_orphans(TableId)` requires the existing Core
+no-retained-handle gate and Heap checkpoint admission, rejects pins and durable
+tail intents, and supports only a single Heap placement. Preflight validates the
+whole file and all active/retained/raw root traversals. No eligible ordinary v3
+orphan means no WAL write or checkpoint. Otherwise an internal checkpoint flushes
+the committed recovery baseline and rotates WAL; a fresh identical global proof
+then selects active-owned ordinary v3 pages minus validated reachable pages.
+Meta and current root pages are additionally protected. The proof follows full
+PageRefs for meta, root and every child; DFS leaf order must exactly match all
+leaf-next PageRefs.
+PageId membership sets detect physical aliases only after generation validation.
+
+The plan keeps ascending PageId order and exact before images (owner, PageRef,
+kind, pageLSN, payload and CRC). Every candidate must be clean, unpinned and match
+disk before BEGIN and again before any marker log; each image is revalidated
+immediately before its own update too. The exclusive synchronous owner and
+dedicated writer prevent an intervening DML/DDL/vacuum operation. One ordinary
+PageUpdate transaction converts candidates to existing NBTR v1, without new
+generation reservations, a new catalog, or an allocation transition. Partial
+runtime failure rolls back; an unresolved commit/rollback or checkpoint failure
+requires reopen. Commit invalidates the existing cache, then committed markers
+are flushed before success so a following allocator can use them immediately.
+No schema/inspection/planner generation changes, automatic open-time adoption,
+or NBTR tail eligibility changes occur. See the checkpoint section below and
+[Round 15's detailed proof](historical-orphan-round15.md).
+See also [Round 14](btree-orphan-round14.md), [Round 13](page-transition-round13.md), [Round 12](page-reuse-round12.md),
 [Round 11](index-tail-reclaim-round11.md) and [Round 10](page-generation-round10.md).
 
 A registered table index is distinct from a raw tree created through
@@ -2005,7 +2032,8 @@ enter ordinary CatalogInspection, access paths, ANALYZE, or vacuum. Explicit
 Round 9 compaction replaces owned retired definitions with minimal pending
 ownership after validating the full file. Legacy and historical pre-owner pages
 remain unreclaimable. No free-list exists; repeated CREATE/DROP still grows the
-file. See [the ownership audit](index-reclaim-round9.md).
+file in the original Round 9 baseline; current Round 13 reuse bounds that growth.
+See [the ownership audit](index-reclaim-round9.md).
 For every physical Heap version that has not been vacuumed and every registered
 index, one candidate entry `(version[column], version RowId)` exists. Raw
 B+Trees are outside this invariant. INSERT and UPDATE publish a new Heap version

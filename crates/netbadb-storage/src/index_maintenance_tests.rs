@@ -2,7 +2,7 @@ use netbadb_types::IndexId;
 
 /// Historical fixture only: recreate pre-Round14 unmarked orphans using the
 /// exact active before images from retirement WAL, then checkpoint that state.
-/// Production never adopts or reconstructs these historical pages.
+/// Production never reconstructs these historical bytes; adoption is explicit.
 fn historical_unmarked_vacuum(storage: &mut HeapStorage) {
     storage.vacuum().unwrap();
     let mut images = std::collections::BTreeMap::new();

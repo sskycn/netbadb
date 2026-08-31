@@ -14,6 +14,10 @@ pub(crate) const EXIT_CODE: i32 = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCrashPoint {
+    AdoptionAfterCheckpoint,
+    AdoptionAfterManyPages,
+    AdoptionBeforeCheckpoint,
+    AdoptionAfterCommit,
     RetirementBeforeCommit,
     RetirementBeforeLog,
     RetirementAfterLog,
@@ -85,6 +89,10 @@ pub(crate) enum TestCrashPoint {
 impl TestCrashPoint {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::AdoptionAfterCheckpoint => "adoption-after-checkpoint",
+            Self::AdoptionAfterManyPages => "adoption-after-many-pages",
+            Self::AdoptionBeforeCheckpoint => "adoption-before-checkpoint",
+            Self::AdoptionAfterCommit => "adoption-after-commit",
             Self::RetirementBeforeCommit => "RetirementBeforeCommit",
             Self::RetirementBeforeLog => "RetirementBeforeLog",
             Self::RetirementAfterLog => "RetirementAfterLog",

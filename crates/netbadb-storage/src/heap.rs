@@ -29,6 +29,9 @@ use crate::{PreparedTransaction, PreparedTxnResolution};
 
 #[path = "btree_allocator.rs"]
 mod btree_allocator;
+#[path = "historical_orphan.rs"]
+mod historical_orphan;
+pub use historical_orphan::HistoricalOrphanAdoptionReport;
 #[path = "index_ownership.rs"]
 mod ownership;
 #[path = "index_tail_reclaim.rs"]
@@ -89,6 +92,8 @@ pub struct HeapStorage {
     fail_index_compaction_after_logs: Option<usize>,
     #[cfg(test)]
     fail_tail: Option<&'static str>,
+    #[cfg(test)]
+    fail_adoption: Option<&'static str>,
 }
 
 /// Result of explicit catalog maintenance, not an Inspection JSON or SQL result.
@@ -119,7 +124,6 @@ struct IndexPageInventory {
     markers: HashSet<PageId>,
     legacy_retired: HashSet<PageId>,
     report: IndexReclaimReport,
-    #[cfg(test)]
     observations: Vec<ownership::BTreePageOwnership>,
 }
 
@@ -374,6 +378,8 @@ impl HeapStorage {
             fail_index_compaction_after_logs: None,
             #[cfg(test)]
             fail_tail: None,
+            #[cfg(test)]
+            fail_adoption: None,
         })
     }
 
@@ -529,6 +535,8 @@ impl HeapStorage {
             fail_index_compaction_after_logs: None,
             #[cfg(test)]
             fail_tail: None,
+            #[cfg(test)]
+            fail_adoption: None,
         };
         storage.recover_tail_intent()?;
         let (table_statistics, entries) = storage.load_index_registry(catalog_root)?;
@@ -9393,5 +9401,6 @@ mod tests {
         include!("page_reuse_tests.rs");
         include!("page_transition_tests.rs");
         include!("btree_retirement_tests.rs");
+        include!("historical_orphan_tests.rs");
     }
 }

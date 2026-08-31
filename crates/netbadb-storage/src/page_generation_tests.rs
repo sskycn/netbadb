@@ -482,6 +482,12 @@ fn generation_legacy_v2_remains_read_write_and_explicitly_unreclaimable() {
         storage.delete(row).unwrap();
     }
     storage.vacuum().unwrap();
+    let historical = storage.inspect_index_reclaim().unwrap();
+    assert!(historical.active_orphan_pages > 0);
+    let lsn = storage.transactions.wal().borrow().next_lsn();
+    assert_eq!(storage.adopt_historical_btree_orphans().unwrap().adopted, 0);
+    assert_eq!(storage.transactions.wal().borrow().next_lsn(), lsn);
+    assert_eq!(storage.inspect_index_reclaim().unwrap(), historical);
     storage.drop_index(index.id).unwrap();
     storage.compact_index_catalog().unwrap();
     let report = storage.inspect_index_reclaim().unwrap();

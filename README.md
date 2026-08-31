@@ -363,10 +363,17 @@ unpinned candidates are selected by lowest PageId before EOF append; no free cat
 is added. Round 14 marks newly unlinked registered nodes with independent NBTR v1
 retirement payloads, after every structural unlink in the same transaction.
 Only committed markers enter reuse; same-owner transitions require a marker
-before image and a fresh generation. Historical unmarked active orphans, Heap,
-Catalog and raw/legacy reuse remain unsupported. A 100-cycle same-index
+before image and a fresh generation. Round 15 adds the explicit
+`Database::adopt_historical_btree_orphans(TableId)` maintenance API: quiescent
+admission, internal checkpoint, fresh complete tree/file proof, then one atomic
+same-generation PageUpdate transaction converts historical ordinary v3 orphans
+to NBTR. It never runs automatically on open. The 81-page historical fixture
+adopts and immediately reuses every hole without file growth; a 1,186-candidate
+fixture also commits in one transaction. Heap, Catalog, raw/v1/v2 adoption and
+NBTR tail truncation remain unsupported. A 100-cycle same-index
 grow/shrink workload stays at 115 pages with 8,100 marker reuses and no appends.
-See [Round 14's retirement and reuse proof](docs/btree-orphan-round14.md),
+See [Round 15's adoption and WAL horizon proof](docs/historical-orphan-round15.md),
+[Round 14's retirement and reuse proof](docs/btree-orphan-round14.md),
 [Round 13's transition, crash and growth proof](docs/page-transition-round13.md),
 [Round 12's audit and owner-only format](docs/page-reuse-round12.md),
 [Round 11's protocol and crash matrix](docs/index-tail-reclaim-round11.md),

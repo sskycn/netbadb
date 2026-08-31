@@ -516,6 +516,28 @@ impl BufferPool {
         Ok(Some(state.disk.read_page(page_id)?))
     }
 
+    /// Strict maintenance precondition, unlike allocation's skip-and-append
+    /// policy. No eviction, writeback, invalidation or frame installation.
+    pub(crate) fn maintenance_page_snapshot(&self, page_id: PageId) -> Result<Page, StorageError> {
+        let mut state = self.state.borrow_mut();
+        if let Some(index) = state.find_frame(page_id) {
+            let frame = &state.frames[index];
+            if frame.pin_count != 0 || frame.writer {
+                return Err(BufferError::PagePinned { page_id }.into());
+            }
+            if frame.dirty {
+                return Err(BufferError::PageDirty { page_id }.into());
+            }
+        }
+        let disk = state.disk.read_page(page_id)?;
+        if let Some(index) = state.find_frame(page_id) {
+            if state.frames[index].page.bytes() != disk.bytes() {
+                return Err(crate::invalid_format("maintenance frame differs from disk"));
+            }
+        }
+        Ok(disk)
+    }
+
     /// Only after the explicit transition was logged. Never retain an old
     /// allocation frame: remove it, then install the new identity as dirty.
     pub(crate) fn publish_page_transition(

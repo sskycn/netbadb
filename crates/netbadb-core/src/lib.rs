@@ -49,8 +49,8 @@ pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_storage::{
-    IndexDefinition, IndexMaintenanceReport, IndexReclaimReport, IndexStatistics,
-    IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
+    HistoricalOrphanAdoptionReport, IndexDefinition, IndexMaintenanceReport, IndexReclaimReport,
+    IndexStatistics, IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
     LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
     ReusablePageInspection, StorageKind, TableStatistics,
 };
@@ -1440,6 +1440,34 @@ impl Database {
                 .map_err(Into::into),
             TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
                 operation: "reusable page inspection",
+                storage_kind: "range-partitioned table",
+            }
+            .into()),
+        }
+    }
+
+    /// Explicitly adopts historical ordinary v3 orphans of all active indexes
+    /// on one single-storage Heap table. Drop every DatabaseTransaction handle
+    /// first, including resolved and lazy handles. Storage internally checkpoints,
+    /// proves full reachability/ownership and commits same-allocation NBTR writes.
+    /// No schema, planner/catalog generation, SQL surface or file length changes.
+    /// An unresolved persistence failure requires reopen; it may have committed.
+    pub fn adopt_historical_btree_orphans(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<HistoricalOrphanAdoptionReport, DatabaseError> {
+        self.ensure_index_maintenance_quiescent()?;
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => self
+                .registry
+                .get_mut(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .adopt_historical_btree_orphans()
+                .map_err(Into::into),
+            TablePlacement::RangePartitioned { .. } => Err(StorageError::UnsupportedOperation {
+                operation: "historical BTree orphan adoption",
                 storage_kind: "range-partitioned table",
             }
             .into()),
@@ -5144,11 +5172,22 @@ mod tests {
         assert!(database.inspect_index_reclaim(TableId(1)).is_err());
         assert!(database.inspect_reusable_pages(TableId(1)).is_err());
         assert!(database.reclaim_retired_index_tail(TableId(1)).is_err());
+        assert!(database.adopt_historical_btree_orphans(TableId(1)).is_err());
         drop(lazy_reader);
         let mut retained_terminal = database.begin_transaction().unwrap();
         database.commit_transaction(&mut retained_terminal).unwrap();
         assert!(database.reclaim_retired_index_tail(TableId(1)).is_err());
+        assert!(database.adopt_historical_btree_orphans(TableId(1)).is_err());
         drop(retained_terminal);
+        assert_eq!(
+            database
+                .adopt_historical_btree_orphans(TableId(1))
+                .unwrap()
+                .adopted,
+            0
+        );
+        assert_eq!(database.inspect_catalog().unwrap(), inspection_before);
+        assert_eq!(database.catalog_generation(), generation_before);
         let retired = database.create_index(TableId(1), ColumnId(1)).unwrap();
         database.drop_index(TableId(1), retired.id).unwrap();
         let generation_after_drop = database.catalog_generation();

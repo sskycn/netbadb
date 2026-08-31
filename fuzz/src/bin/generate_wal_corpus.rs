@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 include!("../retirement_seeds.rs");
+include!("../adoption_seeds.rs");
 
 use netbadb_index::{
     BTreeHandle, IndexCatalogEntry, IndexCatalogNode, IndexDefinition, IndexEntry, IndexSpec,
@@ -71,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_transition_seeds(&output)?;
     write_transition_split_seeds(&output)?;
     write_retirement_seeds(&output)?;
+    write_adoption_seeds(&output)?;
     Ok(())
 }
 

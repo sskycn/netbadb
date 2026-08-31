@@ -8,7 +8,19 @@ seeds reproduce byte-for-byte. Existing Round 11/13 snapshots remain unchanged.
 `btree_decode` round-trips markers and asserts that active decoders reject them.
 Markers retain the existing Page v5 CRC and WAL binary framing.
 
-`wal_recovery` accepts at most 256 KiB, replaces the WAL belonging to a fresh
+Round 15 adds five deterministic adoption snapshots: winner, loser, 81-page
+partial-flush winner, adoption followed by a real same-owner split/reuse winner,
+and a retained old structural WAL horizon. The generator uses synthetic valid
+historical allocations, invokes the production adoption API, and verifies every
+snapshot across three reopens. Real pre-Round14 merge images are exercised in
+the storage process-crash tests. `NBRH` is a fuzz-only envelope containing three
+little-endian u32 lengths followed by heap, selected WAL and optional older WAL
+bytes; it does not change any database format or the existing `NBRF` envelope.
+The 81-page image needs a larger bounded input (2 MiB); WAL record limits remain
+unchanged. Successful ownership inspection additionally checks marker/historical
+counts against reuse inventory, active-marker exclusion and pending identities.
+
+`wal_recovery` accepts at most 2 MiB, replaces the WAL belonging to a fresh
 minimal heap, and calls `HeapStorage::open`. That public path invokes the
 crate-private recovery decoder without adding a fuzz-only production API.
 Root, alternate WAL, and heap files are isolated by process ID and removed

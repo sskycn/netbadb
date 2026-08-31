@@ -1093,7 +1093,9 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    fn retire_btree_page_in(
+    /// Caller must have removed every incoming live edge in this transaction,
+    /// or hold the quiescent post-checkpoint historical-adoption proof.
+    pub(crate) fn retire_btree_page_in(
         &mut self,
         transaction: &mut Transaction,
         expected: PageRef,

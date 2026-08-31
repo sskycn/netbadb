@@ -506,7 +506,6 @@ impl HeapStorage {
             markers,
             legacy_retired,
             report,
-            #[cfg(test)]
             observations,
         })
     }
