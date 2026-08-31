@@ -213,8 +213,26 @@ transaction scope. Startup resolves journal/coordinator obligations before valid
 the active NBSC/state pair. The immutable partition catalog remains baseline evidence;
 NBSC includes newly created single Heaps without rewriting that evidence.
 SchemaGeneration advances once per creation commit; table versions stay 1 and the
-runtime revision increments with checked arithmetic. SQL table DDL, DROP/ALTER,
-constraint enforcement and non-Heap runtime creation remain future work.
+runtime revision increments with checked arithmetic. [Round 19](sql-create-table-round19.md)
+adds generic SQL CREATE TABLE through parser declarations, typed HIR,
+CompiledDdlStatement and PreparedDdlStatement. Core alone maps it to CreateTableSpec
+and invokes the existing transactional lifecycle. DROP/ALTER, constraint enforcement
+and non-Heap runtime creation remain future work.
+
+`compile_sql_statement` parses once and selects relational or DDL lowering from the
+AST. Core's `prepare_sql_statement_in` shares the transaction SchemaView and
+identity/version/fingerprint dependency rules of `prepare_statement_in`; sessions
+use this combined entry point for both statement families. Prepared statements that
+reference staged tables retain exact transaction scope; plans over committed tables
+remain reusable. CREATE declarations contain no IDs, and schema-writer admission/
+reservations occur only during Execute.
+`StatementAccess::schema_write` describes schema mutation without a sentinel ID.
+Server authorization checks the optional default-false manifest principal
+`schema_admin` for all network DDL (index DDL also retains table-write checks).
+An active creating transaction may read/write only its own staged TableId; this
+exception is never written into grants, manifests or catalogs. Committed tables
+remain default-denied unless externally granted. Autocommit sessions retain their
+transaction handle through fallible commit/rollback and allow pending commit retry.
 
 ## Compiler and plans
 
@@ -2672,9 +2690,10 @@ verified leaf-certificate fingerprint. During `OpenSession`, the database
 worker resolves that identity to an immutable principal policy; a trusted but
 unlisted certificate is closed before SessionState and Hello. The worker keeps
 the resolved grants beside the transport-neutral SessionState. For Execute it
-asks `netbadb-core::Database::statement_access` to compile SQL and expose only
-ordered canonical read/write TableIds. The worker checks those IDs before
-calling SessionState's execution path. Core describes access but knows nothing
+uses `DatabaseSession::prepare` to compile against the current transaction view
+and obtain canonical read/write TableIds and schema-write access from the prepared
+object. The worker checks those capabilities before passing that same object to
+SessionState's execution path. Core describes access but knows nothing
 about clients or policy; TLS, authorization, and server dependencies never flow
 into compiler, planner, executor, storage, or persistent formats.
 

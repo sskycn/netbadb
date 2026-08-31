@@ -1726,3 +1726,88 @@ fn listener_bind_failure_waits_for_database_worker_cleanup() {
     drop(occupied);
     cleanup(&directory);
 }
+
+#[test]
+fn protocol_v1_sql_create_table_preserves_authorization_and_catalog_reopen() {
+    let directory = test_directory("round19-sql");
+    std::fs::create_dir(&directory).unwrap();
+    let catalog = directory.join("catalog");
+    Database::create_catalog(
+        &catalog,
+        vec![netbadb_core::TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table("UserId"),
+        )],
+        None,
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let manifest = directory.join("server.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    // Explicit fixture permission; existing manifests continue to default false.
+    config["authorization"]["local_plaintext"]["schema_admin"] = true.into();
+    std::fs::write(&manifest, serde_json::to_vec(&config).unwrap()).unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .start()
+        .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    request(&mut stream, 1, ClientMessage::Hello);
+    request(
+        &mut stream,
+        2,
+        ClientMessage::Begin {
+            table_id: TableId(1),
+        },
+    );
+    for (id, sql, count) in [
+        (
+            3,
+            "CREATE TABLE projects (id BIGINT NOT NULL, name TEXT, active BOOLEAN NOT NULL)",
+            0,
+        ),
+        (4, "INSERT INTO projects VALUES (10, 'demo', true)", 1),
+    ] {
+        assert_eq!(
+            request(&mut stream, id, ClientMessage::Execute { sql: sql.into() }),
+            [ServerMessage::AffectedRows { count }]
+        );
+    }
+    let result = request(
+        &mut stream,
+        5,
+        ClientMessage::Execute {
+            sql: "SELECT * FROM projects".into(),
+        },
+    );
+    assert!(result.iter().any(|m| matches!(m, ServerMessage::QueryRow { values } if values == &vec![ScalarValue::Int64(10), ScalarValue::Text("demo".into()), ScalarValue::Bool(true)])));
+    assert_eq!(
+        request(&mut stream, 6, ClientMessage::Commit),
+        [ServerMessage::TransactionCommitted]
+    );
+    assert_error(
+        &request(
+            &mut stream,
+            7,
+            ClientMessage::Execute {
+                sql: "SELECT * FROM projects".into(),
+            },
+        ),
+        ProtocolErrorCode::Database,
+        WireTransactionState::None,
+    );
+    drop(stream);
+    server.shutdown().unwrap();
+    let mut db = Database::open_catalog(&catalog).unwrap();
+    assert_eq!(db.schema().table("projects").unwrap().id, TableId(2));
+    assert_eq!(db.query("SELECT * FROM projects").unwrap().rows.len(), 1);
+    db.close().unwrap();
+    // Original manifest is still only a subset; server startup opens the extra table.
+    TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .start()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    cleanup(&directory);
+}

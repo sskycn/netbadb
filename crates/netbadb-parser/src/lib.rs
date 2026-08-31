@@ -82,9 +82,41 @@ pub enum Statement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
 }
+
+/// A logical declaration: persistent identities belong exclusively to Core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableStatement {
+    pub name: Ident,
+    pub columns: Vec<CreateColumn>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateColumn {
+    pub name: Ident,
+    pub data_type: Ident,
+    /// None means the SQL default (nullable).
+    pub nullability: Option<ColumnNullability>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnNullability {
+    pub nullable: bool,
+    pub span: Span,
+}
+
+/// Bounds apply before allocation or recursive expression construction.
+pub const MAX_SQL_BYTES: usize = 1_048_576;
+pub const MAX_SQL_TOKENS: usize = 32_768;
+pub const MAX_IDENTIFIER_BYTES: usize = 1024;
+pub const MAX_CREATE_COLUMNS: usize = 4096;
+const MAX_EXPRESSION_NODES: usize = 256;
+const MAX_EXPRESSION_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropIndexStatement {
@@ -105,6 +137,7 @@ pub struct CreateIndexStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertStatement {
     pub table: Ident,
+    /// Empty means the canonical declaration order (no explicit column list).
     pub columns: Vec<Ident>,
     pub values: Vec<Expr>,
     pub span: Span,
@@ -233,8 +266,15 @@ pub enum UnaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    pub kind: ParseErrorKind,
     pub message: String,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    Syntax,
+    UnsupportedFeature,
 }
 
 impl fmt::Display for ParseError {
@@ -315,6 +355,7 @@ pub fn parse(input: &str) -> Result<Query, ParseError> {
     match parse_statement(input)? {
         Statement::Select(query) => Ok(query),
         statement => Err(ParseError {
+            kind: ParseErrorKind::Syntax,
             message: "expected a SELECT statement".into(),
             span: statement_span(&statement),
         }),
@@ -326,11 +367,20 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
     Parser {
         tokens,
         position: 0,
+        expression_nodes: 0,
+        expression_depth: 0,
     }
     .parse_statement()
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
+    if input.len() > MAX_SQL_BYTES {
+        return Err(ParseError {
+            kind: ParseErrorKind::Syntax,
+            message: "SQL byte limit exceeded".into(),
+            span: Span { start: 0, end: 0 },
+        });
+    }
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut position = 0;
@@ -340,6 +390,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
         if byte.is_ascii_whitespace() {
             position += 1;
             continue;
+        }
+        if tokens.len() >= MAX_SQL_TOKENS {
+            return Err(ParseError {
+                kind: ParseErrorKind::Syntax,
+                message: "SQL token limit exceeded".into(),
+                span: Span {
+                    start: position,
+                    end: position,
+                },
+            });
         }
         let start = position;
         let token = match byte {
@@ -403,6 +463,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 if digits_start == position {
                     return Err(ParseError {
+                        kind: ParseErrorKind::Syntax,
                         message: "parameter marker expects a positive integer".into(),
                         span: Span {
                             start,
@@ -414,6 +475,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     input[digits_start..position]
                         .parse::<u32>()
                         .map_err(|_| ParseError {
+                            kind: ParseErrorKind::Syntax,
                             message: "parameter number is too large".into(),
                             span: Span {
                                 start,
@@ -421,6 +483,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                             },
                         })?;
                 let zero_based = ordinal.checked_sub(1).ok_or_else(|| ParseError {
+                    kind: ParseErrorKind::Syntax,
                     message: "parameter numbers start at $1".into(),
                     span: Span {
                         start,
@@ -437,6 +500,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 if position == bytes.len() {
                     return Err(ParseError {
+                        kind: ParseErrorKind::Syntax,
                         message: "unterminated string literal".into(),
                         span: Span {
                             start,
@@ -456,6 +520,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 let value = input[start..position]
                     .parse::<i64>()
                     .map_err(|_| ParseError {
+                        kind: ParseErrorKind::Syntax,
                         message: "invalid integer literal".into(),
                         span: Span {
                             start,
@@ -471,6 +536,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     .is_some_and(|value| value.is_ascii_alphanumeric() || *value == b'_')
                 {
                     position += 1;
+                }
+                if position - start > MAX_IDENTIFIER_BYTES {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::Syntax,
+                        message: "identifier byte limit exceeded".into(),
+                        span: Span {
+                            start,
+                            end: position,
+                        },
+                    });
                 }
                 match input[start..position].to_ascii_uppercase().as_str() {
                     "SELECT" => TokenKind::Select,
@@ -514,6 +589,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 let character = input[start..].chars().next().unwrap_or('\0');
                 let end = start + character.len_utf8();
                 return Err(ParseError {
+                    kind: ParseErrorKind::Syntax,
                     message: format!("unexpected character `{}`", character.escape_default()),
                     span: Span { start, end },
                 });
@@ -541,6 +617,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
+    expression_nodes: usize,
+    expression_depth: usize,
 }
 
 impl Parser {
@@ -550,11 +628,11 @@ impl Parser {
             TokenKind::Insert => Statement::Insert(self.parse_insert()?),
             TokenKind::Update => Statement::Update(self.parse_update()?),
             TokenKind::Delete => Statement::Delete(self.parse_delete()?),
-            TokenKind::Create => Statement::CreateIndex(self.parse_create_index()?),
+            TokenKind::Create => self.parse_create()?,
             TokenKind::Drop => Statement::DropIndex(self.parse_drop_index()?),
             _ => {
                 return Err(self.error_here(
-                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE INDEX, or DROP INDEX",
+                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, CREATE INDEX, or DROP INDEX",
                 ));
             }
         };
@@ -563,6 +641,129 @@ impl Parser {
         }
         self.expect_simple(TokenKind::Eof)?;
         Ok(statement)
+    }
+
+    fn contextual(&self, word: &str) -> bool {
+        matches!(&self.current().kind, TokenKind::Ident(name) if name.eq_ignore_ascii_case(word))
+    }
+
+    fn unsupported(&self, feature: &str) -> ParseError {
+        ParseError {
+            kind: ParseErrorKind::UnsupportedFeature,
+            message: format!("{feature} is not supported"),
+            span: self.current().span,
+        }
+    }
+
+    fn parse_create(&mut self) -> Result<Statement, ParseError> {
+        // TABLE and new clause words remain contextual, preserving identifier policy.
+        let start = self.current().span.start;
+        self.position += 1;
+        if self.contextual("table") {
+            self.position += 1;
+            return self.parse_create_table(start).map(Statement::CreateTable);
+        }
+        if ["temp", "temporary", "unlogged"]
+            .iter()
+            .any(|word| self.contextual(word))
+        {
+            return Err(self.unsupported("temporary/unlogged CREATE TABLE"));
+        }
+        self.position -= 1;
+        self.parse_create_index().map(Statement::CreateIndex)
+    }
+
+    fn reject_table_clause(&self) -> Result<(), ParseError> {
+        if [
+            "primary",
+            "unique",
+            "default",
+            "check",
+            "references",
+            "foreign",
+            "generated",
+            "identity",
+            "collate",
+            "constraint",
+            "exclude",
+            "like",
+            "inherits",
+            "partition",
+            "using",
+            "with",
+            "tablespace",
+        ]
+        .iter()
+        .any(|word| self.contextual(word))
+            || matches!(
+                self.current().kind,
+                TokenKind::As | TokenKind::On | TokenKind::If
+            )
+        {
+            return Err(self.unsupported("CREATE TABLE clause"));
+        }
+        Ok(())
+    }
+
+    fn parse_create_table(&mut self, start: usize) -> Result<CreateTableStatement, ParseError> {
+        self.reject_table_clause()?;
+        let name = self.expect_ident()?;
+        if self.matches(&TokenKind::Dot) {
+            return Err(self.unsupported("qualified CREATE TABLE name"));
+        }
+        self.reject_table_clause()?;
+        self.expect_simple(TokenKind::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            self.reject_table_clause()?;
+            if columns.len() >= MAX_CREATE_COLUMNS {
+                return Err(self.error_here("CREATE TABLE column limit exceeded"));
+            }
+            let name = self.expect_ident()?;
+            let data_type = self.expect_ident()?;
+            if self.matches(&TokenKind::LParen) {
+                return Err(self.unsupported("type modifiers/length constraints"));
+            }
+            let nullability = if self.matches(&TokenKind::Not) || self.matches(&TokenKind::Null) {
+                let start = self.current().span.start;
+                let nullable = !self.matches(&TokenKind::Not);
+                if !nullable {
+                    self.position += 1;
+                }
+                let end = self.expect_simple(TokenKind::Null)?.span.end;
+                Some(ColumnNullability {
+                    nullable,
+                    span: Span { start, end },
+                })
+            } else {
+                None
+            };
+            if self.matches(&TokenKind::Not) || self.matches(&TokenKind::Null) {
+                return Err(self.error_here("duplicate or conflicting nullability constraint"));
+            }
+            self.reject_table_clause()?;
+            let span = Span {
+                start: name.span.start,
+                end: nullability.map_or(data_type.span.end, |n| n.span.end),
+            };
+            columns.push(CreateColumn {
+                name,
+                data_type,
+                nullability,
+                span,
+            });
+            if !self.matches(&TokenKind::Comma) {
+                break;
+            }
+            self.position += 1;
+        }
+        let end = self.expect_simple(TokenKind::RParen)?.span.end;
+        self.reject_table_clause()?;
+        Ok(CreateTableStatement {
+            name,
+            columns,
+            span: Span { start, end },
+        })
     }
 
     fn parse_drop_index(&mut self) -> Result<DropIndexStatement, ParseError> {
@@ -816,9 +1017,14 @@ impl Parser {
         let start = self.expect_simple(TokenKind::Insert)?.span.start;
         self.expect_simple(TokenKind::Into)?;
         let table = self.expect_ident()?;
-        self.expect_simple(TokenKind::LParen)?;
-        let columns = self.parse_identifier_list()?;
-        self.expect_simple(TokenKind::RParen)?;
+        let columns = if self.matches(&TokenKind::LParen) {
+            self.position += 1;
+            let columns = self.parse_identifier_list()?;
+            self.expect_simple(TokenKind::RParen)?;
+            columns
+        } else {
+            Vec::new()
+        };
         self.expect_simple(TokenKind::Values)?;
         self.expect_simple(TokenKind::LParen)?;
         let values = self.parse_expression_list()?;
@@ -998,6 +1204,7 @@ impl Parser {
             AggregateFunction::Max
         } else {
             return Err(ParseError {
+                kind: ParseErrorKind::Syntax,
                 message: format!("unsupported projection function `{name}`"),
                 span: token.span,
             });
@@ -1008,6 +1215,7 @@ impl Parser {
             let span = self.current().span;
             if function != AggregateFunction::Count {
                 return Err(ParseError {
+                    kind: ParseErrorKind::Syntax,
                     message: format!("{} does not accept `*`", aggregate_name(function)),
                     span,
                 });
@@ -1030,7 +1238,26 @@ impl Parser {
         }))
     }
 
+    fn expression_node(&mut self) -> Result<(), ParseError> {
+        self.expression_nodes += 1;
+        if self.expression_nodes > MAX_EXPRESSION_NODES {
+            return Err(self.error_here("expression node limit exceeded"));
+        }
+        Ok(())
+    }
+
     fn parse_expr(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
+        if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+            return Err(self.error_here("expression depth limit exceeded"));
+        }
+        self.expression_node()?;
+        self.expression_depth += 1;
+        let result = self.parse_expr_inner(minimum_precedence);
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn parse_expr_inner(&mut self, minimum_precedence: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_prefix()?;
         loop {
             if self.matches(&TokenKind::ColonColon) {
@@ -1050,6 +1277,7 @@ impl Parser {
                     SqlTypeName::Text
                 } else {
                     return Err(ParseError {
+                        kind: ParseErrorKind::Syntax,
                         message: format!("unsupported cast type `{name}`"),
                         span: data_type_token.span,
                     });
@@ -1059,6 +1287,7 @@ impl Parser {
                     start: expr_span(&left).start,
                     end: data_type_token.span.end,
                 };
+                self.expression_node()?;
                 left = Expr::Cast {
                     expression: Box::new(left),
                     data_type,
@@ -1083,6 +1312,7 @@ impl Parser {
                     start: expr_span(&left).start,
                     end: null.span.end,
                 };
+                self.expression_node()?;
                 left = Expr::IsNull {
                     expression: Box::new(left),
                     negated,
@@ -1173,6 +1403,7 @@ impl Parser {
                     TokenKind::Null => Literal::Null,
                     _ => {
                         return Err(ParseError {
+                            kind: ParseErrorKind::Syntax,
                             message: "invalid literal token".into(),
                             span: token.span,
                         });
@@ -1267,6 +1498,7 @@ impl Parser {
 
     fn error_here(&self, message: &str) -> ParseError {
         ParseError {
+            kind: ParseErrorKind::Syntax,
             message: message.into(),
             span: self.current().span,
         }
@@ -1291,6 +1523,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::Insert(statement) => statement.span,
         Statement::Update(statement) => statement.span,
         Statement::Delete(statement) => statement.span,
+        Statement::CreateTable(statement) => statement.span,
         Statement::CreateIndex(statement) => statement.span,
         Statement::DropIndex(statement) => statement.span,
     }
@@ -1796,3 +2029,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod create_table_tests;

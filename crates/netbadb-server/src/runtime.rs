@@ -567,6 +567,24 @@ impl WorkerSession {
             return response;
         }
 
+        if let ClientMessage::Execute { sql } = &request {
+            let prepared = match self.state.execution.prepare(database, sql, &[]) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return SessionResponse::standard(
+                        self.state.database_error_batch(request_id, error),
+                    );
+                }
+            };
+            if let Err(denial) = self
+                .authorization
+                .authorize_statement(&prepared.access(), &self.state.execution)
+            {
+                return authorization_denied_response(&self.state, request_id, denial);
+            }
+            return self.state.handle_prepared(database, request_id, &prepared);
+        }
+
         let denial = match &request {
             ClientMessage::Hello
             | ClientMessage::Ping
@@ -602,24 +620,7 @@ impl WorkerSession {
                         .err()
                 }
             }
-            ClientMessage::Execute { sql } => match database.statement_access(sql) {
-                Ok(access) => access
-                    .read_tables()
-                    .iter()
-                    .find_map(|table_id| {
-                        self.authorization
-                            .authorize(AuthorizationAction::Read, *table_id)
-                            .err()
-                    })
-                    .or_else(|| {
-                        access.write_tables().iter().find_map(|table_id| {
-                            self.authorization
-                                .authorize(AuthorizationAction::Write, *table_id)
-                                .err()
-                        })
-                    }),
-                Err(_) => None,
-            },
+            ClientMessage::Execute { .. } => None,
         };
         match denial {
             Some(denial) => authorization_denied_response(&self.state, request_id, denial),
@@ -1147,3 +1148,7 @@ mod tests {
         drop(client);
     }
 }
+
+#[cfg(test)]
+#[path = "native_create_table_tests.rs"]
+mod create_table_tests;

@@ -48,7 +48,9 @@ production or build dependencies.
 | psql `DROP INDEX` / `IF EXISTS` | yes | implicit and explicit commit/rollback; `\di` / `\d` removal |
 | SQLAlchemy ↔ existing psql connection | yes | both directions see committed removal without reconnect |
 | DROP legacy synthetic name | yes | adapter resolution to generic identity; durable retirement |
-| Table DDL | unsupported | explicit `0A000`; CREATE/DROP/ALTER TABLE not implemented |
+| Basic Heap CREATE TABLE | partial | BIGINT/TEXT/BOOLEAN, NULL/NOT NULL; transactional native + PG |
+| SQLAlchemy `Table.create(checkfirst=False)` | yes, bounded fixture | no PK, defaults, sequences or VARCHAR length; same-transaction insert/select |
+| DROP/ALTER TABLE, table migrations | unsupported | explicit `0A000`; no Alembic CreateTableOp |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
 dialect, `implicit_returning=False`, `use_insertmanyvalues=False`, `create_all`,
@@ -122,3 +124,31 @@ python3 scripts/test-postgresql-psql.py
 
 Set `NETBADB_POSTGRES_TRACE=1` only when protocol diagnostics are needed. The
 trace records SQL and lifecycle metadata but redacts password and Bind payloads.
+
+## Round 19 real CREATE TABLE fixture
+
+`scripts/test-sql-create-table.py` runs independent fresh databases for psql 17.11,
+psycopg 3.2.13 and SQLAlchemy 2.0.52. Each rolls back one CREATE with rows, then
+commits one CREATE with `(10, 'demo', true)`. The fixture shuts down, starts the
+normal server against the original single-table manifest expectation, shuts down
+again, and verifies catalog-only reopen, IDs, unnamed types, nullability, generation
+and table version. The manifest contains no dynamic-table grants and never changes.
+Post-commit creator SELECT is denied and psql metadata hides the new table.
+
+Actual psycopg 3.2.13 behavior: no-parameter default CREATE uses Simple Query;
+parameterized DML uses Extended Query. The fixture additionally uses the public
+`prepare=True` API for CREATE and checks Parse/Bind/Execute trace evidence. No
+prepare_threshold change, simple-protocol override or custom dialect is used.
+SQLAlchemy's unmodified PostgreSQL dialect sends Table.create as Simple Query and
+parameterized INSERT as Extended Query; both execute within the same transaction.
+Use BigInteger/Text/Boolean, nullable flags and no primary_key/default/length options.
+MetaData.create_all and table-migration apply remain outside acceptance.
+
+```bash
+CARGO_TARGET_DIR=/private/tmp/netbadb-round19-target \
+  /path/to/orm-venv/bin/python scripts/test-sql-create-table.py
+```
+
+Install the exact existing `scripts/requirements-postgresql-orm.txt` dependencies.
+The prior psql/ORM/Alembic index-only regression scripts continue on separate fresh
+`postgres_driver_fixture` databases with explicit schema_admin and table grants.

@@ -61,7 +61,7 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
             "version": 4,
             "listen": "127.0.0.1:0",
             "authorization": {
-                "local_plaintext": {"tables": [
+                "local_plaintext": {"schema_admin": true,"tables": [
                     {
                         "table_id": 1,
                         "read": true,

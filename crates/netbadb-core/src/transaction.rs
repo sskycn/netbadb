@@ -564,6 +564,13 @@ impl DatabaseTransaction {
             .as_mut()
             .and_then(|m| m.staged.as_mut())
     }
+    /// Whether this active transaction privately owns a staged table identity.
+    /// This reports lifecycle state only; authorization remains a server policy.
+    #[must_use]
+    pub fn owns_staged_table(&self, table: netbadb_types::TableId) -> bool {
+        self.state() == TransactionState::Active && self.staged_binding(table).is_some()
+    }
+
     pub(crate) fn staged_binding(&self, table: netbadb_types::TableId) -> Option<StorageId> {
         self.schema_mutation
             .as_ref()

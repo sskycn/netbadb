@@ -185,3 +185,12 @@ cargo +nightly fuzz run schema_mutation_decode /private/tmp/netbadb-round18-fuzz
 
 Copy only the reviewed deterministic output into the repository; use temporary
 corpus and artifact directories for all seven Round 18 smoke fuzz targets.
+
+## Round 19 SQL parser bounds
+
+There is no existing generic SQL parser fuzz target. The parser's deterministic
+`create_table_tests::parser_bounds_and_deterministic_mutations` runs 2,000 seeded
+mutations plus byte/token/identifier/column, deep-parenthesis/NOT and long-cast
+bounds. No new fuzz infrastructure or persistent format is introduced. Continue
+all seven Round 18 decoder targets at 1,000 runs each using temporary corpus and
+artifact directories; tracked storage seeds remain unchanged.

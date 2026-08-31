@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use netbadb_core::{
     Database, DatabaseError, DatabaseErrorKind, DdlOutcome, ExecutionResult, IndexKindInspection,
-    PreparedDdlStatement as CorePreparedDdl, PreparedStatement as CorePrepared, QueryResult,
-    StatementAccess, StatementDescription, TablePlacementInspection,
+    PreparedDdlStatement as CorePreparedDdl, PreparedSqlStatement,
+    PreparedStatement as CorePrepared, QueryResult, StatementAccess, StatementDescription,
+    TablePlacementInspection,
 };
 use netbadb_pgwire::{
     BackendMessage, CloseTarget, DescribeTarget, ErrorResponse, FieldDescription, FormatCode,
@@ -22,7 +23,7 @@ use netbadb_protocol::WireTransactionState;
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
 use sha2::{Digest, Sha256};
 
-use crate::authorization::{AuthorizationAction, AuthorizationPolicy, PrincipalAuthorization};
+use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
 use crate::{
     ClientIdentity, DatabaseSession, ServerConfig, ServerLimits, SessionPolicy, TableBootstrap,
     TransportKind,
@@ -1204,8 +1205,29 @@ impl PgWorkerSession {
             Ok(declared) => declared,
             Err(error) => return self.extended_error(error),
         };
-        let prepared = match database.prepare_statement(&query, &declared) {
-            Ok(prepared) => prepared,
+        let prepared = match self.execution.prepare(database, &query, &declared) {
+            Ok(PreparedSqlStatement::Relational(prepared)) => *prepared,
+            Ok(PreparedSqlStatement::Ddl(prepared)) => {
+                if let Err(error) = preflight_ddl_types(&prepared) {
+                    return self.extended_error(error);
+                }
+                if statement.is_empty() {
+                    self.prepared.remove("");
+                    self.portals
+                        .retain(|_, portal| !portal.statement.is_empty());
+                }
+                self.prepared.insert(
+                    statement,
+                    PreparedStatement {
+                        sql: query,
+                        execution: PreparedExecution::Ddl(Box::new(prepared)),
+                        parameters: Vec::new(),
+                        fields: Vec::new(),
+                        is_query: false,
+                    },
+                );
+                return vec![BackendMessage::ParseComplete];
+            }
             Err(error) => return self.extended_error(map_database_error(&error)),
         };
         let description = prepared.description();
@@ -1427,6 +1449,12 @@ impl PgWorkerSession {
         name: &str,
         max_rows: u32,
     ) -> Vec<BackendMessage> {
+        if self.status == PgTransactionStatus::Failed {
+            return self.extended_error(fixed_error(
+                "25P02",
+                "current transaction is aborted; ROLLBACK is required",
+            ));
+        }
         let Some(mut portal) = self.portals.remove(name) else {
             return self.extended_error(fixed_error("34000", "portal does not exist"));
         };
@@ -1471,6 +1499,7 @@ impl PgWorkerSession {
                 if !values.is_empty() {
                     return Err(fixed_error("08P01", "DDL does not accept parameters"));
                 }
+                preflight_ddl_types(prepared)?;
                 self.authorize_access(&prepared.access())?;
                 let outcome = self
                     .execution
@@ -1481,12 +1510,7 @@ impl PgWorkerSession {
                 }
                 self.refresh_catalog(database)?;
                 return Ok(PortalResult::Command {
-                    tag: if prepared.is_index_drop() {
-                        "DROP INDEX"
-                    } else {
-                        "CREATE INDEX"
-                    }
-                    .into(),
+                    tag: ddl_command_tag(prepared).into(),
                 });
             }
             PreparedExecution::Compatibility(statement) => {
@@ -1518,9 +1542,14 @@ impl PgWorkerSession {
         database: &Database,
         sql: &str,
     ) -> Result<CorePreparedDdl, ErrorResponse> {
-        let prepared = database
-            .prepare_ddl_statement(sql)
-            .map_err(|error| map_create_index_error(&error))?;
+        let prepared = match self
+            .execution
+            .prepare(database, sql, &[])
+            .map_err(|error| map_create_index_error(&error))?
+        {
+            PreparedSqlStatement::Ddl(prepared) => prepared,
+            PreparedSqlStatement::Relational(_) => return Err(unsupported_index_ddl()),
+        };
         if let Some(name) = prepared.unresolved_index_name() {
             self.refresh_catalog(database)?;
             // Compatibility aliases are resolved only within visible tables.
@@ -1699,7 +1728,27 @@ impl PgWorkerSession {
         if is_unsupported_schema_ddl(&normalized) {
             return Err(self.record_protocol_error(unsupported_schema_ddl()));
         }
-        let result = self.execute_core(database, sql)?;
+        let prepared = self
+            .execution
+            .prepare(database, sql, &[])
+            .map_err(|error| self.record_error(&error))?;
+        let result = match prepared {
+            PreparedSqlStatement::Relational(prepared) => {
+                self.execute_prepared_core(database, &prepared, &[])?
+            }
+            PreparedSqlStatement::Ddl(prepared) => {
+                preflight_ddl_types(&prepared).map_err(|e| self.record_protocol_error(e))?;
+                self.authorize_access(&prepared.access())?;
+                self.execution
+                    .execute_ddl(database, &prepared)
+                    .map_err(|e| self.record_error(&e))?;
+                self.mutation_generation = self.mutation_generation.saturating_add(1);
+                self.refresh_catalog(database)?;
+                return Ok(vec![BackendMessage::CommandComplete(
+                    ddl_command_tag(&prepared).into(),
+                )]);
+            }
+        };
         match result {
             ExecutionResult::Query(query) => {
                 query_messages(query, self.execution.policy.max_result_rows())
@@ -1712,20 +1761,6 @@ impl PgWorkerSession {
                 ))])
             }
         }
-    }
-
-    fn execute_core(
-        &mut self,
-        database: &mut Database,
-        sql: &str,
-    ) -> Result<ExecutionResult, ErrorResponse> {
-        let access = database
-            .statement_access(sql)
-            .map_err(|error| self.record_error(&error))?;
-        self.authorize_access(&access)?;
-        self.execution
-            .execute(database, sql)
-            .map_err(|error| self.record_error(&error))
     }
 
     fn execute_prepared_core(
@@ -1747,44 +1782,35 @@ impl PgWorkerSession {
     }
 
     fn authorize_access(&mut self, access: &StatementAccess) -> Result<(), ErrorResponse> {
-        for table in access.read_tables() {
-            if self
-                .authorization
-                .authorize(AuthorizationAction::Read, *table)
-                .is_err()
-            {
-                return Err(self.record_protocol_error(fixed_error(
+        self.authorization
+            .authorize_statement(access, &self.execution)
+            .map_err(|_| {
+                self.record_protocol_error(fixed_error(
                     "42501",
-                    "permission denied for relation",
-                )));
-            }
+                    "permission denied for schema or relation",
+                ))
+            })
+    }
+
+    fn record_failure(&mut self) {
+        // An uncertain schema commit retains its handle for COMMIT retry. It
+        // must not be converted into an abort-only PG transaction at Sync.
+        if self.execution.transaction_state() == WireTransactionState::CommitPending {
+            self.status = PgTransactionStatus::InTransaction;
+        } else if self.status == PgTransactionStatus::InTransaction
+            || self.execution.transaction_state() == WireTransactionState::RollbackPending
+        {
+            self.status = PgTransactionStatus::Failed;
         }
-        for table in access.write_tables() {
-            if self
-                .authorization
-                .authorize(AuthorizationAction::Write, *table)
-                .is_err()
-            {
-                return Err(self.record_protocol_error(fixed_error(
-                    "42501",
-                    "permission denied for relation",
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn record_error(&mut self, error: &DatabaseError) -> ErrorResponse {
-        if self.status == PgTransactionStatus::InTransaction {
-            self.status = PgTransactionStatus::Failed;
-        }
+        self.record_failure();
         map_database_error(error)
     }
 
     fn record_protocol_error(&mut self, error: ErrorResponse) -> ErrorResponse {
-        if self.status == PgTransactionStatus::InTransaction {
-            self.status = PgTransactionStatus::Failed;
-        }
+        self.record_failure();
         error
     }
 
@@ -1802,11 +1828,13 @@ impl PgWorkerSession {
             .catalog
             .tables
             .iter()
-            .find(|table| self.authorization.can_see(table.table_id))
-            .map(|table| table.table_id)
-            .ok_or_else(|| fixed_error("42501", "no authorized transaction anchor"))?;
+            .find(|t| self.authorization.can_see(t.table_id))
+            .map(|t| t.table_id);
+        if transaction_anchor.is_none() && !self.authorization.schema_admin() {
+            return Err(fixed_error("42501", "no authorized transaction anchor"));
+        }
         self.execution
-            .begin(database, Some(transaction_anchor))
+            .begin(database, transaction_anchor)
             .map_err(|error| map_database_error(&error))?;
         self.status = PgTransactionStatus::InTransaction;
         self.savepoints.clear();
@@ -1825,6 +1853,7 @@ impl PgWorkerSession {
                     .commit(database)
                     .map_err(|error| map_database_error(&error))?;
                 self.status = PgTransactionStatus::Idle;
+                self.portals.clear();
                 self.savepoints.clear();
                 Ok(vec![BackendMessage::CommandComplete("COMMIT".into())])
             }
@@ -1838,6 +1867,7 @@ impl PgWorkerSession {
                 .map_err(|error| map_database_error(&error))?;
         }
         self.status = PgTransactionStatus::Idle;
+        self.portals.clear();
         self.savepoints.clear();
         Ok(vec![BackendMessage::CommandComplete("ROLLBACK".into())])
     }
@@ -1967,9 +1997,7 @@ impl PgWorkerSession {
     }
 
     fn extended_error(&mut self, error: ErrorResponse) -> Vec<BackendMessage> {
-        if self.status == PgTransactionStatus::InTransaction {
-            self.status = PgTransactionStatus::Failed;
-        }
+        self.record_failure();
         self.awaiting_sync = true;
         vec![BackendMessage::ErrorResponse(error)]
     }
@@ -2752,6 +2780,23 @@ fn classify_compatibility_statement(sql: &str) -> Option<CompatibilityStatement>
     None
 }
 
+fn preflight_ddl_types(prepared: &CorePreparedDdl) -> Result<(), ErrorResponse> {
+    for data_type in prepared.created_column_types() {
+        PostgresType::from_netbadb(data_type.physical).map_err(map_type_error)?;
+    }
+    Ok(())
+}
+
+fn ddl_command_tag(prepared: &CorePreparedDdl) -> &'static str {
+    if prepared.is_table_create() {
+        "CREATE TABLE"
+    } else if prepared.is_index_drop() {
+        "DROP INDEX"
+    } else {
+        "CREATE INDEX"
+    }
+}
+
 fn is_index_ddl(normalized: &str) -> bool {
     normalized.starts_with("create index ")
         || normalized.starts_with("create unique index ")
@@ -2760,7 +2805,6 @@ fn is_index_ddl(normalized: &str) -> bool {
 
 fn is_unsupported_schema_ddl(normalized: &str) -> bool {
     [
-        "create table ",
         "alter table ",
         "drop table ",
         "create schema ",
@@ -2780,7 +2824,7 @@ fn is_unsupported_schema_ddl(normalized: &str) -> bool {
 fn unsupported_schema_ddl() -> ErrorResponse {
     fixed_error(
         "0A000",
-        "table, schema, type, and sequence DDL is not supported",
+        "this table/schema/type/sequence mutation is not supported",
     )
 }
 
@@ -2799,7 +2843,9 @@ fn map_create_index_error(error: &DatabaseError) -> ErrorResponse {
         | DatabaseErrorKind::DuplicateObject
         | DatabaseErrorKind::TransactionState
         | DatabaseErrorKind::Operational
-        | DatabaseErrorKind::Internal => map_database_error(error),
+        | DatabaseErrorKind::Internal
+        | DatabaseErrorKind::SchemaBusy
+        | DatabaseErrorKind::DuplicateColumn => map_database_error(error),
         DatabaseErrorKind::Syntax
         | DatabaseErrorKind::AmbiguousColumn
         | DatabaseErrorKind::DatatypeMismatch
@@ -4498,6 +4544,8 @@ fn command_tag(sql: &str, count: u64) -> String {
 
 fn map_database_error(error: &DatabaseError) -> ErrorResponse {
     let (sqlstate, safe_message) = match error.kind() {
+        DatabaseErrorKind::DuplicateColumn => ("42701", Some(error.to_string())),
+        DatabaseErrorKind::SchemaBusy => ("55P03", Some("schema writer is busy".into())),
         DatabaseErrorKind::Syntax => ("42601", Some(error.to_string())),
         DatabaseErrorKind::UndefinedTable => ("42P01", Some(error.to_string())),
         DatabaseErrorKind::UndefinedObject => ("42704", Some(error.to_string())),
@@ -4681,7 +4729,10 @@ mod tests {
             .collect();
         AuthorizationPolicy::new(
             TransportKind::PlaintextLoopback,
-            Some(permissions),
+            Some(crate::authorization::PrincipalGrants {
+                schema_admin: false,
+                tables: permissions,
+            }),
             Vec::new(),
             known,
         )
@@ -4841,7 +4892,6 @@ mod tests {
     #[test]
     fn unsupported_schema_ddl_is_classified_without_entering_the_generic_parser() {
         for sql in [
-            "create table users (id bigint)",
             "alter table users add column name text",
             "drop table users",
             "create schema private",
@@ -4862,6 +4912,7 @@ mod tests {
         use netbadb_parser::{ParseError, Span};
 
         let error = DatabaseError::Compile(CompileError::Parse(ParseError {
+            kind: netbadb_parser::ParseErrorKind::Syntax,
             message: "expected SELECT".into(),
             span: Span { start: 4, end: 5 },
         }));
@@ -5735,3 +5786,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "postgres_create_table_tests.rs"]
+mod create_table_tests;

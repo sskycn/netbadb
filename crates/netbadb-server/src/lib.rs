@@ -13,7 +13,7 @@ use std::fmt;
 
 use netbadb_core::{
     Database, DatabaseError, DatabaseTransaction, DdlOutcome, ExecutionResult,
-    PreparedDdlStatement, QueryResult, TransactionState,
+    PreparedDdlStatement, PreparedSqlStatement, QueryResult, TransactionState,
 };
 use netbadb_protocol::{
     ClientMessage, MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, ProtocolError,
@@ -150,24 +150,46 @@ impl DatabaseSession {
             })
     }
 
+    fn prepare(
+        &self,
+        database: &Database,
+        sql: &str,
+        declared: &[Option<netbadb_types::PhysicalType>],
+    ) -> Result<PreparedSqlStatement, DatabaseError> {
+        match &self.transaction {
+            Some(transaction) => database.prepare_sql_statement_in(transaction, sql, declared),
+            None => database.prepare_sql_statement(sql, declared),
+        }
+    }
+
+    fn owns_staged_table(&self, table: netbadb_types::TableId) -> bool {
+        self.transaction
+            .as_ref()
+            .is_some_and(|t| t.owns_staged_table(table))
+    }
+
+    fn execute_sql_prepared(
+        &mut self,
+        database: &mut Database,
+        prepared: &PreparedSqlStatement,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        match prepared {
+            PreparedSqlStatement::Relational(statement) => {
+                self.execute_prepared(database, statement, &[])
+            }
+            PreparedSqlStatement::Ddl(statement) => self
+                .execute_ddl(database, statement)
+                .map(|_| ExecutionResult::AffectedRows(0)),
+        }
+    }
+
     fn execute(
         &mut self,
         database: &mut Database,
         sql: &str,
     ) -> Result<ExecutionResult, DatabaseError> {
-        let result = match self.transaction.as_mut() {
-            Some(transaction) => database.execute_in(transaction, sql),
-            None => database.execute(sql),
-        };
-        if self.transaction.as_ref().is_some_and(|transaction| {
-            matches!(
-                transaction.state(),
-                TransactionState::Committed | TransactionState::RolledBack
-            )
-        }) {
-            self.transaction = None;
-        }
-        result
+        let prepared = self.prepare(database, sql, &[])?;
+        self.execute_sql_prepared(database, &prepared)
     }
 
     fn execute_prepared(
@@ -196,9 +218,28 @@ impl DatabaseSession {
         database: &mut Database,
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
-        match self.transaction.as_mut() {
+        let implicit = self.transaction.is_none() && prepared.is_table_create();
+        if implicit {
+            self.begin(database, None)?;
+        }
+        let result = match self.transaction.as_mut() {
             Some(transaction) => database.execute_ddl_in(transaction, prepared),
             None => database.execute_ddl(prepared),
+        };
+        if !implicit {
+            return result;
+        }
+        // Keep the transaction in the session until cleanup/commit succeeds.
+        // Failed commit and rollback operations remain retryable by the owner.
+        match result {
+            Ok(outcome) => {
+                self.commit(database)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.rollback()?;
+                Err(error)
+            }
         }
     }
 
@@ -393,6 +434,28 @@ impl SessionState {
                     .map_err(SessionFailure::Server)
             }
             ExecutionResult::AffectedRows(count) => Ok(vec![ServerMessage::AffectedRows { count }]),
+        }
+    }
+
+    fn handle_prepared(
+        &mut self,
+        database: &mut Database,
+        request_id: u64,
+        prepared: &PreparedSqlStatement,
+    ) -> SessionResponse {
+        match self.execution.execute_sql_prepared(database, prepared) {
+            Ok(ExecutionResult::AffectedRows(count)) => SessionResponse::standard(
+                self.success_batch(request_id, vec![ServerMessage::AffectedRows { count }]),
+            ),
+            Ok(ExecutionResult::Query(query)) => {
+                match build_query_messages(query, self.execution.policy.max_result_rows()) {
+                    Ok(messages) => {
+                        SessionResponse::standard(self.success_batch(request_id, messages))
+                    }
+                    Err(error) => self.classified_server_error_batch(request_id, error),
+                }
+            }
+            Err(error) => SessionResponse::standard(self.database_error_batch(request_id, error)),
         }
     }
 
@@ -1369,3 +1432,6 @@ mod tests {
         netbadb_protocol::encode_server_frame(batch.request_id, &batch.messages[0]).unwrap();
     }
 }
+
+#[cfg(test)]
+mod sql_create_table_test_support;

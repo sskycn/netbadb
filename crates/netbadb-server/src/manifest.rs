@@ -393,15 +393,21 @@ struct ManifestClient {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestPrincipal {
+    #[serde(default)]
+    schema_admin: bool,
     tables: Vec<ManifestTablePermissions>,
 }
 
 impl ManifestPrincipal {
-    fn into_permissions(self) -> Vec<TablePermissions> {
-        self.tables
-            .into_iter()
-            .map(ManifestTablePermissions::into_permissions)
-            .collect()
+    fn into_permissions(self) -> crate::authorization::PrincipalGrants {
+        crate::authorization::PrincipalGrants {
+            schema_admin: self.schema_admin,
+            tables: self
+                .tables
+                .into_iter()
+                .map(ManifestTablePermissions::into_permissions)
+                .collect(),
+        }
     }
 }
 
@@ -924,5 +930,53 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod schema_admin_tests {
+    use super::*;
+    use crate::{AuthenticatedClientIdentity, ClientIdentity};
+
+    #[test]
+    fn old_and_explicit_local_and_certificate_principals_preserve_schema_default_deny() {
+        for explicit in [false, true] {
+            let extra = if explicit {
+                ",\"schema_admin\":true"
+            } else {
+                ""
+            };
+            let principal = format!("{{\"tables\":[{{\"table_id\":1,\"read\":true}}]{extra}}}");
+            let local: ManifestAuthorization =
+                serde_json::from_str(&format!("{{\"local_plaintext\":{principal}}}")).unwrap();
+            let policy = local
+                .into_policy(TransportKind::PlaintextLoopback, &[TableId(1)])
+                .unwrap();
+            assert_eq!(
+                policy
+                    .admit(&ClientIdentity::LocalPlaintext)
+                    .unwrap()
+                    .schema_admin(),
+                explicit
+            );
+            let certificate = format!(
+                "{{\"certificate_sha256\":\"{}\",\"tables\":[{{\"table_id\":1,\"read\":true}}]{extra}}}",
+                "01".repeat(32)
+            );
+            let tls: ManifestAuthorization =
+                serde_json::from_str(&format!("{{\"clients\":[{certificate}]}}")).unwrap();
+            let policy = tls
+                .into_policy(TransportKind::MutualTls, &[TableId(1)])
+                .unwrap();
+            assert_eq!(
+                policy
+                    .admit(&ClientIdentity::MutualTls(
+                        AuthenticatedClientIdentity::from_certificate_sha256_for_test([1; 32])
+                    ))
+                    .unwrap()
+                    .schema_admin(),
+                explicit
+            );
+        }
     }
 }

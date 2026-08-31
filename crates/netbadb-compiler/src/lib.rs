@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-pub use netbadb_hir::{DropIndexTarget, IndexNameBinding, TypedDropIndex};
+pub use netbadb_hir::{DropIndexTarget, IndexNameBinding, TypedCreateTable, TypedDropIndex};
 
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
@@ -39,8 +39,16 @@ pub struct PreparedParameter {
     pub data_type: SemanticType,
 }
 
+/// Generic dispatch preserves the separate relational and schema mutation IRs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledSqlStatement {
+    Relational(Box<CompiledStatement>),
+    Ddl(CompiledDdlStatement),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompiledDdlStatement {
+    CreateTable(TypedCreateTable),
     CreateIndex(TypedCreateIndex),
     DropIndex(TypedDropIndex),
 }
@@ -90,6 +98,8 @@ pub enum CompileError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileErrorKind {
     Syntax,
+    UndefinedType,
+    DuplicateColumn,
     UndefinedTable,
     UndefinedColumn,
     AmbiguousColumn,
@@ -103,8 +113,18 @@ impl CompileError {
     #[must_use]
     pub const fn kind(&self) -> CompileErrorKind {
         match self {
-            Self::Parse(_) => CompileErrorKind::Syntax,
+            Self::Parse(error) => match error.kind {
+                netbadb_parser::ParseErrorKind::Syntax => CompileErrorKind::Syntax,
+                netbadb_parser::ParseErrorKind::UnsupportedFeature => {
+                    CompileErrorKind::FeatureNotSupported
+                }
+            },
             Self::Hir(error) => match error {
+                HirError::UnknownType { .. } => CompileErrorKind::UndefinedType,
+                HirError::DuplicateColumn { .. } => CompileErrorKind::DuplicateColumn,
+                HirError::UnsupportedType { .. } | HirError::InvalidTableDefinition { .. } => {
+                    CompileErrorKind::FeatureNotSupported
+                }
                 HirError::UnknownTable { .. } => CompileErrorKind::UndefinedTable,
                 HirError::UnknownColumn { .. } | HirError::UnknownRelationQualifier { .. } => {
                     CompileErrorKind::UndefinedColumn
@@ -125,7 +145,6 @@ impl CompileError {
                 | HirError::IncompatibleComparison { .. }
                 | HirError::CannotInferNullType { .. }
                 | HirError::ParameterTypeConflict { .. }
-                | HirError::DuplicateColumn { .. }
                 | HirError::ValueCountMismatch { .. }
                 | HirError::InsertValueReferencesColumn { .. }
                 | HirError::UngroupedColumn { .. }
@@ -195,7 +214,15 @@ pub fn compile_statement_with_parameters(
     declared: &[Option<PhysicalType>],
 ) -> Result<CompiledStatement, CompileError> {
     let ast = parse_statement(source)?;
-    let (hir, parameters) = netbadb_hir::lower_statement_with_parameters(schema, &ast, declared)?;
+    compile_relational_ast(schema, &ast, declared)
+}
+
+fn compile_relational_ast(
+    schema: &Schema,
+    ast: &netbadb_parser::Statement,
+    declared: &[Option<PhysicalType>],
+) -> Result<CompiledStatement, CompileError> {
+    let (hir, parameters) = netbadb_hir::lower_statement_with_parameters(schema, ast, declared)?;
     let logical_statement = lower_statement(&hir);
     Ok(CompiledStatement {
         hir,
@@ -209,7 +236,48 @@ pub fn compile_ddl_statement(
     source: &str,
     indexes: &[IndexNameBinding],
 ) -> Result<CompiledDdlStatement, CompileError> {
-    match parse_statement(source)? {
+    compile_ddl_ast(schema, parse_statement(source)?, indexes)
+}
+
+/// Parse once, then select the typed boundary from the AST, never SQL text.
+pub fn compile_sql_statement(
+    schema: &Schema,
+    source: &str,
+    indexes: &[IndexNameBinding],
+    declared: &[Option<PhysicalType>],
+) -> Result<CompiledSqlStatement, CompileError> {
+    let ast = parse_statement(source)?;
+    match ast {
+        netbadb_parser::Statement::CreateTable(_)
+        | netbadb_parser::Statement::CreateIndex(_)
+        | netbadb_parser::Statement::DropIndex(_) => {
+            if !declared.is_empty() {
+                return Err(CompileError::Hir(HirError::InvalidTableDefinition {
+                    message: "DDL does not accept parameters",
+                    span: netbadb_parser::Span {
+                        start: 0,
+                        end: source.len(),
+                    },
+                }));
+            }
+            compile_ddl_ast(schema, ast, indexes).map(CompiledSqlStatement::Ddl)
+        }
+        _ => compile_relational_ast(schema, &ast, declared)
+            .map(|statement| CompiledSqlStatement::Relational(Box::new(statement))),
+    }
+}
+
+fn compile_ddl_ast(
+    schema: &Schema,
+    ast: netbadb_parser::Statement,
+    indexes: &[IndexNameBinding],
+) -> Result<CompiledDdlStatement, CompileError> {
+    match ast {
+        netbadb_parser::Statement::CreateTable(statement) => {
+            netbadb_hir::lower_create_table(&statement)
+                .map(CompiledDdlStatement::CreateTable)
+                .map_err(CompileError::from)
+        }
         netbadb_parser::Statement::DropIndex(statement) => {
             netbadb_hir::lower_drop_index(&statement, indexes)
                 .map(CompiledDdlStatement::DropIndex)
@@ -227,6 +295,7 @@ pub fn compile_ddl_statement(
                 netbadb_parser::Statement::Insert(value) => value.span,
                 netbadb_parser::Statement::Update(value) => value.span,
                 netbadb_parser::Statement::Delete(value) => value.span,
+                netbadb_parser::Statement::CreateTable(value) => value.span,
                 netbadb_parser::Statement::CreateIndex(value) => value.span,
                 netbadb_parser::Statement::DropIndex(value) => value.span,
             },
@@ -1062,3 +1131,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod create_table_tests;

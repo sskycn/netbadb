@@ -17,6 +17,77 @@ use netbadb_types::{
     ScalarValue, SemanticType, TableId,
 };
 
+/// Checked logical columns in declaration order; identities are allocated at Execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCreateTable {
+    pub name: String,
+    pub columns: Vec<TypedCreateColumn>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCreateColumn {
+    pub name: String,
+    pub data_type: SemanticType,
+    pub nullable: bool,
+    pub span: Span,
+    pub type_span: Span,
+}
+
+/// Resolve a declaration, without an existing-table lookup or nominal inference.
+pub fn lower_create_table(
+    statement: &netbadb_parser::CreateTableStatement,
+) -> Result<TypedCreateTable, HirError> {
+    let mut seen = HashSet::new();
+    let mut columns = Vec::with_capacity(statement.columns.len());
+    for column in &statement.columns {
+        if !seen.insert(&column.name.name) {
+            return Err(HirError::DuplicateColumn {
+                name: column.name.name.clone(),
+                span: column.name.span,
+            });
+        }
+        let data_type = resolve_declared_type(&column.data_type)?;
+        columns.push(TypedCreateColumn {
+            name: column.name.name.clone(),
+            data_type,
+            nullable: column.nullability.is_none_or(|n| n.nullable),
+            span: column.span,
+            type_span: column.data_type.span,
+        });
+    }
+    Ok(TypedCreateTable {
+        name: statement.name.name.clone(),
+        columns,
+        span: statement.span,
+    })
+}
+
+fn resolve_declared_type(name: &Ident) -> Result<SemanticType, HirError> {
+    let physical = match name.name.to_ascii_uppercase().as_str() {
+        "BOOL" | "BOOLEAN" => PhysicalType::Bool,
+        "BIGINT" | "INT64" | "INT8" => PhysicalType::Int64,
+        "TEXT" | "VARCHAR" => PhysicalType::Text,
+        "UINT64" => PhysicalType::UInt64,
+        "SMALLINT" | "INT2" | "INTEGER" | "INT" | "INT4" | "NUMERIC" | "DECIMAL" | "REAL"
+        | "FLOAT" | "DOUBLE" | "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL"
+        | "JSON" | "JSONB" | "UUID" | "BYTEA" | "ARRAY" | "SERIAL" | "BIGSERIAL"
+        | "SMALLSERIAL" | "CHAR" | "CHARACTER" => {
+            return Err(HirError::UnsupportedType {
+                name: name.name.clone(),
+                span: name.span,
+            });
+        }
+        _ => {
+            return Err(HirError::UnknownType {
+                name: name.name.clone(),
+                span: name.span,
+            });
+        }
+    };
+    Ok(SemanticType::physical(physical))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedCreateIndex {
     pub name: IndexName,
@@ -286,6 +357,18 @@ pub struct TypedDelete {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HirError {
+    UnknownType {
+        name: String,
+        span: Span,
+    },
+    UnsupportedType {
+        name: String,
+        span: Span,
+    },
+    InvalidTableDefinition {
+        message: &'static str,
+        span: Span,
+    },
     InvalidIndexDefinition {
         message: &'static str,
         span: Span,
@@ -383,7 +466,10 @@ impl HirError {
     #[must_use]
     pub const fn span(&self) -> Span {
         match self {
-            Self::InvalidIndexDefinition { span, .. }
+            Self::UnknownType { span, .. }
+            | Self::UnsupportedType { span, .. }
+            | Self::InvalidTableDefinition { span, .. }
+            | Self::InvalidIndexDefinition { span, .. }
             | Self::UnknownTable { span, .. }
             | Self::UnknownColumn { span, .. }
             | Self::UnknownRelationQualifier { span, .. }
@@ -412,6 +498,11 @@ impl HirError {
 impl fmt::Display for HirError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownType { name, .. } => write!(formatter, "unknown type `{name}`"),
+            Self::UnsupportedType { name, .. } => {
+                write!(formatter, "type `{name}` is not supported")
+            }
+            Self::InvalidTableDefinition { message, .. } => formatter.write_str(message),
             Self::InvalidIndexDefinition { message, .. } => formatter.write_str(message),
             Self::UnknownTable { name, .. } => write!(formatter, "unknown table `{name}`"),
             Self::UnknownColumn { table, name, .. } => {
@@ -607,6 +698,12 @@ pub fn lower_statement_with_parameters(
         }
         AstStatement::Delete(delete) => {
             lower_delete(schema, delete, &mut parameters).map(TypedStatement::Delete)
+        }
+        AstStatement::CreateTable(create) => {
+            return Err(HirError::InvalidTableDefinition {
+                message: "CREATE TABLE requires the schema-mutation compiler boundary",
+                span: create.span,
+            });
         }
         AstStatement::DropIndex(drop) => {
             return Err(HirError::InvalidIndexDefinition {
@@ -1088,16 +1185,30 @@ fn lower_insert(
     parameters: &mut ParameterContext,
 ) -> Result<TypedInsert, HirError> {
     let table = resolve_table(schema, &insert.table)?;
-    if insert.columns.len() != insert.values.len() {
+    let implicit_columns;
+    let targets = if insert.columns.is_empty() {
+        implicit_columns = table
+            .columns
+            .iter()
+            .map(|c| Ident {
+                name: c.name.clone(),
+                span: insert.table.span,
+            })
+            .collect::<Vec<_>>();
+        &implicit_columns
+    } else {
+        &insert.columns
+    };
+    if targets.len() != insert.values.len() {
         return Err(HirError::ValueCountMismatch {
-            columns: insert.columns.len(),
+            columns: targets.len(),
             values: insert.values.len(),
             span: insert.span,
         });
     }
     let mut seen = HashSet::new();
     let mut values = vec![None; table.columns.len()];
-    for (target, value) in insert.columns.iter().zip(&insert.values) {
+    for (target, value) in targets.iter().zip(&insert.values) {
         let column = resolve_column(table, target)?;
         if !seen.insert(column.column_id) {
             return Err(HirError::DuplicateColumn {
@@ -2272,3 +2383,6 @@ mod tests {
         assert!(!typed.joins[0].predicate.expr_type.nullable);
     }
 }
+
+#[cfg(test)]
+mod create_table_tests;

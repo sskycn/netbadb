@@ -708,10 +708,29 @@ assert identities, rows, generation and repeated reopen. Prepared table dependen
 survive unrelated creation; transaction-local statements cannot execute globally.
 PG/Protocol metadata remains a Core projection with existing authorization.
 
-Next: generic SQL CREATE TABLE may map a small typed syntax to this Core API.
+Round 19 below connects generic SQL CREATE TABLE to this Core API.
 Reject PRIMARY KEY/UNIQUE/DEFAULT/CHECK/REFERENCES/GENERATED/PARTITION/CTAS/TEMP/
 UNLOGGED/INHERITS/LIKE until their semantics exist. DROP/ALTER, non-Heap creation,
 journal compaction, and general aborted-resource garbage collection remain deferred.
+
+### Generic SQL CREATE TABLE — Round 19
+
+[Round 19](sql-create-table-round19.md) implements parser declarations with spans,
+typed HIR columns, compiled/prepared DDL and schema-write access metadata, with
+no allocated IDs before execution. Native Protocol v1 and PG Simple/Extended Query
+reuse Core Heap creation and transaction SchemaOverlay. Explicit default-deny
+schema-admin authorization includes temporary creator access only while staged.
+psql, psycopg and SQLAlchemy Table.create fixtures verify real transactional DML,
+rollback, commit, unchanged manifests, catalog-only reopen and post-commit denial.
+Constraints, DROP/ALTER, runtime LSM/range placement and ORM table migrations remain
+unsupported. SQL parser bounds/property tests and existing storage crash/fuzz
+regressions protect the new frontend boundary.
+
+Next: Core transactional DROP TABLE foundation, before SQL DROP. Resolve exact
+TableId retirement, private overlay removal, dependency invalidation, rollback,
+coordinator decisions, deferred physical deletion/old handles and catalog-only
+reopen. DROP/recreate must use a new TableId and must not inherit identity grants.
+Logical retirement correctness takes priority over eager unlink.
 
 ## Phase 6 — SDK and tooling
 
