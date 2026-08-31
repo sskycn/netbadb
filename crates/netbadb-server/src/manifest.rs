@@ -676,6 +676,36 @@ mod tests {
     }
 
     #[test]
+    fn manifest_schema_is_an_expectation_checked_when_storage_opens() {
+        let directory = test_directory("round16-schema-expectation");
+        std::fs::create_dir(&directory).unwrap();
+        let heap = directory.join("users.ndb");
+        create_heap(&heap);
+        let manifest = directory.join("server.json");
+        std::fs::write(&manifest, manifest_json(None, "users.ndb", "DifferentId")).unwrap();
+
+        // Config parsing validates definitions/paths, not the heap fingerprint.
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert_eq!(config.tables()[0].table, users_table("DifferentId"));
+        let entries = config
+            .tables()
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.table.clone()))
+            .collect();
+        assert!(matches!(
+            Database::open_tables(entries),
+            Err(netbadb_core::DatabaseError::Storage(
+                netbadb_storage::StorageError::SchemaMismatch { .. }
+            ))
+        ));
+        Database::open(&heap, users_table("UserId"))
+            .unwrap()
+            .close()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn rejects_unknown_versions_fields_remote_listeners_and_missing_paths() {
         let directory = test_directory("invalid");
         let _ = std::fs::remove_dir_all(&directory);
