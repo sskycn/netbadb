@@ -50,8 +50,14 @@ Protocol v1 or any persistent database format.
 ```
 
 Start it with `netbadbd --manifest path/to/netbadb-server.json`. The server
-opens existing heaps only. Relative heap and TLS paths resolve from the
-manifest directory.
+uses the listed existing Heap paths to locate an already initialized runtime
+schema catalog. Relative Heap and TLS paths resolve from the manifest directory.
+Table definitions are required exact subset expectations (TableId and canonical
+fingerprint), not the live logical schema. All committed catalog resources open
+before authorization filters session visibility, including extra persisted tables
+not listed here. Provisioning must use a database create API or explicit complete
+legacy import once; ordinary startup never creates a database or repairs a missing
+catalog. See [Round 17](runtime-schema-catalog-round17.md).
 
 ## Authentication and principal admission
 

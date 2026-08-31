@@ -678,12 +678,29 @@ schema overlays, a quiescent schema writer lease, and a versioned schema
 participant with recoverable physical creation intents. DROP retires logically;
 physical deletion waits for recovery-log retention gates.
 
-Next recommendation: **Runtime Schema Catalog Foundation** (Round 17): persist
-current committed schema, bootstrap/migrate legacy inputs, reopen from persisted
-catalog, preserve identities/high-waters, define generation/fingerprints and
-inspection. Continue to exclude CREATE TABLE, DROP TABLE and ALTER TABLE. Later
-phases add Core transactional Heap creation before SQL syntax; PK declarations
-must wait for real constraint enforcement.
+### Runtime Schema Catalog Foundation Round 17
+
+[Round 17](runtime-schema-catalog-round17.md) implements a database-level full
+committed snapshot and independent durable installation discriminator. Fresh
+create and explicit complete-inventory Heap/LSM/range legacy import install once;
+ordinary reopen reconstructs Schema, placements and bindings without an external
+schema authority. Semantic types, sparse IDs/order, fingerprints, schema/table
+versions and four independent identity high-waters persist. Expectations permit
+extra committed tables while requiring exact IDs/fingerprints for requested ones.
+Missing/corrupt initialized catalogs fail; snapshot/marker shadows have explicit
+crash winner/loser tests. The [v1 byte contract](schema-catalog-v1.md) is documented.
+
+Manifest startup, native fingerprints and PG inspection remain projections or
+expectations. Protocol v1, physical Heap/LSM/index/coordinator formats, PK enforcement
+and prepared statements are unchanged. Runtime index revision saturation and the
+anonymous-index notification gap remain follow-up work. Incomplete physical
+creation and writable clone/downgrade workflows are not solved by catalog import.
+
+Next: **Core Transactional Heap CREATE TABLE Foundation** (Round 18), gated on
+catalog review: non-rollback durable identity reservations, a transaction schema
+overlay, private Heap storage, prepared snapshots tied to the coordinator decision,
+commit publication/rollback cleanup, crash tests, and prepared/schema invalidation.
+Do not add SQL CREATE TABLE until those Core contracts work; DROP/ALTER stay deferred.
 
 ## Phase 6 — SDK and tooling
 

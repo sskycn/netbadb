@@ -358,7 +358,7 @@ impl DatabaseWorker {
                     .into_iter()
                     .map(|entry| (entry.path, entry.table))
                     .collect();
-                let database = match Database::open_tables(entries) {
+                let database = match Database::open_tables_with_expectation(entries) {
                     Ok(database) => database,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));

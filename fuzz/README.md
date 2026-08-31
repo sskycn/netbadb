@@ -150,3 +150,18 @@ compaction while old dirty pages are ineligible, so production reuse does not
 consume the pages the fixture is intended to preserve. Generate twice in temporary
 directories, compare deterministic snapshots, and copy only reviewed seeds; keep
 random mutations and findings outside Git.
+
+Round 17 adds `schema_catalog_decode`, which calls the bounded production snapshot
+decoder and verifies byte-for-byte deterministic re-encoding on success. Reviewed
+seeds cover mixed Heap/LSM/range metadata, sparse/nominal schema, truncation, bad
+CRC and an invalid TableId high-water. Run with temporary corpus/artifact paths:
+
+```bash
+cargo +nightly fuzz run schema_catalog_decode /private/tmp/netbadb-schema-corpus -- -runs=1000
+```
+
+Copy `fuzz/corpus/schema_catalog_decode` into that temporary corpus first. The
+Core test `schema_catalog_tests::codec_reviewed_seed_export` deterministically
+exports these seeds only when `NETBADB_SCHEMA_SEED_DIR` is explicitly set.
+`btree_decode`, `index_catalog_decode`, `wal_recovery` and `pgwire_decode` remain
+required companion regression targets because catalog loading precedes recovery.

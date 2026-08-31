@@ -6,6 +6,11 @@ mod coordinator_log;
 mod inspection;
 mod partition_catalog;
 mod registry;
+mod schema_catalog;
+mod schema_catalog_api;
+mod schema_catalog_file;
+#[cfg(test)]
+mod schema_catalog_tests;
 mod transaction;
 
 use std::cell::RefCell;
@@ -43,6 +48,7 @@ use partition_catalog::{CatalogTable, PartitionCatalog, canonicalize_partitions,
 use registry::{
     PhysicalBindings, RangePartitionBinding, StorageRegistry, StorageRegistryEntry, TablePlacement,
 };
+use schema_catalog::CommittedCatalogState;
 use transaction::SharedCoordinatorLog;
 
 pub use coordinator_log::CoordinatorLogError;
@@ -54,10 +60,29 @@ pub use netbadb_storage::{
     LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
     ReusablePageInspection, StorageKind, TableStatistics,
 };
+pub use netbadb_types::{SchemaGeneration, TableSchemaVersion};
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
 };
 pub use registry::StorageRegistryError;
+pub use schema_catalog::SchemaCatalogError;
+pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
+
+impl From<SchemaCatalogError> for DatabaseError {
+    fn from(error: SchemaCatalogError) -> Self {
+        Self::SchemaCatalog(error)
+    }
+}
+
+/// Strict bounded decoder entry point for the standalone catalog fuzzer.
+#[doc(hidden)]
+pub fn fuzz_schema_catalog_bytes(bytes: &[u8]) {
+    if let Ok(snapshot) = schema_catalog::SchemaCatalogSnapshot::decode(bytes) {
+        if let Ok(encoded) = snapshot.encode() {
+            assert_eq!(bytes, encoded);
+        }
+    }
+}
 pub use transaction::{
     CoordinatorError, DatabaseReadView, DatabaseTransaction, ParticipantMode, TransactionState,
 };
@@ -320,6 +345,7 @@ pub enum DatabaseError {
     Compile(CompileError),
     Bind(BindError),
     Schema(SchemaError),
+    SchemaCatalog(SchemaCatalogError),
     Storage(StorageError),
     Execution(ExecutionError),
     Registry(StorageRegistryError),
@@ -427,7 +453,8 @@ impl DatabaseError {
             Self::Registry(StorageRegistryError::DuplicateIndexName { .. }) => {
                 DatabaseErrorKind::DuplicateObject
             }
-            Self::Schema(_)
+            Self::SchemaCatalog(_)
+            | Self::Schema(_)
             | Self::Storage(_)
             | Self::Registry(_)
             | Self::CoordinatorLog(_)
@@ -466,6 +493,7 @@ impl fmt::Display for DatabaseError {
             Self::Compile(error) => error.fmt(formatter),
             Self::Bind(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
+            Self::SchemaCatalog(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
             Self::Registry(error) => error.fmt(formatter),
@@ -548,6 +576,7 @@ impl Error for DatabaseError {
             Self::Compile(error) => Some(error),
             Self::Bind(error) => Some(error),
             Self::Schema(error) => Some(error),
+            Self::SchemaCatalog(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
             Self::Registry(error) => Some(error),
@@ -630,7 +659,7 @@ impl From<PartitionError> for DatabaseError {
 }
 
 pub struct Database {
-    schema: Schema,
+    committed: schema_catalog::CommittedCatalogState,
     bindings: PhysicalBindings,
     registry: StorageRegistry,
     transaction_owner: Rc<()>,
@@ -640,29 +669,17 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn create(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
-        let schema = Schema::new(vec![table.clone()])?;
-        let storage = TableStorage::create_heap(path, table)?;
-        Self::compose(schema, vec![storage])
-    }
-
-    pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, DatabaseError> {
-        let schema = Schema::new(vec![table.clone()])?;
-        let storage = TableStorage::open_heap(path, table)?;
-        Self::compose(schema, vec![storage])
-    }
-
     /// Creates an explicit mixed Heap/LSM catalog without a durable database
     /// coordinator. As with the legacy API, at most one storage may be written
     /// by a transaction.
-    pub fn create_storages(specs: Vec<TableStorageCreateSpec>) -> Result<Self, DatabaseError> {
+    fn physical_create_storages(specs: Vec<TableStorageCreateSpec>) -> Result<Self, DatabaseError> {
         let (schema, storages) = create_explicit_storages(specs)?;
         Self::compose(schema, storages)
     }
 
     /// Creates an explicit mixed Heap/LSM catalog whose multi-storage writes
     /// use the shared durable coordinator.
-    pub fn create_storages_with_coordinator(
+    fn physical_create_storages_with_coordinator(
         specs: Vec<TableStorageCreateSpec>,
         config: DatabaseCoordinatorConfig,
     ) -> Result<Self, DatabaseError> {
@@ -682,9 +699,11 @@ impl Database {
 
     /// Opens an explicit mixed Heap/LSM catalog without coordinator recovery.
     /// Any prepared participant is therefore a typed in-doubt error.
-    pub fn open_storages(specs: Vec<TableStorageOpenSpec>) -> Result<Self, DatabaseError> {
+    fn physical_open_storages(
+        specs: Vec<TableStorageOpenSpec>,
+        committed: CommittedCatalogState,
+    ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
-        let schema = Schema::new(specs.iter().map(|spec| spec.table().clone()).collect())?;
         let mut storages = Vec::with_capacity(specs.len());
         for spec in specs {
             storages.push(match spec {
@@ -694,15 +713,16 @@ impl Database {
                 }
             });
         }
-        Self::compose(schema, storages)
+        Self::compose_recovered(committed, storages, None, None)
     }
 
     /// Opens an explicit mixed Heap/LSM catalog, validates every durable
     /// participant identity before mutation, and resolves prepared work from
     /// the coordinator decision log.
-    pub fn open_storages_with_coordinator(
+    fn physical_open_storages_with_coordinator(
         specs: Vec<TableStorageOpenSpec>,
         config: DatabaseCoordinatorConfig,
+        committed: CommittedCatalogState,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
         if specs.iter().any(|spec| spec.path() == config.log_path()) {
@@ -710,7 +730,6 @@ impl Database {
                 config.log_path().to_owned(),
             ));
         }
-        let schema = Schema::new(specs.iter().map(|spec| spec.table().clone()).collect())?;
         let mut coordinator = CoordinatorLog::open(config.log_path())?;
         let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
         let mut inspected = Vec::with_capacity(specs.len());
@@ -774,12 +793,17 @@ impl Database {
                 .checked_add(1)
                 .ok_or(CoordinatorError::TransactionIdExhausted)?,
         );
-        Self::compose_with_coordinator(schema, storages, coordinator, next_transaction_id)
+        Self::compose_recovered(
+            committed,
+            storages,
+            Some((coordinator, next_transaction_id)),
+            None,
+        )
     }
 
     /// Creates one heap file per validated table and composes them into one
     /// query catalog. Each heap persists the table's schema fingerprint.
-    pub fn create_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
+    fn physical_create_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
         let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
@@ -814,7 +838,7 @@ impl Database {
 
     /// Creates a catalog with an explicit durable database coordinator log.
     /// Only databases opened through this API permit atomic multi-storage writes.
-    pub fn create_tables_with_coordinator(
+    fn physical_create_tables_with_coordinator(
         tables: Vec<(PathBuf, TableDef)>,
         config: DatabaseCoordinatorConfig,
     ) -> Result<Self, DatabaseError> {
@@ -857,25 +881,27 @@ impl Database {
     }
 
     /// Opens one existing heap-format file per table as a single query catalog.
-    pub fn open_tables(tables: Vec<(PathBuf, TableDef)>) -> Result<Self, DatabaseError> {
+    fn physical_open_tables(
+        tables: Vec<(PathBuf, TableDef)>,
+        committed: CommittedCatalogState,
+    ) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
-        let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut storages = Vec::with_capacity(tables.len());
         for (path, table) in tables {
             storages.push(TableStorage::open_heap(path, table)?);
         }
-        Self::compose(schema, storages)
+        Self::compose_recovered(committed, storages, None, None)
     }
 
     /// Opens a coordinator-enabled database after resolving every prepared
     /// participant from the durable database decision log.
-    pub fn open_tables_with_coordinator(
+    fn physical_open_tables_with_coordinator(
         tables: Vec<(PathBuf, TableDef)>,
         config: DatabaseCoordinatorConfig,
+        committed: CommittedCatalogState,
     ) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
         validate_coordinator_path(&tables, &config)?;
-        let schema = Schema::new(tables.iter().map(|(_, table)| table.clone()).collect())?;
         let mut coordinator = CoordinatorLog::open(config.log_path())?;
         let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
         let mut inspected = Vec::with_capacity(tables.len());
@@ -946,14 +972,19 @@ impl Database {
                 .checked_add(1)
                 .ok_or(CoordinatorError::TransactionIdExhausted)?,
         );
-        Self::compose_with_coordinator(schema, storages, coordinator, next_transaction_id)
+        Self::compose_recovered(
+            committed,
+            storages,
+            Some((coordinator, next_transaction_id)),
+            None,
+        )
     }
 
     /// Creates a mixed catalog of single and RANGE-partitioned logical tables.
     /// The explicit catalog and coordinator paths are never inferred from heap
     /// locations. All partitioned writes therefore use the durable database
     /// coordinator from their first release.
-    pub fn create_with_placements(
+    fn physical_create_with_placements(
         specs: Vec<TablePlacementSpec>,
         config: PartitionCatalogConfig,
     ) -> Result<Self, DatabaseError> {
@@ -1067,12 +1098,12 @@ impl Database {
     /// Opens a durable placement catalog from schemas plus an unordered set of
     /// physical heap paths. Heap identity, not caller order or path, resolves
     /// every partition before prepared transactions are recovered.
-    pub fn open_with_placements(
+    fn physical_open_with_placements(
         tables: Vec<TableDef>,
         storage_paths: Vec<PathBuf>,
         config: PartitionCatalogConfig,
+        committed: CommittedCatalogState,
     ) -> Result<Self, DatabaseError> {
-        let schema = Schema::new(tables.clone())?;
         validate_physical_paths(&storage_paths, &config)?;
         let catalog = PartitionCatalog::open(config.catalog_path())?;
         validate_catalog_schemas(&catalog, &tables)?;
@@ -1162,13 +1193,21 @@ impl Database {
                 .checked_add(1)
                 .ok_or(CoordinatorError::TransactionIdExhausted)?,
         );
-        Self::compose_with_catalog(schema, storages, catalog, coordinator, next_transaction_id)
+        Self::compose_recovered(
+            committed,
+            storages,
+            Some((coordinator, next_transaction_id)),
+            Some(catalog),
+        )
     }
 
     fn compose(schema: Schema, storages: Vec<TableStorage>) -> Result<Self, DatabaseError> {
         let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
         Ok(Self {
-            schema,
+            committed: crate::schema_catalog::CommittedCatalogState::initial(
+                schema,
+                bindings.iter().cloned(),
+            ),
             bindings,
             registry,
             transaction_owner: Rc::new(()),
@@ -1186,7 +1225,10 @@ impl Database {
     ) -> Result<Self, DatabaseError> {
         let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
         Ok(Self {
-            schema,
+            committed: crate::schema_catalog::CommittedCatalogState::initial(
+                schema,
+                bindings.iter().cloned(),
+            ),
             bindings,
             registry,
             transaction_owner: Rc::new(()),
@@ -1221,12 +1263,76 @@ impl Database {
             &registry,
         )?;
         Ok(Self {
-            schema,
+            committed: crate::schema_catalog::CommittedCatalogState::initial(
+                schema,
+                bindings.iter().cloned(),
+            ),
             bindings,
             registry,
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
+            catalog_generation: 0,
+        })
+    }
+
+    // Recovery must carry stored lineage, including historical high-waters.
+    // Only fresh bootstrap composition may compute initial successors.
+    fn compose_recovered(
+        committed: CommittedCatalogState,
+        storages: Vec<TableStorage>,
+        coordinator: Option<(CoordinatorLog, DatabaseTxnId)>,
+        catalog: Option<PartitionCatalog>,
+    ) -> Result<Self, DatabaseError> {
+        let registry = StorageRegistry::new(
+            storages
+                .into_iter()
+                .map(|storage| StorageRegistryEntry {
+                    id: storage.storage_id(),
+                    storage,
+                })
+                .collect(),
+        )?;
+        let bindings = match catalog {
+            Some(catalog) => PhysicalBindings::new(
+                catalog
+                    .tables
+                    .into_iter()
+                    .map(|entry| entry.placement)
+                    .collect(),
+                &registry,
+            )?,
+            None => PhysicalBindings::from_single_storages(&registry)?,
+        };
+        if bindings.iter().count() != committed.schema.tables().len() {
+            return Err(
+                SchemaCatalogError::InventoryMismatch("committed table binding count").into(),
+            );
+        }
+        for table in committed.schema.tables() {
+            for storage_id in bindings.placement(table.id)?.storage_ids() {
+                let storage = registry
+                    .get(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+                if storage.table() != table {
+                    return Err(SchemaCatalogError::InventoryMismatch(
+                        "recovered logical schema differs from catalog",
+                    )
+                    .into());
+                }
+            }
+        }
+        let (coordinator, next_transaction_id) = match coordinator {
+            Some((log, next)) => (Some(Rc::new(RefCell::new(log))), next),
+            None => (None, DatabaseTxnId(1)),
+        };
+        Ok(Self {
+            committed,
+            bindings,
+            registry,
+            transaction_owner: Rc::new(()),
+            next_transaction_id,
+            coordinator,
             catalog_generation: 0,
         })
     }
@@ -1738,7 +1844,7 @@ impl Database {
     /// Compiles SQL and reports its canonical table access without planning,
     /// reading rows, starting a transaction, or touching persistent state.
     pub fn statement_access(&self, source: &str) -> Result<StatementAccess, DatabaseError> {
-        let compiled = compile_statement(&self.schema, source)?;
+        let compiled = compile_statement(&self.committed.schema, source)?;
         Ok(StatementAccess {
             read_tables: compiled.logical_statement.read_tables(),
             write_tables: compiled.logical_statement.write_tables(),
@@ -1754,7 +1860,7 @@ impl Database {
         declared: &[Option<PhysicalType>],
     ) -> Result<PreparedStatement, DatabaseError> {
         Ok(PreparedStatement {
-            compiled: compile_statement_with_parameters(&self.schema, source, declared)?,
+            compiled: compile_statement_with_parameters(&self.committed.schema, source, declared)?,
         })
     }
 
@@ -1779,7 +1885,7 @@ impl Database {
             })
             .collect::<Vec<_>>();
         Ok(PreparedDdlStatement {
-            compiled: compile_ddl_statement(&self.schema, source, &indexes)?,
+            compiled: compile_ddl_statement(&self.committed.schema, source, &indexes)?,
         })
     }
 
@@ -2013,7 +2119,7 @@ impl Database {
     /// identity/kind/uniqueness in persistent registration order, and cached
     /// `ANALYZE` snapshots without scanning data or refreshing statistics.
     pub fn inspect_catalog(&self) -> Result<CatalogInspection, DatabaseError> {
-        inspection::catalog(&self.schema, &self.bindings, &self.registry)
+        inspection::catalog(&self.committed.schema, &self.bindings, &self.registry)
     }
 
     /// Reports the explicit physical storage kind for a non-partitioned table.
@@ -2188,7 +2294,7 @@ impl Database {
 
     #[must_use]
     pub fn schema(&self) -> &Schema {
-        &self.schema
+        &self.committed.schema
     }
 
     #[cfg(test)]
@@ -2200,7 +2306,7 @@ impl Database {
         &self,
         source: &str,
     ) -> Result<(CompiledStatement, PhysicalStatement), DatabaseError> {
-        let compiled = compile_statement(&self.schema, source)?;
+        let compiled = compile_statement(&self.committed.schema, source)?;
         let physical = self.plan_logical_statement(&compiled.logical_statement);
         Ok((compiled, physical))
     }
@@ -2566,6 +2672,7 @@ impl Database {
                 ..
             } => {
                 let table = self
+                    .committed
                     .schema
                     .tables()
                     .iter()
@@ -4013,12 +4120,24 @@ mod tests {
 
             let error = if case == "missing-participant" {
                 let (users, _teams, projects, _) = coordinator_fixture_paths(&root);
-                Database::open_tables_with_coordinator(
-                    vec![(users, table()), (projects, projects_table())],
+                let subset = vec![(users, table()), (projects, projects_table())];
+                let complete = Database::open_tables_with_coordinator(
+                    subset.clone(),
                     DatabaseCoordinatorConfig::new(&coordinator_path),
                 )
+                .expect("subset expectation opens every committed participant");
+                assert_eq!(complete.schema().tables().len(), 3);
+                let committed = complete.committed.clone();
+                complete.close().unwrap();
+                // The lower recovery validator still rejects an actually
+                // incomplete inventory; public open cannot construct one.
+                Database::physical_open_tables_with_coordinator(
+                    subset,
+                    DatabaseCoordinatorConfig::new(&coordinator_path),
+                    committed,
+                )
                 .err()
-                .expect("missing participant must fail")
+                .expect("missing recovery participant must fail")
             } else {
                 let mut bytes = std::fs::read(&coordinator_path).expect("read coordinator");
                 bytes[12] ^= 1;
@@ -4192,7 +4311,10 @@ mod tests {
 
         let schema = Schema::new(vec![table(), teams_table()]).expect("build schema");
         let mut database = Database {
-            schema,
+            committed: crate::schema_catalog::CommittedCatalogState::initial(
+                schema,
+                bindings.iter().cloned(),
+            ),
             bindings,
             registry,
             transaction_owner: Rc::new(()),

@@ -21,6 +21,8 @@ pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Required exact table expectation and physical locator. Provisioning creates
+/// the catalog once; ordinary server startup never installs or repairs it.
 pub struct TableBootstrap {
     pub path: PathBuf,
     pub table: TableDef,
@@ -693,7 +695,7 @@ mod tests {
             .map(|entry| (entry.path.clone(), entry.table.clone()))
             .collect();
         assert!(matches!(
-            Database::open_tables(entries),
+            Database::open_tables_with_expectation(entries),
             Err(netbadb_core::DatabaseError::Storage(
                 netbadb_storage::StorageError::SchemaMismatch { .. }
             ))
@@ -702,6 +704,52 @@ mod tests {
             .unwrap()
             .close()
             .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_manifest_subset_opens_complete_persisted_catalog() {
+        let directory = test_directory("round17-subset");
+        std::fs::create_dir(&directory).unwrap();
+        let users = users_table("UserId");
+        let extra = TableDef::new(TableId(9), "future_extra", users.columns.clone());
+        Database::create_tables(vec![
+            (directory.join("users.ndb"), users.clone()),
+            (directory.join("extra.ndb"), extra.clone()),
+        ])
+        .unwrap()
+        .close()
+        .unwrap();
+        let manifest = directory.join("server.json");
+        std::fs::write(&manifest, manifest_json(None, "users.ndb", "UserId")).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        let entries = config
+            .tables()
+            .iter()
+            .map(|t| (t.path.clone(), t.table.clone()))
+            .collect();
+        let database = Database::open_tables_with_expectation(entries).unwrap();
+        assert_eq!(database.schema().tables(), &[users, extra]);
+        assert_eq!(database.inspect_catalog().unwrap().tables.len(), 2);
+        database.close().unwrap();
+        // Same name but different TableId cannot redirect an authorization grant.
+        let mut bad: serde_json::Value =
+            serde_json::from_str(&manifest_json(None, "users.ndb", "UserId")).unwrap();
+        bad["tables"][0]["id"] = json!(2);
+        bad["authorization"]["local_plaintext"]["tables"][0]["table_id"] = json!(2);
+        std::fs::write(&manifest, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        let entries = config
+            .tables()
+            .iter()
+            .map(|t| (t.path.clone(), t.table.clone()))
+            .collect();
+        assert!(matches!(
+            Database::open_tables_with_expectation(entries),
+            Err(netbadb_core::DatabaseError::Storage(
+                netbadb_storage::StorageError::TableIdMismatch { .. }
+            ))
+        ));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

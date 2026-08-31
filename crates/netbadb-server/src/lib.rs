@@ -615,6 +615,7 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         DatabaseError::Storage(_) => ProtocolErrorCode::Storage,
         DatabaseError::Execution(_) => ProtocolErrorCode::Execution,
         DatabaseError::ExpectedQuery
+        | DatabaseError::SchemaCatalog(_)
         | DatabaseError::Registry(_)
         | DatabaseError::Transaction(_)
         | DatabaseError::CoordinatorLog(_)

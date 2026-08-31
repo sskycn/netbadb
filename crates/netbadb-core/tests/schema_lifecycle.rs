@@ -1,5 +1,4 @@
-//! Current external-schema lifecycle baselines for the Round 16 audit.
-//! These are not assertions that a persistent runtime schema catalog exists.
+//! Round 16 lifecycle regression cases updated for Round 17 persisted authority.
 
 use std::path::{Path, PathBuf};
 
@@ -153,7 +152,7 @@ fn reopen_rejects_changed_table_identity_and_column_shape() {
 }
 
 #[test]
-fn reordered_external_schema_rebuilds_bindings_without_reassigning_storage_ids() {
+fn reordered_expectation_preserves_committed_order_and_storage_ids() {
     let root = TestDirectory::new("reorder");
     let alpha = table(900, "alpha");
     let beta = table(100, "beta");
@@ -179,7 +178,7 @@ fn reordered_external_schema_rebuilds_bindings_without_reassigning_storage_ids()
         (alpha_path.clone(), alpha.clone()),
     ])
     .unwrap();
-    assert_eq!(reopened.schema().tables(), &[beta.clone(), alpha.clone()]);
+    assert_eq!(reopened.schema().tables(), &[alpha.clone(), beta.clone()]);
     assert_eq!(
         reopened
             .query("SELECT a.name, b.name FROM alpha a JOIN beta b ON a.id < b.id")
@@ -196,7 +195,7 @@ fn reordered_external_schema_rebuilds_bindings_without_reassigning_storage_ids()
 }
 
 #[test]
-fn ordinary_reopen_only_exposes_the_declared_table_subset() {
+fn ordinary_subset_expectation_opens_every_committed_table() {
     let root = TestDirectory::new("subset");
     let alpha = table(900, "alpha");
     let beta = table(100, "beta");
@@ -209,14 +208,14 @@ fn ordinary_reopen_only_exposes_the_declared_table_subset() {
         .close()
         .unwrap();
 
-    // There is no database-level persisted complete schema in this legacy API.
+    // Required exact subset expectations do not narrow the committed catalog.
     let subset = Database::open_tables(vec![entries[1].clone()]).unwrap();
-    assert_eq!(subset.schema().tables(), &[beta]);
-    assert_eq!(subset.inspect_catalog().unwrap().tables.len(), 1);
+    assert_eq!(subset.schema().tables(), &[alpha.clone(), beta]);
+    assert_eq!(subset.inspect_catalog().unwrap().tables.len(), 2);
     assert!(
         subset
             .prepare_statement("SELECT name FROM alpha", &[])
-            .is_err()
+            .is_ok()
     );
     subset.close().unwrap();
     assert_heap_identity(&entries[0].0, &alpha, StorageId(1));
@@ -226,7 +225,7 @@ fn ordinary_reopen_only_exposes_the_declared_table_subset() {
 }
 
 #[test]
-fn lsm_persists_identity_but_still_requires_external_schema() {
+fn lsm_persists_identity_and_validates_external_expectation() {
     let root = TestDirectory::new("lsm");
     let heap = table(900, "heap_records");
     let lsm = table(100, "lsm_records");

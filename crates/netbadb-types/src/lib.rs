@@ -13,6 +13,12 @@ macro_rules! id_type {
 
 id_type!(DatabaseId, u64);
 id_type!(TableId, u64);
+/// Durable order of committed logical table/column schema changes. Zero is uninitialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SchemaGeneration(pub u64);
+/// Durable logical version of one table, independent of its content fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TableSchemaVersion(pub u64);
 /// Stable identity of one logical physical partition.
 ///
 /// A partition belongs to one logical [`TableId`] and resolves to a physical

@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use netbadb_core::Database;
+use netbadb_core::{Database, TableStorageCreateSpec};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{ServerConfig, TcpServer};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
@@ -31,8 +31,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run(directory: &Path, transport: &str) -> Result<(), Box<dyn Error>> {
     let table = users_table();
     let heap = directory.join("users.ndb");
-    Database::create(&heap, table.clone())?.close()?;
-    let fingerprint = table.fingerprint()?;
+    let catalog = directory.join("database.schema");
+    Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table)],
+        None,
+    )?
+    .close()?;
+    let persisted = Database::open_catalog(&catalog)?;
+    let fingerprint = persisted.inspect_catalog()?.tables[0].fingerprint;
+    persisted.close()?;
 
     let (tls, authorization, client) = if transport == "mtls" {
         let pki = TestPki::generate()?;

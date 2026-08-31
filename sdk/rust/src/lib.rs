@@ -2,8 +2,10 @@
 
 #[cfg(feature = "embedded")]
 pub use netbadb_core::{
-    Database, DatabaseError, ExecutionResult, PartitionCatalogConfig, QueryResult,
-    RangePartitionSpec, ResultColumn, TablePlacementSpec, Transaction, TransactionState,
+    CompleteLegacyInventory, Database, DatabaseCoordinatorConfig, DatabaseError, ExecutionResult,
+    LegacyStorageLocation, PartitionCatalogConfig, QueryResult, RangePartitionSpec, ResultColumn,
+    SchemaCatalogError, SchemaGeneration, TablePlacementSpec, TableSchemaVersion,
+    TableStorageCreateSpec, Transaction, TransactionState,
 };
 pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,
@@ -11,7 +13,7 @@ pub use netbadb_schema::{
 };
 pub use netbadb_types::{
     AccessPathId, ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue,
-    SemanticType, TableId,
+    SemanticType, StorageId, TableId,
 };
 
 /// Stable embedded catalog and physical-plan inspection values and renderers.

@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use netbadb_core::Database;
+use netbadb_core::{Database, TableStorageCreateSpec};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{PostgresTcpServer, ServerConfig};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
@@ -22,7 +22,15 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
         (directory.join("users.ndb"), users_table()),
         (directory.join("teams.ndb"), teams_table()),
     ];
-    let mut database = Database::create_tables(tables.clone())?;
+    let catalog = directory.join("database.schema");
+    let mut database = Database::create_catalog(
+        &catalog,
+        tables
+            .into_iter()
+            .map(|(path, table)| TableStorageCreateSpec::heap(path, table))
+            .collect(),
+        None,
+    )?;
     database.create_index(TableId(1), ColumnId(2))?;
     database.create_index(TableId(1), ColumnId(3))?;
     // All real-client probes start from a checkpointed compacted catalog.
@@ -36,7 +44,7 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
     }
     database.checkpoint()?;
     database.close()?;
-    let reopened = Database::open_tables(tables)?;
+    let reopened = Database::open_catalog(&catalog)?;
     let indexes = &reopened.inspect_catalog()?.tables[0].indexes;
     if indexes.len() != 2 {
         return Err(format!(

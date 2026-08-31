@@ -126,7 +126,7 @@ human text   Inspection JSON v5
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
-obtain table bootstrap paths and canonical definitions. It never starts a TCP
+obtain required table expectation paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
 filesystem access. JSON v5 is the current explicit external CLI contract when
 IndexNestedLoopJoin appears, converted exhaustively from inspection DTOs;
@@ -175,20 +175,38 @@ name, nullability, and primary-key booleans. Strings are UTF-8 with little-endia
 `SchemaFingerprint`; no Rust enum discriminant, layout, `Debug` output, or map
 iteration order participates.
 
-## Table schema lifecycle decision (Round 16)
+## Persistent runtime schema authority (Round 17)
 
-Current `Database` owns a caller-supplied live `Schema`; Heap/LSM fingerprints
-verify that external definition but cannot reconstruct it. PartitionCatalog owns
-placement, not complete table/column definitions. Manifest v4 embeds schema and
-opens existing Heap files, while SDK fingerprints are subset expectations.
+The [Round 16 decision](table-schema-lifecycle-round16.md) is implemented for
+initial schema installation and reopen by the
+[Round 17 catalog foundation](runtime-schema-catalog-round17.md). Core owns one
+immutable `CommittedCatalogState`: a Schema decoded from the persistent snapshot,
+SchemaGeneration, per-table TableSchemaVersion and durable identity high-waters.
+Compiler/execution/inspection consume it alongside validated physical bindings and
+storage handles. Index metadata remains in the existing per-engine catalogs.
 
-The [Round 16 audit](table-schema-lifecycle-round16.md) chooses bootstrap followed
-by one persistent per-database SchemaCatalog, immutable committed publication,
-independent durable ID allocation, transaction-local schema overlays and a
-versioned schema participant in coordinator recovery. It documents current
-identity/PK/cache limitations and crash-safe CREATE/DROP design. These are chosen
-future contracts, not implemented APIs or formats. The next foundation phase
-persists and reopens existing canonical schema; table DDL remains deferred.
+Explicit `create_catalog`/`create_catalog_with_placements` bootstrap a full snapshot
+at a caller-selected database root. `open_catalog` reconstructs every table and
+placement without external schema. `open_catalog_with_expectation` accepts an
+optional exact required subset; extra committed tables stay open and visible to
+Core. Compatibility open signatures now validate expectations only. Their locator
+sidecars are discovery evidence, never logical authority.
+
+[SchemaCatalog v1](schema-catalog-v1.md) defines bounded binary fields, versions,
+CRC32C, semantic types, declaration order, placement descriptors and checked
+next-ID/exhausted states. A separate durable pending/initialized marker distinguishes
+legacy/bootstrap-required state from a damaged initialized catalog. Shadow write,
+file sync, atomic rename and directory sync publish the snapshot before the
+initialized marker. Missing/corrupt initialized catalogs cannot fall back to a
+manifest. Catalog loading precedes physical identity validation and WAL recovery.
+
+Legacy adoption is explicit and requires a separately attested complete physical
+inventory; old arbitrary filenames cannot independently establish completeness.
+Physical metadata validates TableId, StorageId, fingerprint, engine and partition
+identity. Table/column DDL, non-rollback reservations, schema overlays, staged
+physical creation, coordinator schema participants and prepared-schema invalidation
+remain future work. The current index runtime revision remains separate from
+persistent logical schema generations.
 
 ## Compiler and plans
 
@@ -2633,9 +2651,11 @@ sessions, explicitly closes the Database, and joins the worker.
 `netbadbd` reads deployment manifest v4 before startup. Relative heap and TLS
 paths are resolved against the manifest directory. Certificate, private-key,
 and client-CA material is parsed into a mandatory-client-auth rustls config
-before the database worker starts; the worker then calls `Database::open_tables`
-before the listener is bound. The manifest supplies complete TableDefs because
-a heap fingerprint cannot reconstruct schema. Plaintext listeners are
+before the database worker starts; the worker then calls
+`Database::open_tables_with_expectation` before the listener is bound. Manifest
+TableDefs are required exact subset expectations; persisted SchemaCatalog alone
+reconstructs the complete logical schema and physical inventory. Missing catalogs
+never trigger startup creation or legacy migration. Plaintext listeners are
 restricted to loopback, while non-loopback listeners require mutual TLS.
 
 Authentication, authorization, compilation, and execution remain separate.

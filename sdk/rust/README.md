@@ -123,3 +123,15 @@ clients must not reclassify it by matching message text.
 The Rust remote client reuses the authoritative `netbadb-protocol` crate. The
 Go SDK intentionally uses an independent codec to validate the language-neutral
 wire contract.
+
+## Persisted schema catalog
+
+Embedded `Database::create_catalog(root, specs, coordinator)` installs bootstrap
+schema once; `Database::open_catalog(root)` reconstructs it without generated or
+caller TableDefs. `open_catalog_with_expectation(root, Some(&schema))` validates an
+exact required subset while retaining all committed tables. The old `open` and
+`open_tables` signatures are expectation-only transition wrappers. Legacy files
+require `open_legacy_and_install_catalog` with a separately attested
+`CompleteLegacyInventory`; missing initialized catalogs never fall back to
+external schema. Runtime table DDL is not supported. See the
+[Round 17 contract](../../docs/runtime-schema-catalog-round17.md).

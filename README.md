@@ -90,13 +90,16 @@ semantic: UserId
 representation is the same. The storage format encodes physical values; the
 Canonical Schema remains the source of semantic meaning. Each validated table
 also has a versioned canonical byte encoding and SHA-256 schema fingerprint.
-Heap metadata persists that fingerprint, and reopen requires the caller's full
-table identity—including semantic types and column order—to match.
-Current create/open APIs still obtain the live logical schema from callers;
-physical fingerprints cannot reconstruct it. The
-[Round 16 schema lifecycle audit](docs/table-schema-lifecycle-round16.md) chooses
-bootstrap followed by a persistent database schema authority as the prerequisite
-for table DDL. That catalog and table DDL are not implemented yet.
+Heap/LSM metadata validates that fingerprint against the persisted logical schema.
+The [Round 17 runtime schema catalog](docs/runtime-schema-catalog-round17.md)
+installs a full database schema snapshot once at create or explicit legacy import.
+`Database::open_catalog(path)` reconstructs the complete schema without external
+TableDefs. Optional application/manifest schemas are exact subset expectations;
+missing or corrupt initialized catalogs fail without fallback. Semantic types,
+declaration order, placements, IDs, high-waters and schema versions survive reopen.
+The [SchemaCatalog v1 format](docs/schema-catalog-v1.md) documents the independent
+installation marker and crash-safe publication. Runtime CREATE/DROP/ALTER TABLE
+remain unsupported.
 
 ## Repository layout
 

@@ -5243,10 +5243,24 @@ mod tests {
         );
 
         database.close().expect("close catalog fixture");
-        let reopened = Database::open_tables(paths.iter().cloned().zip(tables).collect::<Vec<_>>())
-            .expect("reopen catalog fixture");
+        let mut root = paths[0].as_os_str().to_os_string();
+        root.push(".schema");
+        let reopened = Database::open_catalog(std::path::PathBuf::from(root))
+            .expect("reopen catalog fixture without external schema");
         let reopened_catalog =
             PgCompatibilityCatalog::derive(&reopened).expect("derive reopened catalog");
+        assert_eq!(
+            reopened_catalog
+                .tables
+                .iter()
+                .map(|table| table.oid)
+                .collect::<Vec<_>>(),
+            catalog
+                .tables
+                .iter()
+                .map(|table| table.oid)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             reopened_catalog
                 .table("users")

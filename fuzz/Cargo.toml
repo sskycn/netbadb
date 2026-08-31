@@ -97,6 +97,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "schema_catalog_decode"
+path = "fuzz_targets/schema_catalog_decode.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
 

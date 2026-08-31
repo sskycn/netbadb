@@ -179,7 +179,7 @@ impl PartitionCatalog {
         Self::decode(&bytes)
     }
 
-    fn encode(&self) -> Result<Vec<u8>, PartitionError> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, PartitionError> {
         let mut payload = Vec::new();
         push_u32(&mut payload, self.tables.len(), "table count")?;
         for entry in &self.tables {
