@@ -300,16 +300,18 @@ Potentially destructive operations MUST resolve exact targets first and SHOULD
 prefer recoverable actions. Planning, inspection, and explanation MUST remain
 distinct from mutation.
 
-The user has authorized this default completion workflow for repository changes:
-after implementation, validation and final diff review, commit the task changes,
-merge the task branch into `main`, and push `main` to `origin`. Fetch and inspect
-the remote state before integrating; do not force-push or overwrite unrelated
-work. Only after confirming the pushed main contains the task commits, remove
-this task's clean temporary worktree and delete its merged local branch (and its
-remote branch if one was published). Do not clean up unrelated branches or
-worktrees. This is standing authorization for these completion steps; a later
-explicit task instruction can override the default. If integration or push is
-blocked, preserve the task branch/worktree and report the blocker.
+After every task is complete, the completion workflow MUST be performed: after
+implementation, validation, and final diff review, commit the task changes,
+merge the task branch into `main`, and push `main` to `origin`. Fetch and
+inspect the remote state before integrating; do not force-push or overwrite
+unrelated work. Only after confirming the pushed `main` contains the task
+commits, remove this task's clean temporary worktree and delete its merged
+local branch (and its remote branch if one was published). Do not clean up
+unrelated branches or worktrees. This workflow is standing authorization for
+every task; a later explicit task instruction can override it. If integration
+or push is blocked, preserve the task branch/worktree and report the blocker;
+do not claim the task is complete until the workflow succeeds or the blocker
+is explicitly reported.
 
 ## 10. Definition of done
 
