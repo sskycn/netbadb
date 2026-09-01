@@ -5,7 +5,7 @@ fn generic_dispatch_produces_logical_ddl_without_catalog_identities() {
     let schema = Schema::new(vec![]).unwrap();
     let sql = "CREATE TABLE projects (id INT64 NOT NULL, name TEXT)";
     let CompiledSqlStatement::Ddl(CompiledDdlStatement::CreateTable(table)) =
-        compile_sql_statement(&schema, sql, &[], &[]).unwrap()
+        compile_sql_statement(&schema, sql, &[], &[], &[]).unwrap()
     else {
         panic!()
     };
@@ -16,7 +16,7 @@ fn generic_dispatch_produces_logical_ddl_without_catalog_identities() {
     );
     assert!(!table.columns[0].nullable);
     assert!(table.columns[1].nullable);
-    assert!(compile_sql_statement(&schema, sql, &[], &[Some(PhysicalType::Int64)]).is_err());
+    assert!(compile_sql_statement(&schema, sql, &[], &[], &[Some(PhysicalType::Int64)]).is_err());
     for (sql, kind) in [
         (
             "CREATE TABLE t (a TEXT, a TEXT)",
@@ -36,7 +36,7 @@ fn generic_dispatch_produces_logical_ddl_without_catalog_identities() {
         ),
     ] {
         assert_eq!(
-            compile_sql_statement(&schema, sql, &[], &[])
+            compile_sql_statement(&schema, sql, &[], &[], &[])
                 .unwrap_err()
                 .kind(),
             kind

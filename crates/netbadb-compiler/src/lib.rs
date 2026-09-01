@@ -3,7 +3,10 @@
 use std::error::Error;
 use std::fmt;
 
-pub use netbadb_hir::{DropIndexTarget, IndexNameBinding, TypedCreateTable, TypedDropIndex};
+pub use netbadb_hir::{
+    DropIndexTarget, IndexNameBinding, TableIdentityBinding, TypedCreateTable, TypedDropIndex,
+    TypedDropTable,
+};
 
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
@@ -49,6 +52,7 @@ pub enum CompiledSqlStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompiledDdlStatement {
     CreateTable(TypedCreateTable),
+    DropTable(TypedDropTable),
     CreateIndex(TypedCreateIndex),
     DropIndex(TypedDropIndex),
 }
@@ -235,8 +239,9 @@ pub fn compile_ddl_statement(
     schema: &Schema,
     source: &str,
     indexes: &[IndexNameBinding],
+    tables: &[TableIdentityBinding],
 ) -> Result<CompiledDdlStatement, CompileError> {
-    compile_ddl_ast(schema, parse_statement(source)?, indexes)
+    compile_ddl_ast(schema, parse_statement(source)?, indexes, tables)
 }
 
 /// Parse once, then select the typed boundary from the AST, never SQL text.
@@ -244,11 +249,13 @@ pub fn compile_sql_statement(
     schema: &Schema,
     source: &str,
     indexes: &[IndexNameBinding],
+    tables: &[TableIdentityBinding],
     declared: &[Option<PhysicalType>],
 ) -> Result<CompiledSqlStatement, CompileError> {
     let ast = parse_statement(source)?;
     match ast {
         netbadb_parser::Statement::CreateTable(_)
+        | netbadb_parser::Statement::DropTable(_)
         | netbadb_parser::Statement::CreateIndex(_)
         | netbadb_parser::Statement::DropIndex(_) => {
             if !declared.is_empty() {
@@ -260,7 +267,7 @@ pub fn compile_sql_statement(
                     },
                 }));
             }
-            compile_ddl_ast(schema, ast, indexes).map(CompiledSqlStatement::Ddl)
+            compile_ddl_ast(schema, ast, indexes, tables).map(CompiledSqlStatement::Ddl)
         }
         _ => compile_relational_ast(schema, &ast, declared)
             .map(|statement| CompiledSqlStatement::Relational(Box::new(statement))),
@@ -271,11 +278,17 @@ fn compile_ddl_ast(
     schema: &Schema,
     ast: netbadb_parser::Statement,
     indexes: &[IndexNameBinding],
+    tables: &[TableIdentityBinding],
 ) -> Result<CompiledDdlStatement, CompileError> {
     match ast {
         netbadb_parser::Statement::CreateTable(statement) => {
             netbadb_hir::lower_create_table(&statement)
                 .map(CompiledDdlStatement::CreateTable)
+                .map_err(CompileError::from)
+        }
+        netbadb_parser::Statement::DropTable(statement) => {
+            netbadb_hir::lower_drop_table(schema, &statement, tables)
+                .map(CompiledDdlStatement::DropTable)
                 .map_err(CompileError::from)
         }
         netbadb_parser::Statement::DropIndex(statement) => {
@@ -296,6 +309,7 @@ fn compile_ddl_ast(
                 netbadb_parser::Statement::Update(value) => value.span,
                 netbadb_parser::Statement::Delete(value) => value.span,
                 netbadb_parser::Statement::CreateTable(value) => value.span,
+                netbadb_parser::Statement::DropTable(value) => value.span,
                 netbadb_parser::Statement::CreateIndex(value) => value.span,
                 netbadb_parser::Statement::DropIndex(value) => value.span,
             },
@@ -1134,3 +1148,5 @@ mod tests {
 
 #[cfg(test)]
 mod create_table_tests;
+#[cfg(test)]
+mod drop_table_tests;

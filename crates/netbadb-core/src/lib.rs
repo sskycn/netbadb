@@ -26,8 +26,8 @@ use std::rc::Rc;
 
 use netbadb_compiler::{
     BindError, CompileError, CompileErrorKind, CompiledDdlStatement, CompiledStatement,
-    DropIndexTarget, IndexNameBinding, PreparedParameter, TypedDropIndex, bind_statement,
-    compile_ddl_statement, compile_statement, compile_statement_with_parameters,
+    DropIndexTarget, IndexNameBinding, PreparedParameter, TableIdentityBinding, TypedDropIndex,
+    bind_statement, compile_ddl_statement, compile_statement, compile_statement_with_parameters,
 };
 use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
@@ -59,6 +59,7 @@ use transaction::SharedCoordinatorLog;
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
+pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
     HistoricalOrphanAdoptionReport, IndexDefinition, IndexMaintenanceReport, IndexReclaimReport,
     IndexStatistics, IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
@@ -73,8 +74,7 @@ pub use registry::StorageRegistryError;
 pub use schema_catalog::SchemaCatalogError;
 pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
 pub use schema_mutation::{
-    CreateColumnSpec, CreateTableSpec, DropTableTarget, RetiredTableResource, SchemaDependency,
-    SchemaMutationError,
+    CreateColumnSpec, CreateTableSpec, RetiredTableResource, SchemaDependency, SchemaMutationError,
 };
 
 impl From<SchemaCatalogError> for DatabaseError {
@@ -248,6 +248,7 @@ impl TableStorageOpenSpec {
 pub struct StatementAccess {
     read_tables: Vec<TableId>,
     write_tables: Vec<TableId>,
+    schema_tables: Vec<TableId>,
     schema_write: bool,
 }
 
@@ -303,11 +304,23 @@ impl PreparedDdlStatement {
             CompiledDdlStatement::CreateTable(_) => StatementAccess {
                 read_tables: Vec::new(),
                 write_tables: Vec::new(),
+                schema_tables: Vec::new(),
+                schema_write: true,
+            },
+            CompiledDdlStatement::DropTable(statement) => StatementAccess {
+                read_tables: Vec::new(),
+                write_tables: Vec::new(),
+                schema_tables: vec![statement.target.table_id],
                 schema_write: true,
             },
             CompiledDdlStatement::DropIndex(statement) => StatementAccess {
                 schema_write: true,
                 read_tables: Vec::new(),
+                schema_tables: statement
+                    .target
+                    .map(|target| target.table_id)
+                    .into_iter()
+                    .collect(),
                 write_tables: statement
                     .target
                     .map(|target| target.table_id)
@@ -318,6 +331,7 @@ impl PreparedDdlStatement {
                 schema_write: true,
                 read_tables: Vec::new(),
                 write_tables: vec![statement.table_id],
+                schema_tables: vec![statement.table_id],
             },
         }
     }
@@ -339,6 +353,21 @@ impl PreparedDdlStatement {
     #[must_use]
     pub fn is_index_drop(&self) -> bool {
         matches!(self.compiled, CompiledDdlStatement::DropIndex(_))
+    }
+
+    /// Whether this statement is a generic SQL DROP TABLE.
+    #[must_use]
+    pub fn is_table_drop(&self) -> bool {
+        matches!(self.compiled, CompiledDdlStatement::DropTable(_))
+    }
+
+    /// Exact prepared target for generic DROP TABLE, when applicable.
+    #[must_use]
+    pub fn drop_table_target(&self) -> Option<DropTableTarget> {
+        match &self.compiled {
+            CompiledDdlStatement::DropTable(statement) => Some(statement.target),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -374,6 +403,7 @@ impl PreparedStatement {
             schema_write: false,
             read_tables: self.compiled.logical_statement.read_tables(),
             write_tables: self.compiled.logical_statement.write_tables(),
+            schema_tables: Vec::new(),
         }
     }
 
@@ -398,6 +428,12 @@ impl StatementAccess {
     #[must_use]
     pub fn write_tables(&self) -> &[TableId] {
         &self.write_tables
+    }
+
+    /// Exact logical targets of schema DDL, separate from row-write grants.
+    #[must_use]
+    pub fn schema_tables(&self) -> &[TableId] {
+        &self.schema_tables
     }
 }
 
@@ -2007,8 +2043,9 @@ impl Database {
         source: &str,
     ) -> Result<PreparedDdlStatement, DatabaseError> {
         let indexes = self.index_name_bindings();
+        let tables = self.table_identity_bindings(None)?;
         Ok(PreparedDdlStatement {
-            compiled: compile_ddl_statement(&self.committed.schema, source, &indexes)?,
+            compiled: compile_ddl_statement(&self.committed.schema, source, &indexes, &tables)?,
         })
     }
 
@@ -2027,6 +2064,42 @@ impl Database {
                 })
             })
             .collect::<Vec<_>>()
+    }
+
+    fn table_identity_bindings(
+        &self,
+        transaction: Option<&Transaction>,
+    ) -> Result<Vec<TableIdentityBinding>, DatabaseError> {
+        let schema = transaction.map_or(&self.committed.schema, |value| {
+            value.visible_schema(&self.committed.schema)
+        });
+        schema
+            .tables()
+            .iter()
+            .map(|table| {
+                let table_version = self
+                    .committed
+                    .tables
+                    .iter()
+                    .find(|lineage| lineage.table_id == table.id)
+                    .map(|lineage| lineage.version)
+                    .or_else(|| {
+                        transaction
+                            .filter(|value| value.owns_staged_table(table.id))
+                            .map(|_| TableSchemaVersion(1))
+                    })
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "visible table lineage absent during compilation",
+                    ))?;
+                Ok(TableIdentityBinding {
+                    target: DropTableTarget {
+                        table_id: table.id,
+                        table_version,
+                        fingerprint: table.fingerprint()?,
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Prepare any generic SQL through one parser pass, with no execution effects.
@@ -2064,6 +2137,7 @@ impl Database {
             schema,
             source,
             &self.index_name_bindings(),
+            &self.table_identity_bindings(transaction)?,
             declared,
         )?;
         match compiled {
@@ -2158,6 +2232,15 @@ impl Database {
                 self.commit_transaction(&mut transaction)?;
                 Ok(DdlOutcome::Created)
             }
+            CompiledDdlStatement::DropTable(statement) => {
+                let mut transaction = self.begin_transaction()?;
+                if let Err(error) = self.drop_table_in(&mut transaction, statement.target) {
+                    transaction.rollback()?;
+                    return Err(error);
+                }
+                self.commit_transaction(&mut transaction)?;
+                Ok(DdlOutcome::Dropped)
+            }
             CompiledDdlStatement::DropIndex(statement) => {
                 let Some(target) = self.validate_drop_target(statement)? else {
                     return Ok(DdlOutcome::Unchanged);
@@ -2211,6 +2294,10 @@ impl Database {
             CompiledDdlStatement::CreateTable(statement) => {
                 self.create_heap_table_in(transaction, CreateTableSpec::from(statement))?;
                 Ok(DdlOutcome::Created)
+            }
+            CompiledDdlStatement::DropTable(statement) => {
+                self.drop_table_in(transaction, statement.target)?;
+                Ok(DdlOutcome::Dropped)
             }
             CompiledDdlStatement::DropIndex(statement) => {
                 if transaction.has_pending_index_creations() {
@@ -6603,3 +6690,5 @@ mod tests {
 
 #[cfg(test)]
 mod sql_create_table_tests;
+#[cfg(test)]
+mod sql_drop_table_tests;

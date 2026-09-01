@@ -228,7 +228,15 @@ WAL/status and contained BTree pages remain on disk. Commit removes schema,
 placement and registry entry at one synchronous publication boundary; rollback
 leaves the exact old identity/data/indexes active and does not advance generation or
 allocator floors. Reopen resolves DROP before opening only active NBSC storages.
-SQL/PG DROP, physical unlink/GC, LSM and partition DROP remain future work.
+Physical unlink/GC, LSM and partition DROP remain future work.
+
+[Round 21](sql-drop-table-round21.md) adds a thin generic SQL adapter. The parser
+keeps only a logical name/span; HIR resolves the transaction SchemaView to the shared
+exact TableId/version/fingerprint target; compiled/prepared DDL retains it until
+Execute calls Round 20 Core. Statement access records schema-write authority and a
+separate exact schema target, so `schema_admin` does not imply or require row DML
+grants. Native and PostgreSQL Simple/Extended paths add no identity or persistent
+format. Same-name replacement fails stale/undefined rather than rebinding.
 
 `compile_sql_statement` parses once and selects relational or DDL lowering from the
 AST. Core's `prepare_sql_statement_in` shares the transaction SchemaView and
@@ -236,7 +244,8 @@ identity/version/fingerprint dependency rules of `prepare_statement_in`; session
 use this combined entry point for both statement families. Prepared statements that
 reference staged tables retain exact transaction scope; plans over committed tables
 remain reusable. CREATE declarations contain no IDs, and schema-writer admission/
-reservations occur only during Execute.
+reservations occur only during Execute. DROP preparation similarly performs no
+writer admission or journal/catalog/storage mutation.
 `StatementAccess::schema_write` describes schema mutation without a sentinel ID.
 Server authorization checks the optional default-false manifest principal
 `schema_admin` for all network DDL (index DDL also retains table-write checks).

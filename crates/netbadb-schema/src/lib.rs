@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use netbadb_types::{ColumnId, PhysicalType, SemanticType, TableId};
+use netbadb_types::{ColumnId, PhysicalType, SemanticType, TableId, TableSchemaVersion};
 use sha2::{Digest, Sha256};
 
 /// Version of the explicit canonical table-schema encoding.
@@ -35,6 +35,18 @@ impl fmt::Display for SchemaFingerprint {
         }
         Ok(())
     }
+}
+
+/// Exact logical table identity used by prepared schema mutations.
+///
+/// Names are resolved to this value during compilation. Execution must not
+/// resolve the name again, so a same-name replacement cannot be mutated by an
+/// older prepared statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DropTableTarget {
+    pub table_id: TableId,
+    pub table_version: TableSchemaVersion,
+    pub fingerprint: SchemaFingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

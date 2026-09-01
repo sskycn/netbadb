@@ -83,6 +83,7 @@ pub enum Statement {
     Update(UpdateStatement),
     Delete(DeleteStatement),
     CreateTable(CreateTableStatement),
+    DropTable(DropTableStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
 }
@@ -92,6 +93,13 @@ pub enum Statement {
 pub struct CreateTableStatement {
     pub name: Ident,
     pub columns: Vec<CreateColumn>,
+    pub span: Span,
+}
+
+/// A logical unqualified table name. Persistent identities are resolved by HIR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableStatement {
+    pub name: Ident,
     pub span: Span,
 }
 
@@ -629,10 +637,10 @@ impl Parser {
             TokenKind::Update => Statement::Update(self.parse_update()?),
             TokenKind::Delete => Statement::Delete(self.parse_delete()?),
             TokenKind::Create => self.parse_create()?,
-            TokenKind::Drop => Statement::DropIndex(self.parse_drop_index()?),
+            TokenKind::Drop => self.parse_drop()?,
             _ => {
                 return Err(self.error_here(
-                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, CREATE INDEX, or DROP INDEX",
+                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, or DROP INDEX",
                 ));
             }
         };
@@ -671,6 +679,57 @@ impl Parser {
         }
         self.position -= 1;
         self.parse_create_index().map(Statement::CreateIndex)
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement, ParseError> {
+        let object = self.tokens.get(self.position + 1).unwrap_or(self.current());
+        match &object.kind {
+            TokenKind::Index => self.parse_drop_index().map(Statement::DropIndex),
+            TokenKind::Ident(name) if name.eq_ignore_ascii_case("table") => {
+                self.parse_drop_table().map(Statement::DropTable)
+            }
+            TokenKind::Ident(_) => Err(ParseError {
+                kind: ParseErrorKind::UnsupportedFeature,
+                message: "DROP object type is not supported".into(),
+                span: object.span,
+            }),
+            _ => Err(ParseError {
+                kind: ParseErrorKind::Syntax,
+                message: "DROP expects TABLE or INDEX".into(),
+                span: object.span,
+            }),
+        }
+    }
+
+    fn parse_drop_table(&mut self) -> Result<DropTableStatement, ParseError> {
+        let start = self.expect_simple(TokenKind::Drop)?.span.start;
+        if !self.contextual("table") {
+            return Err(self.error_here("DROP expects TABLE"));
+        }
+        self.position += 1;
+        if self.matches(&TokenKind::If) {
+            return Err(self.unsupported("DROP TABLE IF EXISTS"));
+        }
+        if self.contextual("only") {
+            return Err(self.unsupported("DROP TABLE ONLY"));
+        }
+        let name = self.expect_ident()?;
+        if self.matches(&TokenKind::Dot) {
+            return Err(self.unsupported("qualified DROP TABLE name"));
+        }
+        if self.matches(&TokenKind::Comma) {
+            return Err(self.unsupported("multi-table DROP TABLE"));
+        }
+        if self.contextual("cascade") || self.contextual("restrict") {
+            return Err(self.unsupported("DROP TABLE dependency behavior"));
+        }
+        Ok(DropTableStatement {
+            span: Span {
+                start,
+                end: name.span.end,
+            },
+            name,
+        })
     }
 
     fn reject_table_clause(&self) -> Result<(), ParseError> {
@@ -1524,6 +1583,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::Update(statement) => statement.span,
         Statement::Delete(statement) => statement.span,
         Statement::CreateTable(statement) => statement.span,
+        Statement::DropTable(statement) => statement.span,
         Statement::CreateIndex(statement) => statement.span,
         Statement::DropIndex(statement) => statement.span,
     }
@@ -1999,7 +2059,6 @@ mod tests {
             "DROP INDEX idx RESTRICT",
             "DROP INDEX $1",
             "DROP INDEX \"idx\"",
-            "DROP TABLE users",
         ] {
             assert!(parse_statement(sql).is_err(), "{sql}");
         }
@@ -2032,3 +2091,5 @@ mod tests {
 
 #[cfg(test)]
 mod create_table_tests;
+#[cfg(test)]
+mod drop_table_tests;

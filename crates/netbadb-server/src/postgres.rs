@@ -2790,6 +2790,8 @@ fn preflight_ddl_types(prepared: &CorePreparedDdl) -> Result<(), ErrorResponse> 
 fn ddl_command_tag(prepared: &CorePreparedDdl) -> &'static str {
     if prepared.is_table_create() {
         "CREATE TABLE"
+    } else if prepared.is_table_drop() {
+        "DROP TABLE"
     } else if prepared.is_index_drop() {
         "DROP INDEX"
     } else {
@@ -2806,7 +2808,6 @@ fn is_index_ddl(normalized: &str) -> bool {
 fn is_unsupported_schema_ddl(normalized: &str) -> bool {
     [
         "alter table ",
-        "drop table ",
         "create schema ",
         "alter schema ",
         "drop schema ",
@@ -4893,7 +4894,6 @@ mod tests {
     fn unsupported_schema_ddl_is_classified_without_entering_the_generic_parser() {
         for sql in [
             "alter table users add column name text",
-            "drop table users",
             "create schema private",
             "create type mood as enum ('ok')",
             "create sequence users_id_seq",
@@ -5790,3 +5790,6 @@ mod tests {
 #[cfg(test)]
 #[path = "postgres_create_table_tests.rs"]
 mod create_table_tests;
+#[cfg(test)]
+#[path = "postgres_drop_table_tests.rs"]
+mod drop_table_tests;

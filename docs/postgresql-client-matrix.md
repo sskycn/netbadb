@@ -50,7 +50,9 @@ production or build dependencies.
 | DROP legacy synthetic name | yes | adapter resolution to generic identity; durable retirement |
 | Basic Heap CREATE TABLE | partial | BIGINT/TEXT/BOOLEAN, NULL/NOT NULL; transactional native + PG |
 | SQLAlchemy `Table.create(checkfirst=False)` | yes, bounded fixture | no PK, defaults, sequences or VARCHAR length; same-transaction insert/select |
-| DROP/ALTER TABLE, table migrations | unsupported | explicit `0A000`; no Alembic CreateTableOp |
+| Basic Heap `DROP TABLE name` | yes, bounded fixture | exact prepared identity; transactional Simple/Extended Query |
+| SQLAlchemy `Table.drop(checkfirst=False)` | yes | rollback and commit; no custom dialect |
+| DROP IF EXISTS/qualified/multiple, ALTER TABLE, table migrations | unsupported | explicit rejection; no Alembic table operation |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
 dialect, `implicit_returning=False`, `use_insertmanyvalues=False`, `create_all`,
@@ -152,3 +154,12 @@ CARGO_TARGET_DIR=/private/tmp/netbadb-round19-target \
 Install the exact existing `scripts/requirements-postgresql-orm.txt` dependencies.
 The prior psql/ORM/Alembic index-only regression scripts continue on separate fresh
 `postgres_driver_fixture` databases with explicit schema_admin and table grants.
+
+## Round 21 real DROP TABLE fixture
+
+The psql and ORM regression scripts create bounded temporary Heap tables, roll back
+one DROP, commit one DROP, and verify absence. psycopg also forces Extended Query
+with public `prepare=True`; SQLAlchemy uses its native PostgreSQL dialect and
+`Table.drop(connection, checkfirst=False)`. psql checks missing-table, failed-transaction
+`42P01`/`25P02` behavior, and unsupported IF EXISTS/CASCADE forms. The existing
+Alembic script remains index-only.

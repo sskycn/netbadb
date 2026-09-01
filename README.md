@@ -105,7 +105,9 @@ private transaction schema/DML, coordinator-backed commit, and catalog-only reco
 `CREATE TABLE` over native SQL and PostgreSQL. [Round 20](docs/core-drop-table-round20.md)
 adds exact-identity transactional Core Heap retirement, prepared-dependency
 invalidation, durable retained-resource inventory and deferred physical deletion.
-SQL `DROP TABLE` and `ALTER TABLE` remain unsupported.
+[Round 21](docs/sql-drop-table-round21.md) adds generic exact-prepared SQL
+`DROP TABLE name` over native and PostgreSQL frontends. `ALTER TABLE` remains
+unsupported.
 
 ## Repository layout
 
@@ -300,7 +302,9 @@ Basic Heap `CREATE TABLE` supports BIGINT/INT64, TEXT and BOOLEAN/BOOL columns
 with NULL/NOT NULL, including real SQLAlchemy `Table.create(checkfirst=False)`
 without constraints/defaults. Network DDL requires explicit `schema_admin`; the
 creator can use its staged table only within the creating transaction, and receives
-no durable DML grant. DROP/ALTER TABLE, general migration execution, a complete
+no durable DML grant. Exact prepared `DROP TABLE name` is transactional and works
+through psql, psycopg, and SQLAlchemy `Table.drop(checkfirst=False)`; IF EXISTS,
+qualified/multi-table DROP, ALTER TABLE, general migration execution, a complete
 `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
@@ -545,6 +549,21 @@ SELECT sees a private schema; rollback removes it, while commit publishes its
 schema and rows durably. SQL tables require 1..4096 columns; constraints (including
 PRIMARY KEY), type lengths, IF NOT EXISTS, temporary tables and qualified/quoted
 CREATE names are unsupported. See the [complete scope and verification report](docs/sql-create-table-round19.md).
+
+Basic SQL table retirement accepts one unquoted, unqualified name:
+
+```sql
+DROP TABLE projects;
+```
+
+Preparation binds TableId, table schema version, and fingerprint without storage
+effects. Execute never resolves the name again, so an old prepared DROP cannot
+retire a same-name replacement. Network DROP requires `schema_admin`, not a table
+DML grant. Commit logically retires the Heap through the Round 20 lifecycle;
+rollback restores visibility, and physical Heap/index resources remain retained for
+future garbage collection. IF EXISTS, CASCADE/RESTRICT, qualified/quoted or multiple
+targets, LSM/range DROP, and ALTER TABLE are unsupported. See the
+[Round 21 report](docs/sql-drop-table-round21.md).
 
 Mutation is located by an internal versioned physical `RowId` (`PageId +
 SlotId + u32 generation`) that is never exposed as a SQL column or treated as a
