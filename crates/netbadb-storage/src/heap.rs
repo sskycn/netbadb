@@ -20,10 +20,10 @@ use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
 use crate::transaction::TransactionManager;
 use crate::txn_status::{SharedTxnStatus, TxnStatusStore, txn_status_path};
 use crate::{
-    BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, IsolationLevel, MetadataError,
-    PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageError, PageManager, PageType, ReadView, SLOT_SIZE,
-    SlotRef, SlotState, Snapshot, StorageError, Transaction, TransactionError, WalManager,
-    WalRecordKind, wal_path,
+    BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, HeapRewriteIndex, HeapRewriteIndexes,
+    IsolationLevel, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageError, PageManager,
+    PageType, ReadView, SLOT_SIZE, SlotRef, SlotState, Snapshot, StorageError, Transaction,
+    TransactionError, WalManager, WalRecordKind, wal_path,
 };
 use crate::{PreparedTransaction, PreparedTxnResolution};
 
@@ -557,6 +557,22 @@ impl HeapStorage {
         &self.indexes
     }
 
+    pub(crate) fn rewrite_indexes(&mut self) -> Result<HeapRewriteIndexes, StorageError> {
+        let catalog = self.read_index_catalog(self.index_catalog_root)?;
+        Ok(HeapRewriteIndexes {
+            active: self
+                .indexes
+                .iter()
+                .map(|definition| HeapRewriteIndex {
+                    id: definition.id,
+                    name: definition.name.clone(),
+                    column_id: definition.column_id,
+                })
+                .collect(),
+            next_index_id: catalog.next_index_id,
+        })
+    }
+
     #[must_use]
     pub fn storage_id(&self) -> StorageId {
         self.storage_id
@@ -633,6 +649,64 @@ impl HeapStorage {
     ) -> Result<IndexDefinition, StorageError> {
         self.build_index_in(transaction, Some(name), column_id)
             .map(|plan| plan.definition)
+    }
+
+    pub(crate) fn install_rewrite_indexes_in(
+        &mut self,
+        transaction: &mut Transaction,
+        snapshot: &HeapRewriteIndexes,
+    ) -> Result<(), StorageError> {
+        if !self.indexes.is_empty() || snapshot.next_index_id.0 == 0 {
+            return Err(IndexError::InvalidIndexHighWater(snapshot.next_index_id).into());
+        }
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        let mut columns = HashSet::new();
+        for index in &snapshot.active {
+            if index.id.0 == 0
+                || index.id.0 >= snapshot.next_index_id.0
+                || !ids.insert(index.id)
+                || !columns.insert(index.column_id)
+                || index
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !names.insert(name.clone()))
+            {
+                return Err(IndexError::InvalidIndexHighWater(snapshot.next_index_id).into());
+            }
+            self.validate_index_creation(index.name.as_ref(), index.column_id)?;
+        }
+
+        self.validate_transaction(transaction)?;
+        transaction.acquire_writer()?;
+        let page = self.buffer.read_page(self.index_catalog_root)?;
+        let before = page.page().clone();
+        let mut node = decode_index_catalog(page.page().single_payload(PageType::IndexCatalog)?)?;
+        drop(page);
+        node.next_index_id = Some(snapshot.next_index_id);
+        self.write_catalog_node_in(transaction, self.index_catalog_root, before, node)?;
+
+        for index in &snapshot.active {
+            let (column_position, spec) =
+                self.validate_index_creation(index.name.as_ref(), index.column_id)?;
+            transaction.building_indexes.insert(index.id);
+            let handle = self
+                .btree()
+                .create_owned_in(transaction, spec.clone(), index.id)?;
+            let definition = IndexDefinition {
+                id: index.id,
+                name: index.name.clone(),
+                column_id: index.column_id,
+                handle,
+            };
+            self.append_index_definition(transaction, &definition)?;
+            self.publish_committed_index_plan(RegisteredIndexPlan {
+                definition,
+                column_position,
+                spec,
+            });
+        }
+        Ok(())
     }
 
     fn build_index_in(

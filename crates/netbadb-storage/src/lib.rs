@@ -43,9 +43,9 @@ pub use recovery::{
     RecoveryError,
 };
 pub use table::{
-    AccessPathCapabilities, HeapResourceComponent, HeapResourceComponentKind,
-    StorageAccessCostHints, StorageAccessPath, StorageKind, StorageReadView, StorageRowHandle,
-    StorageTransaction, TableStorage, heap_resource_components,
+    AccessPathCapabilities, HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex,
+    HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath, StorageKind, StorageReadView,
+    StorageRowHandle, StorageTransaction, TableStorage, heap_resource_components,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};

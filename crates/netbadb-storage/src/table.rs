@@ -15,6 +15,22 @@ use crate::{
     StorageError, Transaction, TransactionError, TransactionState,
 };
 
+/// Logical index identity copied into a private replacement Heap.
+/// Physical BTree handles are intentionally replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapRewriteIndex {
+    pub id: IndexId,
+    pub name: Option<IndexName>,
+    pub column_id: ColumnId,
+}
+
+/// Active index inventory plus its durable allocation boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapRewriteIndexes {
+    pub active: Vec<HeapRewriteIndex>,
+    pub next_index_id: IndexId,
+}
+
 /// One exact file owned by a single Heap storage resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeapResourceComponentKind {
@@ -1169,6 +1185,38 @@ impl TableStorage {
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    /// Captures only logical active indexes and the authoritative high-water.
+    pub fn heap_rewrite_indexes(&mut self) -> Result<HeapRewriteIndexes, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.rewrite_indexes(),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "snapshot Heap indexes for schema rewrite",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    /// Installs empty replacement trees before streaming row copy.
+    pub fn install_heap_rewrite_indexes_in(
+        &mut self,
+        transaction: &mut StorageTransaction,
+        snapshot: &HeapRewriteIndexes,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                storage.install_rewrite_indexes_in(
+                    transaction.heap_transaction_mut(table_id)?,
+                    snapshot,
+                )
+            }
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "install Heap indexes for schema rewrite",
                 storage_kind: "LSM",
             }),
         }
