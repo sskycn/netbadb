@@ -212,3 +212,16 @@ complete histories. Replay rejects GC before retained DROP winner, complete
 without intent, duplicates, truncated horizon/digest, a horizon older than the
 DROP transaction and unknown tags. The existing bounded target and 1,000-run
 command remain authoritative; no new fuzz-only production decoder is added.
+
+## Round 24 Heap schema rewrite records
+
+`schema_mutation_decode` retains the NBSJ/NBSR v1 envelope and adds reviewed
+rewrite reservation, intent, loser, winner and truncated histories. The intent
+contains a bounded typed operation plus exact base/target NBSC v1 fragments.
+Replay verifies same TableId, distinct StorageIds, optional ADD ColumnId,
+checked version/generation/epoch successors, canonical fingerprints, Single Heap
+placement, allocator floors and terminal ordering. The existing 16 MiB harness
+bound and 1,000-run command remain authoritative; no new persistent format or
+fuzz-only decoder is introduced. Run all thirteen registered targets because
+Heap rewrite also relies on the existing catalog, coordinator, page, BTree,
+IndexCatalog and WAL decoders.

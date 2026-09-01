@@ -5,6 +5,11 @@ prepared DDL, Core mutation, storage rewrite, catalog-write, Protocol, or
 PostgreSQL `ALTER TABLE` production path. The target below is therefore a design
 contract for a later implementation, not a supported feature.
 
+Round 24 subsequently implements that typed Core Single-Heap rewrite contract;
+see [Core Heap schema rewrite foundation](core-heap-schema-rewrite-round24.md).
+This document remains the evidence and alternatives audit, not current support
+documentation. SQL and PostgreSQL `ALTER TABLE` remain unsupported.
+
 ## 1. Commits / integration
 
 Round 23 is intentionally limited to this audit, current-state regression tests,

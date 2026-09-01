@@ -378,11 +378,15 @@ impl Database {
     /// Use table_schema_version to distinguish absence; this is not allocation.
     #[must_use]
     pub fn next_column_id(&self, id: TableId) -> Option<ColumnId> {
-        self.committed
+        let floor = self
+            .committed
             .tables
             .iter()
             .find(|t| t.table_id == id)
-            .and_then(|t| t.next_column_id)
+            .and_then(|t| t.next_column_id);
+        self.mutation_journal.as_ref().map_or(floor, |journal| {
+            journal.borrow().effective_column(id, floor)
+        })
     }
     #[must_use]
     pub fn next_storage_id(&self) -> Option<StorageId> {
@@ -687,6 +691,7 @@ fn open_authority(
             .reservations
             .keys()
             .chain(journal.drops.keys())
+            .chain(journal.rewrite_reservations.keys())
             .max()
         {
             let next =
@@ -902,7 +907,11 @@ pub(crate) fn recover_physical(
     let coordinator_locator = snapshot.coordinator.as_ref().or_else(|| {
         journal
             .as_ref()
-            .filter(|j| !j.reservations.is_empty() || !j.drops.is_empty())
+            .filter(|j| {
+                !j.reservations.is_empty()
+                    || !j.drops.is_empty()
+                    || !j.rewrite_reservations.is_empty()
+            })
             .map(|j| &j.coordinator)
     });
     let retired_storage_ids = journal
@@ -914,6 +923,13 @@ pub(crate) fn recover_physical(
                 .values()
                 .filter(|drop| drop.retired && drop.resolved == Some(true))
                 .map(crate::schema_mutation_journal::DropIntent::storage)
+                .chain(
+                    journal
+                        .rewrites
+                        .values()
+                        .filter(|rewrite| rewrite.retired)
+                        .map(crate::schema_mutation_journal::RewriteIntent::old_storage),
+                )
         })
         .collect::<Vec<_>>();
     let coordinator = coordinator_locator.map(|p| {

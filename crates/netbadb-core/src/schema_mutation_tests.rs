@@ -7,10 +7,867 @@ use netbadb_types::{
 };
 
 use crate::{
-    CreateColumnSpec, CreateTableSpec, Database, DatabaseCoordinatorConfig, ExecutionResult,
-    RetiredHeapGcState, RetiredTableResource, SchemaGeneration, SchemaMutationError,
-    TableSchemaVersion, TableStorageCreateSpec, TransactionState,
+    AlterTableOperation, AlterTableSpec, CreateColumnSpec, CreateTableSpec, Database,
+    DatabaseCoordinatorConfig, ExecutionResult, RetiredHeapGcState, RetiredTableResource,
+    SchemaGeneration, SchemaMutationError, TableSchemaVersion, TableStorageCreateSpec,
+    TransactionState,
 };
+
+#[test]
+fn heap_schema_rewrite_add_nullable_preserves_identity_indexes_and_same_txn_dml() {
+    let root = root("rewrite-add-basic");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![
+                    CreateColumnSpec::new("id", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("name", SemanticType::physical(PhysicalType::Text), true),
+                ],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects (id, name) VALUES (1, 'one')")
+        .unwrap();
+    db.execute("INSERT INTO projects (id, name) VALUES (2, NULL)")
+        .unwrap();
+    db.execute("INSERT INTO projects (id, name) VALUES (9, 'dead')")
+        .unwrap();
+    db.execute("UPDATE projects SET name = 'one-updated' WHERE id = 1")
+        .unwrap();
+    db.execute("DELETE FROM projects WHERE id = 9").unwrap();
+    let index = db
+        .create_named_index(
+            IndexName::new("projects_id_idx").unwrap(),
+            table,
+            ColumnId(1),
+        )
+        .unwrap();
+    db.analyze(table).unwrap();
+    let analyzed = db
+        .inspect_catalog()
+        .unwrap()
+        .tables
+        .into_iter()
+        .find(|entry| entry.table_id == table)
+        .unwrap();
+    assert!(analyzed.statistics.is_some());
+    assert!(analyzed.indexes[0].statistics.is_some());
+    let old_storage = db.bindings.resolve_single(table).unwrap();
+    let old_fingerprint = db
+        .schema()
+        .table("projects")
+        .unwrap()
+        .fingerprint()
+        .unwrap();
+    let target = db.resolve_alter_table("projects").unwrap();
+    let mut alter = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut alter,
+        AlterTableSpec::new(
+            target,
+            AlterTableOperation::AddNullableColumn {
+                name: "active".into(),
+                data_type: SemanticType::physical(PhysicalType::Bool),
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(db.next_column_id(table), Some(ColumnId(4)));
+    assert_eq!(
+        rows(
+            db.execute_in(
+                &mut alter,
+                "SELECT id, name, active FROM projects ORDER BY id"
+            )
+            .unwrap()
+        ),
+        vec![
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("one-updated".into()),
+                ScalarValue::Null
+            ],
+            vec![ScalarValue::Int64(2), ScalarValue::Null, ScalarValue::Null],
+        ]
+    );
+    db.execute_in(
+        &mut alter,
+        "INSERT INTO projects (id, name, active) VALUES (3, 'three', true)",
+    )
+    .unwrap();
+    db.commit_transaction(&mut alter).unwrap();
+    drop(alter);
+    assert_eq!(
+        db.bindings.resolve_single(table).unwrap(),
+        StorageId(old_storage.0 + 1)
+    );
+    assert_eq!(db.table_schema_version(table), Some(TableSchemaVersion(2)));
+    assert_ne!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .fingerprint()
+            .unwrap(),
+        old_fingerprint
+    );
+    assert_eq!(db.indexes(table).unwrap()[0].id, index.id);
+    let rewritten = db
+        .inspect_catalog()
+        .unwrap()
+        .tables
+        .into_iter()
+        .find(|entry| entry.table_id == table)
+        .unwrap();
+    assert_eq!(rewritten.statistics, None);
+    assert_eq!(rewritten.indexes[0].statistics, None);
+    assert_eq!(
+        db.query("SELECT id, active FROM projects ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![ScalarValue::Int64(1), ScalarValue::Null],
+            vec![ScalarValue::Int64(2), ScalarValue::Null],
+            vec![ScalarValue::Int64(3), ScalarValue::Bool(true)],
+        ]
+    );
+    db.close().unwrap();
+    let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(
+        reopened.table_schema_version(table),
+        Some(TableSchemaVersion(2))
+    );
+    assert_eq!(reopened.indexes(table).unwrap()[0].id, index.id);
+    assert_eq!(
+        reopened
+            .query("SELECT id, active FROM projects ORDER BY id")
+            .unwrap()
+            .rows
+            .len(),
+        3
+    );
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn heap_schema_rewrite_rollback_burns_storage_and_column_ids_and_discards_target_dml() {
+    let root = root("rewrite-rollback-gaps");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![
+                    CreateColumnSpec::new("id", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("name", SemanticType::physical(PhysicalType::Text), true),
+                ],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects VALUES (1, 'one')")
+        .unwrap();
+    let old_storage = db.bindings.resolve_single(table).unwrap();
+    assert_eq!(db.next_column_id(table), Some(ColumnId(3)));
+    let first_storage = db.next_storage_id().unwrap();
+    let mut loser = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut loser,
+        AlterTableSpec::new(
+            db.resolve_alter_table("projects").unwrap(),
+            AlterTableOperation::AddNullableColumn {
+                name: "loser".into(),
+                data_type: SemanticType::physical(PhysicalType::Bool),
+            },
+        ),
+    )
+    .unwrap();
+    db.execute_in(
+        &mut loser,
+        "INSERT INTO projects (id, name, loser) VALUES (2, 'private', true)",
+    )
+    .unwrap();
+    loser.rollback().unwrap();
+    drop(loser);
+    assert_eq!(db.bindings.resolve_single(table).unwrap(), old_storage);
+    assert_eq!(db.next_storage_id(), Some(StorageId(first_storage.0 + 1)));
+    assert_eq!(db.next_column_id(table), Some(ColumnId(4)));
+    assert_eq!(
+        db.query("SELECT id, name FROM projects").unwrap().rows,
+        vec![vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())]]
+    );
+
+    let mut winner = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut winner,
+        AlterTableSpec::new(
+            db.resolve_alter_table("projects").unwrap(),
+            AlterTableOperation::AddNullableColumn {
+                name: "winner".into(),
+                data_type: SemanticType::physical(PhysicalType::Bool),
+            },
+        ),
+    )
+    .unwrap();
+    db.commit_transaction(&mut winner).unwrap();
+    drop(winner);
+    assert_eq!(
+        db.bindings.resolve_single(table).unwrap(),
+        StorageId(first_storage.0 + 1)
+    );
+    assert_eq!(
+        db.schema().table("projects").unwrap().columns[2].id,
+        ColumnId(4)
+    );
+    assert_eq!(db.next_column_id(table), Some(ColumnId(5)));
+    assert_eq!(db.next_storage_id(), Some(StorageId(first_storage.0 + 2)));
+    db.close().unwrap();
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(reopened.next_column_id(table), Some(ColumnId(5)));
+    assert_eq!(
+        reopened.next_storage_id(),
+        Some(StorageId(first_storage.0 + 2))
+    );
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn heap_schema_rewrite_preserves_sparse_index_identity_and_high_water() {
+    let root = root("rewrite-index-high-water");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![
+                    CreateColumnSpec::new("a", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("b", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("c", SemanticType::physical(PhysicalType::Int64), false),
+                ],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects VALUES (1, 2, 3)").unwrap();
+    let first = db.create_index(table, ColumnId(1)).unwrap();
+    db.drop_index(table, first.id).unwrap();
+    let second = db.create_index(table, ColumnId(2)).unwrap();
+    assert_eq!(first.id.0 + 1, second.id.0);
+    let mut rewrite = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut rewrite,
+        AlterTableSpec::new(
+            db.resolve_alter_table("projects").unwrap(),
+            AlterTableOperation::RenameColumn {
+                column_id: ColumnId(3),
+                new_name: "renamed_c".into(),
+            },
+        ),
+    )
+    .unwrap();
+    db.commit_transaction(&mut rewrite).unwrap();
+    drop(rewrite);
+    assert_eq!(db.indexes(table).unwrap()[0].id, second.id);
+    let third = db.create_index(table, ColumnId(1)).unwrap();
+    assert_eq!(second.id.0 + 1, third.id.0);
+    assert_eq!(
+        db.query("SELECT a FROM projects WHERE b = 2").unwrap().rows,
+        vec![vec![ScalarValue::Int64(1)]]
+    );
+    db.close().unwrap();
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(
+        reopened
+            .indexes(table)
+            .unwrap()
+            .iter()
+            .map(|index| index.id)
+            .collect::<Vec<_>>(),
+        vec![second.id, third.id]
+    );
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_identity() {
+    let root = root("rewrite-all-operations");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![
+                    CreateColumnSpec::new("id", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("name", SemanticType::physical(PhysicalType::Text), true),
+                    CreateColumnSpec::new("flag", SemanticType::physical(PhysicalType::Bool), true),
+                    CreateColumnSpec::new(
+                        "code",
+                        SemanticType::named("UserId", PhysicalType::Int64),
+                        true,
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects VALUES (1, 'one', true, 11)")
+        .unwrap();
+    db.execute("INSERT INTO projects VALUES (2, 'two', false, 22)")
+        .unwrap();
+    let index = db
+        .create_named_index(
+            IndexName::new("projects_id_idx").unwrap(),
+            table,
+            ColumnId(1),
+        )
+        .unwrap();
+    let unrelated = db.prepare_statement("SELECT id FROM teams", &[]).unwrap();
+    let stale = db
+        .prepare_statement("SELECT id FROM projects", &[])
+        .unwrap();
+    let initial_storage = db.bindings.resolve_single(table).unwrap();
+    let mut current_name = "projects".to_owned();
+    let mut expected_rows = 2;
+    let operations = vec![
+        AlterTableOperation::RenameTable {
+            new_name: "work".into(),
+        },
+        AlterTableOperation::RenameColumn {
+            column_id: ColumnId(2),
+            new_name: "title".into(),
+        },
+        AlterTableOperation::AddNullableColumn {
+            name: "extra".into(),
+            data_type: SemanticType::physical(PhysicalType::Bool),
+        },
+        AlterTableOperation::DropColumn {
+            column_id: ColumnId(3),
+        },
+        AlterTableOperation::SetNotNull {
+            column_id: ColumnId(2),
+        },
+        AlterTableOperation::DropNotNull {
+            column_id: ColumnId(1),
+        },
+        AlterTableOperation::ChangeNominalType {
+            column_id: ColumnId(4),
+            target_type: SemanticType::named("AccountId", PhysicalType::Int64),
+        },
+    ];
+    for (position, operation) in operations.into_iter().enumerate() {
+        let before = db.bindings.resolve_single(table).unwrap();
+        let target = db.resolve_alter_table(&current_name).unwrap();
+        let old_prepared = db
+            .prepare_statement(&format!("SELECT id FROM {current_name}"), &[])
+            .unwrap();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.rewrite_heap_table_schema_in(
+            &mut transaction,
+            AlterTableSpec::new(target, operation.clone()),
+        )
+        .unwrap();
+        if matches!(operation, AlterTableOperation::RenameTable { .. }) {
+            current_name = "work".into();
+            assert!(
+                db.prepare_statement_in(&transaction, "SELECT id FROM projects", &[])
+                    .is_err()
+            );
+        }
+        assert!(
+            db.execute_prepared_in(&mut transaction, &old_prepared, &[])
+                .is_err()
+        );
+        assert_eq!(
+            rows(
+                db.execute_in(
+                    &mut transaction,
+                    &format!("SELECT id FROM {current_name} ORDER BY id")
+                )
+                .unwrap()
+            )
+            .len(),
+            expected_rows
+        );
+        if matches!(operation, AlterTableOperation::DropNotNull { .. }) {
+            db.execute_in(
+                &mut transaction,
+                "INSERT INTO work (id, title, code, extra) VALUES (NULL, 'null-id', 33, NULL)",
+            )
+            .unwrap();
+            expected_rows += 1;
+        }
+        db.commit_transaction(&mut transaction).unwrap();
+        drop(transaction);
+        let after = db.bindings.resolve_single(table).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(after.0, initial_storage.0 + position as u64 + 1);
+        assert_eq!(
+            db.table_schema_version(table),
+            Some(TableSchemaVersion(position as u64 + 2))
+        );
+        assert_eq!(db.indexes(table).unwrap()[0].id, index.id);
+    }
+    assert!(db.execute_prepared(&stale, &[]).is_err());
+    assert_eq!(
+        rows(db.execute_prepared(&unrelated, &[]).unwrap()),
+        vec![vec![ScalarValue::Int64(2)]]
+    );
+    let final_table = db.schema().table("work").unwrap();
+    assert_eq!(final_table.id, table);
+    assert_eq!(final_table.column_by_id(ColumnId(2)).unwrap().name, "title");
+    assert!(final_table.column_by_id(ColumnId(3)).is_none());
+    assert_eq!(final_table.column_by_id(ColumnId(5)).unwrap().name, "extra");
+    assert!(final_table.column_by_id(ColumnId(1)).unwrap().nullable);
+    assert!(!final_table.column_by_id(ColumnId(2)).unwrap().nullable);
+    assert_eq!(
+        final_table
+            .column_by_id(ColumnId(4))
+            .unwrap()
+            .semantic_type(),
+        SemanticType::named("AccountId", PhysicalType::Int64)
+    );
+    assert_eq!(db.inspect_replacement_retired_heaps().len(), 7);
+    let retained = db.inspect_replacement_retired_heaps()[0].clone();
+    assert!(matches!(
+        db.gc_replacement_retired_heap(&retained),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::ReplacementRetirementGcUnsupported
+        ))
+    ));
+    assert_eq!(db.inspect_replacement_retired_heaps().len(), 7);
+    assert_eq!(
+        db.query("SELECT id FROM work WHERE id = 2").unwrap().rows,
+        vec![vec![ScalarValue::Int64(2)]]
+    );
+    db.close().unwrap();
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(reopened.schema().table("work").unwrap().id, table);
+        assert_eq!(
+            reopened.table_schema_version(table),
+            Some(TableSchemaVersion(8))
+        );
+        assert_eq!(reopened.indexes(table).unwrap()[0].id, index.id);
+        assert_eq!(reopened.inspect_replacement_retired_heaps().len(), 7);
+        assert_eq!(reopened.query("SELECT id FROM work").unwrap().rows.len(), 3);
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_null() {
+    let root = root("rewrite-rejections");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![
+                    CreateColumnSpec::new("id", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("name", SemanticType::physical(PhysicalType::Text), true),
+                ],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects VALUES (1, NULL)").unwrap();
+    db.create_index(table, ColumnId(1)).unwrap();
+
+    let before_storage = db.next_storage_id();
+    let before_column = db.next_column_id(table);
+    let target = db.resolve_alter_table("projects").unwrap();
+    let mut stale = target.clone();
+    stale.table_version = TableSchemaVersion(stale.table_version.0 + 1);
+    let mut stale_txn = db.begin_transaction().unwrap();
+    assert!(matches!(
+        db.rewrite_heap_table_schema_in(
+            &mut stale_txn,
+            AlterTableSpec::new(
+                stale,
+                AlterTableOperation::RenameTable {
+                    new_name: "work".into()
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::StaleSchemaDependency
+        ))
+    ));
+    stale_txn.rollback().unwrap();
+    drop(stale_txn);
+
+    let mut no_op = db.begin_transaction().unwrap();
+    assert!(matches!(
+        db.rewrite_heap_table_schema_in(
+            &mut no_op,
+            AlterTableSpec::new(
+                target.clone(),
+                AlterTableOperation::RenameTable {
+                    new_name: "projects".into()
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::InvalidSchemaEvolution(_)
+        ))
+    ));
+    no_op.rollback().unwrap();
+    drop(no_op);
+
+    let mut conversion = db.begin_transaction().unwrap();
+    assert!(matches!(
+        db.rewrite_heap_table_schema_in(
+            &mut conversion,
+            AlterTableSpec::new(
+                target.clone(),
+                AlterTableOperation::ChangeNominalType {
+                    column_id: ColumnId(1),
+                    target_type: SemanticType::physical(PhysicalType::Text),
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedSchemaEvolution
+        ))
+    ));
+    conversion.rollback().unwrap();
+    drop(conversion);
+    assert_eq!(db.next_storage_id(), before_storage);
+    assert_eq!(db.next_column_id(table), before_column);
+
+    let mut read_first = db.begin_transaction().unwrap();
+    db.execute_in(&mut read_first, "SELECT id FROM projects")
+        .unwrap();
+    assert!(matches!(
+        db.rewrite_heap_table_schema_in(
+            &mut read_first,
+            AlterTableSpec::new(
+                target.clone(),
+                AlterTableOperation::RenameTable {
+                    new_name: "work".into()
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::TransactionNotPristine
+        ))
+    ));
+    read_first.rollback().unwrap();
+    drop(read_first);
+    assert_eq!(db.next_storage_id(), before_storage);
+    assert_eq!(db.next_column_id(table), before_column);
+
+    let mut indexed_drop = db.begin_transaction().unwrap();
+    assert!(matches!(
+        db.rewrite_heap_table_schema_in(
+            &mut indexed_drop,
+            AlterTableSpec::new(
+                target.clone(),
+                AlterTableOperation::DropColumn {
+                    column_id: ColumnId(1)
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::IndexedColumn(ColumnId(1))
+        ))
+    ));
+    indexed_drop.rollback().unwrap();
+    drop(indexed_drop);
+    assert_eq!(db.next_storage_id(), before_storage);
+
+    let failed_storage = db.next_storage_id().unwrap();
+    let mut not_null = db.begin_transaction().unwrap();
+    assert!(matches!(
+        db.rewrite_heap_table_schema_in(
+            &mut not_null,
+            AlterTableSpec::new(
+                target,
+                AlterTableOperation::SetNotNull {
+                    column_id: ColumnId(2)
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::NotNullViolation(ColumnId(2))
+        ))
+    ));
+    not_null.rollback().unwrap();
+    assert_eq!(db.next_storage_id(), Some(StorageId(failed_storage.0 + 1)));
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column_by_id(ColumnId(2))
+            .unwrap()
+            .nullable
+    );
+    assert_eq!(
+        db.query("SELECT id, name FROM projects").unwrap().rows,
+        vec![vec![ScalarValue::Int64(1), ScalarValue::Null]]
+    );
+    db.close().unwrap();
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(
+        reopened.next_storage_id(),
+        Some(StorageId(failed_storage.0 + 1))
+    );
+    assert_eq!(
+        reopened.table_schema_version(table),
+        Some(TableSchemaVersion(1))
+    );
+    assert!(reopened.inspect_replacement_retired_heaps().is_empty());
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn heap_schema_rewrite_rejects_bootstrap_lsm_and_range_placements_before_reservation() {
+    let bootstrap_root = root("rewrite-bootstrap-rejection");
+    let mut bootstrap = seed(&bootstrap_root, true);
+    let target = bootstrap.resolve_alter_table("users").unwrap();
+    let before_storage = bootstrap.next_storage_id();
+    let mut transaction = bootstrap.begin_transaction().unwrap();
+    assert!(matches!(
+        bootstrap.rewrite_heap_table_schema_in(
+            &mut transaction,
+            AlterTableSpec::new(
+                target,
+                AlterTableOperation::RenameTable {
+                    new_name: "people".into()
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedPlacement
+        ))
+    ));
+    assert_eq!(bootstrap.next_storage_id(), before_storage);
+    assert!(!bootstrap_root.join("catalog.mutations").exists());
+    transaction.rollback().unwrap();
+    drop(transaction);
+    bootstrap.close().unwrap();
+
+    let lsm_root = root("rewrite-lsm-rejection");
+    let mut lsm = Database::create_catalog(
+        lsm_root.join("catalog"),
+        vec![TableStorageCreateSpec::lsm(
+            lsm_root.join("rows.lsm"),
+            old_table(1, "rows"),
+            ColumnId(1),
+        )],
+        Some(DatabaseCoordinatorConfig::new(lsm_root.join("coordinator"))),
+    )
+    .unwrap();
+    let target = lsm.resolve_alter_table("rows").unwrap();
+    let before_storage = lsm.next_storage_id();
+    let mut transaction = lsm.begin_transaction().unwrap();
+    assert!(matches!(
+        lsm.rewrite_heap_table_schema_in(
+            &mut transaction,
+            AlterTableSpec::new(
+                target,
+                AlterTableOperation::RenameTable {
+                    new_name: "records".into()
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedPlacement
+        ))
+    ));
+    assert_eq!(lsm.next_storage_id(), before_storage);
+    assert!(!lsm_root.join("catalog.mutations").exists());
+    transaction.rollback().unwrap();
+    drop(transaction);
+    lsm.close().unwrap();
+
+    let range_root = root("rewrite-range-rejection");
+    let mut range = Database::create_catalog_with_placements(
+        range_root.join("catalog"),
+        vec![crate::TablePlacementSpec::range_partitioned(
+            old_table(1, "events"),
+            ColumnId(1),
+            vec![crate::RangePartitionSpec::new(
+                netbadb_types::PartitionId(1),
+                range_root.join("events.heap"),
+                None,
+                None,
+            )],
+        )],
+        crate::PartitionCatalogConfig::new(
+            range_root.join("partitions"),
+            range_root.join("coordinator"),
+        ),
+    )
+    .unwrap();
+    let target = range.resolve_alter_table("events").unwrap();
+    let before_storage = range.next_storage_id();
+    let mut transaction = range.begin_transaction().unwrap();
+    assert!(matches!(
+        range.rewrite_heap_table_schema_in(
+            &mut transaction,
+            AlterTableSpec::new(
+                target,
+                AlterTableOperation::RenameTable {
+                    new_name: "history".into()
+                }
+            )
+        ),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedPlacement
+        ))
+    ));
+    assert_eq!(range.next_storage_id(), before_storage);
+    assert!(!range_root.join("catalog.mutations").exists());
+    transaction.rollback().unwrap();
+    drop(transaction);
+    range.close().unwrap();
+
+    std::fs::remove_dir_all(bootstrap_root).unwrap();
+    std::fs::remove_dir_all(lsm_root).unwrap();
+    std::fs::remove_dir_all(range_root).unwrap();
+}
+
+#[test]
+fn one_hundred_heap_schema_rewrites_preserve_identity_and_report_growth() {
+    let root = root("rewrite-one-hundred");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![CreateColumnSpec::new(
+                    "value_a",
+                    SemanticType::physical(PhysicalType::Int64),
+                    false,
+                )],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects VALUES (7)").unwrap();
+    let initial_storage = db.bindings.resolve_single(table).unwrap();
+    let journal_before = std::fs::metadata(root.join("catalog.mutations"))
+        .unwrap()
+        .len();
+    let coordinator_before = std::fs::metadata(root.join("coordinator")).unwrap().len();
+
+    let mut current_name = "value_a";
+    for iteration in 0..100 {
+        let next_name = if current_name == "value_a" {
+            "value_b"
+        } else {
+            "value_a"
+        };
+        let target = db.resolve_alter_table("projects").unwrap();
+        let column_id = db.resolve_alter_column(&target, current_name).unwrap();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.rewrite_heap_table_schema_in(
+            &mut transaction,
+            AlterTableSpec::new(
+                target,
+                AlterTableOperation::RenameColumn {
+                    column_id,
+                    new_name: next_name.into(),
+                },
+            ),
+        )
+        .unwrap();
+        db.commit_transaction(&mut transaction).unwrap();
+        drop(transaction);
+        current_name = next_name;
+        assert_eq!(
+            db.table_schema_version(table),
+            Some(TableSchemaVersion(iteration + 2))
+        );
+    }
+
+    assert_eq!(table, TableId(3));
+    assert_eq!(
+        db.bindings.resolve_single(table).unwrap(),
+        StorageId(initial_storage.0 + 100)
+    );
+    assert_eq!(db.inspect_replacement_retired_heaps().len(), 100);
+    assert_eq!(
+        db.query(&format!("SELECT {current_name} FROM projects"))
+            .unwrap()
+            .rows,
+        vec![vec![ScalarValue::Int64(7)]]
+    );
+
+    let retained_bytes = db
+        .inspect_replacement_retired_heaps()
+        .iter()
+        .flat_map(|retired| {
+            netbadb_storage::heap_resource_components(crate::schema_catalog_file::resolve(
+                &root.join("catalog"),
+                &retired.old_relative_locator,
+            ))
+        })
+        .filter_map(|component| std::fs::metadata(component.path).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    let journal_after = std::fs::metadata(root.join("catalog.mutations"))
+        .unwrap()
+        .len();
+    let coordinator_after = std::fs::metadata(root.join("coordinator")).unwrap().len();
+    eprintln!(
+        "round24 rewrite stress: cycles=100 table={} initial_storage={} final_storage={} retained_heaps=100 retained_bytes={} nbsj_before={} nbsj_after={} nbsj_growth={} cord_before={} cord_after={} cord_growth={}",
+        table.0,
+        initial_storage.0,
+        initial_storage.0 + 100,
+        retained_bytes,
+        journal_before,
+        journal_after,
+        journal_after - journal_before,
+        coordinator_before,
+        coordinator_after,
+        coordinator_after - coordinator_before,
+    );
+    db.close().unwrap();
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            reopened.table_schema_version(table),
+            Some(TableSchemaVersion(101))
+        );
+        assert_eq!(reopened.inspect_replacement_retired_heaps().len(), 100);
+        assert_eq!(
+            reopened
+                .query(&format!("SELECT {current_name} FROM projects"))
+                .unwrap()
+                .rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 fn root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -1627,6 +2484,180 @@ fn subprocess_create_crash_matrix_reopens_three_times_with_exact_outcomes() {
     }
 }
 
+fn seed_rewrite_crash(root: &Path) {
+    let mut db = seed(root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut create,
+            CreateTableSpec::new(
+                "projects",
+                vec![
+                    CreateColumnSpec::new("id", SemanticType::physical(PhysicalType::Int64), false),
+                    CreateColumnSpec::new("name", SemanticType::physical(PhysicalType::Text), true),
+                ],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.execute("INSERT INTO projects VALUES (1, 'one')")
+        .unwrap();
+    db.execute("INSERT INTO projects VALUES (2, 'two')")
+        .unwrap();
+    db.create_named_index(
+        IndexName::new("projects_id_idx").unwrap(),
+        table,
+        ColumnId(1),
+    )
+    .unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn rewrite_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_REWRITE_CHILD_ROOT") else {
+        return;
+    };
+    let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut transaction,
+        AlterTableSpec::new(
+            db.resolve_alter_table("projects").unwrap(),
+            AlterTableOperation::AddNullableColumn {
+                name: "active".into(),
+                data_type: SemanticType::physical(PhysicalType::Bool),
+            },
+        ),
+    )
+    .unwrap();
+    if std::env::var("NETBADB_REWRITE_CRASH_POINT")
+        .unwrap_or_default()
+        .starts_with("rollback-")
+    {
+        transaction.rollback().unwrap();
+    } else {
+        db.commit_transaction(&mut transaction).unwrap();
+    }
+    panic!("configured rewrite crash hook was not reached");
+}
+
+fn spawn_rewrite(root: &Path, point: &str) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "schema_mutation_tests::rewrite_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_REWRITE_CHILD_ROOT", root)
+        .env("NETBADB_REWRITE_CRASH_POINT", point);
+    if point == "during-decision-append" || point == "after-decision-append" {
+        crate::coordinator_crash::configure_child(&mut command, "schema-rewrite", root, point);
+    }
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if point.contains("decision-append") {
+            87
+        } else {
+            90
+        }),
+        "{point}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn rewrite_outcome(root: &Path, winner: bool) {
+    for _ in 0..3 {
+        let mut db = Database::open_catalog(root.join("catalog")).unwrap();
+        let table = db.schema().table("projects").unwrap();
+        assert_eq!(table.id, TableId(3));
+        assert_eq!(
+            db.schema_generation(),
+            SchemaGeneration(if winner { 3 } else { 2 })
+        );
+        assert_eq!(
+            db.table_schema_version(table.id),
+            Some(TableSchemaVersion(if winner { 2 } else { 1 }))
+        );
+        assert_eq!(
+            db.bindings.resolve_single(table.id).unwrap(),
+            StorageId(if winner { 4 } else { 3 })
+        );
+        assert_eq!(db.next_storage_id(), Some(StorageId(5)));
+        assert_eq!(db.next_column_id(table.id), Some(ColumnId(4)));
+        assert_eq!(db.indexes(table.id).unwrap()[0].id.0, 1);
+        if winner {
+            assert_eq!(table.columns[2].id, ColumnId(3));
+            assert_eq!(db.inspect_replacement_retired_heaps().len(), 1);
+            assert_eq!(
+                db.query("SELECT id, active FROM projects ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![ScalarValue::Int64(1), ScalarValue::Null],
+                    vec![ScalarValue::Int64(2), ScalarValue::Null],
+                ]
+            );
+        } else {
+            assert_eq!(table.columns.len(), 2);
+            assert!(db.inspect_replacement_retired_heaps().is_empty());
+            assert_eq!(
+                db.query("SELECT id FROM projects ORDER BY id")
+                    .unwrap()
+                    .rows
+                    .len(),
+                2
+            );
+        }
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn subprocess_rewrite_crash_matrix_reopens_three_times_without_recopy() {
+    for (point, winner) in [
+        ("rewrite-reservation-durable", false),
+        ("rewrite-intent-durable", false),
+        ("rewrite-stage-first-file", false),
+        ("rewrite-before-index-install", false),
+        ("rewrite-stage-synced", false),
+        ("rewrite-first-row", false),
+        ("rewrite-mid-copy", false),
+        ("rewrite-copy-complete", false),
+        ("rewrite-indexes-complete", false),
+        ("participants-prepared", false),
+        ("prepared-catalog-written", false),
+        ("prepared-catalog-durable", false),
+        ("before-coordinator-decision", false),
+        ("during-decision-append", false),
+        ("after-decision-append", true),
+        ("coordinator-durable", true),
+        ("staged-heap-committed", true),
+        ("promotion-partial", true),
+        ("rewrite-promotion-complete", true),
+        ("rewrite-retirement-durable", true),
+        ("before-nbsc-publication", true),
+        ("during-nbsc-publication", true),
+        ("nbsc-state-durable", true),
+        ("rewrite-nbsc-durable", true),
+        ("before-memory-publish", true),
+        ("after-memory-publish", true),
+        ("before-api-return", true),
+        ("rollback-participants-durable", false),
+        ("rollback-cleanup", false),
+    ] {
+        eprintln!("rewrite crash point: {point}");
+        let root = root(&format!("rewrite-{point}"));
+        seed_rewrite_crash(&root);
+        spawn_rewrite(&root, point);
+        rewrite_outcome(&root, winner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn drop_crash_child() {
     let Ok(root) = std::env::var("NETBADB_DROP_CHILD_ROOT") else {
@@ -2237,9 +3268,105 @@ fn write_schema_mutation_fuzz_corpus() {
         retained.encode().unwrap(),
     )
     .unwrap();
+    let schema_drop_zero = std::fs::read(root.join("coordinator")).unwrap();
+
+    let mut rewrite_create = db.begin_transaction().unwrap();
+    db.create_heap_table_in(
+        &mut rewrite_create,
+        CreateTableSpec::new(
+            "rewrite_rows",
+            vec![CreateColumnSpec::new(
+                "id",
+                SemanticType::physical(PhysicalType::Int64),
+                false,
+            )],
+        ),
+    )
+    .unwrap();
+    db.commit_transaction(&mut rewrite_create).unwrap();
+    drop(rewrite_create);
+    let rewrite_target = db.resolve_alter_table("rewrite_rows").unwrap();
+    let mut rewrite_loser = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut rewrite_loser,
+        AlterTableSpec::new(
+            rewrite_target.clone(),
+            AlterTableOperation::AddNullableColumn {
+                name: "note".into(),
+                data_type: SemanticType::physical(PhysicalType::Text),
+            },
+        ),
+    )
+    .unwrap();
+    let mut rewrite_intent = db.mutation_journal.as_ref().unwrap().borrow().clone();
+    rewrite_intent.reservations.clear();
+    rewrite_intent.drops.clear();
+    normalize_rewrite_fuzz_journal(&mut rewrite_intent);
+    let rewrite_transaction = *rewrite_intent.rewrite_reservations.keys().next().unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-intent-v1"),
+        rewrite_intent.encode().unwrap(),
+    )
+    .unwrap();
+    let mut rewrite_reservation = rewrite_intent.clone();
+    rewrite_reservation.rewrites.clear();
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-reservation-v1"),
+        rewrite_reservation.encode().unwrap(),
+    )
+    .unwrap();
+    let rewrite_bytes = rewrite_intent.encode().unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-truncated-v1"),
+        &rewrite_bytes[..rewrite_bytes.len() - 11],
+    )
+    .unwrap();
+    rewrite_loser.rollback().unwrap();
+    drop(rewrite_loser);
+    let mut rewrite_loser_history = rewrite_reservation.clone();
+    rewrite_loser_history
+        .rewrite_losers
+        .insert(rewrite_transaction);
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-loser-v1"),
+        rewrite_loser_history.encode().unwrap(),
+    )
+    .unwrap();
+
+    let mut rewrite_winner = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut rewrite_winner,
+        AlterTableSpec::new(
+            rewrite_target,
+            AlterTableOperation::RenameColumn {
+                column_id: ColumnId(1),
+                new_name: "row_id".into(),
+            },
+        ),
+    )
+    .unwrap();
+    db.commit_transaction(&mut rewrite_winner).unwrap();
+    drop(rewrite_winner);
+    let mut rewrite_winner_history = db.mutation_journal.as_ref().unwrap().borrow().clone();
+    rewrite_winner_history.reservations.clear();
+    rewrite_winner_history.drops.clear();
+    let winner_transaction = *rewrite_winner_history.rewrites.keys().next_back().unwrap();
+    rewrite_winner_history
+        .rewrite_reservations
+        .retain(|transaction, _| *transaction == winner_transaction);
+    rewrite_winner_history
+        .rewrites
+        .retain(|transaction, _| *transaction == winner_transaction);
+    rewrite_winner_history.rewrite_losers.clear();
+    normalize_rewrite_fuzz_journal(&mut rewrite_winner_history);
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-winner-v1"),
+        rewrite_winner_history.encode().unwrap(),
+    )
+    .unwrap();
     std::fs::write(
         output.join("coordinator_log_decode/schema-drop-zero-v2"),
-        std::fs::read(root.join("coordinator")).unwrap(),
+        schema_drop_zero,
     )
     .unwrap();
     let reference = crate::coordinator_log::SchemaParticipantReference {
@@ -2284,6 +3411,23 @@ fn write_schema_mutation_fuzz_corpus() {
     drop(log);
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn normalize_rewrite_fuzz_journal(
+    journal: &mut crate::schema_mutation_journal::SchemaMutationJournal,
+) {
+    journal.incarnation = [24; 16];
+    journal.coordinator = "coordinator".into();
+    for rewrite in journal.rewrites.values_mut() {
+        rewrite.snapshot_digest = [24; 32];
+        for fragment in [&mut rewrite.base, &mut rewrite.target] {
+            fragment.incarnation = [24; 16];
+            fragment.coordinator = Some("coordinator".into());
+            for storage in &mut fragment.storages {
+                storage.locator = format!("resources/storage/{}.heap", storage.id.0);
+            }
+        }
+    }
 }
 
 #[test]

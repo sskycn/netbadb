@@ -106,9 +106,11 @@ private transaction schema/DML, coordinator-backed commit, and catalog-only reco
 adds exact-identity transactional Core Heap retirement, prepared-dependency
 invalidation, durable retained-resource inventory and deferred physical deletion.
 [Round 21](docs/sql-drop-table-round21.md) adds generic exact-prepared SQL
-`DROP TABLE name` over native and PostgreSQL frontends. `ALTER TABLE` remains
-unsupported; [Round 23](docs/schema-evolution-round23.md) documents the row-format
-audit and selected future staged Heap rewrite architecture.
+`DROP TABLE name` over native and PostgreSQL frontends. [Round 24](docs/core-heap-schema-rewrite-round24.md)
+implements the typed embedded Core foundation for transactional runtime-created
+Single Heap schema rewrites with the same TableId and a new StorageId. SQL and
+PostgreSQL `ALTER TABLE` syntax remain unsupported; [Round 23](docs/schema-evolution-round23.md)
+records the row-format audit that selected this architecture.
 
 ## Repository layout
 
@@ -305,7 +307,7 @@ without constraints/defaults. Network DDL requires explicit `schema_admin`; the
 creator can use its staged table only within the creating transaction, and receives
 no durable DML grant. Exact prepared `DROP TABLE name` is transactional and works
 through psql, psycopg, and SQLAlchemy `Table.drop(checkfirst=False)`; IF EXISTS,
-qualified/multi-table DROP, ALTER TABLE, general migration execution, a complete
+qualified/multi-table DROP, SQL ALTER TABLE, general migration execution, a complete
 `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
@@ -565,8 +567,10 @@ rollback restores visibility, and physical Heap/index resources remain retained
 until an explicit exact-resource Core GC proves the
 [Round 22 recovery horizon](docs/retired-heap-gc-round22.md). There is no
 background or SQL GC. IF EXISTS, CASCADE/RESTRICT, qualified/quoted or multiple
-targets, LSM/range DROP, and ALTER TABLE are unsupported. See the
-[Round 21 report](docs/sql-drop-table-round21.md).
+targets, LSM/range DROP, and SQL ALTER TABLE are unsupported. The embedded typed
+Core rewrite surface is documented separately in the
+[Round 24 report](docs/core-heap-schema-rewrite-round24.md); see also the
+[Round 21 DROP report](docs/sql-drop-table-round21.md).
 
 Mutation is located by an internal versioned physical `RowId` (`PageId +
 SlotId + u32 generation`) that is never exposed as a SQL column or treated as a

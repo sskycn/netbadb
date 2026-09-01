@@ -57,6 +57,11 @@ Every NBSR payload starts with tag u8 and nonzero DatabaseTxnId u64.
 | 8 | Resolved DROP winner | None |
 | 9 | RetiredHeapGcIntent | coordinator recovery horizon DatabaseTxnId u64, exact bundle SHA-256 `[u8;32]` |
 | 10 | RetiredHeapGcComplete | None |
+| 11 | HeapRewriteReserve | TableId u64, new StorageId u64, optional ADD ColumnId u32 (`0` means none), base SchemaGeneration u64, base snapshot epoch u64 |
+| 12 | HeapRewriteIntent | prepared NBSC SHA-256 `[u8;32]`, bounded typed operation, base-fragment length u32 + NBSC v1 fragment, target-fragment length u32 + NBSC v1 fragment |
+| 13 | Replacement Heap retained | None |
+| 14 | Resolved rewrite loser | None |
+| 15 | Resolved rewrite winner | None |
 
 A reservation consumes both IDs together; it is synchronized before intent or
 staged files. ColumnIds are deterministic 1..N; the intent persists these exact
@@ -95,6 +100,19 @@ identity and generated locator; tag 9 binds the greatest completed coordinator
 reference and deterministic component manifest. Tag 10 is invalid without tag
 9, duplicate tags are invalid, and tag 9 is invalid before durable retained
 winner state. Admission reserves capacity for both records before intent.
+
+A Heap rewrite reservation consumes a fresh StorageId and, only for ADD, one
+table-scoped ColumnId. The typed operation encodes only rename table, rename
+column, add nullable column, drop column, set/drop NOT NULL, and same-physical
+nominal-type change. Its fragments contain the same TableId on distinct old/new
+Single Heap StorageIds. Target version, generation and epoch must be checked
+successors; target canonical fingerprint must differ; allocator floors and the
+optional ADD reservation must agree. Replay reconstructs the target table from the
+base plus operation and rejects any mismatch, unsupported physical conversion,
+out-of-order retirement/resolution, winner before tag 13, loser after tag 13,
+duplicate retirement and truncation. A reservation-only crash may end directly in
+tag 14. Current readers accept pre-Round24 histories; older readers reject tags
+11–15, so downgrade after Heap rewrite is unsupported.
 
 ## Locators and ownership
 
@@ -162,6 +180,15 @@ only its exact component deletion; tag 10 requires every component to remain
 absent. A reappeared component is a hard conflict. Retired fragments never
 participate in active lookup or ordinary inspection.
 
+For rewrite winners, recovery promotes and resolves the exact staged replacement
+participant from the CORD decision, validates the immutable source Heap, persists
+tag 13 before NBSC publication, publishes the prepared target and then persists
+tag 15. It never recopies rows. Losers remove only exact private replacement
+artifacts and preserve the source. The active NBSC may contain the same TableId on
+the new StorageId while tag 13 retains the old StorageId; this state is distinct
+from DROP retirement and is exposed through a separate inspection API. Physical GC
+for replacement retirement is intentionally unsupported in Round 24.
+
 Dropping an unresolved schema handle requires reopen. Unknown/unlisted files are
 not garbage-collected. Startup does not choose GC candidates. Journal compaction
 and general aborted-resource GC are deferred. See
@@ -172,7 +199,8 @@ Deterministic seeds are produced by the ignored Core test
 output directory. `schema_mutation_decode` fuzzes nested framing and replay;
 `coordinator_log_decode` includes schema decision, zero-participant DROP decision,
 Complete and truncated v2 seeds. DROP seeds include intent, loser, retained, winner
-and truncated records.
+and truncated records. Round 24 adds rewrite reservation, intent, loser, winner and
+truncated histories to the same bounded target.
 
 An empty journal without its activation witness is an interrupted initialization,
 not reservation history. Read-only reopen preserves it; the next mutation completes

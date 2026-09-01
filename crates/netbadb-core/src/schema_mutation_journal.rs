@@ -1,12 +1,15 @@
 //! Ordered reservation/intention history; NBSC floors + this history are one allocator.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use netbadb_types::{DatabaseTxnId, SchemaGeneration, StorageId, TableId};
+use netbadb_schema::TypeSpec;
+use netbadb_types::{
+    ColumnId, DatabaseTxnId, PhysicalType, SchemaGeneration, SemanticType, StorageId, TableId,
+};
 
 use crate::schema_catalog::{Reader, SchemaCatalogSnapshot, Writer, envelope, open_envelope};
 use crate::schema_catalog_file as file;
-use crate::schema_mutation::SchemaMutationError;
+use crate::schema_mutation::{AlterTableOperation, SchemaMutationError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reservation {
@@ -41,6 +44,42 @@ pub(crate) struct DropIntent {
     pub(crate) gc: Option<RetiredHeapGcRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteReservation {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) table: TableId,
+    pub(crate) storage: StorageId,
+    pub(crate) column: Option<ColumnId>,
+    pub(crate) base_generation: SchemaGeneration,
+    pub(crate) base_epoch: u64,
+}
+
+/// Durable old/new logical and physical identity for one Heap replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteIntent {
+    pub(crate) reservation: RewriteReservation,
+    pub(crate) operation: AlterTableOperation,
+    pub(crate) base: SchemaCatalogSnapshot,
+    pub(crate) target: SchemaCatalogSnapshot,
+    pub(crate) snapshot_digest: [u8; 32],
+    pub(crate) retired: bool,
+    pub(crate) resolved: Option<bool>,
+}
+
+impl RewriteIntent {
+    pub(crate) fn old_storage(&self) -> StorageId {
+        self.base.storages[0].id
+    }
+
+    pub(crate) fn new_storage(&self) -> StorageId {
+        self.reservation.storage
+    }
+
+    pub(crate) fn table(&self) -> TableId {
+        self.reservation.table
+    }
+}
+
 /// Durable retry-only physical deletion state. The surrounding DropIntent
 /// already carries the exact database incarnation, table/version/fingerprint,
 /// StorageId, locator and retirement transaction.
@@ -68,6 +107,9 @@ pub(crate) struct SchemaMutationJournal {
     pub(crate) coordinator: String,
     pub(crate) reservations: BTreeMap<DatabaseTxnId, Reservation>,
     pub(crate) drops: BTreeMap<DatabaseTxnId, DropIntent>,
+    pub(crate) rewrite_reservations: BTreeMap<DatabaseTxnId, RewriteReservation>,
+    pub(crate) rewrites: BTreeMap<DatabaseTxnId, RewriteIntent>,
+    pub(crate) rewrite_losers: BTreeSet<DatabaseTxnId>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_sync: bool,
@@ -163,11 +205,23 @@ impl SchemaMutationJournal {
                 }
             }
         }
+        for rewrite in journal.rewrites.values() {
+            if rewrite.target.storages[0].locator
+                != final_locator(catalog, incarnation, rewrite.new_storage())?
+                || rewrite.base.storages[0].locator
+                    != final_locator(catalog, incarnation, rewrite.old_storage())?
+            {
+                return Err(corrupt("rewrite locator differs from physical identity"));
+            }
+        }
         if activated {
             if open_envelope(&file::read(&witness)?, b"NBSA")? != incarnation {
                 return Err(corrupt("mutation activation incarnation mismatch"));
             }
-        } else if !journal.reservations.is_empty() {
+        } else if !journal.reservations.is_empty()
+            || !journal.drops.is_empty()
+            || !journal.rewrite_reservations.is_empty()
+        {
             return Err(corrupt("reservation history has no activation witness"));
         }
         Ok(Some(journal))
@@ -192,6 +246,9 @@ impl SchemaMutationJournal {
                     coordinator,
                     reservations: BTreeMap::new(),
                     drops: BTreeMap::new(),
+                    rewrite_reservations: BTreeMap::new(),
+                    rewrites: BTreeMap::new(),
+                    rewrite_losers: BTreeSet::new(),
                     poisoned: false,
                     #[cfg(test)]
                     fail_next_sync: false,
@@ -252,6 +309,33 @@ impl SchemaMutationJournal {
         self.activate()
     }
 
+    pub(crate) fn prepare_rewrite(
+        &self,
+        reservation: &RewriteReservation,
+        intent: &RewriteIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.reservations.contains_key(&reservation.transaction)
+            || self.drops.contains_key(&reservation.transaction)
+            || self
+                .rewrite_reservations
+                .contains_key(&reservation.transaction)
+            || reservation != &intent.reservation
+        {
+            return Err(corrupt("duplicate or mismatched rewrite transaction"));
+        }
+        let mut complete = self.clone();
+        complete
+            .rewrite_reservations
+            .insert(reservation.transaction, reservation.clone());
+        let mut projected = intent.clone();
+        projected.retired = true;
+        projected.resolved = Some(true);
+        complete.rewrites.insert(reservation.transaction, projected);
+        complete.encode()?;
+        self.activate()
+    }
+
     pub(crate) fn prepare_gc(
         &self,
         txn: DatabaseTxnId,
@@ -295,9 +379,32 @@ impl SchemaMutationJournal {
         self.reservations
             .values()
             .map(|r| r.storage.0)
+            .chain(
+                self.rewrite_reservations
+                    .values()
+                    .map(|reservation| reservation.storage.0),
+            )
             .max()
             .map_or(Some(floor), |max| {
                 max.checked_add(1).map(|n| StorageId(n.max(floor.0)))
+            })
+    }
+    pub(crate) fn effective_column(
+        &self,
+        table: TableId,
+        floor: Option<ColumnId>,
+    ) -> Option<ColumnId> {
+        let floor = floor?;
+        self.rewrite_reservations
+            .values()
+            .filter(|reservation| reservation.table == table)
+            .filter_map(|reservation| reservation.column)
+            .map(|column| column.0)
+            .max()
+            .map_or(Some(floor), |maximum| {
+                maximum
+                    .checked_add(1)
+                    .map(|next| ColumnId(next.max(floor.0)))
             })
     }
     pub(crate) fn ensure_ready(&self) -> Result<(), SchemaMutationError> {
@@ -314,6 +421,95 @@ impl SchemaMutationJournal {
         }
         self.reservations
             .insert(reservation.transaction, reservation);
+        self.persist()
+    }
+    pub(crate) fn reserve_rewrite(
+        &mut self,
+        reservation: RewriteReservation,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.reservations.contains_key(&reservation.transaction)
+            || self.drops.contains_key(&reservation.transaction)
+            || self
+                .rewrite_reservations
+                .contains_key(&reservation.transaction)
+        {
+            return Err(corrupt("duplicate rewrite reservation"));
+        }
+        self.rewrite_reservations
+            .insert(reservation.transaction, reservation);
+        self.persist()
+    }
+    pub(crate) fn rewrite_intent(
+        &mut self,
+        intent: RewriteIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let reservation = self
+            .rewrite_reservations
+            .get(&intent.reservation.transaction)
+            .ok_or(corrupt("rewrite intent without reservation"))?;
+        if reservation != &intent.reservation
+            || self.rewrites.contains_key(&intent.reservation.transaction)
+            || self
+                .rewrite_losers
+                .contains(&intent.reservation.transaction)
+        {
+            return Err(corrupt("duplicate or mismatched rewrite intent"));
+        }
+        self.rewrites.insert(intent.reservation.transaction, intent);
+        self.persist()
+    }
+
+    pub(crate) fn retire_rewrite(&mut self, txn: DatabaseTxnId) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let intent = self
+            .rewrites
+            .get_mut(&txn)
+            .ok_or(corrupt("replacement retirement without rewrite intent"))?;
+        if intent.resolved == Some(false) {
+            return Err(corrupt("loser rewrite cannot retire source"));
+        }
+        if intent.retired {
+            return Ok(());
+        }
+        intent.retired = true;
+        self.persist()
+    }
+
+    pub(crate) fn resolve_rewrite(
+        &mut self,
+        txn: DatabaseTxnId,
+        committed: bool,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if !committed && !self.rewrites.contains_key(&txn) {
+            if !self.rewrite_reservations.contains_key(&txn) {
+                return Err(corrupt("rewrite resolution without reservation"));
+            }
+            if !self.rewrite_losers.insert(txn) {
+                return Ok(());
+            }
+            return self.persist();
+        }
+        let intent = self
+            .rewrites
+            .get_mut(&txn)
+            .ok_or(corrupt("rewrite winner without intent"))?;
+        if committed && !intent.retired {
+            return Err(corrupt("rewrite winner source is not durably retired"));
+        }
+        if !committed && intent.retired {
+            return Err(corrupt("retired rewrite cannot resolve as loser"));
+        }
+        if let Some(previous) = intent.resolved {
+            return if previous == committed {
+                Ok(())
+            } else {
+                Err(corrupt("conflicting rewrite resolution"))
+            };
+        }
+        intent.resolved = Some(committed);
         self.persist()
     }
     pub(crate) fn intent(
@@ -479,14 +675,32 @@ impl SchemaMutationJournal {
                     + usize::from(d.gc.as_ref().is_some_and(|gc| gc.complete))
             })
             .sum::<usize>();
+        let rewrite_count = self
+            .rewrite_reservations
+            .values()
+            .map(|reservation| {
+                1 + self
+                    .rewrites
+                    .get(&reservation.transaction)
+                    .map_or(0, |rewrite| {
+                        1 + usize::from(rewrite.retired) + usize::from(rewrite.resolved.is_some())
+                    })
+                    + usize::from(
+                        !self.rewrites.contains_key(&reservation.transaction)
+                            && self.rewrite_losers.contains(&reservation.transaction),
+                    )
+            })
+            .sum::<usize>();
         let count = create_count
             .checked_add(drop_count)
+            .and_then(|count| count.checked_add(rewrite_count))
             .ok_or(corrupt("too many journal records"))?;
         w.u32(u32::try_from(count).map_err(|_| corrupt("too many journal records"))?);
         let mut transactions = self
             .reservations
             .keys()
             .chain(self.drops.keys())
+            .chain(self.rewrite_reservations.keys())
             .copied()
             .collect::<Vec<_>>();
         transactions.sort_unstable();
@@ -541,6 +755,47 @@ impl SchemaMutationJournal {
                         put_record(&mut w, &record.0)?;
                     }
                 }
+            } else if let Some(reservation) = self.rewrite_reservations.get(&txn) {
+                let mut record = Writer(vec![11]);
+                record.u64(reservation.transaction.0);
+                record.u64(reservation.table.0);
+                record.u64(reservation.storage.0);
+                record.u32(reservation.column.map_or(0, |column| column.0));
+                record.u64(reservation.base_generation.0);
+                record.u64(reservation.base_epoch);
+                put_record(&mut w, &record.0)?;
+                if let Some(rewrite) = self.rewrites.get(&txn) {
+                    let mut record = Writer(vec![12]);
+                    record.u64(txn.0);
+                    record.0.extend_from_slice(&rewrite.snapshot_digest);
+                    encode_operation(&mut record, &rewrite.operation)?;
+                    let base = rewrite.base.encode()?;
+                    record.u32(
+                        u32::try_from(base.len()).map_err(|_| corrupt("rewrite base too large"))?,
+                    );
+                    record.0.extend_from_slice(&base);
+                    let target = rewrite.target.encode()?;
+                    record.u32(
+                        u32::try_from(target.len())
+                            .map_err(|_| corrupt("rewrite target too large"))?,
+                    );
+                    record.0.extend_from_slice(&target);
+                    put_record(&mut w, &record.0)?;
+                    if rewrite.retired {
+                        let mut record = Writer(vec![13]);
+                        record.u64(txn.0);
+                        put_record(&mut w, &record.0)?;
+                    }
+                    if let Some(committed) = rewrite.resolved {
+                        let mut record = Writer(vec![if committed { 15 } else { 14 }]);
+                        record.u64(txn.0);
+                        put_record(&mut w, &record.0)?;
+                    }
+                } else if self.rewrite_losers.contains(&txn) {
+                    let mut record = Writer(vec![14]);
+                    record.u64(txn.0);
+                    put_record(&mut w, &record.0)?;
+                }
             }
         }
         let bytes = envelope(b"NBSJ", &w.0)?;
@@ -567,6 +822,9 @@ impl SchemaMutationJournal {
         let count = reader.count(65536, 29)?;
         let mut reservations: BTreeMap<DatabaseTxnId, Reservation> = BTreeMap::new();
         let mut drops: BTreeMap<DatabaseTxnId, DropIntent> = BTreeMap::new();
+        let mut rewrite_reservations: BTreeMap<DatabaseTxnId, RewriteReservation> = BTreeMap::new();
+        let mut rewrites: BTreeMap<DatabaseTxnId, RewriteIntent> = BTreeMap::new();
+        let mut rewrite_losers = BTreeSet::new();
         let mut last = (0, 0, 0, 0, 0);
         let mut current = None;
         for _ in 0..count {
@@ -603,6 +861,11 @@ impl SchemaMutationJournal {
                             || drops
                                 .get(&previous)
                                 .is_some_and(|drop| drop.resolved.is_none())
+                            || rewrite_reservations.contains_key(&previous)
+                                && !rewrite_losers.contains(&previous)
+                                && rewrites
+                                    .get(&previous)
+                                    .is_none_or(|rewrite| rewrite.resolved.is_none())
                         {
                             return Err(corrupt("overlapping schema transactions"));
                         }
@@ -701,7 +964,12 @@ impl SchemaMutationJournal {
                             .is_some_and(|r| r.resolved.is_none());
                         let unresolved_drop =
                             drops.get(&previous).is_some_and(|d| d.resolved.is_none());
-                        if unresolved_create || unresolved_drop {
+                        let unresolved_rewrite = rewrite_reservations.contains_key(&previous)
+                            && !rewrite_losers.contains(&previous)
+                            && rewrites
+                                .get(&previous)
+                                .is_none_or(|rewrite| rewrite.resolved.is_none());
+                        if unresolved_create || unresolved_drop || unresolved_rewrite {
                             return Err(corrupt("overlapping schema transactions"));
                         }
                     }
@@ -812,6 +1080,128 @@ impl SchemaMutationJournal {
                     }
                     gc.complete = true;
                 }
+                11 => {
+                    let table = TableId(record.u64()?);
+                    let storage = StorageId(record.u64()?);
+                    let raw_column = record.u32()?;
+                    let column = (raw_column != 0).then_some(ColumnId(raw_column));
+                    let generation = SchemaGeneration(record.u64()?);
+                    let epoch = record.u64()?;
+                    if txn.0 <= last.0
+                        || table.0 == 0
+                        || storage.0 <= last.2
+                        || generation.0 == 0
+                        || generation.0 < last.3
+                        || epoch == 0
+                        || epoch < last.4
+                        || generation.0.checked_add(1).is_none()
+                        || epoch.checked_add(1).is_none()
+                    {
+                        return Err(corrupt("invalid or nonmonotonic rewrite reservation"));
+                    }
+                    if let Some(previous) = current {
+                        let unresolved_create = reservations
+                            .get(&previous)
+                            .is_some_and(|reservation| reservation.resolved.is_none());
+                        let unresolved_drop = drops
+                            .get(&previous)
+                            .is_some_and(|drop| drop.resolved.is_none());
+                        let unresolved_rewrite = rewrite_reservations.contains_key(&previous)
+                            && !rewrite_losers.contains(&previous)
+                            && rewrites
+                                .get(&previous)
+                                .is_none_or(|rewrite| rewrite.resolved.is_none());
+                        if unresolved_create || unresolved_drop || unresolved_rewrite {
+                            return Err(corrupt("overlapping schema transactions"));
+                        }
+                    }
+                    last = (txn.0, last.1.max(table.0), storage.0, generation.0, epoch);
+                    current = Some(txn);
+                    rewrite_reservations.insert(
+                        txn,
+                        RewriteReservation {
+                            transaction: txn,
+                            table,
+                            storage,
+                            column,
+                            base_generation: generation,
+                            base_epoch: epoch,
+                        },
+                    );
+                }
+                12 => {
+                    if current != Some(txn) || rewrites.contains_key(&txn) {
+                        return Err(corrupt("rewrite intent without current reservation"));
+                    }
+                    let reservation = rewrite_reservations
+                        .get(&txn)
+                        .cloned()
+                        .ok_or(corrupt("rewrite intent without reservation"))?;
+                    let snapshot_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("rewrite intent digest"))?;
+                    let operation = decode_operation(&mut record)?;
+                    let base_len = usize::try_from(record.u32()?)
+                        .map_err(|_| corrupt("rewrite base length overflow"))?;
+                    let base = SchemaCatalogSnapshot::decode(record.take(base_len)?)?;
+                    let target_len = usize::try_from(record.u32()?)
+                        .map_err(|_| corrupt("rewrite target length overflow"))?;
+                    let target = SchemaCatalogSnapshot::decode(record.take(target_len)?)?;
+                    validate_rewrite_fragments(
+                        &reservation,
+                        &operation,
+                        &base,
+                        &target,
+                        incarnation,
+                        &coordinator,
+                    )?;
+                    rewrites.insert(
+                        txn,
+                        RewriteIntent {
+                            reservation,
+                            operation,
+                            base,
+                            target,
+                            snapshot_digest,
+                            retired: false,
+                            resolved: None,
+                        },
+                    );
+                }
+                13 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("rewrite retirement for unknown transaction"));
+                    }
+                    let rewrite = rewrites
+                        .get_mut(&txn)
+                        .ok_or(corrupt("rewrite retirement without intent"))?;
+                    if rewrite.retired || rewrite.resolved.is_some() {
+                        return Err(corrupt("duplicate or out-of-order rewrite retirement"));
+                    }
+                    rewrite.retired = true;
+                }
+                14 | 15 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("rewrite resolution for unknown transaction"));
+                    }
+                    if tag == 14 && !rewrites.contains_key(&txn) {
+                        if !rewrite_reservations.contains_key(&txn) || !rewrite_losers.insert(txn) {
+                            return Err(corrupt("duplicate rewrite reservation loser"));
+                        }
+                    } else {
+                        let rewrite = rewrites
+                            .get_mut(&txn)
+                            .ok_or(corrupt("rewrite winner without intent"))?;
+                        if rewrite.resolved.is_some() || (tag == 15 && !rewrite.retired) {
+                            return Err(corrupt("duplicate or out-of-order rewrite resolution"));
+                        }
+                        if tag == 14 && rewrite.retired {
+                            return Err(corrupt("retired rewrite resolved as loser"));
+                        }
+                        rewrite.resolved = Some(tag == 15);
+                    }
+                }
                 _ => return Err(corrupt("unknown journal record tag")),
             }
             if !record.0.is_empty() {
@@ -830,12 +1220,26 @@ impl SchemaMutationJournal {
                 return Err(corrupt("duplicate storage retirement"));
             }
         }
+        for rewrite in rewrites.values().filter(|rewrite| rewrite.retired) {
+            if retired
+                .insert(rewrite.old_storage(), rewrite.table())
+                .is_some()
+            {
+                return Err(corrupt("duplicate storage retirement"));
+            }
+            if rewrite.old_storage() == rewrite.new_storage() {
+                return Err(corrupt("rewrite reuses old StorageId"));
+            }
+        }
         Ok(Self {
             path: PathBuf::new(),
             incarnation,
             coordinator,
             reservations,
             drops,
+            rewrite_reservations,
+            rewrites,
+            rewrite_losers,
             poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,
@@ -849,6 +1253,121 @@ fn allocator_predecessor(floor: Option<u64>) -> Result<u64, SchemaMutationError>
             .checked_sub(1)
             .ok_or(corrupt("zero allocator floor in drop intent")),
         None => Ok(u64::MAX),
+    }
+}
+
+fn encode_operation(
+    writer: &mut Writer,
+    operation: &AlterTableOperation,
+) -> Result<(), SchemaMutationError> {
+    match operation {
+        AlterTableOperation::RenameTable { new_name } => {
+            writer.u8(1);
+            writer.string(new_name)?;
+        }
+        AlterTableOperation::RenameColumn {
+            column_id,
+            new_name,
+        } => {
+            writer.u8(2);
+            writer.u32(column_id.0);
+            writer.string(new_name)?;
+        }
+        AlterTableOperation::AddNullableColumn { name, data_type } => {
+            writer.u8(3);
+            writer.string(name)?;
+            encode_semantic_type(writer, data_type)?;
+        }
+        AlterTableOperation::DropColumn { column_id } => {
+            writer.u8(4);
+            writer.u32(column_id.0);
+        }
+        AlterTableOperation::SetNotNull { column_id } => {
+            writer.u8(5);
+            writer.u32(column_id.0);
+        }
+        AlterTableOperation::DropNotNull { column_id } => {
+            writer.u8(6);
+            writer.u32(column_id.0);
+        }
+        AlterTableOperation::ChangeNominalType {
+            column_id,
+            target_type,
+        } => {
+            writer.u8(7);
+            writer.u32(column_id.0);
+            encode_semantic_type(writer, target_type)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_operation(reader: &mut Reader<'_>) -> Result<AlterTableOperation, SchemaMutationError> {
+    let column = |reader: &mut Reader<'_>| -> Result<ColumnId, SchemaMutationError> {
+        let id = ColumnId(reader.u32()?);
+        if id.0 == 0 {
+            return Err(corrupt("zero rewrite ColumnId"));
+        }
+        Ok(id)
+    };
+    Ok(match reader.u8()? {
+        1 => AlterTableOperation::RenameTable {
+            new_name: reader.string()?,
+        },
+        2 => AlterTableOperation::RenameColumn {
+            column_id: column(reader)?,
+            new_name: reader.string()?,
+        },
+        3 => AlterTableOperation::AddNullableColumn {
+            name: reader.string()?,
+            data_type: decode_semantic_type(reader)?,
+        },
+        4 => AlterTableOperation::DropColumn {
+            column_id: column(reader)?,
+        },
+        5 => AlterTableOperation::SetNotNull {
+            column_id: column(reader)?,
+        },
+        6 => AlterTableOperation::DropNotNull {
+            column_id: column(reader)?,
+        },
+        7 => AlterTableOperation::ChangeNominalType {
+            column_id: column(reader)?,
+            target_type: decode_semantic_type(reader)?,
+        },
+        _ => return Err(corrupt("unknown rewrite operation tag")),
+    })
+}
+
+fn encode_semantic_type(
+    writer: &mut Writer,
+    data_type: &SemanticType,
+) -> Result<(), SchemaMutationError> {
+    writer.u8(match data_type.physical {
+        PhysicalType::Bool => 1,
+        PhysicalType::Int64 => 2,
+        PhysicalType::UInt64 => 3,
+        PhysicalType::Text => 4,
+    });
+    writer.u8(u8::from(data_type.name.is_some()));
+    if let Some(name) = &data_type.name {
+        writer.string(name)?;
+    }
+    Ok(())
+}
+
+fn decode_semantic_type(reader: &mut Reader<'_>) -> Result<SemanticType, SchemaMutationError> {
+    let physical = match reader.u8()? {
+        1 => PhysicalType::Bool,
+        2 => PhysicalType::Int64,
+        3 => PhysicalType::UInt64,
+        4 => PhysicalType::Text,
+        _ => return Err(corrupt("unknown rewrite physical type")),
+    };
+    match reader.u8()? {
+        0 => Ok(SemanticType::physical(physical)),
+        1 => Ok(SemanticType::named(reader.string()?, physical)),
+        _ => Err(corrupt("invalid rewrite semantic type flag")),
     }
 }
 
@@ -908,6 +1427,213 @@ fn validate_drop_fragment(
         return Err(corrupt("drop intent exact identity mismatch"));
     }
     Ok(())
+}
+
+fn validate_rewrite_fragments(
+    reservation: &RewriteReservation,
+    operation: &AlterTableOperation,
+    base: &SchemaCatalogSnapshot,
+    target: &SchemaCatalogSnapshot,
+    incarnation: [u8; 16],
+    coordinator: &str,
+) -> Result<(), SchemaMutationError> {
+    if base.incarnation != incarnation
+        || target.incarnation != incarnation
+        || base.epoch != reservation.base_epoch
+        || base.committed.generation != reservation.base_generation
+        || target.epoch
+            != base
+                .epoch
+                .checked_add(1)
+                .ok_or(corrupt("rewrite epoch exhausted"))?
+        || target.committed.generation.0
+            != base
+                .committed
+                .generation
+                .0
+                .checked_add(1)
+                .ok_or(corrupt("rewrite generation exhausted"))?
+        || base.coordinator.as_deref() != Some(coordinator)
+        || target.coordinator.as_deref() != Some(coordinator)
+        || base.partition_evidence.is_some()
+        || target.partition_evidence.is_some()
+        || base.committed.schema.tables().len() != 1
+        || target.committed.schema.tables().len() != 1
+        || base.committed.tables.len() != 1
+        || target.committed.tables.len() != 1
+        || base.placements.tables.len() != 1
+        || target.placements.tables.len() != 1
+        || base.storages.len() != 1
+        || target.storages.len() != 1
+    {
+        return Err(corrupt("rewrite fragment generation or inventory mismatch"));
+    }
+    let base_table = &base.committed.schema.tables()[0];
+    let target_table = &target.committed.schema.tables()[0];
+    let base_lineage = &base.committed.tables[0];
+    let target_lineage = &target.committed.tables[0];
+    let base_storage = &base.storages[0];
+    let target_storage = &target.storages[0];
+    if base_table.id != reservation.table
+        || target_table.id != reservation.table
+        || base_lineage.table_id != reservation.table
+        || target_lineage.table_id != reservation.table
+        || target_lineage.version.0
+            != base_lineage
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(corrupt("rewrite table version exhausted"))?
+        || base_storage.table_id != reservation.table
+        || target_storage.table_id != reservation.table
+        || base_storage.id == reservation.storage
+        || target_storage.id != reservation.storage
+        || !matches!(
+            base_storage.kind,
+            crate::schema_catalog::CatalogStorageKind::Heap
+        )
+        || !matches!(
+            target_storage.kind,
+            crate::schema_catalog::CatalogStorageKind::Heap
+        )
+        || !matches!(
+            base.placements.tables[0].placement,
+            crate::registry::TablePlacement::Single { table_id, storage_id }
+                if table_id == reservation.table && storage_id == base_storage.id
+        )
+        || !matches!(
+            target.placements.tables[0].placement,
+            crate::registry::TablePlacement::Single { table_id, storage_id }
+                if table_id == reservation.table && storage_id == reservation.storage
+        )
+        || base_table
+            .fingerprint()
+            .map_err(|_| corrupt("invalid rewrite base schema"))?
+            != base.placements.tables[0].schema_fingerprint
+        || target_table
+            .fingerprint()
+            .map_err(|_| corrupt("invalid rewrite target schema"))?
+            != target.placements.tables[0].schema_fingerprint
+        || base.placements.tables[0].schema_fingerprint
+            == target.placements.tables[0].schema_fingerprint
+        || base.committed.next_table_id != target.committed.next_table_id
+        || base.committed.next_partition_id != target.committed.next_partition_id
+        || !floor_at_least(
+            target.committed.next_storage_id.map(|id| id.0),
+            reservation.storage.0.checked_add(1),
+        )
+        || !floor_at_least(
+            target_lineage.next_column_id.map(|id| u64::from(id.0)),
+            base_lineage.next_column_id.map(|id| u64::from(id.0)),
+        )
+    {
+        return Err(corrupt("rewrite exact identity mismatch"));
+    }
+
+    let mut expected = base_table.clone();
+    match operation {
+        AlterTableOperation::RenameTable { new_name } => {
+            if reservation.column.is_some() {
+                return Err(corrupt("rename unexpectedly reserves ColumnId"));
+            }
+            expected.name = new_name.clone();
+        }
+        AlterTableOperation::RenameColumn {
+            column_id,
+            new_name,
+        } => {
+            if reservation.column.is_some() {
+                return Err(corrupt("rename unexpectedly reserves ColumnId"));
+            }
+            expected
+                .columns
+                .iter_mut()
+                .find(|column| column.id == *column_id)
+                .ok_or(corrupt("rewrite column absent"))?
+                .name = new_name.clone();
+        }
+        AlterTableOperation::AddNullableColumn { name, data_type } => {
+            let id = reservation
+                .column
+                .ok_or(corrupt("ADD rewrite has no ColumnId reservation"))?;
+            let type_spec = match &data_type.name {
+                Some(type_name) => TypeSpec::Semantic {
+                    physical: data_type.physical,
+                    name: type_name.clone(),
+                },
+                None => TypeSpec::Physical(data_type.physical),
+            };
+            expected
+                .columns
+                .push(netbadb_schema::ColumnDef::new(id, name.clone(), type_spec).nullable(true));
+            if target_lineage.next_column_id.map(|next| next.0) != id.0.checked_add(1) {
+                return Err(corrupt("ADD rewrite ColumnId floor mismatch"));
+            }
+        }
+        AlterTableOperation::DropColumn { column_id } => {
+            if reservation.column.is_some() {
+                return Err(corrupt("DROP unexpectedly reserves ColumnId"));
+            }
+            expected.columns.retain(|column| column.id != *column_id);
+        }
+        AlterTableOperation::SetNotNull { column_id } => {
+            if reservation.column.is_some() {
+                return Err(corrupt(
+                    "nullability rewrite unexpectedly reserves ColumnId",
+                ));
+            }
+            expected
+                .columns
+                .iter_mut()
+                .find(|column| column.id == *column_id)
+                .ok_or(corrupt("rewrite column absent"))?
+                .nullable = false;
+        }
+        AlterTableOperation::DropNotNull { column_id } => {
+            if reservation.column.is_some() {
+                return Err(corrupt(
+                    "nullability rewrite unexpectedly reserves ColumnId",
+                ));
+            }
+            expected
+                .columns
+                .iter_mut()
+                .find(|column| column.id == *column_id)
+                .ok_or(corrupt("rewrite column absent"))?
+                .nullable = true;
+        }
+        AlterTableOperation::ChangeNominalType {
+            column_id,
+            target_type,
+        } => {
+            if reservation.column.is_some() {
+                return Err(corrupt("type rewrite unexpectedly reserves ColumnId"));
+            }
+            let column = expected
+                .columns
+                .iter_mut()
+                .find(|column| column.id == *column_id)
+                .ok_or(corrupt("rewrite column absent"))?;
+            column.type_spec = match &target_type.name {
+                Some(type_name) => TypeSpec::Semantic {
+                    physical: target_type.physical,
+                    name: type_name.clone(),
+                },
+                None => TypeSpec::Physical(target_type.physical),
+            };
+        }
+    }
+    if expected != *target_table {
+        return Err(corrupt("rewrite operation differs from target schema"));
+    }
+    Ok(())
+}
+fn floor_at_least(current: Option<u64>, required: Option<u64>) -> bool {
+    match (current, required) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(current), Some(required)) => current >= required,
+    }
 }
 fn put_record(w: &mut Writer, payload: &[u8]) -> Result<(), SchemaMutationError> {
     let record = envelope(b"NBSR", payload)?;

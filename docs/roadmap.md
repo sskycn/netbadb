@@ -774,12 +774,20 @@ and surviving ColumnIds remain stable; the table version/fingerprint advance; a 
 StorageId is reserved; rows are streamed by ColumnId; all active indexes are rebuilt;
 and exact old-schema/resource evidence is retained for later recovery-safe GC.
 
-Next: implement exactly the Core Heap Schema Rewrite Foundation for one
-runtime-created Single Heap, including typed transforms, reservations, staged
-binding, index rebuild, generic replacement retirement and coordinator crash
-recovery. Do not add SQL syntax in that phase. LSM/partition/imported ALTER, online
-mixed schemas, physical conversions, defaults, column reorder and journal/log
-compaction remain deferred.
+### Core Heap schema rewrite foundation — Round 24
+
+[Round 24](core-heap-schema-rewrite-round24.md) implements the audited foundation
+for one runtime-created Single Heap: exact typed transforms, durable StorageId and
+ADD ColumnId reservations, same-TableId staged replacement, current-visible-row
+streaming, stable IndexId/high-water rebuild, statistics reset, private target DML,
+CORD v2 winner publication and distinct replacement-retirement evidence. NBSJ v1
+adds bounded tags 11–15; recovery converges without recopying. The old Heap remains
+physically retained and its exact replacement GC API is explicitly unsupported.
+
+Next: integrate the Round 22 retention-horizon proof with replacement-retired Heap
+history without treating the still-active TableId as dropped. SQL syntax remains a
+later thin frontend. LSM/partition/imported ALTER, online mixed schemas, physical
+conversions, defaults, column reorder and journal/log compaction remain deferred.
 
 ## Phase 6 — SDK and tooling
 

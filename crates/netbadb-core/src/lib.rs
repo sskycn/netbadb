@@ -74,9 +74,10 @@ pub use registry::StorageRegistryError;
 pub use schema_catalog::SchemaCatalogError;
 pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
 pub use schema_mutation::{
-    CreateColumnSpec, CreateTableSpec, RetiredHeapGcBlocker, RetiredHeapGcComponent,
-    RetiredHeapGcComponentKind, RetiredHeapGcInspection, RetiredHeapGcReport, RetiredHeapGcState,
-    RetiredTableResource, SchemaDependency, SchemaMutationError,
+    AlterTableOperation, AlterTableSpec, CreateColumnSpec, CreateTableSpec, ReplacementRetiredHeap,
+    RetiredHeapGcBlocker, RetiredHeapGcComponent, RetiredHeapGcComponentKind,
+    RetiredHeapGcInspection, RetiredHeapGcReport, RetiredHeapGcState, RetiredTableResource,
+    SchemaDependency, SchemaMutationError,
 };
 
 impl From<SchemaCatalogError> for DatabaseError {
@@ -570,11 +571,19 @@ impl DatabaseError {
             Self::SchemaMutation(
                 SchemaMutationError::UnsupportedConstraint
                 | SchemaMutationError::UnsupportedPlacement
-                | SchemaMutationError::MultipleCreatesUnsupported,
+                | SchemaMutationError::MultipleCreatesUnsupported
+                | SchemaMutationError::UnsupportedSchemaEvolution
+                | SchemaMutationError::ReplacementRetirementGcUnsupported,
             ) => DatabaseErrorKind::FeatureNotSupported,
             Self::SchemaMutation(
                 SchemaMutationError::TableNotFound(_) | SchemaMutationError::UndefinedTable(_),
             ) => DatabaseErrorKind::UndefinedTable,
+            Self::SchemaMutation(SchemaMutationError::ColumnNotFound(_)) => {
+                DatabaseErrorKind::UndefinedColumn
+            }
+            Self::SchemaMutation(SchemaMutationError::NotNullViolation(_)) => {
+                DatabaseErrorKind::NotNullViolation
+            }
             Self::Schema(SchemaError::DuplicateTableName { .. }) => {
                 DatabaseErrorKind::DuplicateObject
             }
@@ -585,7 +594,8 @@ impl DatabaseError {
             Self::SchemaMutation(
                 SchemaMutationError::StalePreparedStatement
                 | SchemaMutationError::StaleSchemaDependency
-                | SchemaMutationError::RecoveryRequired,
+                | SchemaMutationError::RecoveryRequired
+                | SchemaMutationError::TransactionNotPristine,
             ) => DatabaseErrorKind::TransactionState,
             Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
@@ -2552,7 +2562,7 @@ impl Database {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
-        let physical = self.plan_logical_statement(&logical);
+        let physical = self.plan_logical_statement_in(&logical, transaction);
         if let PhysicalStatement::Query(plan) = &physical {
             let storage_ids = self.storage_ids_for_tables_in(logical.read_tables(), transaction)?;
             let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
@@ -2600,6 +2610,57 @@ impl Database {
             logical,
             &self.planner_table_statistics(),
             &self.planner_access_paths(),
+            &self.planner_range_tables(),
+        )
+    }
+
+    fn plan_logical_statement_in(
+        &self,
+        logical: &netbadb_rel::LogicalStatement,
+        transaction: &Transaction,
+    ) -> PhysicalStatement {
+        let staged = transaction
+            .schema_mutation
+            .as_ref()
+            .and_then(|mutation| mutation.staged.as_ref());
+        let staged_table = staged.map(|storage| storage.table().id);
+        let mut statistics = self
+            .planner_table_statistics()
+            .into_iter()
+            .filter(|entry| Some(entry.table_id) != staged_table)
+            .collect::<Vec<_>>();
+        let mut access_paths = self
+            .planner_access_paths()
+            .into_iter()
+            .filter(|entry| Some(entry.table_id) != staged_table)
+            .collect::<Vec<_>>();
+        if let Some(storage) = staged {
+            statistics.push(TableAccessStatistics {
+                table_id: storage.table().id,
+                statistics: None,
+            });
+            access_paths.extend(storage.access_paths().into_iter().map(|path| AccessPath {
+                table_id: storage.table().id,
+                column_id: path.column_id,
+                id: path.id,
+                capabilities: AccessPathCapabilities {
+                    point_lookup: path.capabilities.point_lookup,
+                    range_lookup: path.capabilities.range_lookup,
+                    ordered: path.capabilities.ordered,
+                },
+                statistics: None,
+                cost_hints: path.cost_hints.map(|hints| AccessCostHints {
+                    point_probe_base_cost: hints.point_probe_base_cost,
+                    expected_point_io: hints.expected_point_io,
+                    range_startup_cost: hints.range_startup_cost,
+                    sequential_unit_cost: hints.sequential_unit_cost,
+                }),
+            }));
+        }
+        plan_statement_with_partition_snapshots(
+            logical,
+            &statistics,
+            &access_paths,
             &self.planner_range_tables(),
         )
     }
@@ -2759,6 +2820,7 @@ impl Database {
         view: &DatabaseReadView,
         staged: Option<&mut TableStorage>,
     ) -> Result<QueryResult, DatabaseError> {
+        let staged_table = staged.as_ref().map(|storage| storage.table().id);
         let mut bindings = self
             .bindings
             .iter()
@@ -2766,11 +2828,11 @@ impl Database {
                 TablePlacement::Single {
                     table_id,
                     storage_id,
-                } => Some(ExecutionStorageBinding {
+                } if Some(*table_id) != staged_table => Some(ExecutionStorageBinding {
                     table_id: *table_id,
                     storage_id: *storage_id,
                 }),
-                TablePlacement::RangePartitioned { .. } => None,
+                _ => None,
             })
             .collect::<Vec<_>>();
         if let Some(storage) = staged.as_ref() {
@@ -2811,6 +2873,11 @@ impl Database {
         let table_id = statement_table_id(physical).ok_or(DatabaseError::ExpectedQuery)?;
         let storage_ids = self.storage_ids_for_tables_in(vec![table_id], transaction)?;
         let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
+        let staged_table = transaction
+            .schema_mutation
+            .as_ref()
+            .and_then(|mutation| mutation.staged.as_ref())
+            .map(|storage| storage.table().id);
         let mut bindings = self
             .bindings
             .iter()
@@ -2818,11 +2885,11 @@ impl Database {
                 TablePlacement::Single {
                     table_id,
                     storage_id,
-                } => Some(ExecutionStorageBinding {
+                } if Some(*table_id) != staged_table => Some(ExecutionStorageBinding {
                     table_id: *table_id,
                     storage_id: *storage_id,
                 }),
-                TablePlacement::RangePartitioned { .. } => None,
+                _ => None,
             })
             .collect::<Vec<_>>();
         if let Some(storage) = transaction.staged_storage_mut() {

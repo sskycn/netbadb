@@ -67,6 +67,18 @@ impl PhysicalBindings {
         self.placements
             .retain(|placement| placement.table_id() != table_id);
     }
+    pub(crate) fn publish_replaced(&mut self, table_id: TableId, storage_id: StorageId) {
+        if let Some(placement) = self
+            .placements
+            .iter_mut()
+            .find(|placement| placement.table_id() == table_id)
+        {
+            *placement = TablePlacement::Single {
+                table_id,
+                storage_id,
+            };
+        }
+    }
     pub(crate) fn new(
         placements: Vec<TablePlacement>,
         registry: &StorageRegistry,
@@ -172,6 +184,24 @@ impl StorageRegistry {
             .iter()
             .position(|entry| entry.id == storage_id)?;
         Some(self.entries.remove(position).storage)
+    }
+    pub(crate) fn publish_replaced(
+        &mut self,
+        old_storage_id: StorageId,
+        storage: TableStorage,
+    ) -> Option<TableStorage> {
+        let position = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == old_storage_id)?;
+        let old = std::mem::replace(
+            &mut self.entries[position],
+            StorageRegistryEntry {
+                id: storage.storage_id(),
+                storage,
+            },
+        );
+        Some(old.storage)
     }
     pub(crate) fn from_catalog_order(
         storages: Vec<TableStorage>,

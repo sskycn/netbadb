@@ -327,6 +327,13 @@ impl DatabaseTransaction {
             || !self.pending_index_drops.is_empty()
     }
 
+    pub(crate) fn is_pristine_for_schema_rewrite(&self) -> bool {
+        self.state == TransactionState::Active
+            && self.participants.is_empty()
+            && self.write_participants.is_empty()
+            && !self.has_pending_schema_mutations()
+    }
+
     pub(crate) fn has_pending_index_creations(&self) -> bool {
         !self.pending_indexes.is_empty()
     }
@@ -563,6 +570,33 @@ impl DatabaseTransaction {
         self.schema_mutation
             .as_mut()
             .and_then(|m| m.staged.as_mut())
+    }
+
+    pub(crate) fn with_staged_write<T>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut netbadb_storage::TableStorage,
+            &mut StorageTransaction,
+        ) -> Result<T, StorageError>,
+    ) -> Result<T, CoordinatorError> {
+        self.ensure_active()?;
+        let storage_id = self
+            .schema_mutation
+            .as_ref()
+            .and_then(|mutation| mutation.staged.as_ref())
+            .map(netbadb_storage::TableStorage::storage_id)
+            .ok_or(SchemaMutationError::Corrupt("staged Heap is absent"))?;
+        let context = &mut self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?
+            .context;
+        let storage = self
+            .schema_mutation
+            .as_mut()
+            .and_then(|mutation| mutation.staged.as_mut())
+            .ok_or(SchemaMutationError::Corrupt("staged Heap is absent"))?;
+        Ok(operation(storage, context)?)
     }
     /// Whether this active transaction privately owns a staged table identity.
     /// This reports lifecycle state only; authorization remains a server policy.
