@@ -23,8 +23,8 @@ use crate::schema_catalog::{
 };
 use crate::schema_catalog_file as file;
 use crate::schema_mutation_journal::{
-    CreateIntent, Reservation, SchemaMutationJournal, final_locator, namespace, prepared_locator,
-    stage_locator,
+    CreateIntent, DropIntent, Reservation, SchemaMutationJournal, final_locator, namespace,
+    prepared_locator, stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -100,6 +100,38 @@ pub struct SchemaDependency {
     pub fingerprint: SchemaFingerprint,
 }
 
+/// Exact logical identity accepted by Core DROP. A name can be resolved to this
+/// value, but execution never resolves the name again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableTarget {
+    pub table_id: TableId,
+    pub table_version: TableSchemaVersion,
+    pub fingerprint: SchemaFingerprint,
+}
+
+impl From<SchemaDependency> for DropTableTarget {
+    fn from(dependency: SchemaDependency) -> Self {
+        Self {
+            table_id: dependency.table_id,
+            table_version: dependency.table_version,
+            fingerprint: dependency.fingerprint,
+        }
+    }
+}
+
+/// Read-only physical-lifecycle projection. Retired resources are deliberately
+/// absent from the active logical catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredTableResource {
+    pub table_id: TableId,
+    pub table_version: TableSchemaVersion,
+    pub fingerprint: SchemaFingerprint,
+    pub storage_id: StorageId,
+    pub engine: netbadb_storage::StorageKind,
+    pub relative_locator: String,
+    pub retired_generation: crate::SchemaGeneration,
+}
+
 #[derive(Debug)]
 pub enum SchemaMutationError {
     SchemaBusy,
@@ -107,6 +139,9 @@ pub enum SchemaMutationError {
     MultipleCreatesUnsupported,
     UnsupportedConstraint,
     UnsupportedPlacement,
+    TableNotFound(TableId),
+    UndefinedTable(String),
+    StaleSchemaDependency,
     StalePreparedStatement,
     IdentityExhausted(&'static str),
     Corrupt(&'static str),
@@ -128,8 +163,15 @@ impl fmt::Display for SchemaMutationError {
                 f.write_str("runtime table constraints are not supported")
             }
             Self::UnsupportedPlacement => {
-                f.write_str("runtime creation supports only a single Heap")
+                f.write_str("runtime table mutation supports only a single Heap")
             }
+            Self::TableNotFound(table) => {
+                write!(f, "table identity {} is not active", table.0)
+            }
+            Self::UndefinedTable(name) => {
+                write!(f, "table `{name}` is not active")
+            }
+            Self::StaleSchemaDependency => f.write_str("exact table schema dependency is stale"),
             Self::StalePreparedStatement => {
                 f.write_str("prepared statement schema or transaction scope is no longer valid")
             }
@@ -170,10 +212,17 @@ pub(crate) struct SchemaMutation {
     pub(crate) target: SchemaCatalogSnapshot,
     pub(crate) reference: SchemaParticipantReference,
     pub(crate) staged: Option<TableStorage>,
+    pub(crate) drop: Option<DropIntent>,
     pub(crate) journal: SharedMutationJournal,
     pub(crate) writer: SchemaWriter,
 }
 impl SchemaMutation {
+    pub(crate) fn transaction(&self) -> DatabaseTxnId {
+        self.drop
+            .as_ref()
+            .map_or(self.reservation.transaction, |drop| drop.transaction)
+    }
+
     pub(crate) fn prepare(&self) -> Result<(), SchemaMutationError> {
         let bytes = self.target.encode()?;
         if digest(&bytes) != self.reference.digest {
@@ -181,14 +230,11 @@ impl SchemaMutation {
         }
         let path = file::resolve(
             &self.catalog,
-            &prepared_locator(
-                &self.catalog,
-                self.target.incarnation,
-                self.reservation.transaction,
-            )?,
+            &prepared_locator(&self.catalog, self.target.incarnation, self.transaction())?,
         );
         // Retained until durable completion, allowing both NBSC/state renames to retry.
         validate_resource_path(&self.catalog, &path)?;
+        ensure_parent(&path)?;
         file::atomic_write(&path, &bytes, false)?;
         file::sync_parent(&path)?;
         crash("prepared-catalog-durable");
@@ -196,6 +242,15 @@ impl SchemaMutation {
     }
     pub(crate) fn cleanup_loser(&mut self) -> Result<(), SchemaMutationError> {
         self.journal.borrow().ensure_ready()?;
+        if let Some(drop) = &self.drop {
+            cleanup_drop_prepared(&self.catalog, drop)?;
+            crash("drop-rollback-cleanup");
+            self.journal
+                .borrow_mut()
+                .resolve_drop(drop.transaction, false)?;
+            self.writer.set(None);
+            return Ok(());
+        }
         // Physical rollback has already synchronized all participants.
         self.staged.take();
         cleanup_loser(&self.catalog, &self.reservation, self.target.incarnation)?;
@@ -219,6 +274,306 @@ pub(crate) fn digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 impl Database {
+    /// Resolves a convenience name to the exact durable identity required by
+    /// [`Database::drop_table_in`]. This method has no persistent side effects.
+    pub fn resolve_drop_table(&self, name: &str) -> Result<DropTableTarget, DatabaseError> {
+        let table = self
+            .committed
+            .schema
+            .table(name)
+            .ok_or_else(|| SchemaMutationError::UndefinedTable(name.to_owned()))?;
+        let lineage = self
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == table.id)
+            .ok_or(SchemaMutationError::Corrupt("active table lineage absent"))?;
+        Ok(DropTableTarget {
+            table_id: table.id,
+            table_version: lineage.version,
+            fingerprint: table.fingerprint()?,
+        })
+    }
+
+    /// Logically retires one exact active non-partitioned Heap in `transaction`.
+    /// The physical Heap and its index pages remain intact for deferred GC.
+    pub fn drop_table_in(
+        &mut self,
+        transaction: &mut Transaction,
+        target: DropTableTarget,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        if transaction.schema_mutation.is_some() || transaction.has_pending_schema_mutations() {
+            return Err(DatabaseError::UnsupportedDdlCombination);
+        }
+        if self.schema_writer.get().is_some() || Rc::strong_count(&self.transaction_owner) != 2 {
+            return Err(SchemaMutationError::SchemaBusy.into());
+        }
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == target.table_id)
+            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?
+            .clone();
+        let lineage = self
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == target.table_id)
+            .ok_or(SchemaMutationError::Corrupt("active table lineage absent"))?
+            .clone();
+        if lineage.version != target.table_version || table.fingerprint()? != target.fingerprint {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let placement = self.bindings.placement(target.table_id)?.clone();
+        let storage_id = match placement {
+            TablePlacement::Single { storage_id, .. } => storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(SchemaMutationError::UnsupportedPlacement.into());
+            }
+        };
+        let active_storage = self
+            .registry
+            .get(storage_id)
+            .ok_or(SchemaMutationError::Corrupt("active Heap storage absent"))?;
+        if active_storage.kind() != netbadb_storage::StorageKind::Heap
+            || active_storage.table().id != target.table_id
+            || active_storage.table().fingerprint()? != target.fingerprint
+        {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        for entry in self.registry.iter() {
+            entry.storage.ensure_recovery_ready()?;
+        }
+        let catalog = self
+            .catalog_path
+            .clone()
+            .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
+        let base = file::load(&catalog)?;
+        let base_table = base
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == target.table_id)
+            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?;
+        let base_lineage = base
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == target.table_id)
+            .ok_or(SchemaMutationError::Corrupt("catalog table lineage absent"))?;
+        if base_lineage.version != target.table_version
+            || base_table.fingerprint()? != target.fingerprint
+        {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let catalog_table = base
+            .placements
+            .tables
+            .iter()
+            .find(|entry| entry.table_id == target.table_id)
+            .ok_or(SchemaMutationError::Corrupt(
+                "catalog table placement absent",
+            ))?
+            .clone();
+        if catalog_table.placement != placement
+            || catalog_table.schema_fingerprint != target.fingerprint
+        {
+            return Err(
+                SchemaMutationError::Corrupt("catalog binding differs from active view").into(),
+            );
+        }
+        let descriptor = base
+            .storages
+            .iter()
+            .find(|storage| storage.id == storage_id)
+            .ok_or(SchemaMutationError::Corrupt(
+                "catalog Heap descriptor absent",
+            ))?
+            .clone();
+        if descriptor.table_id != target.table_id
+            || !matches!(descriptor.kind, CatalogStorageKind::Heap)
+        {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        let next_generation = base
+            .committed
+            .generation
+            .0
+            .checked_add(1)
+            .ok_or(SchemaMutationError::IdentityExhausted("SchemaGeneration"))?;
+        let next_epoch = base
+            .epoch
+            .checked_add(1)
+            .ok_or(SchemaMutationError::IdentityExhausted("catalog epoch"))?;
+        self.catalog_generation
+            .checked_add(1)
+            .ok_or(SchemaMutationError::IdentityExhausted(
+                "runtime catalog revision",
+            ))?;
+        let coordinator_locator = base
+            .coordinator
+            .clone()
+            .or_else(|| {
+                self.mutation_journal
+                    .as_ref()
+                    .map(|journal| journal.borrow().coordinator.clone())
+            })
+            .unwrap_or(format!(
+                "{}/coordinator",
+                namespace(&catalog, base.incarnation)?
+            ));
+        let mut target_snapshot = base.clone();
+        target_snapshot.epoch = next_epoch;
+        target_snapshot.committed.generation = crate::SchemaGeneration(next_generation);
+        target_snapshot.committed.schema = Schema::new(
+            base.committed
+                .schema
+                .tables()
+                .iter()
+                .filter(|candidate| candidate.id != target.table_id)
+                .cloned()
+                .collect(),
+        )?;
+        target_snapshot
+            .committed
+            .tables
+            .retain(|entry| entry.table_id != target.table_id);
+        target_snapshot
+            .placements
+            .tables
+            .retain(|entry| entry.table_id != target.table_id);
+        target_snapshot
+            .storages
+            .retain(|storage| storage.id != storage_id);
+        target_snapshot.coordinator = Some(coordinator_locator.clone());
+        let target_bytes = target_snapshot.encode()?;
+        let fragment = SchemaCatalogSnapshot {
+            incarnation: base.incarnation,
+            epoch: base.epoch,
+            committed: CommittedCatalogState {
+                schema: Schema::new(vec![table])?,
+                generation: base.committed.generation,
+                next_table_id: base.committed.next_table_id,
+                next_storage_id: base.committed.next_storage_id,
+                next_partition_id: base.committed.next_partition_id,
+                tables: vec![lineage],
+            },
+            placements: PartitionCatalog {
+                tables: vec![catalog_table],
+            },
+            storages: vec![descriptor],
+            coordinator: Some(coordinator_locator.clone()),
+            partition_evidence: None,
+        };
+        let drop = DropIntent {
+            transaction: transaction.id(),
+            fragment,
+            target_generation: target_snapshot.committed.generation,
+            target_epoch: target_snapshot.epoch,
+            snapshot_digest: digest(&target_bytes),
+            retired: false,
+            resolved: None,
+        };
+        validate_drop_resource(&catalog, &drop)?;
+        let journal = match &self.mutation_journal {
+            Some(journal) => Rc::clone(journal),
+            None => {
+                let journal = SchemaMutationJournal::initialize(
+                    &catalog,
+                    base.incarnation,
+                    coordinator_locator.clone(),
+                )?;
+                let journal = Rc::new(RefCell::new(journal));
+                self.mutation_journal = Some(Rc::clone(&journal));
+                journal
+            }
+        };
+        journal.borrow().ensure_ready()?;
+        journal.borrow().prepare_drop(&drop)?;
+        let coordinator = match &self.coordinator {
+            Some(coordinator) => Rc::clone(coordinator),
+            None => {
+                let path = file::resolve(&catalog, &coordinator_locator);
+                validate_resource_path(&catalog, &path)?;
+                ensure_parent(&path)?;
+                let log = if path
+                    .try_exists()
+                    .map_err(|error| file::io("inspect schema coordinator", &path, error))?
+                {
+                    CoordinatorLog::open(&path)?
+                } else {
+                    CoordinatorLog::create(&path)?
+                };
+                Rc::new(RefCell::new(log))
+            }
+        };
+        transaction.set_coordinator(coordinator);
+        let reference = SchemaParticipantReference {
+            incarnation: base.incarnation,
+            target_epoch: next_epoch,
+            digest: drop.snapshot_digest,
+        };
+        let reservation = Reservation {
+            transaction: transaction.id(),
+            table: target.table_id,
+            storage: storage_id,
+            base_generation: base.committed.generation,
+            base_epoch: base.epoch,
+            intent: None,
+            resolved: None,
+        };
+        self.schema_writer.set(Some(transaction.id()));
+        transaction.schema_mutation = Some(SchemaMutation {
+            catalog,
+            reservation,
+            target: target_snapshot,
+            reference,
+            staged: None,
+            drop: Some(drop.clone()),
+            journal: Rc::clone(&journal),
+            writer: Rc::clone(&self.schema_writer),
+        });
+        if let Err(error) = journal.borrow_mut().drop_intent(drop) {
+            transaction.require_schema_rollback();
+            return Err(error.into());
+        }
+        crash("drop-intent-durable");
+        crash("drop-overlay-established");
+        Ok(())
+    }
+
+    /// Lists durably retained physical resources for committed table drops.
+    pub fn inspect_retired_table_resources(&self) -> Vec<RetiredTableResource> {
+        self.mutation_journal
+            .as_ref()
+            .into_iter()
+            .flat_map(|journal| {
+                journal
+                    .borrow()
+                    .drops
+                    .values()
+                    .filter(|drop| drop.retired && drop.resolved == Some(true))
+                    .map(|drop| {
+                        let table = &drop.fragment.committed.schema.tables()[0];
+                        RetiredTableResource {
+                            table_id: table.id,
+                            table_version: drop.fragment.committed.tables[0].version,
+                            fingerprint: drop.fragment.placements.tables[0].schema_fingerprint,
+                            storage_id: drop.fragment.storages[0].id,
+                            engine: netbadb_storage::StorageKind::Heap,
+                            relative_locator: drop.fragment.storages[0].locator.clone(),
+                            retired_generation: drop.target_generation,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Stages one new Heap and enlists it in `transaction`. Existing-table DML
     /// may precede/follow creation. Use `prepare_statement_in` for its private
     /// schema and `commit_transaction` to publish it; rollback never reuses IDs.
@@ -422,6 +777,7 @@ impl Database {
             target,
             reference,
             staged: None,
+            drop: None,
             journal: Rc::clone(&journal),
             writer: Rc::clone(&self.schema_writer),
         });
@@ -486,6 +842,13 @@ impl Database {
         if transaction.state() != TransactionState::FinalizePending {
             return Err(SchemaMutationError::RecoveryRequired.into());
         }
+        if transaction
+            .schema_mutation
+            .as_ref()
+            .is_some_and(|mutation| mutation.drop.is_some())
+        {
+            return self.finish_drop_schema_commit(transaction);
+        }
         let mutation = transaction
             .schema_mutation
             .as_mut()
@@ -549,6 +912,62 @@ impl Database {
         self.coordinator = transaction.shared_coordinator();
         self.schema_writer.set(None);
         transaction.complete_schema_publication();
+        crash("after-memory-publish");
+        crash("before-api-return");
+        Ok(())
+    }
+
+    fn finish_drop_schema_commit(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        let mutation = transaction
+            .schema_mutation
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt("schema participant absent"))?;
+        let intent = mutation
+            .drop
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt("drop participant absent"))?
+            .clone();
+        let catalog = mutation.catalog.clone();
+        let target = mutation.target.clone();
+        let journal = Rc::clone(&mutation.journal);
+        validate_drop_resource(&catalog, &intent)?;
+        if self
+            .registry
+            .get(intent.storage())
+            .is_none_or(|storage| storage.table().id != intent.table())
+        {
+            return Err(SchemaMutationError::Corrupt("drop publication storage absent").into());
+        }
+        let revision = self.catalog_generation.checked_add(1).ok_or(
+            SchemaMutationError::IdentityExhausted("runtime catalog revision"),
+        )?;
+        journal.borrow_mut().retire_drop(intent.transaction)?;
+        crash("drop-retirement-durable");
+        crash("before-nbsc-publication");
+        let published = file::publish_runtime(&catalog, &target)?;
+        crash("drop-nbsc-durable");
+        transaction.finish_schema_decision()?;
+        journal
+            .borrow_mut()
+            .resolve_drop(intent.transaction, true)?;
+        cleanup_drop_prepared(&catalog, &intent)?;
+        crash("before-memory-publish");
+        // The synchronous Database owner exposes no callback between these
+        // infallible moves, so schema, binding and registry change together.
+        let retired = self
+            .registry
+            .publish_dropped(intent.storage())
+            .ok_or(SchemaMutationError::Corrupt("retired storage disappeared"))?;
+        self.bindings.publish_dropped(intent.table());
+        self.committed = published.committed;
+        self.catalog_generation = revision;
+        self.coordinator = transaction.shared_coordinator();
+        self.schema_writer.set(None);
+        transaction.complete_schema_publication();
+        drop(retired);
         crash("after-memory-publish");
         crash("before-api-return");
         Ok(())
@@ -651,6 +1070,25 @@ fn exists_file(path: &Path) -> Result<bool, SchemaMutationError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(file::io("inspect schema component", path, e).into()),
     }
+}
+
+fn validate_drop_resource(catalog: &Path, intent: &DropIntent) -> Result<(), DatabaseError> {
+    let descriptor = &intent.fragment.storages[0];
+    if !matches!(descriptor.kind, CatalogStorageKind::Heap) {
+        return Err(SchemaMutationError::UnsupportedPlacement.into());
+    }
+    let path = file::resolve(catalog, &descriptor.locator);
+    let identity = TableStorage::inspect_heap_identity(&path)?;
+    let recovery =
+        TableStorage::inspect_heap_recovery(&path, &intent.fragment.committed.schema.tables()[0])?;
+    if identity.storage_id != descriptor.id
+        || recovery.storage_id != descriptor.id
+        || identity.table_id != descriptor.table_id
+        || identity.schema_fingerprint != intent.fragment.placements.tables[0].schema_fingerprint
+    {
+        return Err(SchemaMutationError::Corrupt("retained Heap identity mismatch").into());
+    }
+    Ok(())
 }
 fn validate_intent(
     catalog: &Path,
@@ -834,6 +1272,26 @@ fn cleanup_prepared(
     }
     Ok(())
 }
+fn cleanup_drop_prepared(catalog: &Path, intent: &DropIntent) -> Result<(), SchemaMutationError> {
+    let prepared = file::resolve(
+        catalog,
+        &prepared_locator(catalog, intent.fragment.incarnation, intent.transaction)?,
+    );
+    validate_resource_path(catalog, &prepared)?;
+    remove_file(&prepared)?;
+    remove_file(&file::suffix(&prepared, ".next"))?;
+    if let Some(parent) = prepared.parent() {
+        match std::fs::remove_dir(parent) {
+            Ok(()) => file::sync_parent(parent)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => {
+                return Err(file::io("remove private drop directory", parent, error).into());
+            }
+        }
+    }
+    Ok(())
+}
 fn cleanup_loser(
     catalog: &Path,
     reservation: &Reservation,
@@ -877,33 +1335,38 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         return Ok(None);
     };
     let coordinator_path = file::resolve(catalog, &journal.coordinator);
-    if journal.reservations.is_empty() {
+    if journal.reservations.is_empty() && journal.drops.is_empty() {
         return Ok(Some(journal));
     }
     let mut coordinator = CoordinatorLog::open(&coordinator_path)?;
     let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
     for decision in decisions.iter().filter(|d| d.schema.is_some()) {
-        let r = journal.reservations.get(&decision.database_txn_id).ok_or(
-            SchemaMutationError::Corrupt("schema decision has no reservation"),
-        )?;
-        validate_intent(
-            catalog,
-            r,
-            decision
-                .schema
-                .as_ref()
-                .ok_or(SchemaMutationError::Corrupt("missing schema reference"))?,
-        )?;
-        if r.resolved == Some(false)
-            || !decision
-                .participants
-                .iter()
-                .any(|p| p.storage_id == r.storage)
-        {
-            return Err(SchemaMutationError::Corrupt(
-                "schema winner contradicts journal/participants",
-            )
-            .into());
+        let reference = decision
+            .schema
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt("missing schema reference"))?;
+        if let Some(reservation) = journal.reservations.get(&decision.database_txn_id) {
+            validate_intent(catalog, reservation, reference)?;
+            if reservation.resolved == Some(false)
+                || !decision
+                    .participants
+                    .iter()
+                    .any(|participant| participant.storage_id == reservation.storage)
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "create winner contradicts journal/participants",
+                )
+                .into());
+            }
+        } else if let Some(intent) = journal.drops.get(&decision.database_txn_id) {
+            validate_drop_reference(intent, reference)?;
+            if intent.resolved == Some(false) {
+                return Err(SchemaMutationError::Corrupt("drop loser has commit decision").into());
+            }
+        } else {
+            return Err(
+                SchemaMutationError::Corrupt("schema decision has no mutation intent").into(),
+            );
         }
     }
     let mut reservations = journal.reservations.values().cloned().collect::<Vec<_>>();
@@ -924,7 +1387,15 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             validate_intent(catalog, &reservation, reference)?;
             if reservation.resolved == Some(true) {
                 let active = file::load(catalog)?;
-                verify_published(&active, &reservation)?;
+                let later_drop = journal.drops.values().find(|drop| {
+                    drop.table() == reservation.table
+                        && drop.storage() == reservation.storage
+                        && drop.retired
+                        && drop.resolved == Some(true)
+                });
+                if later_drop.is_none() {
+                    verify_published(&active, &reservation)?;
+                }
                 if !decision.complete {
                     return Err(SchemaMutationError::Corrupt(
                         "resolved winner lacks coordinator completion",
@@ -1000,7 +1471,189 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             }
         }
     }
+    let mut drops = journal.drops.values().cloned().collect::<Vec<_>>();
+    drops.sort_by_key(|drop| (drop.resolved.is_some(), drop.transaction));
+    for intent in drops {
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.database_txn_id == intent.transaction);
+        if let Some(decision) = decision {
+            let reference = decision
+                .schema
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "drop mutation has a storage-only decision",
+                ))?;
+            validate_drop_reference(&intent, reference)?;
+            if intent.resolved == Some(true) {
+                let active = file::load(catalog)?;
+                verify_drop_published(&active, &intent, false)?;
+                if !decision.complete || !intent.retired {
+                    return Err(
+                        SchemaMutationError::Corrupt("resolved drop winner is incomplete").into(),
+                    );
+                }
+                validate_drop_resource(catalog, &intent)?;
+                cleanup_drop_prepared(catalog, &intent)?;
+                continue;
+            }
+            let prepared = file::resolve(
+                catalog,
+                &prepared_locator(catalog, marker.incarnation, intent.transaction)?,
+            );
+            let bytes = file::read(&prepared)?;
+            if digest(&bytes) != reference.digest {
+                return Err(
+                    SchemaMutationError::Corrupt("prepared DROP NBSC digest mismatch").into(),
+                );
+            }
+            let target = SchemaCatalogSnapshot::decode(&bytes)?;
+            verify_drop_published(&target, &intent, true)?;
+            validate_drop_resource(catalog, &intent)?;
+            if !decision.participants.is_empty() {
+                let recovery = drop_recovery_snapshot(&target, &intent)?;
+                let database =
+                    crate::schema_catalog_api::recover_physical(catalog, &recovery, &[])?;
+                database.close()?;
+            }
+            journal.retire_drop(intent.transaction)?;
+            crash("drop-retirement-durable");
+            file::publish_runtime(catalog, &target)?;
+            coordinator.complete(intent.transaction)?;
+            journal.resolve_drop(intent.transaction, true)?;
+            cleanup_drop_prepared(catalog, &intent)?;
+        } else {
+            if intent.resolved == Some(true) || intent.retired {
+                return Err(SchemaMutationError::Corrupt(
+                    "retired drop lacks coordinator decision",
+                )
+                .into());
+            }
+            if intent.resolved.is_none() {
+                cleanup_drop_prepared(catalog, &intent)?;
+                journal.resolve_drop(intent.transaction, false)?;
+            }
+        }
+    }
+    let active = file::load(catalog)?;
+    for intent in journal
+        .drops
+        .values()
+        .filter(|intent| intent.retired && intent.resolved == Some(true))
+    {
+        validate_drop_resource(catalog, intent)?;
+        if active
+            .storages
+            .iter()
+            .any(|storage| storage.id == intent.storage())
+        {
+            return Err(
+                SchemaMutationError::Corrupt("active catalog references retired storage").into(),
+            );
+        }
+    }
     Ok(Some(journal))
+}
+
+fn validate_drop_reference(
+    intent: &DropIntent,
+    reference: &SchemaParticipantReference,
+) -> Result<(), SchemaMutationError> {
+    if reference.incarnation != intent.fragment.incarnation
+        || reference.target_epoch != intent.target_epoch
+        || reference.digest != intent.snapshot_digest
+    {
+        return Err(SchemaMutationError::Corrupt(
+            "coordinator/drop intent mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_drop_published(
+    snapshot: &SchemaCatalogSnapshot,
+    intent: &DropIntent,
+    exact: bool,
+) -> Result<(), DatabaseError> {
+    if snapshot.incarnation != intent.fragment.incarnation
+        || if exact {
+            snapshot.epoch != intent.target_epoch
+                || snapshot.committed.generation != intent.target_generation
+        } else {
+            snapshot.epoch < intent.target_epoch
+                || snapshot.committed.generation < intent.target_generation
+        }
+        || snapshot
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .any(|table| table.id == intent.table())
+        || snapshot
+            .committed
+            .tables
+            .iter()
+            .any(|lineage| lineage.table_id == intent.table())
+        || snapshot
+            .placements
+            .tables
+            .iter()
+            .any(|placement| placement.table_id == intent.table())
+        || snapshot
+            .storages
+            .iter()
+            .any(|storage| storage.id == intent.storage())
+        || if exact {
+            snapshot.committed.next_table_id != intent.fragment.committed.next_table_id
+                || snapshot.committed.next_storage_id != intent.fragment.committed.next_storage_id
+                || snapshot.committed.next_partition_id
+                    != intent.fragment.committed.next_partition_id
+        } else {
+            !high_water_at_least(
+                snapshot.committed.next_table_id.map(|id| id.0),
+                intent.fragment.committed.next_table_id.map(|id| id.0),
+            ) || !high_water_at_least(
+                snapshot.committed.next_storage_id.map(|id| id.0),
+                intent.fragment.committed.next_storage_id.map(|id| id.0),
+            ) || !high_water_at_least(
+                snapshot.committed.next_partition_id.map(|id| id.0),
+                intent.fragment.committed.next_partition_id.map(|id| id.0),
+            )
+        }
+    {
+        return Err(SchemaMutationError::Corrupt("published DROP differs from intent").into());
+    }
+    Ok(())
+}
+
+fn high_water_at_least(current: Option<u64>, retired: Option<u64>) -> bool {
+    match (current, retired) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(current), Some(retired)) => current >= retired,
+    }
+}
+
+fn drop_recovery_snapshot(
+    target: &SchemaCatalogSnapshot,
+    intent: &DropIntent,
+) -> Result<SchemaCatalogSnapshot, DatabaseError> {
+    let mut recovery = target.clone();
+    recovery
+        .committed
+        .schema
+        .add_table(intent.fragment.committed.schema.tables()[0].clone())?;
+    recovery
+        .committed
+        .tables
+        .push(intent.fragment.committed.tables[0].clone());
+    recovery
+        .placements
+        .tables
+        .push(intent.fragment.placements.tables[0].clone());
+    recovery.storages.push(intent.fragment.storages[0].clone());
+    recovery.validate()?;
+    Ok(recovery)
 }
 fn verify_published(
     snapshot: &SchemaCatalogSnapshot,
@@ -1031,7 +1684,9 @@ fn verify_published(
 
 #[cfg(test)]
 pub(crate) fn crash(point: &str) {
-    if std::env::var("NETBADB_CREATE_CRASH_POINT").as_deref() == Ok(point) {
+    if std::env::var("NETBADB_CREATE_CRASH_POINT").as_deref() == Ok(point)
+        || std::env::var("NETBADB_DROP_CRASH_POINT").as_deref() == Ok(point)
+    {
         std::process::exit(90);
     }
 }

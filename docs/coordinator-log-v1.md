@@ -78,8 +78,10 @@ whole database open.
 
 The NBCO file header stays v1. Existing CORD v1 records are still read and written
 for storage-only decisions and Complete. CORD **record version 2, tag 3** adds a
-schema CommitDecision. The same 32-byte header and 1..1024 sorted physical
-participant tuples are followed by exactly 56 bytes:
+schema CommitDecision. The same 32-byte header and 0..1024 sorted physical
+participant tuples are followed by exactly 56 bytes. Zero tuples are valid only
+for a schema decision, allowing logical DROP with no physical writes; storage-only
+CommitDecision still requires at least one participant.
 
 | Width | Meaning |
 | --- | --- |
@@ -95,7 +97,9 @@ into CoordinatorLog. DatabaseTxnId locates the corresponding reservation/intent
 and prepared relative locator in [SchemaMutationJournal v1](schema-mutation-journal-v1.md).
 
 A schema transaction takes this path even when the new Heap is its only physical
-writer or has no rows. Existing Heap/LSM/partition writes participate normally.
+writer or has no rows. Core DROP creates no empty physical transaction: a DROP with
+no preceding DML has zero tuples, while existing Heap/LSM/partition writes
+participate normally.
 Storage prepare and prepared NBSC sync precede the sole commit decision. Physical
 commits, staged promotion, and NBSC/state publication must all finish before the
 Complete record is synchronized. DecisionPending/FinalizePending retain retry-only

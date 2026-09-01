@@ -63,6 +63,10 @@ impl PhysicalBindings {
     pub(crate) fn publish_created(&mut self, placement: TablePlacement) {
         self.placements.push(placement);
     }
+    pub(crate) fn publish_dropped(&mut self, table_id: TableId) {
+        self.placements
+            .retain(|placement| placement.table_id() != table_id);
+    }
     pub(crate) fn new(
         placements: Vec<TablePlacement>,
         registry: &StorageRegistry,
@@ -161,6 +165,13 @@ impl StorageRegistry {
             id: storage.storage_id(),
             storage,
         });
+    }
+    pub(crate) fn publish_dropped(&mut self, storage_id: StorageId) -> Option<TableStorage> {
+        let position = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == storage_id)?;
+        Some(self.entries.remove(position).storage)
     }
     pub(crate) fn from_catalog_order(
         storages: Vec<TableStorage>,

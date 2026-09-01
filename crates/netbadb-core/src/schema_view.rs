@@ -36,7 +36,6 @@ impl Database {
     ) -> Result<Vec<SchemaDependency>, DatabaseError> {
         let committed = transaction
             .and_then(|t| t.schema_mutation.as_ref())
-            .filter(|m| m.staged.is_some())
             .map_or(&self.committed, |m| &m.target.committed);
         let mut dependencies = Vec::new();
         for id in compiled

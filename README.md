@@ -102,8 +102,10 @@ installation marker and crash-safe publication. [Core transactional Heap table
 creation](docs/core-create-table-round18.md) adds durable identity reservations,
 private transaction schema/DML, coordinator-backed commit, and catalog-only recovery.
 [Round 19](docs/sql-create-table-round19.md) adds transactional basic Heap
-`CREATE TABLE` over native SQL and PostgreSQL. DROP TABLE and ALTER TABLE remain
-unsupported.
+`CREATE TABLE` over native SQL and PostgreSQL. [Round 20](docs/core-drop-table-round20.md)
+adds exact-identity transactional Core Heap retirement, prepared-dependency
+invalidation, durable retained-resource inventory and deferred physical deletion.
+SQL `DROP TABLE` and `ALTER TABLE` remain unsupported.
 
 ## Repository layout
 

@@ -126,7 +126,7 @@ impl CoordinatorLog {
         participants: &[CoordinatorParticipant],
         schema: Option<&SchemaParticipantReference>,
     ) -> Result<(), CoordinatorLogError> {
-        let participants = canonical_participants(database_txn_id, participants)?;
+        let participants = canonical_participants(database_txn_id, participants, schema.is_some())?;
         if let Some(existing) = self.decisions.get(&database_txn_id) {
             if existing.participants != participants || existing.schema.as_ref() != schema {
                 return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
@@ -329,7 +329,9 @@ fn apply_decoded_record(
     }
     match bytes[6] {
         COMMIT_DECISION_TAG | SCHEMA_COMMIT_TAG => {
-            if participant_count == 0 || participant_count > MAX_COORDINATOR_PARTICIPANTS {
+            if (participant_count == 0 && bytes[6] != SCHEMA_COMMIT_TAG)
+                || participant_count > MAX_COORDINATOR_PARTICIPANTS
+            {
                 return Err(CoordinatorLogError::InvalidParticipantCount {
                     offset,
                     count: participant_count,
@@ -351,7 +353,11 @@ fn apply_decoded_record(
                     physical_txn_id,
                 });
             }
-            let participants = canonical_participants(database_txn_id, &participants)?;
+            let participants = canonical_participants(
+                database_txn_id,
+                &participants,
+                bytes[6] == SCHEMA_COMMIT_TAG,
+            )?;
             let schema = if bytes[6] == SCHEMA_COMMIT_TAG {
                 let base = RECORD_HEADER_SIZE + participant_count * PARTICIPANT_SIZE;
                 let mut incarnation = [0; 16];
@@ -403,11 +409,14 @@ fn apply_decoded_record(
 fn canonical_participants(
     database_txn_id: DatabaseTxnId,
     participants: &[CoordinatorParticipant],
+    allow_empty: bool,
 ) -> Result<Vec<CoordinatorParticipant>, CoordinatorLogError> {
     if database_txn_id.0 == 0 {
         return Err(CoordinatorLogError::InvalidTransactionId { offset: 0 });
     }
-    if participants.is_empty() || participants.len() > MAX_COORDINATOR_PARTICIPANTS {
+    if (participants.is_empty() && !allow_empty)
+        || participants.len() > MAX_COORDINATOR_PARTICIPANTS
+    {
         return Err(CoordinatorLogError::InvalidParticipantCount {
             offset: 0,
             count: participants.len(),
@@ -480,7 +489,7 @@ fn encode_record(
     let (tag, participants) = match record {
         CoordinatorRecord::CommitDecision(participants) => (
             COMMIT_DECISION_TAG,
-            canonical_participants(database_txn_id, participants)?,
+            canonical_participants(database_txn_id, participants, false)?,
         ),
         CoordinatorRecord::SchemaCommit(participants, reference) => {
             if reference.incarnation == [0; 16] || reference.target_epoch == 0 {
@@ -488,7 +497,7 @@ fn encode_record(
             }
             (
                 SCHEMA_COMMIT_TAG,
-                canonical_participants(database_txn_id, participants)?,
+                canonical_participants(database_txn_id, participants, true)?,
             )
         }
         CoordinatorRecord::Complete => (COMPLETE_TAG, Vec::new()),

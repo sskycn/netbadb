@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
-use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, StorageId, TableId};
+use netbadb_types::{
+    ColumnId, IndexName, PhysicalType, ScalarValue, SemanticType, StorageId, TableId,
+};
 
 use crate::{
     CreateColumnSpec, CreateTableSpec, Database, DatabaseCoordinatorConfig, ExecutionResult,
@@ -99,6 +101,494 @@ fn expected() -> Vec<Vec<ScalarValue>> {
         ScalarValue::Null,
         ScalarValue::Null,
     ]]
+}
+
+#[test]
+fn core_drop_exact_overlay_prepared_invalidation_retirement_and_reopen() {
+    let root = root("drop-basic");
+    let mut db = seed(&root, true);
+    let stale_expectation = Schema::new(db.schema().tables().to_vec()).unwrap();
+    let target = db.resolve_drop_table("users").unwrap();
+    let old_users = db.prepare_statement("SELECT id FROM users", &[]).unwrap();
+    let unaffected = db.prepare_statement("SELECT id FROM teams", &[]).unwrap();
+    let before_generation = db.schema_generation();
+    let before_revision = db.catalog_generation();
+    let before_table = db.next_table_id();
+    let before_storage = db.next_storage_id();
+    let before_partition = db.next_partition_id();
+    let mut txn = db.begin_transaction().unwrap();
+    let transaction_users = db
+        .prepare_statement_in(&txn, "SELECT id FROM users", &[])
+        .unwrap();
+    db.execute_in(&mut txn, "UPDATE users SET id = 9").unwrap();
+    db.drop_table_in(&mut txn, target.clone()).unwrap();
+    assert!(
+        db.prepare_statement_in(&txn, "SELECT id FROM users", &[])
+            .is_err()
+    );
+    assert!(
+        db.execute_prepared_in(&mut txn, &transaction_users, &[])
+            .is_err()
+    );
+    assert!(db.schema().table("users").is_some());
+    assert_eq!(db.inspect_catalog().unwrap().tables.len(), 2);
+    assert!(db.inspect_retired_table_resources().is_empty());
+    assert_eq!(db.schema_generation(), before_generation);
+    assert_eq!(db.catalog_generation(), before_revision);
+    assert_eq!(db.next_table_id(), before_table);
+    assert_eq!(db.next_storage_id(), before_storage);
+    assert_eq!(db.next_partition_id(), before_partition);
+    db.commit_transaction(&mut txn).unwrap();
+    assert_eq!(txn.state(), TransactionState::Committed);
+    assert!(db.schema().table("users").is_none());
+    assert_eq!(db.inspect_catalog().unwrap().tables.len(), 1);
+    assert!(db.execute_prepared(&old_users, &[]).is_err());
+    assert_eq!(
+        rows(db.execute_prepared(&unaffected, &[]).unwrap()),
+        vec![vec![ScalarValue::Int64(2)]]
+    );
+    assert_eq!(db.schema_generation(), SchemaGeneration(2));
+    assert_eq!(db.catalog_generation(), before_revision + 1);
+    assert_eq!(db.next_table_id(), before_table);
+    assert_eq!(db.next_storage_id(), before_storage);
+    assert_eq!(db.next_partition_id(), before_partition);
+    let retired = db.inspect_retired_table_resources();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].table_id, TableId(1));
+    assert_eq!(retired[0].storage_id, StorageId(1));
+    assert_eq!(retired[0].table_version, TableSchemaVersion(1));
+    assert_eq!(retired[0].fingerprint, target.fingerprint);
+    assert_eq!(retired[0].retired_generation, SchemaGeneration(2));
+    assert!(root.join("users.heap").is_file());
+    drop(txn);
+    db.close().unwrap();
+    assert!(
+        Database::open_catalog_with_expectation(root.join("catalog"), Some(&stale_expectation))
+            .is_err()
+    );
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert!(reopened.schema().table("users").is_none());
+        assert_eq!(reopened.schema_generation(), SchemaGeneration(2));
+        assert_eq!(reopened.next_table_id(), before_table);
+        assert_eq!(reopened.next_storage_id(), before_storage);
+        assert_eq!(reopened.inspect_retired_table_resources(), retired);
+        assert_eq!(
+            reopened.query("SELECT id FROM teams").unwrap().rows,
+            vec![vec![ScalarValue::Int64(2)]]
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn core_drop_rollback_restores_exact_table_data_indexes_and_high_waters() {
+    let root = root("drop-rollback");
+    let mut db = seed(&root, true);
+    db.create_named_index(
+        IndexName::new("users_id_idx").unwrap(),
+        TableId(1),
+        ColumnId(1),
+    )
+    .unwrap();
+    let target = db.resolve_drop_table("users").unwrap();
+    let before = db.inspect_catalog().unwrap();
+    let before_generation = db.schema_generation();
+    let before_revision = db.catalog_generation();
+    let high_waters = (
+        db.next_table_id(),
+        db.next_storage_id(),
+        db.next_partition_id(),
+        db.next_column_id(TableId(1)),
+    );
+    let mut txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut txn, target.clone()).unwrap();
+    txn.rollback().unwrap();
+    assert_eq!(db.inspect_catalog().unwrap(), before);
+    assert_eq!(db.schema_generation(), before_generation);
+    assert_eq!(db.catalog_generation(), before_revision);
+    assert_eq!(
+        (
+            db.next_table_id(),
+            db.next_storage_id(),
+            db.next_partition_id(),
+            db.next_column_id(TableId(1)),
+        ),
+        high_waters
+    );
+    assert!(db.inspect_retired_table_resources().is_empty());
+    assert_eq!(db.indexes(TableId(1)).unwrap().len(), 1);
+    assert_eq!(
+        db.query("SELECT id FROM users").unwrap().rows,
+        vec![vec![ScalarValue::Int64(1)]]
+    );
+    drop(txn);
+    db.close().unwrap();
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(reopened.resolve_drop_table("users").unwrap(), target);
+    assert_eq!(reopened.inspect_catalog().unwrap(), before);
+    assert!(reopened.inspect_retired_table_resources().is_empty());
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn core_drop_recreate_same_name_never_reuses_identity_data_index_or_prepared_target() {
+    let root = root("drop-recreate");
+    let mut db = seed(&root, true);
+    db.create_named_index(
+        IndexName::new("users_id_idx").unwrap(),
+        TableId(1),
+        ColumnId(1),
+    )
+    .unwrap();
+    let old_prepared = db.prepare_statement("SELECT id FROM users", &[]).unwrap();
+    let old_target = db.resolve_drop_table("users").unwrap();
+    let mut drop_txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut drop_txn, old_target).unwrap();
+    db.commit_transaction(&mut drop_txn).unwrap();
+    drop(drop_txn);
+    let mut create_txn = db.begin_transaction().unwrap();
+    let new_table = db
+        .create_heap_table_in(
+            &mut create_txn,
+            CreateTableSpec::new(
+                "users",
+                vec![CreateColumnSpec::new(
+                    "id",
+                    SemanticType::physical(PhysicalType::Int64),
+                    false,
+                )],
+            ),
+        )
+        .unwrap();
+    assert_eq!(new_table, TableId(3));
+    db.commit_transaction(&mut create_txn).unwrap();
+    assert_eq!(db.bindings.resolve_single(new_table).unwrap(), StorageId(3));
+    assert_eq!(
+        db.table_schema_version(new_table),
+        Some(TableSchemaVersion(1))
+    );
+    assert!(db.indexes(new_table).unwrap().is_empty());
+    assert!(db.query("SELECT id FROM users").unwrap().rows.is_empty());
+    assert!(db.execute_prepared(&old_prepared, &[]).is_err());
+    assert_eq!(db.schema_generation(), SchemaGeneration(3));
+    assert_eq!(
+        db.inspect_retired_table_resources()[0].storage_id,
+        StorageId(1)
+    );
+    assert!(root.join("users.heap").is_file());
+    let snapshot = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+    let new_locator = snapshot
+        .storages
+        .iter()
+        .find(|storage| storage.id == StorageId(3))
+        .unwrap()
+        .locator
+        .clone();
+    assert_ne!(
+        db.inspect_retired_table_resources()[0].relative_locator,
+        new_locator
+    );
+    assert!(root.join(new_locator).is_file());
+    drop(create_txn);
+    db.close().unwrap();
+    let mut retired_heap =
+        netbadb_storage::TableStorage::open_heap(root.join("users.heap"), old_table(1, "users"))
+            .unwrap();
+    assert_eq!(retired_heap.indexes().len(), 1);
+    let view = retired_heap.read_view().unwrap();
+    assert_eq!(
+        retired_heap
+            .scan_columns_with_view(&[ColumnId(1)], &view)
+            .unwrap()
+            .into_iter()
+            .map(|(_, values)| values)
+            .collect::<Vec<_>>(),
+        vec![vec![ScalarValue::Int64(1)]]
+    );
+    retired_heap.close().unwrap();
+    let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(reopened.schema().table("users").unwrap().id, TableId(3));
+    assert!(
+        reopened
+            .query("SELECT id FROM users")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        reopened.inspect_retired_table_resources()[0].storage_id,
+        StorageId(1)
+    );
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
+    let root = root("drop-validation");
+    let mut db = seed(&root, true);
+    let exact = db.resolve_drop_table("users").unwrap();
+    let before_catalog = std::fs::read(root.join("catalog")).unwrap();
+    let before_marker = std::fs::read(root.join("catalog.state")).unwrap();
+    let before_generation = db.schema_generation();
+    let high_waters = (
+        db.next_table_id(),
+        db.next_storage_id(),
+        db.next_partition_id(),
+    );
+    let retained = db.begin_transaction().unwrap();
+    let mut blocked = db.begin_transaction().unwrap();
+    assert!(matches!(
+        db.drop_table_in(&mut blocked, exact.clone()),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::SchemaBusy
+        ))
+    ));
+    assert!(!root.join("catalog.mutations").exists());
+    drop(blocked);
+    drop(retained);
+    let mut txn = db.begin_transaction().unwrap();
+    let mut missing = exact.clone();
+    missing.table_id = TableId(999);
+    assert!(matches!(
+        db.drop_table_in(&mut txn, missing),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::TableNotFound(TableId(999))
+        ))
+    ));
+    let mut stale = exact.clone();
+    stale.table_version = TableSchemaVersion(2);
+    assert!(matches!(
+        db.drop_table_in(&mut txn, stale),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::StaleSchemaDependency
+        ))
+    ));
+    assert!(!root.join("catalog.mutations").exists());
+    assert_eq!(std::fs::read(root.join("catalog")).unwrap(), before_catalog);
+    assert_eq!(
+        std::fs::read(root.join("catalog.state")).unwrap(),
+        before_marker
+    );
+    assert_eq!(db.schema_generation(), before_generation);
+    assert_eq!(
+        (
+            db.next_table_id(),
+            db.next_storage_id(),
+            db.next_partition_id()
+        ),
+        high_waters
+    );
+    db.drop_table_in(&mut txn, exact).unwrap();
+    let teams = db.resolve_drop_table("teams").unwrap();
+    assert!(matches!(
+        db.drop_table_in(&mut txn, teams),
+        Err(crate::DatabaseError::UnsupportedDdlCombination)
+    ));
+    assert!(matches!(
+        db.create_heap_table_in(&mut txn, spec("other")),
+        Err(crate::DatabaseError::UnsupportedDdlCombination)
+            | Err(crate::DatabaseError::SchemaMutation(
+                SchemaMutationError::MultipleCreatesUnsupported
+            ))
+    ));
+    txn.rollback().unwrap();
+    drop(txn);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn core_drop_rejects_lsm_and_partitioned_tables_before_persistent_intent() {
+    let lsm_root = root("drop-lsm");
+    let mut lsm = Database::create_catalog(
+        lsm_root.join("catalog"),
+        vec![TableStorageCreateSpec::lsm(
+            lsm_root.join("rows.lsm"),
+            old_table(1, "rows"),
+            ColumnId(1),
+        )],
+        Some(DatabaseCoordinatorConfig::new(lsm_root.join("coordinator"))),
+    )
+    .unwrap();
+    let target = lsm.resolve_drop_table("rows").unwrap();
+    let mut txn = lsm.begin_transaction().unwrap();
+    assert!(matches!(
+        lsm.drop_table_in(&mut txn, target),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedPlacement
+        ))
+    ));
+    assert!(!lsm_root.join("catalog.mutations").exists());
+    txn.rollback().unwrap();
+    drop(txn);
+    lsm.close().unwrap();
+
+    let partition_root = root("drop-partition");
+    let mut partitioned = Database::create_catalog_with_placements(
+        partition_root.join("catalog"),
+        vec![crate::TablePlacementSpec::range_partitioned(
+            old_table(1, "events"),
+            ColumnId(1),
+            vec![crate::RangePartitionSpec::new(
+                netbadb_types::PartitionId(1),
+                partition_root.join("events.heap"),
+                None,
+                None,
+            )],
+        )],
+        crate::PartitionCatalogConfig::new(
+            partition_root.join("partitions"),
+            partition_root.join("coordinator"),
+        ),
+    )
+    .unwrap();
+    let target = partitioned.resolve_drop_table("events").unwrap();
+    let mut txn = partitioned.begin_transaction().unwrap();
+    assert!(matches!(
+        partitioned.drop_table_in(&mut txn, target),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedPlacement
+        ))
+    ));
+    assert!(!partition_root.join("catalog.mutations").exists());
+    txn.rollback().unwrap();
+    drop(txn);
+    partitioned.close().unwrap();
+    std::fs::remove_dir_all(lsm_root).unwrap();
+    std::fs::remove_dir_all(partition_root).unwrap();
+}
+
+#[test]
+fn core_drop_highest_identity_is_not_reused_and_missing_retained_heap_fails_open() {
+    let root = root("drop-highest");
+    let mut db = seed(&root, true);
+    let teams = db.resolve_drop_table("teams").unwrap();
+    let mut txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut txn, teams).unwrap();
+    db.commit_transaction(&mut txn).unwrap();
+    drop(txn);
+    let mut create = db.begin_transaction().unwrap();
+    let id = db
+        .create_heap_table_in(&mut create, CreateTableSpec::new("replacement", vec![]))
+        .unwrap();
+    assert_eq!(id, TableId(3));
+    db.commit_transaction(&mut create).unwrap();
+    assert_eq!(db.bindings.resolve_single(id).unwrap(), StorageId(3));
+    assert_eq!(db.next_table_id(), Some(TableId(4)));
+    assert_eq!(db.next_storage_id(), Some(StorageId(4)));
+    drop(create);
+    db.close().unwrap();
+    let journal_before = std::fs::read(root.join("catalog.mutations")).unwrap();
+    for _ in 0..3 {
+        Database::open_catalog(root.join("catalog"))
+            .unwrap()
+            .close()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("catalog.mutations")).unwrap(),
+            journal_before
+        );
+    }
+    std::fs::remove_file(root.join("teams.heap")).unwrap();
+    for _ in 0..3 {
+        assert!(Database::open_catalog(root.join("catalog")).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn runtime_created_heap_can_be_dropped_and_recovered_from_retained_create_history() {
+    let root = root("drop-runtime-create");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(&mut create, CreateTableSpec::new("projects", vec![]))
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    let target = db.resolve_drop_table("projects").unwrap();
+    let mut drop_txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut drop_txn, target).unwrap();
+    db.commit_transaction(&mut drop_txn).unwrap();
+    assert_eq!(db.schema_generation(), SchemaGeneration(3));
+    assert!(db.schema().table("projects").is_none());
+    assert_eq!(db.inspect_retired_table_resources()[0].table_id, table);
+    drop(drop_txn);
+    db.close().unwrap();
+    for _ in 0..3 {
+        let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert!(reopened.schema().table("projects").is_none());
+        assert_eq!(reopened.schema_generation(), SchemaGeneration(3));
+        assert_eq!(
+            reopened.inspect_retired_table_resources()[0].table_id,
+            table
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn imported_single_heap_drop_preserves_immutable_placement_evidence() {
+    let root = root("drop-imported-single");
+    let mut db = Database::create_catalog_with_placements(
+        root.join("catalog"),
+        vec![crate::TablePlacementSpec::single(
+            root.join("imported.heap"),
+            old_table(9, "imported"),
+        )],
+        crate::PartitionCatalogConfig::new(root.join("placements"), root.join("coordinator")),
+    )
+    .unwrap();
+    let target = db.resolve_drop_table("imported").unwrap();
+    let mut txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut txn, target).unwrap();
+    db.commit_transaction(&mut txn).unwrap();
+    drop(txn);
+    db.close().unwrap();
+    for _ in 0..3 {
+        let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert!(reopened.schema().tables().is_empty());
+        assert_eq!(
+            reopened.inspect_retired_table_resources()[0].table_id,
+            TableId(9)
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retired_inventory_explains_completed_historical_storage_only_decisions() {
+    let root = root("drop-historical-decision");
+    let mut db = seed(&root, true);
+    let mut write = db.begin_transaction().unwrap();
+    db.execute_in(&mut write, "UPDATE users SET id = 10")
+        .unwrap();
+    db.execute_in(&mut write, "UPDATE teams SET id = 20")
+        .unwrap();
+    db.commit_transaction(&mut write).unwrap();
+    drop(write);
+    let target = db.resolve_drop_table("users").unwrap();
+    let mut drop_txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut drop_txn, target).unwrap();
+    db.commit_transaction(&mut drop_txn).unwrap();
+    drop(drop_txn);
+    db.close().unwrap();
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert!(reopened.schema().table("users").is_none());
+        assert_eq!(
+            reopened.query("SELECT id FROM teams").unwrap().rows,
+            vec![vec![ScalarValue::Int64(20)]]
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -545,6 +1035,131 @@ fn subprocess_create_crash_matrix_reopens_three_times_with_exact_outcomes() {
 }
 
 #[test]
+fn drop_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_DROP_CHILD_ROOT") else {
+        return;
+    };
+    let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    let target = db.resolve_drop_table("users").unwrap();
+    let mut txn = db.begin_transaction().unwrap();
+    if std::env::var_os("NETBADB_DROP_SKIP_DML").is_none() {
+        db.execute_in(&mut txn, "UPDATE users SET id = 7").unwrap();
+    }
+    db.drop_table_in(&mut txn, target).unwrap();
+    if std::env::var("NETBADB_DROP_CRASH_POINT")
+        .unwrap_or_default()
+        .starts_with("drop-rollback")
+    {
+        txn.rollback().unwrap();
+    } else {
+        db.commit_transaction(&mut txn).unwrap();
+    }
+    panic!("configured DROP crash hook was not reached");
+}
+
+fn spawn_drop(root: &Path, point: &str) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "schema_mutation_tests::drop_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_DROP_CHILD_ROOT", root)
+        .env("NETBADB_DROP_CRASH_POINT", point);
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(90),
+        "{point}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn drop_outcome(root: &Path, winner: bool) {
+    for _ in 0..3 {
+        let mut db = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            db.schema_generation(),
+            SchemaGeneration(if winner { 2 } else { 1 })
+        );
+        assert_eq!(db.next_table_id(), Some(TableId(3)));
+        assert_eq!(db.next_storage_id(), Some(StorageId(3)));
+        assert!(root.join("users.heap").is_file());
+        if winner {
+            assert!(db.schema().table("users").is_none());
+            assert_eq!(db.inspect_retired_table_resources().len(), 1);
+            assert!(db.prepare_statement("SELECT id FROM users", &[]).is_err());
+        } else {
+            assert_eq!(
+                db.query("SELECT id FROM users").unwrap().rows,
+                vec![vec![ScalarValue::Int64(1)]]
+            );
+            assert!(db.inspect_retired_table_resources().is_empty());
+        }
+        assert_eq!(
+            db.query("SELECT id FROM teams").unwrap().rows,
+            vec![vec![ScalarValue::Int64(2)]]
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn subprocess_drop_crash_matrix_reopens_three_times_with_exact_outcomes() {
+    for (point, winner) in [
+        ("drop-intent-durable", false),
+        ("drop-overlay-established", false),
+        ("participants-prepared", false),
+        ("prepared-catalog-written", false),
+        ("prepared-catalog-durable", false),
+        ("before-coordinator-decision", false),
+        ("coordinator-durable", true),
+        ("staged-heap-committed", true),
+        ("drop-retirement-durable", true),
+        ("before-nbsc-publication", true),
+        ("during-nbsc-publication", true),
+        ("nbsc-state-durable", true),
+        ("drop-nbsc-durable", true),
+        ("before-memory-publish", true),
+        ("after-memory-publish", true),
+        ("before-api-return", true),
+        ("drop-rollback-cleanup", false),
+    ] {
+        let root = root(&format!("drop-{point}"));
+        seed(&root, true).close().unwrap();
+        spawn_drop(&root, point);
+        drop_outcome(&root, winner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn schema_only_drop_uses_zero_physical_participants_and_recovers() {
+    let root = root("drop-zero-participants");
+    seed(&root, true).close().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::drop_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_DROP_CHILD_ROOT", &root)
+        .env("NETBADB_DROP_SKIP_DML", "1")
+        .env("NETBADB_DROP_CRASH_POINT", "coordinator-durable")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(90));
+    let log = crate::CoordinatorLog::open(root.join("coordinator")).unwrap();
+    let decision = log.decisions().next().unwrap();
+    assert!(decision.participants.is_empty());
+    assert!(decision.schema.is_some());
+    drop(log);
+    drop_outcome(&root, true);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn initialized_journal_and_winner_corruption_fail_closed() {
     for case in [
         "missing-journal",
@@ -647,6 +1262,37 @@ fn journal_codec_roundtrip_truncation_duplicates_and_incarnation() {
     );
     drop(journal);
     drop(txn);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn journal_rejects_create_reservation_below_retired_allocator_floor() {
+    let root = root("drop-journal-allocator-conflict");
+    let mut db = seed(&root, true);
+    let target = db.resolve_drop_table("users").unwrap();
+    let mut txn = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut txn, target).unwrap();
+    db.commit_transaction(&mut txn).unwrap();
+    drop(txn);
+
+    let mut journal = db.mutation_journal.as_ref().unwrap().borrow().clone();
+    let retired = journal.drops.values().next_back().unwrap().clone();
+    let transaction = crate::DatabaseTxnId(retired.transaction.0 + 1);
+    journal.reservations.insert(
+        transaction,
+        crate::schema_mutation_journal::Reservation {
+            transaction,
+            table: retired.fragment.committed.next_table_id.unwrap(),
+            storage: retired.storage(),
+            base_generation: retired.target_generation,
+            base_epoch: retired.target_epoch,
+            intent: None,
+            resolved: None,
+        },
+    );
+    assert!(journal.encode().is_err());
+
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -880,6 +1526,62 @@ fn write_schema_mutation_fuzz_corpus() {
         let bytes = sample.encode().unwrap();
         std::fs::write(output.join("schema_mutation_decode").join(name), bytes).unwrap();
     }
+    txn.rollback().unwrap();
+    drop(txn);
+    let target = db.resolve_drop_table("users").unwrap();
+    let mut drop_loser = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut drop_loser, target.clone()).unwrap();
+    let drop_intent = db
+        .mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .encode()
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/drop-intent-v1"),
+        &drop_intent,
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/drop-truncated-v1"),
+        &drop_intent[..drop_intent.len() - 7],
+    )
+    .unwrap();
+    drop_loser.rollback().unwrap();
+    drop(drop_loser);
+    std::fs::write(
+        output.join("schema_mutation_decode/drop-loser-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut drop_winner = db.begin_transaction().unwrap();
+    db.drop_table_in(&mut drop_winner, target).unwrap();
+    db.commit_transaction(&mut drop_winner).unwrap();
+    drop(drop_winner);
+    let winner = db.mutation_journal.as_ref().unwrap().borrow().clone();
+    std::fs::write(
+        output.join("schema_mutation_decode/drop-winner-v1"),
+        winner.encode().unwrap(),
+    )
+    .unwrap();
+    let mut retained = winner;
+    retained.drops.values_mut().next_back().unwrap().resolved = None;
+    std::fs::write(
+        output.join("schema_mutation_decode/drop-retained-v1"),
+        retained.encode().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("coordinator_log_decode/schema-drop-zero-v2"),
+        std::fs::read(root.join("coordinator")).unwrap(),
+    )
+    .unwrap();
     let reference = crate::coordinator_log::SchemaParticipantReference {
         incarnation: [7; 16],
         target_epoch: 2,
@@ -920,8 +1622,6 @@ fn write_schema_mutation_fuzz_corpus() {
     )
     .unwrap();
     drop(log);
-    txn.rollback().unwrap();
-    drop(txn);
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
