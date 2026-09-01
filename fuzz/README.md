@@ -225,3 +225,13 @@ bound and 1,000-run command remain authoritative; no new persistent format or
 fuzz-only decoder is introduced. Run all thirteen registered targets because
 Heap rewrite also relies on the existing catalog, coordinator, page, BTree,
 IndexCatalog and WAL decoders.
+
+## Round 25 replacement-retired Heap GC records
+
+The same `schema_mutation_decode` target adds generated valid rewrite-GC intent
+and complete seeds. Tags 9/10 and their payloads are unchanged; the seed proves
+that replay attaches them after terminal rewrite tags 13/15 as well as after a
+terminal DROP. Deterministic replay tests reject GC before rewrite retirement or
+winner, wrong transactions, duplicate intent/complete and active-old-StorageId
+states. Generate these seeds into the temporary reviewed corpus with the command
+above; tracked corpus bytes remain unchanged because no tag or envelope changed.

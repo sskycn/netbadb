@@ -64,6 +64,7 @@ pub(crate) struct RewriteIntent {
     pub(crate) snapshot_digest: [u8; 32],
     pub(crate) retired: bool,
     pub(crate) resolved: Option<bool>,
+    pub(crate) gc: Option<RetiredHeapGcRecord>,
 }
 
 impl RewriteIntent {
@@ -80,8 +81,8 @@ impl RewriteIntent {
     }
 }
 
-/// Durable retry-only physical deletion state. The surrounding DropIntent
-/// already carries the exact database incarnation, table/version/fingerprint,
+/// Durable retry-only physical deletion state. The surrounding DROP or rewrite
+/// intent carries the exact database incarnation, table/version/fingerprint,
 /// StorageId, locator and retirement transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RetiredHeapGcRecord {
@@ -342,24 +343,35 @@ impl SchemaMutationJournal {
         gc: &RetiredHeapGcRecord,
     ) -> Result<(), SchemaMutationError> {
         self.ensure_ready()?;
-        let drop = self
+        let terminal = self
             .drops
             .get(&txn)
-            .ok_or(corrupt("GC intent without drop history"))?;
-        if !drop.retired || drop.resolved != Some(true) || drop.gc.is_some() || gc.complete {
+            .map(|drop| (drop.retired, drop.resolved, drop.gc.is_some()))
+            .or_else(|| {
+                self.rewrites
+                    .get(&txn)
+                    .map(|rewrite| (rewrite.retired, rewrite.resolved, rewrite.gc.is_some()))
+            })
+            .ok_or(corrupt("GC intent without retirement history"))?;
+        if !terminal.0 || terminal.1 != Some(true) || terminal.2 || gc.complete {
             return Err(corrupt("out-of-order GC intent"));
         }
         // Reserve both terminal records before the first unlink. Capacity can
         // therefore never strand a durable deleting state without Complete.
         let mut projected = self.clone();
-        let projected_drop = projected
-            .drops
-            .get_mut(&txn)
-            .ok_or(corrupt("projected GC drop disappeared"))?;
-        projected_drop.gc = Some(RetiredHeapGcRecord {
+        let complete = RetiredHeapGcRecord {
             complete: true,
             ..gc.clone()
-        });
+        };
+        if let Some(drop) = projected.drops.get_mut(&txn) {
+            drop.gc = Some(complete);
+        } else {
+            projected
+                .rewrites
+                .get_mut(&txn)
+                .ok_or(corrupt("projected GC retirement disappeared"))?
+                .gc = Some(complete);
+        }
         projected.encode()?;
         Ok(())
     }
@@ -589,20 +601,27 @@ impl SchemaMutationJournal {
         gc: RetiredHeapGcRecord,
     ) -> Result<(), SchemaMutationError> {
         self.prepare_gc(txn, &gc)?;
-        self.drops
-            .get_mut(&txn)
-            .ok_or(corrupt("GC intent without drop history"))?
-            .gc = Some(gc);
+        if let Some(drop) = self.drops.get_mut(&txn) {
+            drop.gc = Some(gc);
+        } else {
+            self.rewrites
+                .get_mut(&txn)
+                .ok_or(corrupt("GC intent without retirement history"))?
+                .gc = Some(gc);
+        }
         self.persist()
     }
 
     pub(crate) fn complete_gc(&mut self, txn: DatabaseTxnId) -> Result<(), SchemaMutationError> {
         self.ensure_ready()?;
-        let gc = self
-            .drops
-            .get_mut(&txn)
-            .and_then(|drop| drop.gc.as_mut())
-            .ok_or(corrupt("GC complete without intent"))?;
+        let gc = if let Some(drop) = self.drops.get_mut(&txn) {
+            drop.gc.as_mut()
+        } else {
+            self.rewrites
+                .get_mut(&txn)
+                .and_then(|rewrite| rewrite.gc.as_mut())
+        }
+        .ok_or(corrupt("GC complete without intent"))?;
         if gc.complete {
             return Ok(());
         }
@@ -683,7 +702,10 @@ impl SchemaMutationJournal {
                     .rewrites
                     .get(&reservation.transaction)
                     .map_or(0, |rewrite| {
-                        1 + usize::from(rewrite.retired) + usize::from(rewrite.resolved.is_some())
+                        1 + usize::from(rewrite.retired)
+                            + usize::from(rewrite.resolved.is_some())
+                            + usize::from(rewrite.gc.is_some())
+                            + usize::from(rewrite.gc.as_ref().is_some_and(|gc| gc.complete))
                     })
                     + usize::from(
                         !self.rewrites.contains_key(&reservation.transaction)
@@ -790,6 +812,18 @@ impl SchemaMutationJournal {
                         let mut record = Writer(vec![if committed { 15 } else { 14 }]);
                         record.u64(txn.0);
                         put_record(&mut w, &record.0)?;
+                    }
+                    if let Some(gc) = &rewrite.gc {
+                        let mut record = Writer(vec![9]);
+                        record.u64(txn.0);
+                        record.u64(gc.coordinator_horizon.0);
+                        record.0.extend_from_slice(&gc.manifest_digest);
+                        put_record(&mut w, &record.0)?;
+                        if gc.complete {
+                            let mut record = Writer(vec![10]);
+                            record.u64(txn.0);
+                            put_record(&mut w, &record.0)?;
+                        }
                     }
                 } else if self.rewrite_losers.contains(&txn) {
                     let mut record = Writer(vec![14]);
@@ -1046,35 +1080,53 @@ impl SchemaMutationJournal {
                     if current != Some(txn) {
                         return Err(corrupt("GC intent for unknown transaction"));
                     }
-                    let intent = drops
-                        .get_mut(&txn)
-                        .ok_or(corrupt("GC intent without drop history"))?;
                     let coordinator_horizon = DatabaseTxnId(record.u64()?);
                     let manifest_digest = record
                         .take(32)?
                         .try_into()
                         .map_err(|_| corrupt("GC manifest digest"))?;
-                    if !intent.retired
-                        || intent.resolved != Some(true)
-                        || intent.gc.is_some()
-                        || coordinator_horizon.0 < intent.transaction.0
+                    let terminal = drops
+                        .get(&txn)
+                        .map(|drop| (drop.retired, drop.resolved, drop.gc.is_some()))
+                        .or_else(|| {
+                            rewrites.get(&txn).map(|rewrite| {
+                                (rewrite.retired, rewrite.resolved, rewrite.gc.is_some())
+                            })
+                        })
+                        .ok_or(corrupt("GC intent without retirement history"))?;
+                    if !terminal.0
+                        || terminal.1 != Some(true)
+                        || terminal.2
+                        || coordinator_horizon.0 < txn.0
                     {
                         return Err(corrupt("duplicate or out-of-order GC intent"));
                     }
-                    intent.gc = Some(RetiredHeapGcRecord {
+                    let gc = RetiredHeapGcRecord {
                         coordinator_horizon,
                         manifest_digest,
                         complete: false,
-                    });
+                    };
+                    if let Some(drop) = drops.get_mut(&txn) {
+                        drop.gc = Some(gc);
+                    } else {
+                        rewrites
+                            .get_mut(&txn)
+                            .ok_or(corrupt("GC rewrite history disappeared"))?
+                            .gc = Some(gc);
+                    }
                 }
                 10 => {
                     if current != Some(txn) {
                         return Err(corrupt("GC complete for unknown transaction"));
                     }
-                    let gc = drops
-                        .get_mut(&txn)
-                        .and_then(|drop| drop.gc.as_mut())
-                        .ok_or(corrupt("GC complete without intent"))?;
+                    let gc = if let Some(drop) = drops.get_mut(&txn) {
+                        drop.gc.as_mut()
+                    } else {
+                        rewrites
+                            .get_mut(&txn)
+                            .and_then(|rewrite| rewrite.gc.as_mut())
+                    }
+                    .ok_or(corrupt("GC complete without intent"))?;
                     if gc.complete {
                         return Err(corrupt("duplicate GC complete"));
                     }
@@ -1166,6 +1218,7 @@ impl SchemaMutationJournal {
                             snapshot_digest,
                             retired: false,
                             resolved: None,
+                            gc: None,
                         },
                     );
                 }

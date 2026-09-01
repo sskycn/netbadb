@@ -76,8 +76,8 @@ pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
 pub use schema_mutation::{
     AlterTableOperation, AlterTableSpec, CreateColumnSpec, CreateTableSpec, ReplacementRetiredHeap,
     RetiredHeapGcBlocker, RetiredHeapGcComponent, RetiredHeapGcComponentKind,
-    RetiredHeapGcInspection, RetiredHeapGcReport, RetiredHeapGcState, RetiredTableResource,
-    SchemaDependency, SchemaMutationError,
+    RetiredHeapGcInspection, RetiredHeapGcReport, RetiredHeapGcState, RetiredHeapGcTarget,
+    RetiredTableResource, SchemaDependency, SchemaMutationError,
 };
 
 impl From<SchemaCatalogError> for DatabaseError {
@@ -572,8 +572,7 @@ impl DatabaseError {
                 SchemaMutationError::UnsupportedConstraint
                 | SchemaMutationError::UnsupportedPlacement
                 | SchemaMutationError::MultipleCreatesUnsupported
-                | SchemaMutationError::UnsupportedSchemaEvolution
-                | SchemaMutationError::ReplacementRetirementGcUnsupported,
+                | SchemaMutationError::UnsupportedSchemaEvolution,
             ) => DatabaseErrorKind::FeatureNotSupported,
             Self::SchemaMutation(
                 SchemaMutationError::TableNotFound(_) | SchemaMutationError::UndefinedTable(_),

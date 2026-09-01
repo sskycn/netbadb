@@ -707,6 +707,48 @@ fn heap_schema_rewrite_preserves_index_and_join_planner_paths() {
         vec![vec![ScalarValue::Int64(2)]]
     );
 
+    let retired = db.inspect_replacement_retired_heaps()[0].clone();
+    let active_storage = db.bindings.resolve_single(table).unwrap();
+    let active = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+    let active_locator = &active
+        .storages
+        .iter()
+        .find(|storage| storage.id == active_storage)
+        .unwrap()
+        .locator;
+    let active_path = crate::schema_catalog_file::resolve(&root.join("catalog"), active_locator);
+    let active_bundle = heap_bundle_bytes(&active_path);
+    let before_gc = db.inspect_replacement_retired_heap_gc(&retired).unwrap();
+    let report = db.gc_replacement_retired_heap(&retired).unwrap();
+    eprintln!(
+        "index-heavy replacement GC: old_storage={} active_storage={} files_deleted={} bytes_deleted={}",
+        retired.old_storage_id.0, active_storage.0, report.files_deleted, report.bytes_deleted
+    );
+    assert_eq!(report.bytes_deleted, before_gc.total_present_bytes);
+    assert!(
+        before_gc
+            .components
+            .iter()
+            .all(|component| !component.path.exists())
+    );
+    assert_eq!(heap_bundle_bytes(&active_path), active_bundle);
+    assert_eq!(
+        db.indexes(table)
+            .unwrap()
+            .iter()
+            .map(|index| (index.id, index.column_id))
+            .collect::<Vec<_>>(),
+        vec![(id_index.id, ColumnId(1)), (name_index.id, ColumnId(2))]
+    );
+    assert_eq!(
+        db.query(&format!(
+            "SELECT id FROM projects WHERE title = 'name-42-{payload}'"
+        ))
+        .unwrap()
+        .rows,
+        vec![vec![ScalarValue::Int64(42)]]
+    );
+
     db.close().unwrap();
     let reopened = Database::open_catalog(root.join("catalog")).unwrap();
     assert!(plan_contains(
@@ -909,13 +951,16 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
     let retained_path =
         crate::schema_catalog_file::resolve(&root.join("catalog"), &retained.old_relative_locator);
     let retained_bundle = heap_bundle_bytes(&retained_path);
-    assert!(matches!(
-        db.gc_replacement_retired_heap(&retained),
-        Err(crate::DatabaseError::SchemaMutation(
-            SchemaMutationError::ReplacementRetirementGcUnsupported
-        ))
-    ));
-    assert_eq!(heap_bundle_bytes(&retained_path), retained_bundle);
+    let inspection = db.inspect_replacement_retired_heap_gc(&retained).unwrap();
+    assert!(inspection.eligible(), "{:?}", inspection.blockers);
+    let report = db.gc_replacement_retired_heap(&retained).unwrap();
+    assert_eq!(report.state, RetiredHeapGcState::Deleted);
+    assert!(retained_bundle.iter().any(|(_, bytes)| bytes.is_some()));
+    assert!(
+        heap_bundle_bytes(&retained_path)
+            .iter()
+            .all(|(_, bytes)| bytes.is_none())
+    );
     assert_eq!(db.inspect_replacement_retired_heaps().len(), 7);
     assert_eq!(
         db.query("SELECT id FROM work WHERE id = 2").unwrap().rows,
@@ -1432,6 +1477,289 @@ fn one_hundred_heap_schema_rewrites_preserve_identity_and_report_growth() {
 }
 
 #[test]
+fn replacement_gc_supports_chained_rewrites_reverse_order_and_later_alter() {
+    let root = root("replacement-gc-chain");
+    let mut db = seed(&root, true);
+    let table = create_rewrite_gc_table(&mut db, "projects");
+    db.execute("INSERT INTO projects VALUES (7)").unwrap();
+    let index = db
+        .create_named_index(
+            IndexName::new("projects_value_idx").unwrap(),
+            table,
+            ColumnId(1),
+        )
+        .unwrap();
+    let first = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+    let second = rename_rewrite_gc_column(&mut db, "projects", "value_b", "value_c");
+    let third = rename_rewrite_gc_column(&mut db, "projects", "value_c", "value_d");
+    let retired = vec![first, second, third];
+    let active_storage = db.bindings.resolve_single(table).unwrap();
+    let active = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+    let active_locator = &active
+        .storages
+        .iter()
+        .find(|storage| storage.id == active_storage)
+        .unwrap()
+        .locator;
+    let active_path = crate::schema_catalog_file::resolve(&root.join("catalog"), active_locator);
+    let active_bytes = heap_bundle_bytes(&active_path);
+    let invariants = (
+        db.schema_generation(),
+        db.catalog_generation(),
+        db.next_table_id(),
+        db.next_storage_id(),
+        db.next_partition_id(),
+        db.next_column_id(table),
+    );
+
+    for resource in retired.iter().rev() {
+        let inspection = db.inspect_replacement_retired_heap_gc(resource).unwrap();
+        assert!(inspection.eligible(), "{:?}", inspection.blockers);
+        assert_eq!(inspection.target.storage_id(), resource.old_storage_id);
+        db.gc_replacement_retired_heap(resource).unwrap();
+    }
+    assert_eq!(heap_bundle_bytes(&active_path), active_bytes);
+    assert_eq!(
+        (
+            db.schema_generation(),
+            db.catalog_generation(),
+            db.next_table_id(),
+            db.next_storage_id(),
+            db.next_partition_id(),
+            db.next_column_id(table),
+        ),
+        invariants
+    );
+    assert_eq!(db.indexes(table).unwrap()[0].id, index.id);
+    assert_eq!(
+        db.query("SELECT value_d FROM projects").unwrap().rows,
+        vec![vec![ScalarValue::Int64(7)]]
+    );
+    for resource in &retired {
+        assert_eq!(
+            db.inspect_replacement_retired_heap_gc(resource)
+                .unwrap()
+                .state,
+            RetiredHeapGcState::Deleted
+        );
+    }
+
+    let fourth = rename_rewrite_gc_column(&mut db, "projects", "value_d", "value_e");
+    assert_eq!(fourth.old_storage_id, active_storage);
+    assert_eq!(db.schema().table("projects").unwrap().id, table);
+    assert_eq!(
+        db.query("SELECT value_e FROM projects").unwrap().rows,
+        vec![vec![ScalarValue::Int64(7)]]
+    );
+    db.close().unwrap();
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(reopened.schema().table("projects").unwrap().id, table);
+        assert_eq!(
+            reopened.query("SELECT value_e FROM projects").unwrap().rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        for resource in &retired {
+            assert_eq!(
+                reopened
+                    .inspect_replacement_retired_heap_gc(resource)
+                    .unwrap()
+                    .state,
+                RetiredHeapGcState::Deleted
+            );
+        }
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_and_drop_retirements_gc_independently_in_both_orders() {
+    for drop_first in [false, true] {
+        let root = root(if drop_first {
+            "replacement-gc-drop-first"
+        } else {
+            "replacement-gc-rewrite-first"
+        });
+        let mut db = seed(&root, true);
+        let table = create_rewrite_gc_table(&mut db, "projects");
+        db.execute("INSERT INTO projects VALUES (11)").unwrap();
+        let replacement = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+        let active_storage = db.bindings.resolve_single(table).unwrap();
+        let target = db.resolve_drop_table("projects").unwrap();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.drop_table_in(&mut transaction, target).unwrap();
+        db.commit_transaction(&mut transaction).unwrap();
+        drop(transaction);
+        let dropped = db
+            .inspect_retired_table_resources()
+            .into_iter()
+            .find(|resource| resource.storage_id == active_storage)
+            .unwrap();
+        if drop_first {
+            db.gc_retired_heap(&dropped).unwrap();
+            db.gc_replacement_retired_heap(&replacement).unwrap();
+        } else {
+            db.gc_replacement_retired_heap(&replacement).unwrap();
+            db.gc_retired_heap(&dropped).unwrap();
+        }
+        assert_eq!(
+            db.inspect_replacement_retired_heap_gc(&replacement)
+                .unwrap()
+                .state,
+            RetiredHeapGcState::Deleted
+        );
+        assert_eq!(
+            db.inspect_retired_heap_gc(&dropped).unwrap().state,
+            RetiredHeapGcState::Deleted
+        );
+        assert!(db.schema().tables().iter().all(|active| active.id != table));
+        assert_eq!(
+            db.query("SELECT id FROM teams").unwrap().rows,
+            vec![vec![ScalarValue::Int64(2)]]
+        );
+        db.close().unwrap();
+        for _ in 0..3 {
+            Database::open_catalog(root.join("catalog"))
+                .unwrap()
+                .close()
+                .unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn one_hundred_rewrite_gc_cycles_reclaim_physical_history_without_reusing_storage() {
+    let root = root("replacement-gc-one-hundred");
+    let mut db = seed(&root, true);
+    let table = create_rewrite_gc_table(&mut db, "projects");
+    db.execute("INSERT INTO projects VALUES (25)").unwrap();
+    let initial_storage = db.bindings.resolve_single(table).unwrap();
+    let journal_before = std::fs::metadata(root.join("catalog.mutations"))
+        .unwrap()
+        .len();
+    let coordinator_before = std::fs::metadata(root.join("coordinator")).unwrap().len();
+    let mut current_name = "value_a";
+    let mut deleted_bytes = 0_u64;
+    let mut first_before = 0_u64;
+    for iteration in 0..100 {
+        let next_name = if current_name == "value_a" {
+            "value_b"
+        } else {
+            "value_a"
+        };
+        let retired = rename_rewrite_gc_column(&mut db, "projects", current_name, next_name);
+        let before = db.inspect_replacement_retired_heap_gc(&retired).unwrap();
+        assert!(before.eligible(), "{:?}", before.blockers);
+        if iteration == 0 {
+            first_before = before.total_present_bytes;
+        }
+        let invariants = (
+            db.schema_generation(),
+            db.catalog_generation(),
+            db.next_storage_id(),
+            db.next_column_id(table),
+        );
+        let report = db.gc_replacement_retired_heap(&retired).unwrap();
+        deleted_bytes = deleted_bytes.checked_add(report.bytes_deleted).unwrap();
+        assert_eq!(
+            (
+                db.schema_generation(),
+                db.catalog_generation(),
+                db.next_storage_id(),
+                db.next_column_id(table),
+            ),
+            invariants
+        );
+        current_name = next_name;
+    }
+    let retained_bytes = db
+        .inspect_replacement_retired_heaps()
+        .iter()
+        .map(|retired| {
+            db.inspect_replacement_retired_heap_gc(retired)
+                .unwrap()
+                .total_present_bytes
+        })
+        .sum::<u64>();
+    let active_storage = db.bindings.resolve_single(table).unwrap();
+    let active = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+    let active_locator = &active
+        .storages
+        .iter()
+        .find(|storage| storage.id == active_storage)
+        .unwrap()
+        .locator;
+    let active_bytes = heap_bundle_size(&heap_bundle_bytes(&crate::schema_catalog_file::resolve(
+        &root.join("catalog"),
+        active_locator,
+    )));
+    let journal_after = std::fs::metadata(root.join("catalog.mutations"))
+        .unwrap()
+        .len();
+    let coordinator_after = std::fs::metadata(root.join("coordinator")).unwrap().len();
+    eprintln!(
+        "round25 rewrite+GC stress: cycles=100 table={} initial_storage={} active_storage={} first_retired_before={} retained_replacement_bytes={} deleted_replacement_bytes={} active_heap_bytes={} nbsj_before={} nbsj_after={} cord_before={} cord_after={}",
+        table.0,
+        initial_storage.0,
+        active_storage.0,
+        first_before,
+        retained_bytes,
+        deleted_bytes,
+        active_bytes,
+        journal_before,
+        journal_after,
+        coordinator_before,
+        coordinator_after,
+    );
+    assert_eq!(db.schema().table("projects").unwrap().id, table);
+    assert_eq!(
+        db.table_schema_version(table),
+        Some(TableSchemaVersion(101))
+    );
+    assert_eq!(active_storage, StorageId(initial_storage.0 + 100));
+    assert_eq!(retained_bytes, 0);
+    assert_eq!(db.inspect_replacement_retired_heaps().len(), 100);
+    assert_eq!(
+        db.query(&format!("SELECT {current_name} FROM projects"))
+            .unwrap()
+            .rows,
+        vec![vec![ScalarValue::Int64(25)]]
+    );
+    db.close().unwrap();
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            reopened.bindings.resolve_single(table).unwrap(),
+            active_storage
+        );
+        assert_eq!(
+            reopened
+                .inspect_replacement_retired_heaps()
+                .iter()
+                .map(|retired| {
+                    reopened
+                        .inspect_replacement_retired_heap_gc(retired)
+                        .unwrap()
+                        .total_present_bytes
+                })
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            reopened
+                .query(&format!("SELECT {current_name} FROM projects"))
+                .unwrap()
+                .rows,
+            vec![vec![ScalarValue::Int64(25)]]
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn rewrite_journal_rejects_invalid_identity_version_fingerprint_and_ordering() {
     let root = root("rewrite-journal-invalid");
     let mut db = seed(&root, true);
@@ -1547,6 +1875,43 @@ fn rewrite_journal_rejects_invalid_identity_version_fingerprint_and_ordering() {
         .column = Some(ColumnId(4));
     assert!(reserved_column.encode().is_err());
 
+    let mut gc_intent = valid.clone();
+    gc_intent.rewrites.get_mut(&transaction).unwrap().gc =
+        Some(crate::schema_mutation_journal::RetiredHeapGcRecord {
+            coordinator_horizon: transaction,
+            manifest_digest: [25; 32],
+            complete: false,
+        });
+    assert!(gc_intent.encode().is_ok());
+    gc_intent
+        .rewrites
+        .get_mut(&transaction)
+        .unwrap()
+        .gc
+        .as_mut()
+        .unwrap()
+        .complete = true;
+    assert!(gc_intent.encode().is_ok());
+
+    let mut gc_before_winner = valid.clone();
+    let rewrite = gc_before_winner.rewrites.get_mut(&transaction).unwrap();
+    rewrite.resolved = None;
+    rewrite.gc = Some(crate::schema_mutation_journal::RetiredHeapGcRecord {
+        coordinator_horizon: transaction,
+        manifest_digest: [25; 32],
+        complete: false,
+    });
+    assert!(gc_before_winner.encode().is_err());
+
+    let mut stale_horizon = valid.clone();
+    stale_horizon.rewrites.get_mut(&transaction).unwrap().gc =
+        Some(crate::schema_mutation_journal::RetiredHeapGcRecord {
+            coordinator_horizon: netbadb_types::DatabaseTxnId(transaction.0 - 1),
+            manifest_digest: [25; 32],
+            complete: false,
+        });
+    assert!(stale_horizon.encode().is_err());
+
     let mut winner_without_retirement = valid;
     winner_without_retirement
         .rewrites
@@ -1567,6 +1932,55 @@ fn root(name: &str) -> PathBuf {
     ));
     std::fs::create_dir(&path).expect("fresh isolated test directory");
     path
+}
+
+fn create_rewrite_gc_table(db: &mut Database, name: &str) -> TableId {
+    let mut transaction = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_in(
+            &mut transaction,
+            CreateTableSpec::new(
+                name,
+                vec![CreateColumnSpec::new(
+                    "value_a",
+                    SemanticType::physical(PhysicalType::Int64),
+                    false,
+                )],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+    table
+}
+
+fn rename_rewrite_gc_column(
+    db: &mut Database,
+    table_name: &str,
+    old_name: &str,
+    new_name: &str,
+) -> crate::ReplacementRetiredHeap {
+    let target = db.resolve_alter_table(table_name).unwrap();
+    let column_id = db.resolve_alter_column(&target, old_name).unwrap();
+    let old_storage = db.bindings.resolve_single(target.table_id).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut transaction,
+        AlterTableSpec::new(
+            target,
+            AlterTableOperation::RenameColumn {
+                column_id,
+                new_name: new_name.into(),
+            },
+        ),
+    )
+    .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+    db.inspect_replacement_retired_heaps()
+        .into_iter()
+        .find(|retired| retired.old_storage_id == old_storage)
+        .unwrap()
 }
 
 fn heap_bundle_bytes(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
@@ -2723,6 +3137,7 @@ fn subprocess_retired_heap_gc_crash_matrix_converges_on_three_reopens() {
         "gc-after-link-shadow-delete",
         "gc-directory-synced",
         "gc-complete-durable",
+        "gc-before-api-return",
     ] {
         let root = root(point);
         let mut db = seed(&root, true);
@@ -2743,6 +3158,227 @@ fn subprocess_retired_heap_gc_crash_matrix_converges_on_three_reopens() {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn replacement_retired_heap_gc_waits_for_complete_coordinator_horizon() {
+    let root = root("replacement-gc-horizon");
+    let mut db = seed(&root, true);
+    create_rewrite_gc_table(&mut db, "projects");
+    let retired = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+    let horizon = db.next_transaction_id;
+    db.coordinator
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .commit_decision(
+            horizon,
+            &[crate::coordinator_log::CoordinatorParticipant {
+                storage_id: retired.old_storage_id,
+                physical_txn_id: TxnId(991),
+            }],
+        )
+        .unwrap();
+    let blocked = db.inspect_replacement_retired_heap_gc(&retired).unwrap();
+    assert_eq!(blocked.coordinator_horizon, Some(horizon));
+    assert!(blocked.blockers.iter().any(|blocker| matches!(
+        blocker,
+        crate::RetiredHeapGcBlocker::CoordinatorDecisionIncomplete { transaction }
+            if *transaction == horizon
+    )));
+    assert!(db.gc_replacement_retired_heap(&retired).is_err());
+    db.coordinator
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .complete(horizon)
+        .unwrap();
+    assert!(
+        db.inspect_replacement_retired_heap_gc(&retired)
+            .unwrap()
+            .eligible()
+    );
+    db.gc_replacement_retired_heap(&retired).unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_retired_heap_missing_without_gc_intent_is_hard_corruption() {
+    let root = root("replacement-gc-missing-retained");
+    let mut db = seed(&root, true);
+    create_rewrite_gc_table(&mut db, "projects");
+    let retired = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+    let main = db
+        .inspect_replacement_retired_heap_gc(&retired)
+        .unwrap()
+        .components
+        .into_iter()
+        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::Main)
+        .unwrap()
+        .path;
+    db.close().unwrap();
+    std::fs::remove_file(main).unwrap();
+    for _ in 0..3 {
+        assert!(Database::open_catalog(root.join("catalog")).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_gc_refuses_symlinks_and_completed_component_reappearance() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let root = root("replacement-gc-symlink");
+        let mut db = seed(&root, true);
+        create_rewrite_gc_table(&mut db, "projects");
+        let retired = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+        let owner = db
+            .inspect_replacement_retired_heap_gc(&retired)
+            .unwrap()
+            .components
+            .into_iter()
+            .find(|component| component.kind == crate::RetiredHeapGcComponentKind::Owner)
+            .unwrap()
+            .path;
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(&owner).unwrap();
+        symlink(&outside, &owner).unwrap();
+        assert!(db.inspect_replacement_retired_heap_gc(&retired).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    let root = root("replacement-gc-reappeared");
+    let mut db = seed(&root, true);
+    create_rewrite_gc_table(&mut db, "projects");
+    let retired = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+    let main = db
+        .inspect_replacement_retired_heap_gc(&retired)
+        .unwrap()
+        .components
+        .into_iter()
+        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::Main)
+        .unwrap()
+        .path;
+    db.gc_replacement_retired_heap(&retired).unwrap();
+    db.close().unwrap();
+    std::fs::write(main, b"reappeared").unwrap();
+    for _ in 0..3 {
+        assert!(Database::open_catalog(root.join("catalog")).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_retired_heap_gc_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_REPLACEMENT_GC_CHILD_ROOT") else {
+        return;
+    };
+    let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    let retired = db
+        .inspect_replacement_retired_heaps()
+        .into_iter()
+        .max_by_key(|resource| resource.replacement_transaction)
+        .unwrap();
+    db.gc_replacement_retired_heap(&retired).unwrap();
+    panic!("configured replacement-retired Heap GC crash hook was not reached");
+}
+
+fn spawn_replacement_retired_heap_gc(root: &Path, point: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::replacement_retired_heap_gc_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_REPLACEMENT_GC_CHILD_ROOT", root)
+        .env("NETBADB_GC_CRASH_POINT", point)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(90),
+        "{point}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn subprocess_replacement_retired_heap_gc_crash_matrix_converges_on_three_reopens() {
+    for point in [
+        "gc-before-intent",
+        "gc-intent-durable",
+        "gc-before-first-delete",
+        "gc-after-owner-delete",
+        "gc-after-main-delete",
+        "gc-after-wal-delete",
+        "gc-after-status-delete",
+        "gc-after-alternate-delete",
+        "gc-after-link-delete",
+        "gc-after-link-shadow-delete",
+        "gc-directory-synced",
+        "gc-complete-durable",
+        "gc-before-api-return",
+    ] {
+        let root = root(&format!("replacement-{point}"));
+        let mut db = seed(&root, true);
+        create_rewrite_gc_table(&mut db, "projects");
+        let retired = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+        db.close().unwrap();
+        spawn_replacement_retired_heap_gc(&root, point);
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+            let state = reopened
+                .inspect_replacement_retired_heap_gc(&retired)
+                .unwrap()
+                .state;
+            if state == RetiredHeapGcState::Retained {
+                reopened.gc_replacement_retired_heap(&retired).unwrap();
+            }
+            assert_eq!(
+                reopened
+                    .inspect_replacement_retired_heap_gc(&retired)
+                    .unwrap()
+                    .state,
+                RetiredHeapGcState::Deleted
+            );
+            reopened.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn replacement_gc_intent_refuses_a_different_heap_at_the_old_path() {
+    let root = root("replacement-gc-wrong-heap");
+    let mut db = seed(&root, true);
+    create_rewrite_gc_table(&mut db, "projects");
+    let retired = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+    let active_storage = db.bindings.resolve_single(retired.table_id).unwrap();
+    let active = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+    let active_locator = &active
+        .storages
+        .iter()
+        .find(|storage| storage.id == active_storage)
+        .unwrap()
+        .locator;
+    let active_path = crate::schema_catalog_file::resolve(&root.join("catalog"), active_locator);
+    let old_path =
+        crate::schema_catalog_file::resolve(&root.join("catalog"), &retired.old_relative_locator);
+    let active_before = heap_bundle_bytes(&active_path);
+    db.close().unwrap();
+    spawn_replacement_retired_heap_gc(&root, "gc-intent-durable");
+    std::fs::copy(&active_path, &old_path).unwrap();
+    for _ in 0..3 {
+        assert!(Database::open_catalog(root.join("catalog")).is_err());
+    }
+    assert_eq!(heap_bundle_bytes(&active_path), active_before);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -4160,6 +4796,34 @@ fn write_schema_mutation_fuzz_corpus() {
     std::fs::write(
         output.join("schema_mutation_decode/rewrite-winner-v1"),
         rewrite_winner_history.encode().unwrap(),
+    )
+    .unwrap();
+    let mut rewrite_gc_intent = rewrite_winner_history.clone();
+    rewrite_gc_intent
+        .rewrites
+        .get_mut(&winner_transaction)
+        .unwrap()
+        .gc = Some(crate::schema_mutation_journal::RetiredHeapGcRecord {
+        coordinator_horizon: winner_transaction,
+        manifest_digest: [25; 32],
+        complete: false,
+    });
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-gc-intent-v1"),
+        rewrite_gc_intent.encode().unwrap(),
+    )
+    .unwrap();
+    rewrite_gc_intent
+        .rewrites
+        .get_mut(&winner_transaction)
+        .unwrap()
+        .gc
+        .as_mut()
+        .unwrap()
+        .complete = true;
+    std::fs::write(
+        output.join("schema_mutation_decode/rewrite-gc-complete-v1"),
+        rewrite_gc_intent.encode().unwrap(),
     )
     .unwrap();
     std::fs::write(

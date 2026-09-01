@@ -153,8 +153,11 @@ Replacement retirement is not DROP retirement: T remains active, its grants and
 logical identity survive, and only `(V,F,S)` advances. It has a separate inspection
 token, `ReplacementRetiredHeap`. S1 is retained physically and excluded from active
 catalog inspection. Round 24 intentionally returns
-`ReplacementRetirementGcUnsupported` for an exact token; it does not reuse the
-Round 22 DROP GC proof because that proof assumes the logical TableId is retired.
+Round 24 originally returned `ReplacementRetirementGcUnsupported`. Round 25 now
+reuses the Round 22 physical proof while applying a rewrite-specific logical rule:
+the old StorageId must be absent, but the same TableId may remain active on any
+durably linked later successor. See
+[replacement-retired Heap GC](replacement-retired-gc-round25.md).
 
 NBSC v1, NBSM v1, Heap metadata v5, `NBMV` row headers v1, Page v5, IndexCatalog
 v9, BTree v1/v2/v3, WAL, transaction status, CORD v2, Protocol v1 and PostgreSQL
@@ -180,8 +183,8 @@ zero filesystem mutation.
 
 ## Deferred work
 
-Replacement-retired Heap GC integration is the next physical-lifecycle step. Also
-deferred are SQL/PG ALTER syntax, protocol ALTER requests, LSM/range rewrite,
+Replacement-retired Heap GC integration is complete in Round 25. Still deferred
+are SQL/PG ALTER syntax, protocol ALTER requests, LSM/range rewrite,
 online/concurrent rewrite, defaults, ADD NOT NULL, physical conversion, column
 reorder, multiple ALTER actions, journal/coordinator compaction and cross-process
 writer exclusion.

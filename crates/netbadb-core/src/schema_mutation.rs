@@ -184,6 +184,37 @@ pub struct ReplacementRetiredHeap {
     pub retired_generation: crate::SchemaGeneration,
 }
 
+/// Exact durable identity of one supported retired Heap incarnation. The cause
+/// controls logical eligibility; physical deletion always uses the embedded
+/// StorageId, generated locator and Heap identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetiredHeapGcTarget {
+    TableDrop(RetiredTableResource),
+    SchemaRewrite(ReplacementRetiredHeap),
+}
+
+impl RetiredHeapGcTarget {
+    #[must_use]
+    pub fn storage_id(&self) -> StorageId {
+        match self {
+            Self::TableDrop(resource) => resource.storage_id,
+            Self::SchemaRewrite(resource) => resource.old_storage_id,
+        }
+    }
+}
+
+impl From<RetiredTableResource> for RetiredHeapGcTarget {
+    fn from(resource: RetiredTableResource) -> Self {
+        Self::TableDrop(resource)
+    }
+}
+
+impl From<ReplacementRetiredHeap> for RetiredHeapGcTarget {
+    fn from(resource: ReplacementRetiredHeap) -> Self {
+        Self::SchemaRewrite(resource)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetiredHeapGcState {
     Retained,
@@ -224,7 +255,7 @@ pub enum RetiredHeapGcBlocker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredHeapGcInspection {
-    pub resource: RetiredTableResource,
+    pub target: RetiredHeapGcTarget,
     pub state: RetiredHeapGcState,
     pub coordinator_horizon: Option<DatabaseTxnId>,
     pub manifest_digest: [u8; 32],
@@ -272,7 +303,6 @@ pub enum SchemaMutationError {
     RetiredHeapNotFound(StorageId),
     RetiredHeapTargetMismatch(StorageId),
     RetiredHeapGcIneligible,
-    ReplacementRetirementGcUnsupported,
     Catalog(SchemaCatalogError),
 }
 impl fmt::Display for SchemaMutationError {
@@ -332,9 +362,6 @@ impl fmt::Display for SchemaMutationError {
             ),
             Self::RetiredHeapGcIneligible => {
                 f.write_str("retired Heap is not eligible for physical deletion")
-            }
-            Self::ReplacementRetirementGcUnsupported => {
-                f.write_str("replacement-retired Heap GC is not supported")
             }
             Self::Catalog(error) => error.fmt(f),
         }
@@ -951,6 +978,7 @@ impl Database {
             snapshot_digest: digest(&target_bytes),
             retired: false,
             resolved: None,
+            gc: None,
         };
         let journal = match &self.mutation_journal {
             Some(journal) => Rc::clone(journal),
@@ -1444,23 +1472,22 @@ impl Database {
             .collect()
     }
 
-    /// Round 24 deliberately retains replacement history. This validates the
-    /// exact token and returns an explicit unsupported result without touching
-    /// the filesystem.
+    /// Inspects one exact replacement-retired Heap through the same physical
+    /// proof used for DROP retirement.
+    pub fn inspect_replacement_retired_heap_gc(
+        &self,
+        target: &ReplacementRetiredHeap,
+    ) -> Result<RetiredHeapGcInspection, DatabaseError> {
+        self.inspect_retired_heap_gc_target(&RetiredHeapGcTarget::SchemaRewrite(target.clone()))
+    }
+
+    /// Reclaims one exact replacement-retired Heap through the generic retired
+    /// resource state machine.
     pub fn gc_replacement_retired_heap(
         &mut self,
         target: &ReplacementRetiredHeap,
-    ) -> Result<(), DatabaseError> {
-        if !self
-            .inspect_replacement_retired_heaps()
-            .iter()
-            .any(|candidate| candidate == target)
-        {
-            return Err(
-                SchemaMutationError::RetiredHeapTargetMismatch(target.old_storage_id).into(),
-            );
-        }
-        Err(SchemaMutationError::ReplacementRetirementGcUnsupported.into())
+    ) -> Result<RetiredHeapGcReport, DatabaseError> {
+        self.gc_retired_heap_resource(&RetiredHeapGcTarget::SchemaRewrite(target.clone()))
     }
 
     /// Inspects one exact durable retirement. This never selects candidates or
@@ -1470,34 +1497,30 @@ impl Database {
         &self,
         target: &RetiredTableResource,
     ) -> Result<RetiredHeapGcInspection, DatabaseError> {
+        self.inspect_retired_heap_gc_target(&RetiredHeapGcTarget::TableDrop(target.clone()))
+    }
+
+    /// Generic read-only proof for either supported retirement cause.
+    pub fn inspect_retired_heap_gc_target(
+        &self,
+        target: &RetiredHeapGcTarget,
+    ) -> Result<RetiredHeapGcInspection, DatabaseError> {
         let catalog = self
             .catalog_path
             .as_deref()
             .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
-        let journal = self
-            .mutation_journal
-            .as_ref()
-            .ok_or(SchemaMutationError::RetiredHeapNotFound(target.storage_id))?;
+        let journal =
+            self.mutation_journal
+                .as_ref()
+                .ok_or(SchemaMutationError::RetiredHeapNotFound(
+                    target.storage_id(),
+                ))?;
         let (intent, create_transaction) = {
             let journal = journal.borrow();
-            let intent = journal
-                .drops
-                .values()
-                .find(|drop| drop.storage() == target.storage_id && drop.retired)
-                .cloned()
-                .ok_or(SchemaMutationError::RetiredHeapNotFound(target.storage_id))?;
-            let create_transaction = journal
-                .reservations
-                .values()
-                .find(|reservation| {
-                    reservation.storage == target.storage_id && reservation.resolved == Some(true)
-                })
-                .map(|reservation| reservation.transaction);
+            let intent = retired_intent_for_target(&journal, target)?;
+            let create_transaction = create_transaction_for_storage(&journal, intent.storage());
             (intent, create_transaction)
         };
-        if retired_resource(&intent) != *target {
-            return Err(SchemaMutationError::RetiredHeapTargetMismatch(target.storage_id).into());
-        }
         let decisions = self
             .coordinator
             .as_ref()
@@ -1518,35 +1541,28 @@ impl Database {
         &mut self,
         target: &RetiredTableResource,
     ) -> Result<RetiredHeapGcReport, DatabaseError> {
+        self.gc_retired_heap_resource(&RetiredHeapGcTarget::TableDrop(target.clone()))
+    }
+
+    /// Physically deletes one exact retired runtime Heap, independent of
+    /// whether logical retirement was caused by DROP or schema replacement.
+    pub fn gc_retired_heap_resource(
+        &mut self,
+        target: &RetiredHeapGcTarget,
+    ) -> Result<RetiredHeapGcReport, DatabaseError> {
         let catalog = self
             .catalog_path
             .clone()
             .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
-        let journal = self
-            .mutation_journal
-            .as_ref()
-            .cloned()
-            .ok_or(SchemaMutationError::RetiredHeapNotFound(target.storage_id))?;
+        let journal = self.mutation_journal.as_ref().cloned().ok_or(
+            SchemaMutationError::RetiredHeapNotFound(target.storage_id()),
+        )?;
         let (intent, create_transaction) = {
             let journal = journal.borrow();
-            let intent = journal
-                .drops
-                .values()
-                .find(|drop| drop.storage() == target.storage_id && drop.retired)
-                .cloned()
-                .ok_or(SchemaMutationError::RetiredHeapNotFound(target.storage_id))?;
-            let create_transaction = journal
-                .reservations
-                .values()
-                .find(|reservation| {
-                    reservation.storage == target.storage_id && reservation.resolved == Some(true)
-                })
-                .map(|reservation| reservation.transaction);
+            let intent = retired_intent_for_target(&journal, target)?;
+            let create_transaction = create_transaction_for_storage(&journal, intent.storage());
             (intent, create_transaction)
         };
-        if retired_resource(&intent) != *target {
-            return Err(SchemaMutationError::RetiredHeapTargetMismatch(target.storage_id).into());
-        }
         let decisions = self
             .coordinator
             .as_ref()
@@ -1560,7 +1576,7 @@ impl Database {
         let inspection = inspect_gc(&catalog, &intent, create_transaction, &decisions, self)?;
         if inspection.state == RetiredHeapGcState::Deleted {
             return Ok(RetiredHeapGcReport {
-                storage_id: target.storage_id,
+                storage_id: target.storage_id(),
                 coordinator_horizon: inspection
                     .coordinator_horizon
                     .ok_or(SchemaMutationError::Corrupt("deleted GC has no horizon"))?,
@@ -1584,12 +1600,12 @@ impl Database {
                 manifest_digest: inspection.manifest_digest,
                 complete: false,
             };
-            journal.borrow().prepare_gc(intent.transaction, &gc)?;
+            journal.borrow().prepare_gc(intent.transaction(), &gc)?;
 
             // Resolve all local prepared history while the full physical bundle
             // is still present, then close the only recovery-only handle.
-            let path = file::resolve(&catalog, &intent.fragment.storages[0].locator);
-            let table = &intent.fragment.committed.schema.tables()[0];
+            let path = file::resolve(&catalog, intent.relative_locator());
+            let table = &intent.fragment().committed.schema.tables()[0];
             let recovery = TableStorage::inspect_heap_recovery(&path, table)?;
             let resolutions = recovery
                 .prepared_transactions
@@ -1610,7 +1626,7 @@ impl Database {
             // retry-only transition.
             validate_gc_horizon(&intent, &decisions, horizon)?;
             crash("gc-before-intent");
-            journal.borrow_mut().gc_intent(intent.transaction, gc)?;
+            journal.borrow_mut().gc_intent(intent.transaction(), gc)?;
             crash("gc-intent-durable");
         }
         let before = gc_components(&catalog, &intent)?
@@ -1624,15 +1640,25 @@ impl Database {
                 .ok_or(SchemaMutationError::Corrupt("GC byte count overflow"))
         })?;
         resume_gc_intent(&catalog, &mut journal.borrow_mut(), &intent, &decisions)?;
-        Ok(RetiredHeapGcReport {
-            storage_id: target.storage_id,
-            coordinator_horizon: journal
-                .borrow()
+        crash("gc-before-api-return");
+        let coordinator_horizon = {
+            let journal = journal.borrow();
+            journal
                 .drops
-                .get(&intent.transaction)
+                .get(&intent.transaction())
                 .and_then(|drop| drop.gc.as_ref())
-                .ok_or(SchemaMutationError::Corrupt("completed GC state absent"))?
-                .coordinator_horizon,
+                .or_else(|| {
+                    journal
+                        .rewrites
+                        .get(&intent.transaction())
+                        .and_then(|rewrite| rewrite.gc.as_ref())
+                })
+                .map(|gc| gc.coordinator_horizon)
+        }
+        .ok_or(SchemaMutationError::Corrupt("completed GC state absent"))?;
+        Ok(RetiredHeapGcReport {
+            storage_id: target.storage_id(),
+            coordinator_horizon,
             files_deleted,
             bytes_deleted,
             state: RetiredHeapGcState::Deleted,
@@ -2221,11 +2247,129 @@ fn retired_resource(intent: &DropIntent) -> RetiredTableResource {
     }
 }
 
+fn replacement_resource(intent: &RewriteIntent) -> ReplacementRetiredHeap {
+    ReplacementRetiredHeap {
+        table_id: intent.table(),
+        base_table_version: intent.base.committed.tables[0].version,
+        target_table_version: intent.target.committed.tables[0].version,
+        base_fingerprint: intent.base.placements.tables[0].schema_fingerprint,
+        target_fingerprint: intent.target.placements.tables[0].schema_fingerprint,
+        old_storage_id: intent.old_storage(),
+        new_storage_id: intent.new_storage(),
+        old_relative_locator: intent.base.storages[0].locator.clone(),
+        replacement_transaction: intent.reservation.transaction,
+        retired_generation: intent.target.committed.generation,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RetiredHeapIntent {
+    TableDrop(Box<DropIntent>),
+    SchemaRewrite(Box<RewriteIntent>),
+}
+
+impl RetiredHeapIntent {
+    fn transaction(&self) -> DatabaseTxnId {
+        match self {
+            Self::TableDrop(intent) => intent.transaction,
+            Self::SchemaRewrite(intent) => intent.reservation.transaction,
+        }
+    }
+
+    fn table(&self) -> TableId {
+        match self {
+            Self::TableDrop(intent) => intent.table(),
+            Self::SchemaRewrite(intent) => intent.table(),
+        }
+    }
+
+    fn storage(&self) -> StorageId {
+        match self {
+            Self::TableDrop(intent) => intent.storage(),
+            Self::SchemaRewrite(intent) => intent.old_storage(),
+        }
+    }
+
+    fn fragment(&self) -> &SchemaCatalogSnapshot {
+        match self {
+            Self::TableDrop(intent) => &intent.fragment,
+            Self::SchemaRewrite(intent) => &intent.base,
+        }
+    }
+
+    fn relative_locator(&self) -> &str {
+        &self.fragment().storages[0].locator
+    }
+
+    fn gc(&self) -> Option<&RetiredHeapGcRecord> {
+        match self {
+            Self::TableDrop(intent) => intent.gc.as_ref(),
+            Self::SchemaRewrite(intent) => intent.gc.as_ref(),
+        }
+    }
+
+    fn target(&self) -> RetiredHeapGcTarget {
+        match self {
+            Self::TableDrop(intent) => RetiredHeapGcTarget::TableDrop(retired_resource(intent)),
+            Self::SchemaRewrite(intent) => {
+                RetiredHeapGcTarget::SchemaRewrite(replacement_resource(intent))
+            }
+        }
+    }
+}
+
+fn retired_intent_for_target(
+    journal: &SchemaMutationJournal,
+    target: &RetiredHeapGcTarget,
+) -> Result<RetiredHeapIntent, SchemaMutationError> {
+    let intent = match target {
+        RetiredHeapGcTarget::TableDrop(resource) => journal
+            .drops
+            .values()
+            .find(|drop| drop.storage() == resource.storage_id && drop.retired)
+            .cloned()
+            .map(|drop| RetiredHeapIntent::TableDrop(Box::new(drop))),
+        RetiredHeapGcTarget::SchemaRewrite(resource) => journal
+            .rewrites
+            .values()
+            .find(|rewrite| rewrite.old_storage() == resource.old_storage_id && rewrite.retired)
+            .cloned()
+            .map(|rewrite| RetiredHeapIntent::SchemaRewrite(Box::new(rewrite))),
+    }
+    .ok_or(SchemaMutationError::RetiredHeapNotFound(
+        target.storage_id(),
+    ))?;
+    if intent.target() != *target {
+        return Err(SchemaMutationError::RetiredHeapTargetMismatch(
+            target.storage_id(),
+        ));
+    }
+    Ok(intent)
+}
+
+fn create_transaction_for_storage(
+    journal: &SchemaMutationJournal,
+    storage: StorageId,
+) -> Option<DatabaseTxnId> {
+    journal
+        .reservations
+        .values()
+        .find(|reservation| reservation.storage == storage && reservation.resolved == Some(true))
+        .map(|reservation| reservation.transaction)
+        .or_else(|| {
+            journal
+                .rewrites
+                .values()
+                .find(|rewrite| rewrite.new_storage() == storage && rewrite.resolved == Some(true))
+                .map(|rewrite| rewrite.reservation.transaction)
+        })
+}
+
 fn gc_components(
     catalog: &Path,
-    intent: &DropIntent,
+    intent: &RetiredHeapIntent,
 ) -> Result<Vec<RetiredHeapGcComponent>, SchemaMutationError> {
-    let heap = file::resolve(catalog, &intent.fragment.storages[0].locator);
+    let heap = file::resolve(catalog, intent.relative_locator());
     validate_resource_path(catalog, &heap)?;
     let mut components = vec![RetiredHeapGcComponent {
         kind: RetiredHeapGcComponentKind::Owner,
@@ -2318,27 +2462,32 @@ fn component_metadata(path: &Path) -> Result<Option<u64>, SchemaMutationError> {
 }
 
 fn coordinator_horizon(
-    intent: &DropIntent,
+    intent: &RetiredHeapIntent,
     decisions: &[crate::CoordinatorDecision],
 ) -> Result<(DatabaseTxnId, Vec<RetiredHeapGcBlocker>), SchemaMutationError> {
-    let drop_decision = decisions
+    let retirement_decision = decisions
         .iter()
-        .find(|decision| decision.database_txn_id == intent.transaction)
+        .find(|decision| decision.database_txn_id == intent.transaction())
         .ok_or(SchemaMutationError::Corrupt(
-            "retired drop decision is missing",
+            "retirement decision is missing",
         ))?;
-    let reference = drop_decision
+    let reference = retirement_decision
         .schema
         .as_ref()
         .ok_or(SchemaMutationError::Corrupt(
-            "retired drop has no schema decision",
+            "retirement has no schema decision",
         ))?;
-    validate_drop_reference(intent, reference)?;
-    let mut highest = intent.transaction.0;
+    match intent {
+        RetiredHeapIntent::TableDrop(drop) => validate_drop_reference(drop, reference)?,
+        RetiredHeapIntent::SchemaRewrite(rewrite) => {
+            validate_rewrite_reference(rewrite, reference)?
+        }
+    }
+    let mut highest = intent.transaction().0;
     let mut blockers = Vec::new();
-    if !drop_decision.complete {
+    if !retirement_decision.complete {
         blockers.push(RetiredHeapGcBlocker::CoordinatorDecisionIncomplete {
-            transaction: drop_decision.database_txn_id,
+            transaction: retirement_decision.database_txn_id,
         });
     }
     for decision in decisions {
@@ -2359,7 +2508,7 @@ fn coordinator_horizon(
 }
 
 fn validate_gc_horizon(
-    intent: &DropIntent,
+    intent: &RetiredHeapIntent,
     decisions: &[crate::CoordinatorDecision],
     expected: DatabaseTxnId,
 ) -> Result<(), SchemaMutationError> {
@@ -2372,18 +2521,137 @@ fn validate_gc_horizon(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeapIncarnation {
+    table: TableId,
+    version: TableSchemaVersion,
+    fingerprint: SchemaFingerprint,
+    storage: StorageId,
+}
+
+fn fragment_incarnation(snapshot: &SchemaCatalogSnapshot) -> HeapIncarnation {
+    HeapIncarnation {
+        table: snapshot.committed.schema.tables()[0].id,
+        version: snapshot.committed.tables[0].version,
+        fingerprint: snapshot.placements.tables[0].schema_fingerprint,
+        storage: snapshot.storages[0].id,
+    }
+}
+
+fn active_incarnation(
+    snapshot: &SchemaCatalogSnapshot,
+    table: TableId,
+) -> Result<Option<HeapIncarnation>, SchemaMutationError> {
+    let Some(lineage) = snapshot
+        .committed
+        .tables
+        .iter()
+        .find(|lineage| lineage.table_id == table)
+    else {
+        return Ok(None);
+    };
+    let placement = snapshot
+        .placements
+        .tables
+        .iter()
+        .find(|placement| placement.table_id == table)
+        .ok_or(SchemaMutationError::Corrupt(
+            "active table has no physical placement",
+        ))?;
+    let mut storages = placement.placement.storage_ids();
+    let storage = storages
+        .next()
+        .ok_or(SchemaMutationError::Corrupt("active table has no storage"))?;
+    if storages.next().is_some() {
+        return Err(SchemaMutationError::Corrupt(
+            "retired Heap lineage reached partitioned active storage",
+        ));
+    }
+    Ok(Some(HeapIncarnation {
+        table,
+        version: lineage.version,
+        fingerprint: placement.schema_fingerprint,
+        storage,
+    }))
+}
+
+fn validate_retirement_lineage(
+    active: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+    intent: &RetiredHeapIntent,
+) -> Result<(), SchemaMutationError> {
+    match intent {
+        RetiredHeapIntent::TableDrop(drop) => {
+            if active_incarnation(active, drop.table())?.is_some() {
+                return Err(SchemaMutationError::Corrupt(
+                    "dropped TableId remains active",
+                ));
+            }
+        }
+        RetiredHeapIntent::SchemaRewrite(rewrite) => {
+            if !rewrite.retired || rewrite.resolved != Some(true) {
+                return Err(SchemaMutationError::Corrupt(
+                    "replacement retirement is not terminal",
+                ));
+            }
+            let mut current = fragment_incarnation(&rewrite.target);
+            let mut transaction = rewrite.reservation.transaction;
+            loop {
+                if let Some(next) = journal.rewrites.values().find(|candidate| {
+                    candidate.old_storage() == current.storage
+                        && candidate.retired
+                        && candidate.resolved == Some(true)
+                }) {
+                    if next.reservation.transaction.0 <= transaction.0
+                        || fragment_incarnation(&next.base) != current
+                    {
+                        return Err(SchemaMutationError::Corrupt(
+                            "replacement rewrite lineage is inconsistent",
+                        ));
+                    }
+                    current = fragment_incarnation(&next.target);
+                    transaction = next.reservation.transaction;
+                    continue;
+                }
+                if let Some(drop) = journal.drops.values().find(|candidate| {
+                    candidate.storage() == current.storage
+                        && candidate.retired
+                        && candidate.resolved == Some(true)
+                }) {
+                    if drop.transaction.0 <= transaction.0
+                        || fragment_incarnation(&drop.fragment) != current
+                        || active_incarnation(active, current.table)?.is_some()
+                    {
+                        return Err(SchemaMutationError::Corrupt(
+                            "replacement-to-drop lineage is inconsistent",
+                        ));
+                    }
+                    return Ok(());
+                }
+                if active_incarnation(active, current.table)? != Some(current) {
+                    return Err(SchemaMutationError::Corrupt(
+                        "replacement lineage does not reach active storage",
+                    ));
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn inspect_gc(
     catalog: &Path,
-    intent: &DropIntent,
+    intent: &RetiredHeapIntent,
     create_transaction: Option<DatabaseTxnId>,
     decisions: &[crate::CoordinatorDecision],
     database: &Database,
 ) -> Result<RetiredHeapGcInspection, DatabaseError> {
-    if intent.fragment.storages[0].locator
-        != final_locator(catalog, intent.fragment.incarnation, intent.storage())?
+    if intent.relative_locator()
+        != final_locator(catalog, intent.fragment().incarnation, intent.storage())?
     {
         return Ok(RetiredHeapGcInspection {
-            resource: retired_resource(intent),
+            target: intent.target(),
             state: RetiredHeapGcState::Retained,
             coordinator_horizon: None,
             manifest_digest: [0; 32],
@@ -2409,15 +2677,25 @@ fn inspect_gc(
     {
         return Err(SchemaMutationError::Corrupt("active state references retired Heap").into());
     }
+    {
+        let journal = database
+            .mutation_journal
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt(
+                "retirement history disappeared",
+            ))?
+            .borrow();
+        validate_retirement_lineage(&active, &journal, intent)?;
+    }
     let mut components = gc_components(catalog, intent)?;
     let manifest_digest = gc_manifest_digest(catalog, &components)?;
-    let state = match &intent.gc {
+    let state = match intent.gc() {
         None => RetiredHeapGcState::Retained,
         Some(gc) if gc.complete => RetiredHeapGcState::Deleted,
         Some(_) => RetiredHeapGcState::Deleting,
     };
     let (horizon, mut blockers) = coordinator_horizon(intent, decisions)?;
-    if let Some(gc) = &intent.gc {
+    if let Some(gc) = intent.gc() {
         if gc.manifest_digest != manifest_digest {
             return Err(SchemaMutationError::Corrupt("retired Heap GC manifest changed").into());
         }
@@ -2453,18 +2731,18 @@ fn inspect_gc(
         return Err(SchemaMutationError::Corrupt("deleted Heap component reappeared").into());
     }
     if state == RetiredHeapGcState::Retained {
-        let heap = file::resolve(catalog, &intent.fragment.storages[0].locator);
+        let heap = file::resolve(catalog, intent.relative_locator());
         if components
             .iter()
             .find(|component| component.kind == RetiredHeapGcComponentKind::Owner)
             .is_some_and(|component| component.present)
             && file::read(&file::suffix(&heap, ".owner"))?
                 != owner_bytes(
-                    intent.fragment.incarnation,
+                    intent.fragment().incarnation,
                     create_transaction,
                     intent.table(),
                     intent.storage(),
-                    intent.fragment.placements.tables[0].schema_fingerprint,
+                    intent.fragment().placements.tables[0].schema_fingerprint,
                 )?
         {
             return Err(SchemaMutationError::Corrupt("retired Heap owner mismatch").into());
@@ -2474,10 +2752,10 @@ fn inspect_gc(
             .find(|component| component.kind == RetiredHeapGcComponentKind::Main)
             .is_some_and(|component| component.present)
         {
-            validate_drop_resource(catalog, intent)?;
+            validate_retired_resource(catalog, intent)?;
             let recovery = TableStorage::inspect_heap_recovery(
                 &heap,
-                &intent.fragment.committed.schema.tables()[0],
+                &intent.fragment().committed.schema.tables()[0],
             )?;
             blockers.extend(
                 recovery
@@ -2497,14 +2775,9 @@ fn inspect_gc(
         }
     }
     Ok(RetiredHeapGcInspection {
-        resource: retired_resource(intent),
+        target: intent.target(),
         state,
-        coordinator_horizon: Some(
-            intent
-                .gc
-                .as_ref()
-                .map_or(horizon, |gc| gc.coordinator_horizon),
-        ),
+        coordinator_horizon: Some(intent.gc().map_or(horizon, |gc| gc.coordinator_horizon)),
         manifest_digest,
         components,
         blockers,
@@ -2515,17 +2788,22 @@ fn inspect_gc(
 fn resume_gc_intent(
     catalog: &Path,
     journal: &mut SchemaMutationJournal,
-    intent: &DropIntent,
+    intent: &RetiredHeapIntent,
     decisions: &[crate::CoordinatorDecision],
 ) -> Result<(), DatabaseError> {
     let gc = intent
-        .gc
-        .as_ref()
+        .gc()
         .or_else(|| {
             journal
                 .drops
-                .get(&intent.transaction)
+                .get(&intent.transaction())
                 .and_then(|drop| drop.gc.as_ref())
+        })
+        .or_else(|| {
+            journal
+                .rewrites
+                .get(&intent.transaction())
+                .and_then(|rewrite| rewrite.gc.as_ref())
         })
         .ok_or(SchemaMutationError::Corrupt(
             "GC deletion without durable intent",
@@ -2544,6 +2822,7 @@ fn resume_gc_intent(
     {
         return Err(SchemaMutationError::Corrupt("GC target returned to active catalog").into());
     }
+    validate_retirement_lineage(&active, journal, intent)?;
     let present = components
         .iter()
         .map(|component| component_metadata(&component.path))
@@ -2553,6 +2832,31 @@ fn resume_gc_intent(
             return Err(SchemaMutationError::Corrupt("deleted Heap component reappeared").into());
         }
         return Ok(());
+    }
+    let heap = file::resolve(catalog, intent.relative_locator());
+    if present.first().is_some_and(|component| component.is_some()) {
+        let create_transaction = create_transaction_for_storage(journal, intent.storage()).ok_or(
+            SchemaMutationError::Corrupt("runtime retired Heap has no create history"),
+        )?;
+        if file::read(&file::suffix(&heap, ".owner"))?
+            != owner_bytes(
+                intent.fragment().incarnation,
+                create_transaction,
+                intent.table(),
+                intent.storage(),
+                intent.fragment().placements.tables[0].schema_fingerprint,
+            )?
+        {
+            return Err(SchemaMutationError::Corrupt("retired Heap owner mismatch").into());
+        }
+    }
+    if present.get(1).is_some_and(|component| component.is_some()) {
+        validate_retired_resource(catalog, intent)?;
+    }
+    if present.get(5).is_some_and(|component| component.is_some())
+        && file::discover(&heap)? != catalog
+    {
+        return Err(SchemaMutationError::Corrupt("retired Heap catalog link mismatch").into());
     }
     crash("gc-before-first-delete");
     const CRASH_POINTS: [&str; 7] = [
@@ -2577,7 +2881,7 @@ fn resume_gc_intent(
         .ok_or(SchemaMutationError::Corrupt("empty GC component manifest"))?;
     file::sync_parent(&first.path)?;
     crash("gc-directory-synced");
-    journal.complete_gc(intent.transaction)?;
+    journal.complete_gc(intent.transaction())?;
     crash("gc-complete-durable");
     Ok(())
 }
@@ -2598,6 +2902,16 @@ fn exists_file(path: &Path) -> Result<bool, SchemaMutationError> {
         Ok(_) => Err(SchemaCatalogError::PathConflict(path.to_owned()).into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(file::io("inspect schema component", path, e).into()),
+    }
+}
+
+fn validate_retired_resource(
+    catalog: &Path,
+    intent: &RetiredHeapIntent,
+) -> Result<(), DatabaseError> {
+    match intent {
+        RetiredHeapIntent::TableDrop(drop) => validate_drop_resource(catalog, drop),
+        RetiredHeapIntent::SchemaRewrite(rewrite) => validate_rewrite_source(catalog, rewrite),
     }
 }
 
@@ -2935,12 +3249,22 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
     }
     // Startup never chooses a candidate. It only resumes or verifies deletions
     // that already crossed the durable retry-only GC-intent boundary.
-    let durable_gc = journal
+    let mut durable_gc = journal
         .drops
         .values()
         .filter(|drop| drop.gc.is_some())
         .cloned()
+        .map(|drop| RetiredHeapIntent::TableDrop(Box::new(drop)))
+        .chain(
+            journal
+                .rewrites
+                .values()
+                .filter(|rewrite| rewrite.gc.is_some())
+                .cloned()
+                .map(|rewrite| RetiredHeapIntent::SchemaRewrite(Box::new(rewrite))),
+        )
         .collect::<Vec<_>>();
+    durable_gc.sort_by_key(RetiredHeapIntent::transaction);
     for intent in durable_gc {
         resume_gc_intent(catalog, &mut journal, &intent, &decisions)?;
     }
@@ -2995,7 +3319,11 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                     .ok_or(SchemaMutationError::Corrupt(
                         "resolved winner intent absent",
                     ))?;
-                if !later_drop.is_some_and(|drop| drop.gc.as_ref().is_some_and(|gc| gc.complete))
+                let physical_deleted = later_drop
+                    .is_some_and(|drop| drop.gc.as_ref().is_some_and(|gc| gc.complete))
+                    || later_rewrite
+                        .is_some_and(|rewrite| rewrite.gc.as_ref().is_some_and(|gc| gc.complete));
+                if !physical_deleted
                     && file::read(&file::suffix(&final_path, ".owner"))?
                         != owner_bytes(
                             marker.incarnation,
@@ -3110,7 +3438,11 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                     )
                     .into());
                 }
-                validate_rewrite_source(catalog, &rewrite)?;
+                if rewrite.gc.is_none() {
+                    validate_rewrite_source(catalog, &rewrite)?;
+                } else if !rewrite.gc.as_ref().is_some_and(|gc| gc.complete) {
+                    return Err(SchemaMutationError::Corrupt("GC recovery did not complete").into());
+                }
                 cleanup_prepared(catalog, &reservation, marker.incarnation)?;
                 continue;
             }
@@ -3228,6 +3560,11 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         .values()
         .filter(|intent| intent.retired && intent.resolved == Some(true))
     {
+        validate_retirement_lineage(
+            &active,
+            &journal,
+            &RetiredHeapIntent::TableDrop(Box::new(intent.clone())),
+        )?;
         if intent.gc.is_none() {
             validate_drop_resource(catalog, intent)?;
         } else if !intent.gc.as_ref().is_some_and(|gc| gc.complete) {
@@ -3248,7 +3585,16 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         .values()
         .filter(|rewrite| rewrite.retired && rewrite.resolved == Some(true))
     {
-        validate_rewrite_source(catalog, rewrite)?;
+        validate_retirement_lineage(
+            &active,
+            &journal,
+            &RetiredHeapIntent::SchemaRewrite(Box::new(rewrite.clone())),
+        )?;
+        if rewrite.gc.is_none() {
+            validate_rewrite_source(catalog, rewrite)?;
+        } else if !rewrite.gc.as_ref().is_some_and(|gc| gc.complete) {
+            return Err(SchemaMutationError::Corrupt("GC recovery did not complete").into());
+        }
         if active
             .storages
             .iter()

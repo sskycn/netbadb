@@ -4,6 +4,9 @@ Round 22 closes the physical lifecycle for an explicitly selected,
 runtime-created, non-partitioned Heap. It adds no SQL and never scans for
 candidates. The operator first inspects one exact durable
 `RetiredTableResource`, then may pass that same complete identity back to Core.
+Round 25 reuses this exact physical proof for `ReplacementRetiredHeap`; see
+[replacement-retired Heap GC](replacement-retired-gc-round25.md). The stronger
+DROP-specific rule that TableId is absent remains in force for this cause.
 
 ## Recovery-retention proof
 
@@ -53,9 +56,9 @@ The states are:
 Active -> Retained -> Deleting -> Deleted
 ```
 
-NBSJ v1 tag 9 is `RetiredHeapGcIntent`: DROP transaction, coordinator horizon
-u64 and bundle SHA-256. Tag 10 is `RetiredHeapGcComplete`: DROP transaction.
-The surrounding DROP fragment already persists incarnation, TableId,
+NBSJ v1 tag 9 is `RetiredHeapGcIntent`: retirement transaction, coordinator
+horizon u64 and bundle SHA-256. Tag 10 is `RetiredHeapGcComplete`: retirement
+transaction. The surrounding DROP fragment already persists incarnation, TableId,
 TableSchemaVersion, fingerprint, StorageId, locator and retirement generation.
 Before tag 9 is written, capacity is checked for both tags 9 and 10.
 
@@ -87,6 +90,10 @@ horizon, digest, exact component paths/sizes and blockers without mutation.
 `Database::gc_retired_heap(&RetiredTableResource)` performs the explicit
 single-resource transition and returns deleted file/byte counts. Passing a
 modified or stale resource token is rejected.
+
+Round 25 adds `RetiredHeapGcTarget` as the cause-typed generic boundary plus
+replacement inspection/GC wrappers. Both causes enter this same state machine;
+there is no replacement-specific deletion engine.
 
 ## Crash and growth coverage
 

@@ -63,6 +63,11 @@ Every NBSR payload starts with tag u8 and nonzero DatabaseTxnId u64.
 | 14 | Resolved rewrite loser | None |
 | 15 | Resolved rewrite winner | None |
 
+Tags 9/10 identify the surrounding terminal physical retirement by transaction,
+not by cause. They may follow a committed DROP (tags 5/6/8) or a committed Heap
+rewrite (tags 11/12/13/15). This is the original tag payload and meaning; Round 25
+generalizes replay attachment without changing old DROP bytes or the NBSJ envelope.
+
 A reservation consumes both IDs together; it is synchronized before intent or
 staged files. ColumnIds are deterministic 1..N; the intent persists these exact
 IDs and next_column_id=N+1 (1 for a zero-column canonical table). ColumnIds are

@@ -785,13 +785,23 @@ adds bounded tags 11–15; prepared WAL/status provides no-force S2 recovery and
 recovery converges without recopying. The acceptance matrix proves byte-stable S1
 rollback/maintenance isolation, recovery-only old-schema reopen, target
 ANALYZE/VACUUM, point/range/join planner paths, stale schema expectations and 34
-real subprocess windows. The old Heap remains physically retained and its exact
-replacement GC API is explicitly unsupported without filesystem mutation.
+real subprocess windows. Round 25 now closes the old Heap's physical lifecycle.
 
-Next: integrate the Round 22 retention-horizon proof with replacement-retired Heap
-history without treating the still-active TableId as dropped. SQL syntax remains a
-later thin frontend. LSM/partition/imported ALTER, online mixed schemas, physical
-conversions, defaults, column reorder and journal/log compaction remain deferred.
+### Replacement-retired Heap GC integration — Round 25
+
+[Round 25](replacement-retired-gc-round25.md) generalizes NBSJ v1 tags 9/10 and
+the Round 22 exact-bundle state machine to both DROP and schema-rewrite retirement
+without changing their bytes. Eligibility follows durable transitive
+`(TableId, version, fingerprint, StorageId)` replacement lineage, permits the
+same TableId on a different active StorageId, preserves DROP's stronger inactive
+TableId rule, and includes the rewrite transaction in the coordinator horizon
+even though the old source is not a physical participant. Chained rewrite,
+ALTER-to-DROP, crash/reopen, wrong-identity, index-heavy and 100-cycle tests prove
+that deleted ancestors are not recovery dependencies.
+
+Next: SQL syntax remains a later thin frontend. LSM/partition/imported ALTER,
+online mixed schemas, physical conversions, defaults, column reorder and
+journal/log compaction remain deferred.
 
 ## Phase 6 — SDK and tooling
 

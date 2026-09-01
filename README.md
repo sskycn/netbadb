@@ -110,7 +110,9 @@ invalidation, durable retained-resource inventory and deferred physical deletion
 implements the typed embedded Core foundation for transactional runtime-created
 Single Heap schema rewrites with the same TableId and a new StorageId. SQL and
 PostgreSQL `ALTER TABLE` syntax remain unsupported; [Round 23](docs/schema-evolution-round23.md)
-records the row-format audit that selected this architecture.
+records the row-format audit that selected this architecture. [Round 25](docs/replacement-retired-gc-round25.md)
+extends explicit safe single-resource GC to old runtime Heaps retired by schema
+rewrite without treating their still-active TableId as dropped.
 
 ## Repository layout
 
