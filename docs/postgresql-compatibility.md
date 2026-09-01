@@ -178,15 +178,16 @@ LSM and partitioned-table secondary-index DDL remains unsupported.
 this adapter only, an authorized legacy synthetic alias to `(TableId, IndexId)`.
 It writes a v4 retired catalog state in the existing transaction and publishes
 registry removal after commit. Missing indexes return `42704`; IF EXISTS is a
-successful no-op. Table write permission is required (`42501`). CONCURRENTLY,
+successful no-op. Explicit `schema_admin` and table write permission are required
+(`42501`); existing principals default-deny schema mutations. CONCURRENTLY,
 multiple targets, CASCADE, RESTRICT, parameters as identifiers, and quoted
-identifiers fail closed (`0A000`). Table DDL remains unsupported.
+identifiers fail closed (`0A000`). Basic table creation is described below.
 
 Uncommitted DROP keeps the published planner/reflection view active, like
 uncommitted CREATE keeps its registration unpublished. This is an experimental
 compatibility boundary, not PostgreSQL catalog MVCC. CREATE and DROP cannot be
-combined within one explicit transaction (`0A000`); no transaction-local DDL
-overlay is implemented. DML after staged DROP still maintains the old tree until
+combined within one explicit transaction (`0A000`); no transaction-local index
+registry overlay is implemented. DML after staged DROP still maintains the old tree until
 commit. Any DDL error fails the transaction (`E` / `25P02`) until rollback.
 Prepared DROP is bound to the resolved ID and never drops a replacement index
 that reused the same name. Prepared queries replan using current active paths.
@@ -202,6 +203,47 @@ phase; SQL DROP does not promise file shrinkage.
 The same Canonical Schema/index registry therefore produces the same names and
 OIDs across queries, connections, and restarts. They are not persisted or
 stable across schema/index changes and remain private to the adapter.
+
+## Basic transactional CREATE TABLE (Round 19)
+
+Partial support: basic Heap columns with BOOLEAN/BOOL, BIGINT/INT64/INT8, and
+TEXT/unbounded VARCHAR; NULL is the default, explicit NULL and NOT NULL work.
+Unquoted, unqualified table/column names follow the generic identifier policy.
+1..4096 columns retain declaration order and unnamed physical SemanticTypes.
+Native SQL additionally accepts UINT64; this frontend rejects it before writer
+admission, ID reservation, journal writes or physical creation.
+
+Simple Query emits exactly `CREATE TABLE`. Extended Parse/Bind/Describe/Execute/
+Sync uses the same generic AST/HIR/compiled DDL: zero parameters and NoData;
+Parse/Bind have no schema effects; each newly bound execution checks duplicates
+against current Core authority. `BEGIN; CREATE; INSERT; SELECT; ROLLBACK/COMMIT`
+is transactional. Statements in the creating session compile against the private
+SchemaOverlay, while other sessions cannot resolve the table until commit.
+Commit/rollback clears portals; transaction-scoped prepared DML cannot escape.
+
+All network DDL requires explicit manifest `schema_admin` (default false).
+A creating transaction alone gets temporary staged-table read/write access.
+Commit never adds durable table grants, even for its creator; catalog rows still
+use the ordinary TableId visibility filter. Metadata refresh after commit does
+not imply permission. Schema-only admins may BEGIN without an existing table grant.
+
+Duplicate tables map to 42P07, duplicate columns to 42701, unknown type names to
+42704, permission denial to 42501, known unsupported types/features to 0A000,
+and schema-writer contention to 55P03. Syntax errors map to 42601. Parser/HIR
+errors retain source positions. An explicit transaction's CREATE failure yields
+E and subsequent statements return 25P02 until rollback.
+
+Unsupported: PRIMARY KEY (inline/table-level), UNIQUE, DEFAULT, CHECK, REFERENCES,
+FOREIGN KEY, GENERATED, IDENTITY, COLLATE, CONSTRAINT, EXCLUDE; VARCHAR(n)/CHAR(n);
+SMALLINT/INTEGER/NUMERIC/DECIMAL/FLOAT/DOUBLE/DATE/TIME/TIMESTAMP/INTERVAL/JSON/UUID/
+BYTEA/ARRAY/SERIAL/BIGSERIAL and other non-native types; TEMP/TEMPORARY/UNLOGGED,
+IF NOT EXISTS, CTAS, LIKE, INHERITS, PARTITION BY, USING, WITH, TABLESPACE, ON COMMIT;
+qualified/quoted CREATE names; DROP/ALTER TABLE; runtime LSM/range placement;
+multiple CREATE TABLEs per transaction and table/index DDL mixing. Unsupported
+clauses are rejected, never silently discarded or stored as unenforced metadata.
+
+See [Round 19](sql-create-table-round19.md) for native/PG, real-client, recovery and
+no-side-effect evidence. This is not full PostgreSQL DDL or ORM migrations.
 
 ## Compatibility tracing
 

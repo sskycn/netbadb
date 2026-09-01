@@ -92,7 +92,8 @@ leave `clients` empty:
 ```
 
 Mutual TLS must omit `local_plaintext` and configure at least one client.
-Duplicate fingerprints, duplicate table grants, empty principals, grants with
+Duplicate fingerprints, duplicate table grants, principals with neither table grants
+nor schema_admin, grants with
 no enabled operation, and unknown TableIds are startup errors. Unknown JSON
 fields are rejected. `authorization` itself is required; omission never means
 full access.
@@ -127,6 +128,28 @@ Protocol v1 has no dedicated authorization error tag. Operation denials use
 the existing generic Database code with an `authorization denied ...`
 diagnostic. Admission denial for an unlisted mTLS identity happens before Hello
 and sends no NDBP response.
+
+## Schema mutation authorization
+
+Round 19 adds an optional principal boolean `schema_admin`, default false, to
+`authorization.local_plaintext` and each certificate principal. It is an additive
+v4 configuration field; existing v4 manifests still read with schema DDL denied.
+No database or Protocol v1 version changes. A schema-only principal may explicitly
+set `"schema_admin": true, "tables": []`. Unknown fields still fail validation.
+
+`schema_admin` authorizes generic schema-write access for CREATE TABLE and index
+DDL. CREATE/DROP INDEX additionally requires its existing target table write grant.
+It does not imply ordinary table read/write/analyze permission or PostgreSQL roles,
+ownership, SQL GRANT or a security catalog. Embedded filesystem owners remain
+outside network policy. Native Begin(TableId) still requires its transaction grant;
+PostgreSQL schema-only admins may begin a table-independent transaction.
+
+During the creating transaction only, an administrator may read/write that exact
+staged TableId. Commit/rollback ends this exception. No grant or manifest is mutated,
+no automatic durable access is added, and creator SELECT after commit is denied
+without external TableId grants. Catalog visibility remains filtered independently.
+Authorization precedes writer admission, identity reservation and resource creation.
+PG explicit transaction failures retain the frontend's E/25P02 behavior.
 
 ## Operational notes
 

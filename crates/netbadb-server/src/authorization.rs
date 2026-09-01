@@ -67,15 +67,20 @@ impl TablePermissions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrincipalAuthorization {
+    schema_admin: bool,
     tables: Vec<TablePermissions>,
 }
 
 impl PrincipalAuthorization {
     fn new(
-        tables: Vec<TablePermissions>,
+        grants: PrincipalGrants,
         known_tables: &[TableId],
     ) -> Result<Self, AuthorizationConfigError> {
-        if tables.is_empty() {
+        let PrincipalGrants {
+            tables,
+            schema_admin,
+        } = grants;
+        if tables.is_empty() && !schema_admin {
             return Err(AuthorizationConfigError::EmptyPrincipalPolicy);
         }
         for (index, permissions) in tables.iter().enumerate() {
@@ -98,7 +103,38 @@ impl PrincipalAuthorization {
                 });
             }
         }
-        Ok(Self { tables })
+        Ok(Self {
+            tables,
+            schema_admin,
+        })
+    }
+
+    pub(crate) fn schema_admin(&self) -> bool {
+        self.schema_admin
+    }
+
+    /// The creator exception is valid only for an active transaction's exact
+    /// staged identity. It never modifies this immutable principal policy.
+    pub(crate) fn authorize_statement(
+        &self,
+        access: &netbadb_core::StatementAccess,
+        execution: &crate::DatabaseSession,
+    ) -> Result<(), AuthorizationDenied> {
+        if access.schema_write() && !self.schema_admin {
+            return Err(AuthorizationDenied::SchemaAdmin);
+        }
+        for (tables, action) in [
+            (access.read_tables(), AuthorizationAction::Read),
+            (access.write_tables(), AuthorizationAction::Write),
+        ] {
+            for table in tables {
+                if self.schema_admin && execution.owns_staged_table(*table) {
+                    continue;
+                }
+                self.authorize(action, *table)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn authorize(
@@ -124,10 +160,18 @@ impl PrincipalAuthorization {
     }
 
     pub(crate) fn can_start_transaction(&self) -> bool {
-        self.tables
-            .iter()
-            .any(|permissions| permissions.allows(AuthorizationAction::Transaction))
+        self.schema_admin
+            || self
+                .tables
+                .iter()
+                .any(|permissions| permissions.allows(AuthorizationAction::Transaction))
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrincipalGrants {
+    pub(crate) schema_admin: bool,
+    pub(crate) tables: Vec<TablePermissions>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -145,8 +189,8 @@ pub(crate) struct AuthorizationPolicy {
 impl AuthorizationPolicy {
     pub(crate) fn new(
         transport: TransportKind,
-        local_plaintext: Option<Vec<TablePermissions>>,
-        clients: Vec<([u8; 32], Vec<TablePermissions>)>,
+        local_plaintext: Option<PrincipalGrants>,
+        clients: Vec<([u8; 32], PrincipalGrants)>,
         known_tables: &[TableId],
     ) -> Result<Self, AuthorizationConfigError> {
         match transport {
@@ -286,6 +330,7 @@ impl Error for AuthorizationConfigError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorizationDenied {
+    SchemaAdmin,
     UnconfiguredPrincipal,
     Operation {
         action: AuthorizationAction,
@@ -296,6 +341,7 @@ pub(crate) enum AuthorizationDenied {
 impl fmt::Display for AuthorizationDenied {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SchemaAdmin => formatter.write_str("authorization denied: schema_admin required"),
             Self::UnconfiguredPrincipal => {
                 formatter.write_str("authorization denied for unconfigured principal")
             }
@@ -379,7 +425,10 @@ mod tests {
         assert!(matches!(
             AuthorizationPolicy::new(
                 TransportKind::MutualTls,
-                Some(vec![permissions(1, true, false, false, false)]),
+                Some(PrincipalGrants {
+                    schema_admin: false,
+                    tables: vec![permissions(1, true, false, false, false)]
+                }),
                 Vec::new(),
                 &known,
             ),
@@ -388,8 +437,17 @@ mod tests {
         assert!(matches!(
             AuthorizationPolicy::new(
                 TransportKind::PlaintextLoopback,
-                Some(vec![permissions(1, true, false, false, false)]),
-                vec![([1; 32], vec![permissions(1, true, false, false, false)])],
+                Some(PrincipalGrants {
+                    schema_admin: false,
+                    tables: vec![permissions(1, true, false, false, false)]
+                }),
+                vec![(
+                    [1; 32],
+                    PrincipalGrants {
+                        schema_admin: false,
+                        tables: vec![permissions(1, true, false, false, false)]
+                    }
+                )],
                 &known,
             ),
             Err(AuthorizationConfigError::PlaintextClientsNotAllowed)
@@ -401,7 +459,7 @@ mod tests {
         assert!(matches!(
             AuthorizationPolicy::new(
                 TransportKind::PlaintextLoopback,
-                Some(Vec::new()),
+                Some(PrincipalGrants::default()),
                 Vec::new(),
                 &known,
             ),
@@ -410,7 +468,10 @@ mod tests {
         assert!(matches!(
             AuthorizationPolicy::new(
                 TransportKind::PlaintextLoopback,
-                Some(vec![permissions(3, true, false, false, false)]),
+                Some(PrincipalGrants {
+                    schema_admin: false,
+                    tables: vec![permissions(3, true, false, false, false)]
+                }),
                 Vec::new(),
                 &known,
             ),
@@ -421,10 +482,13 @@ mod tests {
         assert!(matches!(
             AuthorizationPolicy::new(
                 TransportKind::PlaintextLoopback,
-                Some(vec![
-                    permissions(1, true, false, false, false),
-                    permissions(1, false, true, false, false),
-                ]),
+                Some(PrincipalGrants {
+                    schema_admin: false,
+                    tables: vec![
+                        permissions(1, true, false, false, false),
+                        permissions(1, false, true, false, false),
+                    ]
+                }),
                 Vec::new(),
                 &known,
             ),
@@ -437,8 +501,20 @@ mod tests {
                 TransportKind::MutualTls,
                 None,
                 vec![
-                    ([1; 32], vec![permissions(1, true, false, false, false)]),
-                    ([1; 32], vec![permissions(2, true, false, false, false)]),
+                    (
+                        [1; 32],
+                        PrincipalGrants {
+                            schema_admin: false,
+                            tables: vec![permissions(1, true, false, false, false)]
+                        }
+                    ),
+                    (
+                        [1; 32],
+                        PrincipalGrants {
+                            schema_admin: false,
+                            tables: vec![permissions(2, true, false, false, false)]
+                        }
+                    ),
                 ],
                 &known,
             ),
@@ -450,10 +526,13 @@ mod tests {
     fn local_policy_checks_every_operation_independently() {
         let policy = AuthorizationPolicy::new(
             TransportKind::PlaintextLoopback,
-            Some(vec![
-                permissions(1, true, false, true, false),
-                permissions(2, false, true, false, true),
-            ]),
+            Some(PrincipalGrants {
+                schema_admin: false,
+                tables: vec![
+                    permissions(1, true, false, true, false),
+                    permissions(2, false, true, false, true),
+                ],
+            }),
             Vec::new(),
             &[TableId(1), TableId(2)],
         )
@@ -503,7 +582,13 @@ mod tests {
         let policy = AuthorizationPolicy::new(
             TransportKind::MutualTls,
             None,
-            vec![([7; 32], vec![permissions(1, true, false, false, false)])],
+            vec![(
+                [7; 32],
+                PrincipalGrants {
+                    schema_admin: false,
+                    tables: vec![permissions(1, true, false, false, false)],
+                },
+            )],
             &[TableId(1)],
         )
         .unwrap();

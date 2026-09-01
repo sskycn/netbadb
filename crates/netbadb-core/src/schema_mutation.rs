@@ -1,4 +1,4 @@
-//! Core-only transactional Heap creation. No SQL DDL is accepted here.
+//! Frontend-independent transactional Heap creation. No SQL parsing occurs here.
 use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
@@ -73,6 +73,21 @@ impl CreateTableSpec {
             name: name.into(),
             columns,
         }
+    }
+}
+
+// Pure mapping only. Validation, identity reservation and physical lifecycle
+// remain in create_heap_table_in, shared with direct embedded callers.
+impl From<&netbadb_compiler::TypedCreateTable> for CreateTableSpec {
+    fn from(statement: &netbadb_compiler::TypedCreateTable) -> Self {
+        Self::new(
+            statement.name.clone(),
+            statement
+                .columns
+                .iter()
+                .map(|c| CreateColumnSpec::new(c.name.clone(), c.data_type.clone(), c.nullable))
+                .collect(),
+        )
     }
 }
 

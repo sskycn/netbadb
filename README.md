@@ -101,7 +101,9 @@ The [SchemaCatalog v1 format](docs/schema-catalog-v1.md) documents the independe
 installation marker and crash-safe publication. [Core transactional Heap table
 creation](docs/core-create-table-round18.md) adds durable identity reservations,
 private transaction schema/DML, coordinator-backed commit, and catalog-only recovery.
-SQL CREATE TABLE, DROP TABLE and ALTER TABLE remain unsupported.
+[Round 19](docs/sql-create-table-round19.md) adds transactional basic Heap
+`CREATE TABLE` over native SQL and PostgreSQL. DROP TABLE and ALTER TABLE remain
+unsupported.
 
 ## Repository layout
 
@@ -181,7 +183,7 @@ The current code genuinely supports:
 - Canonical schema definitions with nullable, primary-key, physical, and
   semantic type metadata, unified validation, and stable schema fingerprints;
 - parser support for `SELECT`, qualified columns, `AS` and shorthand table
-  aliases, chained `JOIN`/`INNER JOIN ... ON`, explicit-column single-row `INSERT`, `UPDATE`,
+  aliases, chained `JOIN`/`INNER JOIN ... ON`, single-row `INSERT` with explicit columns or declaration order, `UPDATE`,
   `DELETE`, optional DML `WHERE`, source-column `GROUP BY`, multi-key
   source-column `ORDER BY`, contextual `COUNT`/`SUM`/`MIN`/`MAX`, `LIMIT`, wildcard projection,
   `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
@@ -292,7 +294,12 @@ psql, SQLAlchemy, and guarded Alembic index-only apply. This builds on Round 5's
 psycopg 3 and SQLAlchemy 2 Core/ORM profile. The PostgreSQL adapter consumes
 stable Core metadata, preserves explicit durable index names while synthesizing
 legacy names/OIDs, and supports index-only Alembic add/remove migration.
-Table DDL, general migration execution, a complete `pg_catalog` or `information_schema`,
+Basic Heap `CREATE TABLE` supports BIGINT/INT64, TEXT and BOOLEAN/BOOL columns
+with NULL/NOT NULL, including real SQLAlchemy `Table.create(checkfirst=False)`
+without constraints/defaults. Network DDL requires explicit `schema_admin`; the
+creator can use its staged table only within the creating transaction, and receives
+no durable DML grant. DROP/ALTER TABLE, general migration execution, a complete
+`pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
@@ -516,10 +523,26 @@ API.
 Typed DML uses the same compiler, transaction, full-page WAL, rollback, and
 recovery path as heap writes. `Database::execute` returns either query rows or
 an explicit `AffectedRows(u64)` result; `query` rejects mutating statements.
-Single-row INSERT requires an explicit column list. Omitted nullable columns
+Single-row INSERT accepts an explicit column list or all values in canonical
+declaration order. With an explicit list, omitted nullable columns
 become NULL, while omitted non-nullable columns are rejected. UPDATE evaluates
 all right-hand sides against the original row, and UPDATE/DELETE reuse the
 SELECT predicate evaluator, so FALSE and UNKNOWN do not mutate a row.
+
+Basic SQL table creation uses the same typed DDL boundary as CREATE/DROP INDEX:
+
+```sql
+CREATE TABLE projects (id BIGINT NOT NULL, name TEXT, active BOOLEAN NOT NULL);
+```
+
+The generic aliases are BOOLEAN/BOOL, BIGINT/INT64/INT8, TEXT/unbounded VARCHAR,
+and native UINT64. PostgreSQL rejects UINT64 before execution. Types are unnamed
+physical semantic types; column names never imply nominal types. Preparation has
+no identity or storage effects. Explicit transaction CREATE followed by INSERT and
+SELECT sees a private schema; rollback removes it, while commit publishes its
+schema and rows durably. SQL tables require 1..4096 columns; constraints (including
+PRIMARY KEY), type lengths, IF NOT EXISTS, temporary tables and qualified/quoted
+CREATE names are unsupported. See the [complete scope and verification report](docs/sql-create-table-round19.md).
 
 Mutation is located by an internal versioned physical `RowId` (`PageId +
 SlotId + u32 generation`) that is never exposed as a SQL column or treated as a

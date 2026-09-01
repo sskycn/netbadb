@@ -49,7 +49,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
             "version": 4,
             "listen": "127.0.0.1:0",
             "authorization": {
-                "local_plaintext": {
+                "local_plaintext": {"schema_admin": true,
                     "tables": [{
                         "table_id": 1,
                         "read": true,

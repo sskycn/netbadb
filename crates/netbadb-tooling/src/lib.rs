@@ -30,6 +30,9 @@ impl TextSpan {
 /// Stable machine-facing classifications for current parser and HIR errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticCode {
+    UnknownType,
+    UnsupportedType,
+    InvalidTableDefinition,
     Parse,
     UnknownTable,
     UnknownColumn,
@@ -60,6 +63,9 @@ impl DiagnosticCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::UnknownType => "unknown_type",
+            Self::UnsupportedType => "unsupported_type",
+            Self::InvalidTableDefinition => "invalid_table_definition",
             Self::Parse => "parse",
             Self::UnknownTable => "unknown_table",
             Self::UnknownColumn => "unknown_column",
@@ -134,6 +140,9 @@ const fn text_span(span: Span) -> TextSpan {
 
 const fn hir_code(error: &HirError) -> DiagnosticCode {
     match error {
+        HirError::UnknownType { .. } => DiagnosticCode::UnknownType,
+        HirError::UnsupportedType { .. } => DiagnosticCode::UnsupportedType,
+        HirError::InvalidTableDefinition { .. } => DiagnosticCode::InvalidTableDefinition,
         HirError::InvalidIndexDefinition { .. } => DiagnosticCode::InvalidIndexDefinition,
         HirError::UnknownTable { .. } => DiagnosticCode::UnknownTable,
         HirError::UnknownColumn { .. } => DiagnosticCode::UnknownColumn,

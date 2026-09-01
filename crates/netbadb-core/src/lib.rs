@@ -236,6 +236,7 @@ impl TableStorageOpenSpec {
 pub struct StatementAccess {
     read_tables: Vec<TableId>,
     write_tables: Vec<TableId>,
+    schema_write: bool,
 }
 
 /// Typed output metadata obtained without executing a statement.
@@ -255,6 +256,22 @@ pub struct PreparedStatement {
     scope: Option<std::rc::Weak<()>>,
 }
 
+/// Prepared SQL retains separate relational and DDL boundaries.
+#[derive(Debug, Clone)]
+pub enum PreparedSqlStatement {
+    Relational(Box<PreparedStatement>),
+    Ddl(PreparedDdlStatement),
+}
+impl PreparedSqlStatement {
+    #[must_use]
+    pub fn access(&self) -> StatementAccess {
+        match self {
+            Self::Relational(s) => s.access(),
+            Self::Ddl(s) => s.access(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedDdlStatement {
     compiled: CompiledDdlStatement,
@@ -271,7 +288,13 @@ impl PreparedDdlStatement {
     #[must_use]
     pub fn access(&self) -> StatementAccess {
         match &self.compiled {
+            CompiledDdlStatement::CreateTable(_) => StatementAccess {
+                read_tables: Vec::new(),
+                write_tables: Vec::new(),
+                schema_write: true,
+            },
             CompiledDdlStatement::DropIndex(statement) => StatementAccess {
+                schema_write: true,
                 read_tables: Vec::new(),
                 write_tables: statement
                     .target
@@ -280,11 +303,26 @@ impl PreparedDdlStatement {
                     .collect(),
             },
             CompiledDdlStatement::CreateIndex(statement) => StatementAccess {
+                schema_write: true,
                 read_tables: Vec::new(),
                 write_tables: vec![statement.table_id],
             },
         }
     }
+    #[must_use]
+    pub fn is_table_create(&self) -> bool {
+        matches!(self.compiled, CompiledDdlStatement::CreateTable(_))
+    }
+
+    /// Declaration types for frontend compatibility preflight, without executing.
+    pub fn created_column_types(&self) -> impl Iterator<Item = &netbadb_types::SemanticType> {
+        let columns = match &self.compiled {
+            CompiledDdlStatement::CreateTable(s) => s.columns.as_slice(),
+            _ => &[],
+        };
+        columns.iter().map(|c| &c.data_type)
+    }
+
     /// Frontend command kind, with no protocol-specific completion tag.
     #[must_use]
     pub fn is_index_drop(&self) -> bool {
@@ -321,6 +359,7 @@ impl PreparedStatement {
     #[must_use]
     pub fn access(&self) -> StatementAccess {
         StatementAccess {
+            schema_write: false,
             read_tables: self.compiled.logical_statement.read_tables(),
             write_tables: self.compiled.logical_statement.write_tables(),
         }
@@ -333,6 +372,12 @@ impl PreparedStatement {
 }
 
 impl StatementAccess {
+    /// Schema mutation is a generic capability, independent of any table identity.
+    #[must_use]
+    pub fn schema_write(&self) -> bool {
+        self.schema_write
+    }
+
     #[must_use]
     pub fn read_tables(&self) -> &[TableId] {
         &self.read_tables
@@ -421,6 +466,8 @@ pub enum DatabaseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseErrorKind {
     Syntax,
+    DuplicateColumn,
+    SchemaBusy,
     UndefinedTable,
     UndefinedColumn,
     AmbiguousColumn,
@@ -441,6 +488,8 @@ impl DatabaseError {
     pub const fn kind(&self) -> DatabaseErrorKind {
         match self {
             Self::Compile(error) => match error.kind() {
+                CompileErrorKind::UndefinedType => DatabaseErrorKind::UndefinedObject,
+                CompileErrorKind::DuplicateColumn => DatabaseErrorKind::DuplicateColumn,
                 CompileErrorKind::Syntax => DatabaseErrorKind::Syntax,
                 CompileErrorKind::UndefinedTable => DatabaseErrorKind::UndefinedTable,
                 CompileErrorKind::UndefinedColumn => DatabaseErrorKind::UndefinedColumn,
@@ -473,10 +522,15 @@ impl DatabaseError {
                 | SchemaMutationError::UnsupportedPlacement
                 | SchemaMutationError::MultipleCreatesUnsupported,
             ) => DatabaseErrorKind::FeatureNotSupported,
+            Self::Schema(SchemaError::DuplicateTableName { .. }) => {
+                DatabaseErrorKind::DuplicateObject
+            }
+            Self::Schema(SchemaError::DuplicateColumnName { .. }) => {
+                DatabaseErrorKind::DuplicateColumn
+            }
+            Self::SchemaMutation(SchemaMutationError::SchemaBusy) => DatabaseErrorKind::SchemaBusy,
             Self::SchemaMutation(
-                SchemaMutationError::SchemaBusy
-                | SchemaMutationError::StalePreparedStatement
-                | SchemaMutationError::RecoveryRequired,
+                SchemaMutationError::StalePreparedStatement | SchemaMutationError::RecoveryRequired,
             ) => DatabaseErrorKind::TransactionState,
             Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
@@ -1910,11 +1964,7 @@ impl Database {
     /// Compiles SQL and reports its canonical table access without planning,
     /// reading rows, starting a transaction, or touching persistent state.
     pub fn statement_access(&self, source: &str) -> Result<StatementAccess, DatabaseError> {
-        let compiled = compile_statement(&self.committed.schema, source)?;
-        Ok(StatementAccess {
-            read_tables: compiled.logical_statement.read_tables(),
-            write_tables: compiled.logical_statement.write_tables(),
-        })
+        Ok(self.prepare_sql_statement(source, &[])?.access())
     }
 
     /// Parses, resolves, and type-checks a reusable parameterized statement.
@@ -1939,8 +1989,14 @@ impl Database {
         &self,
         source: &str,
     ) -> Result<PreparedDdlStatement, DatabaseError> {
-        let indexes = self
-            .registry
+        let indexes = self.index_name_bindings();
+        Ok(PreparedDdlStatement {
+            compiled: compile_ddl_statement(&self.committed.schema, source, &indexes)?,
+        })
+    }
+
+    fn index_name_bindings(&self) -> Vec<IndexNameBinding> {
+        self.registry
             .iter()
             .flat_map(|entry| {
                 entry.storage.indexes().iter().filter_map(|index| {
@@ -1953,10 +2009,72 @@ impl Database {
                     })
                 })
             })
-            .collect::<Vec<_>>();
-        Ok(PreparedDdlStatement {
-            compiled: compile_ddl_statement(&self.committed.schema, source, &indexes)?,
-        })
+            .collect::<Vec<_>>()
+    }
+
+    /// Prepare any generic SQL through one parser pass, with no execution effects.
+    pub fn prepare_sql_statement(
+        &self,
+        source: &str,
+        declared: &[Option<PhysicalType>],
+    ) -> Result<PreparedSqlStatement, DatabaseError> {
+        self.prepare_sql_with_transaction(None, source, declared)
+    }
+
+    /// Prepares against the transaction view, including logical DDL. Unlike
+    /// explicitly scoped `prepare_statement_in`, only statements referencing
+    /// private tables are transaction-bound; committed-table plans remain reusable.
+    pub fn prepare_sql_statement_in(
+        &self,
+        transaction: &Transaction,
+        source: &str,
+        declared: &[Option<PhysicalType>],
+    ) -> Result<PreparedSqlStatement, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        self.prepare_sql_with_transaction(Some(transaction), source, declared)
+    }
+
+    fn prepare_sql_with_transaction(
+        &self,
+        transaction: Option<&Transaction>,
+        source: &str,
+        declared: &[Option<PhysicalType>],
+    ) -> Result<PreparedSqlStatement, DatabaseError> {
+        let schema = transaction.map_or(&self.committed.schema, |t| {
+            t.visible_schema(&self.committed.schema)
+        });
+        let compiled = netbadb_compiler::compile_sql_statement(
+            schema,
+            source,
+            &self.index_name_bindings(),
+            declared,
+        )?;
+        match compiled {
+            netbadb_compiler::CompiledSqlStatement::Ddl(compiled) => {
+                if transaction.is_some_and(|t| t.schema_mutation.is_some())
+                    && !matches!(compiled, CompiledDdlStatement::CreateTable(_))
+                {
+                    return Err(DatabaseError::UnsupportedDdlCombination);
+                }
+                Ok(PreparedSqlStatement::Ddl(PreparedDdlStatement { compiled }))
+            }
+            netbadb_compiler::CompiledSqlStatement::Relational(compiled) => {
+                let dependencies = self.statement_dependencies(&compiled, transaction)?;
+                // Only private identities require transaction scope. Drivers may
+                // cache statements prepared inside a transaction over committed
+                // tables and safely reuse them after unrelated schema commits.
+                let scope = transaction
+                    .filter(|t| dependencies.iter().any(|d| t.owns_staged_table(d.table_id)))
+                    .map(|t| std::rc::Rc::downgrade(&t.preparation_scope));
+                Ok(PreparedSqlStatement::Relational(Box::new(
+                    PreparedStatement {
+                        compiled: *compiled,
+                        dependencies,
+                        scope,
+                    },
+                )))
+            }
+        }
     }
 
     /// Prepares an already resolved generic identity, including unnamed legacy
@@ -2012,6 +2130,17 @@ impl Database {
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
         match &prepared.compiled {
+            CompiledDdlStatement::CreateTable(statement) => {
+                let mut transaction = self.begin_transaction()?;
+                if let Err(error) =
+                    self.create_heap_table_in(&mut transaction, CreateTableSpec::from(statement))
+                {
+                    transaction.rollback()?;
+                    return Err(error);
+                }
+                self.commit_transaction(&mut transaction)?;
+                Ok(DdlOutcome::Created)
+            }
             CompiledDdlStatement::DropIndex(statement) => {
                 let Some(target) = self.validate_drop_target(statement)? else {
                     return Ok(DdlOutcome::Unchanged);
@@ -2057,11 +2186,15 @@ impl Database {
         transaction: &mut Transaction,
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
-        if transaction.schema_mutation.is_some() {
+        if transaction.schema_mutation.is_some() && !prepared.is_table_create() {
             return Err(DatabaseError::UnsupportedDdlCombination);
         }
         self.validate_transaction(transaction)?;
         match &prepared.compiled {
+            CompiledDdlStatement::CreateTable(statement) => {
+                self.create_heap_table_in(transaction, CreateTableSpec::from(statement))?;
+                Ok(DdlOutcome::Created)
+            }
             CompiledDdlStatement::DropIndex(statement) => {
                 if transaction.has_pending_index_creations() {
                     return Err(DatabaseError::UnsupportedDdlCombination);
@@ -2241,29 +2374,15 @@ impl Database {
         ))
     }
 
-    /// Executes SELECT or one typed DML statement. DML runs in one implicit
-    /// transaction and returns an explicit affected-row count.
+    /// Executes SELECT, typed DML or generic DDL. Mutations use existing implicit
+    /// transactions; DDL returns AffectedRows(0). For fallible schema commits
+    /// requiring explicit retry, use execute_ddl_in and retain the transaction.
     pub fn execute(&mut self, source: &str) -> Result<ExecutionResult, DatabaseError> {
-        let (compiled, physical) = self.compile_and_plan(source)?;
-        if let PhysicalStatement::Query(plan) = &physical {
-            let storage_ids =
-                self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
-            let view = self.autocommit_read_view(&storage_ids)?;
-            return self
-                .execute_query_plan(plan, &view, None)
-                .map(ExecutionResult::Query);
-        }
-
-        let mut transaction = self.begin_database_transaction(IsolationLevel::ReadCommitted)?;
-        match self.execute_mutation_in(&mut transaction, &physical) {
-            Ok(result) => {
-                transaction.commit()?;
-                Ok(result)
-            }
-            Err(error) => match transaction.rollback() {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(rollback_error.into()),
-            },
+        match self.prepare_sql_statement(source, &[])? {
+            PreparedSqlStatement::Relational(prepared) => self.execute_prepared(&prepared, &[]),
+            PreparedSqlStatement::Ddl(prepared) => self
+                .execute_ddl(&prepared)
+                .map(|_| ExecutionResult::AffectedRows(0)),
         }
     }
 
@@ -2308,34 +2427,13 @@ impl Database {
         transaction: &mut Transaction,
         source: &str,
     ) -> Result<ExecutionResult, DatabaseError> {
-        self.validate_transaction(transaction)?;
-        let compiled =
-            compile_statement(transaction.visible_schema(&self.committed.schema), source)?;
-        let physical = self.plan_logical_statement(&compiled.logical_statement);
-        if let PhysicalStatement::Query(plan) = &physical {
-            let storage_ids = self
-                .storage_ids_for_tables_in(compiled.logical_statement.read_tables(), transaction)?;
-            let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
-            return self
-                .execute_query_plan(plan, &view, transaction.staged_storage_mut())
-                .map(ExecutionResult::Query);
-        }
-        if transaction.has_pending_index_creations() {
-            return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit.into());
-        }
-        let table_id = statement_table_id(&physical).ok_or(DatabaseError::ExpectedQuery)?;
-        if let Some(storage_id) = self.single_storage_in(table_id, transaction)? {
-            // Preserve the legacy one-writer preflight boundary: rejecting a
-            // second physical writer mutates no row and leaves the explicit
-            // transaction active for its caller to roll back.
-            let _ = transaction.write_context(storage_id, &mut self.registry)?;
-        }
-        match self.execute_mutation_in(transaction, &physical) {
-            Ok(result) => Ok(result),
-            Err(error) => match transaction.rollback() {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(rollback_error.into()),
-            },
+        match self.prepare_sql_statement_in(transaction, source, &[])? {
+            PreparedSqlStatement::Relational(prepared) => {
+                self.execute_prepared_in(transaction, &prepared, &[])
+            }
+            PreparedSqlStatement::Ddl(prepared) => self
+                .execute_ddl_in(transaction, &prepared)
+                .map(|_| ExecutionResult::AffectedRows(0)),
         }
     }
 
@@ -6473,3 +6571,6 @@ mod tests {
         let _ = std::fs::remove_file(&wal);
     }
 }
+
+#[cfg(test)]
+mod sql_create_table_tests;
