@@ -1,5 +1,5 @@
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, TableStatistics};
 use netbadb_schema::TableDef;
@@ -14,6 +14,54 @@ use crate::{
     LsmStorage, LsmTransaction, PreparedTxnResolution, PresenceCountSummary, ReadView,
     StorageError, Transaction, TransactionError, TransactionState,
 };
+
+/// One exact file owned by a single Heap storage resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapResourceComponentKind {
+    Main,
+    Wal,
+    TransactionStatus,
+    AlternateWal,
+}
+
+/// Storage-authored physical bundle member. Callers may add their own
+/// higher-layer metadata, but must not infer Heap suffixes independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapResourceComponent {
+    pub kind: HeapResourceComponentKind,
+    pub path: PathBuf,
+    pub required: bool,
+}
+
+/// Returns the complete, exact set of files owned by one Heap implementation.
+/// Index-catalog and BTree pages are contained in `Main`.
+#[must_use]
+pub fn heap_resource_components(path: impl AsRef<Path>) -> Vec<HeapResourceComponent> {
+    let main = path.as_ref();
+    let wal = crate::wal_path(main);
+    vec![
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::Main,
+            path: main.to_owned(),
+            required: true,
+        },
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::Wal,
+            path: wal.clone(),
+            required: true,
+        },
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::TransactionStatus,
+            path: crate::txn_status_path(main),
+            required: true,
+        },
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::AlternateWal,
+            path: crate::wal_alternate_path(wal),
+            required: false,
+        },
+    ]
+}
 
 /// Executable capabilities advertised by one table-scoped access path.
 ///

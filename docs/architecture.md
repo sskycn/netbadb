@@ -238,6 +238,16 @@ separate exact schema target, so `schema_admin` does not imply or require row DM
 grants. Native and PostgreSQL Simple/Extended paths add no identity or persistent
 format. Same-name replacement fails stale/undefined rather than rebinding.
 
+[Round 22](retired-heap-gc-round22.md) adds explicit physical retirement for one
+exact runtime-created Single Heap. Append-only completed Coordinator decisions
+form a durable per-StorageId recovery horizon; Core resolves and closes local Heap
+recovery before persisting a retry-only NBSJ GC intent. Storage authors the exact
+Heap/WAL/status bundle, Core adds owner/link metadata, and deletion synchronizes the
+parent directory before durable Complete. Startup resumes only existing intents,
+never selects candidates. Deleted history remains authoritative for non-reuse and
+completed coordinator replay. LSM, partitions, imported locators, background GC and
+metadata compaction remain deferred.
+
 `compile_sql_statement` parses once and selects relational or DDL lowering from the
 AST. Core's `prepare_sql_statement_in` shares the transaction SchemaView and
 identity/version/fingerprint dependency rules of `prepare_statement_in`; sessions

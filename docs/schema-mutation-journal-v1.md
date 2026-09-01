@@ -55,6 +55,8 @@ Every NBSR payload starts with tag u8 and nonzero DatabaseTxnId u64.
 | 6 | Retained physical resource | None |
 | 7 | Resolved DROP loser | None |
 | 8 | Resolved DROP winner | None |
+| 9 | RetiredHeapGcIntent | coordinator recovery horizon DatabaseTxnId u64, exact bundle SHA-256 `[u8;32]` |
+| 10 | RetiredHeapGcComplete | None |
 
 A reservation consumes both IDs together; it is synchronized before intent or
 staged files. ColumnIds are deterministic 1..N; the intent persists these exact
@@ -86,6 +88,13 @@ unsupported engine, overlap with another unresolved schema mutation, a later CRE
 reservation below the retained allocator floors, and invalid ordering. Current
 readers accept every Round 18 journal; older readers reject the new tags, so
 downgrade after Core DROP is unsupported.
+
+For a committed retained runtime Heap, tag 9 follows tag 8 and starts a
+retry-only physical deletion. The surrounding DROP fragment supplies the exact
+identity and generated locator; tag 9 binds the greatest completed coordinator
+reference and deterministic component manifest. Tag 10 is invalid without tag
+9, duplicate tags are invalid, and tag 9 is invalid before durable retained
+winner state. Admission reserves capacity for both records before intent.
 
 ## Locators and ownership
 
@@ -147,12 +156,16 @@ For DROP winners, recovery validates the retained Heap/WAL/status identity, reco
 any ordinary physical participants through a recovery-only snapshot, persists tag 6,
 publishes the prepared NBSC excluding the table, completes Coordinator and only then
 persists tag 8. DROP losers retain the original active resource and schema. Active
-NBSC StorageIds must be disjoint from committed retained StorageIds; missing retained
-resources are hard errors. Retired fragments never participate in active lookup or
-ordinary inspection.
+NBSC StorageIds must be disjoint from committed retained StorageIds. A missing
+Retained resource without tag 9 is a hard error. Tag 9 permits recovery to resume
+only its exact component deletion; tag 10 requires every component to remain
+absent. A reappeared component is a hard conflict. Retired fragments never
+participate in active lookup or ordinary inspection.
 
 Dropping an unresolved schema handle requires reopen. Unknown/unlisted files are
-not garbage-collected. Journal compaction and general aborted-resource GC are deferred.
+not garbage-collected. Startup does not choose GC candidates. Journal compaction
+and general aborted-resource GC are deferred. See
+[Round 22](retired-heap-gc-round22.md) for the retention proof and exact bundle.
 
 Deterministic seeds are produced by the ignored Core test
 `write_schema_mutation_fuzz_corpus` with an explicit `NETBADB_ROUND18_CORPUS`

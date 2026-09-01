@@ -114,6 +114,10 @@ recovery error; no empty replacement is created.
 NBSJ is intentionally still append/history-retaining. Physical deletion and a safe
 coordinator/handle retention horizon remain future work.
 
+Round 22 subsequently closes that boundary for explicit runtime-created Single
+Heaps; see [Retired Heap physical GC](retired-heap-gc-round22.md). This paragraph
+records the deliberate Round 20 state before the later proof existed.
+
 ## Commit, rollback and recovery
 
 Live commit order is:

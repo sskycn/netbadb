@@ -38,6 +38,17 @@ pub(crate) struct DropIntent {
     pub(crate) snapshot_digest: [u8; 32],
     pub(crate) retired: bool,
     pub(crate) resolved: Option<bool>,
+    pub(crate) gc: Option<RetiredHeapGcRecord>,
+}
+
+/// Durable retry-only physical deletion state. The surrounding DropIntent
+/// already carries the exact database incarnation, table/version/fingerprint,
+/// StorageId, locator and retirement transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredHeapGcRecord {
+    pub(crate) coordinator_horizon: DatabaseTxnId,
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) complete: bool,
 }
 
 impl DropIntent {
@@ -241,6 +252,34 @@ impl SchemaMutationJournal {
         self.activate()
     }
 
+    pub(crate) fn prepare_gc(
+        &self,
+        txn: DatabaseTxnId,
+        gc: &RetiredHeapGcRecord,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let drop = self
+            .drops
+            .get(&txn)
+            .ok_or(corrupt("GC intent without drop history"))?;
+        if !drop.retired || drop.resolved != Some(true) || drop.gc.is_some() || gc.complete {
+            return Err(corrupt("out-of-order GC intent"));
+        }
+        // Reserve both terminal records before the first unlink. Capacity can
+        // therefore never strand a durable deleting state without Complete.
+        let mut projected = self.clone();
+        let projected_drop = projected
+            .drops
+            .get_mut(&txn)
+            .ok_or(corrupt("projected GC drop disappeared"))?;
+        projected_drop.gc = Some(RetiredHeapGcRecord {
+            complete: true,
+            ..gc.clone()
+        });
+        projected.encode()?;
+        Ok(())
+    }
+
     pub(crate) fn effective_table(&self, floor: Option<TableId>) -> Option<TableId> {
         let floor = floor?;
         self.reservations
@@ -347,6 +386,33 @@ impl SchemaMutationJournal {
         intent.resolved = Some(committed);
         self.persist()
     }
+
+    pub(crate) fn gc_intent(
+        &mut self,
+        txn: DatabaseTxnId,
+        gc: RetiredHeapGcRecord,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_gc(txn, &gc)?;
+        self.drops
+            .get_mut(&txn)
+            .ok_or(corrupt("GC intent without drop history"))?
+            .gc = Some(gc);
+        self.persist()
+    }
+
+    pub(crate) fn complete_gc(&mut self, txn: DatabaseTxnId) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let gc = self
+            .drops
+            .get_mut(&txn)
+            .and_then(|drop| drop.gc.as_mut())
+            .ok_or(corrupt("GC complete without intent"))?;
+        if gc.complete {
+            return Ok(());
+        }
+        gc.complete = true;
+        self.persist()
+    }
     pub(crate) fn resolve(
         &mut self,
         txn: DatabaseTxnId,
@@ -406,7 +472,12 @@ impl SchemaMutationJournal {
         let drop_count = self
             .drops
             .values()
-            .map(|d| 1 + usize::from(d.retired) + usize::from(d.resolved.is_some()))
+            .map(|d| {
+                1 + usize::from(d.retired)
+                    + usize::from(d.resolved.is_some())
+                    + usize::from(d.gc.is_some())
+                    + usize::from(d.gc.as_ref().is_some_and(|gc| gc.complete))
+            })
             .sum::<usize>();
         let count = create_count
             .checked_add(drop_count)
@@ -457,6 +528,18 @@ impl SchemaMutationJournal {
                     let mut record = Writer(vec![if committed { 8 } else { 7 }]);
                     record.u64(d.transaction.0);
                     put_record(&mut w, &record.0)?;
+                }
+                if let Some(gc) = &d.gc {
+                    let mut record = Writer(vec![9]);
+                    record.u64(d.transaction.0);
+                    record.u64(gc.coordinator_horizon.0);
+                    record.0.extend_from_slice(&gc.manifest_digest);
+                    put_record(&mut w, &record.0)?;
+                    if gc.complete {
+                        let mut record = Writer(vec![10]);
+                        record.u64(d.transaction.0);
+                        put_record(&mut w, &record.0)?;
+                    }
                 }
             }
         }
@@ -660,6 +743,7 @@ impl SchemaMutationJournal {
                             snapshot_digest,
                             retired: false,
                             resolved: None,
+                            gc: None,
                         },
                     );
                 }
@@ -689,6 +773,44 @@ impl SchemaMutationJournal {
                         return Err(corrupt("retired drop resolved as loser"));
                     }
                     intent.resolved = Some(tag == 8);
+                }
+                9 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("GC intent for unknown transaction"));
+                    }
+                    let intent = drops
+                        .get_mut(&txn)
+                        .ok_or(corrupt("GC intent without drop history"))?;
+                    let coordinator_horizon = DatabaseTxnId(record.u64()?);
+                    let manifest_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("GC manifest digest"))?;
+                    if !intent.retired
+                        || intent.resolved != Some(true)
+                        || intent.gc.is_some()
+                        || coordinator_horizon.0 < intent.transaction.0
+                    {
+                        return Err(corrupt("duplicate or out-of-order GC intent"));
+                    }
+                    intent.gc = Some(RetiredHeapGcRecord {
+                        coordinator_horizon,
+                        manifest_digest,
+                        complete: false,
+                    });
+                }
+                10 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("GC complete for unknown transaction"));
+                    }
+                    let gc = drops
+                        .get_mut(&txn)
+                        .and_then(|drop| drop.gc.as_mut())
+                        .ok_or(corrupt("GC complete without intent"))?;
+                    if gc.complete {
+                        return Err(corrupt("duplicate GC complete"));
+                    }
+                    gc.complete = true;
                 }
                 _ => return Err(corrupt("unknown journal record tag")),
             }

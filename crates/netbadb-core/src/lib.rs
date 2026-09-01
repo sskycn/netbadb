@@ -74,7 +74,9 @@ pub use registry::StorageRegistryError;
 pub use schema_catalog::SchemaCatalogError;
 pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
 pub use schema_mutation::{
-    CreateColumnSpec, CreateTableSpec, RetiredTableResource, SchemaDependency, SchemaMutationError,
+    CreateColumnSpec, CreateTableSpec, RetiredHeapGcBlocker, RetiredHeapGcComponent,
+    RetiredHeapGcComponentKind, RetiredHeapGcInspection, RetiredHeapGcReport, RetiredHeapGcState,
+    RetiredTableResource, SchemaDependency, SchemaMutationError,
 };
 
 impl From<SchemaCatalogError> for DatabaseError {

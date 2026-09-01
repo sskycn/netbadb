@@ -560,8 +560,10 @@ Preparation binds TableId, table schema version, and fingerprint without storage
 effects. Execute never resolves the name again, so an old prepared DROP cannot
 retire a same-name replacement. Network DROP requires `schema_admin`, not a table
 DML grant. Commit logically retires the Heap through the Round 20 lifecycle;
-rollback restores visibility, and physical Heap/index resources remain retained for
-future garbage collection. IF EXISTS, CASCADE/RESTRICT, qualified/quoted or multiple
+rollback restores visibility, and physical Heap/index resources remain retained
+until an explicit exact-resource Core GC proves the
+[Round 22 recovery horizon](docs/retired-heap-gc-round22.md). There is no
+background or SQL GC. IF EXISTS, CASCADE/RESTRICT, qualified/quoted or multiple
 targets, LSM/range DROP, and ALTER TABLE are unsupported. See the
 [Round 21 report](docs/sql-drop-table-round21.md).
 

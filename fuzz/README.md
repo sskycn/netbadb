@@ -204,3 +204,11 @@ placement, checked generation/epoch, ordering, duplicate retirement and winner/
 loser state constraints. `coordinator_log_decode` adds a CORD v2 schema DROP
 decision with zero physical participants. The same 1,000-run command applies; no
 new standalone persistent format or fuzz target is introduced.
+
+## Round 22 retired Heap GC records
+
+`schema_mutation_decode` also covers valid retry-only GC intent and terminal
+complete histories. Replay rejects GC before retained DROP winner, complete
+without intent, duplicates, truncated horizon/digest, a horizon older than the
+DROP transaction and unknown tags. The existing bounded target and 1,000-run
+command remain authoritative; no new fuzz-only production decoder is added.

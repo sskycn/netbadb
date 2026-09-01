@@ -751,9 +751,22 @@ protection, SQL-driven crash regression, and real psql/psycopg/SQLAlchemy probes
 No persistent format changes. IF EXISTS, CASCADE/RESTRICT, multi-table/qualified
 forms, LSM/range DROP, physical deletion and Alembic table migration remain deferred.
 
-Next: design physical-resource garbage collection around an explicit safe-retention
-horizon for coordinator history, crash recovery, open handles, and retired Heap/WAL/
-index ownership. Do not unlink resources until those invariants are proved.
+### Retired Heap Physical Resource GC — Round 22
+
+[Round 22](retired-heap-gc-round22.md) proves a durable recovery-retention horizon
+from append-only completed Coordinator history and implements explicit GC for one
+exact runtime-created Single Heap. NBSJ v1 GC intent/complete records make deletion
+retry-only; startup resumes intents but never chooses candidates. Exact storage-owned
+Heap/WAL/status plus Core owner/link files are removed without symlink following,
+then the parent directory is synchronized. Same-name recreation, indexed Heaps,
+12 crash points, terminal reappearance and 100 create/drop/GC cycles are covered.
+LSM/partition/imported-orphan GC, automatic GC and journal/coordinator compaction
+remain deferred.
+
+Next: perform an ALTER TABLE/schema-evolution architecture audit before any ALTER
+implementation. The audit must cover ColumnId non-reuse, TableSchemaVersion,
+row-format compatibility, existing MVCC/index dependencies, prepared invalidation,
+catalog migration and online/offline rewrite recovery.
 
 ## Phase 6 — SDK and tooling
 
