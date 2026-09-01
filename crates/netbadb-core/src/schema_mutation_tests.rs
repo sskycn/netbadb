@@ -1477,100 +1477,111 @@ fn one_hundred_heap_schema_rewrites_preserve_identity_and_report_growth() {
 }
 
 #[test]
-fn replacement_gc_supports_chained_rewrites_reverse_order_and_later_alter() {
-    let root = root("replacement-gc-chain");
-    let mut db = seed(&root, true);
-    let table = create_rewrite_gc_table(&mut db, "projects");
-    db.execute("INSERT INTO projects VALUES (7)").unwrap();
-    let index = db
-        .create_named_index(
-            IndexName::new("projects_value_idx").unwrap(),
-            table,
-            ColumnId(1),
-        )
-        .unwrap();
-    let first = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
-    let second = rename_rewrite_gc_column(&mut db, "projects", "value_b", "value_c");
-    let third = rename_rewrite_gc_column(&mut db, "projects", "value_c", "value_d");
-    let retired = vec![first, second, third];
-    let active_storage = db.bindings.resolve_single(table).unwrap();
-    let active = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
-    let active_locator = &active
-        .storages
-        .iter()
-        .find(|storage| storage.id == active_storage)
-        .unwrap()
-        .locator;
-    let active_path = crate::schema_catalog_file::resolve(&root.join("catalog"), active_locator);
-    let active_bytes = heap_bundle_bytes(&active_path);
-    let invariants = (
-        db.schema_generation(),
-        db.catalog_generation(),
-        db.next_table_id(),
-        db.next_storage_id(),
-        db.next_partition_id(),
-        db.next_column_id(table),
-    );
-
-    for resource in retired.iter().rev() {
-        let inspection = db.inspect_replacement_retired_heap_gc(resource).unwrap();
-        assert!(inspection.eligible(), "{:?}", inspection.blockers);
-        assert_eq!(inspection.target.storage_id(), resource.old_storage_id);
-        db.gc_replacement_retired_heap(resource).unwrap();
-    }
-    assert_eq!(heap_bundle_bytes(&active_path), active_bytes);
-    assert_eq!(
-        (
+fn replacement_gc_supports_chained_rewrites_both_orders_and_later_alter() {
+    for newest_first in [false, true] {
+        let root = root(if newest_first {
+            "replacement-gc-chain-newest-first"
+        } else {
+            "replacement-gc-chain-oldest-first"
+        });
+        let mut db = seed(&root, true);
+        let table = create_rewrite_gc_table(&mut db, "projects");
+        db.execute("INSERT INTO projects VALUES (7)").unwrap();
+        let index = db
+            .create_named_index(
+                IndexName::new("projects_value_idx").unwrap(),
+                table,
+                ColumnId(1),
+            )
+            .unwrap();
+        let first = rename_rewrite_gc_column(&mut db, "projects", "value_a", "value_b");
+        let second = rename_rewrite_gc_column(&mut db, "projects", "value_b", "value_c");
+        let third = rename_rewrite_gc_column(&mut db, "projects", "value_c", "value_d");
+        let retired = vec![first, second, third];
+        let active_storage = db.bindings.resolve_single(table).unwrap();
+        let active = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+        let active_locator = &active
+            .storages
+            .iter()
+            .find(|storage| storage.id == active_storage)
+            .unwrap()
+            .locator;
+        let active_path =
+            crate::schema_catalog_file::resolve(&root.join("catalog"), active_locator);
+        let active_bytes = heap_bundle_bytes(&active_path);
+        let invariants = (
             db.schema_generation(),
             db.catalog_generation(),
             db.next_table_id(),
             db.next_storage_id(),
             db.next_partition_id(),
             db.next_column_id(table),
-        ),
-        invariants
-    );
-    assert_eq!(db.indexes(table).unwrap()[0].id, index.id);
-    assert_eq!(
-        db.query("SELECT value_d FROM projects").unwrap().rows,
-        vec![vec![ScalarValue::Int64(7)]]
-    );
-    for resource in &retired {
-        assert_eq!(
-            db.inspect_replacement_retired_heap_gc(resource)
-                .unwrap()
-                .state,
-            RetiredHeapGcState::Deleted
         );
-    }
-
-    let fourth = rename_rewrite_gc_column(&mut db, "projects", "value_d", "value_e");
-    assert_eq!(fourth.old_storage_id, active_storage);
-    assert_eq!(db.schema().table("projects").unwrap().id, table);
-    assert_eq!(
-        db.query("SELECT value_e FROM projects").unwrap().rows,
-        vec![vec![ScalarValue::Int64(7)]]
-    );
-    db.close().unwrap();
-    for _ in 0..3 {
-        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
-        assert_eq!(reopened.schema().table("projects").unwrap().id, table);
+        let order = if newest_first {
+            retired.iter().rev().collect::<Vec<_>>()
+        } else {
+            retired.iter().collect::<Vec<_>>()
+        };
+        for resource in order {
+            let inspection = db.inspect_replacement_retired_heap_gc(resource).unwrap();
+            assert!(inspection.eligible(), "{:?}", inspection.blockers);
+            assert_eq!(inspection.target.storage_id(), resource.old_storage_id);
+            db.gc_replacement_retired_heap(resource).unwrap();
+        }
+        assert_eq!(heap_bundle_bytes(&active_path), active_bytes);
         assert_eq!(
-            reopened.query("SELECT value_e FROM projects").unwrap().rows,
+            (
+                db.schema_generation(),
+                db.catalog_generation(),
+                db.next_table_id(),
+                db.next_storage_id(),
+                db.next_partition_id(),
+                db.next_column_id(table),
+            ),
+            invariants
+        );
+        assert_eq!(db.indexes(table).unwrap()[0].id, index.id);
+        assert_eq!(
+            db.query("SELECT value_d FROM projects").unwrap().rows,
             vec![vec![ScalarValue::Int64(7)]]
         );
         for resource in &retired {
             assert_eq!(
-                reopened
-                    .inspect_replacement_retired_heap_gc(resource)
+                db.inspect_replacement_retired_heap_gc(resource)
                     .unwrap()
                     .state,
                 RetiredHeapGcState::Deleted
             );
         }
-        reopened.close().unwrap();
+
+        let fourth = rename_rewrite_gc_column(&mut db, "projects", "value_d", "value_e");
+        assert_eq!(fourth.old_storage_id, active_storage);
+        assert_eq!(db.schema().table("projects").unwrap().id, table);
+        assert_eq!(
+            db.query("SELECT value_e FROM projects").unwrap().rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        db.close().unwrap();
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+            assert_eq!(reopened.schema().table("projects").unwrap().id, table);
+            assert_eq!(
+                reopened.query("SELECT value_e FROM projects").unwrap().rows,
+                vec![vec![ScalarValue::Int64(7)]]
+            );
+            for resource in &retired {
+                assert_eq!(
+                    reopened
+                        .inspect_replacement_retired_heap_gc(resource)
+                        .unwrap()
+                        .state,
+                    RetiredHeapGcState::Deleted
+                );
+            }
+            reopened.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -4088,6 +4099,81 @@ fn subprocess_rewrite_crash_matrix_reopens_three_times_without_recopy() {
             assert_rewrite_target_requires_prepared_recovery(&root);
         }
         rewrite_outcome(&root, winner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn seed_rewrite_crash_after_deleted_ancestor(root: &Path) -> crate::ReplacementRetiredHeap {
+    seed_rewrite_crash(root);
+    let mut db = Database::open_catalog(root.join("catalog")).unwrap();
+    let target = db.resolve_alter_table("projects").unwrap();
+    let column_id = db.resolve_alter_column(&target, "name").unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut transaction,
+        AlterTableSpec::new(
+            target,
+            AlterTableOperation::RenameColumn {
+                column_id,
+                new_name: "title".into(),
+            },
+        ),
+    )
+    .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+    let retired = db.inspect_replacement_retired_heaps()[0].clone();
+    db.gc_replacement_retired_heap(&retired).unwrap();
+    db.close().unwrap();
+    retired
+}
+
+#[test]
+fn rewrite_crash_recovery_does_not_require_a_deleted_ancestor() {
+    for (point, winner) in [
+        ("rewrite-copy-complete", false),
+        ("coordinator-durable", true),
+    ] {
+        let root = root(&format!("rewrite-after-gc-{point}"));
+        let deleted = seed_rewrite_crash_after_deleted_ancestor(&root);
+        spawn_rewrite(&root, point);
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+            let table = reopened.schema().table("projects").unwrap();
+            assert_eq!(table.id, TableId(3));
+            assert_eq!(
+                reopened.table_schema_version(table.id),
+                Some(TableSchemaVersion(if winner { 3 } else { 2 }))
+            );
+            assert_eq!(
+                reopened.bindings.resolve_single(table.id).unwrap(),
+                StorageId(if winner { 5 } else { 4 })
+            );
+            assert_eq!(table.column_by_id(ColumnId(2)).unwrap().name, "title");
+            assert_eq!(table.column_by_id(ColumnId(3)).is_some(), winner);
+            assert_eq!(reopened.indexes(table.id).unwrap()[0].id.0, 1);
+            assert_eq!(
+                reopened
+                    .query("SELECT id, title FROM projects ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                    vec![ScalarValue::Int64(2), ScalarValue::Text("two".into())],
+                ]
+            );
+            let inspection = reopened
+                .inspect_replacement_retired_heap_gc(&deleted)
+                .unwrap();
+            assert_eq!(inspection.state, RetiredHeapGcState::Deleted);
+            assert!(
+                inspection
+                    .components
+                    .iter()
+                    .all(|component| !component.present)
+            );
+            reopened.close().unwrap();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
