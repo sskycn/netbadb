@@ -7,11 +7,12 @@ use std::fmt;
 use netbadb_parser::{
     AggregateArgument as AstAggregateArgument, AggregateCall as AstAggregateCall,
     AggregateFunction as AstAggregateFunction, BinaryOp as AstBinaryOp, ColumnName,
-    CreateIndexStatement as AstCreateIndexStatement, Expr as AstExpr, FromItem, Ident, Literal,
-    NullOrder as AstNullOrder, Query, SortDirection as AstSortDirection, Span,
-    SqlTypeName as AstSqlTypeName, Statement as AstStatement, UnaryOp as AstUnaryOp,
+    CreateIndexStatement as AstCreateIndexStatement, DropTableStatement as AstDropTableStatement,
+    Expr as AstExpr, FromItem, Ident, Literal, NullOrder as AstNullOrder, Query,
+    SortDirection as AstSortDirection, Span, SqlTypeName as AstSqlTypeName,
+    Statement as AstStatement, UnaryOp as AstUnaryOp,
 };
-use netbadb_schema::{Schema, TableDef};
+use netbadb_schema::{DropTableTarget, Schema, TableDef};
 use netbadb_types::{
     ColumnId, ExprType, IndexId, IndexName, ParameterId, PhysicalType, RelationBindingId,
     ScalarValue, SemanticType, TableId,
@@ -32,6 +33,49 @@ pub struct TypedCreateColumn {
     pub nullable: bool,
     pub span: Span,
     pub type_span: Span,
+}
+
+/// Exact table identity available in the current schema view at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableIdentityBinding {
+    pub target: DropTableTarget,
+}
+
+/// Prepared DROP TABLE payload. The source name is diagnostic-only; execution
+/// consumes `target` and never performs a second name lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedDropTable {
+    pub name: String,
+    pub target: DropTableTarget,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+pub fn lower_drop_table(
+    schema: &Schema,
+    statement: &AstDropTableStatement,
+    tables: &[TableIdentityBinding],
+) -> Result<TypedDropTable, HirError> {
+    let table = schema
+        .table(&statement.name.name)
+        .ok_or_else(|| HirError::UnknownTable {
+            name: statement.name.name.clone(),
+            span: statement.name.span,
+        })?;
+    let target = tables
+        .iter()
+        .find(|binding| binding.target.table_id == table.id)
+        .map(|binding| binding.target)
+        .ok_or_else(|| HirError::UnknownTable {
+            name: statement.name.name.clone(),
+            span: statement.name.span,
+        })?;
+    Ok(TypedDropTable {
+        name: statement.name.name.clone(),
+        target,
+        name_span: statement.name.span,
+        span: statement.span,
+    })
 }
 
 /// Resolve a declaration, without an existing-table lookup or nominal inference.
@@ -703,6 +747,12 @@ pub fn lower_statement_with_parameters(
             return Err(HirError::InvalidTableDefinition {
                 message: "CREATE TABLE requires the schema-mutation compiler boundary",
                 span: create.span,
+            });
+        }
+        AstStatement::DropTable(drop) => {
+            return Err(HirError::InvalidTableDefinition {
+                message: "DROP TABLE requires the schema-mutation compiler boundary",
+                span: drop.span,
             });
         }
         AstStatement::DropIndex(drop) => {
@@ -2386,3 +2436,5 @@ mod tests {
 
 #[cfg(test)]
 mod create_table_tests;
+#[cfg(test)]
+mod drop_table_tests;

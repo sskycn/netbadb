@@ -740,10 +740,20 @@ intent through retirement/publication, including zero-participant DROP and
 DML-before-DROP. LSM/range DROP and all physical deletion remain explicit deferred
 work.
 
-Next: a generic SQL `DROP TABLE name` vertical slice may resolve a prepared exact
-identity and invoke this Core lifecycle. Keep `IF EXISTS`, CASCADE/RESTRICT,
-multi-table/qualified variants and physical GC unsupported initially; an old
-prepared DROP must become stale rather than drop a same-name replacement.
+### Generic SQL DROP TABLE — Round 21
+
+[Round 21](sql-drop-table-round21.md) implements the bounded `DROP TABLE name`
+vertical slice. Parser AST keeps only name/spans; HIR and compiled DDL bind the exact
+TableId/version/fingerprint from the transaction SchemaView. Native Protocol v1 and
+PostgreSQL Simple/Extended execution invoke Round 20 Core, with schema-admin-only
+DDL authorization, exact `DROP TABLE` completion, rollback/commit, stale same-name
+protection, SQL-driven crash regression, and real psql/psycopg/SQLAlchemy probes.
+No persistent format changes. IF EXISTS, CASCADE/RESTRICT, multi-table/qualified
+forms, LSM/range DROP, physical deletion and Alembic table migration remain deferred.
+
+Next: design physical-resource garbage collection around an explicit safe-retention
+horizon for coordinator history, crash recovery, open handles, and retired Heap/WAL/
+index ownership. Do not unlink resources until those invariants are proved.
 
 ## Phase 6 — SDK and tooling
 

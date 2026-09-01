@@ -121,7 +121,7 @@ fn core_drop_exact_overlay_prepared_invalidation_retirement_and_reopen() {
         .prepare_statement_in(&txn, "SELECT id FROM users", &[])
         .unwrap();
     db.execute_in(&mut txn, "UPDATE users SET id = 9").unwrap();
-    db.drop_table_in(&mut txn, target.clone()).unwrap();
+    db.drop_table_in(&mut txn, target).unwrap();
     assert!(
         db.prepare_statement_in(&txn, "SELECT id FROM users", &[])
             .is_err()
@@ -203,7 +203,7 @@ fn core_drop_rollback_restores_exact_table_data_indexes_and_high_waters() {
         db.next_column_id(TableId(1)),
     );
     let mut txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut txn, target.clone()).unwrap();
+    db.drop_table_in(&mut txn, target).unwrap();
     txn.rollback().unwrap();
     assert_eq!(db.inspect_catalog().unwrap(), before);
     assert_eq!(db.schema_generation(), before_generation);
@@ -342,7 +342,7 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
     let retained = db.begin_transaction().unwrap();
     let mut blocked = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.drop_table_in(&mut blocked, exact.clone()),
+        db.drop_table_in(&mut blocked, exact),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::SchemaBusy
         ))
@@ -351,7 +351,7 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
     drop(blocked);
     drop(retained);
     let mut txn = db.begin_transaction().unwrap();
-    let mut missing = exact.clone();
+    let mut missing = exact;
     missing.table_id = TableId(999);
     assert!(matches!(
         db.drop_table_in(&mut txn, missing),
@@ -359,7 +359,7 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
             SchemaMutationError::TableNotFound(TableId(999))
         ))
     ));
-    let mut stale = exact.clone();
+    let mut stale = exact;
     stale.table_version = TableSchemaVersion(2);
     assert!(matches!(
         db.drop_table_in(&mut txn, stale),
@@ -1040,12 +1040,19 @@ fn drop_crash_child() {
         return;
     };
     let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
-    let target = db.resolve_drop_table("users").unwrap();
     let mut txn = db.begin_transaction().unwrap();
     if std::env::var_os("NETBADB_DROP_SKIP_DML").is_none() {
         db.execute_in(&mut txn, "UPDATE users SET id = 7").unwrap();
     }
-    db.drop_table_in(&mut txn, target).unwrap();
+    if std::env::var_os("NETBADB_DROP_SQL").is_some() {
+        assert_eq!(
+            db.execute_in(&mut txn, "DROP TABLE users;").unwrap(),
+            ExecutionResult::AffectedRows(0)
+        );
+    } else {
+        let target = db.resolve_drop_table("users").unwrap();
+        db.drop_table_in(&mut txn, target).unwrap();
+    }
     if std::env::var("NETBADB_DROP_CRASH_POINT")
         .unwrap_or_default()
         .starts_with("drop-rollback")
@@ -1068,6 +1075,26 @@ fn spawn_drop(root: &Path, point: &str) {
         .env("NETBADB_DROP_CHILD_ROOT", root)
         .env("NETBADB_DROP_CRASH_POINT", point);
     let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(90),
+        "{point}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn spawn_sql_drop(root: &Path, point: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::drop_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_DROP_CHILD_ROOT", root)
+        .env("NETBADB_DROP_CRASH_POINT", point)
+        .env("NETBADB_DROP_SQL", "1")
+        .output()
+        .unwrap();
     assert_eq!(
         output.status.code(),
         Some(90),
@@ -1129,6 +1156,20 @@ fn subprocess_drop_crash_matrix_reopens_three_times_with_exact_outcomes() {
         let root = root(&format!("drop-{point}"));
         seed(&root, true).close().unwrap();
         spawn_drop(&root, point);
+        drop_outcome(&root, winner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn sql_drop_crash_loser_and_winner_reopen_three_times() {
+    for (point, winner) in [
+        ("before-coordinator-decision", false),
+        ("coordinator-durable", true),
+    ] {
+        let root = root(&format!("sql-drop-{point}"));
+        seed(&root, true).close().unwrap();
+        spawn_sql_drop(&root, point);
         drop_outcome(&root, winner);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1530,7 +1571,7 @@ fn write_schema_mutation_fuzz_corpus() {
     drop(txn);
     let target = db.resolve_drop_table("users").unwrap();
     let mut drop_loser = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_loser, target.clone()).unwrap();
+    db.drop_table_in(&mut drop_loser, target).unwrap();
     let drop_intent = db
         .mutation_journal
         .as_ref()

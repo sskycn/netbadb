@@ -79,6 +79,36 @@ def psycopg_smoke(dsn: str) -> None:
             assert cursor.fetchone() == (8,)
         connection.rollback()
 
+        try:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute("DROP TABLE teams")
+                raise RuntimeError("rollback DROP probe")
+        except RuntimeError as error:
+            assert str(error) == "rollback DROP probe"
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM teams")
+            assert cursor.fetchall() == []
+            cursor.execute("CREATE TABLE psycopg_drop_probe (id BIGINT NOT NULL)")
+        connection.commit()
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE psycopg_drop_probe", prepare=True)
+        connection.commit()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("DROP TABLE psycopg_drop_probe")
+        except psycopg.errors.UndefinedTable:
+            connection.rollback()
+        else:
+            raise AssertionError("committed psycopg DROP remained active")
+
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE TABLE psycopg_extended_drop (id BIGINT)")
+        connection.commit()
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute("DROP TABLE psycopg_extended_drop", prepare=True)
+
 
 def cross_client_index_visibility(engine: sqlalchemy.Engine, users: Table, dsn: str) -> None:
     default = Path("/opt/local/lib/pgsql/bin/psql")
@@ -268,6 +298,34 @@ def sqlalchemy_smoke(dsn: str) -> None:
         }
         created_index.drop(engine)
     cross_client_index_visibility(engine, users, dsn)
+
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        teams.drop(connection, checkfirst=False)
+        transaction.rollback()
+        assert inspect(connection).has_table("teams")
+        connection.rollback()
+
+    drop_probe = Table(
+        "sqlalchemy_drop_probe",
+        MetaData(),
+        Column("id", BigInteger, nullable=False),
+    )
+    with engine.connect() as connection:
+        drop_probe.create(connection, checkfirst=False)
+        connection.commit()
+        transaction = connection.begin()
+        drop_probe.drop(connection, checkfirst=False)
+        transaction.commit()
+        assert not inspect(connection).has_table("sqlalchemy_drop_probe")
+        connection.rollback()
+        try:
+            drop_probe.drop(connection, checkfirst=False)
+        except sqlalchemy.exc.ProgrammingError as error:
+            assert error.orig.sqlstate == "42P01"
+            connection.rollback()
+        else:
+            raise AssertionError("committed SQLAlchemy DROP remained active")
     second_engine.dispose()
     engine.dispose()
 

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use netbadb_schema::{ColumnDef, Schema, SchemaFingerprint, TableDef, TypeSpec};
+use netbadb_schema::{ColumnDef, DropTableTarget, Schema, SchemaFingerprint, TableDef, TypeSpec};
 use netbadb_storage::TableStorage;
 use netbadb_types::{
     ColumnId, DatabaseTxnId, SemanticType, StorageId, TableId, TableSchemaVersion,
@@ -95,15 +95,6 @@ impl From<&netbadb_compiler::TypedCreateTable> for CreateTableSpec {
 /// schema meaning, not on the database-wide generation alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaDependency {
-    pub table_id: TableId,
-    pub table_version: TableSchemaVersion,
-    pub fingerprint: SchemaFingerprint,
-}
-
-/// Exact logical identity accepted by Core DROP. A name can be resolved to this
-/// value, but execution never resolves the name again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DropTableTarget {
     pub table_id: TableId,
     pub table_version: TableSchemaVersion,
     pub fingerprint: SchemaFingerprint,

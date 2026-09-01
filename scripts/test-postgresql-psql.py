@@ -82,22 +82,23 @@ def main() -> int:
             raise RuntimeError(f"fixture failed to start: {fixture.stderr.read()}")
         host, port = address.rsplit(":", 1)
 
+        arguments = [
+            psql,
+            "-X",
+            "-w",
+            "-h",
+            host,
+            "-p",
+            port,
+            "-U",
+            "netbadb",
+            "-d",
+            "test",
+        ]
+        if os.environ.get("NETBADB_PSQL_ECHO_HIDDEN"):
+            arguments.append("-E")
+
         def describe(command: str, expected_returncodes: tuple[int, ...] = (0,)) -> str:
-            arguments = [
-                psql,
-                "-X",
-                "-w",
-                "-h",
-                host,
-                "-p",
-                port,
-                "-U",
-                "netbadb",
-                "-d",
-                "test",
-            ]
-            if os.environ.get("NETBADB_PSQL_ECHO_HIDDEN"):
-                arguments.append("-E")
             completed = subprocess.run(
                 [*arguments, "-c", command],
                 check=False,
@@ -108,6 +109,21 @@ def main() -> int:
             if completed.returncode not in expected_returncodes:
                 raise RuntimeError(
                     f"psql {command!r} failed with {completed.returncode}:\n{completed.stdout}"
+            )
+            return completed.stdout
+
+        def session_script(script: str) -> str:
+            completed = subprocess.run(
+                arguments,
+                check=False,
+                text=True,
+                input=script,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if completed.returncode not in (0, 1):
+                raise RuntimeError(
+                    f"psql session failed with {completed.returncode}:\n{completed.stdout}"
                 )
             return completed.stdout
 
@@ -182,6 +198,45 @@ def main() -> int:
         require(describe("DROP INDEX users_id_round7_idx;"), "DROP INDEX")
         for command in [r"\di", r"\d users"]:
             assert "users_id_round7_idx" not in describe(command)
+
+        require(
+            describe("CREATE TABLE psql_drop_probe (id BIGINT NOT NULL);"),
+            "CREATE TABLE",
+        )
+        require(
+            describe("BEGIN; DROP TABLE psql_drop_probe; ROLLBACK;"),
+            "BEGIN",
+            "DROP TABLE",
+            "ROLLBACK",
+        )
+        require(describe(r"\dt psql_drop_probe"), "psql_drop_probe")
+        require(
+            describe("BEGIN; DROP TABLE psql_drop_probe; COMMIT;"),
+            "BEGIN",
+            "DROP TABLE",
+            "COMMIT",
+        )
+        require(
+            describe(r"\dt psql_drop_probe", expected_returncodes=(0, 1)),
+            "Did not find",
+        )
+        require(
+            describe("DROP TABLE missing_drop_probe;", expected_returncodes=(0, 1)),
+            "unknown table",
+        )
+        failed_transaction = session_script(
+            "\\set VERBOSITY verbose\n"
+            "BEGIN;\n"
+            "DROP TABLE missing_drop_probe;\n"
+            "SELECT 1;\n"
+            "ROLLBACK;\n"
+        )
+        require(failed_transaction, "42P01", "25P02", "ROLLBACK")
+        for command in [
+            "DROP TABLE IF EXISTS users;",
+            "DROP TABLE users CASCADE;",
+        ]:
+            require(describe(command, expected_returncodes=(0, 1)), "not supported")
 
     finally:
         if fixture.stdin is not None:

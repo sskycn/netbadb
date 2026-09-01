@@ -238,12 +238,32 @@ FOREIGN KEY, GENERATED, IDENTITY, COLLATE, CONSTRAINT, EXCLUDE; VARCHAR(n)/CHAR(
 SMALLINT/INTEGER/NUMERIC/DECIMAL/FLOAT/DOUBLE/DATE/TIME/TIMESTAMP/INTERVAL/JSON/UUID/
 BYTEA/ARRAY/SERIAL/BIGSERIAL and other non-native types; TEMP/TEMPORARY/UNLOGGED,
 IF NOT EXISTS, CTAS, LIKE, INHERITS, PARTITION BY, USING, WITH, TABLESPACE, ON COMMIT;
-qualified/quoted CREATE names; DROP/ALTER TABLE; runtime LSM/range placement;
+qualified/quoted CREATE names; ALTER TABLE; runtime LSM/range placement;
 multiple CREATE TABLEs per transaction and table/index DDL mixing. Unsupported
 clauses are rejected, never silently discarded or stored as unenforced metadata.
 
 See [Round 19](sql-create-table-round19.md) for native/PG, real-client, recovery and
 no-side-effect evidence. This is not full PostgreSQL DDL or ORM migrations.
+
+## Basic transactional DROP TABLE (Round 21)
+
+The supported form is one unquoted, unqualified `DROP TABLE name` with an optional
+semicolon. Simple Query emits exactly `DROP TABLE`. Extended Parse/Bind/Describe/
+Execute/Sync uses zero parameters and `NoData`; only Execute mutates state. HIR binds
+the exact TableId, schema version, and fingerprint from the transaction view, so a
+prepared statement never resolves a same-name replacement at Execute.
+
+Autocommit and explicit transaction commit use the Round 20 logical-retirement
+lifecycle. Rollback preserves the active table, rows, indexes, generations, and
+allocator floors. Physical resources remain retained. A missing or stale target is
+`42P01`; permission denial is `42501`; an explicit transaction error leads to
+`25P02` until rollback. `schema_admin` is required, but a table DML grant is not.
+
+Unsupported with `0A000` or the generic identifier syntax policy: IF EXISTS,
+CASCADE/RESTRICT, multiple names, qualified/quoted names, ONLY, other DROP object
+types, LSM/range tables, multiple schema mutations, and table/index DDL mixing.
+SQLAlchemy `Table.drop(checkfirst=False)` is covered; checkfirst/drop_all and Alembic
+table migration remain outside acceptance. See [Round 21](sql-drop-table-round21.md).
 
 ## Compatibility tracing
 
