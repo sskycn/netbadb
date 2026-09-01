@@ -781,8 +781,12 @@ for one runtime-created Single Heap: exact typed transforms, durable StorageId a
 ADD ColumnId reservations, same-TableId staged replacement, current-visible-row
 streaming, stable IndexId/high-water rebuild, statistics reset, private target DML,
 CORD v2 winner publication and distinct replacement-retirement evidence. NBSJ v1
-adds bounded tags 11–15; recovery converges without recopying. The old Heap remains
-physically retained and its exact replacement GC API is explicitly unsupported.
+adds bounded tags 11–15; prepared WAL/status provides no-force S2 recovery and
+recovery converges without recopying. The acceptance matrix proves byte-stable S1
+rollback/maintenance isolation, recovery-only old-schema reopen, target
+ANALYZE/VACUUM, point/range/join planner paths, stale schema expectations and 34
+real subprocess windows. The old Heap remains physically retained and its exact
+replacement GC API is explicitly unsupported without filesystem mutation.
 
 Next: integrate the Round 22 retention-horizon proof with replacement-retired Heap
 history without treating the still-active TableId as dropped. SQL syntax remains a

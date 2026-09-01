@@ -70,6 +70,13 @@ new target-local RowIds. Only rows visible in the stable committed read view are
 copied: dead update/delete history, old version-chain pointers and obsolete BTree
 entries remain entirely in S1.
 
+The implementation does not force target data/index pages after the copy. S2's
+physical prepare synchronizes its WAL and transaction status before the CORD
+decision. A winner that crashes immediately after that decision is therefore
+recovered from the already-prepared S2 participant; it never rescans S1. Tests
+also compare every storage-owned S1 bundle member byte-for-byte across failed
+rewrite rollback and across active S2 `VACUUM`/`ANALYZE` maintenance.
+
 ## Indexes and statistics
 
 Before row copy, storage snapshots every active logical index as
@@ -115,7 +122,7 @@ reference binds the prepared NBSC digest/target epoch. Live winner order is:
 4. prepare S2 and synchronize the prepared NBSC;
 5. synchronize the CORD schema commit decision;
 6. commit S2, close its live handle and promote every exact staged component;
-7. reopen/recover S2 from the decision and validate S1;
+7. reopen/recover S2 from the decision, synchronize the final Heap and validate S1;
 8. synchronize replacement-retirement evidence;
 9. publish NBSC then NBSM;
 10. synchronize Coordinator `Complete`, resolve the rewrite winner and remove
@@ -159,7 +166,17 @@ fingerprint/prepared invalidation behavior applies after an embedded Core rewrit
 The existing bounded `schema_mutation_decode` target covers reviewed reservation,
 intent, loser, winner and truncated rewrite histories. Subprocess tests cover
 reservation, staging, copy, index, prepare, decision, promotion, retirement,
-NBSC and in-memory publication windows, with three catalog-only reopens per outcome.
+NBSC, Coordinator Complete, journal winner resolution and in-memory publication
+windows, with three catalog-only reopens per outcome. The immediate post-decision
+case additionally proves that S2 still contains a prepared physical transaction
+which startup must recover.
+
+Acceptance regressions reopen S1 independently using its retained base `TableDef`
+and verify its current rows and logical indexes, while active catalog inspection
+contains only S2. They also exercise point/range index scans, index nested-loop and
+hash joins after rewrite, reset then repopulate target statistics, reject stale
+manifest/SDK schema expectations, and prove unsupported replacement GC performs
+zero filesystem mutation.
 
 ## Deferred work
 

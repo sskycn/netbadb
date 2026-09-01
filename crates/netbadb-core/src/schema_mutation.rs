@@ -1120,7 +1120,10 @@ impl Database {
                 .into());
             }
             crash("rewrite-copy-complete");
-            transaction.with_staged_write(|storage, _| storage.flush())?;
+            // Deliberately do not force target data/index pages here. Physical
+            // participant prepare synchronizes WAL/status before the schema
+            // decision; winner recovery must be able to replay those durable
+            // records into S2 without rescanning S1.
             crash("rewrite-indexes-complete");
             Ok(())
         })();
@@ -2023,6 +2026,7 @@ impl Database {
         )?;
         storage.flush()?;
         validate_rewrite_source(&catalog, &rewrite)?;
+        crash("rewrite-final-heap-synced");
         if self.registry.get(reservation.storage).is_some()
             || self.registry.get(rewrite.old_storage()).is_none()
         {
@@ -2040,10 +2044,14 @@ impl Database {
         crash("before-nbsc-publication");
         let published = file::publish_runtime(&catalog, &target)?;
         crash("rewrite-nbsc-durable");
+        crash("rewrite-before-coordinator-complete");
         transaction.finish_schema_decision()?;
+        crash("rewrite-coordinator-complete");
+        crash("rewrite-before-winner-resolution");
         journal
             .borrow_mut()
             .resolve_rewrite(rewrite.reservation.transaction, true)?;
+        crash("rewrite-winner-resolved");
         cleanup_prepared(&catalog, &reservation, target.incarnation)?;
         crash("before-memory-publish");
         let old = self
