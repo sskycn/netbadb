@@ -763,10 +763,23 @@ then the parent directory is synchronized. Same-name recreation, indexed Heaps,
 LSM/partition/imported-orphan GC, automatic GC and journal/coordinator compaction
 remain deferred.
 
-Next: perform an ALTER TABLE/schema-evolution architecture audit before any ALTER
-implementation. The audit must cover ColumnId non-reuse, TableSchemaVersion,
-row-format compatibility, existing MVCC/index dependencies, prepared invalidation,
-catalog migration and online/offline rewrite recovery.
+### ALTER TABLE / schema-evolution architecture audit — Round 23
+
+[Round 23](schema-evolution-round23.md) freezes the current row, MVCC, Heap/LSM,
+partition, RowId, index, identity, prepared, SDK and PostgreSQL-reflection facts
+without implementing ALTER. Rows have neither arity nor schema identity, and Heap
+open requires an exact fingerprint, so the chosen first-version architecture uses
+an offline staged copy-on-write replacement for every supported operation. TableId
+and surviving ColumnIds remain stable; the table version/fingerprint advance; a new
+StorageId is reserved; rows are streamed by ColumnId; all active indexes are rebuilt;
+and exact old-schema/resource evidence is retained for later recovery-safe GC.
+
+Next: implement exactly the Core Heap Schema Rewrite Foundation for one
+runtime-created Single Heap, including typed transforms, reservations, staged
+binding, index rebuild, generic replacement retirement and coordinator crash
+recovery. Do not add SQL syntax in that phase. LSM/partition/imported ALTER, online
+mixed schemas, physical conversions, defaults, column reorder and journal/log
+compaction remain deferred.
 
 ## Phase 6 — SDK and tooling
 

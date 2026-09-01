@@ -5615,6 +5615,47 @@ mod tests {
     }
 
     #[test]
+    fn schema_evolution_audit_reads_exact_row_bytes_from_a_heap_slot() {
+        let path = test_path("schema-evolution-row-bytes");
+        cleanup(&path);
+        let table = TableDef::new(
+            TableId(10),
+            "records",
+            vec![
+                ColumnDef::new(ColumnId(1), "a", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "b", TypeSpec::Physical(PhysicalType::Text))
+                    .nullable(true),
+                ColumnDef::new(ColumnId(3), "c", TypeSpec::Physical(PhysicalType::Bool)),
+            ],
+        );
+        let mut storage = HeapStorage::create(&path, table).expect("create audit heap");
+        let row_id = storage
+            .insert(&[
+                ScalarValue::Int64(7),
+                ScalarValue::Text("hi".into()),
+                ScalarValue::Bool(true),
+            ])
+            .expect("insert audit row");
+        storage.close().expect("close audit heap");
+
+        {
+            let mut pages = PageManager::open(&path).expect("open audit heap pages");
+            let page = pages.read_page(row_id.page).expect("read audit row page");
+            let tuple = page
+                .read_record(SlotId(row_id.slot))
+                .expect("read audit tuple");
+            assert_eq!(&tuple[..4], b"NBMV");
+            assert_eq!(&tuple[4..6], &1_u16.to_le_bytes());
+            assert_eq!(
+                &tuple[crate::mvcc::TUPLE_HEADER_SIZE..],
+                &[1, 7, 0, 0, 0, 0, 0, 0, 0, 3, 2, 0, 0, 0, b'h', b'i', 0, 1]
+            );
+            assert_eq!(tuple.len(), crate::mvcc::TUPLE_HEADER_SIZE + 18);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn invalid_schema_is_rejected_before_heap_or_wal_creation() {
         let path = test_path("heap-invalid-schema");
         cleanup(&path);

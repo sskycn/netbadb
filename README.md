@@ -107,7 +107,8 @@ adds exact-identity transactional Core Heap retirement, prepared-dependency
 invalidation, durable retained-resource inventory and deferred physical deletion.
 [Round 21](docs/sql-drop-table-round21.md) adds generic exact-prepared SQL
 `DROP TABLE name` over native and PostgreSQL frontends. `ALTER TABLE` remains
-unsupported.
+unsupported; [Round 23](docs/schema-evolution-round23.md) documents the row-format
+audit and selected future staged Heap rewrite architecture.
 
 ## Repository layout
 

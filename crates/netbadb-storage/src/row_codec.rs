@@ -195,6 +195,7 @@ mod tests {
     use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
     use super::{decode_row, decode_row_columns, encode_row};
+    use crate::{CodecError, StorageError};
 
     fn table() -> TableDef {
         TableDef::new(
@@ -226,5 +227,94 @@ mod tests {
         let mut corrupt = bytes;
         corrupt[0] = 99;
         assert!(decode_row_columns(&corrupt, &table(), &[ColumnId(2)]).is_err());
+    }
+
+    #[test]
+    fn schema_evolution_audit_pins_the_positional_unversioned_row_contract() {
+        let baseline = TableDef::new(
+            TableId(10),
+            "records",
+            vec![
+                ColumnDef::new(ColumnId(1), "a", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "b", TypeSpec::Physical(PhysicalType::Text))
+                    .nullable(true),
+                ColumnDef::new(ColumnId(3), "c", TypeSpec::Physical(PhysicalType::Bool)),
+            ],
+        );
+        let row = vec![
+            ScalarValue::Int64(7),
+            ScalarValue::Text("hi".into()),
+            ScalarValue::Bool(true),
+        ];
+        let bytes = encode_row(&row).expect("encode baseline row");
+
+        // This is the entire engine-neutral row payload used by Heap and LSM:
+        // one tag per positional scalar, with no envelope, arity, schema
+        // version, TableId or ColumnId. Null is the single tag 4.
+        assert_eq!(
+            bytes,
+            vec![1, 7, 0, 0, 0, 0, 0, 0, 0, 3, 2, 0, 0, 0, b'h', b'i', 0, 1]
+        );
+        assert_eq!(encode_row(&[ScalarValue::Null]).unwrap(), vec![4]);
+        assert_eq!(decode_row(&bytes, &baseline).unwrap(), row);
+
+        let mut renamed = baseline.clone();
+        renamed.name = "renamed_records".into();
+        renamed.columns[1].name = "renamed_b".into();
+        assert_eq!(decode_row(&bytes, &renamed).unwrap(), row);
+
+        let sparse_ids = TableDef::new(
+            TableId(999),
+            "other_identity",
+            vec![
+                ColumnDef::new(ColumnId(40), "x", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "y", TypeSpec::Physical(PhysicalType::Text))
+                    .nullable(true),
+                ColumnDef::new(ColumnId(900), "z", TypeSpec::Physical(PhysicalType::Bool)),
+            ],
+        );
+        assert_eq!(decode_row(&bytes, &sparse_ids).unwrap(), row);
+        assert_eq!(
+            decode_row_columns(&bytes, &sparse_ids, &[ColumnId(900), ColumnId(40)]).unwrap(),
+            vec![ScalarValue::Bool(true), ScalarValue::Int64(7)]
+        );
+
+        let mut appended_nullable = baseline.clone();
+        appended_nullable.columns.push(
+            ColumnDef::new(ColumnId(4), "d", TypeSpec::Physical(PhysicalType::Bool)).nullable(true),
+        );
+        assert!(matches!(
+            decode_row(&bytes, &appended_nullable),
+            Err(StorageError::Codec(CodecError::MissingScalarTag))
+        ));
+
+        let mut dropped_middle = baseline.clone();
+        dropped_middle.columns.remove(1);
+        assert!(matches!(
+            decode_row(&bytes, &dropped_middle),
+            Err(StorageError::TypeMismatch {
+                expected: PhysicalType::Bool,
+                actual: Some(PhysicalType::Text),
+                ..
+            })
+        ));
+
+        let mut changed_physical = baseline.clone();
+        changed_physical.columns[0].type_spec = TypeSpec::Physical(PhysicalType::UInt64);
+        assert!(matches!(
+            decode_row(&bytes, &changed_physical),
+            Err(StorageError::TypeMismatch {
+                expected: PhysicalType::UInt64,
+                actual: Some(PhysicalType::Int64),
+                ..
+            })
+        ));
+
+        let mut dropped_trailing = baseline;
+        dropped_trailing.columns.pop();
+        assert!(matches!(
+            decode_row(&bytes, &dropped_trailing),
+            Err(StorageError::Codec(CodecError::ExtraValues))
+        ));
     }
 }

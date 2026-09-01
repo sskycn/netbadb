@@ -248,6 +248,19 @@ never selects candidates. Deleted history remains authoritative for non-reuse an
 completed coordinator replay. LSM, partitions, imported locators, background GC and
 metadata compaction remain deferred.
 
+[Round 23](schema-evolution-round23.md) audits schema evolution without exposing an
+ALTER production path. Heap and LSM row payloads are positional tagged scalars with
+no arity, ColumnId or schema version; Heap metadata separately requires the complete
+canonical fingerprint. The selected first-version architecture is therefore an
+offline staged copy-on-write replacement for every supported ALTER on one
+runtime-created Single Heap: preserve TableId and surviving ColumnIds, advance the
+table version and fingerprint, allocate a new StorageId, stream current logical
+rows through a typed ColumnId transform, rebuild every active index, and retain the
+old Heap under its old schema until a generalized Round 22 recovery horizon permits
+GC. LSM, partitioned/imported storage, online mixed schemas, SQL syntax and physical
+type conversion remain deferred. Round 24 is the Core Heap rewrite foundation, not
+a frontend ALTER slice.
+
 `compile_sql_statement` parses once and selects relational or DDL lowering from the
 AST. Core's `prepare_sql_statement_in` shares the transaction SchemaView and
 identity/version/fingerprint dependency rules of `prepare_statement_in`; sessions

@@ -183,6 +183,59 @@ fn core_drop_exact_overlay_prepared_invalidation_retirement_and_reopen() {
 }
 
 #[test]
+fn prepared_dependencies_pin_table_version_and_fingerprint_independently() {
+    let root = root("prepared-dependency-audit");
+    let mut db = seed(&root, true);
+    let users = db.prepare_statement("SELECT id FROM users", &[]).unwrap();
+    let teams = db.prepare_statement("SELECT id FROM teams", &[]).unwrap();
+    assert_eq!(users.schema_dependencies().len(), 1);
+    assert_eq!(users.schema_dependencies()[0].table_id, TableId(1));
+    assert_eq!(
+        users.schema_dependencies()[0].table_version,
+        TableSchemaVersion(1)
+    );
+    assert_eq!(
+        users.schema_dependencies()[0].fingerprint,
+        db.schema().table("users").unwrap().fingerprint().unwrap()
+    );
+
+    db.committed
+        .tables
+        .iter_mut()
+        .find(|lineage| lineage.table_id == TableId(1))
+        .unwrap()
+        .version = TableSchemaVersion(2);
+    assert!(matches!(
+        db.validate_prepared_dependencies(&users, None),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+    db.validate_prepared_dependencies(&teams, None)
+        .expect("an unrelated table dependency remains valid");
+
+    db.committed
+        .tables
+        .iter_mut()
+        .find(|lineage| lineage.table_id == TableId(1))
+        .unwrap()
+        .version = TableSchemaVersion(1);
+    let mut renamed_users = db.schema().table("users").unwrap().clone();
+    renamed_users.columns[0].name = "user_id".into();
+    db.committed.schema = Schema::new(vec![renamed_users, old_table(2, "teams")]).unwrap();
+    assert!(matches!(
+        db.validate_prepared_dependencies(&users, None),
+        Err(crate::DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+    db.validate_prepared_dependencies(&teams, None)
+        .expect("an unrelated table fingerprint remains valid");
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn core_drop_rollback_restores_exact_table_data_indexes_and_high_waters() {
     let root = root("drop-rollback");
     let mut db = seed(&root, true);
