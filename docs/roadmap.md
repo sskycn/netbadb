@@ -726,11 +726,24 @@ Constraints, DROP/ALTER, runtime LSM/range placement and ORM table migrations re
 unsupported. SQL parser bounds/property tests and existing storage crash/fuzz
 regressions protect the new frontend boundary.
 
-Next: Core transactional DROP TABLE foundation, before SQL DROP. Resolve exact
-TableId retirement, private overlay removal, dependency invalidation, rollback,
-coordinator decisions, deferred physical deletion/old handles and catalog-only
-reopen. DROP/recreate must use a new TableId and must not inherit identity grants.
-Logical retirement correctness takes priority over eager unlink.
+### Core Transactional DROP TABLE Foundation — Round 20
+
+[Round 20](core-drop-table-round20.md) implements Core-only exact
+TableId/version/fingerprint retirement for one active non-partitioned Heap. The
+transaction overlay removes the table before commit and invalidates old prepared
+dependencies without name rebinding. Coordinator winner recovery publishes NBSC
+G+1, while retained NBSJ history durably accounts for the old StorageId/locator and
+the complete Heap/index resource remains on disk. Rollback preserves exact identity,
+data, indexes, generations and allocator floors. Same-name recreation receives new
+TableId/StorageId and no old data/index/grant identity. Real subprocess crashes cover
+intent through retirement/publication, including zero-participant DROP and
+DML-before-DROP. LSM/range DROP and all physical deletion remain explicit deferred
+work.
+
+Next: a generic SQL `DROP TABLE name` vertical slice may resolve a prepared exact
+identity and invoke this Core lifecycle. Keep `IF EXISTS`, CASCADE/RESTRICT,
+multi-table/qualified variants and physical GC unsupported initially; an old
+prepared DROP must become stale rather than drop a same-name replacement.
 
 ## Phase 6 — SDK and tooling
 

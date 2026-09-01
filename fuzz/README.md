@@ -194,3 +194,13 @@ mutations plus byte/token/identifier/column, deep-parenthesis/NOT and long-cast
 bounds. No new fuzz infrastructure or persistent format is introduced. Continue
 all seven Round 18 decoder targets at 1,000 runs each using temporary corpus and
 artifact directories; tracked storage seeds remain unchanged.
+
+## Round 20 DROP retirement records
+
+`schema_mutation_decode` retains the Round 18 seeds and adds deterministic valid
+DROP intent, loser, retained-terminal and winner histories plus a truncated DROP
+record. Replay validates exact retired TableId/version/fingerprint/StorageId/Heap
+placement, checked generation/epoch, ordering, duplicate retirement and winner/
+loser state constraints. `coordinator_log_decode` adds a CORD v2 schema DROP
+decision with zero physical participants. The same 1,000-run command applies; no
+new standalone persistent format or fuzz target is introduced.

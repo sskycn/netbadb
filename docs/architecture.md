@@ -216,8 +216,19 @@ SchemaGeneration advances once per creation commit; table versions stay 1 and th
 runtime revision increments with checked arithmetic. [Round 19](sql-create-table-round19.md)
 adds generic SQL CREATE TABLE through parser declarations, typed HIR,
 CompiledDdlStatement and PreparedDdlStatement. Core alone maps it to CreateTableSpec
-and invokes the existing transactional lifecycle. DROP/ALTER, constraint enforcement
-and non-Heap runtime creation remain future work.
+and invokes the existing transactional lifecycle. SQL DROP/ALTER, constraint
+enforcement and non-Heap runtime creation remain future work.
+
+[Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
+exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
+the transaction materializes NBSC G+1 with that identity removed, invalidating old
+prepared dependencies before storage access. Coordinator remains the winner
+authority. NBSJ retains exact terminal physical-retirement evidence while the Heap,
+WAL/status and contained BTree pages remain on disk. Commit removes schema,
+placement and registry entry at one synchronous publication boundary; rollback
+leaves the exact old identity/data/indexes active and does not advance generation or
+allocator floors. Reopen resolves DROP before opening only active NBSC storages.
+SQL/PG DROP, physical unlink/GC, LSM and partition DROP remain future work.
 
 `compile_sql_statement` parses once and selects relational or DDL lowering from the
 AST. Core's `prepare_sql_statement_in` shares the transaction SchemaView and

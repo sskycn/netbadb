@@ -583,7 +583,6 @@ impl DatabaseTransaction {
     ) -> &'a netbadb_schema::Schema {
         self.schema_mutation
             .as_ref()
-            .filter(|m| m.staged.is_some())
             .map_or(committed, |m| &m.target.committed.schema)
     }
     pub(crate) fn release_staged_context(&mut self, id: StorageId) {

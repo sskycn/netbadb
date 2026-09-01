@@ -51,6 +51,10 @@ Every NBSR payload starts with tag u8 and nonzero DatabaseTxnId u64.
 | 2 | CreateTableIntent | prepared NBSC SHA-256 `[u8;32]`, single-new-table NBSC v1 fragment |
 | 3 | Resolved loser | None |
 | 4 | Resolved winner | None |
+| 5 | DropTableIntent | target SchemaGeneration u64, target snapshot epoch u64, prepared NBSC SHA-256 `[u8;32]`, exact retired-table NBSC v1 fragment |
+| 6 | Retained physical resource | None |
+| 7 | Resolved DROP loser | None |
+| 8 | Resolved DROP winner | None |
 
 A reservation consumes both IDs together; it is synchronized before intent or
 staged files. ColumnIds are deterministic 1..N; the intent persists these exact
@@ -69,6 +73,19 @@ columns must be consecutive/nonzero and have no primary-key metadata. New table
 version must be 1. Heap placement and reserved IDs/floors must agree. All count,
 length, tag, version, fingerprint and arithmetic checks precede indexing/allocation.
 An identical in-process resolution retry does not add another durable record.
+
+DROP consumes no reservation and changes no allocator floor. Its fragment contains
+exactly the final TableDef/lineage/version/fingerprint, Single Heap placement,
+StorageId/kind/relative locator, database incarnation, base generation/epoch,
+unchanged allocator floors and coordinator locator. The separately named target
+generation/epoch are each the checked successor of the base. `Retained` is durable
+terminal physical-lifecycle evidence, not logical schema: tag 8 is invalid before
+tag 6, and tag 7 is invalid after it. Replay also rejects duplicate retirement,
+one StorageId retired more than once, identity/placement/fingerprint disagreement,
+unsupported engine, overlap with another unresolved schema mutation, a later CREATE
+reservation below the retained allocator floors, and invalid ordering. Current
+readers accept every Round 18 journal; older readers reject the new tags, so
+downgrade after Core DROP is unsupported.
 
 ## Locators and ownership
 
@@ -110,7 +127,8 @@ Reserve does not consume SchemaGeneration. Effective next ID is the maximum of
 NBSC's floor and checked successor of every retained reservation. Exhausted None
 is absorbing. A committed snapshot checkpoints those effective floors; retained
 history still reconciles by maximum. Rollback and crash losers never rewind IDs.
-DatabaseTxnId allocation also advances beyond retained reservations after reopen.
+DatabaseTxnId allocation also advances beyond retained reservations and DROP
+intents after reopen.
 
 Recovery loads NBSM incarnation, journal and coordinator before requiring an exact
 active NBSC/NBSM pair. An unresolved schema decision must name a known intent and
@@ -125,18 +143,29 @@ need not be opened. Old physical participants undergo ordinary presumed-abort
 recovery. Runtime rollback first durably undoes enlisted participants, then cleans
 private components and resolves the journal. Cleanup failure retains RollbackPending
 and the intent for retry/reopen, never publishes a table, and never deletes a winner.
+For DROP winners, recovery validates the retained Heap/WAL/status identity, recovers
+any ordinary physical participants through a recovery-only snapshot, persists tag 6,
+publishes the prepared NBSC excluding the table, completes Coordinator and only then
+persists tag 8. DROP losers retain the original active resource and schema. Active
+NBSC StorageIds must be disjoint from committed retained StorageIds; missing retained
+resources are hard errors. Retired fragments never participate in active lookup or
+ordinary inspection.
+
 Dropping an unresolved schema handle requires reopen. Unknown/unlisted files are
 not garbage-collected. Journal compaction and general aborted-resource GC are deferred.
 
 Deterministic seeds are produced by the ignored Core test
 `write_schema_mutation_fuzz_corpus` with an explicit `NETBADB_ROUND18_CORPUS`
 output directory. `schema_mutation_decode` fuzzes nested framing and replay;
-`coordinator_log_decode` includes schema decision, Complete and truncated v2 seeds.
+`coordinator_log_decode` includes schema decision, zero-participant DROP decision,
+Complete and truncated v2 seeds. DROP seeds include intent, loser, retained, winner
+and truncated records.
 
 An empty journal without its activation witness is an interrupted initialization,
 not reservation history. Read-only reopen preserves it; the next mutation completes
 and syncs activation before reserving. Admission validates capacity for the complete
-reserve + intent + resolution history, so reaching the byte/record bound cannot
-strand an already admitted winner or loser. Both transitions have deterministic
+CREATE reserve + intent + resolution or DROP intent + retained + resolution
+history, so reaching the byte/record bound cannot strand an already admitted winner
+or loser. Both transitions have deterministic
 regression tests, including a valid 65,534-record history with insufficient room
 for another complete obligation.

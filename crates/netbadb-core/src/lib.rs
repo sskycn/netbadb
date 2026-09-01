@@ -73,7 +73,8 @@ pub use registry::StorageRegistryError;
 pub use schema_catalog::SchemaCatalogError;
 pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
 pub use schema_mutation::{
-    CreateColumnSpec, CreateTableSpec, SchemaDependency, SchemaMutationError,
+    CreateColumnSpec, CreateTableSpec, DropTableTarget, RetiredTableResource, SchemaDependency,
+    SchemaMutationError,
 };
 
 impl From<SchemaCatalogError> for DatabaseError {
@@ -125,6 +126,7 @@ pub fn fuzz_partition_catalog_bytes(bytes: &[u8]) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseCoordinatorConfig {
     log_path: PathBuf,
+    retired_storage_ids: Vec<StorageId>,
 }
 
 impl DatabaseCoordinatorConfig {
@@ -132,12 +134,22 @@ impl DatabaseCoordinatorConfig {
     pub fn new(log_path: impl Into<PathBuf>) -> Self {
         Self {
             log_path: log_path.into(),
+            retired_storage_ids: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    pub(crate) fn with_retired_storage_ids(mut self, ids: Vec<StorageId>) -> Self {
+        self.retired_storage_ids = ids;
+        self
+    }
+
+    pub(crate) fn retired_storage_ids(&self) -> &[StorageId] {
+        &self.retired_storage_ids
     }
 }
 
@@ -522,6 +534,9 @@ impl DatabaseError {
                 | SchemaMutationError::UnsupportedPlacement
                 | SchemaMutationError::MultipleCreatesUnsupported,
             ) => DatabaseErrorKind::FeatureNotSupported,
+            Self::SchemaMutation(
+                SchemaMutationError::TableNotFound(_) | SchemaMutationError::UndefinedTable(_),
+            ) => DatabaseErrorKind::UndefinedTable,
             Self::Schema(SchemaError::DuplicateTableName { .. }) => {
                 DatabaseErrorKind::DuplicateObject
             }
@@ -530,7 +545,9 @@ impl DatabaseError {
             }
             Self::SchemaMutation(SchemaMutationError::SchemaBusy) => DatabaseErrorKind::SchemaBusy,
             Self::SchemaMutation(
-                SchemaMutationError::StalePreparedStatement | SchemaMutationError::RecoveryRequired,
+                SchemaMutationError::StalePreparedStatement
+                | SchemaMutationError::StaleSchemaDependency
+                | SchemaMutationError::RecoveryRequired,
             ) => DatabaseErrorKind::TransactionState,
             Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
@@ -849,7 +866,7 @@ impl Database {
             };
             inspected.push(GenericInspectedStorage { recovery });
         }
-        validate_generic_coordinator_recovery(&decisions, &inspected)?;
+        validate_generic_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
 
         let mut maximum_database_txn_id = decisions
             .iter()
@@ -1009,7 +1026,7 @@ impl Database {
                 recovery: TableStorage::inspect_heap_recovery(path, table)?,
             });
         }
-        validate_coordinator_recovery(&decisions, &inspected)?;
+        validate_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
 
         let mut maximum_database_txn_id = decisions
             .iter()
@@ -1237,7 +1254,7 @@ impl Database {
             });
         }
         validate_catalog_storage_set(&catalog, &inspected)?;
-        validate_coordinator_recovery(&decisions, &inspected)?;
+        validate_coordinator_recovery(&decisions, &inspected, &[])?;
 
         let mut maximum_database_txn_id = decisions
             .iter()
@@ -3272,6 +3289,7 @@ fn resolution_for_prepared(
 fn validate_generic_coordinator_recovery(
     decisions: &[CoordinatorDecision],
     storages: &[GenericInspectedStorage],
+    retired_storage_ids: &[StorageId],
 ) -> Result<(), DatabaseError> {
     for (position, storage) in storages.iter().enumerate() {
         if storages[..position]
@@ -3286,14 +3304,19 @@ fn validate_generic_coordinator_recovery(
     }
     for decision in decisions {
         for participant in &decision.participants {
-            let storage = storages
+            let Some(storage) = storages
                 .iter()
                 .find(|storage| storage.recovery.storage_id == participant.storage_id)
-                .ok_or(DatabaseError::MissingCommitParticipant {
+            else {
+                if decision.complete && retired_storage_ids.contains(&participant.storage_id) {
+                    continue;
+                }
+                return Err(DatabaseError::MissingCommitParticipant {
                     database_txn_id: decision.database_txn_id,
                     storage_id: participant.storage_id,
                     physical_txn_id: participant.physical_txn_id,
-                })?;
+                });
+            };
             if !decision.complete
                 && !storage
                     .recovery
@@ -3331,6 +3354,7 @@ fn validate_coordinator_path(
 fn validate_coordinator_recovery(
     decisions: &[CoordinatorDecision],
     storages: &[InspectedStorage],
+    retired_storage_ids: &[StorageId],
 ) -> Result<(), DatabaseError> {
     for (position, storage) in storages.iter().enumerate() {
         if storages[..position]
@@ -3345,14 +3369,19 @@ fn validate_coordinator_recovery(
     }
     for decision in decisions {
         for participant in &decision.participants {
-            let storage = storages
+            let Some(storage) = storages
                 .iter()
                 .find(|storage| storage.recovery.storage_id == participant.storage_id)
-                .ok_or(DatabaseError::MissingCommitParticipant {
+            else {
+                if decision.complete && retired_storage_ids.contains(&participant.storage_id) {
+                    continue;
+                }
+                return Err(DatabaseError::MissingCommitParticipant {
                     database_txn_id: decision.database_txn_id,
                     storage_id: participant.storage_id,
                     physical_txn_id: participant.physical_txn_id,
-                })?;
+                });
+            };
             if !decision.complete
                 && !storage
                     .recovery

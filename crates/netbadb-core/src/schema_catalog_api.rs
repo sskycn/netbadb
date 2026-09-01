@@ -683,7 +683,12 @@ fn open_authority(
     database.committed = snapshot.committed;
     database.catalog_path = Some(path);
     if let Some(journal) = journal {
-        if let Some(id) = journal.reservations.keys().next_back() {
+        if let Some(id) = journal
+            .reservations
+            .keys()
+            .chain(journal.drops.keys())
+            .max()
+        {
             let next =
                 id.0.checked_add(1)
                     .ok_or(crate::CoordinatorError::TransactionIdExhausted)?;
@@ -713,23 +718,32 @@ fn validate_partition_evidence(
             path,
             snapshot.incarnation,
         )?;
-        let created = snapshot
+        let explained_retirement = |placement: &CatalogTable| {
+            journal.as_ref().is_some_and(|journal| {
+                journal.drops.values().any(|drop| {
+                    drop.retired
+                        && drop.resolved == Some(true)
+                        && drop.fragment.placements.tables[0] == *placement
+                })
+            })
+        };
+        let explained_create = |placement: &CatalogTable| {
+            journal.as_ref().is_some_and(|journal| {
+                journal.reservations.values().any(|reservation| {
+                    reservation.resolved == Some(true)
+                        && reservation.intent.as_ref().is_some_and(|intent| {
+                            intent.fragment.placements.tables[0] == *placement
+                        })
+                })
+            })
+        };
+        if evidence.tables.iter().any(|placement| {
+            !snapshot.placements.tables.contains(placement) && !explained_retirement(placement)
+        }) || snapshot
             .placements
             .tables
             .iter()
-            .filter(|table| {
-                journal.as_ref().is_some_and(|j| {
-                    j.reservations
-                        .values()
-                        .any(|r| r.table == table.table_id && r.intent.is_some())
-                })
-            })
-            .count();
-        if evidence.tables.len() + created != snapshot.placements.tables.len()
-            || evidence
-                .tables
-                .iter()
-                .any(|p| !snapshot.placements.tables.contains(p))
+            .any(|placement| !evidence.tables.contains(placement) && !explained_create(placement))
         {
             return Err(SchemaCatalogError::InventoryMismatch(
                 "legacy partition catalog differs from committed placement",
@@ -888,11 +902,24 @@ pub(crate) fn recover_physical(
     let coordinator_locator = snapshot.coordinator.as_ref().or_else(|| {
         journal
             .as_ref()
-            .filter(|j| !j.reservations.is_empty())
+            .filter(|j| !j.reservations.is_empty() || !j.drops.is_empty())
             .map(|j| &j.coordinator)
     });
-    let coordinator =
-        coordinator_locator.map(|p| DatabaseCoordinatorConfig::new(file::resolve(path, p)));
+    let retired_storage_ids = journal
+        .as_ref()
+        .into_iter()
+        .flat_map(|journal| {
+            journal
+                .drops
+                .values()
+                .filter(|drop| drop.retired && drop.resolved == Some(true))
+                .map(crate::schema_mutation_journal::DropIntent::storage)
+        })
+        .collect::<Vec<_>>();
+    let coordinator = coordinator_locator.map(|p| {
+        DatabaseCoordinatorConfig::new(file::resolve(path, p))
+            .with_retired_storage_ids(retired_storage_ids)
+    });
     if let (Some(partition), Some(coordinator)) = (&snapshot.partition_evidence, &coordinator) {
         if snapshot.committed.generation.0 == 1 {
             return Database::physical_open_with_placements(
@@ -908,7 +935,11 @@ pub(crate) fn recover_physical(
             .map(|config| {
                 let log = crate::CoordinatorLog::open(config.log_path())?;
                 let decisions = log.decisions().cloned().collect::<Vec<_>>();
-                crate::validate_generic_coordinator_recovery(&decisions, &[])?;
+                crate::validate_generic_coordinator_recovery(
+                    &decisions,
+                    &[],
+                    config.retired_storage_ids(),
+                )?;
                 let next = decisions
                     .iter()
                     .map(|d| d.database_txn_id.0)
