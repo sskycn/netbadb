@@ -947,20 +947,24 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
     let final_fingerprint = final_table.fingerprint().unwrap();
     let final_next_storage = db.next_storage_id();
     let final_next_column = db.next_column_id(table);
-    let retained = db.inspect_replacement_retired_heaps()[0].clone();
-    let retained_path =
-        crate::schema_catalog_file::resolve(&root.join("catalog"), &retained.old_relative_locator);
-    let retained_bundle = heap_bundle_bytes(&retained_path);
-    let inspection = db.inspect_replacement_retired_heap_gc(&retained).unwrap();
-    assert!(inspection.eligible(), "{:?}", inspection.blockers);
-    let report = db.gc_replacement_retired_heap(&retained).unwrap();
-    assert_eq!(report.state, RetiredHeapGcState::Deleted);
-    assert!(retained_bundle.iter().any(|(_, bytes)| bytes.is_some()));
-    assert!(
-        heap_bundle_bytes(&retained_path)
-            .iter()
-            .all(|(_, bytes)| bytes.is_none())
-    );
+    let retained = db.inspect_replacement_retired_heaps();
+    for resource in &retained {
+        let path = crate::schema_catalog_file::resolve(
+            &root.join("catalog"),
+            &resource.old_relative_locator,
+        );
+        let bundle = heap_bundle_bytes(&path);
+        let inspection = db.inspect_replacement_retired_heap_gc(resource).unwrap();
+        assert!(inspection.eligible(), "{:?}", inspection.blockers);
+        let report = db.gc_replacement_retired_heap(resource).unwrap();
+        assert_eq!(report.state, RetiredHeapGcState::Deleted);
+        assert!(bundle.iter().any(|(_, bytes)| bytes.is_some()));
+        assert!(
+            heap_bundle_bytes(&path)
+                .iter()
+                .all(|(_, bytes)| bytes.is_none())
+        );
+    }
     assert_eq!(db.inspect_replacement_retired_heaps().len(), 7);
     assert_eq!(
         db.query("SELECT id FROM work WHERE id = 2").unwrap().rows,
@@ -999,6 +1003,15 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
             index_identity
         );
         assert_eq!(reopened.inspect_replacement_retired_heaps().len(), 7);
+        for resource in &retained {
+            assert_eq!(
+                reopened
+                    .inspect_replacement_retired_heap_gc(resource)
+                    .unwrap()
+                    .state,
+                RetiredHeapGcState::Deleted
+            );
+        }
         assert_eq!(reopened.query("SELECT id FROM work").unwrap().rows.len(), 3);
         reopened.close().unwrap();
     }
@@ -1607,6 +1620,16 @@ fn replacement_and_drop_retirements_gc_independently_in_both_orders() {
             .into_iter()
             .find(|resource| resource.storage_id == active_storage)
             .unwrap();
+        let recreated = create_rewrite_gc_table(&mut db, "projects");
+        assert_ne!(recreated, table);
+        db.execute("INSERT INTO projects VALUES (99)").unwrap();
+        let recreated_index = db
+            .create_named_index(
+                IndexName::new("recreated_projects_value_idx").unwrap(),
+                recreated,
+                ColumnId(1),
+            )
+            .unwrap();
         if drop_first {
             db.gc_retired_heap(&dropped).unwrap();
             db.gc_replacement_retired_heap(&replacement).unwrap();
@@ -1625,16 +1648,25 @@ fn replacement_and_drop_retirements_gc_independently_in_both_orders() {
             RetiredHeapGcState::Deleted
         );
         assert!(db.schema().tables().iter().all(|active| active.id != table));
+        assert_eq!(db.schema().table("projects").unwrap().id, recreated);
+        assert_eq!(db.indexes(recreated).unwrap()[0].id, recreated_index.id);
+        assert_eq!(
+            db.query("SELECT value_a FROM projects").unwrap().rows,
+            vec![vec![ScalarValue::Int64(99)]]
+        );
         assert_eq!(
             db.query("SELECT id FROM teams").unwrap().rows,
             vec![vec![ScalarValue::Int64(2)]]
         );
         db.close().unwrap();
         for _ in 0..3 {
-            Database::open_catalog(root.join("catalog"))
-                .unwrap()
-                .close()
-                .unwrap();
+            let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+            assert_eq!(reopened.schema().table("projects").unwrap().id, recreated);
+            assert_eq!(
+                reopened.query("SELECT value_a FROM projects").unwrap().rows,
+                vec![vec![ScalarValue::Int64(99)]]
+            );
+            reopened.close().unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
     }
