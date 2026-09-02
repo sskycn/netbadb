@@ -4708,6 +4708,153 @@ fn generation_and_identity_exhaustion_are_checked_before_staging() {
 #[test]
 #[ignore = "explicit deterministic fuzz corpus generation"]
 fn write_schema_mutation_fuzz_corpus() {
+    fn read_u32(bytes: &[u8], offset: usize) -> usize {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+    }
+
+    fn skip_index_inventory(bytes: &[u8], start: usize) -> (usize, Vec<(usize, usize, usize)>) {
+        let count = read_u32(bytes, start + 8);
+        let mut cursor = start + 12;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = cursor;
+            cursor += 8;
+            let name = match bytes[cursor] {
+                0 => {
+                    cursor += 1;
+                    usize::MAX
+                }
+                1 => {
+                    cursor += 1;
+                    let length = read_u32(bytes, cursor);
+                    cursor += 4;
+                    let name = cursor;
+                    cursor += length;
+                    name
+                }
+                value => panic!("invalid generated index-name option {value}"),
+            };
+            let column = cursor;
+            cursor += 4;
+            entries.push((id, name, column));
+        }
+        (cursor, entries)
+    }
+
+    fn schema_index_plan_offsets(bytes: &[u8]) -> Vec<usize> {
+        let mut cursor = 77;
+        cursor += match bytes[cursor] {
+            0 => 1,
+            1 => 33,
+            value => panic!("invalid generated snapshot option {value}"),
+        };
+        let count = read_u32(bytes, cursor);
+        cursor += 4;
+        let mut plans = Vec::with_capacity(count);
+        for _ in 0..count {
+            plans.push(cursor);
+            match bytes[cursor] {
+                1 => {
+                    cursor += 1;
+                    let base_length = read_u32(bytes, cursor);
+                    cursor += 4 + base_length;
+                    let target_length = read_u32(bytes, cursor);
+                    cursor += 4 + target_length;
+                    cursor = skip_index_inventory(bytes, cursor).0;
+                    cursor = skip_index_inventory(bytes, cursor).0;
+                }
+                2 => {
+                    cursor += 57;
+                    cursor = skip_index_inventory(bytes, cursor).0;
+                    cursor = skip_index_inventory(bytes, cursor).0;
+                }
+                value => panic!("invalid generated table-plan variant {value}"),
+            }
+        }
+        assert_eq!(cursor, bytes.len());
+        plans
+    }
+
+    fn index_only_inventory_offsets(bytes: &[u8], plan: usize) -> (usize, usize) {
+        assert_eq!(bytes[plan], 2);
+        let base = plan + 57;
+        let final_inventory = skip_index_inventory(bytes, base).0;
+        (base, final_inventory)
+    }
+
+    fn rewrite_inventory_offsets(bytes: &[u8], plan: usize) -> (usize, usize) {
+        assert_eq!(bytes[plan], 1);
+        let mut cursor = plan + 1;
+        let base_length = read_u32(bytes, cursor);
+        cursor += 4 + base_length;
+        let target_length = read_u32(bytes, cursor);
+        cursor += 4 + target_length;
+        let base = cursor;
+        let final_inventory = skip_index_inventory(bytes, base).0;
+        (base, final_inventory)
+    }
+
+    fn malformed_schema_index_seed(bytes: &[u8], mutate: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut reader = crate::schema_catalog::Reader(
+            crate::schema_catalog::open_envelope(bytes, b"NBSJ").unwrap(),
+        );
+        let incarnation = reader.take(16).unwrap().to_vec();
+        let coordinator = reader.string().unwrap();
+        let count = reader.u32().unwrap();
+        let mut records = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let length = reader.u32().unwrap() as usize;
+            let record = reader.take(length).unwrap();
+            records.push(
+                crate::schema_catalog::open_envelope(record, b"NBSR")
+                    .unwrap()
+                    .to_vec(),
+            );
+        }
+        assert!(reader.0.is_empty());
+        let index = records
+            .iter()
+            .rposition(|record| record.first() == Some(&25))
+            .unwrap();
+        mutate(&mut records[index]);
+        let mut writer = crate::schema_catalog::Writer(incarnation);
+        writer.string(&coordinator).unwrap();
+        writer.u32(count);
+        for payload in records {
+            let record = crate::schema_catalog::envelope(b"NBSR", &payload).unwrap();
+            writer.u32(record.len() as u32);
+            writer.0.extend_from_slice(&record);
+        }
+        crate::schema_catalog::envelope(b"NBSJ", &writer.0).unwrap()
+    }
+
+    fn write_malformed(
+        output: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+        mutate: impl FnOnce(&mut Vec<u8>),
+    ) {
+        let malformed = malformed_schema_index_seed(bytes, mutate);
+        assert!(
+            crate::schema_mutation_journal::SchemaMutationJournal::decode(&malformed).is_err(),
+            "malformed seed decoded successfully: {name}"
+        );
+        std::fs::write(output.join("schema_mutation_decode").join(name), malformed).unwrap();
+    }
+
+    fn write_recovery_mismatch(
+        output: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+        mutate: impl FnOnce(&mut Vec<u8>),
+    ) {
+        std::fs::write(
+            output.join("schema_mutation_decode").join(name),
+            malformed_schema_index_seed(bytes, mutate),
+        )
+        .unwrap();
+    }
+
     let output = PathBuf::from(
         std::env::var("NETBADB_ROUND18_CORPUS").expect("explicit corpus output directory"),
     );
@@ -5025,6 +5172,288 @@ fn write_schema_mutation_fuzz_corpus() {
             .unwrap(),
     )
     .unwrap();
+
+    let mut index_loser = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut index_loser,
+        "CREATE INDEX composition_a_id_idx ON composition_a(id)",
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-reservation-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut index_loser).unwrap();
+    let index_only = db
+        .mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .encode()
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-only-one-table-v1"),
+        &index_only,
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-delta-truncated-v1"),
+        &index_only[..index_only.len() - 9],
+    )
+    .unwrap();
+    write_malformed(
+        &output,
+        "composition-index-wrong-storage-v1",
+        &index_only,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            record[plan + 49..plan + 57].copy_from_slice(&0_u64.to_le_bytes());
+        },
+    );
+    write_recovery_mismatch(
+        &output,
+        "composition-index-wrong-version-v1",
+        &index_only,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            record[plan + 9..plan + 17].copy_from_slice(&u64::MAX.to_le_bytes());
+        },
+    );
+    write_recovery_mismatch(
+        &output,
+        "composition-index-wrong-fingerprint-v1",
+        &index_only,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            record[plan + 17] ^= 0x80;
+        },
+    );
+    write_malformed(
+        &output,
+        "composition-index-final-floor-too-low-v1",
+        &index_only,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            let final_inventory = index_only_inventory_offsets(record, plan).1;
+            record[final_inventory..final_inventory + 8].copy_from_slice(&1_u64.to_le_bytes());
+        },
+    );
+    index_loser.rollback().unwrap();
+    drop(index_loser);
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-loser-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut index_multi = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut index_multi,
+        "CREATE INDEX composition_a_id_idx ON composition_a(id)",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut index_multi,
+        "CREATE INDEX composition_team_id_idx ON composition_team(id)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut index_multi).unwrap();
+    let index_multi_bytes = db
+        .mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .encode()
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-only-multi-table-v1"),
+        &index_multi_bytes,
+    )
+    .unwrap();
+    write_malformed(
+        &output,
+        "composition-index-bad-canonical-order-v1",
+        &index_multi_bytes,
+        |record| {
+            let plans = schema_index_plan_offsets(record);
+            assert_eq!(plans.len(), 2);
+            let first = u64::from_le_bytes(record[plans[0] + 1..plans[0] + 9].try_into().unwrap());
+            let second = u64::from_le_bytes(record[plans[1] + 1..plans[1] + 9].try_into().unwrap());
+            record[plans[0] + 1..plans[0] + 9].copy_from_slice(&second.to_le_bytes());
+            record[plans[1] + 1..plans[1] + 9].copy_from_slice(&first.to_le_bytes());
+        },
+    );
+    index_multi.rollback().unwrap();
+    drop(index_multi);
+
+    let mut duplicate_inventory = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut duplicate_inventory,
+        "CREATE INDEX invalid_a_idx ON composition_a(id)",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut duplicate_inventory,
+        "CREATE INDEX invalid_b_idx ON composition_a(enabled)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut duplicate_inventory)
+        .unwrap();
+    let duplicate_inventory_bytes = db
+        .mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .encode()
+        .unwrap();
+    write_malformed(
+        &output,
+        "composition-index-duplicate-id-v1",
+        &duplicate_inventory_bytes,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            let final_inventory = index_only_inventory_offsets(record, plan).1;
+            let entries = skip_index_inventory(record, final_inventory).1;
+            assert_eq!(entries.len(), 2);
+            let first_id = record[entries[0].0..entries[0].0 + 8].to_vec();
+            record[entries[1].0..entries[1].0 + 8].copy_from_slice(&first_id);
+        },
+    );
+    write_malformed(
+        &output,
+        "composition-index-duplicate-name-v1",
+        &duplicate_inventory_bytes,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            let final_inventory = index_only_inventory_offsets(record, plan).1;
+            let entries = skip_index_inventory(record, final_inventory).1;
+            assert_eq!(entries.len(), 2);
+            let first_name = record[entries[0].1..entries[0].1 + "invalid_a_idx".len()].to_vec();
+            record[entries[1].1..entries[1].1 + "invalid_b_idx".len()].copy_from_slice(&first_name);
+        },
+    );
+    duplicate_inventory.rollback().unwrap();
+    drop(duplicate_inventory);
+
+    let mut mixed = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut mixed,
+        "ALTER TABLE composition_a ADD COLUMN round29_note TEXT",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut mixed,
+        "CREATE INDEX composition_a_note_idx ON composition_a(round29_note)",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut mixed,
+        "CREATE INDEX composition_team_id_idx ON composition_team(id)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut mixed).unwrap();
+    let mixed_bytes = db
+        .mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .encode()
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-schema-index-mixed-v1"),
+        &mixed_bytes,
+    )
+    .unwrap();
+    write_malformed(
+        &output,
+        "composition-index-unknown-column-v1",
+        &mixed_bytes,
+        |record| {
+            let plan = schema_index_plan_offsets(record)[0];
+            let final_inventory = rewrite_inventory_offsets(record, plan).1;
+            let column = skip_index_inventory(record, final_inventory).1[0].2;
+            record[column..column + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        },
+    );
+    let composition_a = db.schema().table("composition_a").unwrap().id;
+    write_malformed(
+        &output,
+        "composition-index-duplicate-table-plan-v1",
+        &mixed_bytes,
+        |record| {
+            let plans = schema_index_plan_offsets(record);
+            assert_eq!(record[plans[0]], 1);
+            assert_eq!(record[plans[1]], 2);
+            record[plans[1] + 1..plans[1] + 9].copy_from_slice(&composition_a.0.to_le_bytes());
+        },
+    );
+    db.commit_transaction(&mut mixed).unwrap();
+    drop(mixed);
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-schema-index-winner-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut no_op = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut no_op,
+        "CREATE INDEX composition_a_temp_idx ON composition_a(id)",
+    )
+    .unwrap();
+    db.execute_in(&mut no_op, "DROP INDEX composition_a_temp_idx")
+        .unwrap();
+    db.ensure_schema_materialized(&mut no_op).unwrap();
+    db.commit_transaction(&mut no_op).unwrap();
+    drop(no_op);
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-create-drop-noop-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut recreate = db.begin_transaction().unwrap();
+    db.execute_in(&mut recreate, "DROP INDEX composition_team_id_idx")
+        .unwrap();
+    db.execute_in(
+        &mut recreate,
+        "CREATE INDEX composition_team_id_idx ON composition_team(id)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut recreate).unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-index-drop-recreate-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    recreate.rollback().unwrap();
+    drop(recreate);
     std::fs::write(
         output.join("coordinator_log_decode/schema-composition-decision-v2"),
         std::fs::read(root.join("coordinator")).unwrap(),

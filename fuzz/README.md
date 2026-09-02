@@ -247,3 +247,15 @@ and retry-only per-table GC ordering. `coordinator_log_decode` adds a real
 multi-participant composition decision while retaining CORD v2 unchanged. Use
 the existing corpus generator and the same bounded 1,000-run command; no new
 fuzz-only decoder or persistent envelope is introduced.
+
+## Round 29 schema/index composition records
+
+`schema_mutation_decode` adds tag-24 IndexId reservations and tag-25 index-only
+and mixed rewrite/in-place aggregate histories while retaining the NBSJ/NBSR v1
+envelope. Reviewed seeds cover one/multiple tables, mixed final inventories,
+CREATE/DROP no-op, same-name recreation, loser/winner, truncation, duplicate
+IDs/names/table plans, unknown columns, wrong storage/version/fingerprint, low
+final allocator floors, and noncanonical table order. The coordinator corpus adds
+a real mixed composition decision; CORD remains v2. Run all thirteen registered
+targets for 1,000 runs with `-seed=29`, using copied temporary corpora so random
+mutations and artifacts never enter the repository.

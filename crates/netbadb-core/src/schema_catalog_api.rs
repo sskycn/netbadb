@@ -692,6 +692,7 @@ fn open_authority(
             .keys()
             .chain(journal.drops.keys())
             .chain(journal.rewrite_reservations.keys())
+            .chain(journal.compositions.keys())
             .max()
         {
             let next =
@@ -951,6 +952,26 @@ pub(crate) fn recover_physical(
                                 .iter()
                                 .map(crate::schema_mutation_journal::CompositionTablePlan::old_storage)
                         }),
+                )
+                .chain(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            !matches!(
+                                composition.resolution,
+                                Some(
+                                    crate::schema_mutation_journal::CompositionResolution::Loser
+                                        | crate::schema_mutation_journal::CompositionResolution::NoEffectiveChange
+                                )
+                            )
+                        })
+                        .filter_map(|composition| composition.index_intent.as_ref())
+                        .flat_map(|intent| intent.tables.iter())
+                        .filter_map(
+                            crate::schema_mutation_journal::SchemaIndexTablePlan::replacement,
+                        )
+                        .map(crate::schema_mutation_journal::CompositionTablePlan::old_storage),
                 )
         })
         .collect::<Vec<_>>();

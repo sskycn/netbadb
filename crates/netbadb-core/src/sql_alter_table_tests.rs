@@ -1,6 +1,7 @@
 use super::*;
+use netbadb_planner::PhysicalPlan;
 use netbadb_schema::{ColumnDef, TypeSpec};
-use netbadb_types::{IndexName, SemanticType};
+use netbadb_types::{IndexId, IndexName, SemanticType};
 use std::path::{Path, PathBuf};
 
 fn root(name: &str) -> PathBuf {
@@ -48,6 +49,613 @@ fn files(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     }
     result.sort();
     result
+}
+
+#[test]
+fn schema_and_index_ddl_compose_into_final_inventory() {
+    let root = root("round29-schema-index");
+    let mut db = seed(&root);
+    db.execute("INSERT INTO projects VALUES (1, 'one')")
+        .unwrap();
+    let table = db.schema().table("projects").unwrap().id;
+    let base_generation = db.schema_generation();
+    let base_revision = db.catalog_generation();
+    let base_storage = db.bindings.resolve_single(table).unwrap();
+
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ADD COLUMN active BOOLEAN",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX projects_active_idx ON projects(active)",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects RENAME COLUMN name TO title",
+    )
+    .unwrap();
+    assert_eq!(transaction.participant_count(), 0);
+    db.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+
+    let replacement = db.bindings.resolve_single(table).unwrap();
+    assert_ne!(replacement, base_storage);
+    assert_eq!(
+        db.schema_generation(),
+        SchemaGeneration(base_generation.0 + 1)
+    );
+    assert_eq!(db.catalog_generation(), base_revision + 1);
+    let index = db.indexes(table).unwrap()[0].clone();
+    assert_eq!(index.name.as_ref().unwrap().as_str(), "projects_active_idx");
+    assert_eq!(
+        index.column_id,
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("active")
+            .unwrap()
+            .id
+    );
+
+    let generation = db.schema_generation();
+    let revision = db.catalog_generation();
+    let storage = db.bindings.resolve_single(table).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(&mut transaction, "DROP INDEX projects_active_idx")
+        .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE projects DROP COLUMN active")
+        .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    assert_eq!(db.schema_generation(), SchemaGeneration(generation.0 + 1));
+    assert_eq!(db.catalog_generation(), revision + 1);
+    assert_ne!(db.bindings.resolve_single(table).unwrap(), storage);
+    assert!(db.indexes(table).unwrap().is_empty());
+    db.close().unwrap();
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert!(
+        reopened
+            .schema()
+            .table("projects")
+            .unwrap()
+            .column("active")
+            .is_none()
+    );
+    assert!(reopened.indexes(table).unwrap().is_empty());
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn index_only_composition_preserves_schema_identity_and_burns_transient_ids() {
+    let root = root("round29-index-only");
+    let mut db = seed(&root);
+    let table = db.schema().table("projects").unwrap().id;
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let old = db.indexes(table).unwrap()[0].clone();
+    let generation = db.schema_generation();
+    let version = db.table_schema_version(table).unwrap();
+    let revision = db.catalog_generation();
+    let storage = db.bindings.resolve_single(table).unwrap();
+    let snapshot = crate::schema_catalog_file::load(&root.join("catalog")).unwrap();
+    let epoch = snapshot.epoch;
+    let heap_path = crate::schema_catalog_file::resolve(
+        &root.join("catalog"),
+        &snapshot
+            .storages
+            .iter()
+            .find(|descriptor| descriptor.id == storage)
+            .unwrap()
+            .locator,
+    );
+    let heap_bytes = std::fs::metadata(&heap_path).unwrap().len();
+
+    let mut no_op = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut no_op,
+        "CREATE INDEX projects_id_temporary_idx ON projects(id)",
+    )
+    .unwrap();
+    let temporary = no_op.schema_composition.plan().unwrap().touched[&table]
+        .indexes
+        .active
+        .iter()
+        .find(|index| {
+            index
+                .name
+                .as_ref()
+                .is_some_and(|name| name.as_str().contains("temporary"))
+        })
+        .unwrap()
+        .id;
+    db.execute_in(&mut no_op, "DROP INDEX projects_id_temporary_idx")
+        .unwrap();
+    db.commit_transaction(&mut no_op).unwrap();
+    drop(no_op);
+    assert_eq!(db.catalog_generation(), revision);
+    assert_eq!(std::fs::metadata(&heap_path).unwrap().len(), heap_bytes);
+    assert_eq!(
+        db.index_allocation_floor(table, storage).unwrap(),
+        IndexId(temporary.0 + 1)
+    );
+
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(&mut transaction, "DROP INDEX projects_name_idx")
+        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX projects_name_idx ON projects(name)",
+    )
+    .unwrap();
+    let replacement = transaction.schema_composition.plan().unwrap().touched[&table]
+        .indexes
+        .active
+        .iter()
+        .find(|index| {
+            index
+                .name
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "projects_name_idx")
+        })
+        .unwrap()
+        .id;
+    assert!(replacement.0 > temporary.0);
+    db.execute_in(&mut transaction, "INSERT INTO projects VALUES (2, 'two')")
+        .unwrap();
+    assert_eq!(transaction.participant_count(), 1);
+    let ExecutionResult::Query(result) = db
+        .execute_in(
+            &mut transaction,
+            "SELECT id FROM projects WHERE name = 'two'",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT returned affected rows")
+    };
+    assert_eq!(result.rows, [vec![ScalarValue::Int64(2)]]);
+    assert_eq!(db.bindings.resolve_single(table).unwrap(), storage);
+    assert_eq!(
+        db.execute_in(&mut transaction, "DROP INDEX projects_name_idx")
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::TransactionState
+    );
+    db.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+
+    assert_eq!(db.schema_generation(), generation);
+    assert_eq!(db.table_schema_version(table), Some(version));
+    assert_eq!(
+        crate::schema_catalog_file::load(&root.join("catalog"))
+            .unwrap()
+            .epoch,
+        epoch
+    );
+    assert_eq!(db.bindings.resolve_single(table).unwrap(), storage);
+    assert_eq!(db.catalog_generation(), revision + 1);
+    let final_index = db.indexes(table).unwrap()[0].clone();
+    assert_eq!(final_index.id, replacement);
+    assert_ne!(final_index.id, old.id);
+    assert_eq!(final_index.name, old.name);
+    db.close().unwrap();
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(reopened.indexes(table).unwrap()[0].id, replacement);
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn index_reservation_survives_rollback_and_prepared_identities_never_rebind() {
+    let root = root("round29-index-reservation");
+    let mut db = seed(&root);
+    let table = db.schema().table("projects").unwrap().id;
+    let stale_create = db
+        .prepare_ddl_statement("CREATE INDEX stale_name_idx ON projects(name)")
+        .unwrap();
+
+    let mut altered = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut altered,
+        "ALTER TABLE projects RENAME COLUMN name TO title",
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute_ddl_in(&mut altered, &stale_create)
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::TransactionState
+    );
+    assert_eq!(
+        altered
+            .schema_composition
+            .plan()
+            .unwrap()
+            .index_reservation_count,
+        0
+    );
+    altered.rollback().unwrap();
+    drop(altered);
+
+    let mut rolled_back = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut rolled_back,
+        "CREATE INDEX rolled_back_idx ON projects(name)",
+    )
+    .unwrap();
+    let burned = rolled_back.schema_composition.plan().unwrap().touched[&table]
+        .indexes
+        .active
+        .iter()
+        .find(|index| {
+            index
+                .name
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "rolled_back_idx")
+        })
+        .unwrap()
+        .id;
+    assert_eq!(rolled_back.participant_count(), 0);
+    rolled_back.rollback().unwrap();
+    drop(rolled_back);
+    db.close().unwrap();
+
+    let mut db = Database::open_catalog(root.join("catalog")).unwrap();
+    assert!(db.indexes(table).unwrap().is_empty());
+    let mut committed = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut committed,
+        "CREATE INDEX committed_idx ON projects(name)",
+    )
+    .unwrap();
+    let fresh = committed.schema_composition.plan().unwrap().touched[&table]
+        .indexes
+        .active[0]
+        .id;
+    assert!(fresh.0 > burned.0);
+    db.commit_transaction(&mut committed).unwrap();
+    drop(committed);
+    let old_drop = db
+        .prepare_ddl_statement("DROP INDEX committed_idx")
+        .unwrap();
+
+    let mut replacement = db.begin_transaction().unwrap();
+    db.execute_in(&mut replacement, "DROP INDEX committed_idx")
+        .unwrap();
+    db.execute_in(
+        &mut replacement,
+        "CREATE INDEX committed_idx ON projects(name)",
+    )
+    .unwrap();
+    db.commit_transaction(&mut replacement).unwrap();
+    drop(replacement);
+    let newest = db.indexes(table).unwrap()[0].id;
+    assert!(newest.0 > fresh.0);
+    assert_eq!(
+        db.execute_ddl(&old_drop).unwrap_err().kind(),
+        DatabaseErrorKind::UndefinedObject
+    );
+    assert_eq!(db.indexes(table).unwrap()[0].id, newest);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn index_overlay_enforces_statement_order_for_column_dependencies() {
+    let root = root("round29-index-order");
+    let mut db = seed(&root);
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let mut reverse = db.begin_transaction().unwrap();
+    assert_eq!(
+        db.execute_in(&mut reverse, "ALTER TABLE projects DROP COLUMN name")
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::DependentObjects
+    );
+    reverse.rollback().unwrap();
+    drop(reverse);
+
+    let mut created = db.begin_transaction().unwrap();
+    db.execute_in(&mut created, "CREATE INDEX projects_id_idx ON projects(id)")
+        .unwrap();
+    assert_eq!(
+        db.execute_in(&mut created, "ALTER TABLE projects DROP COLUMN id")
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::DependentObjects
+    );
+    created.rollback().unwrap();
+    drop(created);
+
+    let mut removed = db.begin_transaction().unwrap();
+    db.execute_in(&mut removed, "CREATE INDEX projects_id_idx ON projects(id)")
+        .unwrap();
+    db.execute_in(&mut removed, "DROP INDEX projects_id_idx")
+        .unwrap();
+    db.execute_in(&mut removed, "ALTER TABLE projects DROP COLUMN id")
+        .unwrap();
+    assert!(
+        removed
+            .visible_schema(db.schema())
+            .table("projects")
+            .unwrap()
+            .column("id")
+            .is_none()
+    );
+    assert_eq!(removed.participant_count(), 0);
+    removed.rollback().unwrap();
+    drop(removed);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn physical_uses_index(plan: &PhysicalStatement) -> bool {
+    fn visit(plan: &PhysicalPlan) -> bool {
+        match plan {
+            PhysicalPlan::IndexScan { .. } | PhysicalPlan::RangeIndexScan { .. } => true,
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::ScalarProject { input, .. }
+            | PhysicalPlan::Aggregate { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::IndexNestedLoopJoin { left: input, .. } => visit(input),
+            PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::HashJoin { left, right, .. } => visit(left) || visit(right),
+            PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::PartitionedScan { .. }
+            | PhysicalPlan::OneRow => false,
+        }
+    }
+    match plan {
+        PhysicalStatement::Query(plan)
+        | PhysicalStatement::Update { input: plan, .. }
+        | PhysicalStatement::Delete { input: plan, .. } => visit(plan),
+        PhysicalStatement::Insert { .. } => false,
+    }
+}
+
+#[test]
+fn transaction_planner_uses_created_and_surviving_indexes_but_not_dropped_indexes() {
+    let root = root("round29-index-planner");
+    let mut db = seed(&root);
+    db.execute("INSERT INTO projects VALUES (1, 'one')")
+        .unwrap();
+
+    let mut created = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut created,
+        "CREATE INDEX projects_name_idx ON projects(name)",
+    )
+    .unwrap();
+    let PreparedSqlStatement::Relational(created_select) = db
+        .prepare_sql_statement_in(&created, "SELECT id FROM projects WHERE name = 'one'", &[])
+        .unwrap()
+    else {
+        panic!("SELECT prepared as DDL")
+    };
+    let logical = bind_statement(&created_select.compiled, &[]).unwrap();
+    db.ensure_schema_materialized(&mut created).unwrap();
+    assert!(physical_uses_index(
+        &db.plan_logical_statement_in(&logical, &created)
+    ));
+    db.commit_transaction(&mut created).unwrap();
+    drop(created);
+
+    let mut rewritten = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut rewritten,
+        "ALTER TABLE projects RENAME COLUMN name TO title",
+    )
+    .unwrap();
+    let PreparedSqlStatement::Relational(rewritten_select) = db
+        .prepare_sql_statement_in(
+            &rewritten,
+            "SELECT id FROM projects WHERE title = 'one'",
+            &[],
+        )
+        .unwrap()
+    else {
+        panic!("SELECT prepared as DDL")
+    };
+    let logical = bind_statement(&rewritten_select.compiled, &[]).unwrap();
+    db.ensure_schema_materialized(&mut rewritten).unwrap();
+    assert!(physical_uses_index(
+        &db.plan_logical_statement_in(&logical, &rewritten)
+    ));
+    db.commit_transaction(&mut rewritten).unwrap();
+    drop(rewritten);
+
+    let mut dropped = db.begin_transaction().unwrap();
+    db.execute_in(&mut dropped, "DROP INDEX projects_name_idx")
+        .unwrap();
+    let PreparedSqlStatement::Relational(dropped_select) = db
+        .prepare_sql_statement_in(&dropped, "SELECT id FROM projects WHERE title = 'one'", &[])
+        .unwrap()
+    else {
+        panic!("SELECT prepared as DDL")
+    };
+    let logical = bind_statement(&dropped_select.compiled, &[]).unwrap();
+    db.ensure_schema_materialized(&mut dropped).unwrap();
+    assert!(!physical_uses_index(
+        &db.plan_logical_statement_in(&logical, &dropped)
+    ));
+    dropped.rollback().unwrap();
+    drop(dropped);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn multiple_index_actions_on_one_table_use_one_participant_and_final_work_only() {
+    let root = root("round29-index-cost");
+    let mut db = seed(&root);
+    let table = db.schema().table("projects").unwrap().id;
+    let storage = db.bindings.resolve_single(table).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX projects_id_idx ON projects(id)",
+    )
+    .unwrap();
+    let first = transaction.schema_composition.plan().unwrap().touched[&table]
+        .indexes
+        .active[0]
+        .id;
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX projects_name_idx ON projects(name)",
+    )
+    .unwrap();
+    db.execute_in(&mut transaction, "DROP INDEX projects_id_idx")
+        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX projects_id_idx ON projects(id)",
+    )
+    .unwrap();
+    let final_inventory = transaction.schema_composition.plan().unwrap().touched[&table]
+        .indexes
+        .clone();
+    assert_eq!(final_inventory.active.len(), 2);
+    assert!(final_inventory.active.iter().all(|index| index.id != first));
+    assert_eq!(transaction.participant_count(), 0);
+    db.execute_in(&mut transaction, "INSERT INTO projects VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(transaction.participant_count(), 1);
+    assert_eq!(db.bindings.resolve_single(table).unwrap(), storage);
+    db.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+    assert_eq!(db.bindings.resolve_single(table).unwrap(), storage);
+    assert_eq!(db.indexes(table).unwrap().len(), 2);
+    assert_eq!(
+        db.index_allocation_floor(table, storage).unwrap(),
+        final_inventory.next_index_id
+    );
+    assert!(
+        db.indexes(table)
+            .unwrap()
+            .iter()
+            .all(|index| index.id != first)
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn schema_index_journal_rejects_noncanonical_and_inexact_typed_plans() {
+    fn rejects(
+        journal: &crate::schema_mutation_journal::SchemaMutationJournal,
+        transaction: DatabaseTxnId,
+        mutate: impl FnOnce(&mut crate::schema_mutation_journal::CompositionRecord),
+    ) {
+        let mut candidate = journal.clone();
+        mutate(candidate.compositions.get_mut(&transaction).unwrap());
+        assert!(candidate.encode().is_err());
+    }
+
+    let root = root("round29-index-journal-validation");
+    let mut db = seed(&root);
+    db.execute("CREATE TABLE teams (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX projects_id_idx ON projects(id)",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX teams_name_idx ON teams(name)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut transaction).unwrap();
+    let transaction_id = transaction.id();
+    let journal = db.mutation_journal.as_ref().unwrap().borrow().clone();
+
+    rejects(&journal, transaction_id, |record| {
+        record.index_intent.as_mut().unwrap().tables.swap(0, 1);
+    });
+    rejects(&journal, transaction_id, |record| {
+        let intent = record.index_intent.as_mut().unwrap();
+        intent.tables.push(intent.tables[0].clone());
+    });
+    rejects(&journal, transaction_id, |record| {
+        record.index_reservations.clear();
+    });
+    rejects(&journal, transaction_id, |record| {
+        record.index_reservations[0].fingerprint =
+            netbadb_schema::SchemaFingerprint::from_bytes([0; 32]);
+    });
+    rejects(&journal, transaction_id, |record| {
+        let intent = record.index_intent.as_mut().unwrap();
+        let first_name = match &intent.tables[0] {
+            crate::schema_mutation_journal::SchemaIndexTablePlan::InPlaceIndexDelta {
+                final_indexes,
+                ..
+            } => final_indexes.active[0].name.clone(),
+            _ => panic!("expected in-place plan"),
+        };
+        match &mut intent.tables[1] {
+            crate::schema_mutation_journal::SchemaIndexTablePlan::InPlaceIndexDelta {
+                final_indexes,
+                ..
+            } => final_indexes.active[0].name = first_name,
+            _ => panic!("expected in-place plan"),
+        }
+    });
+    rejects(&journal, transaction_id, |record| {
+        match &mut record.index_intent.as_mut().unwrap().tables[0] {
+            crate::schema_mutation_journal::SchemaIndexTablePlan::InPlaceIndexDelta {
+                storage,
+                ..
+            } => *storage = StorageId(0),
+            _ => panic!("expected in-place plan"),
+        }
+    });
+    rejects(&journal, transaction_id, |record| {
+        match &mut record.index_intent.as_mut().unwrap().tables[0] {
+            crate::schema_mutation_journal::SchemaIndexTablePlan::InPlaceIndexDelta {
+                final_indexes,
+                ..
+            } => final_indexes.next_index_id = IndexId(1),
+            _ => panic!("expected in-place plan"),
+        }
+    });
+    transaction.rollback().unwrap();
+    drop(transaction);
+
+    let mut rewrite = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut rewrite,
+        "ALTER TABLE projects ADD COLUMN active BOOLEAN",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut rewrite,
+        "CREATE INDEX projects_active_idx ON projects(active)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut rewrite).unwrap();
+    let rewrite_id = rewrite.id();
+    let journal = db.mutation_journal.as_ref().unwrap().borrow().clone();
+    rejects(&journal, rewrite_id, |record| {
+        match &mut record.index_intent.as_mut().unwrap().tables[0] {
+            crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap {
+                final_indexes,
+                ..
+            } => final_indexes.active[0].column_id = ColumnId(999),
+            _ => panic!("expected rewrite plan"),
+        }
+    });
+    rewrite.rollback().unwrap();
+    drop(rewrite);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1166,6 +1774,210 @@ fn multi_alter_crash_child() {
     .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     panic!("configured multi-ALTER crash hook was not reached");
+}
+
+#[test]
+fn schema_index_composition_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_SCHEMA_INDEX_CHILD") else {
+        return;
+    };
+    let mode = std::env::var("NETBADB_SCHEMA_INDEX_MODE").unwrap();
+    let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    match mode.as_str() {
+        "index-only" => {
+            db.execute_in(
+                &mut transaction,
+                "CREATE INDEX projects_name_idx ON projects(name)",
+            )
+            .unwrap();
+        }
+        "mixed" => {
+            db.execute_in(
+                &mut transaction,
+                "ALTER TABLE projects ADD COLUMN active BOOLEAN",
+            )
+            .unwrap();
+            db.execute_in(
+                &mut transaction,
+                "CREATE INDEX projects_active_idx ON projects(active)",
+            )
+            .unwrap();
+            db.execute_in(
+                &mut transaction,
+                "CREATE INDEX teams_name_idx ON teams(name)",
+            )
+            .unwrap();
+        }
+        other => panic!("unexpected schema/index crash mode {other}"),
+    }
+    db.commit_transaction(&mut transaction).unwrap();
+    panic!("configured schema/index composition crash hook was not reached");
+}
+
+#[test]
+fn index_only_composition_crash_matrix_has_no_nbsc_and_converges() {
+    for (point, winner) in [
+        ("composition-index-reservation-durable", false),
+        ("composition-before-intent", false),
+        ("composition-intent-durable", false),
+        ("composition-after-index-delta-1", false),
+        ("composition-all-targets-staged", false),
+        ("composition-participants-prepared", false),
+        ("composition-before-coordinator-decision", false),
+        ("coordinator-durable", true),
+        ("staged-heap-committed", true),
+        ("composition-final-heaps-synced", true),
+        ("composition-after-cord-complete", true),
+        ("composition-before-api-return", true),
+    ] {
+        let root = root(&format!("round29-index-crash-{point}"));
+        let db = seed(&root);
+        let table = db.schema().table("projects").unwrap().id;
+        let generation = db.schema_generation();
+        let version = db.table_schema_version(table).unwrap();
+        let storage = db.bindings.resolve_single(table).unwrap();
+        let epoch = crate::schema_catalog_file::load(&root.join("catalog"))
+            .unwrap()
+            .epoch;
+        db.close().unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sql_alter_table_tests::schema_index_composition_crash_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_SCHEMA_INDEX_CHILD", &root)
+            .env("NETBADB_SCHEMA_INDEX_MODE", "index-only")
+            .env("NETBADB_REWRITE_CRASH_POINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(90),
+            "{point}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for _ in 0..3 {
+            let mut db = Database::open_catalog(root.join("catalog")).unwrap();
+            assert_eq!(db.schema_generation(), generation);
+            assert_eq!(db.table_schema_version(table), Some(version));
+            assert_eq!(db.bindings.resolve_single(table).unwrap(), storage);
+            assert_eq!(
+                crate::schema_catalog_file::load(&root.join("catalog"))
+                    .unwrap()
+                    .epoch,
+                epoch
+            );
+            assert_eq!(db.indexes(table).unwrap().len(), usize::from(winner));
+            if winner {
+                assert_eq!(
+                    db.indexes(table).unwrap()[0]
+                        .name
+                        .as_ref()
+                        .unwrap()
+                        .as_str(),
+                    "projects_name_idx"
+                );
+            }
+            assert_eq!(
+                db.index_allocation_floor(table, storage).unwrap(),
+                IndexId(2)
+            );
+            db.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn mixed_rewrite_and_index_only_crash_matrix_is_all_or_nothing() {
+    for (point, winner) in [
+        ("composition-before-intent", false),
+        ("composition-intent-durable", false),
+        ("composition-after-target-create-1", false),
+        ("composition-after-table-copy-1", false),
+        ("composition-after-index-delta-2", false),
+        ("composition-all-targets-staged", false),
+        ("composition-participants-prepared", false),
+        ("composition-before-coordinator-decision", false),
+        ("coordinator-durable", true),
+        ("staged-heap-committed", true),
+        ("composition-after-promotion-1", true),
+        ("composition-after-retirement-1", true),
+        ("composition-before-nbsc-publication", true),
+        ("composition-after-cord-complete", true),
+        ("composition-after-winner-resolution", true),
+        ("composition-before-memory-publication", true),
+    ] {
+        let root = root(&format!("round29-mixed-crash-{point}"));
+        let mut db = seed(&root);
+        db.execute("CREATE TABLE teams (id BIGINT NOT NULL, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO projects VALUES (1, 'one')")
+            .unwrap();
+        db.execute("INSERT INTO teams VALUES (1, 'red')").unwrap();
+        let projects = db.schema().table("projects").unwrap().id;
+        let teams = db.schema().table("teams").unwrap().id;
+        let generation = db.schema_generation();
+        let project_version = db.table_schema_version(projects).unwrap();
+        let team_version = db.table_schema_version(teams).unwrap();
+        let project_storage = db.bindings.resolve_single(projects).unwrap();
+        let team_storage = db.bindings.resolve_single(teams).unwrap();
+        db.close().unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sql_alter_table_tests::schema_index_composition_crash_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_SCHEMA_INDEX_CHILD", &root)
+            .env("NETBADB_SCHEMA_INDEX_MODE", "mixed")
+            .env("NETBADB_REWRITE_CRASH_POINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(90),
+            "{point}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for _ in 0..3 {
+            let db = Database::open_catalog(root.join("catalog")).unwrap();
+            assert_eq!(
+                db.schema_generation(),
+                SchemaGeneration(generation.0 + u64::from(winner))
+            );
+            assert_eq!(
+                db.table_schema_version(projects),
+                Some(TableSchemaVersion(project_version.0 + u64::from(winner)))
+            );
+            assert_eq!(db.table_schema_version(teams), Some(team_version));
+            assert_eq!(db.bindings.resolve_single(teams).unwrap(), team_storage);
+            assert_eq!(
+                db.bindings.resolve_single(projects).unwrap() == project_storage,
+                !winner
+            );
+            assert_eq!(
+                db.schema()
+                    .table("projects")
+                    .unwrap()
+                    .column("active")
+                    .is_some(),
+                winner
+            );
+            assert_eq!(db.indexes(projects).unwrap().len(), usize::from(winner));
+            assert_eq!(db.indexes(teams).unwrap().len(), usize::from(winner));
+            assert_eq!(
+                db.inspect_replacement_retired_heaps().len(),
+                usize::from(winner)
+            );
+            db.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

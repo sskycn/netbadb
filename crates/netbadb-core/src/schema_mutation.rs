@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use netbadb_schema::{ColumnDef, DropTableTarget, Schema, SchemaFingerprint, TableDef, TypeSpec};
-use netbadb_storage::TableStorage;
+use netbadb_storage::{HeapRewriteIndexes, TableStorage};
 #[cfg(test)]
 use netbadb_types::ScalarValue;
 use netbadb_types::{
@@ -27,9 +27,10 @@ use crate::schema_catalog::{
 };
 use crate::schema_catalog_file as file;
 use crate::schema_mutation_journal::{
-    CompositionResolution, CompositionTablePlan, CreateIntent, DropIntent, Reservation,
-    RetiredHeapGcRecord, RewriteIntent, RewriteReservation, SchemaChangeSetIntent,
-    SchemaMutationJournal, final_locator, namespace, prepared_locator, stage_locator,
+    CompositionRecord, CompositionResolution, CompositionTablePlan, CreateIntent, DropIntent,
+    Reservation, RetiredHeapGcRecord, RewriteIntent, RewriteReservation, SchemaChangeSetIntent,
+    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal, final_locator,
+    namespace, prepared_locator, stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -1547,6 +1548,23 @@ impl Database {
                                 .map(|plan| composition_replacement_resource(intent, plan))
                         }),
                 );
+                resources.extend(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            composition.resolution == Some(CompositionResolution::Winner)
+                        })
+                        .filter_map(|composition| composition.index_intent.as_ref())
+                        .flat_map(|intent| {
+                            intent
+                                .tables
+                                .iter()
+                                .filter_map(SchemaIndexTablePlan::replacement)
+                                .filter(|plan| plan.retired)
+                                .map(|plan| schema_index_replacement_resource(intent, plan))
+                        }),
+                );
                 resources
             })
             .collect()
@@ -2387,6 +2405,24 @@ fn composition_replacement_resource(
     }
 }
 
+fn schema_index_replacement_resource(
+    intent: &SchemaIndexChangeSetIntent,
+    plan: &CompositionTablePlan,
+) -> ReplacementRetiredHeap {
+    ReplacementRetiredHeap {
+        table_id: plan.table(),
+        base_table_version: plan.base.committed.tables[0].version,
+        target_table_version: plan.target.committed.tables[0].version,
+        base_fingerprint: plan.base.placements.tables[0].schema_fingerprint,
+        target_fingerprint: plan.target.placements.tables[0].schema_fingerprint,
+        old_storage_id: plan.old_storage(),
+        new_storage_id: plan.new_storage(),
+        old_relative_locator: plan.base.storages[0].locator.clone(),
+        replacement_transaction: intent.transaction,
+        retired_generation: intent.target_generation.unwrap_or(intent.base_generation),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RetiredHeapIntent {
     TableDrop(Box<DropIntent>),
@@ -2850,6 +2886,30 @@ fn validate_replacement_lineage(
             if next_transaction.0 <= transaction.0 || fragment_incarnation(&next.base) != current {
                 return Err(SchemaMutationError::Corrupt(
                     "composition replacement lineage is inconsistent",
+                ));
+            }
+            current = fragment_incarnation(&next.target);
+            transaction = next_transaction;
+            continue;
+        }
+        if let Some((next_transaction, next)) =
+            journal.compositions.values().find_map(|composition| {
+                (composition.resolution == Some(CompositionResolution::Winner))
+                    .then_some(composition.index_intent.as_ref())
+                    .flatten()
+                    .and_then(|intent| {
+                        intent
+                            .tables
+                            .iter()
+                            .filter_map(SchemaIndexTablePlan::replacement)
+                            .find(|plan| plan.old_storage() == current.storage && plan.retired)
+                            .map(|plan| (intent.transaction, plan))
+                    })
+            })
+        {
+            if next_transaction.0 <= transaction.0 || fragment_incarnation(&next.base) != current {
+                return Err(SchemaMutationError::Corrupt(
+                    "schema/index replacement lineage is inconsistent",
                 ));
             }
             current = fragment_incarnation(&next.target);
@@ -3477,6 +3537,18 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
     }
     let mut coordinator = CoordinatorLog::open(&coordinator_path)?;
     let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+    for decision in decisions
+        .iter()
+        .filter(|decision| decision.schema.is_none())
+    {
+        if let Some(intent) = journal
+            .compositions
+            .get(&decision.database_txn_id)
+            .and_then(|composition| composition.index_intent.as_ref())
+        {
+            validate_schema_index_decision(intent, decision)?;
+        }
+    }
     for decision in decisions.iter().filter(|d| d.schema.is_some()) {
         let reference = decision
             .schema
@@ -3514,6 +3586,10 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 .into());
             }
         } else if let Some(composition) = journal.compositions.get(&decision.database_txn_id) {
+            if let Some(intent) = &composition.index_intent {
+                validate_schema_index_decision(intent, decision)?;
+                continue;
+            }
             let intent = composition
                 .intent
                 .as_ref()
@@ -3571,6 +3647,25 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                     })
             })
         }))
+        .chain(journal.compositions.values().flat_map(|composition| {
+            composition
+                .index_intent
+                .as_ref()
+                .into_iter()
+                .flat_map(|intent| {
+                    intent
+                        .tables
+                        .iter()
+                        .filter_map(SchemaIndexTablePlan::replacement)
+                        .filter(|plan| plan.gc.is_some())
+                        .cloned()
+                        .map(|plan| RetiredHeapIntent::SchemaComposition {
+                            transaction: intent.transaction,
+                            snapshot_digest: intent.snapshot_digest.unwrap_or([0; 32]),
+                            plan: Box::new(plan),
+                        })
+                })
+        }))
         .collect::<Vec<_>>();
     durable_gc.sort_by_key(RetiredHeapIntent::transaction);
     for intent in durable_gc {
@@ -3584,6 +3679,18 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         let decision = decisions
             .iter()
             .find(|decision| decision.database_txn_id == txn);
+        if let Some(intent) = composition.index_intent.as_ref() {
+            recover_schema_index_composition(
+                catalog,
+                marker.incarnation,
+                &mut journal,
+                &mut coordinator,
+                &composition,
+                intent,
+                decision,
+            )?;
+            continue;
+        }
         if let Some(decision) = decision {
             let intent = composition
                 .intent
@@ -3742,16 +3849,35 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                         })
                 });
                 let later_composition = journal.compositions.values().find_map(|composition| {
-                    composition.intent.as_ref().and_then(|intent| {
-                        intent.tables.iter().find(|plan| {
-                            intent.transaction.0 > reservation.transaction.0
-                                && plan.table() == reservation.table
-                                && plan.old_storage() == reservation.storage
-                                && decisions
-                                    .iter()
-                                    .any(|decision| decision.database_txn_id == intent.transaction)
+                    composition
+                        .intent
+                        .as_ref()
+                        .and_then(|intent| {
+                            intent.tables.iter().find(|plan| {
+                                intent.transaction.0 > reservation.transaction.0
+                                    && plan.table() == reservation.table
+                                    && plan.old_storage() == reservation.storage
+                                    && decisions.iter().any(|decision| {
+                                        decision.database_txn_id == intent.transaction
+                                    })
+                            })
                         })
-                    })
+                        .or_else(|| {
+                            composition.index_intent.as_ref().and_then(|intent| {
+                                intent
+                                    .tables
+                                    .iter()
+                                    .filter_map(SchemaIndexTablePlan::replacement)
+                                    .find(|plan| {
+                                        intent.transaction.0 > reservation.transaction.0
+                                            && plan.table() == reservation.table
+                                            && plan.old_storage() == reservation.storage
+                                            && decisions.iter().any(|decision| {
+                                                decision.database_txn_id == intent.transaction
+                                            })
+                                    })
+                            })
+                        })
                 });
                 if later_drop.is_none() && later_rewrite.is_none() && later_composition.is_none() {
                     let active = file::load(catalog)?;
@@ -4097,6 +4223,450 @@ fn composition_reservation(
         }),
         resolved,
     }
+}
+
+fn schema_index_reservation(
+    intent: &SchemaIndexChangeSetIntent,
+    plan: &CompositionTablePlan,
+    resolved: Option<bool>,
+) -> Reservation {
+    Reservation {
+        transaction: intent.transaction,
+        table: plan.table(),
+        storage: plan.new_storage(),
+        base_generation: intent.base_generation,
+        base_epoch: intent.base_epoch,
+        intent: Some(CreateIntent {
+            fragment: plan.target.clone(),
+            snapshot_digest: intent.snapshot_digest.unwrap_or([0; 32]),
+        }),
+        resolved,
+    }
+}
+
+fn validate_schema_index_decision(
+    intent: &SchemaIndexChangeSetIntent,
+    decision: &crate::CoordinatorDecision,
+) -> Result<(), SchemaMutationError> {
+    if decision.schema.is_some() != intent.snapshot_digest.is_some() {
+        return Err(SchemaMutationError::Corrupt(
+            "schema/index coordinator reference presence mismatch",
+        ));
+    }
+    if let (Some(reference), Some(digest), Some(epoch)) = (
+        decision.schema.as_ref(),
+        intent.snapshot_digest,
+        intent.target_epoch,
+    ) {
+        let incarnation = intent
+            .tables
+            .iter()
+            .find_map(SchemaIndexTablePlan::replacement)
+            .map(|plan| plan.target.incarnation)
+            .ok_or(SchemaMutationError::Corrupt(
+                "schema/index reference without rewrite",
+            ))?;
+        if reference.incarnation != incarnation
+            || reference.target_epoch != epoch
+            || reference.digest != digest
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "schema/index coordinator reference mismatch",
+            ));
+        }
+    }
+    for plan in &intent.tables {
+        if !decision
+            .participants
+            .iter()
+            .any(|participant| participant.storage_id == plan.participant_storage())
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "schema/index decision participant mismatch",
+            ));
+        }
+    }
+    if decision.participants.len() != intent.tables.len() {
+        return Err(SchemaMutationError::Corrupt(
+            "schema/index decision has extra participant",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_schema_index_composition(
+    catalog: &Path,
+    incarnation: [u8; 16],
+    journal: &mut SchemaMutationJournal,
+    coordinator: &mut CoordinatorLog,
+    composition: &CompositionRecord,
+    intent: &SchemaIndexChangeSetIntent,
+    decision: Option<&crate::CoordinatorDecision>,
+) -> Result<(), DatabaseError> {
+    if let Some(decision) = decision {
+        validate_schema_index_decision(intent, decision)?;
+        if matches!(
+            composition.resolution,
+            Some(CompositionResolution::Loser | CompositionResolution::NoEffectiveChange)
+        ) {
+            return Err(
+                SchemaMutationError::Corrupt("schema/index loser has commit decision").into(),
+            );
+        }
+        if composition.resolution == Some(CompositionResolution::Winner) {
+            if !decision.complete
+                || intent.tables.iter().any(|plan| {
+                    plan.replacement()
+                        .is_some_and(|replacement| !replacement.retired)
+                })
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "resolved schema/index winner is incomplete",
+                )
+                .into());
+            }
+            let active = file::load(catalog)?;
+            if intent.target_generation.is_some() {
+                verify_schema_index_published(&active, intent, false)?;
+            }
+            let mut database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+            verify_current_schema_index_inventory(&mut database, intent, journal)?;
+            database.close()?;
+            cleanup_schema_index_prepared(catalog, incarnation, intent, Some(true))?;
+            return Ok(());
+        }
+
+        for plan in &intent.tables {
+            if let SchemaIndexTablePlan::RewriteHeap {
+                replacement,
+                base_indexes,
+                ..
+            } = plan
+            {
+                validate_schema_index_source(catalog, replacement, base_indexes)?;
+            }
+        }
+        let target = if let Some(reference) = decision.schema.as_ref() {
+            let prepared = file::resolve(
+                catalog,
+                &prepared_locator(catalog, incarnation, intent.transaction)?,
+            );
+            let bytes = file::read(&prepared)?;
+            if digest(&bytes) != reference.digest
+                || Some(reference.digest) != intent.snapshot_digest
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "prepared schema/index NBSC digest mismatch",
+                )
+                .into());
+            }
+            let target = SchemaCatalogSnapshot::decode(&bytes)?;
+            verify_schema_index_published(&target, intent, true)?;
+            for replacement in intent
+                .tables
+                .iter()
+                .filter_map(SchemaIndexTablePlan::replacement)
+            {
+                promote(
+                    catalog,
+                    &schema_index_reservation(intent, replacement, None),
+                    reference,
+                )?;
+            }
+            target
+        } else {
+            file::load(catalog)?
+        };
+        let mut database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
+        verify_schema_index_inventory(&mut database, intent)?;
+        database.close()?;
+        for replacement in intent
+            .tables
+            .iter()
+            .filter_map(SchemaIndexTablePlan::replacement)
+        {
+            validate_composition_source(catalog, replacement)?;
+            journal.retire_composition_table(intent.transaction, replacement.table())?;
+        }
+        if intent.target_generation.is_some() {
+            file::publish_runtime(catalog, &target)?;
+        }
+        coordinator.complete(intent.transaction)?;
+        journal.resolve_composition(intent.transaction, CompositionResolution::Winner)?;
+        cleanup_schema_index_prepared(catalog, incarnation, intent, Some(true))?;
+        return Ok(());
+    }
+
+    if composition.resolution == Some(CompositionResolution::Winner)
+        || intent.tables.iter().any(|plan| {
+            plan.replacement()
+                .is_some_and(|replacement| replacement.retired)
+        })
+    {
+        return Err(
+            SchemaMutationError::Corrupt("schema/index winner lacks coordinator decision").into(),
+        );
+    }
+    if composition.resolution.is_none() {
+        let active = file::load(catalog)?;
+        let mut database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+        verify_schema_index_base_inventory(&mut database, intent)?;
+        database.close()?;
+        for replacement in intent
+            .tables
+            .iter()
+            .filter_map(SchemaIndexTablePlan::replacement)
+        {
+            cleanup_staged_loser(
+                catalog,
+                &schema_index_reservation(intent, replacement, Some(false)),
+                incarnation,
+            )?;
+        }
+        cleanup_schema_index_prepared(catalog, incarnation, intent, Some(false))?;
+        journal.resolve_composition(intent.transaction, CompositionResolution::Loser)?;
+    }
+    Ok(())
+}
+
+fn cleanup_schema_index_prepared(
+    catalog: &Path,
+    incarnation: [u8; 16],
+    intent: &SchemaIndexChangeSetIntent,
+    resolved: Option<bool>,
+) -> Result<(), SchemaMutationError> {
+    if let Some(replacement) = intent
+        .tables
+        .iter()
+        .find_map(SchemaIndexTablePlan::replacement)
+    {
+        cleanup_prepared(
+            catalog,
+            &schema_index_reservation(intent, replacement, resolved),
+            incarnation,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_schema_index_inventory(
+    database: &mut Database,
+    intent: &SchemaIndexChangeSetIntent,
+) -> Result<(), DatabaseError> {
+    for plan in &intent.tables {
+        let (table, storage, expected) = match plan {
+            SchemaIndexTablePlan::RewriteHeap {
+                replacement,
+                final_indexes,
+                ..
+            } => (
+                replacement.table(),
+                replacement.new_storage(),
+                final_indexes,
+            ),
+            SchemaIndexTablePlan::InPlaceIndexDelta {
+                table,
+                storage,
+                final_indexes,
+                ..
+            } => (*table, *storage, final_indexes),
+        };
+        if !matches!(
+            database.bindings.placement(table)?,
+            TablePlacement::Single { storage_id, .. } if *storage_id == storage
+        ) {
+            return Err(
+                SchemaMutationError::Corrupt("schema/index recovered StorageId mismatch").into(),
+            );
+        }
+        let actual = database
+            .registry
+            .get_mut(storage)
+            .ok_or(SchemaMutationError::Corrupt(
+                "schema/index recovered Heap absent",
+            ))?
+            .heap_rewrite_indexes()?;
+        if actual != *expected {
+            return Err(
+                SchemaMutationError::Corrupt("schema/index recovered inventory mismatch").into(),
+            );
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    if database.registry.iter().any(|entry| {
+        entry.storage.indexes().iter().any(|index| {
+            index
+                .name
+                .as_ref()
+                .is_some_and(|name| !names.insert(name.clone()))
+        })
+    }) {
+        return Err(
+            SchemaMutationError::Corrupt("schema/index recovered global name collision").into(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_schema_index_base_inventory(
+    database: &mut Database,
+    intent: &SchemaIndexChangeSetIntent,
+) -> Result<(), DatabaseError> {
+    for plan in &intent.tables {
+        let (table, storage, expected) = match plan {
+            SchemaIndexTablePlan::RewriteHeap {
+                replacement,
+                base_indexes,
+                ..
+            } => (replacement.table(), replacement.old_storage(), base_indexes),
+            SchemaIndexTablePlan::InPlaceIndexDelta {
+                table,
+                storage,
+                base_indexes,
+                ..
+            } => (*table, *storage, base_indexes),
+        };
+        if !matches!(
+            database.bindings.placement(table)?,
+            TablePlacement::Single { storage_id, .. } if *storage_id == storage
+        ) {
+            return Err(
+                SchemaMutationError::Corrupt("schema/index base StorageId mismatch").into(),
+            );
+        }
+        let actual = database
+            .registry
+            .get_mut(storage)
+            .ok_or(SchemaMutationError::Corrupt(
+                "schema/index base Heap absent",
+            ))?
+            .heap_rewrite_indexes()?;
+        if actual != *expected {
+            return Err(
+                SchemaMutationError::Corrupt("schema/index base inventory mismatch").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_schema_index_source(
+    catalog: &Path,
+    replacement: &CompositionTablePlan,
+    expected: &HeapRewriteIndexes,
+) -> Result<(), DatabaseError> {
+    validate_composition_source(catalog, replacement)?;
+    let path = file::resolve(catalog, &replacement.base.storages[0].locator);
+    let table = replacement.base.committed.schema.tables()[0].clone();
+    let mut storage = TableStorage::open_heap(&path, table)?;
+    let actual = storage.heap_rewrite_indexes()?;
+    storage.close()?;
+    if actual != *expected {
+        return Err(SchemaMutationError::Corrupt(
+            "schema/index replacement base inventory mismatch",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_current_schema_index_inventory(
+    database: &mut Database,
+    intent: &SchemaIndexChangeSetIntent,
+    journal: &SchemaMutationJournal,
+) -> Result<(), DatabaseError> {
+    let current_tables = intent
+        .tables
+        .iter()
+        .filter(|plan| {
+            let table = plan.table();
+            let later_composition = journal.compositions.values().any(|later| {
+                later.transaction.0 > intent.transaction.0
+                    && later.resolution == Some(CompositionResolution::Winner)
+                    && (later.intent.as_ref().is_some_and(|later_intent| {
+                        later_intent
+                            .tables
+                            .iter()
+                            .any(|later_plan| later_plan.table() == table)
+                    }) || later.index_intent.as_ref().is_some_and(|later_intent| {
+                        later_intent
+                            .tables
+                            .iter()
+                            .any(|later_plan| later_plan.table() == table)
+                    }))
+            });
+            let later_rewrite = journal.rewrites.values().any(|later| {
+                later.reservation.transaction.0 > intent.transaction.0
+                    && later.resolved == Some(true)
+                    && later.table() == table
+            });
+            let later_drop = journal.drops.values().any(|later| {
+                later.transaction.0 > intent.transaction.0
+                    && later.resolved == Some(true)
+                    && later.table() == table
+            });
+            !(later_composition || later_rewrite || later_drop)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if current_tables.is_empty() {
+        return Ok(());
+    }
+    let current = SchemaIndexChangeSetIntent {
+        tables: current_tables,
+        ..intent.clone()
+    };
+    verify_schema_index_inventory(database, &current)
+}
+
+fn verify_schema_index_published(
+    snapshot: &SchemaCatalogSnapshot,
+    intent: &SchemaIndexChangeSetIntent,
+    exact: bool,
+) -> Result<(), DatabaseError> {
+    let target_generation = intent
+        .target_generation
+        .ok_or(SchemaMutationError::Corrupt(
+            "schema/index target generation absent",
+        ))?;
+    let target_epoch = intent.target_epoch.ok_or(SchemaMutationError::Corrupt(
+        "schema/index target epoch absent",
+    ))?;
+    if if exact {
+        snapshot.epoch != target_epoch || snapshot.committed.generation != target_generation
+    } else {
+        snapshot.epoch < target_epoch || snapshot.committed.generation < target_generation
+    } {
+        return Err(SchemaMutationError::Corrupt(
+            "published schema/index generation differs from intent",
+        )
+        .into());
+    }
+    if exact {
+        for replacement in intent
+            .tables
+            .iter()
+            .filter_map(SchemaIndexTablePlan::replacement)
+        {
+            if !snapshot
+                .committed
+                .schema
+                .tables()
+                .contains(&replacement.target.committed.schema.tables()[0])
+                || !snapshot
+                    .placements
+                    .tables
+                    .contains(&replacement.target.placements.tables[0])
+                || !snapshot.storages.contains(&replacement.target.storages[0])
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "published schema/index table differs from intent",
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_composition_reference(

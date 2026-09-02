@@ -42,6 +42,14 @@ pub enum TransactionState {
     RolledBack,
 }
 
+#[derive(Debug)]
+pub(crate) struct IndexTransactionState {
+    pub(crate) building: std::collections::HashSet<netbadb_types::IndexId>,
+    pub(crate) provisional: Vec<crate::heap::RegisteredIndexPlan>,
+    pub(crate) dropped: std::collections::HashSet<netbadb_types::IndexId>,
+    pub(crate) floor_before_advance: Option<netbadb_types::IndexId>,
+}
+
 /// A synchronous transaction handle with durable commit, snapshot reads, and
 /// physical runtime rollback. The single-writer rule prevents dirty-write
 /// dependencies while MVCC visibility hides uncommitted versions from peers.
@@ -60,7 +68,7 @@ pub struct Transaction {
     repeatable_read_view: Option<ReadView>,
     registered: bool,
     has_page_updates: bool,
-    pub(crate) building_indexes: std::collections::HashSet<netbadb_types::IndexId>,
+    pub(crate) index_state: Box<IndexTransactionState>,
     /// Never reusable by this transaction, even after steal or cache rebuild.
     pub(crate) retired_btree_pages: std::collections::HashSet<netbadb_types::PageRef>,
     rollback_start_lsn: Option<Lsn>,
@@ -71,6 +79,17 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    pub(crate) fn effective_index_plans(
+        &self,
+        committed: &[crate::heap::RegisteredIndexPlan],
+    ) -> Vec<crate::heap::RegisteredIndexPlan> {
+        committed
+            .iter()
+            .filter(|plan| !self.index_state.dropped.contains(&plan.definition.id))
+            .cloned()
+            .chain(self.index_state.provisional.iter().cloned())
+            .collect()
+    }
     #[must_use]
     pub fn id(&self) -> TxnId {
         self.id
@@ -837,7 +856,12 @@ impl TransactionManager {
             repeatable_read_view: None,
             registered: true,
             has_page_updates: false,
-            building_indexes: std::collections::HashSet::new(),
+            index_state: Box::new(IndexTransactionState {
+                building: std::collections::HashSet::new(),
+                provisional: Vec::new(),
+                dropped: std::collections::HashSet::new(),
+                floor_before_advance: None,
+            }),
             retired_btree_pages: std::collections::HashSet::new(),
             rollback_start_lsn: None,
             rollback_complete_lsn: None,

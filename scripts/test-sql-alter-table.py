@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 28 real-client ALTER-only composition acceptance."""
+"""Round 29 real-client schema/index composition acceptance."""
 from __future__ import annotations
 
 import io
@@ -29,35 +29,25 @@ def psql_probe(dsn: str) -> None:
         input="""\\set VERBOSITY verbose
 BEGIN;
 ALTER TABLE projects ADD COLUMN active BOOLEAN;
+CREATE INDEX projects_active_idx ON projects(active);
 ALTER TABLE projects RENAME COLUMN name TO title;
 ALTER TABLE projects ALTER COLUMN title SET NOT NULL;
 ALTER TABLE projects ALTER COLUMN title DROP NOT NULL;
 COMMIT;
 SELECT id, title, active FROM projects ORDER BY id;
+BEGIN;
+DROP INDEX projects_active_idx;
+ALTER TABLE projects DROP COLUMN active;
+COMMIT;
+SELECT id, title FROM projects ORDER BY id;
 """,
         text=True,
         capture_output=True,
     )
     assert composed.returncode == 0, composed.stderr
-    assert composed.stdout.strip() == "1|one|", composed.stdout
-    script = """
-BEGIN;
-ALTER TABLE projects RENAME COLUMN active TO enabled;
-ALTER TABLE projects RENAME TO work;
-INSERT INTO work VALUES (2, 'two', true);
-COMMIT;
-SELECT id, title, enabled FROM work ORDER BY id;
-"""
-    result = subprocess.run(
-        [PSQL, "-X", "-w", "-qAt", "-v", "ON_ERROR_STOP=1", dsn],
-        input=script,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    assert result.stdout.strip().splitlines() == ["1|one|", "2|two|t"], result.stdout
+    assert composed.stdout.strip().splitlines() == ["1|one|", "1|one"], composed.stdout
     print(
-        f"{version}: ALTER-only multi-statement transactions and post-final DML PASS"
+        f"{version}: ALTER + CREATE INDEX and DROP INDEX + DROP COLUMN transactions PASS"
     )
 
 
@@ -69,27 +59,22 @@ def psycopg_probe(dsn: str) -> None:
                 cursor.execute(
                     "ALTER TABLE projects ADD COLUMN active BOOLEAN", prepare=True
                 )
+                cursor.execute(
+                    "CREATE INDEX projects_active_idx ON projects(active)",
+                    prepare=True,
+                )
                 cursor.execute("ALTER TABLE projects RENAME COLUMN name TO title")
                 cursor.execute("ALTER TABLE projects ALTER COLUMN title SET NOT NULL")
         with connection.transaction():
             with connection.cursor() as cursor:
-                cursor.execute("ALTER TABLE projects RENAME COLUMN active TO enabled")
-                cursor.execute(
-                    "INSERT INTO projects VALUES (%s, %s, %s)",
-                    (2, "two", True),
-                    prepare=True,
-                )
+                cursor.execute("DROP INDEX projects_active_idx", prepare=True)
+                cursor.execute("ALTER TABLE projects DROP COLUMN active")
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id, title, enabled FROM projects ORDER BY id", prepare=True)
-            assert cursor.fetchall() == [(1, "one", None), (2, "two", True)]
+            cursor.execute("SELECT id, title FROM projects ORDER BY id", prepare=True)
+            assert cursor.fetchall() == [(1, "one")]
         connection.commit()
-        with connection.transaction():
-            with connection.cursor() as cursor:
-                cursor.execute("ALTER TABLE projects RENAME TO work")
-                cursor.execute("SELECT id, enabled FROM work ORDER BY id")
-                assert cursor.fetchall() == [(1, None), (2, True)]
     print(
-        f"psycopg {psycopg.__version__}: default and prepare=True multi-ALTER plus DML PASS"
+        f"psycopg {psycopg.__version__}: prepare=True mixed create/drop index transactions PASS"
     )
 
 
@@ -106,8 +91,18 @@ def sqlalchemy_probe(dsn: str) -> None:
             return rows[0][0]
 
     before_oid = table_oid("projects")
+    metadata = sa.MetaData()
+    projects = sa.Table(
+        "projects",
+        metadata,
+        sa.Column("id", sa.BigInteger(), nullable=False),
+        sa.Column("name", sa.Text()),
+        sa.Column("active", sa.Boolean()),
+    )
+    active_index = sa.Index("projects_active_idx", projects.c.active)
     with engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN active BOOLEAN")
+        active_index.create(connection)
         connection.exec_driver_sql("ALTER TABLE projects RENAME COLUMN name TO title")
         connection.exec_driver_sql("ALTER TABLE projects ALTER COLUMN title SET NOT NULL")
     add_oid = table_oid("projects")
@@ -126,14 +121,24 @@ def sqlalchemy_probe(dsn: str) -> None:
         ("title", False),
         ("active", True),
     ]
-    assert [
-        (index["name"], index["column_names"])
+    assert sorted(
+        (index["name"], tuple(index["column_names"]))
         for index in sa.inspect(engine).get_indexes("work")
-    ] == [("projects_name_idx", ["title"])]
+    ) == [
+        ("projects_active_idx", ("active",)),
+        ("projects_name_idx", ("title",)),
+    ]
+    with engine.begin() as connection:
+        active_index.drop(connection)
+        connection.exec_driver_sql("ALTER TABLE work DROP COLUMN active")
+    assert [column["name"] for column in sa.inspect(engine).get_columns("work")] == [
+        "id",
+        "title",
+    ]
     assert before_oid != add_oid and add_oid != rename_oid
     engine.dispose()
     print(
-        f"SQLAlchemy {sa.__version__}: multi-ALTER exec_driver_sql and reflection PASS; "
+        f"SQLAlchemy {sa.__version__}: Index.create/drop in mixed DDL transactions PASS; "
         f"fingerprint-keyed table OIDs {before_oid} -> {add_oid} -> {rename_oid}"
     )
 
@@ -146,7 +151,9 @@ def alembic_probe(dsn: str) -> None:
 
     @event.listens_for(engine, "before_cursor_execute")
     def capture(_connection, _cursor, statement, _parameters, _context, _many):
-        if statement.lstrip().upper().startswith(("ALTER TABLE", "CREATE INDEX")):
+        if statement.lstrip().upper().startswith(
+            ("ALTER TABLE", "CREATE INDEX", "DROP INDEX")
+        ):
             generated.append(" ".join(statement.split()))
 
     @event.listens_for(engine, "begin")
@@ -192,43 +199,41 @@ def alembic_probe(dsn: str) -> None:
         operations.add_column("projects", sa.Column("blocked", sa.Boolean(), nullable=True))
         operations.alter_column("projects", "name", new_column_name="display_name")
         operations.alter_column("projects", "display_name", nullable=False)
+        operations.create_index("projects_blocked_idx", "projects", ["blocked"])
     assert boundaries == ["BEGIN", "COMMIT"], boundaries
-    assert generated == planned_sql[:3], generated
+    assert generated == planned_sql, generated
     assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("projects")] == [
         ("id", False),
         ("display_name", False),
         ("blocked", True),
+    ]
+    assert ("projects_blocked_idx", ["blocked"]) in [
+        (index["name"], index["column_names"])
+        for index in sa.inspect(engine).get_indexes("projects")
     ]
 
     generated.clear()
     boundaries.clear()
-    try:
-        with engine.begin() as connection:
-            operations = Operations(MigrationContext.configure(connection))
-            operations.add_column("projects", sa.Column("doomed", sa.Boolean(), nullable=True))
-            operations.create_index("projects_doomed_idx", "projects", ["doomed"])
-    except sa.exc.DBAPIError as error:
-        assert isinstance(error.orig, psycopg.errors.FeatureNotSupported), error
-        assert error.orig.sqlstate == "0A000", error
-    else:
-        raise AssertionError("ALTER + CREATE INDEX unexpectedly succeeded")
-    assert boundaries == ["BEGIN", "ROLLBACK"], boundaries
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        operations.drop_index("projects_blocked_idx", table_name="projects")
+        operations.drop_column("projects", "blocked")
+    assert boundaries == ["BEGIN", "COMMIT"], boundaries
     assert generated == [
-        "ALTER TABLE projects ADD COLUMN doomed BOOLEAN",
-        "CREATE INDEX projects_doomed_idx ON projects (doomed)",
+        "DROP INDEX projects_blocked_idx",
+        "ALTER TABLE projects DROP COLUMN blocked",
     ], generated
     assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("projects")] == [
         ("id", False),
         ("display_name", False),
-        ("blocked", True),
     ]
-    assert "projects_doomed_idx" not in {
+    assert "projects_blocked_idx" not in {
         index["name"] for index in sa.inspect(engine).get_indexes("projects")
     }
     print(
-        f"Alembic {alembic.__version__}: pure multi-ALTER migration PASS; plan is "
+        f"Alembic {alembic.__version__}: schema + index composition PASS; plan is "
         + " | ".join(planned_sql)
-        + "; ALTER + CREATE INDEX remains 0A000 and rolls back"
+        + "; DROP INDEX projects_blocked_idx | ALTER TABLE projects DROP COLUMN blocked"
     )
     engine.dispose()
 

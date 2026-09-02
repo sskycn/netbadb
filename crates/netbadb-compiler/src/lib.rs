@@ -5,14 +5,14 @@ use std::fmt;
 
 pub use netbadb_hir::{
     DropIndexTarget, IndexNameBinding, TableIdentityBinding, TypedAlterTable,
-    TypedAlterTableOperation, TypedCreateTable, TypedDropIndex, TypedDropTable,
+    TypedAlterTableOperation, TypedCreateIndex, TypedCreateTable, TypedDropIndex, TypedDropTable,
 };
 
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
     NullOrder as HirNullOrder, ParameterMetadata, SortDirection as HirSortDirection,
-    TypedAggregate, TypedAggregateInput, TypedCreateIndex, TypedExpr, TypedExprKind,
-    TypedProjectionItem, TypedQuery, TypedRelation, TypedStatement,
+    TypedAggregate, TypedAggregateInput, TypedExpr, TypedExprKind, TypedProjectionItem, TypedQuery,
+    TypedRelation, TypedStatement,
 };
 use netbadb_parser::{ParseError, parse, parse_statement};
 use netbadb_rel::{
@@ -306,7 +306,7 @@ fn compile_ddl_ast(
                 .map_err(CompileError::from)
         }
         netbadb_parser::Statement::CreateIndex(statement) => {
-            netbadb_hir::lower_create_index(schema, &statement)
+            netbadb_hir::lower_create_index(schema, &statement, tables)
                 .map(CompiledDdlStatement::CreateIndex)
                 .map_err(CompileError::from)
         }

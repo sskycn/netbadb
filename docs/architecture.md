@@ -242,7 +242,16 @@ overlays can touch one or many tables; global materialization performs one
 base-to-final rewrite per dirty table, prepares one NBSC, and records one CORD v2
 schema decision. NBSJ v1 tags 16–23 retain logical reservations, the typed final
 plan, predecessor retirement, resolution, and replacement GC progress. CREATE/
-DROP table or index mixing remains outside this boundary.
+DROP table mixing remains outside this boundary.
+
+[Round 29](schema-index-composition-round29.md) adds CREATE/DROP INDEX to the same
+ordered aggregate. Accepted CREATE reserves its logical IndexId durably before the
+overlay changes, while physical work waits for global materialization. A schema-
+dirty table builds one replacement Heap directly from the final index inventory;
+an index-only table keeps its StorageId and contributes one Heap physical
+participant. IndexCatalog v9 remains committed allocator authority, with retained
+NBSJ reservations supplying the post-catalog effective floor. One CORD v2 decision
+coordinates both strategies, and index-only transactions carry no fake NBSC.
 
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;

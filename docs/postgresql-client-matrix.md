@@ -55,7 +55,8 @@ production or build dependencies.
 | Basic Heap ALTER TABLE | yes, bounded fixture | six exact-prepared actions; Simple/Extended Query; transactional |
 | SQLAlchemy ALTER transport/reflection | yes | `exec_driver_sql`; Inspector sees committed rename/columns/indexes |
 | ALTER-only multi-statement transaction | yes, bounded | same/cross-table Core composition; one final rewrite per dirty table |
-| Alembic table operations | bounded | pure multi-ALTER transaction succeeds; ALTER plus table/index DDL fails and rolls back |
+| ALTER + CREATE/DROP INDEX transaction | yes, bounded | psql, psycopg `prepare=True`, SQLAlchemy `Index.create/drop`, and Alembic Operations |
+| Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
@@ -158,6 +159,9 @@ CARGO_TARGET_DIR=/private/tmp/netbadb-round19-target \
 Install the exact existing `scripts/requirements-postgresql-orm.txt` dependencies.
 The prior psql/ORM/Alembic index-only regression scripts continue on separate fresh
 `postgres_driver_fixture` databases with explicit schema_admin and table grants.
+`scripts/test-sql-alter-table.py` additionally runs Round 29 mixed transactions
+through psql 17.11, psycopg 3.2.13, SQLAlchemy 2.0.52, and Alembic 1.16.5, then
+performs three catalog-only reopens for each fresh fixture.
 
 ## Round 21 real DROP TABLE fixture
 
@@ -166,4 +170,5 @@ one DROP, commit one DROP, and verify absence. psycopg also forces Extended Quer
 with public `prepare=True`; SQLAlchemy uses its native PostgreSQL dialect and
 `Table.drop(connection, checkfirst=False)`. psql checks missing-table, failed-transaction
 `42P01`/`25P02` behavior, and unsupported IF EXISTS/CASCADE forms. The existing
-Alembic script remains index-only.
+The standalone Alembic script remains index-only; the Round 29 ALTER fixture
+separately covers mixed schema/index Operations.

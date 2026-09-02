@@ -832,7 +832,20 @@ materialization. Pure no-op commits publish nothing. CREATE/DROP/index mixing,
 LSM/partition/imported ALTER, online mixed schemas, physical conversions, defaults,
 column reorder, savepoints, and journal/log compaction remain deferred.
 
-Next: **Round 29 — Schema + Index DDL Composition Foundation**.
+### Schema + index DDL composition foundation — Round 29
+
+[Round 29](schema-index-composition-round29.md) extends the Round 28 logical
+aggregate with CREATE/DROP INDEX. It reserves IndexId at accepted execution,
+composes a transaction-local final inventory, builds replacement Heaps directly
+with final indexes, and uses one in-place Heap participant for each index-only
+table. Index-only commits preserve NBSC generation/epoch, table version, and
+StorageId while advancing runtime revision once. NBSJ v1 adds distinct tags 24/25;
+CORD v2 and IndexCatalog v9 remain unchanged.
+
+Next: **Round 30 — CREATE/DROP TABLE Composition Foundation**. The first target is
+one final created Heap for CREATE TABLE + ALTER + CREATE INDEX, plus CREATE/DROP and
+ALTER/DROP elision with permanently consumed logical identities. Any remaining
+IndexId or in-place participant recovery gap takes priority over table composition.
 
 ## Phase 6 — SDK and tooling
 

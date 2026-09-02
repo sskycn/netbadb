@@ -113,7 +113,7 @@ impl HeapStorage {
         self.validate_transaction(transaction)?;
         transaction.acquire_writer()?;
         if !self.indexes.iter().any(|index| index.id == owner)
-            && !transaction.building_indexes.contains(&owner)
+            && !transaction.index_state.building.contains(&owner)
         {
             return Err(IndexError::UnknownIndexId(owner).into());
         }

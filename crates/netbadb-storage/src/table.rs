@@ -1168,6 +1168,21 @@ impl TableStorage {
         }
     }
 
+    pub fn create_index_from_floor(
+        &mut self,
+        name: Option<IndexName>,
+        column_id: ColumnId,
+        floor: IndexId,
+    ) -> Result<IndexDefinition, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.create_index_from_floor(name, column_id, floor),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "create B+Tree access method from durable floor",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     pub fn create_named_index_in(
         &mut self,
         transaction: &mut StorageTransaction,
@@ -1185,6 +1200,50 @@ impl TableStorage {
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    pub fn create_named_index_with_reserved_id_in(
+        &mut self,
+        transaction: &mut StorageTransaction,
+        name: IndexName,
+        column_id: ColumnId,
+        id: IndexId,
+        next_index_id: IndexId,
+    ) -> Result<IndexDefinition, StorageError> {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                storage.create_named_index_with_reserved_id_in(
+                    transaction.heap_transaction_mut(table_id)?,
+                    name,
+                    column_id,
+                    id,
+                    next_index_id,
+                )
+            }
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "create reserved B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
+    pub fn advance_index_id_floor_in(
+        &mut self,
+        transaction: &mut StorageTransaction,
+        target: IndexId,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                storage
+                    .advance_index_id_floor_in(transaction.heap_transaction_mut(table_id)?, target)
+            }
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "advance B+Tree IndexId floor",
                 storage_kind: "LSM",
             }),
         }
@@ -1396,12 +1455,20 @@ fn access_path_id(handle: BTreeHandle) -> AccessPathId {
 }
 
 fn registered_handle(
-    storage: &HeapStorage,
+    storage: &mut HeapStorage,
     access_path: AccessPathId,
 ) -> Result<BTreeHandle, StorageError> {
-    storage
+    if let Some(handle) = storage
         .indexes()
         .iter()
+        .find(|definition| access_path_id(definition.handle) == access_path)
+        .map(|definition| definition.handle)
+    {
+        return Ok(handle);
+    }
+    storage
+        .rewrite_indexes_with_definitions()?
+        .into_iter()
         .find(|definition| access_path_id(definition.handle) == access_path)
         .map(|definition| definition.handle)
         .ok_or(StorageError::UnknownAccessPath {

@@ -216,10 +216,10 @@ impl PresenceProjection {
 }
 
 #[derive(Debug, Clone)]
-struct RegisteredIndexPlan {
-    definition: IndexDefinition,
-    column_position: usize,
-    spec: IndexSpec,
+pub(crate) struct RegisteredIndexPlan {
+    pub(crate) definition: IndexDefinition,
+    pub(crate) column_position: usize,
+    pub(crate) spec: IndexSpec,
 }
 
 #[derive(Debug)]
@@ -573,6 +573,17 @@ impl HeapStorage {
         })
     }
 
+    pub(crate) fn rewrite_indexes_with_definitions(
+        &mut self,
+    ) -> Result<Vec<IndexDefinition>, StorageError> {
+        Ok(self
+            .load_index_registry(self.index_catalog_root)?
+            .1
+            .into_iter()
+            .map(|entry| entry.definition)
+            .collect())
+    }
+
     #[must_use]
     pub fn storage_id(&self) -> StorageId {
         self.storage_id
@@ -617,6 +628,36 @@ impl HeapStorage {
         self.create_index_with_name(Some(name), column_id)
     }
 
+    pub(crate) fn create_index_from_floor(
+        &mut self,
+        name: Option<IndexName>,
+        column_id: ColumnId,
+        floor: IndexId,
+    ) -> Result<IndexDefinition, StorageError> {
+        self.validate_index_creation(name.as_ref(), column_id)?;
+        let committed = self
+            .read_index_catalog(self.index_catalog_root)?
+            .next_index_id;
+        if floor < committed {
+            return Err(IndexError::InvalidIndexHighWater(floor).into());
+        }
+        let next = IndexId(floor.0.checked_add(1).ok_or(IndexError::IndexIdExhausted)?);
+        let mut transaction = self.begin_transaction()?;
+        let result = self.build_index_with_id_in(&mut transaction, name, column_id, floor, next);
+        match result {
+            Ok(plan) => {
+                transaction.commit()?;
+                let definition = plan.definition.clone();
+                self.publish_committed_index_plan(plan);
+                Ok(definition)
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
+        }
+    }
+
     fn create_index_with_name(
         &mut self,
         name: Option<IndexName>,
@@ -649,6 +690,47 @@ impl HeapStorage {
     ) -> Result<IndexDefinition, StorageError> {
         self.build_index_in(transaction, Some(name), column_id)
             .map(|plan| plan.definition)
+    }
+
+    pub(crate) fn create_named_index_with_reserved_id_in(
+        &mut self,
+        transaction: &mut Transaction,
+        name: IndexName,
+        column_id: ColumnId,
+        id: IndexId,
+        next_index_id: IndexId,
+    ) -> Result<IndexDefinition, StorageError> {
+        self.build_index_with_id_in(transaction, Some(name), column_id, id, next_index_id)
+            .map(|plan| plan.definition)
+    }
+
+    pub(crate) fn advance_index_id_floor_in(
+        &mut self,
+        transaction: &mut Transaction,
+        target: IndexId,
+    ) -> Result<(), StorageError> {
+        if target.0 == 0 {
+            return Err(IndexError::InvalidIndexHighWater(target).into());
+        }
+        self.validate_transaction(transaction)?;
+        transaction.acquire_writer()?;
+        let catalog = self.read_index_catalog(self.index_catalog_root)?;
+        transaction
+            .index_state
+            .floor_before_advance
+            .get_or_insert(catalog.next_index_id);
+        if target < catalog.next_index_id {
+            return Err(IndexError::InvalidIndexHighWater(target).into());
+        }
+        if target == catalog.next_index_id {
+            return Ok(());
+        }
+        let page = self.buffer.read_page(self.index_catalog_root)?;
+        let before = page.page().clone();
+        let mut node = decode_index_catalog(page.page().single_payload(PageType::IndexCatalog)?)?;
+        drop(page);
+        node.next_index_id = Some(target);
+        self.write_catalog_node_in(transaction, self.index_catalog_root, before, node)
     }
 
     pub(crate) fn install_rewrite_indexes_in(
@@ -689,7 +771,7 @@ impl HeapStorage {
         for index in &snapshot.active {
             let (column_position, spec) =
                 self.validate_index_creation(index.name.as_ref(), index.column_id)?;
-            transaction.building_indexes.insert(index.id);
+            transaction.index_state.building.insert(index.id);
             let handle = self
                 .btree()
                 .create_owned_in(transaction, spec.clone(), index.id)?;
@@ -715,24 +797,76 @@ impl HeapStorage {
         name: Option<IndexName>,
         column_id: ColumnId,
     ) -> Result<RegisteredIndexPlan, StorageError> {
-        let (column_position, spec) = self.validate_index_creation(name.as_ref(), column_id)?;
+        let catalog = self.read_index_catalog(self.index_catalog_root)?;
+        let id = catalog.next_index_id;
+        let next = IndexId(id.0.checked_add(1).ok_or(IndexError::IndexIdExhausted)?);
+        self.build_index_with_id_in(transaction, name, column_id, id, next)
+    }
 
+    fn build_index_with_id_in(
+        &mut self,
+        transaction: &mut Transaction,
+        name: Option<IndexName>,
+        column_id: ColumnId,
+        id: IndexId,
+        next_index_id: IndexId,
+    ) -> Result<RegisteredIndexPlan, StorageError> {
+        let (column_position, spec) = self
+            .table
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.id == column_id)
+            .map(|(position, column)| {
+                (
+                    position,
+                    IndexSpec {
+                        data_type: column.semantic_type(),
+                        nullable: column.nullable,
+                    },
+                )
+            })
+            .ok_or(IndexError::UnknownIndexColumn { column_id })?;
+        if id.0 == 0 || next_index_id.0 <= id.0 {
+            return Err(IndexError::InvalidIndexHighWater(next_index_id).into());
+        }
         self.validate_transaction(transaction)?;
         transaction.acquire_writer()?;
         (|| {
             let catalog = self.read_index_catalog(self.index_catalog_root)?;
-            let id = catalog.next_index_id;
-            let next = IndexId(id.0.checked_add(1).ok_or(IndexError::IndexIdExhausted)?);
-            // Reserve the ID in the SAME transaction as the tree and registration.
-            // A rollback can reuse an unpublished ID; committed IDs never decrease.
-            let page = self.buffer.read_page(self.index_catalog_root)?;
-            let before = page.page().clone();
-            let mut node =
-                decode_index_catalog(page.page().single_payload(PageType::IndexCatalog)?)?;
-            drop(page);
-            node.next_index_id = Some(next);
-            self.write_catalog_node_in(transaction, self.index_catalog_root, before, node)?;
-            transaction.building_indexes.insert(id);
+            if catalog
+                .entries
+                .iter()
+                .any(|entry| entry.definition.id == id)
+                || id
+                    < transaction
+                        .index_state
+                        .floor_before_advance
+                        .unwrap_or(catalog.next_index_id)
+                || next_index_id < catalog.next_index_id
+            {
+                return Err(IndexError::InvalidIndexHighWater(next_index_id).into());
+            }
+            if catalog
+                .entries
+                .iter()
+                .filter(|entry| !entry.retired)
+                .any(|entry| entry.definition.column_id == column_id)
+            {
+                return Err(IndexError::IndexAlreadyExists { column_id }.into());
+            }
+            if let Some(name) = &name {
+                if catalog
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.retired)
+                    .any(|entry| entry.definition.name.as_ref() == Some(name))
+                {
+                    return Err(IndexError::IndexNameAlreadyExists { name: name.clone() }.into());
+                }
+            }
+            self.advance_index_id_floor_in(transaction, next_index_id)?;
+            transaction.index_state.building.insert(id);
             let handle = self
                 .btree()
                 .create_owned_in(transaction, spec.clone(), id)?;
@@ -754,11 +888,13 @@ impl HeapStorage {
                 crate::crash_test::TestCrashPoint::IndexBuildBeforeCatalogLog,
             );
             self.append_index_definition(transaction, &definition)?;
-            Ok(RegisteredIndexPlan {
+            let plan = RegisteredIndexPlan {
                 definition,
                 column_position,
                 spec: spec.clone(),
-            })
+            };
+            transaction.index_state.provisional.push(plan.clone());
+            Ok(plan)
         })()
     }
 
@@ -1649,6 +1785,7 @@ impl HeapStorage {
                     crate::crash_test::TestCrashPoint::IndexDropBeforeCatalogLog,
                 );
                 self.write_catalog_node_in(transaction, page_id, before, node)?;
+                transaction.index_state.dropped.insert(id);
                 #[cfg(test)]
                 {
                     crate::crash_test::maybe_crash(
@@ -1825,7 +1962,7 @@ impl HeapStorage {
             .into());
         }
         transaction.acquire_writer()?;
-        let plans = self.index_plans.clone();
+        let plans = transaction.effective_index_plans(&self.index_plans);
         for plan in &plans {
             ensure_key_fits(
                 &plan.spec,
@@ -1949,7 +2086,7 @@ impl HeapStorage {
             .into());
         }
         transaction.acquire_writer()?;
-        let plans = self.index_plans.clone();
+        let plans = transaction.effective_index_plans(&self.index_plans);
         for plan in &plans {
             let old_key = &old_values[plan.column_position];
             let new_key = &values[plan.column_position];
@@ -2095,7 +2232,7 @@ impl HeapStorage {
             .read_row_with_view(row_id, &view)?
             .ok_or(StorageError::RowNotFound { row_id })?;
         transaction.acquire_writer()?;
-        let plans = self.index_plans.clone();
+        let plans = transaction.effective_index_plans(&self.index_plans);
         for plan in &plans {
             if !self.btree().contains_exact(
                 plan.definition.handle,
@@ -3306,8 +3443,8 @@ mod tests {
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{
-        ColumnId, DatabaseTxnId, IndexName, Lsn, PageId, PhysicalType, ScalarRef, ScalarValue,
-        SemanticType, StorageId, TableId,
+        ColumnId, DatabaseTxnId, IndexId, IndexName, Lsn, PageId, PhysicalType, ScalarRef,
+        ScalarValue, SemanticType, StorageId, TableId,
     };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
@@ -4113,6 +4250,43 @@ mod tests {
         storage.close().expect("close empty index");
         let reopened = HeapStorage::open(&path, indexed_table()).expect("reopen empty index");
         assert_eq!(reopened.indexes(), std::slice::from_ref(&definition));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reserved_index_create_rejects_an_id_below_the_committed_floor() {
+        let path = test_path("reserved-index-below-floor");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).expect("create empty heap");
+        let mut reservation = storage.begin_transaction().expect("begin reservation");
+        storage
+            .advance_index_id_floor_in(&mut reservation, IndexId(5))
+            .expect("advance committed floor");
+        reservation.commit().expect("commit floor");
+
+        let mut transaction = storage.begin_transaction().expect("begin exact create");
+        assert!(matches!(
+            storage.create_named_index_with_reserved_id_in(
+                &mut transaction,
+                IndexName::new("stale_reserved_idx").unwrap(),
+                ColumnId(2),
+                IndexId(3),
+                IndexId(6),
+            ),
+            Err(StorageError::Index(IndexError::InvalidIndexHighWater(
+                IndexId(6)
+            )))
+        ));
+        transaction.rollback().expect("rollback rejected create");
+        assert!(storage.indexes().is_empty());
+        assert_eq!(
+            storage
+                .rewrite_indexes()
+                .expect("read committed floor")
+                .next_index_id,
+            IndexId(5)
+        );
+        storage.close().expect("close empty heap");
         cleanup(&path);
     }
 

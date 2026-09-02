@@ -253,7 +253,7 @@ fn resolve_declared_type(name: &Ident) -> Result<SemanticType, HirError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedCreateIndex {
     pub name: IndexName,
-    pub table_id: TableId,
+    pub target: DropTableTarget,
     pub table_name: String,
     pub column_id: ColumnId,
     pub column_name: String,
@@ -904,6 +904,7 @@ pub fn lower_statement_with_parameters(
 pub fn lower_create_index(
     schema: &Schema,
     statement: &AstCreateIndexStatement,
+    tables: &[TableIdentityBinding],
 ) -> Result<TypedCreateIndex, HirError> {
     if statement
         .table
@@ -925,6 +926,14 @@ pub fn lower_create_index(
         });
     }
     let table = resolve_table(schema, &statement.table.name)?;
+    let target = tables
+        .iter()
+        .find(|binding| binding.target.table_id == table.id)
+        .map(|binding| binding.target)
+        .ok_or_else(|| HirError::UnknownTable {
+            name: statement.table.name.name.clone(),
+            span: statement.table.span,
+        })?;
     let column = table
         .columns
         .iter()
@@ -942,7 +951,7 @@ pub fn lower_create_index(
     })?;
     Ok(TypedCreateIndex {
         name,
-        table_id: table.id,
+        target,
         table_name: table.name.clone(),
         column_id: column.id,
         column_name: column.name.clone(),

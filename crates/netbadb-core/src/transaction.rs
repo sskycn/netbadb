@@ -260,6 +260,7 @@ impl DatabaseTransaction {
         if self.write_participants.len() > 1
             || self.schema_mutation.is_some()
             || self.schema_composition.materialized().is_some()
+            || self.schema_composition.materialized_index().is_some()
         {
             return self.commit_multi_write();
         }
@@ -423,6 +424,12 @@ impl DatabaseTransaction {
                 composition.prepare()?;
                 crate::schema_mutation::crash("composition-before-coordinator-decision");
                 crate::schema_mutation::crash("before-coordinator-decision");
+            } else if let Some(composition) = self.schema_composition.materialized_index() {
+                crate::schema_mutation::crash("composition-participants-prepared");
+                crate::schema_mutation::crash("participants-prepared");
+                composition.prepare()?;
+                crate::schema_mutation::crash("composition-before-coordinator-decision");
+                crate::schema_mutation::crash("before-coordinator-decision");
             }
             self.state = TransactionState::DecisionPending;
         }
@@ -462,12 +469,21 @@ impl DatabaseTransaction {
                     &decision_participants,
                     Some(&composition.reference),
                 )?;
+            } else if let Some(composition) = self.schema_composition.materialized_index() {
+                log.commit_schema_decision(
+                    self.id,
+                    &decision_participants,
+                    composition.reference.as_ref(),
+                )?;
             } else {
                 log.commit_decision(self.id, &decision_participants)?;
             }
             drop(log);
             self.state = TransactionState::CommitDecided;
-            if self.schema_mutation.is_some() || self.schema_composition.materialized().is_some() {
+            if self.schema_mutation.is_some()
+                || self.schema_composition.materialized().is_some()
+                || self.schema_composition.materialized_index().is_some()
+            {
                 crate::schema_mutation::crash("coordinator-durable");
             }
             #[cfg(test)]
@@ -495,12 +511,18 @@ impl DatabaseTransaction {
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash("after-all-commits");
             self.state = TransactionState::FinalizePending;
-            if self.schema_mutation.is_some() || self.schema_composition.materialized().is_some() {
+            if self.schema_mutation.is_some()
+                || self.schema_composition.materialized().is_some()
+                || self.schema_composition.materialized_index().is_some()
+            {
                 crate::schema_mutation::crash("staged-heap-committed");
             }
         }
 
-        if self.schema_mutation.is_some() || self.schema_composition.materialized().is_some() {
+        if self.schema_mutation.is_some()
+            || self.schema_composition.materialized().is_some()
+            || self.schema_composition.materialized_index().is_some()
+        {
             return Ok(());
         }
         self.coordinator
@@ -606,13 +628,16 @@ impl DatabaseTransaction {
             return Err(SchemaMutationError::Corrupt("duplicate staged participant").into());
         }
         let context = storage.begin_transaction_with_isolation(self.isolation_level)?;
-        let materialized =
-            self.schema_composition
-                .materialized_mut()
-                .ok_or(SchemaMutationError::Corrupt(
-                    "composed enlist outside materialization",
-                ))?;
-        if materialized.staged.insert(id, storage).is_some() {
+        let duplicate = if let Some(materialized) = self.schema_composition.materialized_mut() {
+            materialized.staged.insert(id, storage).is_some()
+        } else if let Some(materialized) = self.schema_composition.materialized_index_mut() {
+            materialized.staged.insert(id, storage).is_some()
+        } else {
+            return Err(
+                SchemaMutationError::Corrupt("composed enlist outside materialization").into(),
+            );
+        };
+        if duplicate {
             return Err(SchemaMutationError::Corrupt("duplicate composed Heap").into());
         }
         self.participants.insert(
@@ -628,8 +653,18 @@ impl DatabaseTransaction {
     pub(crate) fn execution_staged_storages_mut(
         &mut self,
     ) -> Vec<&mut netbadb_storage::TableStorage> {
-        if let Some(materialized) = self.schema_composition.materialized_mut() {
-            return materialized.staged.values_mut().collect();
+        match &mut self.schema_composition {
+            SchemaCompositionState::SealingAndMaterializing(materialized)
+            | SchemaCompositionState::Materialized(materialized)
+            | SchemaCompositionState::RollbackRequiredMaterialized(materialized) => {
+                return materialized.staged.values_mut().collect();
+            }
+            SchemaCompositionState::SealingAndMaterializingIndex(materialized)
+            | SchemaCompositionState::MaterializedIndex(materialized)
+            | SchemaCompositionState::RollbackRequiredMaterializedIndex(materialized) => {
+                return materialized.staged.values_mut().collect();
+            }
+            _ => {}
         }
         self.schema_mutation
             .as_mut()
@@ -679,13 +714,20 @@ impl DatabaseTransaction {
             .get_mut(&storage_id)
             .ok_or(CoordinatorError::UnknownStorageId { storage_id })?
             .context;
-        let storage = self
+        let storage = if let Some(storage) = self
             .schema_composition
             .materialized_mut()
             .and_then(|materialized| materialized.staged.get_mut(&storage_id))
-            .ok_or(SchemaMutationError::Corrupt(
-                "composed staged Heap is absent",
-            ))?;
+        {
+            storage
+        } else {
+            self.schema_composition
+                .materialized_index_mut()
+                .and_then(|materialized| materialized.staged.get_mut(&storage_id))
+                .ok_or(SchemaMutationError::Corrupt(
+                    "composed staged Heap is absent",
+                ))?
+        };
         Ok(operation(storage, context)?)
     }
     /// Whether this active transaction privately owns a staged table identity.
@@ -710,6 +752,25 @@ impl DatabaseTransaction {
                     .iter()
                     .find(|plan| plan.table() == table)
                     .map(|plan| plan.new_storage())
+            })
+            .or_else(|| {
+                self.schema_composition
+                    .materialized_index()
+                    .and_then(|materialized| {
+                        materialized
+                            .intent
+                            .tables
+                            .iter()
+                            .find_map(|plan| {
+                                match plan {
+                            crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap {
+                                replacement,
+                                ..
+                            } if replacement.table() == table => Some(replacement.new_storage()),
+                            _ => None,
+                        }
+                            })
+                    })
             })
             .or_else(|| {
                 self.schema_mutation
@@ -772,15 +833,22 @@ impl DatabaseTransaction {
         {
             Some(storage) => storage,
             None => match self
-                .schema_mutation
-                .as_mut()
-                .and_then(|m| m.staged.as_mut())
-                .filter(|s| s.storage_id() == storage_id)
+                .schema_composition
+                .materialized_index_mut()
+                .and_then(|materialized| materialized.staged.get_mut(&storage_id))
             {
                 Some(storage) => storage,
-                None => registry
-                    .get_mut(storage_id)
-                    .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+                None => match self
+                    .schema_mutation
+                    .as_mut()
+                    .and_then(|m| m.staged.as_mut())
+                    .filter(|s| s.storage_id() == storage_id)
+                {
+                    Some(storage) => storage,
+                    None => registry
+                        .get_mut(storage_id)
+                        .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+                },
             },
         };
         Ok(operation(storage, context)?)
@@ -825,6 +893,11 @@ impl DatabaseTransaction {
                 .schema_composition
                 .materialized()
                 .map(|materialized| materialized.staged.keys().copied().collect::<Vec<_>>())
+                .or_else(|| {
+                    self.schema_composition
+                        .materialized_index()
+                        .map(|materialized| materialized.staged.keys().copied().collect::<Vec<_>>())
+                })
                 .unwrap_or_default();
             for storage_id in staged {
                 self.participants.remove(&storage_id);

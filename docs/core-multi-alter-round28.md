@@ -99,10 +99,12 @@ supported.
 
 ## Supported and deferred
 
-The supported scope is ALTER-only composition over runtime-created Single Heaps,
+The Round 28 supported scope was ALTER-only composition over runtime-created Single Heaps,
 including same-table and cross-table actions and post-final-ALTER DML. CREATE/DROP
 TABLE mixing, CREATE/DROP INDEX mixing, multiple index DDL, savepoints, defaults or
 backfill, physical conversion, constraints, LSM/range/imported storage, online
 schema evolution, cross-process writers, automatic GC, and NBSJ/CORD compaction are
-deferred. Alembic pure multi-ALTER transactions fit this boundary; an ALTER plus
-index migration still fails and rolls back atomically.
+deferred by that round. [Round 29](schema-index-composition-round29.md) now extends
+the same aggregate with logical CREATE/DROP INDEX, durable IndexId reservations,
+final replacement inventories, and index-only in-place participants; CREATE/DROP
+TABLE composition remains deferred.

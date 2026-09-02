@@ -231,6 +231,24 @@ and records tag 21. Without a decision it cleans only exact tag-17 staging paths
 and records tag 19. Composition predecessors use the same explicit replacement
 GC component manifest and coordinator-horizon proof through tags 22/23.
 
+Round 29 keeps tag 17 byte-for-byte as the Round 28 schema-only aggregate. Tag 24
+is a table-scoped IndexId reservation containing DatabaseTxnId, exact
+TableId/version/fingerprint, accepted IndexId, and its checked successor. Tag 25 is
+a distinct schema/index aggregate: optional target generation/epoch/NBSC digest,
+canonical TableId-ordered `RewriteHeap` or `InPlaceIndexDelta` plans, exact base and
+final index inventories, participant StorageIds, and allocator floors. It contains
+no SQL or physical B+Tree page identity. Index-only intent has no NBSC target.
+
+Tags 18–23 are reused for the new aggregate only after their validators were made
+generic over exactly one of tag 17 or tag 25. A rewrite table still receives one
+retirement and optional GC chain; an in-place index table cannot receive replacement
+retirement. Replay rejects two aggregates, duplicate/noncanonical identities,
+participant reuse, global final-name collision, changed meaning for a surviving
+IndexId, invalid floors, wrong in-place table lineage/storage, missing final
+columns on replacement tables, and terminal/decision mismatches. Tags 1–23 retain
+their prior bytes and meanings. Older readers reject tags 24/25, so downgrade after
+Round 29 history is unsupported.
+
 Dropping an unresolved schema handle requires reopen. Unknown/unlisted files are
 not garbage-collected. Startup does not choose GC candidates. Journal compaction
 and general aborted-resource GC are deferred. See
@@ -244,7 +262,11 @@ Complete and truncated v2 seeds. DROP seeds include intent, loser, retained, win
 and truncated records. Round 24 adds rewrite reservation, intent, loser, winner and
 truncated histories to the same bounded target. Round 28 adds composition
 reservation, one-table intent, multi-table intent, loser and winner NBSJ seeds plus
-a real multi-participant CORD v2 seed.
+a real multi-participant CORD v2 seed. Round 29 adds IndexId reservation,
+index-only, mixed rewrite/in-place, no-op, loser/winner, and checksum-valid malformed
+seeds for truncation, duplicate IDs/names/table plans, unknown columns, wrong
+storage/version/fingerprint, low final floors, and noncanonical table order; CORD v2
+itself remains unchanged.
 
 An empty journal without its activation witness is an interrupted initialization,
 not reservation history. Read-only reopen preserves it; the next mutation completes

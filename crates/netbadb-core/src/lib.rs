@@ -27,8 +27,9 @@ use std::rc::Rc;
 
 use netbadb_compiler::{
     BindError, CompileError, CompileErrorKind, CompiledDdlStatement, CompiledStatement,
-    DropIndexTarget, IndexNameBinding, PreparedParameter, TableIdentityBinding, TypedDropIndex,
-    bind_statement, compile_ddl_statement, compile_statement, compile_statement_with_parameters,
+    DropIndexTarget, IndexNameBinding, PreparedParameter, TableIdentityBinding, TypedCreateIndex,
+    TypedDropIndex, bind_statement, compile_ddl_statement, compile_statement,
+    compile_statement_with_parameters,
 };
 use netbadb_executor::{
     ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
@@ -46,7 +47,8 @@ use netbadb_storage::{
     PreparedTxnResolution, StorageError, TableStorage,
 };
 use netbadb_types::{
-    ColumnId, DatabaseTxnId, IndexName, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
+    AccessPathId, ColumnId, DatabaseTxnId, IndexName, PhysicalType, ScalarValue, StorageId,
+    TableId, TxnId,
 };
 
 use coordinator_log::{CoordinatorDecision, CoordinatorLog};
@@ -341,8 +343,8 @@ impl PreparedDdlStatement {
             CompiledDdlStatement::CreateIndex(statement) => StatementAccess {
                 schema_write: true,
                 read_tables: Vec::new(),
-                write_tables: vec![statement.table_id],
-                schema_tables: vec![statement.table_id],
+                write_tables: vec![statement.target.table_id],
+                schema_tables: vec![statement.target.table_id],
             },
         }
     }
@@ -1861,13 +1863,15 @@ impl Database {
     ) -> Result<IndexDefinition, DatabaseError> {
         self.ensure_schema_available(None)?;
         match self.bindings.placement(table_id)? {
-            TablePlacement::Single { storage_id, .. } => Ok(self
-                .registry
-                .get_mut(*storage_id)
-                .ok_or(StorageRegistryError::UnknownStorageId {
-                    storage_id: *storage_id,
-                })?
-                .create_index(column_id)?),
+            TablePlacement::Single { storage_id, .. } => {
+                let storage_id = *storage_id;
+                let floor = self.index_allocation_floor(table_id, storage_id)?;
+                Ok(self
+                    .registry
+                    .get_mut(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                    .create_index_from_floor(None, column_id, floor)?)
+            }
             TablePlacement::RangePartitioned { .. } => {
                 Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
             }
@@ -1892,19 +1896,41 @@ impl Database {
             return Err(DatabaseError::DuplicateIndexName(name));
         }
         let definition = match self.bindings.placement(table_id)? {
-            TablePlacement::Single { storage_id, .. } => self
-                .registry
-                .get_mut(*storage_id)
-                .ok_or(StorageRegistryError::UnknownStorageId {
-                    storage_id: *storage_id,
-                })?
-                .create_named_index(name, column_id)?,
+            TablePlacement::Single { storage_id, .. } => {
+                let storage_id = *storage_id;
+                let floor = self.index_allocation_floor(table_id, storage_id)?;
+                self.registry
+                    .get_mut(storage_id)
+                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                    .create_index_from_floor(Some(name), column_id, floor)?
+            }
             TablePlacement::RangePartitioned { .. } => {
                 return Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into());
             }
         };
         self.catalog_generation = self.catalog_generation.saturating_add(1);
         Ok(definition)
+    }
+
+    fn index_allocation_floor(
+        &mut self,
+        table_id: TableId,
+        storage_id: StorageId,
+    ) -> Result<netbadb_types::IndexId, DatabaseError> {
+        let committed = self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .heap_rewrite_indexes()?
+            .next_index_id;
+        self.mutation_journal
+            .as_ref()
+            .map_or(Ok(committed), |journal| {
+                journal
+                    .borrow()
+                    .effective_index(table_id, committed)
+                    .ok_or_else(|| SchemaMutationError::IdentityExhausted("IndexId").into())
+            })
     }
 
     /// Durably retires one table-scoped logical index. Physical tree space is
@@ -2097,16 +2123,24 @@ impl Database {
         &self,
         source: &str,
     ) -> Result<PreparedDdlStatement, DatabaseError> {
-        let indexes = self.index_name_bindings();
+        let indexes = self.index_name_bindings(None);
         let tables = self.table_identity_bindings(None)?;
         Ok(PreparedDdlStatement {
             compiled: compile_ddl_statement(&self.committed.schema, source, &indexes, &tables)?,
         })
     }
 
-    fn index_name_bindings(&self) -> Vec<IndexNameBinding> {
+    fn index_name_bindings(&self, transaction: Option<&Transaction>) -> Vec<IndexNameBinding> {
         self.registry
             .iter()
+            .filter(|entry| {
+                transaction.is_none_or(|transaction| {
+                    transaction
+                        .schema_composition
+                        .plan()
+                        .is_none_or(|plan| !plan.touched.contains_key(&entry.storage.table().id))
+                })
+            })
             .flat_map(|entry| {
                 entry.storage.indexes().iter().filter_map(|index| {
                     index.name.as_ref().map(|name| IndexNameBinding {
@@ -2118,6 +2152,23 @@ impl Database {
                     })
                 })
             })
+            .chain(
+                transaction
+                    .and_then(|transaction| transaction.schema_composition.plan())
+                    .into_iter()
+                    .flat_map(|plan| plan.touched.iter())
+                    .flat_map(|(table_id, table)| {
+                        table.indexes.active.iter().filter_map(move |index| {
+                            index.name.as_ref().map(|name| IndexNameBinding {
+                                name: name.clone(),
+                                target: DropIndexTarget {
+                                    table_id: *table_id,
+                                    index_id: index.id,
+                                },
+                            })
+                        })
+                    }),
+            )
             .collect::<Vec<_>>()
     }
 
@@ -2203,7 +2254,7 @@ impl Database {
         let compiled = netbadb_compiler::compile_sql_statement(
             schema,
             source,
-            &self.index_name_bindings(),
+            &self.index_name_bindings(transaction),
             &self.table_identity_bindings(transaction)?,
             declared,
         )?;
@@ -2216,7 +2267,12 @@ impl Database {
                 }
                 if transaction.is_some_and(|transaction| {
                     transaction.schema_composition.is_started()
-                        && !matches!(compiled, CompiledDdlStatement::AlterTable(_))
+                        && !matches!(
+                            compiled,
+                            CompiledDdlStatement::AlterTable(_)
+                                | CompiledDdlStatement::CreateIndex(_)
+                                | CompiledDdlStatement::DropIndex(_)
+                        )
                 }) {
                     return if transaction
                         .is_some_and(|transaction| transaction.schema_composition.is_sealed())
@@ -2274,13 +2330,25 @@ impl Database {
     fn validate_drop_target(
         &self,
         statement: &TypedDropIndex,
+        transaction: Option<&Transaction>,
     ) -> Result<Option<DropIndexTarget>, DatabaseError> {
         if let Some(target) = statement.target {
-            if self
-                .indexes(target.table_id)?
-                .iter()
-                .any(|index| index.id == target.index_id)
-            {
+            let active = transaction
+                .and_then(|transaction| transaction.schema_composition.plan())
+                .and_then(|plan| plan.touched.get(&target.table_id))
+                .map(|table| {
+                    table
+                        .indexes
+                        .active
+                        .iter()
+                        .any(|index| index.id == target.index_id)
+                })
+                .unwrap_or(
+                    self.indexes(target.table_id)?
+                        .iter()
+                        .any(|index| index.id == target.index_id),
+                );
+            if active {
                 return Ok(Some(target));
             }
         }
@@ -2331,39 +2399,30 @@ impl Database {
                 self.commit_transaction(&mut transaction)?;
                 Ok(DdlOutcome::Altered)
             }
-            CompiledDdlStatement::DropIndex(statement) => {
-                let Some(target) = self.validate_drop_target(statement)? else {
-                    return Ok(DdlOutcome::Unchanged);
+            CompiledDdlStatement::DropIndex(_) => {
+                let mut transaction = self.begin_transaction()?;
+                let outcome = match self.execute_ddl_in(&mut transaction, prepared) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        transaction.rollback()?;
+                        return Err(error);
+                    }
                 };
-                self.drop_index(target.table_id, target.index_id)?;
-                Ok(DdlOutcome::Dropped)
+                self.commit_transaction(&mut transaction)?;
+                Ok(outcome)
             }
 
-            CompiledDdlStatement::CreateIndex(statement) => {
-                if let Some((existing_table_id, existing)) =
-                    self.registry.iter().find_map(|entry| {
-                        entry
-                            .storage
-                            .indexes()
-                            .iter()
-                            .find(|definition| definition.name.as_ref() == Some(&statement.name))
-                            .map(|definition| (entry.storage.table().id, definition))
-                    })
-                {
-                    if statement.if_not_exists
-                        && existing.column_id == statement.column_id
-                        && existing_table_id == statement.table_id
-                    {
-                        return Ok(DdlOutcome::Unchanged);
+            CompiledDdlStatement::CreateIndex(_) => {
+                let mut transaction = self.begin_transaction()?;
+                let outcome = match self.execute_ddl_in(&mut transaction, prepared) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        transaction.rollback()?;
+                        return Err(error);
                     }
-                    return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
-                }
-                self.create_named_index(
-                    statement.name.clone(),
-                    statement.table_id,
-                    statement.column_id,
-                )?;
-                Ok(DdlOutcome::Created)
+                };
+                self.commit_transaction(&mut transaction)?;
+                Ok(outcome)
             }
         }
     }
@@ -2380,7 +2439,12 @@ impl Database {
             return Err(DatabaseError::UnsupportedDdlCombination);
         }
         if transaction.schema_composition.is_started()
-            && !matches!(prepared.compiled, CompiledDdlStatement::AlterTable(_))
+            && !matches!(
+                prepared.compiled,
+                CompiledDdlStatement::AlterTable(_)
+                    | CompiledDdlStatement::CreateIndex(_)
+                    | CompiledDdlStatement::DropIndex(_)
+            )
         {
             return if transaction.schema_composition.is_sealed() {
                 Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
@@ -2406,14 +2470,20 @@ impl Database {
                 if transaction.has_pending_index_creations() {
                     return Err(DatabaseError::UnsupportedDdlCombination);
                 }
-                let Some(target) = self.validate_drop_target(statement)? else {
+                let Some(target) = self.validate_drop_target(statement, Some(transaction))? else {
                     return Ok(DdlOutcome::Unchanged);
                 };
+                if self.should_compose_index_ddl(transaction, target.table_id)? {
+                    return self.compose_drop_index_in(transaction, target);
+                }
                 self.drop_index_in(transaction, target.table_id, target.index_id)?;
                 Ok(DdlOutcome::Dropped)
             }
 
             CompiledDdlStatement::CreateIndex(statement) => {
+                if self.should_compose_index_ddl(transaction, statement.target.table_id)? {
+                    return self.compose_create_index_in(transaction, statement);
+                }
                 if transaction.has_pending_index_drops() {
                     return Err(DatabaseError::UnsupportedDdlCombination);
                 }
@@ -2428,18 +2498,18 @@ impl Database {
                     })
                 {
                     if statement.if_not_exists
-                        && existing_table_id == statement.table_id
+                        && existing_table_id == statement.target.table_id
                         && existing.column_id == statement.column_id
                     {
                         return Ok(DdlOutcome::Unchanged);
                     }
                     return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
                 }
-                let storage_id = match self.bindings.placement(statement.table_id)? {
+                let storage_id = match self.bindings.placement(statement.target.table_id)? {
                     TablePlacement::Single { storage_id, .. } => *storage_id,
                     TablePlacement::RangePartitioned { .. } => {
                         return Err(PartitionError::PartitionedIndexCreationNotSupported(
-                            statement.table_id,
+                            statement.target.table_id,
                         )
                         .into());
                     }
@@ -2463,12 +2533,20 @@ impl Database {
                     )
                     .into());
                 }
+                let floor = self.index_allocation_floor(statement.target.table_id, storage_id)?;
                 let context = transaction.write_context(storage_id, &mut self.registry)?;
-                let definition = self
-                    .registry
-                    .get_mut(storage_id)
-                    .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-                    .create_named_index_in(context, statement.name.clone(), statement.column_id)?;
+                let definition = {
+                    let storage = self
+                        .registry
+                        .get_mut(storage_id)
+                        .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+                    storage.advance_index_id_floor_in(context, floor)?;
+                    storage.create_named_index_in(
+                        context,
+                        statement.name.clone(),
+                        statement.column_id,
+                    )?
+                };
                 transaction.stage_index(storage_id, definition);
                 Ok(DdlOutcome::Created)
             }
@@ -2490,6 +2568,13 @@ impl Database {
         transaction.commit_with_schema_mutations()?;
         if transaction.schema_composition.materialized().is_some() {
             return self.finish_composition_commit(transaction);
+        }
+        if transaction
+            .schema_composition
+            .materialized_index()
+            .is_some()
+        {
+            return self.finish_schema_index_composition_commit(transaction);
         }
         if no_effective {
             self.finish_no_effective_composition(transaction)?;
@@ -2727,6 +2812,9 @@ impl Database {
             .materialized()
             .map(|materialized| materialized.staged.values().collect::<Vec<_>>())
             .unwrap_or_default();
+        if let Some(materialized) = transaction.schema_composition.materialized_index() {
+            staged.extend(materialized.staged.values());
+        }
         if let Some(storage) = transaction
             .schema_mutation
             .as_ref()
@@ -2748,6 +2836,52 @@ impl Database {
             .into_iter()
             .filter(|entry| !staged_tables.contains(&entry.table_id))
             .collect::<Vec<_>>();
+        if let Some(materialized) = transaction.schema_composition.materialized_index() {
+            for plan in &materialized.intent.tables {
+                if let schema_mutation_journal::SchemaIndexTablePlan::InPlaceIndexDelta {
+                    table,
+                    base_indexes,
+                    final_indexes,
+                    storage,
+                    ..
+                } = plan
+                {
+                    let dropped_columns = base_indexes
+                        .active
+                        .iter()
+                        .filter(|base| {
+                            !final_indexes.active.iter().any(|final_index| {
+                                final_index.id == base.id && final_index == *base
+                            })
+                        })
+                        .map(|index| index.column_id)
+                        .collect::<Vec<_>>();
+                    access_paths.retain(|path| {
+                        path.table_id != *table || !dropped_columns.contains(&path.column_id)
+                    });
+                    if let Some(publication) = materialized
+                        .publications
+                        .iter()
+                        .find(|publication| publication.storage == *storage)
+                    {
+                        access_paths.extend(publication.creates.iter().map(|definition| {
+                            AccessPath {
+                                table_id: *table,
+                                column_id: definition.column_id,
+                                id: AccessPathId(definition.handle.meta_page.page_id().0),
+                                capabilities: AccessPathCapabilities {
+                                    point_lookup: true,
+                                    range_lookup: true,
+                                    ordered: true,
+                                },
+                                statistics: None,
+                                cost_hints: None,
+                            }
+                        }));
+                    }
+                }
+            }
+        }
         for storage in staged {
             statistics.push(TableAccessStatistics {
                 table_id: storage.table().id,
@@ -2996,6 +3130,15 @@ impl Database {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let mut staged_tables = staged_tables;
+        if let Some(materialized) = transaction.schema_composition.materialized_index() {
+            staged_tables.extend(
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| storage.table().id),
+            );
+        }
         let legacy_staged_table = transaction
             .schema_mutation
             .as_ref()
@@ -3020,6 +3163,17 @@ impl Database {
             })
             .collect::<Vec<_>>();
         if let Some(materialized) = transaction.schema_composition.materialized() {
+            bindings.extend(
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| ExecutionStorageBinding {
+                        table_id: storage.table().id,
+                        storage_id: storage.storage_id(),
+                    }),
+            );
+        }
+        if let Some(materialized) = transaction.schema_composition.materialized_index() {
             bindings.extend(
                 materialized
                     .staged
@@ -3088,6 +3242,15 @@ impl Database {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let mut staged_tables = staged_tables;
+        if let Some(materialized) = transaction.schema_composition.materialized_index() {
+            staged_tables.extend(
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| storage.table().id),
+            );
+        }
         let legacy_staged_table = transaction
             .schema_mutation
             .as_ref()
@@ -3112,6 +3275,17 @@ impl Database {
             })
             .collect::<Vec<_>>();
         if let Some(materialized) = transaction.schema_composition.materialized() {
+            bindings.extend(
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| ExecutionStorageBinding {
+                        table_id: storage.table().id,
+                        storage_id: storage.storage_id(),
+                    }),
+            );
+        }
+        if let Some(materialized) = transaction.schema_composition.materialized_index() {
             bindings.extend(
                 materialized
                     .staged

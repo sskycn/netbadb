@@ -113,7 +113,9 @@ maps six generic SQL `ALTER TABLE` actions through exact typed HIR to that exist
 Core lifecycle. [Round 28](docs/core-multi-alter-round28.md) composes multiple
 ALTER statements over one or many runtime Single Heaps into one final rewrite per
 dirty table, one NBSC, and one Coordinator decision. It is intentionally ALTER-only;
-table and index DDL cannot be mixed yet. [Round 23](docs/schema-evolution-round23.md) records the row-format
+table DDL cannot be mixed yet. [Round 29](docs/schema-index-composition-round29.md)
+adds logical CREATE/DROP INDEX to that aggregate, with durable IndexId reservation,
+final replacement inventories, and index-only in-place participants. [Round 23](docs/schema-evolution-round23.md) records the row-format
 audit that selected this architecture. [Round 25](docs/replacement-retired-gc-round25.md)
 extends explicit safe single-resource GC to old runtime Heaps retired by schema
 rewrite without treating their still-active TableId as dropped.
@@ -316,8 +318,9 @@ through psql, psycopg, and SQLAlchemy `Table.drop(checkfirst=False)`; IF EXISTS,
 qualified/multi-table DROP, and general migration execution remain unsupported.
 Basic transactional Heap ALTER supports rename table/column, nullable ADD, restricted
 DROP, and SET/DROP NOT NULL through native SQL and PostgreSQL Simple/Extended Query.
-Real Alembic support includes a bounded pure multi-ALTER transaction. ALTER plus
-table/index DDL remains unsupported and rolls back; complete `pg_catalog` or `information_schema`,
+Real Alembic support includes bounded atomic ALTER + CREATE/DROP INDEX composition
+within current runtime-created Single-Heap limits. CREATE/DROP TABLE mixing remains
+unsupported and rolls back; complete `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
@@ -578,9 +581,11 @@ until an explicit exact-resource Core GC proves the
 background or SQL GC. IF EXISTS, CASCADE/RESTRICT, qualified/quoted or multiple
 targets, and LSM/range DROP are unsupported. Basic SQL ALTER maps exact prepared
 table/column identities to the embedded typed Core rewrite surface. Multiple
-ALTER-only statements compose atomically with one final rewrite per dirty table;
-physical type conversion, defaults, constraints, ADD NOT NULL, mixed table/index DDL, LSM/
+ALTER and CREATE/DROP INDEX statements compose atomically with one final rewrite per
+schema-dirty table or one in-place participant per index-only table; physical type
+conversion, defaults, constraints, ADD NOT NULL, mixed table DDL, LSM/
 range/imported ALTER, and automatic GC remain unsupported. See the
+[Round 29 schema/index composition report](docs/schema-index-composition-round29.md),
 [Round 28 composition report](docs/core-multi-alter-round28.md),
 [Round 26 SQL ALTER report](docs/sql-alter-table-round26.md), the
 [Round 24 Core report](docs/core-heap-schema-rewrite-round24.md), and the

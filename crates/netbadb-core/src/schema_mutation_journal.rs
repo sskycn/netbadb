@@ -2,9 +2,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use netbadb_schema::TypeSpec;
+use netbadb_schema::{SchemaFingerprint, TypeSpec};
+use netbadb_storage::{HeapRewriteIndex, HeapRewriteIndexes};
 use netbadb_types::{
-    ColumnId, DatabaseTxnId, PhysicalType, SchemaGeneration, SemanticType, StorageId, TableId,
+    ColumnId, DatabaseTxnId, IndexId, IndexName, PhysicalType, SchemaGeneration, SemanticType,
+    StorageId, TableId, TableSchemaVersion,
 };
 
 use crate::schema_catalog::{Reader, SchemaCatalogSnapshot, Writer, envelope, open_envelope};
@@ -91,6 +93,16 @@ pub(crate) struct CompositionColumnReservation {
     pub(crate) next_column_id: Option<ColumnId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionIndexReservation {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) table: TableId,
+    pub(crate) table_version: TableSchemaVersion,
+    pub(crate) fingerprint: SchemaFingerprint,
+    pub(crate) index: IndexId,
+    pub(crate) next_index_id: Option<IndexId>,
+}
+
 /// One base-to-final physical replacement in an aggregate schema transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompositionTablePlan {
@@ -129,6 +141,59 @@ pub(crate) struct SchemaChangeSetIntent {
     pub(crate) tables: Vec<CompositionTablePlan>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchemaIndexTablePlan {
+    RewriteHeap {
+        replacement: Box<CompositionTablePlan>,
+        base_indexes: HeapRewriteIndexes,
+        final_indexes: HeapRewriteIndexes,
+    },
+    InPlaceIndexDelta {
+        table: TableId,
+        table_version: TableSchemaVersion,
+        fingerprint: SchemaFingerprint,
+        storage: StorageId,
+        base_indexes: HeapRewriteIndexes,
+        final_indexes: HeapRewriteIndexes,
+    },
+}
+
+impl SchemaIndexTablePlan {
+    pub(crate) fn table(&self) -> TableId {
+        match self {
+            Self::RewriteHeap { replacement, .. } => replacement.table(),
+            Self::InPlaceIndexDelta { table, .. } => *table,
+        }
+    }
+
+    pub(crate) fn participant_storage(&self) -> StorageId {
+        match self {
+            Self::RewriteHeap { replacement, .. } => replacement.new_storage(),
+            Self::InPlaceIndexDelta { storage, .. } => *storage,
+        }
+    }
+
+    pub(crate) fn replacement(&self) -> Option<&CompositionTablePlan> {
+        match self {
+            Self::RewriteHeap { replacement, .. } => Some(replacement),
+            Self::InPlaceIndexDelta { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaIndexChangeSetIntent {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) base_generation: SchemaGeneration,
+    pub(crate) target_generation: Option<SchemaGeneration>,
+    pub(crate) base_epoch: u64,
+    pub(crate) target_epoch: Option<u64>,
+    pub(crate) action_count: u32,
+    pub(crate) action_digest: [u8; 32],
+    pub(crate) snapshot_digest: Option<[u8; 32]>,
+    pub(crate) tables: Vec<SchemaIndexTablePlan>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompositionResolution {
     Loser,
@@ -141,7 +206,50 @@ pub(crate) struct CompositionRecord {
     pub(crate) transaction: DatabaseTxnId,
     pub(crate) reservations: Vec<CompositionColumnReservation>,
     pub(crate) intent: Option<SchemaChangeSetIntent>,
+    pub(crate) index_reservations: Vec<CompositionIndexReservation>,
+    pub(crate) index_intent: Option<SchemaIndexChangeSetIntent>,
     pub(crate) resolution: Option<CompositionResolution>,
+}
+
+fn composition_replacement(
+    record: &CompositionRecord,
+    table: TableId,
+) -> Option<&CompositionTablePlan> {
+    record
+        .intent
+        .as_ref()
+        .and_then(|intent| intent.tables.iter().find(|plan| plan.table() == table))
+        .or_else(|| {
+            record.index_intent.as_ref().and_then(|intent| {
+                intent.tables.iter().find_map(|plan| match plan {
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                        if replacement.table() == table =>
+                    {
+                        Some(replacement.as_ref())
+                    }
+                    _ => None,
+                })
+            })
+        })
+}
+
+fn composition_replacement_mut(
+    record: &mut CompositionRecord,
+    table: TableId,
+) -> Option<&mut CompositionTablePlan> {
+    if let Some(intent) = record.intent.as_mut() {
+        return intent.tables.iter_mut().find(|plan| plan.table() == table);
+    }
+    record.index_intent.as_mut().and_then(|intent| {
+        intent.tables.iter_mut().find_map(|plan| match plan {
+            SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                if replacement.table() == table =>
+            {
+                Some(replacement.as_mut())
+            }
+            _ => None,
+        })
+    })
 }
 
 /// Durable retry-only physical deletion state. The surrounding DROP or rewrite
@@ -290,6 +398,21 @@ impl SchemaMutationJournal {
                         return Err(corrupt(
                             "composition locator differs from physical identity",
                         ));
+                    }
+                }
+            }
+            if let Some(intent) = &composition.index_intent {
+                for plan in &intent.tables {
+                    if let Some(plan) = plan.replacement() {
+                        if plan.target.storages[0].locator
+                            != final_locator(catalog, incarnation, plan.new_storage())?
+                            || plan.base.storages[0].locator
+                                != final_locator(catalog, incarnation, plan.old_storage())?
+                        {
+                            return Err(corrupt(
+                                "schema/index composition locator differs from physical identity",
+                            ));
+                        }
                     }
                 }
             }
@@ -445,9 +568,12 @@ impl SchemaMutationJournal {
                 transaction: reservation.transaction,
                 reservations: Vec::new(),
                 intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
                 resolution: None,
             });
         if record.intent.is_some()
+            || record.index_intent.is_some()
             || record.resolution.is_some()
             || record.reservations.iter().any(|existing| {
                 existing.table == reservation.table && existing.column == reservation.column
@@ -459,6 +585,48 @@ impl SchemaMutationJournal {
         record
             .reservations
             .sort_by_key(|entry| (entry.table, entry.column));
+        projected.encode()?;
+        self.activate()
+    }
+
+    pub(crate) fn prepare_composition_index_reservation(
+        &self,
+        reservation: &CompositionIndexReservation,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.reservations.contains_key(&reservation.transaction)
+            || self.drops.contains_key(&reservation.transaction)
+            || self
+                .rewrite_reservations
+                .contains_key(&reservation.transaction)
+        {
+            return Err(corrupt("composition overlaps legacy schema mutation"));
+        }
+        let mut projected = self.clone();
+        let record = projected
+            .compositions
+            .entry(reservation.transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction: reservation.transaction,
+                reservations: Vec::new(),
+                intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
+                resolution: None,
+            });
+        if record.intent.is_some()
+            || record.index_intent.is_some()
+            || record.resolution.is_some()
+            || record.index_reservations.iter().any(|existing| {
+                existing.table == reservation.table && existing.index == reservation.index
+            })
+        {
+            return Err(corrupt("duplicate or out-of-order IndexId reservation"));
+        }
+        record.index_reservations.push(reservation.clone());
+        record
+            .index_reservations
+            .sort_by_key(|entry| (entry.table, entry.index));
         projected.encode()?;
         self.activate()
     }
@@ -482,9 +650,11 @@ impl SchemaMutationJournal {
                 transaction: intent.transaction,
                 reservations: Vec::new(),
                 intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
                 resolution: None,
             });
-        if record.intent.is_some() || record.resolution.is_some() {
+        if record.intent.is_some() || record.index_intent.is_some() || record.resolution.is_some() {
             return Err(corrupt("duplicate composition intent"));
         }
         record.intent = Some(intent.clone());
@@ -492,6 +662,50 @@ impl SchemaMutationJournal {
         if bytes.len() > crate::schema_catalog::MAX_BYTES {
             return Err(corrupt("composition intent capacity exhausted"));
         }
+        self.activate()
+    }
+
+    pub(crate) fn prepare_schema_index_intent(
+        &self,
+        intent: &SchemaIndexChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        validate_schema_index_intent(
+            &intent.tables,
+            SchemaIndexValidationContext {
+                target_generation: intent.target_generation,
+                target_epoch: intent.target_epoch,
+                snapshot_digest: intent.snapshot_digest,
+                action_count: intent.action_count,
+                incarnation: self.incarnation,
+                coordinator: &self.coordinator,
+                base_generation: intent.base_generation,
+                base_epoch: intent.base_epoch,
+            },
+        )?;
+        if self.reservations.contains_key(&intent.transaction)
+            || self.drops.contains_key(&intent.transaction)
+            || self.rewrite_reservations.contains_key(&intent.transaction)
+        {
+            return Err(corrupt("composition overlaps legacy schema mutation"));
+        }
+        let mut projected = self.clone();
+        let record = projected
+            .compositions
+            .entry(intent.transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction: intent.transaction,
+                reservations: Vec::new(),
+                intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
+                resolution: None,
+            });
+        if record.intent.is_some() || record.index_intent.is_some() || record.resolution.is_some() {
+            return Err(corrupt("duplicate composition intent"));
+        }
+        record.index_intent = Some(intent.clone());
+        projected.encode()?;
         self.activate()
     }
 
@@ -561,9 +775,31 @@ impl SchemaMutationJournal {
                     .flat_map(|intent| intent.tables.iter().map(CompositionTablePlan::new_storage))
                     .map(|storage| storage.0),
             )
+            .chain(
+                self.compositions
+                    .values()
+                    .filter_map(|record| record.index_intent.as_ref())
+                    .flat_map(|intent| intent.tables.iter())
+                    .filter_map(SchemaIndexTablePlan::replacement)
+                    .map(CompositionTablePlan::new_storage)
+                    .map(|storage| storage.0),
+            )
             .max()
             .map_or(Some(floor), |max| {
                 max.checked_add(1).map(|n| StorageId(n.max(floor.0)))
+            })
+    }
+    pub(crate) fn effective_index(&self, table: TableId, floor: IndexId) -> Option<IndexId> {
+        self.compositions
+            .values()
+            .flat_map(|record| record.index_reservations.iter())
+            .filter(|reservation| reservation.table == table)
+            .map(|reservation| reservation.index.0)
+            .max()
+            .map_or(Some(floor), |maximum| {
+                maximum
+                    .checked_add(1)
+                    .map(|next| IndexId(next.max(floor.0)))
             })
     }
     pub(crate) fn effective_column(
@@ -637,9 +873,31 @@ impl SchemaMutationJournal {
                 transaction: reservation.transaction,
                 reservations: Vec::new(),
                 intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
                 resolution: None,
             })
             .reservations
+            .push(reservation);
+        self.persist()
+    }
+
+    pub(crate) fn reserve_composition_index(
+        &mut self,
+        reservation: CompositionIndexReservation,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_composition_index_reservation(&reservation)?;
+        self.compositions
+            .entry(reservation.transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction: reservation.transaction,
+                reservations: Vec::new(),
+                intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
+                resolution: None,
+            })
+            .index_reservations
             .push(reservation);
         self.persist()
     }
@@ -656,9 +914,31 @@ impl SchemaMutationJournal {
                 transaction,
                 reservations: Vec::new(),
                 intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
                 resolution: None,
             })
             .intent = Some(intent);
+        self.persist()
+    }
+
+    pub(crate) fn schema_index_intent(
+        &mut self,
+        intent: SchemaIndexChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_schema_index_intent(&intent)?;
+        let transaction = intent.transaction;
+        self.compositions
+            .entry(transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction,
+                reservations: Vec::new(),
+                intent: None,
+                index_reservations: Vec::new(),
+                index_intent: None,
+                resolution: None,
+            })
+            .index_intent = Some(intent);
         self.persist()
     }
 
@@ -668,12 +948,25 @@ impl SchemaMutationJournal {
         table: TableId,
     ) -> Result<(), SchemaMutationError> {
         self.ensure_ready()?;
-        let plan = self
+        let record = self
             .compositions
             .get_mut(&txn)
-            .and_then(|record| record.intent.as_mut())
-            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
-            .ok_or(corrupt("composition retirement without table plan"))?;
+            .ok_or(corrupt("composition retirement without history"))?;
+        let plan = if let Some(intent) = record.intent.as_mut() {
+            intent.tables.iter_mut().find(|plan| plan.table() == table)
+        } else {
+            record.index_intent.as_mut().and_then(|intent| {
+                intent.tables.iter_mut().find_map(|plan| match plan {
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                        if replacement.table() == table =>
+                    {
+                        Some(replacement.as_mut())
+                    }
+                    _ => None,
+                })
+            })
+        }
+        .ok_or(corrupt("composition retirement without table plan"))?;
         if plan.retired {
             return Ok(());
         }
@@ -700,15 +993,26 @@ impl SchemaMutationJournal {
         }
         match resolution {
             CompositionResolution::Winner => {
-                let intent = record
+                if record.intent.is_none() && record.index_intent.is_none() {
+                    return Err(corrupt("composition winner without intent"));
+                }
+                if record
                     .intent
                     .as_ref()
-                    .ok_or(corrupt("composition winner without intent"))?;
-                if intent.tables.iter().any(|plan| !plan.retired) {
+                    .is_some_and(|intent| intent.tables.iter().any(|plan| !plan.retired))
+                    || record.index_intent.as_ref().is_some_and(|intent| {
+                        intent.tables.iter().any(|plan| {
+                            plan.replacement()
+                                .is_some_and(|replacement| !replacement.retired)
+                        })
+                    })
+                {
                     return Err(corrupt("composition winner has unretired predecessor"));
                 }
             }
-            CompositionResolution::NoEffectiveChange if record.intent.is_some() => {
+            CompositionResolution::NoEffectiveChange
+                if record.intent.is_some() || record.index_intent.is_some() =>
+            {
                 return Err(corrupt("no-change composition has physical intent"));
             }
             CompositionResolution::Loser | CompositionResolution::NoEffectiveChange => {}
@@ -728,8 +1032,7 @@ impl SchemaMutationJournal {
             .compositions
             .get(&txn)
             .filter(|record| record.resolution == Some(CompositionResolution::Winner))
-            .and_then(|record| record.intent.as_ref())
-            .and_then(|intent| intent.tables.iter().find(|plan| plan.table() == table))
+            .and_then(|record| composition_replacement(record, table))
             .ok_or(corrupt("composition GC without winner table plan"))?;
         if !plan.retired || plan.gc.is_some() || gc.complete {
             return Err(corrupt("out-of-order composition GC intent"));
@@ -738,8 +1041,7 @@ impl SchemaMutationJournal {
         projected
             .compositions
             .get_mut(&txn)
-            .and_then(|record| record.intent.as_mut())
-            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .and_then(|record| composition_replacement_mut(record, table))
             .ok_or(corrupt("projected composition GC plan disappeared"))?
             .gc = Some(RetiredHeapGcRecord {
             complete: true,
@@ -758,8 +1060,7 @@ impl SchemaMutationJournal {
         self.prepare_composition_gc(txn, table, &gc)?;
         self.compositions
             .get_mut(&txn)
-            .and_then(|record| record.intent.as_mut())
-            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .and_then(|record| composition_replacement_mut(record, table))
             .ok_or(corrupt("composition GC plan disappeared"))?
             .gc = Some(gc);
         self.persist()
@@ -774,8 +1075,7 @@ impl SchemaMutationJournal {
         let gc = self
             .compositions
             .get_mut(&txn)
-            .and_then(|record| record.intent.as_mut())
-            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .and_then(|record| composition_replacement_mut(record, table))
             .and_then(|plan| plan.gc.as_mut())
             .ok_or(corrupt("composition GC complete without intent"))?;
         if gc.complete {
@@ -1051,7 +1351,9 @@ impl SchemaMutationJournal {
             .values()
             .map(|record| {
                 record.reservations.len()
+                    + record.index_reservations.len()
                     + usize::from(record.intent.is_some())
+                    + usize::from(record.index_intent.is_some())
                     + record.intent.as_ref().map_or(0, |intent| {
                         intent.tables.iter().filter(|plan| plan.retired).count()
                     })
@@ -1066,6 +1368,25 @@ impl SchemaMutationJournal {
                             .sum::<usize>()
                     })
                     + usize::from(record.resolution.is_some())
+                    + record.index_intent.as_ref().map_or(0, |intent| {
+                        intent
+                            .tables
+                            .iter()
+                            .filter_map(SchemaIndexTablePlan::replacement)
+                            .filter(|plan| plan.retired)
+                            .count()
+                    })
+                    + record.index_intent.as_ref().map_or(0, |intent| {
+                        intent
+                            .tables
+                            .iter()
+                            .filter_map(SchemaIndexTablePlan::replacement)
+                            .map(|plan| {
+                                usize::from(plan.gc.is_some())
+                                    + usize::from(plan.gc.as_ref().is_some_and(|gc| gc.complete))
+                            })
+                            .sum::<usize>()
+                    })
             })
             .sum::<usize>();
         let count = create_count
@@ -1198,6 +1519,21 @@ impl SchemaMutationJournal {
                     record.u32(reservation.next_column_id.map_or(0, |column| column.0));
                     put_record(&mut w, &record.0)?;
                 }
+                let mut index_reservations =
+                    composition.index_reservations.iter().collect::<Vec<_>>();
+                index_reservations.sort_by_key(|entry| (entry.table, entry.index));
+                for reservation in index_reservations {
+                    let mut record = Writer(vec![24]);
+                    record.u64(txn.0);
+                    record.u64(reservation.table.0);
+                    record.u64(reservation.table_version.0);
+                    record
+                        .0
+                        .extend_from_slice(reservation.fingerprint.as_bytes());
+                    record.u64(reservation.index.0);
+                    record.u64(reservation.next_index_id.map_or(0, |index| index.0));
+                    put_record(&mut w, &record.0)?;
+                }
                 if let Some(intent) = &composition.intent {
                     let mut record = Writer(vec![17]);
                     record.u64(txn.0);
@@ -1235,6 +1571,68 @@ impl SchemaMutationJournal {
                         record.u64(txn.0);
                         record.u64(plan.table().0);
                         put_record(&mut w, &record.0)?;
+                    }
+                }
+                if let Some(intent) = &composition.index_intent {
+                    let mut record = Writer(vec![25]);
+                    record.u64(txn.0);
+                    record.u64(intent.base_generation.0);
+                    record.u64(intent.target_generation.map_or(0, |value| value.0));
+                    record.u64(intent.base_epoch);
+                    record.u64(intent.target_epoch.unwrap_or(0));
+                    record.u32(intent.action_count);
+                    record.0.extend_from_slice(&intent.action_digest);
+                    match intent.snapshot_digest {
+                        Some(digest) => {
+                            record.u8(1);
+                            record.0.extend_from_slice(&digest);
+                        }
+                        None => record.u8(0),
+                    }
+                    record.u32(
+                        u32::try_from(intent.tables.len())
+                            .map_err(|_| corrupt("too many schema/index table plans"))?,
+                    );
+                    for plan in &intent.tables {
+                        encode_schema_index_table_plan(&mut record, plan)?;
+                    }
+                    if record.0.len() > 4 * 1024 * 1024 {
+                        return Err(corrupt("aggregate schema/index intent exceeds 4 MiB"));
+                    }
+                    put_record(&mut w, &record.0)?;
+                    for replacement in intent
+                        .tables
+                        .iter()
+                        .filter_map(SchemaIndexTablePlan::replacement)
+                        .filter(|plan| plan.retired)
+                    {
+                        let mut record = Writer(vec![18]);
+                        record.u64(txn.0);
+                        record.u64(replacement.table().0);
+                        put_record(&mut w, &record.0)?;
+                    }
+                    for replacement in intent
+                        .tables
+                        .iter()
+                        .filter_map(SchemaIndexTablePlan::replacement)
+                        .filter(|plan| plan.gc.is_some())
+                    {
+                        let gc = replacement
+                            .gc
+                            .as_ref()
+                            .ok_or(corrupt("schema/index composition GC disappeared"))?;
+                        let mut record = Writer(vec![22]);
+                        record.u64(txn.0);
+                        record.u64(replacement.table().0);
+                        record.u64(gc.coordinator_horizon.0);
+                        record.0.extend_from_slice(&gc.manifest_digest);
+                        put_record(&mut w, &record.0)?;
+                        if gc.complete {
+                            let mut record = Writer(vec![23]);
+                            record.u64(txn.0);
+                            record.u64(replacement.table().0);
+                            put_record(&mut w, &record.0)?;
+                        }
                     }
                 }
                 if let Some(resolution) = composition.resolution {
@@ -1297,6 +1695,7 @@ impl SchemaMutationJournal {
         let mut rewrite_losers = BTreeSet::new();
         let mut compositions: BTreeMap<DatabaseTxnId, CompositionRecord> = BTreeMap::new();
         let mut last_columns: BTreeMap<TableId, ColumnId> = BTreeMap::new();
+        let mut last_indexes: BTreeMap<TableId, IndexId> = BTreeMap::new();
         let mut last = (0, 0, 0, 0, 0);
         let mut current = None;
         for _ in 0..count {
@@ -1770,9 +2169,12 @@ impl SchemaMutationJournal {
                                 transaction: txn,
                                 reservations: Vec::new(),
                                 intent: None,
+                                index_reservations: Vec::new(),
+                                index_intent: None,
                                 resolution: None,
                             });
                     if composition.intent.is_some()
+                        || composition.index_intent.is_some()
                         || composition.resolution.is_some()
                         || composition.reservations.last().is_some_and(|previous| {
                             (previous.table, previous.column) >= (table, column)
@@ -1789,6 +2191,83 @@ impl SchemaMutationJournal {
                         next_column_id,
                     });
                     last_columns.insert(table, column);
+                }
+                24 => {
+                    let table = TableId(record.u64()?);
+                    let table_version = TableSchemaVersion(record.u64()?);
+                    let fingerprint = SchemaFingerprint::from_bytes(
+                        record
+                            .take(32)?
+                            .try_into()
+                            .map_err(|_| corrupt("IndexId reservation fingerprint"))?,
+                    );
+                    let index = IndexId(record.u64()?);
+                    let raw_next = record.u64()?;
+                    let next_index_id = (raw_next != 0).then_some(IndexId(raw_next));
+                    if table.0 == 0
+                        || table_version.0 == 0
+                        || index.0 == 0
+                        || next_index_id.map(|next| next.0) != index.0.checked_add(1)
+                        || last_indexes
+                            .get(&table)
+                            .is_some_and(|previous| *previous >= index)
+                        || reservations.contains_key(&txn)
+                        || drops.contains_key(&txn)
+                        || rewrite_reservations.contains_key(&txn)
+                    {
+                        return Err(corrupt("invalid composition IndexId reservation"));
+                    }
+                    if current != Some(txn) {
+                        if txn.0 <= last.0 {
+                            return Err(corrupt("nonmonotonic composition transaction"));
+                        }
+                        if let Some(previous) = current {
+                            if compositions
+                                .get(&previous)
+                                .is_some_and(|entry| entry.resolution.is_none())
+                            {
+                                return Err(corrupt("overlapping schema transactions"));
+                            }
+                        }
+                        last.0 = txn.0;
+                        current = Some(txn);
+                    }
+                    let composition =
+                        compositions
+                            .entry(txn)
+                            .or_insert_with(|| CompositionRecord {
+                                transaction: txn,
+                                reservations: Vec::new(),
+                                intent: None,
+                                index_reservations: Vec::new(),
+                                index_intent: None,
+                                resolution: None,
+                            });
+                    if composition.intent.is_some()
+                        || composition.index_intent.is_some()
+                        || composition.resolution.is_some()
+                        || composition
+                            .index_reservations
+                            .last()
+                            .is_some_and(|previous| {
+                                (previous.table, previous.index) >= (table, index)
+                            })
+                    {
+                        return Err(corrupt(
+                            "duplicate, noncanonical or out-of-order IndexId reservation",
+                        ));
+                    }
+                    composition
+                        .index_reservations
+                        .push(CompositionIndexReservation {
+                            transaction: txn,
+                            table,
+                            table_version,
+                            fingerprint,
+                            index,
+                            next_index_id,
+                        });
+                    last_indexes.insert(table, index);
                 }
                 17 => {
                     if current != Some(txn) {
@@ -1903,12 +2382,126 @@ impl SchemaMutationJournal {
                                 transaction: txn,
                                 reservations: Vec::new(),
                                 intent: None,
+                                index_reservations: Vec::new(),
+                                index_intent: None,
                                 resolution: None,
                             });
-                    if composition.intent.is_some() || composition.resolution.is_some() {
+                    if composition.intent.is_some()
+                        || composition.index_intent.is_some()
+                        || composition.resolution.is_some()
+                        || !composition.index_reservations.is_empty()
+                    {
                         return Err(corrupt("duplicate or out-of-order composition intent"));
                     }
                     composition.intent = Some(SchemaChangeSetIntent {
+                        transaction: txn,
+                        base_generation,
+                        target_generation,
+                        base_epoch,
+                        target_epoch,
+                        action_count,
+                        action_digest,
+                        snapshot_digest,
+                        tables,
+                    });
+                }
+                25 => {
+                    if current != Some(txn) {
+                        if txn.0 <= last.0 {
+                            return Err(corrupt("nonmonotonic schema/index intent transaction"));
+                        }
+                        if let Some(previous) = current {
+                            if compositions
+                                .get(&previous)
+                                .is_some_and(|entry| entry.resolution.is_none())
+                            {
+                                return Err(corrupt("overlapping schema transactions"));
+                            }
+                        }
+                        last.0 = txn.0;
+                        current = Some(txn);
+                    }
+                    let base_generation = SchemaGeneration(record.u64()?);
+                    let raw_target_generation = record.u64()?;
+                    let target_generation = (raw_target_generation != 0)
+                        .then_some(SchemaGeneration(raw_target_generation));
+                    let base_epoch = record.u64()?;
+                    let raw_target_epoch = record.u64()?;
+                    let target_epoch = (raw_target_epoch != 0).then_some(raw_target_epoch);
+                    let action_count = record.u32()?;
+                    let action_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("schema/index action digest"))?;
+                    let snapshot_digest = match record.u8()? {
+                        0 => None,
+                        1 => Some(
+                            record
+                                .take(32)?
+                                .try_into()
+                                .map_err(|_| corrupt("schema/index snapshot digest"))?,
+                        ),
+                        _ => return Err(corrupt("invalid schema/index snapshot option")),
+                    };
+                    let table_count = record.count(64, 2)?;
+                    if action_count == 0
+                        || table_count == 0
+                        || base_generation.0 == 0
+                        || base_epoch == 0
+                        || target_generation.is_some() != target_epoch.is_some()
+                        || target_generation.is_some() != snapshot_digest.is_some()
+                        || target_generation.is_some_and(|target| {
+                            target.0 != base_generation.0.checked_add(1).unwrap_or(0)
+                        })
+                        || target_epoch
+                            .is_some_and(|target| target != base_epoch.checked_add(1).unwrap_or(0))
+                    {
+                        return Err(corrupt("invalid schema/index intent header"));
+                    }
+                    let mut tables = Vec::with_capacity(table_count);
+                    for _ in 0..table_count {
+                        let plan = decode_schema_index_table_plan(&mut record)?;
+                        if tables
+                            .last()
+                            .is_some_and(|previous: &SchemaIndexTablePlan| {
+                                previous.table() >= plan.table()
+                            })
+                        {
+                            return Err(corrupt("noncanonical schema/index table plans"));
+                        }
+                        tables.push(plan);
+                    }
+                    validate_schema_index_intent(
+                        &tables,
+                        SchemaIndexValidationContext {
+                            target_generation,
+                            target_epoch,
+                            snapshot_digest,
+                            action_count,
+                            incarnation,
+                            coordinator: &coordinator,
+                            base_generation,
+                            base_epoch,
+                        },
+                    )?;
+                    let composition =
+                        compositions
+                            .entry(txn)
+                            .or_insert_with(|| CompositionRecord {
+                                transaction: txn,
+                                reservations: Vec::new(),
+                                intent: None,
+                                index_reservations: Vec::new(),
+                                index_intent: None,
+                                resolution: None,
+                            });
+                    if composition.intent.is_some()
+                        || composition.index_intent.is_some()
+                        || composition.resolution.is_some()
+                    {
+                        return Err(corrupt("duplicate or out-of-order schema/index intent"));
+                    }
+                    composition.index_intent = Some(SchemaIndexChangeSetIntent {
                         transaction: txn,
                         base_generation,
                         target_generation,
@@ -1925,13 +2518,24 @@ impl SchemaMutationJournal {
                         return Err(corrupt("composition retirement for unknown transaction"));
                     }
                     let table = TableId(record.u64()?);
-                    let plan = compositions
+                    let composition = compositions
                         .get_mut(&txn)
-                        .and_then(|entry| entry.intent.as_mut())
-                        .and_then(|intent| {
-                            intent.tables.iter_mut().find(|plan| plan.table() == table)
-                        })
                         .ok_or(corrupt("composition retirement without plan"))?;
+                    let plan = if let Some(intent) = composition.intent.as_mut() {
+                        intent.tables.iter_mut().find(|plan| plan.table() == table)
+                    } else {
+                        composition.index_intent.as_mut().and_then(|intent| {
+                            intent.tables.iter_mut().find_map(|plan| match plan {
+                                SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                                    if replacement.table() == table =>
+                                {
+                                    Some(replacement.as_mut())
+                                }
+                                _ => None,
+                            })
+                        })
+                    }
+                    .ok_or(corrupt("composition retirement without plan"))?;
                     if plan.retired {
                         return Err(corrupt("duplicate composition retirement"));
                     }
@@ -1952,12 +2556,21 @@ impl SchemaMutationJournal {
                         .ok_or(corrupt("composition resolution without history"))?;
                     if composition.resolution.is_some()
                         || resolution == CompositionResolution::Winner
-                            && composition
-                                .intent
-                                .as_ref()
-                                .is_none_or(|intent| intent.tables.iter().any(|plan| !plan.retired))
+                            && composition.intent.is_none()
+                            && composition.index_intent.is_none()
+                        || resolution == CompositionResolution::Winner
+                            && composition.intent.as_ref().is_some_and(|intent| {
+                                intent.tables.iter().any(|plan| !plan.retired)
+                            })
+                        || resolution == CompositionResolution::Winner
+                            && composition.index_intent.as_ref().is_some_and(|intent| {
+                                intent.tables.iter().any(|plan| {
+                                    plan.replacement()
+                                        .is_some_and(|replacement| !replacement.retired)
+                                })
+                            })
                         || resolution == CompositionResolution::NoEffectiveChange
-                            && composition.intent.is_some()
+                            && (composition.intent.is_some() || composition.index_intent.is_some())
                     {
                         return Err(corrupt("duplicate or out-of-order composition resolution"));
                     }
@@ -1977,12 +2590,7 @@ impl SchemaMutationJournal {
                         .get_mut(&txn)
                         .filter(|entry| entry.resolution == Some(CompositionResolution::Winner))
                         .ok_or(corrupt("composition GC without winner"))?;
-                    let plan = composition
-                        .intent
-                        .as_mut()
-                        .and_then(|intent| {
-                            intent.tables.iter_mut().find(|plan| plan.table() == table)
-                        })
+                    let plan = composition_replacement_mut(composition, table)
                         .ok_or(corrupt("composition GC without table plan"))?;
                     if !plan.retired || plan.gc.is_some() || coordinator_horizon.0 < txn.0 {
                         return Err(corrupt("duplicate or out-of-order composition GC"));
@@ -2000,10 +2608,7 @@ impl SchemaMutationJournal {
                     let table = TableId(record.u64()?);
                     let gc = compositions
                         .get_mut(&txn)
-                        .and_then(|entry| entry.intent.as_mut())
-                        .and_then(|intent| {
-                            intent.tables.iter_mut().find(|plan| plan.table() == table)
-                        })
+                        .and_then(|record| composition_replacement_mut(record, table))
                         .and_then(|plan| plan.gc.as_mut())
                         .ok_or(corrupt("composition GC complete without intent"))?;
                     if gc.complete {
@@ -2019,6 +2624,64 @@ impl SchemaMutationJournal {
         }
         if !reader.0.is_empty() {
             return Err(corrupt("trailing journal bytes"));
+        }
+        for composition in compositions.values() {
+            if composition.intent.is_some() && composition.index_intent.is_some() {
+                return Err(corrupt("composition has two aggregate intents"));
+            }
+            if let Some(intent) = &composition.index_intent {
+                for reservation in &composition.index_reservations {
+                    let plan = intent
+                        .tables
+                        .iter()
+                        .find(|plan| plan.table() == reservation.table)
+                        .ok_or(corrupt("IndexId reservation table absent from intent"))?;
+                    let final_indexes = match plan {
+                        SchemaIndexTablePlan::RewriteHeap { final_indexes, .. }
+                        | SchemaIndexTablePlan::InPlaceIndexDelta { final_indexes, .. } => {
+                            final_indexes
+                        }
+                    };
+                    if reservation.index >= final_indexes.next_index_id {
+                        return Err(corrupt("IndexId reservation exceeds target high-water"));
+                    }
+                    if let SchemaIndexTablePlan::InPlaceIndexDelta {
+                        table_version,
+                        fingerprint,
+                        ..
+                    } = plan
+                    {
+                        if reservation.table_version != *table_version
+                            || reservation.fingerprint != *fingerprint
+                        {
+                            return Err(corrupt("IndexId reservation table lineage mismatch"));
+                        }
+                    }
+                }
+                for plan in &intent.tables {
+                    let (base_indexes, final_indexes) = match plan {
+                        SchemaIndexTablePlan::RewriteHeap {
+                            base_indexes,
+                            final_indexes,
+                            ..
+                        }
+                        | SchemaIndexTablePlan::InPlaceIndexDelta {
+                            base_indexes,
+                            final_indexes,
+                            ..
+                        } => (base_indexes, final_indexes),
+                    };
+                    for created in final_indexes.active.iter().filter(|created| {
+                        !base_indexes.active.iter().any(|base| base.id == created.id)
+                    }) {
+                        if !composition.index_reservations.iter().any(|reservation| {
+                            reservation.table == plan.table() && reservation.index == created.id
+                        }) {
+                            return Err(corrupt("schema/index create lacks IndexId reservation"));
+                        }
+                    }
+                }
+            }
         }
         let mut retired = BTreeMap::new();
         for intent in drops.values().filter(|d| d.retired) {
@@ -2052,6 +2715,19 @@ impl SchemaMutationJournal {
                 return Err(corrupt("duplicate composition storage retirement"));
             }
         }
+        for plan in compositions
+            .values()
+            .filter_map(|record| record.index_intent.as_ref())
+            .flat_map(|intent| intent.tables.iter())
+            .filter_map(SchemaIndexTablePlan::replacement)
+            .filter(|plan| plan.retired)
+        {
+            if retired.insert(plan.old_storage(), plan.table()).is_some()
+                || plan.old_storage() == plan.new_storage()
+            {
+                return Err(corrupt("duplicate schema/index storage retirement"));
+            }
+        }
         Ok(Self {
             path: PathBuf::new(),
             incarnation,
@@ -2067,6 +2743,278 @@ impl SchemaMutationJournal {
             fail_next_sync: false,
         })
     }
+}
+
+fn encode_heap_indexes(
+    writer: &mut Writer,
+    indexes: &HeapRewriteIndexes,
+) -> Result<(), SchemaMutationError> {
+    validate_heap_indexes(indexes)?;
+    writer.u64(indexes.next_index_id.0);
+    writer
+        .u32(u32::try_from(indexes.active.len()).map_err(|_| corrupt("too many active indexes"))?);
+    for index in &indexes.active {
+        writer.u64(index.id.0);
+        match &index.name {
+            Some(name) => {
+                writer.u8(1);
+                writer.string(name.as_str())?;
+            }
+            None => writer.u8(0),
+        }
+        writer.u32(index.column_id.0);
+    }
+    Ok(())
+}
+
+fn decode_heap_indexes(reader: &mut Reader<'_>) -> Result<HeapRewriteIndexes, SchemaMutationError> {
+    let next_index_id = IndexId(reader.u64()?);
+    let count = reader.count(65536, 13)?;
+    let mut active = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = IndexId(reader.u64()?);
+        let name = match reader.u8()? {
+            0 => None,
+            1 => Some(
+                IndexName::new(reader.string()?)
+                    .map_err(|_| corrupt("invalid persisted index name"))?,
+            ),
+            _ => return Err(corrupt("invalid persisted index name option")),
+        };
+        active.push(HeapRewriteIndex {
+            id,
+            name,
+            column_id: ColumnId(reader.u32()?),
+        });
+    }
+    let indexes = HeapRewriteIndexes {
+        active,
+        next_index_id,
+    };
+    validate_heap_indexes(&indexes)?;
+    Ok(indexes)
+}
+
+fn validate_heap_indexes(indexes: &HeapRewriteIndexes) -> Result<(), SchemaMutationError> {
+    if indexes.next_index_id.0 == 0 {
+        return Err(corrupt("zero index high-water"));
+    }
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut columns = BTreeSet::new();
+    let mut previous = None;
+    for index in &indexes.active {
+        if index.id.0 == 0
+            || index.id >= indexes.next_index_id
+            || previous.is_some_and(|previous| previous >= index.id)
+            || !ids.insert(index.id)
+            || !columns.insert(index.column_id)
+            || index
+                .name
+                .as_ref()
+                .is_some_and(|name| !names.insert(name.clone()))
+        {
+            return Err(corrupt("invalid active index inventory"));
+        }
+        previous = Some(index.id);
+    }
+    Ok(())
+}
+
+fn encode_schema_index_table_plan(
+    writer: &mut Writer,
+    plan: &SchemaIndexTablePlan,
+) -> Result<(), SchemaMutationError> {
+    match plan {
+        SchemaIndexTablePlan::RewriteHeap {
+            replacement,
+            base_indexes,
+            final_indexes,
+        } => {
+            writer.u8(1);
+            let base = replacement.base.encode()?;
+            let target = replacement.target.encode()?;
+            writer
+                .u32(u32::try_from(base.len()).map_err(|_| corrupt("composition base too large"))?);
+            writer.0.extend_from_slice(&base);
+            writer.u32(
+                u32::try_from(target.len()).map_err(|_| corrupt("composition target too large"))?,
+            );
+            writer.0.extend_from_slice(&target);
+            encode_heap_indexes(writer, base_indexes)?;
+            encode_heap_indexes(writer, final_indexes)?;
+        }
+        SchemaIndexTablePlan::InPlaceIndexDelta {
+            table,
+            table_version,
+            fingerprint,
+            storage,
+            base_indexes,
+            final_indexes,
+        } => {
+            writer.u8(2);
+            writer.u64(table.0);
+            writer.u64(table_version.0);
+            writer.0.extend_from_slice(fingerprint.as_bytes());
+            writer.u64(storage.0);
+            encode_heap_indexes(writer, base_indexes)?;
+            encode_heap_indexes(writer, final_indexes)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_schema_index_table_plan(
+    reader: &mut Reader<'_>,
+) -> Result<SchemaIndexTablePlan, SchemaMutationError> {
+    match reader.u8()? {
+        1 => {
+            let base_len = usize::try_from(reader.u32()?)
+                .map_err(|_| corrupt("composition base length overflow"))?;
+            let base = SchemaCatalogSnapshot::decode(reader.take(base_len)?)?;
+            let target_len = usize::try_from(reader.u32()?)
+                .map_err(|_| corrupt("composition target length overflow"))?;
+            let target = SchemaCatalogSnapshot::decode(reader.take(target_len)?)?;
+            let base_indexes = decode_heap_indexes(reader)?;
+            let final_indexes = decode_heap_indexes(reader)?;
+            Ok(SchemaIndexTablePlan::RewriteHeap {
+                replacement: Box::new(CompositionTablePlan {
+                    base,
+                    target,
+                    retired: false,
+                    gc: None,
+                }),
+                base_indexes,
+                final_indexes,
+            })
+        }
+        2 => Ok(SchemaIndexTablePlan::InPlaceIndexDelta {
+            table: TableId(reader.u64()?),
+            table_version: TableSchemaVersion(reader.u64()?),
+            fingerprint: SchemaFingerprint::from_bytes(
+                reader
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| corrupt("index delta schema fingerprint"))?,
+            ),
+            storage: StorageId(reader.u64()?),
+            base_indexes: decode_heap_indexes(reader)?,
+            final_indexes: decode_heap_indexes(reader)?,
+        }),
+        _ => Err(corrupt("unknown schema/index table plan")),
+    }
+}
+
+struct SchemaIndexValidationContext<'a> {
+    target_generation: Option<SchemaGeneration>,
+    target_epoch: Option<u64>,
+    snapshot_digest: Option<[u8; 32]>,
+    action_count: u32,
+    incarnation: [u8; 16],
+    coordinator: &'a str,
+    base_generation: SchemaGeneration,
+    base_epoch: u64,
+}
+
+fn validate_schema_index_intent(
+    tables: &[SchemaIndexTablePlan],
+    context: SchemaIndexValidationContext<'_>,
+) -> Result<(), SchemaMutationError> {
+    let SchemaIndexValidationContext {
+        target_generation,
+        target_epoch,
+        snapshot_digest,
+        action_count,
+        incarnation,
+        coordinator,
+        base_generation,
+        base_epoch,
+    } = context;
+    let has_rewrite = tables
+        .iter()
+        .any(|plan| matches!(plan, SchemaIndexTablePlan::RewriteHeap { .. }));
+    if tables.is_empty()
+        || tables.len() > 64
+        || action_count == 0
+        || has_rewrite != target_generation.is_some()
+        || target_generation.is_some() != target_epoch.is_some()
+        || target_generation.is_some() != snapshot_digest.is_some()
+        || target_generation
+            .is_some_and(|target| target.0 != base_generation.0.checked_add(1).unwrap_or(0))
+        || target_epoch.is_some_and(|target| target != base_epoch.checked_add(1).unwrap_or(0))
+    {
+        return Err(corrupt("schema/index target presence mismatch"));
+    }
+    let mut participants = BTreeSet::new();
+    let mut final_names = BTreeSet::new();
+    for plan in tables {
+        let (participant, base_indexes, final_indexes) = match plan {
+            SchemaIndexTablePlan::RewriteHeap {
+                replacement,
+                base_indexes,
+                final_indexes,
+            } => {
+                validate_composition_table_plan(
+                    &replacement.base,
+                    &replacement.target,
+                    incarnation,
+                    coordinator,
+                    base_generation,
+                    target_generation.ok_or(corrupt("rewrite target generation absent"))?,
+                    base_epoch,
+                    target_epoch.ok_or(corrupt("rewrite target epoch absent"))?,
+                )?;
+                let table = &replacement.target.committed.schema.tables()[0];
+                if final_indexes
+                    .active
+                    .iter()
+                    .any(|index| table.column_by_id(index.column_id).is_none())
+                    || final_indexes.next_index_id < base_indexes.next_index_id
+                {
+                    return Err(corrupt("rewrite index targets missing ColumnId"));
+                }
+                (replacement.new_storage(), base_indexes, final_indexes)
+            }
+            SchemaIndexTablePlan::InPlaceIndexDelta {
+                table,
+                table_version,
+                storage,
+                base_indexes,
+                final_indexes,
+                ..
+            } => {
+                if table.0 == 0
+                    || table_version.0 == 0
+                    || storage.0 == 0
+                    || base_indexes == final_indexes
+                    || final_indexes.next_index_id < base_indexes.next_index_id
+                {
+                    return Err(corrupt("invalid in-place index delta"));
+                }
+                (*storage, base_indexes, final_indexes)
+            }
+        };
+        if !participants.insert(participant)
+            || final_indexes.active.iter().any(|index| {
+                index
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !final_names.insert(name.clone()))
+            })
+            || final_indexes.active.iter().any(|final_index| {
+                base_indexes
+                    .active
+                    .iter()
+                    .find(|base_index| base_index.id == final_index.id)
+                    .is_some_and(|base_index| base_index != final_index)
+            })
+        {
+            return Err(corrupt(
+                "invalid schema/index participant or identity reuse",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn allocator_predecessor(floor: Option<u64>) -> Result<u64, SchemaMutationError> {

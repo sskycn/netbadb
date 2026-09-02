@@ -281,11 +281,13 @@ rewrite or DROP+same-name CREATE but survives DML/index-only revisions. ALTER mu
 precede every executed user data access in its transaction.
 
 Real psql 17.11, psycopg 3.2.13 `prepare=True`, SQLAlchemy 2.0.52 transport/
-reflection, and Alembic 1.16.5 Operations pass. Alembic is limited to one supported
-operation per transaction. Defaults, constraints, ADD NOT NULL, physical type
+reflection and native `Index.create/drop`, and Alembic 1.16.5 Operations pass.
+ALTER plus CREATE/DROP INDEX composes within one transaction for runtime-created
+Single Heaps. Defaults, constraints, ADD NOT NULL, physical type
 conversion, dependent-column DROP, qualified/quoted/IF EXISTS/CASCADE forms,
-multiple actions/mutations, non-Heap placement, online ALTER, and automatic GC are
-unsupported. See [Round 26](sql-alter-table-round26.md).
+CREATE/DROP TABLE mixing, non-Heap placement, online ALTER, and automatic GC are
+unsupported. See [Round 29](schema-index-composition-round29.md) and
+[Round 26](sql-alter-table-round26.md).
 
 ## Compatibility tracing
 
@@ -487,7 +489,7 @@ Compatibility results actually exercised in this environment:
 | psql 17.11 | yes | libpq query path | yes | scalar profile and ordinary table SELECT |
 | psycopg 3.2.13 | yes | explicit `prepare=True`, repeated reuse, binary result cursor | commit, rollback, failed transaction recovery | SQLAlchemy transport |
 | SQLAlchemy 2.0.52 + psycopg | yes | generated typed parameters | Core rollback and ORM transactions | Inspector, autoload, reflected SELECT, Core and ORM CRUD |
-| Alembic 1.16.5 | yes | SQLAlchemy transport | index-only commit/rollback | guarded CreateIndexOp/DropIndexOp apply and empty subsequent comparison |
+| Alembic 1.16.5 | yes | SQLAlchemy transport | mixed schema/index commit/rollback | add-column/create-index and drop-index/drop-column Operations, plus guarded index-only regression |
 | pgx v5.7.6 | yes (Round 2) | prepared CRUD and repeated binds | yes | not tested |
 
 The TCP integration suite performs SSL refusal, startup with known and unknown
@@ -503,7 +505,8 @@ real secondary indexes, a zero-index table, missing-table lookup, repeated and
 qualified reflection, reopen-stable names/OIDs, autoloaded Index objects,
 explicit prepared reuse, selected binary formats, CRUD, transaction/error
 rollback, NULL, Core-generated SQL, reflected SELECT, mapped ORM SELECT/CRUD,
-and Alembic guarded index-only apply. Matching metadata has no diff; named and
+Alembic guarded index-only apply, and Round 29 mixed schema/index Operations.
+Matching metadata has no diff; named and
 legacy synthetic index removal executes DropIndexOp and leaves an empty comparison. See
 `postgresql-client-matrix.md` for captured blockers and exact reproduction.
 
