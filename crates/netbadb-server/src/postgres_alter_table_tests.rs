@@ -84,13 +84,26 @@ fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
     ok(&sql(
         &mut session,
         &mut db,
-        "SELECT id, name, active FROM projects",
+        "ALTER TABLE projects RENAME COLUMN name TO title",
+    ));
+    ok(&sql(
+        &mut session,
+        &mut db,
+        "SELECT id, title, active FROM projects",
     ));
     ok(&sql(
         &mut session,
         &mut db,
         "INSERT INTO projects VALUES (2, 'two', true)",
     ));
+    state(
+        &sql(
+            &mut session,
+            &mut db,
+            "ALTER TABLE projects RENAME COLUMN title TO name",
+        ),
+        "25000",
+    );
     ok(&sql(&mut session, &mut db, "ROLLBACK"));
     assert!(
         db.schema()
@@ -100,6 +113,7 @@ fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
             .is_none()
     );
 
+    ok(&sql(&mut session, &mut db, "BEGIN"));
     for source in [
         "ALTER TABLE projects ADD COLUMN active BOOLEAN",
         "ALTER TABLE projects RENAME COLUMN name TO title",
@@ -112,11 +126,12 @@ fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
             sql(&mut session, &mut db, source),
             [
                 BackendMessage::CommandComplete("ALTER TABLE".into()),
-                BackendMessage::ReadyForQuery(b'I')
+                BackendMessage::ReadyForQuery(b'T')
             ],
             "{source}"
         );
     }
+    ok(&sql(&mut session, &mut db, "COMMIT"));
     assert_eq!(db.schema().table("work").unwrap().id, TableId(2));
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();

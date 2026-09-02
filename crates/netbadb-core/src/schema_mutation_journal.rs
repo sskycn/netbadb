@@ -81,6 +81,69 @@ impl RewriteIntent {
     }
 }
 
+/// A logical identity consumed while an ALTER-only transaction is still
+/// composable. It is allocator history, never committed schema authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionColumnReservation {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) table: TableId,
+    pub(crate) column: ColumnId,
+    pub(crate) next_column_id: Option<ColumnId>,
+}
+
+/// One base-to-final physical replacement in an aggregate schema transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionTablePlan {
+    pub(crate) base: SchemaCatalogSnapshot,
+    pub(crate) target: SchemaCatalogSnapshot,
+    pub(crate) retired: bool,
+    pub(crate) gc: Option<RetiredHeapGcRecord>,
+}
+
+impl CompositionTablePlan {
+    pub(crate) fn table(&self) -> TableId {
+        self.base.committed.schema.tables()[0].id
+    }
+
+    pub(crate) fn old_storage(&self) -> StorageId {
+        self.base.storages[0].id
+    }
+
+    pub(crate) fn new_storage(&self) -> StorageId {
+        self.target.storages[0].id
+    }
+}
+
+/// Durable final recovery plan for a composed ALTER-only transaction. Recovery
+/// never replays SQL or the action sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaChangeSetIntent {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) base_generation: SchemaGeneration,
+    pub(crate) target_generation: SchemaGeneration,
+    pub(crate) base_epoch: u64,
+    pub(crate) target_epoch: u64,
+    pub(crate) action_count: u32,
+    pub(crate) action_digest: [u8; 32],
+    pub(crate) snapshot_digest: [u8; 32],
+    pub(crate) tables: Vec<CompositionTablePlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompositionResolution {
+    Loser,
+    NoEffectiveChange,
+    Winner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionRecord {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) reservations: Vec<CompositionColumnReservation>,
+    pub(crate) intent: Option<SchemaChangeSetIntent>,
+    pub(crate) resolution: Option<CompositionResolution>,
+}
+
 /// Durable retry-only physical deletion state. The surrounding DROP or rewrite
 /// intent carries the exact database incarnation, table/version/fingerprint,
 /// StorageId, locator and retirement transaction.
@@ -111,6 +174,7 @@ pub(crate) struct SchemaMutationJournal {
     pub(crate) rewrite_reservations: BTreeMap<DatabaseTxnId, RewriteReservation>,
     pub(crate) rewrites: BTreeMap<DatabaseTxnId, RewriteIntent>,
     pub(crate) rewrite_losers: BTreeSet<DatabaseTxnId>,
+    pub(crate) compositions: BTreeMap<DatabaseTxnId, CompositionRecord>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_sync: bool,
@@ -215,6 +279,21 @@ impl SchemaMutationJournal {
                 return Err(corrupt("rewrite locator differs from physical identity"));
             }
         }
+        for composition in journal.compositions.values() {
+            if let Some(intent) = &composition.intent {
+                for plan in &intent.tables {
+                    if plan.target.storages[0].locator
+                        != final_locator(catalog, incarnation, plan.new_storage())?
+                        || plan.base.storages[0].locator
+                            != final_locator(catalog, incarnation, plan.old_storage())?
+                    {
+                        return Err(corrupt(
+                            "composition locator differs from physical identity",
+                        ));
+                    }
+                }
+            }
+        }
         if activated {
             if open_envelope(&file::read(&witness)?, b"NBSA")? != incarnation {
                 return Err(corrupt("mutation activation incarnation mismatch"));
@@ -222,6 +301,7 @@ impl SchemaMutationJournal {
         } else if !journal.reservations.is_empty()
             || !journal.drops.is_empty()
             || !journal.rewrite_reservations.is_empty()
+            || !journal.compositions.is_empty()
         {
             return Err(corrupt("reservation history has no activation witness"));
         }
@@ -250,6 +330,7 @@ impl SchemaMutationJournal {
                     rewrite_reservations: BTreeMap::new(),
                     rewrites: BTreeMap::new(),
                     rewrite_losers: BTreeSet::new(),
+                    compositions: BTreeMap::new(),
                     poisoned: false,
                     #[cfg(test)]
                     fail_next_sync: false,
@@ -279,6 +360,9 @@ impl SchemaMutationJournal {
         intent: &CreateIntent,
     ) -> Result<(), SchemaMutationError> {
         self.ensure_ready()?;
+        if self.compositions.contains_key(&reservation.transaction) {
+            return Err(corrupt("legacy create overlaps composition"));
+        }
         // Reserve room for the entire obligation before consuming an identity:
         // a full journal must never prevent winner/loser resolution.
         let mut complete = self.clone();
@@ -298,6 +382,7 @@ impl SchemaMutationJournal {
         self.ensure_ready()?;
         if self.reservations.contains_key(&intent.transaction)
             || self.drops.contains_key(&intent.transaction)
+            || self.compositions.contains_key(&intent.transaction)
         {
             return Err(corrupt("duplicate schema mutation transaction"));
         }
@@ -310,6 +395,7 @@ impl SchemaMutationJournal {
         self.activate()
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_rewrite(
         &self,
         reservation: &RewriteReservation,
@@ -321,6 +407,7 @@ impl SchemaMutationJournal {
             || self
                 .rewrite_reservations
                 .contains_key(&reservation.transaction)
+            || self.compositions.contains_key(&reservation.transaction)
             || reservation != &intent.reservation
         {
             return Err(corrupt("duplicate or mismatched rewrite transaction"));
@@ -334,6 +421,77 @@ impl SchemaMutationJournal {
         projected.resolved = Some(true);
         complete.rewrites.insert(reservation.transaction, projected);
         complete.encode()?;
+        self.activate()
+    }
+
+    pub(crate) fn prepare_composition_reservation(
+        &self,
+        reservation: &CompositionColumnReservation,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.reservations.contains_key(&reservation.transaction)
+            || self.drops.contains_key(&reservation.transaction)
+            || self
+                .rewrite_reservations
+                .contains_key(&reservation.transaction)
+        {
+            return Err(corrupt("composition overlaps legacy schema mutation"));
+        }
+        let mut projected = self.clone();
+        let record = projected
+            .compositions
+            .entry(reservation.transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction: reservation.transaction,
+                reservations: Vec::new(),
+                intent: None,
+                resolution: None,
+            });
+        if record.intent.is_some()
+            || record.resolution.is_some()
+            || record.reservations.iter().any(|existing| {
+                existing.table == reservation.table && existing.column == reservation.column
+            })
+        {
+            return Err(corrupt("duplicate or out-of-order composition reservation"));
+        }
+        record.reservations.push(reservation.clone());
+        record
+            .reservations
+            .sort_by_key(|entry| (entry.table, entry.column));
+        projected.encode()?;
+        self.activate()
+    }
+
+    pub(crate) fn prepare_composition_intent(
+        &self,
+        intent: &SchemaChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.reservations.contains_key(&intent.transaction)
+            || self.drops.contains_key(&intent.transaction)
+            || self.rewrite_reservations.contains_key(&intent.transaction)
+        {
+            return Err(corrupt("composition overlaps legacy schema mutation"));
+        }
+        let mut projected = self.clone();
+        let record = projected
+            .compositions
+            .entry(intent.transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction: intent.transaction,
+                reservations: Vec::new(),
+                intent: None,
+                resolution: None,
+            });
+        if record.intent.is_some() || record.resolution.is_some() {
+            return Err(corrupt("duplicate composition intent"));
+        }
+        record.intent = Some(intent.clone());
+        let bytes = projected.encode()?;
+        if bytes.len() > crate::schema_catalog::MAX_BYTES {
+            return Err(corrupt("composition intent capacity exhausted"));
+        }
         self.activate()
     }
 
@@ -396,6 +554,13 @@ impl SchemaMutationJournal {
                     .values()
                     .map(|reservation| reservation.storage.0),
             )
+            .chain(
+                self.compositions
+                    .values()
+                    .filter_map(|record| record.intent.as_ref())
+                    .flat_map(|intent| intent.tables.iter().map(CompositionTablePlan::new_storage))
+                    .map(|storage| storage.0),
+            )
             .max()
             .map_or(Some(floor), |max| {
                 max.checked_add(1).map(|n| StorageId(n.max(floor.0)))
@@ -412,6 +577,13 @@ impl SchemaMutationJournal {
             .filter(|reservation| reservation.table == table)
             .filter_map(|reservation| reservation.column)
             .map(|column| column.0)
+            .chain(
+                self.compositions
+                    .values()
+                    .flat_map(|record| record.reservations.iter())
+                    .filter(|reservation| reservation.table == table)
+                    .map(|reservation| reservation.column.0),
+            )
             .max()
             .map_or(Some(floor), |maximum| {
                 maximum
@@ -435,6 +607,7 @@ impl SchemaMutationJournal {
             .insert(reservation.transaction, reservation);
         self.persist()
     }
+    #[cfg(test)]
     pub(crate) fn reserve_rewrite(
         &mut self,
         reservation: RewriteReservation,
@@ -452,6 +625,166 @@ impl SchemaMutationJournal {
             .insert(reservation.transaction, reservation);
         self.persist()
     }
+
+    pub(crate) fn reserve_composition_column(
+        &mut self,
+        reservation: CompositionColumnReservation,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_composition_reservation(&reservation)?;
+        self.compositions
+            .entry(reservation.transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction: reservation.transaction,
+                reservations: Vec::new(),
+                intent: None,
+                resolution: None,
+            })
+            .reservations
+            .push(reservation);
+        self.persist()
+    }
+
+    pub(crate) fn composition_intent(
+        &mut self,
+        intent: SchemaChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_composition_intent(&intent)?;
+        let transaction = intent.transaction;
+        self.compositions
+            .entry(transaction)
+            .or_insert_with(|| CompositionRecord {
+                transaction,
+                reservations: Vec::new(),
+                intent: None,
+                resolution: None,
+            })
+            .intent = Some(intent);
+        self.persist()
+    }
+
+    pub(crate) fn retire_composition_table(
+        &mut self,
+        txn: DatabaseTxnId,
+        table: TableId,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let plan = self
+            .compositions
+            .get_mut(&txn)
+            .and_then(|record| record.intent.as_mut())
+            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .ok_or(corrupt("composition retirement without table plan"))?;
+        if plan.retired {
+            return Ok(());
+        }
+        plan.retired = true;
+        self.persist()
+    }
+
+    pub(crate) fn resolve_composition(
+        &mut self,
+        txn: DatabaseTxnId,
+        resolution: CompositionResolution,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let record = self
+            .compositions
+            .get_mut(&txn)
+            .ok_or(corrupt("composition resolution without history"))?;
+        if let Some(previous) = record.resolution {
+            return if previous == resolution {
+                Ok(())
+            } else {
+                Err(corrupt("conflicting composition resolution"))
+            };
+        }
+        match resolution {
+            CompositionResolution::Winner => {
+                let intent = record
+                    .intent
+                    .as_ref()
+                    .ok_or(corrupt("composition winner without intent"))?;
+                if intent.tables.iter().any(|plan| !plan.retired) {
+                    return Err(corrupt("composition winner has unretired predecessor"));
+                }
+            }
+            CompositionResolution::NoEffectiveChange if record.intent.is_some() => {
+                return Err(corrupt("no-change composition has physical intent"));
+            }
+            CompositionResolution::Loser | CompositionResolution::NoEffectiveChange => {}
+        }
+        record.resolution = Some(resolution);
+        self.persist()
+    }
+
+    pub(crate) fn prepare_composition_gc(
+        &self,
+        txn: DatabaseTxnId,
+        table: TableId,
+        gc: &RetiredHeapGcRecord,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let plan = self
+            .compositions
+            .get(&txn)
+            .filter(|record| record.resolution == Some(CompositionResolution::Winner))
+            .and_then(|record| record.intent.as_ref())
+            .and_then(|intent| intent.tables.iter().find(|plan| plan.table() == table))
+            .ok_or(corrupt("composition GC without winner table plan"))?;
+        if !plan.retired || plan.gc.is_some() || gc.complete {
+            return Err(corrupt("out-of-order composition GC intent"));
+        }
+        let mut projected = self.clone();
+        projected
+            .compositions
+            .get_mut(&txn)
+            .and_then(|record| record.intent.as_mut())
+            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .ok_or(corrupt("projected composition GC plan disappeared"))?
+            .gc = Some(RetiredHeapGcRecord {
+            complete: true,
+            ..gc.clone()
+        });
+        projected.encode()?;
+        Ok(())
+    }
+
+    pub(crate) fn composition_gc_intent(
+        &mut self,
+        txn: DatabaseTxnId,
+        table: TableId,
+        gc: RetiredHeapGcRecord,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_composition_gc(txn, table, &gc)?;
+        self.compositions
+            .get_mut(&txn)
+            .and_then(|record| record.intent.as_mut())
+            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .ok_or(corrupt("composition GC plan disappeared"))?
+            .gc = Some(gc);
+        self.persist()
+    }
+
+    pub(crate) fn complete_composition_gc(
+        &mut self,
+        txn: DatabaseTxnId,
+        table: TableId,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let gc = self
+            .compositions
+            .get_mut(&txn)
+            .and_then(|record| record.intent.as_mut())
+            .and_then(|intent| intent.tables.iter_mut().find(|plan| plan.table() == table))
+            .and_then(|plan| plan.gc.as_mut())
+            .ok_or(corrupt("composition GC complete without intent"))?;
+        if gc.complete {
+            return Ok(());
+        }
+        gc.complete = true;
+        self.persist()
+    }
+    #[cfg(test)]
     pub(crate) fn rewrite_intent(
         &mut self,
         intent: RewriteIntent,
@@ -713,9 +1046,32 @@ impl SchemaMutationJournal {
                     )
             })
             .sum::<usize>();
+        let composition_count = self
+            .compositions
+            .values()
+            .map(|record| {
+                record.reservations.len()
+                    + usize::from(record.intent.is_some())
+                    + record.intent.as_ref().map_or(0, |intent| {
+                        intent.tables.iter().filter(|plan| plan.retired).count()
+                    })
+                    + record.intent.as_ref().map_or(0, |intent| {
+                        intent
+                            .tables
+                            .iter()
+                            .map(|plan| {
+                                usize::from(plan.gc.is_some())
+                                    + usize::from(plan.gc.as_ref().is_some_and(|gc| gc.complete))
+                            })
+                            .sum::<usize>()
+                    })
+                    + usize::from(record.resolution.is_some())
+            })
+            .sum::<usize>();
         let count = create_count
             .checked_add(drop_count)
             .and_then(|count| count.checked_add(rewrite_count))
+            .and_then(|count| count.checked_add(composition_count))
             .ok_or(corrupt("too many journal records"))?;
         w.u32(u32::try_from(count).map_err(|_| corrupt("too many journal records"))?);
         let mut transactions = self
@@ -723,6 +1079,7 @@ impl SchemaMutationJournal {
             .keys()
             .chain(self.drops.keys())
             .chain(self.rewrite_reservations.keys())
+            .chain(self.compositions.keys())
             .copied()
             .collect::<Vec<_>>();
         transactions.sort_unstable();
@@ -830,6 +1187,85 @@ impl SchemaMutationJournal {
                     record.u64(txn.0);
                     put_record(&mut w, &record.0)?;
                 }
+            } else if let Some(composition) = self.compositions.get(&txn) {
+                let mut reservations = composition.reservations.iter().collect::<Vec<_>>();
+                reservations.sort_by_key(|entry| (entry.table, entry.column));
+                for reservation in reservations {
+                    let mut record = Writer(vec![16]);
+                    record.u64(txn.0);
+                    record.u64(reservation.table.0);
+                    record.u32(reservation.column.0);
+                    record.u32(reservation.next_column_id.map_or(0, |column| column.0));
+                    put_record(&mut w, &record.0)?;
+                }
+                if let Some(intent) = &composition.intent {
+                    let mut record = Writer(vec![17]);
+                    record.u64(txn.0);
+                    record.u64(intent.base_generation.0);
+                    record.u64(intent.target_generation.0);
+                    record.u64(intent.base_epoch);
+                    record.u64(intent.target_epoch);
+                    record.u32(intent.action_count);
+                    record.0.extend_from_slice(&intent.action_digest);
+                    record.0.extend_from_slice(&intent.snapshot_digest);
+                    record.u32(
+                        u32::try_from(intent.tables.len())
+                            .map_err(|_| corrupt("too many composition table plans"))?,
+                    );
+                    for plan in &intent.tables {
+                        let base = plan.base.encode()?;
+                        let target = plan.target.encode()?;
+                        record.u32(
+                            u32::try_from(base.len())
+                                .map_err(|_| corrupt("composition base fragment too large"))?,
+                        );
+                        record.0.extend_from_slice(&base);
+                        record.u32(
+                            u32::try_from(target.len())
+                                .map_err(|_| corrupt("composition target fragment too large"))?,
+                        );
+                        record.0.extend_from_slice(&target);
+                    }
+                    if record.0.len() > 4 * 1024 * 1024 {
+                        return Err(corrupt("aggregate composition intent exceeds 4 MiB"));
+                    }
+                    put_record(&mut w, &record.0)?;
+                    for plan in intent.tables.iter().filter(|plan| plan.retired) {
+                        let mut record = Writer(vec![18]);
+                        record.u64(txn.0);
+                        record.u64(plan.table().0);
+                        put_record(&mut w, &record.0)?;
+                    }
+                }
+                if let Some(resolution) = composition.resolution {
+                    let mut record = Writer(vec![match resolution {
+                        CompositionResolution::Loser => 19,
+                        CompositionResolution::NoEffectiveChange => 20,
+                        CompositionResolution::Winner => 21,
+                    }]);
+                    record.u64(txn.0);
+                    put_record(&mut w, &record.0)?;
+                }
+                if let Some(intent) = &composition.intent {
+                    for plan in intent.tables.iter().filter(|plan| plan.gc.is_some()) {
+                        let gc = plan
+                            .gc
+                            .as_ref()
+                            .ok_or(corrupt("composition GC disappeared"))?;
+                        let mut record = Writer(vec![22]);
+                        record.u64(txn.0);
+                        record.u64(plan.table().0);
+                        record.u64(gc.coordinator_horizon.0);
+                        record.0.extend_from_slice(&gc.manifest_digest);
+                        put_record(&mut w, &record.0)?;
+                        if gc.complete {
+                            let mut record = Writer(vec![23]);
+                            record.u64(txn.0);
+                            record.u64(plan.table().0);
+                            put_record(&mut w, &record.0)?;
+                        }
+                    }
+                }
             }
         }
         let bytes = envelope(b"NBSJ", &w.0)?;
@@ -859,6 +1295,8 @@ impl SchemaMutationJournal {
         let mut rewrite_reservations: BTreeMap<DatabaseTxnId, RewriteReservation> = BTreeMap::new();
         let mut rewrites: BTreeMap<DatabaseTxnId, RewriteIntent> = BTreeMap::new();
         let mut rewrite_losers = BTreeSet::new();
+        let mut compositions: BTreeMap<DatabaseTxnId, CompositionRecord> = BTreeMap::new();
+        let mut last_columns: BTreeMap<TableId, ColumnId> = BTreeMap::new();
         let mut last = (0, 0, 0, 0, 0);
         let mut current = None;
         for _ in 0..count {
@@ -900,6 +1338,9 @@ impl SchemaMutationJournal {
                                 && rewrites
                                     .get(&previous)
                                     .is_none_or(|rewrite| rewrite.resolved.is_none())
+                            || compositions
+                                .get(&previous)
+                                .is_some_and(|composition| composition.resolution.is_none())
                         {
                             return Err(corrupt("overlapping schema transactions"));
                         }
@@ -1003,7 +1444,14 @@ impl SchemaMutationJournal {
                             && rewrites
                                 .get(&previous)
                                 .is_none_or(|rewrite| rewrite.resolved.is_none());
-                        if unresolved_create || unresolved_drop || unresolved_rewrite {
+                        let unresolved_composition = compositions
+                            .get(&previous)
+                            .is_some_and(|composition| composition.resolution.is_none());
+                        if unresolved_create
+                            || unresolved_drop
+                            || unresolved_rewrite
+                            || unresolved_composition
+                        {
                             return Err(corrupt("overlapping schema transactions"));
                         }
                     }
@@ -1151,6 +1599,13 @@ impl SchemaMutationJournal {
                     {
                         return Err(corrupt("invalid or nonmonotonic rewrite reservation"));
                     }
+                    if column.is_some_and(|column| {
+                        last_columns
+                            .get(&table)
+                            .is_some_and(|previous| *previous >= column)
+                    }) {
+                        return Err(corrupt("reused rewrite ColumnId reservation"));
+                    }
                     if let Some(previous) = current {
                         let unresolved_create = reservations
                             .get(&previous)
@@ -1163,12 +1618,22 @@ impl SchemaMutationJournal {
                             && rewrites
                                 .get(&previous)
                                 .is_none_or(|rewrite| rewrite.resolved.is_none());
-                        if unresolved_create || unresolved_drop || unresolved_rewrite {
+                        let unresolved_composition = compositions
+                            .get(&previous)
+                            .is_some_and(|composition| composition.resolution.is_none());
+                        if unresolved_create
+                            || unresolved_drop
+                            || unresolved_rewrite
+                            || unresolved_composition
+                        {
                             return Err(corrupt("overlapping schema transactions"));
                         }
                     }
                     last = (txn.0, last.1.max(table.0), storage.0, generation.0, epoch);
                     current = Some(txn);
+                    if let Some(column) = column {
+                        last_columns.insert(table, column);
+                    }
                     rewrite_reservations.insert(
                         txn,
                         RewriteReservation {
@@ -1255,6 +1720,297 @@ impl SchemaMutationJournal {
                         rewrite.resolved = Some(tag == 15);
                     }
                 }
+                16 => {
+                    let table = TableId(record.u64()?);
+                    let column = ColumnId(record.u32()?);
+                    let raw_next = record.u32()?;
+                    let next_column_id = (raw_next != 0).then_some(ColumnId(raw_next));
+                    if table.0 == 0
+                        || column.0 == 0
+                        || next_column_id.map(|next| next.0) != column.0.checked_add(1)
+                        || last_columns
+                            .get(&table)
+                            .is_some_and(|previous| *previous >= column)
+                        || reservations.contains_key(&txn)
+                        || drops.contains_key(&txn)
+                        || rewrite_reservations.contains_key(&txn)
+                    {
+                        return Err(corrupt("invalid composition ColumnId reservation"));
+                    }
+                    if current != Some(txn) {
+                        if txn.0 <= last.0 {
+                            return Err(corrupt("nonmonotonic composition transaction"));
+                        }
+                        if let Some(previous) = current {
+                            let unresolved = reservations
+                                .get(&previous)
+                                .is_some_and(|entry| entry.resolved.is_none())
+                                || drops
+                                    .get(&previous)
+                                    .is_some_and(|entry| entry.resolved.is_none())
+                                || rewrite_reservations.contains_key(&previous)
+                                    && !rewrite_losers.contains(&previous)
+                                    && rewrites
+                                        .get(&previous)
+                                        .is_none_or(|entry| entry.resolved.is_none())
+                                || compositions
+                                    .get(&previous)
+                                    .is_some_and(|entry| entry.resolution.is_none());
+                            if unresolved {
+                                return Err(corrupt("overlapping schema transactions"));
+                            }
+                        }
+                        last.0 = txn.0;
+                        current = Some(txn);
+                    }
+                    let composition =
+                        compositions
+                            .entry(txn)
+                            .or_insert_with(|| CompositionRecord {
+                                transaction: txn,
+                                reservations: Vec::new(),
+                                intent: None,
+                                resolution: None,
+                            });
+                    if composition.intent.is_some()
+                        || composition.resolution.is_some()
+                        || composition.reservations.last().is_some_and(|previous| {
+                            (previous.table, previous.column) >= (table, column)
+                        })
+                    {
+                        return Err(corrupt(
+                            "duplicate, noncanonical or out-of-order composition reservation",
+                        ));
+                    }
+                    composition.reservations.push(CompositionColumnReservation {
+                        transaction: txn,
+                        table,
+                        column,
+                        next_column_id,
+                    });
+                    last_columns.insert(table, column);
+                }
+                17 => {
+                    if current != Some(txn) {
+                        if txn.0 <= last.0 {
+                            return Err(corrupt("nonmonotonic composition intent transaction"));
+                        }
+                        if let Some(previous) = current {
+                            let unresolved = reservations
+                                .get(&previous)
+                                .is_some_and(|entry| entry.resolved.is_none())
+                                || drops
+                                    .get(&previous)
+                                    .is_some_and(|entry| entry.resolved.is_none())
+                                || rewrite_reservations.contains_key(&previous)
+                                    && !rewrite_losers.contains(&previous)
+                                    && rewrites
+                                        .get(&previous)
+                                        .is_none_or(|entry| entry.resolved.is_none())
+                                || compositions
+                                    .get(&previous)
+                                    .is_some_and(|entry| entry.resolution.is_none());
+                            if unresolved {
+                                return Err(corrupt("overlapping schema transactions"));
+                            }
+                        }
+                        last.0 = txn.0;
+                        current = Some(txn);
+                    }
+                    let base_generation = SchemaGeneration(record.u64()?);
+                    let target_generation = SchemaGeneration(record.u64()?);
+                    let base_epoch = record.u64()?;
+                    let target_epoch = record.u64()?;
+                    let action_count = record.u32()?;
+                    let action_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("composition action digest"))?;
+                    let snapshot_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("composition snapshot digest"))?;
+                    let table_count = record.count(64, 8)?;
+                    if action_count == 0
+                        || target_generation.0
+                            != base_generation
+                                .0
+                                .checked_add(1)
+                                .ok_or(corrupt("composition generation exhausted"))?
+                        || target_epoch
+                            != base_epoch
+                                .checked_add(1)
+                                .ok_or(corrupt("composition epoch exhausted"))?
+                        || table_count == 0
+                        || reservations.contains_key(&txn)
+                        || drops.contains_key(&txn)
+                        || rewrite_reservations.contains_key(&txn)
+                    {
+                        return Err(corrupt("invalid composition generation or counts"));
+                    }
+                    let mut tables = Vec::with_capacity(table_count);
+                    for _ in 0..table_count {
+                        let base_len = usize::try_from(record.u32()?)
+                            .map_err(|_| corrupt("composition base length overflow"))?;
+                        let base = SchemaCatalogSnapshot::decode(record.take(base_len)?)?;
+                        let target_len = usize::try_from(record.u32()?)
+                            .map_err(|_| corrupt("composition target length overflow"))?;
+                        let target = SchemaCatalogSnapshot::decode(record.take(target_len)?)?;
+                        validate_composition_table_plan(
+                            &base,
+                            &target,
+                            incarnation,
+                            &coordinator,
+                            base_generation,
+                            target_generation,
+                            base_epoch,
+                            target_epoch,
+                        )?;
+                        let plan = CompositionTablePlan {
+                            base,
+                            target,
+                            retired: false,
+                            gc: None,
+                        };
+                        if tables
+                            .last()
+                            .is_some_and(|previous: &CompositionTablePlan| {
+                                previous.table() >= plan.table()
+                                    || previous.new_storage() >= plan.new_storage()
+                            })
+                        {
+                            return Err(corrupt("noncanonical composition table plans"));
+                        }
+                        tables.push(plan);
+                    }
+                    if tables[0].new_storage().0 <= last.2
+                        || base_generation.0 < last.3
+                        || base_epoch < last.4
+                    {
+                        return Err(corrupt("nonmonotonic composition allocation"));
+                    }
+                    last.2 = tables
+                        .last()
+                        .ok_or(corrupt("empty composition table plans"))?
+                        .new_storage()
+                        .0;
+                    last.3 = base_generation.0;
+                    last.4 = base_epoch;
+                    let composition =
+                        compositions
+                            .entry(txn)
+                            .or_insert_with(|| CompositionRecord {
+                                transaction: txn,
+                                reservations: Vec::new(),
+                                intent: None,
+                                resolution: None,
+                            });
+                    if composition.intent.is_some() || composition.resolution.is_some() {
+                        return Err(corrupt("duplicate or out-of-order composition intent"));
+                    }
+                    composition.intent = Some(SchemaChangeSetIntent {
+                        transaction: txn,
+                        base_generation,
+                        target_generation,
+                        base_epoch,
+                        target_epoch,
+                        action_count,
+                        action_digest,
+                        snapshot_digest,
+                        tables,
+                    });
+                }
+                18 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("composition retirement for unknown transaction"));
+                    }
+                    let table = TableId(record.u64()?);
+                    let plan = compositions
+                        .get_mut(&txn)
+                        .and_then(|entry| entry.intent.as_mut())
+                        .and_then(|intent| {
+                            intent.tables.iter_mut().find(|plan| plan.table() == table)
+                        })
+                        .ok_or(corrupt("composition retirement without plan"))?;
+                    if plan.retired {
+                        return Err(corrupt("duplicate composition retirement"));
+                    }
+                    plan.retired = true;
+                }
+                19..=21 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("composition resolution for unknown transaction"));
+                    }
+                    let resolution = match tag {
+                        19 => CompositionResolution::Loser,
+                        20 => CompositionResolution::NoEffectiveChange,
+                        21 => CompositionResolution::Winner,
+                        _ => return Err(corrupt("invalid composition resolution tag")),
+                    };
+                    let composition = compositions
+                        .get_mut(&txn)
+                        .ok_or(corrupt("composition resolution without history"))?;
+                    if composition.resolution.is_some()
+                        || resolution == CompositionResolution::Winner
+                            && composition
+                                .intent
+                                .as_ref()
+                                .is_none_or(|intent| intent.tables.iter().any(|plan| !plan.retired))
+                        || resolution == CompositionResolution::NoEffectiveChange
+                            && composition.intent.is_some()
+                    {
+                        return Err(corrupt("duplicate or out-of-order composition resolution"));
+                    }
+                    composition.resolution = Some(resolution);
+                }
+                22 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("composition GC for unknown transaction"));
+                    }
+                    let table = TableId(record.u64()?);
+                    let coordinator_horizon = DatabaseTxnId(record.u64()?);
+                    let manifest_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("composition GC manifest digest"))?;
+                    let composition = compositions
+                        .get_mut(&txn)
+                        .filter(|entry| entry.resolution == Some(CompositionResolution::Winner))
+                        .ok_or(corrupt("composition GC without winner"))?;
+                    let plan = composition
+                        .intent
+                        .as_mut()
+                        .and_then(|intent| {
+                            intent.tables.iter_mut().find(|plan| plan.table() == table)
+                        })
+                        .ok_or(corrupt("composition GC without table plan"))?;
+                    if !plan.retired || plan.gc.is_some() || coordinator_horizon.0 < txn.0 {
+                        return Err(corrupt("duplicate or out-of-order composition GC"));
+                    }
+                    plan.gc = Some(RetiredHeapGcRecord {
+                        coordinator_horizon,
+                        manifest_digest,
+                        complete: false,
+                    });
+                }
+                23 => {
+                    if current != Some(txn) {
+                        return Err(corrupt("composition GC complete for unknown transaction"));
+                    }
+                    let table = TableId(record.u64()?);
+                    let gc = compositions
+                        .get_mut(&txn)
+                        .and_then(|entry| entry.intent.as_mut())
+                        .and_then(|intent| {
+                            intent.tables.iter_mut().find(|plan| plan.table() == table)
+                        })
+                        .and_then(|plan| plan.gc.as_mut())
+                        .ok_or(corrupt("composition GC complete without intent"))?;
+                    if gc.complete {
+                        return Err(corrupt("duplicate composition GC complete"));
+                    }
+                    gc.complete = true;
+                }
                 _ => return Err(corrupt("unknown journal record tag")),
             }
             if !record.0.is_empty() {
@@ -1284,6 +2040,18 @@ impl SchemaMutationJournal {
                 return Err(corrupt("rewrite reuses old StorageId"));
             }
         }
+        for plan in compositions
+            .values()
+            .filter_map(|record| record.intent.as_ref())
+            .flat_map(|intent| intent.tables.iter())
+            .filter(|plan| plan.retired)
+        {
+            if retired.insert(plan.old_storage(), plan.table()).is_some()
+                || plan.old_storage() == plan.new_storage()
+            {
+                return Err(corrupt("duplicate composition storage retirement"));
+            }
+        }
         Ok(Self {
             path: PathBuf::new(),
             incarnation,
@@ -1293,6 +2061,7 @@ impl SchemaMutationJournal {
             rewrite_reservations,
             rewrites,
             rewrite_losers,
+            compositions,
             poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,
@@ -1678,6 +2447,110 @@ fn validate_rewrite_fragments(
     }
     if expected != *target_table {
         return Err(corrupt("rewrite operation differs from target schema"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_composition_table_plan(
+    base: &SchemaCatalogSnapshot,
+    target: &SchemaCatalogSnapshot,
+    incarnation: [u8; 16],
+    coordinator: &str,
+    base_generation: SchemaGeneration,
+    target_generation: SchemaGeneration,
+    base_epoch: u64,
+    target_epoch: u64,
+) -> Result<(), SchemaMutationError> {
+    if base.incarnation != incarnation
+        || target.incarnation != incarnation
+        || base.epoch != base_epoch
+        || target.epoch != target_epoch
+        || base.committed.generation != base_generation
+        || target.committed.generation != target_generation
+        || base.coordinator.as_deref() != Some(coordinator)
+        || target.coordinator.as_deref() != Some(coordinator)
+        || base.partition_evidence.is_some()
+        || target.partition_evidence.is_some()
+        || base.committed.schema.tables().len() != 1
+        || target.committed.schema.tables().len() != 1
+        || base.committed.tables.len() != 1
+        || target.committed.tables.len() != 1
+        || base.placements.tables.len() != 1
+        || target.placements.tables.len() != 1
+        || base.storages.len() != 1
+        || target.storages.len() != 1
+    {
+        return Err(corrupt("composition table fragment inventory mismatch"));
+    }
+    let base_table = &base.committed.schema.tables()[0];
+    let target_table = &target.committed.schema.tables()[0];
+    let base_lineage = &base.committed.tables[0];
+    let target_lineage = &target.committed.tables[0];
+    let base_placement = &base.placements.tables[0];
+    let target_placement = &target.placements.tables[0];
+    let base_storage = &base.storages[0];
+    let target_storage = &target.storages[0];
+    if base_table.id != target_table.id
+        || base_table.id != base_lineage.table_id
+        || base_table.id != target_lineage.table_id
+        || base_table.id != base_placement.table_id
+        || base_table.id != target_placement.table_id
+        || base_table.id != base_storage.table_id
+        || base_table.id != target_storage.table_id
+        || base_storage.id == target_storage.id
+        || target_lineage.version.0
+            != base_lineage
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(corrupt("composition table version exhausted"))?
+        || base_table
+            .fingerprint()
+            .map_err(|_| corrupt("invalid composition base schema"))?
+            != base_placement.schema_fingerprint
+        || target_table
+            .fingerprint()
+            .map_err(|_| corrupt("invalid composition target schema"))?
+            != target_placement.schema_fingerprint
+        || base_placement.schema_fingerprint == target_placement.schema_fingerprint
+        || !matches!(
+            base_storage.kind,
+            crate::schema_catalog::CatalogStorageKind::Heap
+        )
+        || !matches!(
+            target_storage.kind,
+            crate::schema_catalog::CatalogStorageKind::Heap
+        )
+        || !matches!(
+            base_placement.placement,
+            crate::registry::TablePlacement::Single { table_id, storage_id }
+                if table_id == base_table.id && storage_id == base_storage.id
+        )
+        || !matches!(
+            target_placement.placement,
+            crate::registry::TablePlacement::Single { table_id, storage_id }
+                if table_id == target_table.id && storage_id == target_storage.id
+        )
+        || base.committed.next_table_id != target.committed.next_table_id
+        || base.committed.next_partition_id != target.committed.next_partition_id
+        || !floor_at_least(
+            target.committed.next_storage_id.map(|id| id.0),
+            target_storage.id.0.checked_add(1),
+        )
+        || !floor_at_least(
+            target_lineage.next_column_id.map(|id| u64::from(id.0)),
+            base_lineage.next_column_id.map(|id| u64::from(id.0)),
+        )
+    {
+        return Err(corrupt("composition table exact identity mismatch"));
+    }
+    for column in &target_table.columns {
+        if let Some(base_column) = base_table.column_by_id(column.id) {
+            if base_column.semantic_type().physical != column.semantic_type().physical {
+                return Err(corrupt("composition changes a physical column type"));
+            }
+        }
     }
     Ok(())
 }

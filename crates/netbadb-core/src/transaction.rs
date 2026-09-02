@@ -13,6 +13,7 @@ use netbadb_types::{DatabaseTxnId, StorageId};
 
 use crate::coordinator_log::{CoordinatorLog, CoordinatorLogError, CoordinatorParticipant};
 use crate::registry::{StorageRegistry, StorageRegistryError};
+use crate::schema_composition::SchemaCompositionState;
 use crate::schema_mutation::{SchemaMutation, SchemaMutationError};
 
 pub(crate) type SharedCoordinatorLog = Rc<RefCell<CoordinatorLog>>;
@@ -98,6 +99,7 @@ pub struct DatabaseTransaction {
     write_participants: BTreeSet<StorageId>,
     coordinator: Option<SharedCoordinatorLog>,
     pub(crate) schema_mutation: Option<SchemaMutation>,
+    pub(crate) schema_composition: SchemaCompositionState,
     pub(crate) preparation_scope: Rc<()>,
     pending_indexes: Vec<(StorageId, IndexDefinition)>,
     pending_index_drops: Vec<(StorageId, netbadb_types::IndexId)>,
@@ -119,6 +121,7 @@ impl DatabaseTransaction {
             write_participants: BTreeSet::new(),
             coordinator,
             schema_mutation: None,
+            schema_composition: SchemaCompositionState::None,
             preparation_scope: Rc::new(()),
             pending_indexes: Vec::new(),
             pending_index_drops: Vec::new(),
@@ -254,7 +257,10 @@ impl DatabaseTransaction {
     }
 
     pub(crate) fn commit_with_schema_mutations(&mut self) -> Result<(), CoordinatorError> {
-        if self.write_participants.len() > 1 || self.schema_mutation.is_some() {
+        if self.write_participants.len() > 1
+            || self.schema_mutation.is_some()
+            || self.schema_composition.materialized().is_some()
+        {
             return self.commit_multi_write();
         }
         match self.state {
@@ -323,15 +329,27 @@ impl DatabaseTransaction {
 
     pub(crate) fn has_pending_schema_mutations(&self) -> bool {
         self.schema_mutation.is_some()
+            || self.schema_composition.is_started()
             || !self.pending_indexes.is_empty()
             || !self.pending_index_drops.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_pristine_for_schema_rewrite(&self) -> bool {
         self.state == TransactionState::Active
             && self.participants.is_empty()
             && self.write_participants.is_empty()
             && !self.has_pending_schema_mutations()
+    }
+
+    pub(crate) fn is_pristine_for_schema_composition(&self) -> bool {
+        self.state == TransactionState::Active
+            && self.participants.is_empty()
+            && self.write_participants.is_empty()
+            && self.schema_mutation.is_none()
+            && self.schema_composition.is_none()
+            && self.pending_indexes.is_empty()
+            && self.pending_index_drops.is_empty()
     }
 
     pub(crate) fn has_pending_index_creations(&self) -> bool {
@@ -399,6 +417,12 @@ impl DatabaseTransaction {
                 crate::schema_mutation::crash("participants-prepared");
                 mutation.prepare()?;
                 crate::schema_mutation::crash("before-coordinator-decision");
+            } else if let Some(composition) = self.schema_composition.materialized() {
+                crate::schema_mutation::crash("composition-participants-prepared");
+                crate::schema_mutation::crash("participants-prepared");
+                composition.prepare()?;
+                crate::schema_mutation::crash("composition-before-coordinator-decision");
+                crate::schema_mutation::crash("before-coordinator-decision");
             }
             self.state = TransactionState::DecisionPending;
         }
@@ -432,12 +456,18 @@ impl DatabaseTransaction {
                     &decision_participants,
                     Some(&mutation.reference),
                 )?;
+            } else if let Some(composition) = self.schema_composition.materialized() {
+                log.commit_schema_decision(
+                    self.id,
+                    &decision_participants,
+                    Some(&composition.reference),
+                )?;
             } else {
                 log.commit_decision(self.id, &decision_participants)?;
             }
             drop(log);
             self.state = TransactionState::CommitDecided;
-            if self.schema_mutation.is_some() {
+            if self.schema_mutation.is_some() || self.schema_composition.materialized().is_some() {
                 crate::schema_mutation::crash("coordinator-durable");
             }
             #[cfg(test)]
@@ -465,12 +495,12 @@ impl DatabaseTransaction {
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash("after-all-commits");
             self.state = TransactionState::FinalizePending;
-            if self.schema_mutation.is_some() {
+            if self.schema_mutation.is_some() || self.schema_composition.materialized().is_some() {
                 crate::schema_mutation::crash("staged-heap-committed");
             }
         }
 
-        if self.schema_mutation.is_some() {
+        if self.schema_mutation.is_some() || self.schema_composition.materialized().is_some() {
             return Ok(());
         }
         self.coordinator
@@ -566,12 +596,49 @@ impl DatabaseTransaction {
         self.write_participants.insert(id);
         Ok(())
     }
-    pub(crate) fn staged_storage_mut(&mut self) -> Option<&mut netbadb_storage::TableStorage> {
+
+    pub(crate) fn enlist_composed_staged(
+        &mut self,
+        mut storage: netbadb_storage::TableStorage,
+    ) -> Result<(), CoordinatorError> {
+        let id = storage.storage_id();
+        if self.participants.contains_key(&id) {
+            return Err(SchemaMutationError::Corrupt("duplicate staged participant").into());
+        }
+        let context = storage.begin_transaction_with_isolation(self.isolation_level)?;
+        let materialized =
+            self.schema_composition
+                .materialized_mut()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "composed enlist outside materialization",
+                ))?;
+        if materialized.staged.insert(id, storage).is_some() {
+            return Err(SchemaMutationError::Corrupt("duplicate composed Heap").into());
+        }
+        self.participants.insert(
+            id,
+            StorageParticipant {
+                mode: ParticipantMode::Write,
+                context,
+            },
+        );
+        self.write_participants.insert(id);
+        Ok(())
+    }
+    pub(crate) fn execution_staged_storages_mut(
+        &mut self,
+    ) -> Vec<&mut netbadb_storage::TableStorage> {
+        if let Some(materialized) = self.schema_composition.materialized_mut() {
+            return materialized.staged.values_mut().collect();
+        }
         self.schema_mutation
             .as_mut()
-            .and_then(|m| m.staged.as_mut())
+            .and_then(|mutation| mutation.staged.as_mut())
+            .into_iter()
+            .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn with_staged_write<T>(
         &mut self,
         operation: impl FnOnce(
@@ -598,26 +665,72 @@ impl DatabaseTransaction {
             .ok_or(SchemaMutationError::Corrupt("staged Heap is absent"))?;
         Ok(operation(storage, context)?)
     }
+    pub(crate) fn with_composed_staged_write<T>(
+        &mut self,
+        storage_id: StorageId,
+        operation: impl FnOnce(
+            &mut netbadb_storage::TableStorage,
+            &mut StorageTransaction,
+        ) -> Result<T, StorageError>,
+    ) -> Result<T, CoordinatorError> {
+        self.ensure_active()?;
+        let context = &mut self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?
+            .context;
+        let storage = self
+            .schema_composition
+            .materialized_mut()
+            .and_then(|materialized| materialized.staged.get_mut(&storage_id))
+            .ok_or(SchemaMutationError::Corrupt(
+                "composed staged Heap is absent",
+            ))?;
+        Ok(operation(storage, context)?)
+    }
     /// Whether this active transaction privately owns a staged table identity.
     /// This reports lifecycle state only; authorization remains a server policy.
     #[must_use]
     pub fn owns_staged_table(&self, table: netbadb_types::TableId) -> bool {
-        self.state() == TransactionState::Active && self.staged_binding(table).is_some()
+        self.state() == TransactionState::Active
+            && (self.staged_binding(table).is_some()
+                || self
+                    .schema_composition
+                    .plan()
+                    .is_some_and(|plan| plan.touched.contains_key(&table)))
     }
 
     pub(crate) fn staged_binding(&self, table: netbadb_types::TableId) -> Option<StorageId> {
-        self.schema_mutation
-            .as_ref()
-            .filter(|m| m.reservation.table == table && m.staged.is_some())
-            .map(|m| m.reservation.storage)
+        self.schema_composition
+            .materialized()
+            .and_then(|materialized| {
+                materialized
+                    .intent
+                    .tables
+                    .iter()
+                    .find(|plan| plan.table() == table)
+                    .map(|plan| plan.new_storage())
+            })
+            .or_else(|| {
+                self.schema_mutation
+                    .as_ref()
+                    .filter(|m| m.reservation.table == table && m.staged.is_some())
+                    .map(|m| m.reservation.storage)
+            })
     }
     pub(crate) fn visible_schema<'a>(
         &'a self,
         committed: &'a netbadb_schema::Schema,
     ) -> &'a netbadb_schema::Schema {
-        self.schema_mutation
-            .as_ref()
-            .map_or(committed, |m| &m.target.committed.schema)
+        self.schema_composition
+            .plan()
+            .map(|plan| &plan.overlay.schema)
+            .or_else(|| {
+                self.schema_mutation
+                    .as_ref()
+                    .map(|m| &m.target.committed.schema)
+            })
+            .unwrap_or(committed)
     }
     pub(crate) fn release_staged_context(&mut self, id: StorageId) {
         self.participants.remove(&id);
@@ -634,6 +747,7 @@ impl DatabaseTransaction {
     }
     pub(crate) fn complete_schema_publication(&mut self) {
         self.schema_mutation = None;
+        self.schema_composition = SchemaCompositionState::None;
         self.state = TransactionState::Committed;
     }
     pub(crate) fn with_write_storage<T>(
@@ -652,15 +766,22 @@ impl DatabaseTransaction {
             .ok_or(CoordinatorError::UnknownStorageId { storage_id })?
             .context;
         let storage = match self
-            .schema_mutation
-            .as_mut()
-            .and_then(|m| m.staged.as_mut())
-            .filter(|s| s.storage_id() == storage_id)
+            .schema_composition
+            .materialized_mut()
+            .and_then(|materialized| materialized.staged.get_mut(&storage_id))
         {
             Some(storage) => storage,
-            None => registry
-                .get_mut(storage_id)
-                .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+            None => match self
+                .schema_mutation
+                .as_mut()
+                .and_then(|m| m.staged.as_mut())
+                .filter(|s| s.storage_id() == storage_id)
+            {
+                Some(storage) => storage,
+                None => registry
+                    .get_mut(storage_id)
+                    .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+            },
         };
         Ok(operation(storage, context)?)
     }
@@ -698,6 +819,18 @@ impl DatabaseTransaction {
                 .remove(&mutation.reservation.storage);
             crate::schema_mutation::crash("rollback-participants-durable");
             mutation.cleanup_loser()?;
+        }
+        if self.schema_composition.is_started() {
+            let staged = self
+                .schema_composition
+                .materialized()
+                .map(|materialized| materialized.staged.keys().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for storage_id in staged {
+                self.participants.remove(&storage_id);
+                self.write_participants.remove(&storage_id);
+            }
+            crate::schema_composition::cleanup_composition_loser(&mut self.schema_composition)?;
         }
         self.schema_mutation = None;
         self.state = TransactionState::RolledBack;

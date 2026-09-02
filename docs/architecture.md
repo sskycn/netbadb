@@ -236,6 +236,14 @@ remain execution-time durable logical reservations, while physical StorageIds ar
 materialization-time reservations. Net-no-op composition leaves generation,
 versions, epoch, and runtime revision unchanged but never reuses reserved IDs.
 
+[Round 28](core-multi-alter-round28.md) implements that aggregate for the six
+existing ALTER actions on runtime-created Single Heaps. Sequential canonical
+overlays can touch one or many tables; global materialization performs one
+base-to-final rewrite per dirty table, prepares one NBSC, and records one CORD v2
+schema decision. NBSJ v1 tags 16–23 retain logical reservations, the typed final
+plan, predecessor retirement, resolution, and replacement GC progress. CREATE/
+DROP table or index mixing remains outside this boundary.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

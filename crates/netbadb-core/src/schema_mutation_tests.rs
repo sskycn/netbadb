@@ -70,7 +70,7 @@ fn heap_schema_rewrite_add_nullable_preserves_identity_indexes_and_same_txn_dml(
     let old_table = db.schema().table("projects").unwrap().clone();
     let target = db.resolve_alter_table("projects").unwrap();
     let mut alter = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut alter,
         AlterTableSpec::new(
             target,
@@ -302,7 +302,7 @@ fn heap_schema_rewrite_rollback_burns_storage_and_column_ids_and_discards_target
     assert_eq!(db.next_column_id(table), Some(ColumnId(3)));
     let first_storage = db.next_storage_id().unwrap();
     let mut loser = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut loser,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -337,7 +337,7 @@ fn heap_schema_rewrite_rollback_burns_storage_and_column_ids_and_discards_target
     );
 
     let mut winner = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut winner,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -400,7 +400,7 @@ fn heap_schema_rewrite_rename_is_private_and_rollback_restores_exact_committed_s
     let old_fingerprint = old_table.fingerprint().unwrap();
     let old_catalog = std::fs::read(root.join("catalog")).unwrap();
     let mut transaction = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut transaction,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -482,7 +482,7 @@ fn heap_schema_rewrite_invalidates_stale_manifest_and_sdk_schema_expectations() 
     let stale_expectation = Schema::new(vec![old_table]).unwrap();
 
     let mut rewrite = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut rewrite,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -546,7 +546,7 @@ fn heap_schema_rewrite_preserves_sparse_index_identity_and_high_water() {
     let second = db.create_index(table, ColumnId(2)).unwrap();
     assert_eq!(first.id.0 + 1, second.id.0);
     let mut rewrite = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut rewrite,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -620,7 +620,7 @@ fn heap_schema_rewrite_preserves_index_and_join_planner_paths() {
     let name_index = db.create_index(table, ColumnId(2)).unwrap();
 
     let mut rewrite = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut rewrite,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -861,7 +861,7 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
             .prepare_statement(&format!("SELECT id FROM {current_name}"), &[])
             .unwrap();
         let mut transaction = db.begin_transaction().unwrap();
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut transaction,
             AlterTableSpec::new(target, operation.clone()),
         )
@@ -1047,7 +1047,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     stale.table_version = TableSchemaVersion(stale.table_version.0 + 1);
     let mut stale_txn = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut stale_txn,
             AlterTableSpec::new(
                 stale,
@@ -1065,7 +1065,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
 
     let mut no_op = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut no_op,
             AlterTableSpec::new(
                 target.clone(),
@@ -1095,7 +1095,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     ] {
         let mut no_op = db.begin_transaction().unwrap();
         assert!(matches!(
-            db.rewrite_heap_table_schema_in(
+            db.rewrite_heap_table_schema_legacy_in(
                 &mut no_op,
                 AlterTableSpec::new(target.clone(), operation)
             ),
@@ -1109,7 +1109,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
 
     let mut conversion = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut conversion,
             AlterTableSpec::new(
                 target.clone(),
@@ -1132,7 +1132,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     db.execute_in(&mut read_first, "SELECT id FROM projects")
         .unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut read_first,
             AlterTableSpec::new(
                 target.clone(),
@@ -1157,7 +1157,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     )
     .unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut write_first,
             AlterTableSpec::new(
                 target.clone(),
@@ -1181,7 +1181,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     db.execute_prepared_in(&mut prepared_first, &executed, &[])
         .unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut prepared_first,
             AlterTableSpec::new(
                 target.clone(),
@@ -1200,7 +1200,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
 
     let mut indexed_drop = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut indexed_drop,
             AlterTableSpec::new(
                 target.clone(),
@@ -1220,7 +1220,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     let failed_storage = db.next_storage_id().unwrap();
     let mut not_null = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut not_null,
             AlterTableSpec::new(
                 target,
@@ -1270,7 +1270,7 @@ fn heap_schema_rewrite_rejects_bootstrap_lsm_and_range_placements_before_reserva
     let before_storage = bootstrap.next_storage_id();
     let mut transaction = bootstrap.begin_transaction().unwrap();
     assert!(matches!(
-        bootstrap.rewrite_heap_table_schema_in(
+        bootstrap.rewrite_heap_table_schema_legacy_in(
             &mut transaction,
             AlterTableSpec::new(
                 target,
@@ -1304,7 +1304,7 @@ fn heap_schema_rewrite_rejects_bootstrap_lsm_and_range_placements_before_reserva
     let before_storage = lsm.next_storage_id();
     let mut transaction = lsm.begin_transaction().unwrap();
     assert!(matches!(
-        lsm.rewrite_heap_table_schema_in(
+        lsm.rewrite_heap_table_schema_legacy_in(
             &mut transaction,
             AlterTableSpec::new(
                 target,
@@ -1346,7 +1346,7 @@ fn heap_schema_rewrite_rejects_bootstrap_lsm_and_range_placements_before_reserva
     let before_storage = range.next_storage_id();
     let mut transaction = range.begin_transaction().unwrap();
     assert!(matches!(
-        range.rewrite_heap_table_schema_in(
+        range.rewrite_heap_table_schema_legacy_in(
             &mut transaction,
             AlterTableSpec::new(
                 target,
@@ -1407,7 +1407,7 @@ fn one_hundred_heap_schema_rewrites_preserve_identity_and_report_growth() {
         let target = db.resolve_alter_table("projects").unwrap();
         let column_id = db.resolve_alter_column(&target, current_name).unwrap();
         let mut transaction = db.begin_transaction().unwrap();
-        db.rewrite_heap_table_schema_in(
+        db.rewrite_heap_table_schema_legacy_in(
             &mut transaction,
             AlterTableSpec::new(
                 target,
@@ -1822,7 +1822,7 @@ fn rewrite_journal_rejects_invalid_identity_version_fingerprint_and_ordering() {
     db.commit_transaction(&mut create).unwrap();
     drop(create);
     let mut rewrite = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut rewrite,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -2007,7 +2007,7 @@ fn rename_rewrite_gc_column(
     let column_id = db.resolve_alter_column(&target, old_name).unwrap();
     let old_storage = db.bindings.resolve_single(target.table_id).unwrap();
     let mut transaction = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut transaction,
         AlterTableSpec::new(
             target,
@@ -3963,7 +3963,7 @@ fn rewrite_crash_child() {
     };
     let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
     let mut transaction = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut transaction,
         AlterTableSpec::new(
             db.resolve_alter_table("projects").unwrap(),
@@ -4141,7 +4141,7 @@ fn seed_rewrite_crash_after_deleted_ancestor(root: &Path) -> crate::ReplacementR
     let target = db.resolve_alter_table("projects").unwrap();
     let column_id = db.resolve_alter_column(&target, "name").unwrap();
     let mut transaction = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut transaction,
         AlterTableSpec::new(
             target,
@@ -4839,7 +4839,7 @@ fn write_schema_mutation_fuzz_corpus() {
     drop(rewrite_create);
     let rewrite_target = db.resolve_alter_table("rewrite_rows").unwrap();
     let mut rewrite_loser = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut rewrite_loser,
         AlterTableSpec::new(
             rewrite_target.clone(),
@@ -4886,7 +4886,7 @@ fn write_schema_mutation_fuzz_corpus() {
     .unwrap();
 
     let mut rewrite_winner = db.begin_transaction().unwrap();
-    db.rewrite_heap_table_schema_in(
+    db.rewrite_heap_table_schema_legacy_in(
         &mut rewrite_winner,
         AlterTableSpec::new(
             rewrite_target,
@@ -4942,6 +4942,92 @@ fn write_schema_mutation_fuzz_corpus() {
     std::fs::write(
         output.join("schema_mutation_decode/rewrite-gc-complete-v1"),
         rewrite_gc_intent.encode().unwrap(),
+    )
+    .unwrap();
+
+    db.execute("CREATE TABLE composition_a (id BIGINT)")
+        .unwrap();
+    db.execute("CREATE TABLE composition_b (id BIGINT)")
+        .unwrap();
+    let mut composition_loser = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut composition_loser,
+        "ALTER TABLE composition_a ADD COLUMN note TEXT",
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-reservation-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut composition_loser)
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-one-table-intent-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    composition_loser.rollback().unwrap();
+    drop(composition_loser);
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-loser-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut composition_winner = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut composition_winner,
+        "ALTER TABLE composition_a ADD COLUMN enabled BOOLEAN",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut composition_winner,
+        "ALTER TABLE composition_b RENAME TO composition_team",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut composition_winner)
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-multi-table-intent-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    db.commit_transaction(&mut composition_winner).unwrap();
+    drop(composition_winner);
+    std::fs::write(
+        output.join("schema_mutation_decode/composition-winner-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("coordinator_log_decode/schema-composition-decision-v2"),
+        std::fs::read(root.join("coordinator")).unwrap(),
     )
     .unwrap();
     std::fs::write(

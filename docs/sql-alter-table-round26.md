@@ -5,6 +5,11 @@ schema-rewrite lifecycle. It adds no storage algorithm, durable identity
 allocator, row copier, index rebuilder, recovery state machine, or garbage
 collector to the SQL, compiler, server, or PostgreSQL layers.
 
+Round 28 subsequently changed the Core execution target from one eager rewrite
+to ALTER-only logical composition. The grammar and typed single-statement
+contracts documented here remain unchanged; see
+[Round 28](core-multi-alter-round28.md) for transaction behavior.
+
 ## Existing DDL pipeline audit
 
 Before this change, CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX used:
@@ -81,10 +86,10 @@ the stable TableId means an existing external TableId grant remains applicable.
 Same-transaction post-ALTER DML still requires a real DML grant, independently of
 schema administration.
 
-The Core conversion is pure:
+The Core conversion remains pure:
 
 ```text
-TypedAlterTable -> existing AlterTableSpec -> rewrite_heap_table_schema_in
+TypedAlterTable -> AlterTableSpec -> compose_heap_table_schema_in
 ```
 
 It maps the six SQL operations to RenameTable, RenameColumn,
@@ -105,11 +110,12 @@ index catalog at Execute. A DROP COLUMN prepared while unindexed fails with
 dependent_objects_still_exist if an index is created before Execute. Current rows,
 including DML committed after preparation, are copied by the rewrite.
 
-Parse/preparation does not make a transaction non-pristine. At Execute, the Round
-24 marker rejects ALTER after any executed user SELECT or DML. ALTER must remain
-the first user data execution after BEGIN. One schema mutation per transaction and
-table/index mixing restrictions remain unchanged; the frontend never inserts
-implicit commits or splits operations.
+Parse/preparation does not make a transaction non-pristine. At Execute, the first
+ALTER admits the composition writer; later ALTER statements resolve sequentially
+against its overlay. The first executed user SELECT/DML, or COMMIT, materializes
+and globally seals the aggregate. Later schema/index DDL is rejected. Table/index
+mixing remains unsupported; the frontend never inserts implicit commits or splits
+operations.
 
 ## Transactions and lifecycle
 

@@ -235,3 +235,15 @@ terminal DROP. Deterministic replay tests reject GC before rewrite retirement or
 winner, wrong transactions, duplicate intent/complete and active-old-StorageId
 states. Generate these seeds into the temporary reviewed corpus with the command
 above; tracked corpus bytes remain unchanged because no tag or envelope changed.
+
+## Round 28 composed schema-transaction records
+
+`schema_mutation_decode` keeps the NBSJ/NBSR v1 envelope and covers the new
+ColumnId reservation, one-table aggregate intent, ordered multi-table aggregate
+intent, loser, and terminal winner histories. Replay validates unique
+transaction/table/ColumnId/StorageId ownership, strict TableId and StorageId
+ordering, base-to-target version and fingerprint identities, final retirement,
+and retry-only per-table GC ordering. `coordinator_log_decode` adds a real
+multi-participant composition decision while retaining CORD v2 unchanged. Use
+the existing corpus generator and the same bounded 1,000-run command; no new
+fuzz-only decoder or persistent envelope is introduced.

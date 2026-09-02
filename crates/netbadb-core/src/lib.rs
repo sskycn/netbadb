@@ -11,6 +11,7 @@ mod schema_catalog_api;
 mod schema_catalog_file;
 #[cfg(test)]
 mod schema_catalog_tests;
+mod schema_composition;
 mod schema_mutation;
 mod schema_mutation_journal;
 #[cfg(test)]
@@ -630,7 +631,8 @@ impl DatabaseError {
                 SchemaMutationError::StalePreparedStatement
                 | SchemaMutationError::StaleSchemaDependency
                 | SchemaMutationError::RecoveryRequired
-                | SchemaMutationError::TransactionNotPristine,
+                | SchemaMutationError::TransactionNotPristine
+                | SchemaMutationError::SchemaMutationAfterMaterialization,
             ) => DatabaseErrorKind::TransactionState,
             Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
@@ -1929,6 +1931,13 @@ impl Database {
         table_id: TableId,
         id: netbadb_types::IndexId,
     ) -> Result<(), DatabaseError> {
+        if transaction.schema_composition.is_started() {
+            return if transaction.schema_composition.is_sealed() {
+                Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
+            } else {
+                Err(DatabaseError::UnsupportedDdlCombination)
+            };
+        }
         if transaction.schema_mutation.is_some() {
             return Err(DatabaseError::UnsupportedDdlCombination);
         }
@@ -2129,6 +2138,18 @@ impl Database {
                     .iter()
                     .find(|lineage| lineage.table_id == table.id)
                     .map(|lineage| lineage.version)
+                    .and_then(|committed_version| {
+                        transaction
+                            .and_then(|transaction| transaction.schema_composition.plan())
+                            .and_then(|plan| {
+                                plan.overlay
+                                    .tables
+                                    .iter()
+                                    .find(|lineage| lineage.table_id == table.id)
+                                    .map(|lineage| lineage.version)
+                            })
+                            .or(Some(committed_version))
+                    })
                     .or_else(|| {
                         transaction
                             .filter(|value| value.owns_staged_table(table.id))
@@ -2192,6 +2213,18 @@ impl Database {
                     && !matches!(compiled, CompiledDdlStatement::CreateTable(_))
                 {
                     return Err(DatabaseError::UnsupportedDdlCombination);
+                }
+                if transaction.is_some_and(|transaction| {
+                    transaction.schema_composition.is_started()
+                        && !matches!(compiled, CompiledDdlStatement::AlterTable(_))
+                }) {
+                    return if transaction
+                        .is_some_and(|transaction| transaction.schema_composition.is_sealed())
+                    {
+                        Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
+                    } else {
+                        Err(DatabaseError::UnsupportedDdlCombination)
+                    };
                 }
                 Ok(PreparedSqlStatement::Ddl(PreparedDdlStatement { compiled }))
             }
@@ -2290,7 +2323,7 @@ impl Database {
             CompiledDdlStatement::AlterTable(statement) => {
                 let mut transaction = self.begin_transaction()?;
                 if let Err(error) = self
-                    .rewrite_heap_table_schema_in(&mut transaction, AlterTableSpec::from(statement))
+                    .compose_heap_table_schema_in(&mut transaction, AlterTableSpec::from(statement))
                 {
                     transaction.rollback()?;
                     return Err(error);
@@ -2346,6 +2379,15 @@ impl Database {
         if transaction.schema_mutation.is_some() && !prepared.is_table_create() {
             return Err(DatabaseError::UnsupportedDdlCombination);
         }
+        if transaction.schema_composition.is_started()
+            && !matches!(prepared.compiled, CompiledDdlStatement::AlterTable(_))
+        {
+            return if transaction.schema_composition.is_sealed() {
+                Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
+            } else {
+                Err(DatabaseError::UnsupportedDdlCombination)
+            };
+        }
         self.validate_transaction(transaction)?;
         match &prepared.compiled {
             CompiledDdlStatement::CreateTable(statement) => {
@@ -2357,7 +2399,7 @@ impl Database {
                 Ok(DdlOutcome::Dropped)
             }
             CompiledDdlStatement::AlterTable(statement) => {
-                self.rewrite_heap_table_schema_in(transaction, AlterTableSpec::from(statement))?;
+                self.compose_heap_table_schema_in(transaction, AlterTableSpec::from(statement))?;
                 Ok(DdlOutcome::Altered)
             }
             CompiledDdlStatement::DropIndex(statement) => {
@@ -2440,7 +2482,18 @@ impl Database {
         transaction: &mut Transaction,
     ) -> Result<(), DatabaseError> {
         transaction.validate_commit_owner(&self.transaction_owner)?;
+        self.ensure_schema_materialized(transaction)?;
+        let no_effective = matches!(
+            transaction.schema_composition,
+            schema_composition::SchemaCompositionState::SealedNoEffectiveChange(_)
+        );
         transaction.commit_with_schema_mutations()?;
+        if transaction.schema_composition.materialized().is_some() {
+            return self.finish_composition_commit(transaction);
+        }
+        if no_effective {
+            self.finish_no_effective_composition(transaction)?;
+        }
         if transaction.schema_mutation.is_some() {
             return self.finish_schema_commit(transaction);
         }
@@ -2611,12 +2664,13 @@ impl Database {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
+        self.ensure_schema_materialized(transaction)?;
         let physical = self.plan_logical_statement_in(&logical, transaction);
         if let PhysicalStatement::Query(plan) = &physical {
             let storage_ids = self.storage_ids_for_tables_in(logical.read_tables(), transaction)?;
             let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
             return self
-                .execute_query_plan(plan, &view, transaction.staged_storage_mut())
+                .execute_query_plan_in(plan, &view, transaction)
                 .map(ExecutionResult::Query);
         }
         if transaction.has_pending_index_creations() {
@@ -2668,22 +2722,33 @@ impl Database {
         logical: &netbadb_rel::LogicalStatement,
         transaction: &Transaction,
     ) -> PhysicalStatement {
-        let staged = transaction
+        let mut staged = transaction
+            .schema_composition
+            .materialized()
+            .map(|materialized| materialized.staged.values().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Some(storage) = transaction
             .schema_mutation
             .as_ref()
-            .and_then(|mutation| mutation.staged.as_ref());
-        let staged_table = staged.map(|storage| storage.table().id);
+            .and_then(|mutation| mutation.staged.as_ref())
+        {
+            staged.push(storage);
+        }
+        let staged_tables = staged
+            .iter()
+            .map(|storage| storage.table().id)
+            .collect::<Vec<_>>();
         let mut statistics = self
             .planner_table_statistics()
             .into_iter()
-            .filter(|entry| Some(entry.table_id) != staged_table)
+            .filter(|entry| !staged_tables.contains(&entry.table_id))
             .collect::<Vec<_>>();
         let mut access_paths = self
             .planner_access_paths()
             .into_iter()
-            .filter(|entry| Some(entry.table_id) != staged_table)
+            .filter(|entry| !staged_tables.contains(&entry.table_id))
             .collect::<Vec<_>>();
-        if let Some(storage) = staged {
+        for storage in staged {
             statistics.push(TableAccessStatistics {
                 table_id: storage.table().id,
                 statistics: None,
@@ -2914,15 +2979,24 @@ impl Database {
         )?)
     }
 
-    fn execute_mutation_in(
+    fn execute_query_plan_in(
         &mut self,
+        plan: &netbadb_planner::PhysicalPlan,
+        view: &DatabaseReadView,
         transaction: &mut Transaction,
-        physical: &PhysicalStatement,
-    ) -> Result<ExecutionResult, DatabaseError> {
-        let table_id = statement_table_id(physical).ok_or(DatabaseError::ExpectedQuery)?;
-        let storage_ids = self.storage_ids_for_tables_in(vec![table_id], transaction)?;
-        let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
-        let staged_table = transaction
+    ) -> Result<QueryResult, DatabaseError> {
+        let staged_tables = transaction
+            .schema_composition
+            .materialized()
+            .map(|materialized| {
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| storage.table().id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let legacy_staged_table = transaction
             .schema_mutation
             .as_ref()
             .and_then(|mutation| mutation.staged.as_ref())
@@ -2934,14 +3008,125 @@ impl Database {
                 TablePlacement::Single {
                     table_id,
                     storage_id,
-                } if Some(*table_id) != staged_table => Some(ExecutionStorageBinding {
-                    table_id: *table_id,
-                    storage_id: *storage_id,
-                }),
+                } if !staged_tables.contains(table_id)
+                    && Some(*table_id) != legacy_staged_table =>
+                {
+                    Some(ExecutionStorageBinding {
+                        table_id: *table_id,
+                        storage_id: *storage_id,
+                    })
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if let Some(storage) = transaction.staged_storage_mut() {
+        if let Some(materialized) = transaction.schema_composition.materialized() {
+            bindings.extend(
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| ExecutionStorageBinding {
+                        table_id: storage.table().id,
+                        storage_id: storage.storage_id(),
+                    }),
+            );
+        }
+        if let Some(storage) = transaction
+            .schema_mutation
+            .as_ref()
+            .and_then(|mutation| mutation.staged.as_ref())
+        {
+            bindings.push(ExecutionStorageBinding {
+                table_id: storage.table().id,
+                storage_id: storage.storage_id(),
+            });
+        }
+        let read_views = view
+            .iter()
+            .map(|(storage_id, view)| ExecutionReadView { storage_id, view })
+            .collect::<Vec<_>>();
+        let mut storages = self
+            .registry
+            .iter_mut()
+            .map(|entry| ExecutionStorage {
+                storage_id: entry.id,
+                storage: &mut entry.storage,
+            })
+            .collect::<Vec<_>>();
+        storages.extend(
+            transaction
+                .execution_staged_storages_mut()
+                .into_iter()
+                .map(|storage| ExecutionStorage {
+                    storage_id: storage.storage_id(),
+                    storage,
+                }),
+        );
+        Ok(execute_with_storage_context(
+            plan,
+            &bindings,
+            &mut storages,
+            &read_views,
+        )?)
+    }
+
+    fn execute_mutation_in(
+        &mut self,
+        transaction: &mut Transaction,
+        physical: &PhysicalStatement,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        let table_id = statement_table_id(physical).ok_or(DatabaseError::ExpectedQuery)?;
+        let storage_ids = self.storage_ids_for_tables_in(vec![table_id], transaction)?;
+        let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
+        let staged_tables = transaction
+            .schema_composition
+            .materialized()
+            .map(|materialized| {
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| storage.table().id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let legacy_staged_table = transaction
+            .schema_mutation
+            .as_ref()
+            .and_then(|mutation| mutation.staged.as_ref())
+            .map(|storage| storage.table().id);
+        let mut bindings = self
+            .bindings
+            .iter()
+            .filter_map(|placement| match placement {
+                TablePlacement::Single {
+                    table_id,
+                    storage_id,
+                } if !staged_tables.contains(table_id)
+                    && Some(*table_id) != legacy_staged_table =>
+                {
+                    Some(ExecutionStorageBinding {
+                        table_id: *table_id,
+                        storage_id: *storage_id,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(materialized) = transaction.schema_composition.materialized() {
+            bindings.extend(
+                materialized
+                    .staged
+                    .values()
+                    .map(|storage| ExecutionStorageBinding {
+                        table_id: storage.table().id,
+                        storage_id: storage.storage_id(),
+                    }),
+            );
+        }
+        if let Some(storage) = transaction
+            .schema_mutation
+            .as_ref()
+            .and_then(|mutation| mutation.staged.as_ref())
+        {
             bindings.push(ExecutionStorageBinding {
                 table_id: storage.table().id,
                 storage_id: storage.storage_id(),
@@ -2959,13 +3144,13 @@ impl Database {
                     storage_id: entry.id,
                     storage: &mut entry.storage,
                 })
-                .chain(transaction.staged_storage_mut().into_iter().map(|storage| {
-                    ExecutionStorage {
-                        storage_id: storage.storage_id(),
-                        storage,
-                    }
-                }))
                 .collect::<Vec<_>>();
+            storages.extend(transaction.execution_staged_storages_mut().into_iter().map(
+                |storage| ExecutionStorage {
+                    storage_id: storage.storage_id(),
+                    storage,
+                },
+            ));
             prepare_mutation_with_storage_context(physical, &bindings, &mut storages, &read_views)?
         };
         self.apply_prepared_mutation(transaction, prepared)

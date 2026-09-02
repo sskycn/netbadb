@@ -821,11 +821,18 @@ identity gaps. Real psql/psycopg/SQLAlchemy/Alembic evidence pins the current se
 statement `0A000` failure and whole-transaction rollback. No production API or
 persistent format changes in this round.
 
-Next: **Round 28 — Core Multi-ALTER Schema Transaction Composition Foundation**
-for same/different runtime Single Heaps, with no CREATE/DROP/index mixing and no
-user DML/read between ALTER statements. LSM/partition/imported ALTER, online mixed
-schemas, physical conversions, defaults, column reorder, savepoints, and journal/
-log compaction remain deferred.
+### Core multi-ALTER schema transaction composition — Round 28
+
+[Round 28](core-multi-alter-round28.md) implements the selected ALTER-only
+aggregate for same/different runtime Single Heaps. Logical actions compose before
+one global seal; every dirty table receives one final rewrite, while the database
+publishes one `G+1/E+1` NBSC and one CORD v2 schema decision. ColumnId reservations
+remain statement-time and non-reusable; StorageIds are delayed until
+materialization. Pure no-op commits publish nothing. CREATE/DROP/index mixing,
+LSM/partition/imported ALTER, online mixed schemas, physical conversions, defaults,
+column reorder, savepoints, and journal/log compaction remain deferred.
+
+Next: **Round 29 — Schema + Index DDL Composition Foundation**.
 
 ## Phase 6 — SDK and tooling
 

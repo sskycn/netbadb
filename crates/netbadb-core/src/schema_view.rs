@@ -35,8 +35,14 @@ impl Database {
         transaction: Option<&Transaction>,
     ) -> Result<Vec<SchemaDependency>, DatabaseError> {
         let committed = transaction
-            .and_then(|t| t.schema_mutation.as_ref())
-            .map_or(&self.committed, |m| &m.target.committed);
+            .and_then(|transaction| transaction.schema_composition.plan())
+            .map(|plan| &plan.overlay)
+            .or_else(|| {
+                transaction
+                    .and_then(|transaction| transaction.schema_mutation.as_ref())
+                    .map(|mutation| &mutation.target.committed)
+            })
+            .unwrap_or(&self.committed);
         let mut dependencies = Vec::new();
         for id in compiled
             .logical_statement

@@ -911,6 +911,7 @@ pub(crate) fn recover_physical(
                 !j.reservations.is_empty()
                     || !j.drops.is_empty()
                     || !j.rewrite_reservations.is_empty()
+                    || !j.compositions.is_empty()
             })
             .map(|j| &j.coordinator)
     });
@@ -929,6 +930,27 @@ pub(crate) fn recover_physical(
                         .values()
                         .filter(|rewrite| rewrite.retired)
                         .map(crate::schema_mutation_journal::RewriteIntent::old_storage),
+                )
+                .chain(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            !matches!(
+                                composition.resolution,
+                                Some(
+                                    crate::schema_mutation_journal::CompositionResolution::Loser
+                                        | crate::schema_mutation_journal::CompositionResolution::NoEffectiveChange
+                                )
+                            )
+                        })
+                        .filter_map(|composition| composition.intent.as_ref())
+                        .flat_map(|intent| {
+                            intent
+                                .tables
+                                .iter()
+                                .map(crate::schema_mutation_journal::CompositionTablePlan::old_storage)
+                        }),
                 )
         })
         .collect::<Vec<_>>();

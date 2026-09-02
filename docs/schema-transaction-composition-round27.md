@@ -1,9 +1,10 @@
 # Schema transaction composition architecture audit — Round 27
 
-Round 27 is an audit, experiment, and design round. It does **not** implement a
-production multi-mutation schema transaction API. Current clients still support at
-most one table-schema mutation per transaction. Persistent and wire formats are
-unchanged.
+Round 27 is the historical audit, experiment, and design record. It did **not**
+implement a production multi-mutation schema transaction API. Round 28 now
+implements its ALTER-only Core choice; see
+[Core multi-ALTER composition](core-multi-alter-round28.md). Statements below
+about the then-current one-mutation behavior are retained as audit evidence.
 
 The chosen future model is one aggregate schema transaction:
 

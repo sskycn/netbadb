@@ -4,14 +4,17 @@ use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(test)]
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use netbadb_schema::{ColumnDef, DropTableTarget, Schema, SchemaFingerprint, TableDef, TypeSpec};
 use netbadb_storage::TableStorage;
+#[cfg(test)]
+use netbadb_types::ScalarValue;
 use netbadb_types::{
-    ColumnId, DatabaseTxnId, ScalarValue, SemanticType, StorageId, TableId, TableSchemaVersion,
+    ColumnId, DatabaseTxnId, SemanticType, StorageId, TableId, TableSchemaVersion,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,7 +27,8 @@ use crate::schema_catalog::{
 };
 use crate::schema_catalog_file as file;
 use crate::schema_mutation_journal::{
-    CreateIntent, DropIntent, Reservation, RetiredHeapGcRecord, RewriteIntent, RewriteReservation,
+    CompositionResolution, CompositionTablePlan, CreateIntent, DropIntent, Reservation,
+    RetiredHeapGcRecord, RewriteIntent, RewriteReservation, SchemaChangeSetIntent,
     SchemaMutationJournal, final_locator, namespace, prepared_locator, stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
@@ -336,6 +340,8 @@ pub enum SchemaMutationError {
     RecoveryRequired,
     MultipleCreatesUnsupported,
     TransactionNotPristine,
+    SchemaMutationAfterMaterialization,
+    CompositionLimitExceeded(&'static str),
     UnsupportedConstraint,
     UnsupportedPlacement,
     UnsupportedSchemaEvolution,
@@ -370,6 +376,12 @@ impl fmt::Display for SchemaMutationError {
             Self::TransactionNotPristine => f.write_str(
                 "Heap schema rewrite must precede every user read, write and schema mutation",
             ),
+            Self::SchemaMutationAfterMaterialization => f.write_str(
+                "schema mutation is not allowed after transaction schema materialization",
+            ),
+            Self::CompositionLimitExceeded(limit) => {
+                write!(f, "schema transaction composition limit exceeded: {limit}")
+            }
             Self::UnsupportedConstraint => {
                 f.write_str("runtime table constraints are not supported")
             }
@@ -541,7 +553,7 @@ fn type_spec(data_type: &SemanticType) -> TypeSpec {
     }
 }
 
-fn build_alter_target(
+pub(crate) fn build_alter_target(
     base: &TableDef,
     operation: &AlterTableOperation,
     reserved_column: Option<ColumnId>,
@@ -724,7 +736,8 @@ impl Database {
     /// Rewrites one exact runtime-created Single Heap into a private replacement.
     /// The source remains read-only; every visible row is decoded under the base
     /// schema and immediately inserted under the target schema.
-    pub fn rewrite_heap_table_schema_in(
+    #[cfg(test)]
+    pub(crate) fn rewrite_heap_table_schema_legacy_in(
         &mut self,
         transaction: &mut Transaction,
         spec: AlterTableSpec,
@@ -1500,8 +1513,8 @@ impl Database {
             .as_ref()
             .into_iter()
             .flat_map(|journal| {
-                journal
-                    .borrow()
+                let journal = journal.borrow();
+                let mut resources = journal
                     .rewrites
                     .values()
                     .filter(|rewrite| rewrite.retired && rewrite.resolved == Some(true))
@@ -1517,7 +1530,24 @@ impl Database {
                         replacement_transaction: rewrite.reservation.transaction,
                         retired_generation: rewrite.target.committed.generation,
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                resources.extend(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            composition.resolution == Some(CompositionResolution::Winner)
+                        })
+                        .filter_map(|composition| composition.intent.as_ref())
+                        .flat_map(|intent| {
+                            intent
+                                .tables
+                                .iter()
+                                .filter(|plan| plan.retired)
+                                .map(|plan| composition_replacement_resource(intent, plan))
+                        }),
+                );
+                resources
             })
             .collect()
     }
@@ -1650,7 +1680,12 @@ impl Database {
                 manifest_digest: inspection.manifest_digest,
                 complete: false,
             };
-            journal.borrow().prepare_gc(intent.transaction(), &gc)?;
+            match &intent {
+                RetiredHeapIntent::SchemaComposition { plan, .. } => journal
+                    .borrow()
+                    .prepare_composition_gc(intent.transaction(), plan.table(), &gc)?,
+                _ => journal.borrow().prepare_gc(intent.transaction(), &gc)?,
+            }
 
             // Resolve all local prepared history while the full physical bundle
             // is still present, then close the only recovery-only handle.
@@ -1676,7 +1711,12 @@ impl Database {
             // retry-only transition.
             validate_gc_horizon(&intent, &decisions, horizon)?;
             crash("gc-before-intent");
-            journal.borrow_mut().gc_intent(intent.transaction(), gc)?;
+            match &intent {
+                RetiredHeapIntent::SchemaComposition { plan, .. } => journal
+                    .borrow_mut()
+                    .composition_gc_intent(intent.transaction(), plan.table(), gc)?,
+                _ => journal.borrow_mut().gc_intent(intent.transaction(), gc)?,
+            }
             crash("gc-intent-durable");
         }
         let before = gc_components(&catalog, &intent)?
@@ -1702,6 +1742,20 @@ impl Database {
                         .rewrites
                         .get(&intent.transaction())
                         .and_then(|rewrite| rewrite.gc.as_ref())
+                })
+                .or_else(|| match &intent {
+                    RetiredHeapIntent::SchemaComposition { plan, .. } => journal
+                        .compositions
+                        .get(&intent.transaction())
+                        .and_then(|record| record.intent.as_ref())
+                        .and_then(|composition| {
+                            composition
+                                .tables
+                                .iter()
+                                .find(|candidate| candidate.table() == plan.table())
+                        })
+                        .and_then(|candidate| candidate.gc.as_ref()),
+                    _ => None,
                 })
                 .map(|gc| gc.coordinator_horizon)
         }
@@ -2207,7 +2261,10 @@ impl Database {
 // Generated private locators must not follow an ancestor symlink when creating,
 // promoting or deleting a known artifact. Existing external catalog locators keep
 // their Round 17 semantics; this check covers only the owned resource namespace.
-fn validate_resource_path(catalog: &Path, resource: &Path) -> Result<(), SchemaMutationError> {
+pub(crate) fn validate_resource_path(
+    catalog: &Path,
+    resource: &Path,
+) -> Result<(), SchemaMutationError> {
     let root = catalog
         .parent()
         .ok_or(SchemaMutationError::Corrupt("catalog has no parent"))?;
@@ -2264,7 +2321,7 @@ fn owner_bytes(
     w.0.extend_from_slice(fingerprint.as_bytes());
     Ok(crate::schema_catalog::envelope(b"NBST", &w.0)?)
 }
-fn write_owner(
+pub(crate) fn write_owner(
     path: &Path,
     incarnation: [u8; 16],
     txn: DatabaseTxnId,
@@ -2312,10 +2369,33 @@ fn replacement_resource(intent: &RewriteIntent) -> ReplacementRetiredHeap {
     }
 }
 
+fn composition_replacement_resource(
+    intent: &SchemaChangeSetIntent,
+    plan: &CompositionTablePlan,
+) -> ReplacementRetiredHeap {
+    ReplacementRetiredHeap {
+        table_id: plan.table(),
+        base_table_version: plan.base.committed.tables[0].version,
+        target_table_version: plan.target.committed.tables[0].version,
+        base_fingerprint: plan.base.placements.tables[0].schema_fingerprint,
+        target_fingerprint: plan.target.placements.tables[0].schema_fingerprint,
+        old_storage_id: plan.old_storage(),
+        new_storage_id: plan.new_storage(),
+        old_relative_locator: plan.base.storages[0].locator.clone(),
+        replacement_transaction: intent.transaction,
+        retired_generation: intent.target_generation,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RetiredHeapIntent {
     TableDrop(Box<DropIntent>),
     SchemaRewrite(Box<RewriteIntent>),
+    SchemaComposition {
+        transaction: DatabaseTxnId,
+        snapshot_digest: [u8; 32],
+        plan: Box<CompositionTablePlan>,
+    },
 }
 
 impl RetiredHeapIntent {
@@ -2323,6 +2403,7 @@ impl RetiredHeapIntent {
         match self {
             Self::TableDrop(intent) => intent.transaction,
             Self::SchemaRewrite(intent) => intent.reservation.transaction,
+            Self::SchemaComposition { transaction, .. } => *transaction,
         }
     }
 
@@ -2330,6 +2411,7 @@ impl RetiredHeapIntent {
         match self {
             Self::TableDrop(intent) => intent.table(),
             Self::SchemaRewrite(intent) => intent.table(),
+            Self::SchemaComposition { plan, .. } => plan.table(),
         }
     }
 
@@ -2337,6 +2419,7 @@ impl RetiredHeapIntent {
         match self {
             Self::TableDrop(intent) => intent.storage(),
             Self::SchemaRewrite(intent) => intent.old_storage(),
+            Self::SchemaComposition { plan, .. } => plan.old_storage(),
         }
     }
 
@@ -2344,6 +2427,7 @@ impl RetiredHeapIntent {
         match self {
             Self::TableDrop(intent) => &intent.fragment,
             Self::SchemaRewrite(intent) => &intent.base,
+            Self::SchemaComposition { plan, .. } => &plan.base,
         }
     }
 
@@ -2355,6 +2439,7 @@ impl RetiredHeapIntent {
         match self {
             Self::TableDrop(intent) => intent.gc.as_ref(),
             Self::SchemaRewrite(intent) => intent.gc.as_ref(),
+            Self::SchemaComposition { plan, .. } => plan.gc.as_ref(),
         }
     }
 
@@ -2363,6 +2448,22 @@ impl RetiredHeapIntent {
             Self::TableDrop(intent) => RetiredHeapGcTarget::TableDrop(retired_resource(intent)),
             Self::SchemaRewrite(intent) => {
                 RetiredHeapGcTarget::SchemaRewrite(replacement_resource(intent))
+            }
+            Self::SchemaComposition {
+                transaction, plan, ..
+            } => {
+                let intent = SchemaChangeSetIntent {
+                    transaction: *transaction,
+                    base_generation: plan.base.committed.generation,
+                    target_generation: plan.target.committed.generation,
+                    base_epoch: plan.base.epoch,
+                    target_epoch: plan.target.epoch,
+                    action_count: 1,
+                    action_digest: [0; 32],
+                    snapshot_digest: [0; 32],
+                    tables: vec![(**plan).clone()],
+                };
+                RetiredHeapGcTarget::SchemaRewrite(composition_replacement_resource(&intent, plan))
             }
         }
     }
@@ -2384,7 +2485,22 @@ fn retired_intent_for_target(
             .values()
             .find(|rewrite| rewrite.old_storage() == resource.old_storage_id && rewrite.retired)
             .cloned()
-            .map(|rewrite| RetiredHeapIntent::SchemaRewrite(Box::new(rewrite))),
+            .map(|rewrite| RetiredHeapIntent::SchemaRewrite(Box::new(rewrite)))
+            .or_else(|| {
+                journal.compositions.values().find_map(|composition| {
+                    let intent = composition.intent.as_ref()?;
+                    intent
+                        .tables
+                        .iter()
+                        .find(|plan| plan.old_storage() == resource.old_storage_id && plan.retired)
+                        .cloned()
+                        .map(|plan| RetiredHeapIntent::SchemaComposition {
+                            transaction: intent.transaction,
+                            snapshot_digest: intent.snapshot_digest,
+                            plan: Box::new(plan),
+                        })
+                })
+            }),
     }
     .ok_or(SchemaMutationError::RetiredHeapNotFound(
         target.storage_id(),
@@ -2412,6 +2528,16 @@ fn create_transaction_for_storage(
                 .values()
                 .find(|rewrite| rewrite.new_storage() == storage && rewrite.resolved == Some(true))
                 .map(|rewrite| rewrite.reservation.transaction)
+        })
+        .or_else(|| {
+            journal.compositions.values().find_map(|composition| {
+                let intent = composition.intent.as_ref()?;
+                intent
+                    .tables
+                    .iter()
+                    .any(|plan| plan.new_storage() == storage && plan.retired)
+                    .then_some(intent.transaction)
+            })
         })
 }
 
@@ -2532,6 +2658,20 @@ fn coordinator_horizon(
         RetiredHeapIntent::SchemaRewrite(rewrite) => {
             validate_rewrite_reference(rewrite, reference)?
         }
+        RetiredHeapIntent::SchemaComposition {
+            snapshot_digest,
+            plan,
+            ..
+        } => {
+            if reference.incarnation != plan.target.incarnation
+                || reference.target_epoch != plan.target.epoch
+                || reference.digest != *snapshot_digest
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "coordinator/composition retirement mismatch",
+                ));
+            }
+        }
     }
     let mut highest = intent.transaction().0;
     let mut blockers = Vec::new();
@@ -2644,50 +2784,100 @@ fn validate_retirement_lineage(
                     "replacement retirement is not terminal",
                 ));
             }
-            let mut current = fragment_incarnation(&rewrite.target);
-            let mut transaction = rewrite.reservation.transaction;
-            loop {
-                if let Some(next) = journal.rewrites.values().find(|candidate| {
-                    candidate.old_storage() == current.storage
-                        && candidate.retired
-                        && candidate.resolved == Some(true)
-                }) {
-                    if next.reservation.transaction.0 <= transaction.0
-                        || fragment_incarnation(&next.base) != current
-                    {
-                        return Err(SchemaMutationError::Corrupt(
-                            "replacement rewrite lineage is inconsistent",
-                        ));
-                    }
-                    current = fragment_incarnation(&next.target);
-                    transaction = next.reservation.transaction;
-                    continue;
-                }
-                if let Some(drop) = journal.drops.values().find(|candidate| {
-                    candidate.storage() == current.storage
-                        && candidate.retired
-                        && candidate.resolved == Some(true)
-                }) {
-                    if drop.transaction.0 <= transaction.0
-                        || fragment_incarnation(&drop.fragment) != current
-                        || active_incarnation(active, current.table)?.is_some()
-                    {
-                        return Err(SchemaMutationError::Corrupt(
-                            "replacement-to-drop lineage is inconsistent",
-                        ));
-                    }
-                    return Ok(());
-                }
-                if active_incarnation(active, current.table)? != Some(current) {
-                    return Err(SchemaMutationError::Corrupt(
-                        "replacement lineage does not reach active storage",
-                    ));
-                }
-                return Ok(());
+            validate_replacement_lineage(
+                active,
+                journal,
+                fragment_incarnation(&rewrite.target),
+                rewrite.reservation.transaction,
+            )?;
+        }
+        RetiredHeapIntent::SchemaComposition {
+            transaction, plan, ..
+        } => {
+            if !plan.retired {
+                return Err(SchemaMutationError::Corrupt(
+                    "composition retirement is not terminal",
+                ));
             }
+            validate_replacement_lineage(
+                active,
+                journal,
+                fragment_incarnation(&plan.target),
+                *transaction,
+            )?;
         }
     }
     Ok(())
+}
+
+fn validate_replacement_lineage(
+    active: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+    mut current: HeapIncarnation,
+    mut transaction: DatabaseTxnId,
+) -> Result<(), SchemaMutationError> {
+    loop {
+        if let Some(next) = journal.rewrites.values().find(|candidate| {
+            candidate.old_storage() == current.storage
+                && candidate.retired
+                && candidate.resolved == Some(true)
+        }) {
+            if next.reservation.transaction.0 <= transaction.0
+                || fragment_incarnation(&next.base) != current
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "replacement rewrite lineage is inconsistent",
+                ));
+            }
+            current = fragment_incarnation(&next.target);
+            transaction = next.reservation.transaction;
+            continue;
+        }
+        if let Some((next_transaction, next)) =
+            journal.compositions.values().find_map(|composition| {
+                (composition.resolution == Some(CompositionResolution::Winner))
+                    .then_some(composition.intent.as_ref())
+                    .flatten()
+                    .and_then(|intent| {
+                        intent
+                            .tables
+                            .iter()
+                            .find(|plan| plan.old_storage() == current.storage && plan.retired)
+                            .map(|plan| (intent.transaction, plan))
+                    })
+            })
+        {
+            if next_transaction.0 <= transaction.0 || fragment_incarnation(&next.base) != current {
+                return Err(SchemaMutationError::Corrupt(
+                    "composition replacement lineage is inconsistent",
+                ));
+            }
+            current = fragment_incarnation(&next.target);
+            transaction = next_transaction;
+            continue;
+        }
+        if let Some(drop) = journal.drops.values().find(|candidate| {
+            candidate.storage() == current.storage
+                && candidate.retired
+                && candidate.resolved == Some(true)
+        }) {
+            if drop.transaction.0 <= transaction.0
+                || fragment_incarnation(&drop.fragment) != current
+                || active_incarnation(active, current.table)?.is_some()
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "replacement-to-drop lineage is inconsistent",
+                ));
+            }
+            return Ok(());
+        }
+        if active_incarnation(active, current.table)? != Some(current) {
+            return Err(SchemaMutationError::Corrupt(
+                "replacement lineage does not reach active storage",
+            ));
+        }
+        return Ok(());
+    }
 }
 
 fn inspect_gc(
@@ -2855,6 +3045,20 @@ fn resume_gc_intent(
                 .get(&intent.transaction())
                 .and_then(|rewrite| rewrite.gc.as_ref())
         })
+        .or_else(|| match intent {
+            RetiredHeapIntent::SchemaComposition { plan, .. } => journal
+                .compositions
+                .get(&intent.transaction())
+                .and_then(|record| record.intent.as_ref())
+                .and_then(|composition| {
+                    composition
+                        .tables
+                        .iter()
+                        .find(|candidate| candidate.table() == plan.table())
+                })
+                .and_then(|candidate| candidate.gc.as_ref()),
+            _ => None,
+        })
         .ok_or(SchemaMutationError::Corrupt(
             "GC deletion without durable intent",
         ))?
@@ -2931,7 +3135,12 @@ fn resume_gc_intent(
         .ok_or(SchemaMutationError::Corrupt("empty GC component manifest"))?;
     file::sync_parent(&first.path)?;
     crash("gc-directory-synced");
-    journal.complete_gc(intent.transaction())?;
+    match intent {
+        RetiredHeapIntent::SchemaComposition { plan, .. } => {
+            journal.complete_composition_gc(intent.transaction(), plan.table())?
+        }
+        _ => journal.complete_gc(intent.transaction())?,
+    }
     crash("gc-complete-durable");
     Ok(())
 }
@@ -2962,6 +3171,9 @@ fn validate_retired_resource(
     match intent {
         RetiredHeapIntent::TableDrop(drop) => validate_drop_resource(catalog, drop),
         RetiredHeapIntent::SchemaRewrite(rewrite) => validate_rewrite_source(catalog, rewrite),
+        RetiredHeapIntent::SchemaComposition { plan, .. } => {
+            validate_composition_source(catalog, plan)
+        }
     }
 }
 
@@ -3023,7 +3235,7 @@ fn validate_intent(
     }
     Ok(())
 }
-fn promote(
+pub(crate) fn promote(
     catalog: &Path,
     reservation: &Reservation,
     reference: &SchemaParticipantReference,
@@ -3117,7 +3329,7 @@ fn validate_heap_identity(path: &Path, reservation: &Reservation) -> Result<(), 
     }
     Ok(())
 }
-fn open_winner_heap(
+pub(crate) fn open_winner_heap(
     path: &Path,
     reservation: &Reservation,
     decisions: &[crate::CoordinatorDecision],
@@ -3162,7 +3374,7 @@ fn remove_file(path: &Path) -> Result<(), SchemaMutationError> {
     }
     Ok(())
 }
-fn cleanup_prepared(
+pub(crate) fn cleanup_prepared(
     catalog: &Path,
     reservation: &Reservation,
     incarnation: [u8; 16],
@@ -3204,7 +3416,17 @@ fn cleanup_drop_prepared(catalog: &Path, intent: &DropIntent) -> Result<(), Sche
     }
     Ok(())
 }
-fn cleanup_loser(
+pub(crate) fn cleanup_loser(
+    catalog: &Path,
+    reservation: &Reservation,
+    incarnation: [u8; 16],
+) -> Result<(), SchemaMutationError> {
+    cleanup_staged_loser(catalog, reservation, incarnation)?;
+    crash("rollback-cleanup");
+    cleanup_prepared(catalog, reservation, incarnation)
+}
+
+pub(crate) fn cleanup_staged_loser(
     catalog: &Path,
     reservation: &Reservation,
     incarnation: [u8; 16],
@@ -3234,8 +3456,7 @@ fn cleanup_loser(
     for (path, _) in components(&stage) {
         remove_file(&path)?;
     }
-    crash("rollback-cleanup");
-    cleanup_prepared(catalog, reservation, incarnation)
+    Ok(())
 }
 
 /// Resolve schema obligations before strict active NBSC/state pair validation.
@@ -3250,6 +3471,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
     if journal.reservations.is_empty()
         && journal.drops.is_empty()
         && journal.rewrite_reservations.is_empty()
+        && journal.compositions.is_empty()
     {
         return Ok(Some(journal));
     }
@@ -3291,6 +3513,28 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 )
                 .into());
             }
+        } else if let Some(composition) = journal.compositions.get(&decision.database_txn_id) {
+            let intent = composition
+                .intent
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "composition decision has no aggregate intent",
+                ))?;
+            validate_composition_reference(intent, reference)?;
+            if matches!(
+                composition.resolution,
+                Some(CompositionResolution::Loser | CompositionResolution::NoEffectiveChange)
+            ) || intent.tables.iter().any(|plan| {
+                !decision
+                    .participants
+                    .iter()
+                    .any(|participant| participant.storage_id == plan.new_storage())
+            }) {
+                return Err(SchemaMutationError::Corrupt(
+                    "composition winner contradicts journal/participants",
+                )
+                .into());
+            }
         } else {
             return Err(
                 SchemaMutationError::Corrupt("schema decision has no mutation intent").into(),
@@ -3313,10 +3557,158 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 .cloned()
                 .map(|rewrite| RetiredHeapIntent::SchemaRewrite(Box::new(rewrite))),
         )
+        .chain(journal.compositions.values().flat_map(|composition| {
+            composition.intent.as_ref().into_iter().flat_map(|intent| {
+                intent
+                    .tables
+                    .iter()
+                    .filter(|plan| plan.gc.is_some())
+                    .cloned()
+                    .map(|plan| RetiredHeapIntent::SchemaComposition {
+                        transaction: intent.transaction,
+                        snapshot_digest: intent.snapshot_digest,
+                        plan: Box::new(plan),
+                    })
+            })
+        }))
         .collect::<Vec<_>>();
     durable_gc.sort_by_key(RetiredHeapIntent::transaction);
     for intent in durable_gc {
         resume_gc_intent(catalog, &mut journal, &intent, &decisions)?;
+    }
+    let mut compositions = journal.compositions.values().cloned().collect::<Vec<_>>();
+    compositions
+        .sort_by_key(|composition| (composition.resolution.is_some(), composition.transaction));
+    for composition in compositions {
+        let txn = composition.transaction;
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.database_txn_id == txn);
+        if let Some(decision) = decision {
+            let intent = composition
+                .intent
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "composition decision has no aggregate intent",
+                ))?;
+            let reference = decision
+                .schema
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "composition has a storage-only decision",
+                ))?;
+            validate_composition_reference(intent, reference)?;
+            if composition.resolution == Some(CompositionResolution::Winner) {
+                let active = file::load(catalog)?;
+                verify_composition_published(&active, intent, false)?;
+                if !decision.complete || intent.tables.iter().any(|plan| !plan.retired) {
+                    return Err(SchemaMutationError::Corrupt(
+                        "resolved composition winner is incomplete",
+                    )
+                    .into());
+                }
+                for plan in &intent.tables {
+                    validate_retirement_lineage(
+                        &active,
+                        &journal,
+                        &RetiredHeapIntent::SchemaComposition {
+                            transaction: intent.transaction,
+                            snapshot_digest: intent.snapshot_digest,
+                            plan: Box::new(plan.clone()),
+                        },
+                    )?;
+                    if plan.gc.is_none() {
+                        validate_composition_source(catalog, plan)?;
+                    } else if !plan.gc.as_ref().is_some_and(|gc| gc.complete) {
+                        return Err(SchemaMutationError::Corrupt(
+                            "composition GC recovery incomplete",
+                        )
+                        .into());
+                    }
+                }
+                if let Some(first) = intent.tables.first() {
+                    cleanup_prepared(
+                        catalog,
+                        &composition_reservation(intent, first, Some(true)),
+                        marker.incarnation,
+                    )?;
+                }
+                continue;
+            }
+            if composition.resolution.is_some() {
+                return Err(SchemaMutationError::Corrupt(
+                    "composition loser/no-change has commit decision",
+                )
+                .into());
+            }
+            let prepared = file::resolve(
+                catalog,
+                &prepared_locator(catalog, marker.incarnation, txn)?,
+            );
+            let bytes = file::read(&prepared)?;
+            if digest(&bytes) != reference.digest || digest(&bytes) != intent.snapshot_digest {
+                return Err(SchemaMutationError::Corrupt(
+                    "prepared composition NBSC digest mismatch",
+                )
+                .into());
+            }
+            let target = SchemaCatalogSnapshot::decode(&bytes)?;
+            verify_composition_published(&target, intent, true)?;
+            for plan in &intent.tables {
+                promote(
+                    catalog,
+                    &composition_reservation(intent, plan, None),
+                    reference,
+                )?;
+            }
+            let database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
+            database.close()?;
+            for plan in &intent.tables {
+                validate_composition_source(catalog, plan)?;
+                journal.retire_composition_table(txn, plan.table())?;
+            }
+            file::publish_runtime(catalog, &target)?;
+            coordinator.complete(txn)?;
+            journal.resolve_composition(txn, CompositionResolution::Winner)?;
+            if let Some(first) = intent.tables.first() {
+                cleanup_prepared(
+                    catalog,
+                    &composition_reservation(intent, first, Some(true)),
+                    marker.incarnation,
+                )?;
+            }
+        } else {
+            if matches!(composition.resolution, Some(CompositionResolution::Winner))
+                || composition
+                    .intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.tables.iter().any(|plan| plan.retired))
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "retired composition lacks coordinator decision",
+                )
+                .into());
+            }
+            if composition.resolution.is_none() {
+                if let Some(intent) = &composition.intent {
+                    for plan in &intent.tables {
+                        cleanup_staged_loser(
+                            catalog,
+                            &composition_reservation(intent, plan, Some(false)),
+                            marker.incarnation,
+                        )?;
+                    }
+                    if let Some(first) = intent.tables.first() {
+                        cleanup_prepared(
+                            catalog,
+                            &composition_reservation(intent, first, Some(false)),
+                            marker.incarnation,
+                        )?;
+                    }
+                }
+                journal.resolve_composition(txn, CompositionResolution::Loser)?;
+            }
+        }
     }
     let mut reservations = journal.reservations.values().cloned().collect::<Vec<_>>();
     // Finish the newest unresolved publication before validating older completed
@@ -3349,7 +3741,19 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                             decision.database_txn_id == rewrite.reservation.transaction
                         })
                 });
-                if later_drop.is_none() && later_rewrite.is_none() {
+                let later_composition = journal.compositions.values().find_map(|composition| {
+                    composition.intent.as_ref().and_then(|intent| {
+                        intent.tables.iter().find(|plan| {
+                            intent.transaction.0 > reservation.transaction.0
+                                && plan.table() == reservation.table
+                                && plan.old_storage() == reservation.storage
+                                && decisions
+                                    .iter()
+                                    .any(|decision| decision.database_txn_id == intent.transaction)
+                        })
+                    })
+                });
+                if later_drop.is_none() && later_rewrite.is_none() && later_composition.is_none() {
                     let active = file::load(catalog)?;
                     verify_published(&active, &reservation)?;
                 }
@@ -3372,7 +3776,9 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 let physical_deleted = later_drop
                     .is_some_and(|drop| drop.gc.as_ref().is_some_and(|gc| gc.complete))
                     || later_rewrite
-                        .is_some_and(|rewrite| rewrite.gc.as_ref().is_some_and(|gc| gc.complete));
+                        .is_some_and(|rewrite| rewrite.gc.as_ref().is_some_and(|gc| gc.complete))
+                    || later_composition
+                        .is_some_and(|plan| plan.gc.as_ref().is_some_and(|gc| gc.complete));
                 if !physical_deleted
                     && file::read(&file::suffix(&final_path, ".owner"))?
                         != owner_bytes(
@@ -3672,6 +4078,118 @@ fn rewrite_physical_reservation(intent: &RewriteIntent) -> Reservation {
         }),
         resolved: intent.resolved,
     }
+}
+
+fn composition_reservation(
+    intent: &SchemaChangeSetIntent,
+    plan: &CompositionTablePlan,
+    resolved: Option<bool>,
+) -> Reservation {
+    Reservation {
+        transaction: intent.transaction,
+        table: plan.table(),
+        storage: plan.new_storage(),
+        base_generation: intent.base_generation,
+        base_epoch: intent.base_epoch,
+        intent: Some(CreateIntent {
+            fragment: plan.target.clone(),
+            snapshot_digest: intent.snapshot_digest,
+        }),
+        resolved,
+    }
+}
+
+fn validate_composition_reference(
+    intent: &SchemaChangeSetIntent,
+    reference: &SchemaParticipantReference,
+) -> Result<(), SchemaMutationError> {
+    if intent.tables.is_empty()
+        || reference.incarnation != intent.tables[0].target.incarnation
+        || reference.target_epoch != intent.target_epoch
+        || reference.digest != intent.snapshot_digest
+    {
+        return Err(SchemaMutationError::Corrupt(
+            "coordinator/composition intent mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_composition_source(
+    catalog: &Path,
+    plan: &CompositionTablePlan,
+) -> Result<(), DatabaseError> {
+    let descriptor = &plan.base.storages[0];
+    if !matches!(descriptor.kind, CatalogStorageKind::Heap) || descriptor.id == plan.new_storage() {
+        return Err(
+            SchemaMutationError::Corrupt("invalid composition replacement identity").into(),
+        );
+    }
+    let path = file::resolve(catalog, &descriptor.locator);
+    let table = &plan.base.committed.schema.tables()[0];
+    let identity = TableStorage::inspect_heap_identity(&path)?;
+    let recovery = TableStorage::inspect_heap_recovery(&path, table)?;
+    if identity.storage_id != descriptor.id
+        || recovery.storage_id != descriptor.id
+        || identity.table_id != plan.table()
+        || identity.schema_fingerprint != plan.base.placements.tables[0].schema_fingerprint
+    {
+        return Err(
+            SchemaMutationError::Corrupt("composition replacement-retired Heap mismatch").into(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_composition_published(
+    snapshot: &SchemaCatalogSnapshot,
+    intent: &SchemaChangeSetIntent,
+    exact: bool,
+) -> Result<(), DatabaseError> {
+    if intent.tables.is_empty()
+        || snapshot.incarnation != intent.tables[0].target.incarnation
+        || if exact {
+            snapshot.epoch != intent.target_epoch
+                || snapshot.committed.generation != intent.target_generation
+        } else {
+            snapshot.epoch < intent.target_epoch
+                || snapshot.committed.generation < intent.target_generation
+        }
+    {
+        return Err(SchemaMutationError::Corrupt(
+            "published composition generation differs from intent",
+        )
+        .into());
+    }
+    if exact {
+        for plan in &intent.tables {
+            if !snapshot
+                .committed
+                .schema
+                .tables()
+                .contains(&plan.target.committed.schema.tables()[0])
+                || !snapshot
+                    .committed
+                    .tables
+                    .contains(&plan.target.committed.tables[0])
+                || !snapshot
+                    .placements
+                    .tables
+                    .contains(&plan.target.placements.tables[0])
+                || !snapshot.storages.contains(&plan.target.storages[0])
+                || snapshot
+                    .storages
+                    .iter()
+                    .any(|storage| storage.id == plan.old_storage())
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "published composition table differs from intent",
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn rewrite_cleanup_reservation(intent: &RewriteReservation) -> Reservation {

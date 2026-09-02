@@ -62,6 +62,14 @@ Every NBSR payload starts with tag u8 and nonzero DatabaseTxnId u64.
 | 13 | Replacement Heap retained | None |
 | 14 | Resolved rewrite loser | None |
 | 15 | Resolved rewrite winner | None |
+| 16 | Composition ColumnId reservation | TableId u64, ColumnId u32, optional next ColumnId u32 (`0` means exhausted) |
+| 17 | Aggregate schema change-set intent | base/target generation and epoch, action count/digest, prepared NBSC SHA-256, ordered typed per-table base/target fragments |
+| 18 | Composition predecessor retained | TableId u64 |
+| 19 | Resolved composition loser | None |
+| 20 | Resolved composition no-effective-change | None |
+| 21 | Resolved composition winner | None |
+| 22 | Composition replacement GC intent | TableId u64, coordinator horizon DatabaseTxnId u64, exact bundle SHA-256 |
+| 23 | Composition replacement GC complete | TableId u64 |
 
 Tags 9/10 identify the surrounding terminal physical retirement by transaction,
 not by cause. They may follow a committed DROP (tags 5/6/8) or a committed Heap
@@ -118,6 +126,27 @@ out-of-order retirement/resolution, winner before tag 13, loser after tag 13,
 duplicate retirement and truncation. A reservation-only crash may end directly in
 tag 14. Current readers accept pre-Round24 histories; older readers reject tags
 11–15, so downgrade after Heap rewrite is unsupported.
+
+Composition keeps the same NBSJ v1 envelope. Tag 16 is synchronized at ADD
+statement execution and is allocator evidence, not schema authority. Tag 17 is
+written at global materialization before any staged file; it contains no SQL and
+describes only the final base-to-target recovery plan. Table plans are strictly
+ordered by TableId and their new StorageIds are strictly increasing in that same
+order. Each plan preserves one TableId, changes to a distinct StorageId, advances
+its table version once, and binds canonical base/target fingerprints and Single
+Heap fragments. The aggregate advances schema generation and epoch once and is
+bounded to 4 MiB inside the existing 16 MiB journal.
+
+Tag 18 is repeated once per table only after its winner target is recovered and
+the immutable predecessor is validated. Tag 21 requires every planned predecessor
+to be retained. Tags 19 and 20 have no physical winner plan; no-effective-change
+may retain earlier tag 16 records but cannot have tag 17. Tags 22/23 attach retry-
+only replacement GC to one exact table plan. Replay rejects duplicate transaction,
+table, ColumnId, or StorageId ownership, noncanonical order, mismatched fragments,
+invalid version/fingerprint transitions, retirement of an unknown plan, winner
+without complete retirement, and conflicting terminal outcomes. Tags 1–15 and
+their encoding remain unchanged; older readers reject 16–23, so downgrade after
+composition is unsupported.
 
 ## Locators and ownership
 
@@ -192,7 +221,15 @@ tag 15. It never recopies rows. Losers remove only exact private replacement
 artifacts and preserve the source. The active NBSC may contain the same TableId on
 the new StorageId while tag 13 retains the old StorageId; this state is distinct
 from DROP retirement and is exposed through a separate inspection API. Physical GC
-for replacement retirement is intentionally unsupported in Round 24.
+for replacement retirement is provided by Round 25 tags 9/10.
+
+For composition winners, one CORD v2 schema decision names every final staged
+Heap in StorageId order and one prepared NBSC digest. Recovery promotes and
+recovers all targets without replaying actions or rescanning sources, retains all
+predecessors before publication, publishes the one target NBSC, completes CORD,
+and records tag 21. Without a decision it cleans only exact tag-17 staging paths
+and records tag 19. Composition predecessors use the same explicit replacement
+GC component manifest and coordinator-horizon proof through tags 22/23.
 
 Dropping an unresolved schema handle requires reopen. Unknown/unlisted files are
 not garbage-collected. Startup does not choose GC candidates. Journal compaction
@@ -205,7 +242,9 @@ output directory. `schema_mutation_decode` fuzzes nested framing and replay;
 `coordinator_log_decode` includes schema decision, zero-participant DROP decision,
 Complete and truncated v2 seeds. DROP seeds include intent, loser, retained, winner
 and truncated records. Round 24 adds rewrite reservation, intent, loser, winner and
-truncated histories to the same bounded target.
+truncated histories to the same bounded target. Round 28 adds composition
+reservation, one-table intent, multi-table intent, loser and winner NBSJ seeds plus
+a real multi-participant CORD v2 seed.
 
 An empty journal without its activation witness is an interrupted initialization,
 not reservation history. Read-only reopen preserves it; the next mutation completes

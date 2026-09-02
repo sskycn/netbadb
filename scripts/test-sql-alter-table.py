@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 26 ALTER regressions plus Round 27 multi-DDL failure evidence."""
+"""Round 28 real-client ALTER-only composition acceptance."""
 from __future__ import annotations
 
 import io
@@ -24,38 +24,29 @@ PSQL = os.environ.get("PSQL", "/opt/local/lib/pgsql/bin/psql")
 def psql_probe(dsn: str) -> None:
     version = subprocess.check_output([PSQL, "--version"], text=True).strip()
     assert "17.11" in version, version
-    failed = subprocess.run(
+    composed = subprocess.run(
         [PSQL, "-X", "-w", "-qAt", "-v", "ON_ERROR_STOP=1", dsn],
         input="""\\set VERBOSITY verbose
 BEGIN;
-ALTER TABLE projects ADD COLUMN blocked BOOLEAN;
-ALTER TABLE projects RENAME COLUMN name TO blocked_name;
-COMMIT;
-""",
-        text=True,
-        capture_output=True,
-    )
-    assert failed.returncode == 3, failed
-    assert "0A000" in failed.stderr, failed.stderr
-    unchanged = subprocess.check_output(
-        [PSQL, "-X", "-w", "-qAt", dsn],
-        input="SELECT name FROM projects ORDER BY id;",
-        text=True,
-    )
-    assert unchanged.strip() == "one", unchanged
-    script = """
-BEGIN;
-ALTER TABLE projects ADD COLUMN active BOOLEAN;
-SELECT id, name, active FROM projects;
-INSERT INTO projects VALUES (2, 'two', true);
-ROLLBACK;
 ALTER TABLE projects ADD COLUMN active BOOLEAN;
 ALTER TABLE projects RENAME COLUMN name TO title;
 ALTER TABLE projects ALTER COLUMN title SET NOT NULL;
 ALTER TABLE projects ALTER COLUMN title DROP NOT NULL;
-ALTER TABLE projects DROP COLUMN active;
+COMMIT;
+SELECT id, title, active FROM projects ORDER BY id;
+""",
+        text=True,
+        capture_output=True,
+    )
+    assert composed.returncode == 0, composed.stderr
+    assert composed.stdout.strip() == "1|one|", composed.stdout
+    script = """
+BEGIN;
+ALTER TABLE projects RENAME COLUMN active TO enabled;
 ALTER TABLE projects RENAME TO work;
-SELECT id, title FROM work;
+INSERT INTO work VALUES (2, 'two', true);
+COMMIT;
+SELECT id, title, enabled FROM work ORDER BY id;
 """
     result = subprocess.run(
         [PSQL, "-X", "-w", "-qAt", "-v", "ON_ERROR_STOP=1", dsn],
@@ -64,53 +55,41 @@ SELECT id, title FROM work;
         capture_output=True,
         check=True,
     )
-    assert "1|one|" in result.stdout and "1|one" in result.stdout, result.stdout
+    assert result.stdout.strip().splitlines() == ["1|one|", "2|two|t"], result.stdout
     print(
-        f"{version}: multi-ALTER fails at statement 2 with 0A000 and rolls back; "
-        "six single ALTER operations plus post-ALTER DML PASS"
+        f"{version}: ALTER-only multi-statement transactions and post-final DML PASS"
     )
 
 
 def psycopg_probe(dsn: str) -> None:
     assert psycopg.__version__ == "3.2.13", psycopg.__version__
     with psycopg.connect(dsn) as connection:
-        try:
-            with connection.transaction():
-                with connection.cursor() as cursor:
-                    cursor.execute("ALTER TABLE projects ADD COLUMN blocked BOOLEAN")
-                    cursor.execute("ALTER TABLE projects RENAME COLUMN name TO blocked_name")
-        except psycopg.errors.FeatureNotSupported as error:
-            assert error.sqlstate == "0A000", error
-        else:
-            raise AssertionError("second ALTER unexpectedly succeeded")
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT name FROM projects ORDER BY id")
-            assert cursor.fetchall() == [("one",)]
-        connection.commit()
         with connection.transaction():
             with connection.cursor() as cursor:
                 cursor.execute(
                     "ALTER TABLE projects ADD COLUMN active BOOLEAN", prepare=True
                 )
-                cursor.execute("SELECT id, name, active FROM projects")
-                assert cursor.fetchall() == [(1, "one", None)]
+                cursor.execute("ALTER TABLE projects RENAME COLUMN name TO title")
+                cursor.execute("ALTER TABLE projects ALTER COLUMN title SET NOT NULL")
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute("ALTER TABLE projects RENAME COLUMN active TO enabled")
                 cursor.execute(
                     "INSERT INTO projects VALUES (%s, %s, %s)",
                     (2, "two", True),
                     prepare=True,
                 )
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id, active FROM projects ORDER BY id", prepare=True)
-            assert cursor.fetchall() == [(1, None), (2, True)]
+            cursor.execute("SELECT id, title, enabled FROM projects ORDER BY id", prepare=True)
+            assert cursor.fetchall() == [(1, "one", None), (2, "two", True)]
         connection.commit()
         with connection.transaction():
             with connection.cursor() as cursor:
                 cursor.execute("ALTER TABLE projects RENAME TO work")
-                cursor.execute("SELECT id, active FROM work ORDER BY id")
+                cursor.execute("SELECT id, enabled FROM work ORDER BY id")
                 assert cursor.fetchall() == [(1, None), (2, True)]
     print(
-        f"psycopg {psycopg.__version__}: multi-ALTER fails at statement 2 with "
-        "0A000 and rolls back; default and prepare=True single ALTER plus DML PASS"
+        f"psycopg {psycopg.__version__}: default and prepare=True multi-ALTER plus DML PASS"
     )
 
 
@@ -127,26 +106,15 @@ def sqlalchemy_probe(dsn: str) -> None:
             return rows[0][0]
 
     before_oid = table_oid("projects")
-    try:
-        with engine.begin() as connection:
-            connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN blocked BOOLEAN")
-            connection.exec_driver_sql(
-                "ALTER TABLE projects RENAME COLUMN name TO blocked_name"
-            )
-    except sa.exc.DBAPIError as error:
-        assert isinstance(error.orig, psycopg.errors.FeatureNotSupported), error
-        assert error.orig.sqlstate == "0A000", error
-    else:
-        raise AssertionError("second SQLAlchemy ALTER unexpectedly succeeded")
-    with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT name FROM projects").all() == [("one",)]
     with engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN active BOOLEAN")
+        connection.exec_driver_sql("ALTER TABLE projects RENAME COLUMN name TO title")
+        connection.exec_driver_sql("ALTER TABLE projects ALTER COLUMN title SET NOT NULL")
     add_oid = table_oid("projects")
     inspector = sa.inspect(engine)
     assert [(c["name"], c["nullable"]) for c in inspector.get_columns("projects")] == [
         ("id", False),
-        ("name", True),
+        ("title", False),
         ("active", True),
     ]
     with engine.begin() as connection:
@@ -155,18 +123,17 @@ def sqlalchemy_probe(dsn: str) -> None:
     assert "work" in sa.inspect(engine).get_table_names()
     assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("work")] == [
         ("id", False),
-        ("name", True),
+        ("title", False),
         ("active", True),
     ]
     assert [
         (index["name"], index["column_names"])
         for index in sa.inspect(engine).get_indexes("work")
-    ] == [("projects_name_idx", ["name"])]
-    assert len({before_oid, add_oid, rename_oid}) == 3
+    ] == [("projects_name_idx", ["title"])]
+    assert before_oid != add_oid and add_oid != rename_oid
     engine.dispose()
     print(
-        f"SQLAlchemy {sa.__version__}: multi-ALTER transaction fails at statement 2 "
-        "with 0A000 and rolls back; exec_driver_sql and reflection PASS; "
+        f"SQLAlchemy {sa.__version__}: multi-ALTER exec_driver_sql and reflection PASS; "
         f"fingerprint-keyed table OIDs {before_oid} -> {add_oid} -> {rename_oid}"
     )
 
@@ -220,55 +187,48 @@ def alembic_probe(dsn: str) -> None:
 
     generated.clear()
     boundaries.clear()
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        operations.add_column("projects", sa.Column("blocked", sa.Boolean(), nullable=True))
+        operations.alter_column("projects", "name", new_column_name="display_name")
+        operations.alter_column("projects", "display_name", nullable=False)
+    assert boundaries == ["BEGIN", "COMMIT"], boundaries
+    assert generated == planned_sql[:3], generated
+    assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("projects")] == [
+        ("id", False),
+        ("display_name", False),
+        ("blocked", True),
+    ]
+
+    generated.clear()
+    boundaries.clear()
     try:
         with engine.begin() as connection:
             operations = Operations(MigrationContext.configure(connection))
-            operations.add_column(
-                "projects", sa.Column("blocked", sa.Boolean(), nullable=True)
-            )
-            operations.alter_column(
-                "projects", "name", new_column_name="display_name"
-            )
-            operations.alter_column("projects", "display_name", nullable=False)
-            operations.create_index("projects_blocked_idx", "projects", ["blocked"])
+            operations.add_column("projects", sa.Column("doomed", sa.Boolean(), nullable=True))
+            operations.create_index("projects_doomed_idx", "projects", ["doomed"])
     except sa.exc.DBAPIError as error:
         assert isinstance(error.orig, psycopg.errors.FeatureNotSupported), error
         assert error.orig.sqlstate == "0A000", error
     else:
-        raise AssertionError("ordinary Alembic multi-operation migration unexpectedly succeeded")
+        raise AssertionError("ALTER + CREATE INDEX unexpectedly succeeded")
     assert boundaries == ["BEGIN", "ROLLBACK"], boundaries
-    assert generated == planned_sql[:2], generated
+    assert generated == [
+        "ALTER TABLE projects ADD COLUMN doomed BOOLEAN",
+        "CREATE INDEX projects_doomed_idx ON projects (doomed)",
+    ], generated
     assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("projects")] == [
         ("id", False),
-        ("name", True),
+        ("display_name", False),
+        ("blocked", True),
     ]
-    generated.clear()
-
-    def apply(operation) -> None:
-        with engine.begin() as connection:
-            operation(Operations(MigrationContext.configure(connection)))
-
-    apply(lambda op: op.add_column("projects", sa.Column("active", sa.Boolean(), nullable=True)))
-    apply(lambda op: op.alter_column("projects", "name", nullable=False))
-    apply(lambda op: op.alter_column("projects", "name", nullable=True))
-    apply(lambda op: op.alter_column("projects", "name", new_column_name="title"))
-    apply(lambda op: op.drop_column("projects", "active"))
-    apply(lambda op: op.rename_table("projects", "work"))
-    assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("work")] == [
-        ("id", False),
-        ("title", True),
-    ]
-    assert [
-        (index["name"], index["column_names"])
-        for index in sa.inspect(engine).get_indexes("work")
-    ] == [("projects_name_idx", ["title"])]
-    assert len(generated) == 6, generated
+    assert "projects_doomed_idx" not in {
+        index["name"] for index in sa.inspect(engine).get_indexes("projects")
+    }
     print(
-        f"Alembic {alembic.__version__}: ordinary migration plan is "
+        f"Alembic {alembic.__version__}: pure multi-ALTER migration PASS; plan is "
         + " | ".join(planned_sql)
-        + "; actual BEGIN emitted the first two statements, failed statement 2 with "
-        "0A000, ROLLBACK restored the base schema; six independent operations PASS: "
-        + " | ".join(generated)
+        + "; ALTER + CREATE INDEX remains 0A000 and rolls back"
     )
     engine.dispose()
 

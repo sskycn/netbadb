@@ -54,7 +54,8 @@ production or build dependencies.
 | SQLAlchemy `Table.drop(checkfirst=False)` | yes | rollback and commit; no custom dialect |
 | Basic Heap ALTER TABLE | yes, bounded fixture | six exact-prepared actions; Simple/Extended Query; transactional |
 | SQLAlchemy ALTER transport/reflection | yes | `exec_driver_sql`; Inspector sees committed rename/columns/indexes |
-| Alembic table operations | bounded | six real Operations in independent transactions; no multi-DDL migration claim |
+| ALTER-only multi-statement transaction | yes, bounded | same/cross-table Core composition; one final rewrite per dirty table |
+| Alembic table operations | bounded | pure multi-ALTER transaction succeeds; ALTER plus table/index DDL fails and rolls back |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
