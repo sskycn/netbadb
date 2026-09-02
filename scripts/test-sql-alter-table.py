@@ -66,7 +66,16 @@ def psycopg_probe(dsn: str) -> None:
         with connection.cursor() as cursor:
             cursor.execute("SELECT id, active FROM projects ORDER BY id", prepare=True)
             assert cursor.fetchall() == [(1, None), (2, True)]
-    print(f"psycopg {psycopg.__version__}: prepare=True ALTER and same-transaction DML PASS")
+        connection.commit()
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute("ALTER TABLE projects RENAME TO work")
+                cursor.execute("SELECT id, active FROM work ORDER BY id")
+                assert cursor.fetchall() == [(1, None), (2, True)]
+    print(
+        f"psycopg {psycopg.__version__}: default and prepare=True ALTER plus "
+        "same-transaction DML PASS"
+    )
 
 
 def sqlalchemy_probe(dsn: str) -> None:
