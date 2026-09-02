@@ -77,6 +77,276 @@ fn sql_alter_prepare_is_pure_exact_and_schema_write_only() {
 }
 
 #[test]
+fn current_schema_transaction_materializes_first_alter_and_rejects_a_second() {
+    let root = root("single-mutation-boundary");
+    let mut db = seed(&root);
+    db.execute("CREATE TABLE teams (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO projects VALUES (1, 'one')")
+        .unwrap();
+    let projects = db.schema().table("projects").unwrap().id;
+    let teams = db.schema().table("teams").unwrap().id;
+    let project_name = db
+        .schema()
+        .table("projects")
+        .unwrap()
+        .column("name")
+        .unwrap()
+        .id;
+    let base_generation = db.schema_generation();
+    let base_revision = db.catalog_generation();
+    let reserved_storage = db.next_storage_id().unwrap();
+    let reserved_column = db.next_column_id(projects).unwrap();
+    let old_storage = db.bindings.resolve_single(projects).unwrap();
+
+    let mut transaction = db.begin_transaction().unwrap();
+    db.rewrite_heap_table_schema_in(
+        &mut transaction,
+        AlterTableSpec::new(
+            db.resolve_alter_table("projects").unwrap(),
+            AlterTableOperation::AddNullableColumn {
+                name: "active".into(),
+                data_type: SemanticType::physical(PhysicalType::Bool),
+            },
+        ),
+    )
+    .unwrap();
+
+    let mutation = transaction.schema_mutation.as_ref().unwrap();
+    assert_eq!(mutation.reservation.storage, reserved_storage);
+    assert_eq!(
+        mutation.rewrite.as_ref().unwrap().old_storage(),
+        old_storage
+    );
+    assert_eq!(
+        mutation.rewrite.as_ref().unwrap().new_storage(),
+        reserved_storage
+    );
+    assert_eq!(
+        mutation.staged.as_ref().unwrap().storage_id(),
+        reserved_storage
+    );
+    assert_eq!(transaction.participant_count(), 1);
+    assert_eq!(transaction.write_participant(), Some(reserved_storage));
+    assert_eq!(
+        transaction.participant_mode(reserved_storage),
+        Some(crate::ParticipantMode::Write)
+    );
+    assert_eq!(
+        mutation.target.committed.generation,
+        SchemaGeneration(base_generation.0 + 1)
+    );
+    assert_eq!(
+        mutation
+            .target
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == projects)
+            .unwrap()
+            .version,
+        TableSchemaVersion(2)
+    );
+    assert!(
+        mutation
+            .target
+            .committed
+            .schema
+            .table("projects")
+            .unwrap()
+            .column("active")
+            .is_some()
+    );
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("active")
+            .is_none()
+    );
+    assert_eq!(db.schema_generation(), base_generation);
+    assert_eq!(db.catalog_generation(), base_revision);
+    assert!(matches!(
+        db.begin_transaction(),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::SchemaBusy
+        ))
+    ));
+    assert_eq!(
+        db.next_storage_id(),
+        Some(StorageId(reserved_storage.0 + 1))
+    );
+    assert_eq!(
+        db.next_column_id(projects),
+        Some(ColumnId(reserved_column.0 + 1))
+    );
+    let journal = db.mutation_journal.as_ref().unwrap().borrow();
+    assert_eq!(journal.rewrite_reservations.len(), 1);
+    assert_eq!(journal.rewrites.len(), 1);
+    assert!(journal.rewrites.contains_key(&transaction.id()));
+    drop(journal);
+
+    let same_table = db.rewrite_heap_table_schema_in(
+        &mut transaction,
+        AlterTableSpec::new(
+            db.resolve_alter_table("projects").unwrap(),
+            AlterTableOperation::RenameColumn {
+                column_id: project_name,
+                new_name: "title".into(),
+            },
+        ),
+    );
+    assert!(matches!(
+        same_table,
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::TransactionNotPristine
+        ))
+    ));
+    let different_table = db.rewrite_heap_table_schema_in(
+        &mut transaction,
+        AlterTableSpec::new(
+            db.resolve_alter_table("teams").unwrap(),
+            AlterTableOperation::RenameTable {
+                new_name: "groups".into(),
+            },
+        ),
+    );
+    assert!(matches!(
+        different_table,
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::TransactionNotPristine
+        ))
+    ));
+
+    assert!(matches!(
+        db.prepare_sql_statement_in(
+            &transaction,
+            "ALTER TABLE projects RENAME COLUMN active TO enabled",
+            &[],
+        ),
+        Err(DatabaseError::UnsupportedDdlCombination)
+    ));
+    transaction.rollback().unwrap();
+    drop(transaction);
+
+    assert_eq!(db.schema_generation(), base_generation);
+    assert_eq!(db.catalog_generation(), base_revision);
+    assert_eq!(db.bindings.resolve_single(projects).unwrap(), old_storage);
+    assert_eq!(
+        db.next_storage_id(),
+        Some(StorageId(reserved_storage.0 + 1))
+    );
+    assert_eq!(
+        db.next_column_id(projects),
+        Some(ColumnId(reserved_column.0 + 1))
+    );
+    assert_eq!(db.schema().table("teams").unwrap().id, teams);
+    let mut resumed = db.begin_transaction().unwrap();
+    resumed.rollback().unwrap();
+    drop(resumed);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provisional_version_and_fingerprint_invalidate_prepared_across_overlay_changes() {
+    let root = root("provisional-dependency");
+    let mut db = seed(&root);
+    let table_id = db.schema().table("projects").unwrap().id;
+    let base_fingerprint = db
+        .schema()
+        .table("projects")
+        .unwrap()
+        .fingerprint()
+        .unwrap();
+    let global = db
+        .prepare_statement("SELECT name FROM projects", &[])
+        .unwrap();
+    assert_eq!(
+        global.schema_dependencies()[0].table_version,
+        TableSchemaVersion(1)
+    );
+
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects RENAME COLUMN name TO title",
+    )
+    .unwrap();
+    let provisional = db
+        .prepare_statement_in(&transaction, "SELECT title FROM projects", &[])
+        .unwrap();
+    let first_dependency = &provisional.schema_dependencies()[0];
+    assert_eq!(first_dependency.table_version, TableSchemaVersion(2));
+    assert_ne!(first_dependency.fingerprint, base_fingerprint);
+
+    // Test-only experiment: model a second logical overlay mutation without
+    // invoking the production single-mutation API or creating another Heap.
+    let mutation = transaction.schema_mutation.as_mut().unwrap();
+    let mut cycled = mutation
+        .target
+        .committed
+        .schema
+        .table("projects")
+        .unwrap()
+        .clone();
+    cycled
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "title")
+        .unwrap()
+        .name = "name".into();
+    mutation.target.committed.schema = Schema::new(vec![
+        mutation
+            .target
+            .committed
+            .schema
+            .table("seed")
+            .unwrap()
+            .clone(),
+        cycled,
+    ])
+    .unwrap();
+    let cycled_table = mutation
+        .target
+        .committed
+        .schema
+        .tables()
+        .iter()
+        .find(|table| table.id == table_id)
+        .unwrap();
+    assert_eq!(cycled_table.fingerprint().unwrap(), base_fingerprint);
+    assert_eq!(
+        mutation
+            .target
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == table_id)
+            .unwrap()
+            .version,
+        TableSchemaVersion(2)
+    );
+    assert!(matches!(
+        db.validate_prepared_dependencies(&provisional, Some(&transaction)),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+    assert!(matches!(
+        db.validate_prepared_dependencies(&global, Some(&transaction)),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+
+    transaction.rollback().unwrap();
+    drop(transaction);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn six_sql_alters_use_one_rewrite_lifecycle_and_preserve_logical_identities() {
     let root = root("six-operations");
     let mut db = seed(&root);

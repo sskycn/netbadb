@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Round 26 real psql, psycopg, SQLAlchemy and Alembic ALTER probes."""
+"""Round 26 ALTER regressions plus Round 27 multi-DDL failure evidence."""
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -23,6 +24,25 @@ PSQL = os.environ.get("PSQL", "/opt/local/lib/pgsql/bin/psql")
 def psql_probe(dsn: str) -> None:
     version = subprocess.check_output([PSQL, "--version"], text=True).strip()
     assert "17.11" in version, version
+    failed = subprocess.run(
+        [PSQL, "-X", "-w", "-qAt", "-v", "ON_ERROR_STOP=1", dsn],
+        input="""\\set VERBOSITY verbose
+BEGIN;
+ALTER TABLE projects ADD COLUMN blocked BOOLEAN;
+ALTER TABLE projects RENAME COLUMN name TO blocked_name;
+COMMIT;
+""",
+        text=True,
+        capture_output=True,
+    )
+    assert failed.returncode == 3, failed
+    assert "0A000" in failed.stderr, failed.stderr
+    unchanged = subprocess.check_output(
+        [PSQL, "-X", "-w", "-qAt", dsn],
+        input="SELECT name FROM projects ORDER BY id;",
+        text=True,
+    )
+    assert unchanged.strip() == "one", unchanged
     script = """
 BEGIN;
 ALTER TABLE projects ADD COLUMN active BOOLEAN;
@@ -45,12 +65,28 @@ SELECT id, title FROM work;
         check=True,
     )
     assert "1|one|" in result.stdout and "1|one" in result.stdout, result.stdout
-    print(f"{version}: six ALTER operations, post-ALTER DML and rollback PASS")
+    print(
+        f"{version}: multi-ALTER fails at statement 2 with 0A000 and rolls back; "
+        "six single ALTER operations plus post-ALTER DML PASS"
+    )
 
 
 def psycopg_probe(dsn: str) -> None:
     assert psycopg.__version__ == "3.2.13", psycopg.__version__
     with psycopg.connect(dsn) as connection:
+        try:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute("ALTER TABLE projects ADD COLUMN blocked BOOLEAN")
+                    cursor.execute("ALTER TABLE projects RENAME COLUMN name TO blocked_name")
+        except psycopg.errors.FeatureNotSupported as error:
+            assert error.sqlstate == "0A000", error
+        else:
+            raise AssertionError("second ALTER unexpectedly succeeded")
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT name FROM projects ORDER BY id")
+            assert cursor.fetchall() == [("one",)]
+        connection.commit()
         with connection.transaction():
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -73,8 +109,8 @@ def psycopg_probe(dsn: str) -> None:
                 cursor.execute("SELECT id, active FROM work ORDER BY id")
                 assert cursor.fetchall() == [(1, None), (2, True)]
     print(
-        f"psycopg {psycopg.__version__}: default and prepare=True ALTER plus "
-        "same-transaction DML PASS"
+        f"psycopg {psycopg.__version__}: multi-ALTER fails at statement 2 with "
+        "0A000 and rolls back; default and prepare=True single ALTER plus DML PASS"
     )
 
 
@@ -91,6 +127,19 @@ def sqlalchemy_probe(dsn: str) -> None:
             return rows[0][0]
 
     before_oid = table_oid("projects")
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN blocked BOOLEAN")
+            connection.exec_driver_sql(
+                "ALTER TABLE projects RENAME COLUMN name TO blocked_name"
+            )
+    except sa.exc.DBAPIError as error:
+        assert isinstance(error.orig, psycopg.errors.FeatureNotSupported), error
+        assert error.orig.sqlstate == "0A000", error
+    else:
+        raise AssertionError("second SQLAlchemy ALTER unexpectedly succeeded")
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT name FROM projects").all() == [("one",)]
     with engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN active BOOLEAN")
     add_oid = table_oid("projects")
@@ -116,7 +165,8 @@ def sqlalchemy_probe(dsn: str) -> None:
     assert len({before_oid, add_oid, rename_oid}) == 3
     engine.dispose()
     print(
-        f"SQLAlchemy {sa.__version__}: exec_driver_sql and reflection PASS; "
+        f"SQLAlchemy {sa.__version__}: multi-ALTER transaction fails at statement 2 "
+        "with 0A000 and rolls back; exec_driver_sql and reflection PASS; "
         f"fingerprint-keyed table OIDs {before_oid} -> {add_oid} -> {rename_oid}"
     )
 
@@ -125,11 +175,74 @@ def alembic_probe(dsn: str) -> None:
     assert alembic.__version__ == "1.16.5", alembic.__version__
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://", 1))
     generated: list[str] = []
+    boundaries: list[str] = []
 
     @event.listens_for(engine, "before_cursor_execute")
     def capture(_connection, _cursor, statement, _parameters, _context, _many):
-        if statement.lstrip().upper().startswith("ALTER TABLE"):
+        if statement.lstrip().upper().startswith(("ALTER TABLE", "CREATE INDEX")):
             generated.append(" ".join(statement.split()))
+
+    @event.listens_for(engine, "begin")
+    def capture_begin(_connection):
+        boundaries.append("BEGIN")
+
+    @event.listens_for(engine, "commit")
+    def capture_commit(_connection):
+        boundaries.append("COMMIT")
+
+    @event.listens_for(engine, "rollback")
+    def capture_rollback(_connection):
+        boundaries.append("ROLLBACK")
+
+    offline = io.StringIO()
+    offline_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": offline},
+    )
+    offline_ops = Operations(offline_context)
+    offline_ops.add_column(
+        "projects", sa.Column("blocked", sa.Boolean(), nullable=True)
+    )
+    offline_ops.alter_column("projects", "name", new_column_name="display_name")
+    offline_ops.alter_column("projects", "display_name", nullable=False)
+    offline_ops.create_index("projects_blocked_idx", "projects", ["blocked"])
+    planned_sql = [
+        " ".join(statement.split())
+        for statement in offline.getvalue().split(";")
+        if statement.strip()
+    ]
+    assert planned_sql == [
+        "ALTER TABLE projects ADD COLUMN blocked BOOLEAN",
+        "ALTER TABLE projects RENAME name TO display_name",
+        "ALTER TABLE projects ALTER COLUMN display_name SET NOT NULL",
+        "CREATE INDEX projects_blocked_idx ON projects (blocked)",
+    ], planned_sql
+
+    generated.clear()
+    boundaries.clear()
+    try:
+        with engine.begin() as connection:
+            operations = Operations(MigrationContext.configure(connection))
+            operations.add_column(
+                "projects", sa.Column("blocked", sa.Boolean(), nullable=True)
+            )
+            operations.alter_column(
+                "projects", "name", new_column_name="display_name"
+            )
+            operations.alter_column("projects", "display_name", nullable=False)
+            operations.create_index("projects_blocked_idx", "projects", ["blocked"])
+    except sa.exc.DBAPIError as error:
+        assert isinstance(error.orig, psycopg.errors.FeatureNotSupported), error
+        assert error.orig.sqlstate == "0A000", error
+    else:
+        raise AssertionError("ordinary Alembic multi-operation migration unexpectedly succeeded")
+    assert boundaries == ["BEGIN", "ROLLBACK"], boundaries
+    assert generated == planned_sql[:2], generated
+    assert [(c["name"], c["nullable"]) for c in sa.inspect(engine).get_columns("projects")] == [
+        ("id", False),
+        ("name", True),
+    ]
+    generated.clear()
 
     def apply(operation) -> None:
         with engine.begin() as connection:
@@ -151,7 +264,10 @@ def alembic_probe(dsn: str) -> None:
     ] == [("projects_name_idx", ["title"])]
     assert len(generated) == 6, generated
     print(
-        f"Alembic {alembic.__version__}: six independent single-operation transactions PASS; generated SQL: "
+        f"Alembic {alembic.__version__}: ordinary migration plan is "
+        + " | ".join(planned_sql)
+        + "; actual BEGIN emitted the first two statements, failed statement 2 with "
+        "0A000, ROLLBACK restored the base schema; six independent operations PASS: "
         + " | ".join(generated)
     )
     engine.dispose()
