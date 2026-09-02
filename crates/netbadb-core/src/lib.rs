@@ -297,6 +297,7 @@ pub struct PreparedDdlStatement {
 pub enum DdlOutcome {
     Created,
     Dropped,
+    Altered,
     Unchanged,
 }
 
@@ -311,6 +312,12 @@ impl PreparedDdlStatement {
                 schema_write: true,
             },
             CompiledDdlStatement::DropTable(statement) => StatementAccess {
+                read_tables: Vec::new(),
+                write_tables: Vec::new(),
+                schema_tables: vec![statement.target.table_id],
+                schema_write: true,
+            },
+            CompiledDdlStatement::AlterTable(statement) => StatementAccess {
                 read_tables: Vec::new(),
                 write_tables: Vec::new(),
                 schema_tables: vec![statement.target.table_id],
@@ -349,7 +356,16 @@ impl PreparedDdlStatement {
             CompiledDdlStatement::CreateTable(s) => s.columns.as_slice(),
             _ => &[],
         };
-        columns.iter().map(|c| &c.data_type)
+        let added = match &self.compiled {
+            CompiledDdlStatement::AlterTable(statement) => match &statement.operation {
+                netbadb_compiler::TypedAlterTableOperation::AddNullableColumn {
+                    data_type, ..
+                } => Some(data_type),
+                _ => None,
+            },
+            _ => None,
+        };
+        columns.iter().map(|c| &c.data_type).chain(added)
     }
 
     /// Frontend command kind, with no protocol-specific completion tag.
@@ -362,6 +378,21 @@ impl PreparedDdlStatement {
     #[must_use]
     pub fn is_table_drop(&self) -> bool {
         matches!(self.compiled, CompiledDdlStatement::DropTable(_))
+    }
+
+    /// Whether this statement is a generic SQL ALTER TABLE.
+    #[must_use]
+    pub fn is_table_alter(&self) -> bool {
+        matches!(self.compiled, CompiledDdlStatement::AlterTable(_))
+    }
+
+    /// Exact prepared ALTER target, when applicable.
+    #[must_use]
+    pub fn alter_table_target(&self) -> Option<DropTableTarget> {
+        match &self.compiled {
+            CompiledDdlStatement::AlterTable(statement) => Some(statement.target),
+            _ => None,
+        }
     }
 
     /// Exact prepared target for generic DROP TABLE, when applicable.
@@ -518,6 +549,7 @@ pub enum DatabaseError {
 pub enum DatabaseErrorKind {
     Syntax,
     DuplicateColumn,
+    DependentObjects,
     SchemaBusy,
     UndefinedTable,
     UndefinedColumn,
@@ -541,6 +573,7 @@ impl DatabaseError {
             Self::Compile(error) => match error.kind() {
                 CompileErrorKind::UndefinedType => DatabaseErrorKind::UndefinedObject,
                 CompileErrorKind::DuplicateColumn => DatabaseErrorKind::DuplicateColumn,
+                CompileErrorKind::DuplicateTable => DatabaseErrorKind::DuplicateObject,
                 CompileErrorKind::Syntax => DatabaseErrorKind::Syntax,
                 CompileErrorKind::UndefinedTable => DatabaseErrorKind::UndefinedTable,
                 CompileErrorKind::UndefinedColumn => DatabaseErrorKind::UndefinedColumn,
@@ -583,6 +616,9 @@ impl DatabaseError {
             Self::SchemaMutation(SchemaMutationError::NotNullViolation(_)) => {
                 DatabaseErrorKind::NotNullViolation
             }
+            Self::SchemaMutation(
+                SchemaMutationError::IndexedColumn(_) | SchemaMutationError::PrimaryKeyColumn(_),
+            ) => DatabaseErrorKind::DependentObjects,
             Self::Schema(SchemaError::DuplicateTableName { .. }) => {
                 DatabaseErrorKind::DuplicateObject
             }
@@ -709,9 +745,8 @@ impl fmt::Display for DatabaseError {
                 table_id.0
             ),
             Self::UndefinedIndex => formatter.write_str("index does not exist"),
-            Self::UnsupportedDdlCombination => {
-                formatter.write_str("CREATE and DROP INDEX cannot be combined in one transaction")
-            }
+            Self::UnsupportedDdlCombination => formatter
+                .write_str("this schema/index DDL combination is not supported in one transaction"),
             Self::DuplicateIndexName(name) => write!(formatter, "index `{name}` already exists"),
             Self::CreateTablesRollback {
                 creation,
@@ -2252,6 +2287,17 @@ impl Database {
                 self.commit_transaction(&mut transaction)?;
                 Ok(DdlOutcome::Dropped)
             }
+            CompiledDdlStatement::AlterTable(statement) => {
+                let mut transaction = self.begin_transaction()?;
+                if let Err(error) = self
+                    .rewrite_heap_table_schema_in(&mut transaction, AlterTableSpec::from(statement))
+                {
+                    transaction.rollback()?;
+                    return Err(error);
+                }
+                self.commit_transaction(&mut transaction)?;
+                Ok(DdlOutcome::Altered)
+            }
             CompiledDdlStatement::DropIndex(statement) => {
                 let Some(target) = self.validate_drop_target(statement)? else {
                     return Ok(DdlOutcome::Unchanged);
@@ -2309,6 +2355,10 @@ impl Database {
             CompiledDdlStatement::DropTable(statement) => {
                 self.drop_table_in(transaction, statement.target)?;
                 Ok(DdlOutcome::Dropped)
+            }
+            CompiledDdlStatement::AlterTable(statement) => {
+                self.rewrite_heap_table_schema_in(transaction, AlterTableSpec::from(statement))?;
+                Ok(DdlOutcome::Altered)
             }
             CompiledDdlStatement::DropIndex(statement) => {
                 if transaction.has_pending_index_creations() {
@@ -6756,6 +6806,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod sql_alter_table_tests;
 #[cfg(test)]
 mod sql_create_table_tests;
 #[cfg(test)]

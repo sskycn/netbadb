@@ -1150,6 +1150,9 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "native_alter_table_tests.rs"]
+mod alter_table_tests;
+#[cfg(test)]
 #[path = "native_create_table_tests.rs"]
 mod create_table_tests;
 #[cfg(test)]

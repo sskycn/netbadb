@@ -218,7 +218,8 @@ impl DatabaseSession {
         database: &mut Database,
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
-        let implicit = self.transaction.is_none() && prepared.is_table_create();
+        let implicit =
+            self.transaction.is_none() && (prepared.is_table_create() || prepared.is_table_alter());
         if implicit {
             self.begin(database, None)?;
         }

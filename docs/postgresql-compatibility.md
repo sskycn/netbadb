@@ -238,7 +238,7 @@ FOREIGN KEY, GENERATED, IDENTITY, COLLATE, CONSTRAINT, EXCLUDE; VARCHAR(n)/CHAR(
 SMALLINT/INTEGER/NUMERIC/DECIMAL/FLOAT/DOUBLE/DATE/TIME/TIMESTAMP/INTERVAL/JSON/UUID/
 BYTEA/ARRAY/SERIAL/BIGSERIAL and other non-native types; TEMP/TEMPORARY/UNLOGGED,
 IF NOT EXISTS, CTAS, LIKE, INHERITS, PARTITION BY, USING, WITH, TABLESPACE, ON COMMIT;
-qualified/quoted CREATE names; ALTER TABLE; runtime LSM/range placement;
+qualified/quoted CREATE names; extended ALTER TABLE grammar; runtime LSM/range placement;
 multiple CREATE TABLEs per transaction and table/index DDL mixing. Unsupported
 clauses are rejected, never silently discarded or stored as unenforced metadata.
 
@@ -264,6 +264,28 @@ CASCADE/RESTRICT, multiple names, qualified/quoted names, ONLY, other DROP objec
 types, LSM/range tables, multiple schema mutations, and table/index DDL mixing.
 SQLAlchemy `Table.drop(checkfirst=False)` is covered; checkfirst/drop_all and Alembic
 table migration remain outside acceptance. See [Round 21](sql-drop-table-round21.md).
+
+## Basic transactional ALTER TABLE (Round 26)
+
+Six generic forms are supported for runtime-created Single Heaps: rename table,
+rename column (`COLUMN` optional), add one nullable basic-type column, restricted
+drop column, and set/drop NOT NULL. HIR binds exact TableId/schema version/
+fingerprint and existing-column actions bind ColumnId. Parse/Bind/Describe are
+side-effect-free; Execute calls the existing Round 24 rewrite and returns
+`ALTER TABLE`.
+
+Every committed operation keeps TableId and surviving ColumnIds/IndexIds, advances
+the table version and SchemaGeneration once, and installs a new StorageId. Current
+indexes are validated and rebuilt at Execute. Prepared ALTER fails after a table
+rewrite or DROP+same-name CREATE but survives DML/index-only revisions. ALTER must
+precede every executed user data access in its transaction.
+
+Real psql 17.11, psycopg 3.2.13 `prepare=True`, SQLAlchemy 2.0.52 transport/
+reflection, and Alembic 1.16.5 Operations pass. Alembic is limited to one supported
+operation per transaction. Defaults, constraints, ADD NOT NULL, physical type
+conversion, dependent-column DROP, qualified/quoted/IF EXISTS/CASCADE forms,
+multiple actions/mutations, non-Heap placement, online ALTER, and automatic GC are
+unsupported. See [Round 26](sql-alter-table-round26.md).
 
 ## Compatibility tracing
 

@@ -6,7 +6,8 @@ use std::fmt;
 
 use netbadb_parser::{
     AggregateArgument as AstAggregateArgument, AggregateCall as AstAggregateCall,
-    AggregateFunction as AstAggregateFunction, BinaryOp as AstBinaryOp, ColumnName,
+    AggregateFunction as AstAggregateFunction, AlterTableAction as AstAlterTableAction,
+    AlterTableStatement as AstAlterTableStatement, BinaryOp as AstBinaryOp, ColumnName,
     CreateIndexStatement as AstCreateIndexStatement, DropTableStatement as AstDropTableStatement,
     Expr as AstExpr, FromItem, Ident, Literal, NullOrder as AstNullOrder, Query,
     SortDirection as AstSortDirection, Span, SqlTypeName as AstSqlTypeName,
@@ -51,6 +52,39 @@ pub struct TypedDropTable {
     pub span: Span,
 }
 
+/// Exact prepared table identity plus one frontend-neutral logical rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedAlterTable {
+    pub table_name: String,
+    pub target: DropTableTarget,
+    pub operation: TypedAlterTableOperation,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedAlterTableOperation {
+    RenameTable {
+        new_name: String,
+    },
+    RenameColumn {
+        column_id: ColumnId,
+        new_name: String,
+    },
+    AddNullableColumn {
+        name: String,
+        data_type: SemanticType,
+    },
+    DropColumn {
+        column_id: ColumnId,
+    },
+    SetNotNull {
+        column_id: ColumnId,
+    },
+    DropNotNull {
+        column_id: ColumnId,
+    },
+}
+
 pub fn lower_drop_table(
     schema: &Schema,
     statement: &AstDropTableStatement,
@@ -74,6 +108,90 @@ pub fn lower_drop_table(
         name: statement.name.name.clone(),
         target,
         name_span: statement.name.span,
+        span: statement.span,
+    })
+}
+
+pub fn lower_alter_table(
+    schema: &Schema,
+    statement: &AstAlterTableStatement,
+    tables: &[TableIdentityBinding],
+) -> Result<TypedAlterTable, HirError> {
+    let table = schema
+        .table(&statement.table.name)
+        .ok_or_else(|| HirError::UnknownTable {
+            name: statement.table.name.clone(),
+            span: statement.table.span,
+        })?;
+    let target = tables
+        .iter()
+        .find(|binding| binding.target.table_id == table.id)
+        .map(|binding| binding.target)
+        .ok_or_else(|| HirError::UnknownTable {
+            name: statement.table.name.clone(),
+            span: statement.table.span,
+        })?;
+    let resolve_column = |name: &Ident| {
+        table
+            .column(&name.name)
+            .map(|column| column.id)
+            .ok_or_else(|| HirError::UnknownColumn {
+                table: table.name.clone(),
+                name: name.name.clone(),
+                span: name.span,
+            })
+    };
+    let operation = match &statement.action {
+        AstAlterTableAction::RenameTable { new_name } => {
+            if schema.table(&new_name.name).is_some() {
+                return Err(HirError::DuplicateTable {
+                    name: new_name.name.clone(),
+                    span: new_name.span,
+                });
+            }
+            TypedAlterTableOperation::RenameTable {
+                new_name: new_name.name.clone(),
+            }
+        }
+        AstAlterTableAction::RenameColumn { old_name, new_name } => {
+            let column_id = resolve_column(old_name)?;
+            if table.column(&new_name.name).is_some() {
+                return Err(HirError::DuplicateColumn {
+                    name: new_name.name.clone(),
+                    span: new_name.span,
+                });
+            }
+            TypedAlterTableOperation::RenameColumn {
+                column_id,
+                new_name: new_name.name.clone(),
+            }
+        }
+        AstAlterTableAction::AddColumn { column } => {
+            if table.column(&column.name.name).is_some() {
+                return Err(HirError::DuplicateColumn {
+                    name: column.name.name.clone(),
+                    span: column.name.span,
+                });
+            }
+            TypedAlterTableOperation::AddNullableColumn {
+                name: column.name.name.clone(),
+                data_type: resolve_declared_type(&column.data_type)?,
+            }
+        }
+        AstAlterTableAction::DropColumn { name } => TypedAlterTableOperation::DropColumn {
+            column_id: resolve_column(name)?,
+        },
+        AstAlterTableAction::SetNotNull { column_name } => TypedAlterTableOperation::SetNotNull {
+            column_id: resolve_column(column_name)?,
+        },
+        AstAlterTableAction::DropNotNull { column_name } => TypedAlterTableOperation::DropNotNull {
+            column_id: resolve_column(column_name)?,
+        },
+    };
+    Ok(TypedAlterTable {
+        table_name: table.name.clone(),
+        target,
+        operation,
         span: statement.span,
     })
 }
@@ -421,6 +539,10 @@ pub enum HirError {
         name: String,
         span: Span,
     },
+    DuplicateTable {
+        name: String,
+        span: Span,
+    },
     UnknownColumn {
         table: String,
         name: String,
@@ -515,6 +637,7 @@ impl HirError {
             | Self::InvalidTableDefinition { span, .. }
             | Self::InvalidIndexDefinition { span, .. }
             | Self::UnknownTable { span, .. }
+            | Self::DuplicateTable { span, .. }
             | Self::UnknownColumn { span, .. }
             | Self::UnknownRelationQualifier { span, .. }
             | Self::DuplicateRelationName { span, .. }
@@ -549,6 +672,7 @@ impl fmt::Display for HirError {
             Self::InvalidTableDefinition { message, .. } => formatter.write_str(message),
             Self::InvalidIndexDefinition { message, .. } => formatter.write_str(message),
             Self::UnknownTable { name, .. } => write!(formatter, "unknown table `{name}`"),
+            Self::DuplicateTable { name, .. } => write!(formatter, "table `{name}` already exists"),
             Self::UnknownColumn { table, name, .. } => {
                 write!(formatter, "unknown column `{table}.{name}`")
             }
@@ -753,6 +877,12 @@ pub fn lower_statement_with_parameters(
             return Err(HirError::InvalidTableDefinition {
                 message: "DROP TABLE requires the schema-mutation compiler boundary",
                 span: drop.span,
+            });
+        }
+        AstStatement::AlterTable(alter) => {
+            return Err(HirError::InvalidTableDefinition {
+                message: "ALTER TABLE requires the schema-mutation compiler boundary",
+                span: alter.span,
             });
         }
         AstStatement::DropIndex(drop) => {
@@ -2434,6 +2564,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod alter_table_tests;
 #[cfg(test)]
 mod create_table_tests;
 #[cfg(test)]

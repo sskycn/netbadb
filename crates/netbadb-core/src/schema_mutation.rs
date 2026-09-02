@@ -115,6 +115,56 @@ impl AlterTableSpec {
     }
 }
 
+// SQL/HIR contributes only exact logical identity and a typed operation. Core
+// remains the sole owner of durable IDs, staging, row copy, indexes and recovery.
+impl From<&netbadb_compiler::TypedAlterTable> for AlterTableSpec {
+    fn from(statement: &netbadb_compiler::TypedAlterTable) -> Self {
+        let operation = match &statement.operation {
+            netbadb_compiler::TypedAlterTableOperation::RenameTable { new_name } => {
+                AlterTableOperation::RenameTable {
+                    new_name: new_name.clone(),
+                }
+            }
+            netbadb_compiler::TypedAlterTableOperation::RenameColumn {
+                column_id,
+                new_name,
+            } => AlterTableOperation::RenameColumn {
+                column_id: *column_id,
+                new_name: new_name.clone(),
+            },
+            netbadb_compiler::TypedAlterTableOperation::AddNullableColumn { name, data_type } => {
+                AlterTableOperation::AddNullableColumn {
+                    name: name.clone(),
+                    data_type: data_type.clone(),
+                }
+            }
+            netbadb_compiler::TypedAlterTableOperation::DropColumn { column_id } => {
+                AlterTableOperation::DropColumn {
+                    column_id: *column_id,
+                }
+            }
+            netbadb_compiler::TypedAlterTableOperation::SetNotNull { column_id } => {
+                AlterTableOperation::SetNotNull {
+                    column_id: *column_id,
+                }
+            }
+            netbadb_compiler::TypedAlterTableOperation::DropNotNull { column_id } => {
+                AlterTableOperation::DropNotNull {
+                    column_id: *column_id,
+                }
+            }
+        };
+        Self::new(
+            SchemaDependency {
+                table_id: statement.target.table_id,
+                table_version: statement.target.table_version,
+                fingerprint: statement.target.fingerprint,
+            },
+            operation,
+        )
+    }
+}
+
 /// First-version logical operations. Defaults, physical conversions and
 /// declaration-position controls are deliberately unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]

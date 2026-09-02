@@ -84,6 +84,7 @@ pub enum Statement {
     Delete(DeleteStatement),
     CreateTable(CreateTableStatement),
     DropTable(DropTableStatement),
+    AlterTable(AlterTableStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
 }
@@ -101,6 +102,24 @@ pub struct CreateTableStatement {
 pub struct DropTableStatement {
     pub name: Ident,
     pub span: Span,
+}
+
+/// One generic table-schema mutation. Persistent identities are resolved by HIR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTableStatement {
+    pub table: Ident,
+    pub action: AlterTableAction,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTableAction {
+    RenameTable { new_name: Ident },
+    RenameColumn { old_name: Ident, new_name: Ident },
+    AddColumn { column: CreateColumn },
+    DropColumn { name: Ident },
+    SetNotNull { column_name: Ident },
+    DropNotNull { column_name: Ident },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,9 +657,12 @@ impl Parser {
             TokenKind::Delete => Statement::Delete(self.parse_delete()?),
             TokenKind::Create => self.parse_create()?,
             TokenKind::Drop => self.parse_drop()?,
+            TokenKind::Ident(ref name) if name.eq_ignore_ascii_case("alter") => {
+                Statement::AlterTable(self.parse_alter_table()?)
+            }
             _ => {
                 return Err(self.error_here(
-                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, or DROP INDEX",
+                    "expected SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX, or DROP INDEX",
                 ));
             }
         };
@@ -729,6 +751,156 @@ impl Parser {
                 end: name.span.end,
             },
             name,
+        })
+    }
+
+    fn expect_contextual(&mut self, word: &str) -> Result<Token, ParseError> {
+        if self.contextual(word) {
+            let token = self.current().clone();
+            self.position += 1;
+            Ok(token)
+        } else {
+            Err(self.error_here(&format!("expected {word}")))
+        }
+    }
+
+    fn reject_alter_tail(&self) -> Result<(), ParseError> {
+        if self.matches(&TokenKind::Comma) {
+            return Err(self.unsupported("multiple ALTER TABLE actions"));
+        }
+        if self.contextual("cascade") || self.contextual("restrict") {
+            return Err(self.unsupported("ALTER TABLE dependency behavior"));
+        }
+        Ok(())
+    }
+
+    fn parse_alter_table(&mut self) -> Result<AlterTableStatement, ParseError> {
+        let start = self.expect_contextual("alter")?.span.start;
+        self.expect_contextual("table")?;
+        if self.matches(&TokenKind::If) {
+            return Err(self.unsupported("ALTER TABLE IF EXISTS"));
+        }
+        if self.contextual("only") {
+            return Err(self.unsupported("ALTER TABLE ONLY"));
+        }
+        let table = self.expect_ident()?;
+        if self.matches(&TokenKind::Dot) {
+            return Err(self.unsupported("qualified ALTER TABLE name"));
+        }
+
+        let action = if self.contextual("rename") {
+            self.position += 1;
+            if self.contextual("to") {
+                self.position += 1;
+                AlterTableAction::RenameTable {
+                    new_name: self.expect_ident()?,
+                }
+            } else {
+                if self.contextual("constraint") {
+                    return Err(self.unsupported("ALTER TABLE RENAME CONSTRAINT"));
+                }
+                if self.contextual("column") {
+                    self.position += 1;
+                }
+                let old_name = self.expect_ident()?;
+                self.expect_contextual("to")?;
+                AlterTableAction::RenameColumn {
+                    old_name,
+                    new_name: self.expect_ident()?,
+                }
+            }
+        } else if self.contextual("add") {
+            self.position += 1;
+            if self.contextual("constraint") {
+                return Err(self.unsupported("ALTER TABLE ADD CONSTRAINT"));
+            }
+            self.expect_contextual("column")?;
+            let name = self.expect_ident()?;
+            let data_type = self.expect_ident()?;
+            if self.matches(&TokenKind::LParen) {
+                return Err(self.unsupported("type modifiers/length constraints"));
+            }
+            let nullability = if self.matches(&TokenKind::Null) {
+                let token = self.current().clone();
+                self.position += 1;
+                Some(ColumnNullability {
+                    nullable: true,
+                    span: token.span,
+                })
+            } else if self.matches(&TokenKind::Not) {
+                return Err(self.unsupported("ALTER TABLE ADD COLUMN NOT NULL"));
+            } else {
+                None
+            };
+            if ["default", "primary", "unique", "check", "references"]
+                .iter()
+                .any(|word| self.contextual(word))
+            {
+                return Err(self.unsupported("ALTER TABLE ADD COLUMN clause"));
+            }
+            let span = Span {
+                start: name.span.start,
+                end: nullability.map_or(data_type.span.end, |value| value.span.end),
+            };
+            AlterTableAction::AddColumn {
+                column: CreateColumn {
+                    name,
+                    data_type,
+                    nullability,
+                    span,
+                },
+            }
+        } else if self.matches(&TokenKind::Drop) {
+            self.position += 1;
+            if self.contextual("constraint") {
+                return Err(self.unsupported("ALTER TABLE DROP CONSTRAINT"));
+            }
+            self.expect_contextual("column")?;
+            if self.matches(&TokenKind::If) {
+                return Err(self.unsupported("ALTER TABLE DROP COLUMN IF EXISTS"));
+            }
+            AlterTableAction::DropColumn {
+                name: self.expect_ident()?,
+            }
+        } else if self.contextual("alter") {
+            self.position += 1;
+            self.expect_contextual("column")?;
+            let column_name = self.expect_ident()?;
+            if self.matches(&TokenKind::Set) {
+                self.position += 1;
+                if self.contextual("default") {
+                    return Err(self.unsupported("ALTER COLUMN SET DEFAULT"));
+                }
+                if self.contextual("data") || self.contextual("type") {
+                    return Err(self.unsupported("ALTER COLUMN physical type conversion"));
+                }
+                self.expect_simple(TokenKind::Not)?;
+                self.expect_simple(TokenKind::Null)?;
+                AlterTableAction::SetNotNull { column_name }
+            } else if self.matches(&TokenKind::Drop) {
+                self.position += 1;
+                if self.contextual("default") {
+                    return Err(self.unsupported("ALTER COLUMN DROP DEFAULT"));
+                }
+                self.expect_simple(TokenKind::Not)?;
+                self.expect_simple(TokenKind::Null)?;
+                AlterTableAction::DropNotNull { column_name }
+            } else if self.contextual("type") || self.contextual("using") {
+                return Err(self.unsupported("ALTER COLUMN physical type conversion"));
+            } else {
+                return Err(self.error_here("expected SET NOT NULL or DROP NOT NULL"));
+            }
+        } else {
+            return Err(self.unsupported("ALTER TABLE action"));
+        };
+        self.reject_alter_tail()?;
+        Ok(AlterTableStatement {
+            table,
+            action,
+            span: Span {
+                start,
+                end: self.current().span.start,
+            },
         })
     }
 
@@ -1584,6 +1756,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::Delete(statement) => statement.span,
         Statement::CreateTable(statement) => statement.span,
         Statement::DropTable(statement) => statement.span,
+        Statement::AlterTable(statement) => statement.span,
         Statement::CreateIndex(statement) => statement.span,
         Statement::DropIndex(statement) => statement.span,
     }
@@ -2089,6 +2262,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod alter_table_tests;
 #[cfg(test)]
 mod create_table_tests;
 #[cfg(test)]

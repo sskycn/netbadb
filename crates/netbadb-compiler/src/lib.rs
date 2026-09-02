@@ -4,8 +4,8 @@ use std::error::Error;
 use std::fmt;
 
 pub use netbadb_hir::{
-    DropIndexTarget, IndexNameBinding, TableIdentityBinding, TypedCreateTable, TypedDropIndex,
-    TypedDropTable,
+    DropIndexTarget, IndexNameBinding, TableIdentityBinding, TypedAlterTable,
+    TypedAlterTableOperation, TypedCreateTable, TypedDropIndex, TypedDropTable,
 };
 
 use netbadb_hir::{
@@ -53,6 +53,7 @@ pub enum CompiledSqlStatement {
 pub enum CompiledDdlStatement {
     CreateTable(TypedCreateTable),
     DropTable(TypedDropTable),
+    AlterTable(TypedAlterTable),
     CreateIndex(TypedCreateIndex),
     DropIndex(TypedDropIndex),
 }
@@ -104,6 +105,7 @@ pub enum CompileErrorKind {
     Syntax,
     UndefinedType,
     DuplicateColumn,
+    DuplicateTable,
     UndefinedTable,
     UndefinedColumn,
     AmbiguousColumn,
@@ -126,6 +128,7 @@ impl CompileError {
             Self::Hir(error) => match error {
                 HirError::UnknownType { .. } => CompileErrorKind::UndefinedType,
                 HirError::DuplicateColumn { .. } => CompileErrorKind::DuplicateColumn,
+                HirError::DuplicateTable { .. } => CompileErrorKind::DuplicateTable,
                 HirError::UnsupportedType { .. } | HirError::InvalidTableDefinition { .. } => {
                     CompileErrorKind::FeatureNotSupported
                 }
@@ -256,6 +259,7 @@ pub fn compile_sql_statement(
     match ast {
         netbadb_parser::Statement::CreateTable(_)
         | netbadb_parser::Statement::DropTable(_)
+        | netbadb_parser::Statement::AlterTable(_)
         | netbadb_parser::Statement::CreateIndex(_)
         | netbadb_parser::Statement::DropIndex(_) => {
             if !declared.is_empty() {
@@ -291,6 +295,11 @@ fn compile_ddl_ast(
                 .map(CompiledDdlStatement::DropTable)
                 .map_err(CompileError::from)
         }
+        netbadb_parser::Statement::AlterTable(statement) => {
+            netbadb_hir::lower_alter_table(schema, &statement, tables)
+                .map(CompiledDdlStatement::AlterTable)
+                .map_err(CompileError::from)
+        }
         netbadb_parser::Statement::DropIndex(statement) => {
             netbadb_hir::lower_drop_index(&statement, indexes)
                 .map(CompiledDdlStatement::DropIndex)
@@ -310,6 +319,7 @@ fn compile_ddl_ast(
                 netbadb_parser::Statement::Delete(value) => value.span,
                 netbadb_parser::Statement::CreateTable(value) => value.span,
                 netbadb_parser::Statement::DropTable(value) => value.span,
+                netbadb_parser::Statement::AlterTable(value) => value.span,
                 netbadb_parser::Statement::CreateIndex(value) => value.span,
                 netbadb_parser::Statement::DropIndex(value) => value.span,
             },
@@ -1146,6 +1156,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod alter_table_tests;
 #[cfg(test)]
 mod create_table_tests;
 #[cfg(test)]

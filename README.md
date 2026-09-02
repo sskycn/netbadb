@@ -108,9 +108,10 @@ invalidation, durable retained-resource inventory and deferred physical deletion
 [Round 21](docs/sql-drop-table-round21.md) adds generic exact-prepared SQL
 `DROP TABLE name` over native and PostgreSQL frontends. [Round 24](docs/core-heap-schema-rewrite-round24.md)
 implements the typed embedded Core foundation for transactional runtime-created
-Single Heap schema rewrites with the same TableId and a new StorageId. SQL and
-PostgreSQL `ALTER TABLE` syntax remain unsupported; [Round 23](docs/schema-evolution-round23.md)
-records the row-format audit that selected this architecture. [Round 25](docs/replacement-retired-gc-round25.md)
+Single Heap schema rewrites with the same TableId and a new StorageId. [Round 26](docs/sql-alter-table-round26.md)
+maps six generic SQL `ALTER TABLE` actions through exact typed HIR to that existing
+Core lifecycle; [Round 23](docs/schema-evolution-round23.md) records the row-format
+audit that selected this architecture. [Round 25](docs/replacement-retired-gc-round25.md)
 extends explicit safe single-resource GC to old runtime Heaps retired by schema
 rewrite without treating their still-active TableId as dropped.
 
@@ -309,8 +310,11 @@ without constraints/defaults. Network DDL requires explicit `schema_admin`; the
 creator can use its staged table only within the creating transaction, and receives
 no durable DML grant. Exact prepared `DROP TABLE name` is transactional and works
 through psql, psycopg, and SQLAlchemy `Table.drop(checkfirst=False)`; IF EXISTS,
-qualified/multi-table DROP, SQL ALTER TABLE, general migration execution, a complete
-`pg_catalog` or `information_schema`,
+qualified/multi-table DROP, and general migration execution remain unsupported.
+Basic transactional Heap ALTER supports rename table/column, nullable ADD, restricted
+DROP, and SET/DROP NOT NULL through native SQL and PostgreSQL Simple/Extended Query.
+Real Alembic support is bounded to one supported operation per transaction; a complete
+multi-operation migration, complete `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
@@ -569,9 +573,12 @@ rollback restores visibility, and physical Heap/index resources remain retained
 until an explicit exact-resource Core GC proves the
 [Round 22 recovery horizon](docs/retired-heap-gc-round22.md). There is no
 background or SQL GC. IF EXISTS, CASCADE/RESTRICT, qualified/quoted or multiple
-targets, LSM/range DROP, and SQL ALTER TABLE are unsupported. The embedded typed
-Core rewrite surface is documented separately in the
-[Round 24 report](docs/core-heap-schema-rewrite-round24.md); see also the
+targets, and LSM/range DROP are unsupported. Basic SQL ALTER maps exact prepared
+table/column identities to the embedded typed Core rewrite surface; physical type
+conversion, defaults, constraints, ADD NOT NULL, multiple actions/mutations, LSM/
+range/imported ALTER, and automatic GC remain unsupported. See the
+[Round 26 SQL ALTER report](docs/sql-alter-table-round26.md), the
+[Round 24 Core report](docs/core-heap-schema-rewrite-round24.md), and the
 [Round 21 DROP report](docs/sql-drop-table-round21.md).
 
 Mutation is located by an internal versioned physical `RowId` (`PageId +

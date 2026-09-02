@@ -216,8 +216,14 @@ SchemaGeneration advances once per creation commit; table versions stay 1 and th
 runtime revision increments with checked arithmetic. [Round 19](sql-create-table-round19.md)
 adds generic SQL CREATE TABLE through parser declarations, typed HIR,
 CompiledDdlStatement and PreparedDdlStatement. Core alone maps it to CreateTableSpec
-and invokes the existing transactional lifecycle. SQL DROP/ALTER, constraint
-enforcement and non-Heap runtime creation remain future work.
+and invokes the existing transactional lifecycle. Constraint enforcement and
+non-Heap runtime creation remain future work.
+
+[Round 26](sql-alter-table-round26.md) adds generic SQL ALTER without changing this
+ownership boundary. HIR binds TableId/version/fingerprint and stable ColumnId where
+applicable; Core alone maps the typed operation to AlterTableSpec and owns every
+StorageId/ColumnId reservation, row rewrite, index rebuild, durable decision,
+retirement, recovery, and GC relationship.
 
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;

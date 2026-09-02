@@ -799,8 +799,16 @@ even though the old source is not a physical participant. Chained rewrite,
 ALTER-to-DROP, crash/reopen, wrong-identity, index-heavy and 100-cycle tests prove
 that deleted ancestors are not recovery dependencies.
 
-Next: SQL syntax remains a later thin frontend. LSM/partition/imported ALTER,
-online mixed schemas, physical conversions, defaults, column reorder and
+### Generic SQL ALTER TABLE — Round 26
+
+[Round 26](sql-alter-table-round26.md) connects six bounded generic ALTER actions
+to Round 24 through syntax-only AST, exact TableId/version/fingerprint HIR, stable
+ColumnId resolution, schema-admin access, and native/PG Simple+Extended execution.
+Real psql, psycopg, SQLAlchemy reflection, and single-operation Alembic apply pass.
+No persistent format changes and no second rewrite lifecycle were introduced.
+
+Next: audit multi-mutation schema transaction composition. LSM/partition/imported
+ALTER, online mixed schemas, physical conversions, defaults, column reorder and
 journal/log compaction remain deferred.
 
 ## Phase 6 — SDK and tooling

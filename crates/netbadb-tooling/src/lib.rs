@@ -35,6 +35,7 @@ pub enum DiagnosticCode {
     InvalidTableDefinition,
     Parse,
     UnknownTable,
+    DuplicateTable,
     UnknownColumn,
     UnknownRelationQualifier,
     DuplicateRelationName,
@@ -68,6 +69,7 @@ impl DiagnosticCode {
             Self::InvalidTableDefinition => "invalid_table_definition",
             Self::Parse => "parse",
             Self::UnknownTable => "unknown_table",
+            Self::DuplicateTable => "duplicate_table",
             Self::UnknownColumn => "unknown_column",
             Self::UnknownRelationQualifier => "unknown_relation_qualifier",
             Self::DuplicateRelationName => "duplicate_relation_name",
@@ -145,6 +147,7 @@ const fn hir_code(error: &HirError) -> DiagnosticCode {
         HirError::InvalidTableDefinition { .. } => DiagnosticCode::InvalidTableDefinition,
         HirError::InvalidIndexDefinition { .. } => DiagnosticCode::InvalidIndexDefinition,
         HirError::UnknownTable { .. } => DiagnosticCode::UnknownTable,
+        HirError::DuplicateTable { .. } => DiagnosticCode::DuplicateTable,
         HirError::UnknownColumn { .. } => DiagnosticCode::UnknownColumn,
         HirError::UnknownRelationQualifier { .. } => DiagnosticCode::UnknownRelationQualifier,
         HirError::DuplicateRelationName { .. } => DiagnosticCode::DuplicateRelationName,
@@ -351,6 +354,7 @@ mod tests {
         let codes = [
             (DiagnosticCode::Parse, "parse"),
             (DiagnosticCode::UnknownTable, "unknown_table"),
+            (DiagnosticCode::DuplicateTable, "duplicate_table"),
             (DiagnosticCode::UnknownColumn, "unknown_column"),
             (
                 DiagnosticCode::UnknownRelationQualifier,

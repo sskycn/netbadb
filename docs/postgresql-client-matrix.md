@@ -52,7 +52,10 @@ production or build dependencies.
 | SQLAlchemy `Table.create(checkfirst=False)` | yes, bounded fixture | no PK, defaults, sequences or VARCHAR length; same-transaction insert/select |
 | Basic Heap `DROP TABLE name` | yes, bounded fixture | exact prepared identity; transactional Simple/Extended Query |
 | SQLAlchemy `Table.drop(checkfirst=False)` | yes | rollback and commit; no custom dialect |
-| DROP IF EXISTS/qualified/multiple, ALTER TABLE, table migrations | unsupported | explicit rejection; no Alembic table operation |
+| Basic Heap ALTER TABLE | yes, bounded fixture | six exact-prepared actions; Simple/Extended Query; transactional |
+| SQLAlchemy ALTER transport/reflection | yes | `exec_driver_sql`; Inspector sees committed rename/columns/indexes |
+| Alembic table operations | bounded | six real Operations in independent transactions; no multi-DDL migration claim |
+| DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
 No run used `prepare_threshold=None`, a simple-protocol override, a custom
 dialect, `implicit_returning=False`, `use_insertmanyvalues=False`, `create_all`,

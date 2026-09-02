@@ -1281,7 +1281,22 @@ impl PgWorkerSession {
         parameter_types: Vec<PostgresOid>,
         compatibility: CompatibilityStatement,
     ) -> Vec<BackendMessage> {
-        let expected_parameters = compatibility_parameter_types(compatibility);
+        const THREE_KIND_TABLE_OID_PARAMETERS: &[PostgresType] = &[
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+            PostgresType::Text,
+        ];
+        let expected_parameters = if matches!(
+            compatibility,
+            CompatibilityStatement::TableOidsVisible | CompatibilityStatement::TableOidsQualified
+        ) && highest_postgres_parameter(&query) == 5
+        {
+            THREE_KIND_TABLE_OID_PARAMETERS
+        } else {
+            compatibility_parameter_types(compatibility)
+        };
         if parameter_types.len() > expected_parameters.len() {
             return self.extended_error(fixed_error(
                 "08P01",
@@ -2001,6 +2016,31 @@ impl PgWorkerSession {
         self.awaiting_sync = true;
         vec![BackendMessage::ErrorResponse(error)]
     }
+}
+
+fn highest_postgres_parameter(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut highest = 0_usize;
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'$' {
+            cursor += 1;
+            continue;
+        }
+        cursor += 1;
+        let start = cursor;
+        let mut value = 0_usize;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(usize::from(bytes[cursor] - b'0'));
+            cursor += 1;
+        }
+        if cursor != start {
+            highest = highest.max(value);
+        }
+    }
+    highest
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2792,6 +2832,8 @@ fn ddl_command_tag(prepared: &CorePreparedDdl) -> &'static str {
         "CREATE TABLE"
     } else if prepared.is_table_drop() {
         "DROP TABLE"
+    } else if prepared.is_table_alter() {
+        "ALTER TABLE"
     } else if prepared.is_index_drop() {
         "DROP INDEX"
     } else {
@@ -2807,7 +2849,6 @@ fn is_index_ddl(normalized: &str) -> bool {
 
 fn is_unsupported_schema_ddl(normalized: &str) -> bool {
     [
-        "alter table ",
         "create schema ",
         "alter schema ",
         "drop schema ",
@@ -2846,7 +2887,8 @@ fn map_create_index_error(error: &DatabaseError) -> ErrorResponse {
         | DatabaseErrorKind::Operational
         | DatabaseErrorKind::Internal
         | DatabaseErrorKind::SchemaBusy
-        | DatabaseErrorKind::DuplicateColumn => map_database_error(error),
+        | DatabaseErrorKind::DuplicateColumn
+        | DatabaseErrorKind::DependentObjects => map_database_error(error),
         DatabaseErrorKind::Syntax
         | DatabaseErrorKind::AmbiguousColumn
         | DatabaseErrorKind::DatatypeMismatch
@@ -3960,24 +4002,40 @@ fn execute_compatibility_statement_for_owner(
             })
         }
         CompatibilityStatement::TableOidsVisible | CompatibilityStatement::TableOidsQualified => {
-            let [
-                ScalarValue::Text(kind_1),
-                ScalarValue::Text(kind_2),
-                ScalarValue::Text(kind_3),
-                ScalarValue::Text(kind_4),
-                ScalarValue::Text(kind_5),
-                ScalarValue::Text(namespace),
-                ScalarValue::Text(table_name),
-            ] = values
-            else {
-                return Err(fixed_error(
-                    "42804",
-                    "table OID lookup requires seven text parameters",
-                ));
+            let (exposes_tables, namespace, table_name) = match values {
+                [
+                    ScalarValue::Text(kind_1),
+                    ScalarValue::Text(kind_2),
+                    ScalarValue::Text(kind_3),
+                    ScalarValue::Text(namespace),
+                    ScalarValue::Text(table_name),
+                ] => (
+                    [kind_1, kind_2, kind_3].into_iter().any(|kind| kind == "r"),
+                    namespace,
+                    table_name,
+                ),
+                [
+                    ScalarValue::Text(kind_1),
+                    ScalarValue::Text(kind_2),
+                    ScalarValue::Text(kind_3),
+                    ScalarValue::Text(kind_4),
+                    ScalarValue::Text(kind_5),
+                    ScalarValue::Text(namespace),
+                    ScalarValue::Text(table_name),
+                ] => (
+                    [kind_1, kind_2, kind_3, kind_4, kind_5]
+                        .into_iter()
+                        .any(|kind| kind == "r"),
+                    namespace,
+                    table_name,
+                ),
+                _ => {
+                    return Err(fixed_error(
+                        "42804",
+                        "table OID lookup requires five or seven text parameters",
+                    ));
+                }
             };
-            let exposes_tables = [kind_1, kind_2, kind_3, kind_4, kind_5]
-                .into_iter()
-                .any(|kind| kind == "r");
             let namespace_matches = match statement {
                 CompatibilityStatement::TableOidsVisible => namespace != "public",
                 CompatibilityStatement::TableOidsQualified => namespace == "public",
@@ -4546,6 +4604,7 @@ fn command_tag(sql: &str, count: u64) -> String {
 fn map_database_error(error: &DatabaseError) -> ErrorResponse {
     let (sqlstate, safe_message) = match error.kind() {
         DatabaseErrorKind::DuplicateColumn => ("42701", Some(error.to_string())),
+        DatabaseErrorKind::DependentObjects => ("2BP01", Some(error.to_string())),
         DatabaseErrorKind::SchemaBusy => ("55P03", Some("schema writer is busy".into())),
         DatabaseErrorKind::Syntax => ("42601", Some(error.to_string())),
         DatabaseErrorKind::UndefinedTable => ("42P01", Some(error.to_string())),
@@ -4893,13 +4952,15 @@ mod tests {
     #[test]
     fn unsupported_schema_ddl_is_classified_without_entering_the_generic_parser() {
         for sql in [
-            "alter table users add column name text",
             "create schema private",
             "create type mood as enum ('ok')",
             "create sequence users_id_seq",
         ] {
             assert!(is_unsupported_schema_ddl(sql), "{sql}");
         }
+        assert!(!is_unsupported_schema_ddl(
+            "alter table users add column name text"
+        ));
         assert!(!is_unsupported_schema_ddl(
             "create index users_id_idx on users (id)"
         ));
@@ -5787,6 +5848,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "postgres_alter_table_tests.rs"]
+mod alter_table_tests;
 #[cfg(test)]
 #[path = "postgres_create_table_tests.rs"]
 mod create_table_tests;
