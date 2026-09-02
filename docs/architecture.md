@@ -225,6 +225,17 @@ applicable; Core alone maps the typed operation to AlterTableSpec and owns every
 StorageId/ColumnId reservation, row rewrite, index rebuild, durable decision,
 retirement, recovery, and GC relationship.
 
+[Round 27](schema-transaction-composition-round27.md) audits the next composition
+boundary without implementing it. The chosen future aggregate keeps one ordered
+transaction-local logical overlay at provisional `V+1`, delays one final StorageId
+and base-to-final Heap rewrite per dirty table until global seal/materialization,
+and commits all changed tables through one `G+1/E+1` NBSC and one canonical CORD
+participant set. First post-schema user physical execution or COMMIT seals the
+whole schema transaction; later schema/index mutations are rejected. ADD ColumnIds
+remain execution-time durable logical reservations, while physical StorageIds are
+materialization-time reservations. Net-no-op composition leaves generation,
+versions, epoch, and runtime revision unchanged but never reuses reserved IDs.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

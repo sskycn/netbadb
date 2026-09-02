@@ -807,9 +807,25 @@ ColumnId resolution, schema-admin access, and native/PG Simple+Extended executio
 Real psql, psycopg, SQLAlchemy reflection, and single-operation Alembic apply pass.
 No persistent format changes and no second rewrite lifecycle were introduced.
 
-Next: audit multi-mutation schema transaction composition. LSM/partition/imported
-ALTER, online mixed schemas, physical conversions, defaults, column reorder and
-journal/log compaction remain deferred.
+### Schema transaction composition architecture audit — Round 27
+
+[Round 27](schema-transaction-composition-round27.md) proves the current one-
+mutation guard, immediate staged-Heap cost, writer/admission source stability,
+NBSJ single-operation limitation, and CORD multi-participant capability. It selects
+one aggregate transaction model: ordered logical overlay composition, provisional
+`V+1` per touched table, durable execution-time ColumnId reservations, deferred
+one-StorageId/one-rewrite materialization per final dirty table, a global seal on
+first post-schema physical execution or COMMIT, one final NBSC, and one CORD
+decision. Net-no-op commits do not advance logical/publication versions but retain
+identity gaps. Real psql/psycopg/SQLAlchemy/Alembic evidence pins the current second
+statement `0A000` failure and whole-transaction rollback. No production API or
+persistent format changes in this round.
+
+Next: **Round 28 — Core Multi-ALTER Schema Transaction Composition Foundation**
+for same/different runtime Single Heaps, with no CREATE/DROP/index mixing and no
+user DML/read between ALTER statements. LSM/partition/imported ALTER, online mixed
+schemas, physical conversions, defaults, column reorder, savepoints, and journal/
+log compaction remain deferred.
 
 ## Phase 6 — SDK and tooling
 
