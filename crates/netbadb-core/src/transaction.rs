@@ -678,7 +678,10 @@ impl DatabaseTransaction {
             }
             SchemaCompositionState::BackfillMaterializing(materialized)
             | SchemaCompositionState::BackfillOpen(materialized)
+            | SchemaCompositionState::IndexEvacuating(materialized)
+            | SchemaCompositionState::RefiningAfterEvacuation(materialized)
             | SchemaCompositionState::Refining(materialized)
+            | SchemaCompositionState::IndexFinalizing(materialized)
             | SchemaCompositionState::Finalizing(materialized)
             | SchemaCompositionState::Finalized(materialized) => {
                 return materialized.staged.values_mut().collect();

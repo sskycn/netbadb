@@ -17,6 +17,8 @@ mod schema_mutation_journal;
 #[cfg(test)]
 mod schema_mutation_tests;
 mod schema_view;
+#[cfg(test)]
+mod staged_index_evacuation_tests;
 mod transaction;
 
 use std::cell::RefCell;
@@ -636,7 +638,8 @@ impl DatabaseError {
                 | SchemaMutationError::RecoveryRequired
                 | SchemaMutationError::TransactionNotPristine
                 | SchemaMutationError::SchemaMutationAfterMaterialization
-                | SchemaMutationError::MigrationDataAccessAfterRefinement,
+                | SchemaMutationError::MigrationDataAccessAfterRefinement
+                | SchemaMutationError::EvacuationRequiresRefinement,
             ) => DatabaseErrorKind::TransactionState,
             Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
@@ -2833,6 +2836,8 @@ impl Database {
         if matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::Refining(_)
+                | schema_composition::SchemaCompositionState::IndexEvacuating(_)
+                | schema_composition::SchemaCompositionState::RefiningAfterEvacuation(_)
                 | schema_composition::SchemaCompositionState::IndexFinalizing(_)
                 | schema_composition::SchemaCompositionState::RefiningIndex(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())

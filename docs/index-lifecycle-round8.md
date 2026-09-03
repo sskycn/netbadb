@@ -276,3 +276,10 @@ recovery production files remain byte-identical to the base; no unrelated MSRV
 repair or persistent-format bump was included. Original main remains at the base
 commit with a clean working tree. All edits and the requested commit belong only
 to the isolated Round 8 worktree.
+
+## Round 35 relationship
+
+Round 35 uses ordinary transactional retirement inside a disposable staged Heap
+and adds no compaction or reclamation semantics. Evacuated ownership remains
+subject to the same catalog/high-water and generation-safe page rules; whole-S2
+predecision cleanup is composition recovery, not index-page reclamation.

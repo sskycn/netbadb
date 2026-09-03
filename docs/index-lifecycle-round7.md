@@ -187,3 +187,10 @@ Fuzz and MSRV builds used separate temporary target directories. Corpus generati
 ran through `generate_wal_corpus`; only the reviewed IndexCatalog seeds were
 updated in the repository. Each final real-client script used a fresh two-table
 fixture; all used the default PostgreSQL dialect and preparation behavior.
+
+## Round 35 relationship
+
+Round 35 does not change this IndexId or retirement contract. Private staged
+evacuation uses exact `(TableId, IndexId)` retirement; a replacement receives a
+fresh IndexId, while rollback discards the private Heap instead of reviving or
+reusing the retired identity.

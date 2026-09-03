@@ -40,3 +40,8 @@ The native Round 33 regression covers the primary
 publication, transaction-visible backfill values, post-backfill
 drop/recreate, and ID non-reuse. External PostgreSQL client validation remains
 unverified when the required clients are unavailable.
+
+Round 35 preserves public Round 33 CREATE/DROP behavior and IndexId reservation.
+Its private branch feeds `RefiningAfterEvacuation` into `IndexFinalizing`, while
+finalization now diffs the current physical S2 inventory rather than the base
+inventory, preventing a second retirement of an evacuated index.

@@ -284,6 +284,15 @@ the staged-to-final index delta from transaction-visible rows, and records a
 new index-aware NBSJ finalization tag. The same StorageId and one CORD decision
 are retained; the existing Round 32 tag 32 remains schema-only.
 
+[Round 35](staged-index-evacuation-round35.md) adds a private typed branch for an
+already-open managed Single-Heap backfill. Exact incompatible indexes are retired
+inside S2 before refinement; every surviving persisted BTree spec is checked
+against the candidate final schema. DML stays closed from the first evacuation,
+finalization diffs the current physical S2 inventory, retargets before building
+fresh-ID final indexes, validates the exact catalog, and then reuses tag 34, one
+prepared NBSC, and one CORD decision. Public DROP-first indexed-nullability SQL
+remains unsupported and no persistent format changes.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

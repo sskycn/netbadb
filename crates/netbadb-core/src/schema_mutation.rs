@@ -382,6 +382,7 @@ pub enum SchemaMutationError {
     SchemaMutationAfterMaterialization,
     UnsupportedBackfillRefinement(BackfillRefinementReason),
     MigrationDataAccessAfterRefinement,
+    EvacuationRequiresRefinement,
     CompositionLimitExceeded(&'static str),
     UnsupportedConstraint,
     UnsupportedPlacement,
@@ -425,6 +426,9 @@ impl fmt::Display for SchemaMutationError {
             }
             Self::MigrationDataAccessAfterRefinement => {
                 f.write_str("data access is not allowed after backfill schema refinement")
+            }
+            Self::EvacuationRequiresRefinement => {
+                f.write_str("staged index evacuation requires a compatible schema refinement")
             }
             Self::CompositionLimitExceeded(limit) => {
                 write!(f, "schema transaction composition limit exceeded: {limit}")

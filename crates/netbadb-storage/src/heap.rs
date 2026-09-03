@@ -621,6 +621,37 @@ impl HeapStorage {
         })
     }
 
+    /// Validates the exact transaction-visible active inventory and the
+    /// persisted key specification of every surviving tree against a
+    /// prospective private-Heap schema.
+    pub(crate) fn validate_rewrite_index_inventory(
+        &mut self,
+        target: &TableDef,
+        expected: &HeapRewriteIndexes,
+    ) -> Result<(), StorageError> {
+        if self.rewrite_indexes()? != *expected {
+            return Err(IndexError::InvalidIndexHighWater(expected.next_index_id).into());
+        }
+        for definition in self.indexes.clone() {
+            let column = target.column_by_id(definition.column_id).ok_or(
+                IndexError::UnknownIndexColumn {
+                    column_id: definition.column_id,
+                },
+            )?;
+            let expected_spec = IndexSpec {
+                data_type: column.semantic_type(),
+                nullable: column.nullable,
+            };
+            if self.btree().spec(definition.handle)? != expected_spec {
+                return Err(IndexError::CatalogSpecMismatch {
+                    column_id: definition.column_id,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn rewrite_indexes_with_definitions(
         &mut self,
     ) -> Result<Vec<IndexDefinition>, StorageError> {

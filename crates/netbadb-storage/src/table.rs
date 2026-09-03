@@ -1276,6 +1276,23 @@ impl TableStorage {
         }
     }
 
+    /// Validates an exact private-Heap index inventory against a prospective
+    /// schema without changing the Heap fingerprint.
+    #[doc(hidden)]
+    pub fn validate_heap_rewrite_index_inventory(
+        &mut self,
+        target: &TableDef,
+        expected: &HeapRewriteIndexes,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => storage.validate_rewrite_index_inventory(target, expected),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "validate private Heap index inventory",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     /// Installs empty replacement trees before streaming row copy.
     pub fn install_heap_rewrite_indexes_in(
         &mut self,

@@ -38,3 +38,8 @@ backfill, compatible refinement, rejected layout changes, post-refinement DML,
 predecision crash cleanup, journal round-tripping, and metadata retarget
 validation. PostgreSQL client matrices and fuzz expansion remain follow-up
 work until exercised against the final server build.
+
+Round 35 adds a separate private evacuation branch after `BackfillOpen` without
+weakening this contract. Ordinary `Refining` still applies the historical
+indexed-column guard; only an exact physically validated S2 retirement may enter
+`IndexEvacuating -> RefiningAfterEvacuation`.

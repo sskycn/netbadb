@@ -422,3 +422,8 @@ already-`BackfillOpen` managed Single Heap. Add the typed phases and crash
 proof for physical drop-incompatible -> retarget -> create-final ordering.
 Keep direct DROP-first migration and production indexed-nullability SQL
 unsupported.
+
+Round 35 implements that private Core foundation in
+[staged-index-evacuation-round35.md](staged-index-evacuation-round35.md). Public
+SQL remains blocked, the monotonic guard remains authoritative outside the new
+typed states, and no persistent format changes were required.

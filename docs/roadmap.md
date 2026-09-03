@@ -892,6 +892,20 @@ prepared NBSC, and one CORD v2 decision. Direct DROP INDEX--UPDATE--ALTER of an
 otherwise unchanged table, physical-only same-schema cloning, late S1 participant
 detach, and production SQL exposure remain deferred.
 
+### Staged incompatible-index evacuation foundation — Round 35
+
+[Round 35](staged-index-evacuation-round35.md) implements the selected private
+Core lifecycle for an already-`BackfillOpen` managed Single Heap. Exact S2 index
+retirement enters a DML-closed `IndexEvacuating` phase; refinement proceeds only
+after exact surviving BTree-spec validation, and finalization uses the current
+physical staged inventory before retarget/build/tag-34/NBSC/CORD publication.
+Multiple exact evacuations, unrelated compatible indexes, no-replacement commit,
+and predecision crash recovery are covered without a new NBSJ tag or S3 copy.
+
+Round 36 should audit the production orchestration and external-client contract
+before exposing this path. Direct DROP-first migration, broader placements,
+online/resumable work, and public indexed-nullability SQL remain deferred.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)
