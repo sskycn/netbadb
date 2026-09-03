@@ -1,7 +1,7 @@
 use super::*;
 use crate::authorization::{AuthorizationPolicy, PrincipalGrants};
-use crate::sql_create_table_test_support::{files, principal, seed};
-use netbadb_protocol::ClientMessage;
+use crate::sql_create_table_test_support::{files, managed_seed, principal, seed};
+use netbadb_protocol::{ClientMessage, WireTransactionState};
 use netbadb_types::TableId;
 
 fn session(
@@ -19,7 +19,7 @@ fn session(
 
 #[test]
 fn native_sql_drop_authorization_rollback_commit_and_reopen_use_protocol_v1() {
-    let (root, mut db) = seed("native-drop");
+    let (root, mut db) = managed_seed("native-drop");
     let before = files(&root);
     let mut denied = session(&mut db, principal(false));
     let response = denied.handle(
@@ -81,7 +81,7 @@ fn native_sql_drop_authorization_rollback_commit_and_reopen_use_protocol_v1() {
 
 #[test]
 fn native_schema_admin_needs_no_table_data_grant_to_drop() {
-    let (root, mut db) = seed("native-drop-schema-only");
+    let (root, mut db) = managed_seed("native-drop-schema-only");
     let authorization = AuthorizationPolicy::new(
         TransportKind::PlaintextLoopback,
         Some(PrincipalGrants {
@@ -108,6 +108,32 @@ fn native_schema_admin_needs_no_table_data_grant_to_drop() {
         [ServerMessage::AffectedRows { count: 0 }]
     );
     assert!(db.schema().table("users").is_none());
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_imported_heap_drop_remains_explicitly_outside_composition() {
+    let (root, mut db) = seed("native-drop-imported");
+    let before = files(&root);
+    let mut admin = session(&mut db, principal(true));
+    let response = admin.handle(
+        &mut db,
+        2,
+        ClientMessage::Execute {
+            sql: "DROP TABLE users".into(),
+        },
+    );
+    assert_eq!(
+        response.batch.messages,
+        [ServerMessage::Error {
+            code: ProtocolErrorCode::Database,
+            transaction_state: WireTransactionState::None,
+            message: "runtime table mutation supports only a single Heap".into(),
+        }]
+    );
+    assert_eq!(files(&root), before);
+    assert!(db.schema().table("users").is_some());
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

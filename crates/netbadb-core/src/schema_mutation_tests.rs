@@ -21,7 +21,7 @@ fn heap_schema_rewrite_add_nullable_preserves_identity_indexes_and_same_txn_dml(
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -270,7 +270,7 @@ fn heap_schema_rewrite_rollback_burns_storage_and_column_ids_and_discards_target
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -377,7 +377,7 @@ fn heap_schema_rewrite_rename_is_private_and_rollback_restores_exact_committed_s
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -464,7 +464,7 @@ fn heap_schema_rewrite_invalidates_stale_manifest_and_sdk_schema_expectations() 
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -526,7 +526,7 @@ fn heap_schema_rewrite_preserves_sparse_index_identity_and_high_water() {
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -587,7 +587,7 @@ fn heap_schema_rewrite_preserves_index_and_join_planner_paths() {
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -772,7 +772,7 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -1024,7 +1024,7 @@ fn heap_schema_rewrite_rejects_prior_access_static_dependencies_and_failed_not_n
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -1376,7 +1376,7 @@ fn one_hundred_heap_schema_rewrites_preserve_identity_and_report_growth() {
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -1612,7 +1612,7 @@ fn replacement_and_drop_retirements_gc_independently_in_both_orders() {
         let active_storage = db.bindings.resolve_single(table).unwrap();
         let target = db.resolve_drop_table("projects").unwrap();
         let mut transaction = db.begin_transaction().unwrap();
-        db.drop_table_in(&mut transaction, target).unwrap();
+        db.drop_table_legacy_in(&mut transaction, target).unwrap();
         db.commit_transaction(&mut transaction).unwrap();
         drop(transaction);
         let dropped = db
@@ -1808,7 +1808,7 @@ fn rewrite_journal_rejects_invalid_identity_version_fingerprint_and_ordering() {
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -1980,7 +1980,7 @@ fn root(name: &str) -> PathBuf {
 fn create_rewrite_gc_table(db: &mut Database, name: &str) -> TableId {
     let mut transaction = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut transaction,
             CreateTableSpec::new(
                 name,
@@ -2198,7 +2198,7 @@ fn core_drop_exact_overlay_prepared_invalidation_retirement_and_reopen() {
         .prepare_statement_in(&txn, "SELECT id FROM users", &[])
         .unwrap();
     db.execute_in(&mut txn, "UPDATE users SET id = 9").unwrap();
-    db.drop_table_in(&mut txn, target).unwrap();
+    db.drop_table_legacy_in(&mut txn, target).unwrap();
     assert!(
         db.prepare_statement_in(&txn, "SELECT id FROM users", &[])
             .is_err()
@@ -2333,7 +2333,7 @@ fn core_drop_rollback_restores_exact_table_data_indexes_and_high_waters() {
         db.next_column_id(TableId(1)),
     );
     let mut txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut txn, target).unwrap();
+    db.drop_table_legacy_in(&mut txn, target).unwrap();
     txn.rollback().unwrap();
     assert_eq!(db.inspect_catalog().unwrap(), before);
     assert_eq!(db.schema_generation(), before_generation);
@@ -2376,12 +2376,12 @@ fn core_drop_recreate_same_name_never_reuses_identity_data_index_or_prepared_tar
     let old_prepared = db.prepare_statement("SELECT id FROM users", &[]).unwrap();
     let old_target = db.resolve_drop_table("users").unwrap();
     let mut drop_txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_txn, old_target).unwrap();
+    db.drop_table_legacy_in(&mut drop_txn, old_target).unwrap();
     db.commit_transaction(&mut drop_txn).unwrap();
     drop(drop_txn);
     let mut create_txn = db.begin_transaction().unwrap();
     let new_table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create_txn,
             CreateTableSpec::new(
                 "users",
@@ -2472,7 +2472,7 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
     let retained = db.begin_transaction().unwrap();
     let mut blocked = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.drop_table_in(&mut blocked, exact),
+        db.drop_table_legacy_in(&mut blocked, exact),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::SchemaBusy
         ))
@@ -2484,7 +2484,7 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
     let mut missing = exact;
     missing.table_id = TableId(999);
     assert!(matches!(
-        db.drop_table_in(&mut txn, missing),
+        db.drop_table_legacy_in(&mut txn, missing),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::TableNotFound(TableId(999))
         ))
@@ -2492,7 +2492,7 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
     let mut stale = exact;
     stale.table_version = TableSchemaVersion(2);
     assert!(matches!(
-        db.drop_table_in(&mut txn, stale),
+        db.drop_table_legacy_in(&mut txn, stale),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::StaleSchemaDependency
         ))
@@ -2512,14 +2512,14 @@ fn core_drop_rejects_missing_stale_and_mixed_targets_without_side_effects() {
         ),
         high_waters
     );
-    db.drop_table_in(&mut txn, exact).unwrap();
+    db.drop_table_legacy_in(&mut txn, exact).unwrap();
     let teams = db.resolve_drop_table("teams").unwrap();
     assert!(matches!(
-        db.drop_table_in(&mut txn, teams),
+        db.drop_table_legacy_in(&mut txn, teams),
         Err(crate::DatabaseError::UnsupportedDdlCombination)
     ));
     assert!(matches!(
-        db.create_heap_table_in(&mut txn, spec("other")),
+        db.create_heap_table_legacy_in(&mut txn, spec("other")),
         Err(crate::DatabaseError::UnsupportedDdlCombination)
             | Err(crate::DatabaseError::SchemaMutation(
                 SchemaMutationError::MultipleCreatesUnsupported
@@ -2547,7 +2547,7 @@ fn core_drop_rejects_lsm_and_partitioned_tables_before_persistent_intent() {
     let target = lsm.resolve_drop_table("rows").unwrap();
     let mut txn = lsm.begin_transaction().unwrap();
     assert!(matches!(
-        lsm.drop_table_in(&mut txn, target),
+        lsm.drop_table_legacy_in(&mut txn, target),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::UnsupportedPlacement
         ))
@@ -2579,7 +2579,7 @@ fn core_drop_rejects_lsm_and_partitioned_tables_before_persistent_intent() {
     let target = partitioned.resolve_drop_table("events").unwrap();
     let mut txn = partitioned.begin_transaction().unwrap();
     assert!(matches!(
-        partitioned.drop_table_in(&mut txn, target),
+        partitioned.drop_table_legacy_in(&mut txn, target),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::UnsupportedPlacement
         ))
@@ -2598,12 +2598,12 @@ fn core_drop_highest_identity_is_not_reused_and_missing_retained_heap_fails_open
     let mut db = seed(&root, true);
     let teams = db.resolve_drop_table("teams").unwrap();
     let mut txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut txn, teams).unwrap();
+    db.drop_table_legacy_in(&mut txn, teams).unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
     let mut create = db.begin_transaction().unwrap();
     let id = db
-        .create_heap_table_in(&mut create, CreateTableSpec::new("replacement", vec![]))
+        .create_heap_table_legacy_in(&mut create, CreateTableSpec::new("replacement", vec![]))
         .unwrap();
     assert_eq!(id, TableId(3));
     db.commit_transaction(&mut create).unwrap();
@@ -2636,13 +2636,13 @@ fn runtime_created_heap_can_be_dropped_and_recovered_from_retained_create_histor
     let mut db = seed(&root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(&mut create, CreateTableSpec::new("projects", vec![]))
+        .create_heap_table_legacy_in(&mut create, CreateTableSpec::new("projects", vec![]))
         .unwrap();
     db.commit_transaction(&mut create).unwrap();
     drop(create);
     let target = db.resolve_drop_table("projects").unwrap();
     let mut drop_txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_txn, target).unwrap();
+    db.drop_table_legacy_in(&mut drop_txn, target).unwrap();
     db.commit_transaction(&mut drop_txn).unwrap();
     assert_eq!(db.schema_generation(), SchemaGeneration(3));
     assert!(db.schema().table("projects").is_none());
@@ -2664,7 +2664,7 @@ fn runtime_created_heap_can_be_dropped_and_recovered_from_retained_create_histor
 
 fn create_and_drop_runtime_heap(db: &mut Database, name: &str) -> RetiredTableResource {
     let mut create = db.begin_transaction().unwrap();
-    db.create_heap_table_in(
+    db.create_heap_table_legacy_in(
         &mut create,
         CreateTableSpec::new(
             name,
@@ -2680,7 +2680,7 @@ fn create_and_drop_runtime_heap(db: &mut Database, name: &str) -> RetiredTableRe
     drop(create);
     let target = db.resolve_drop_table(name).unwrap();
     let mut drop_txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_txn, target).unwrap();
+    db.drop_table_legacy_in(&mut drop_txn, target).unwrap();
     db.commit_transaction(&mut drop_txn).unwrap();
     drop(drop_txn);
     db.inspect_retired_table_resources()
@@ -2757,7 +2757,7 @@ fn retired_heap_gc_never_touches_same_name_recreation_with_index() {
     let mut db = seed(&root, true);
     let mut old_create = db.begin_transaction().unwrap();
     let old_table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut old_create,
             CreateTableSpec::new(
                 "projects",
@@ -2781,7 +2781,7 @@ fn retired_heap_gc_never_touches_same_name_recreation_with_index() {
     db.execute("INSERT INTO projects (id) VALUES (11)").unwrap();
     let old_target = db.resolve_drop_table("projects").unwrap();
     let mut old_drop = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut old_drop, old_target).unwrap();
+    db.drop_table_legacy_in(&mut old_drop, old_target).unwrap();
     db.commit_transaction(&mut old_drop).unwrap();
     drop(old_drop);
     let retired = db
@@ -2791,7 +2791,7 @@ fn retired_heap_gc_never_touches_same_name_recreation_with_index() {
         .unwrap();
     let mut create = db.begin_transaction().unwrap();
     let replacement = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -2917,7 +2917,7 @@ fn retired_heap_gc_rejects_inexact_unsupported_and_symlink_targets() {
     let mut db = seed(&imported_root, true);
     let target = db.resolve_drop_table("users").unwrap();
     let mut txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut txn, target).unwrap();
+    db.drop_table_legacy_in(&mut txn, target).unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
     let imported = db.inspect_retired_table_resources()[0].clone();
@@ -3438,7 +3438,7 @@ fn imported_single_heap_drop_preserves_immutable_placement_evidence() {
     .unwrap();
     let target = db.resolve_drop_table("imported").unwrap();
     let mut txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut txn, target).unwrap();
+    db.drop_table_legacy_in(&mut txn, target).unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
     db.close().unwrap();
@@ -3467,7 +3467,7 @@ fn retired_inventory_explains_completed_historical_storage_only_decisions() {
     drop(write);
     let target = db.resolve_drop_table("users").unwrap();
     let mut drop_txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_txn, target).unwrap();
+    db.drop_table_legacy_in(&mut drop_txn, target).unwrap();
     db.commit_transaction(&mut drop_txn).unwrap();
     drop(drop_txn);
     db.close().unwrap();
@@ -3494,7 +3494,8 @@ fn core_create_same_transaction_dml_publication_dependencies_and_catalog_only_re
     db.execute_in(&mut txn, "UPDATE users SET id = 7").unwrap();
     db.execute_in(&mut txn, "UPDATE teams SET id = 8").unwrap();
     assert_eq!(
-        db.create_heap_table_in(&mut txn, spec("projects")).unwrap(),
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .unwrap(),
         TableId(3)
     );
     assert_eq!(db.next_table_id(), Some(TableId(4)));
@@ -3588,7 +3589,9 @@ fn rollback_burns_ids_name_reuse_and_transaction_prepared_scope() {
     let root = root("rollback");
     let mut db = seed(&root, false);
     let mut txn = db.begin_transaction().unwrap();
-    let rolled = db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    let rolled = db
+        .create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     assert_eq!(rolled, TableId(3));
     insert(&mut db, &mut txn);
     let select = db
@@ -3607,7 +3610,8 @@ fn rollback_burns_ids_name_reuse_and_transaction_prepared_scope() {
     assert_eq!(db.next_storage_id(), Some(StorageId(4)));
     let mut txn = db.begin_transaction().unwrap();
     assert_eq!(
-        db.create_heap_table_in(&mut txn, spec("projects")).unwrap(),
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .unwrap(),
         TableId(4)
     );
     assert!(db.execute_prepared_in(&mut txn, &select, &[]).is_err());
@@ -3634,7 +3638,7 @@ fn exclusive_retained_handle_admission_validation_and_mixing() {
     let retained = db.begin_transaction().unwrap();
     let mut txn = db.begin_transaction().unwrap();
     assert!(matches!(
-        db.create_heap_table_in(&mut txn, spec("projects")),
+        db.create_heap_table_legacy_in(&mut txn, spec("projects")),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::SchemaBusy
         ))
@@ -3648,13 +3652,14 @@ fn exclusive_retained_handle_admission_validation_and_mixing() {
             vec![spec("x").columns[0].clone(), spec("x").columns[0].clone()],
         ),
     ] {
-        assert!(db.create_heap_table_in(&mut txn, invalid).is_err());
+        assert!(db.create_heap_table_legacy_in(&mut txn, invalid).is_err());
         assert_eq!(db.next_table_id(), Some(TableId(3)));
         assert_eq!(db.next_storage_id(), Some(StorageId(3)));
     }
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     assert!(matches!(
-        db.create_heap_table_in(&mut txn, spec("other")),
+        db.create_heap_table_legacy_in(&mut txn, spec("other")),
         Err(crate::DatabaseError::SchemaMutation(
             SchemaMutationError::MultipleCreatesUnsupported
         ))
@@ -3705,7 +3710,10 @@ fn empty_catalog_empty_columns_and_multiple_commits_preserve_high_waters() {
     for n in 1..=3 {
         let mut txn = db.begin_transaction().unwrap();
         let id = db
-            .create_heap_table_in(&mut txn, CreateTableSpec::new(format!("table{n}"), vec![]))
+            .create_heap_table_legacy_in(
+                &mut txn,
+                CreateTableSpec::new(format!("table{n}"), vec![]),
+            )
             .unwrap();
         assert_eq!(id, TableId(n));
         db.commit_transaction(&mut txn).unwrap();
@@ -3731,7 +3739,8 @@ fn commit_sync_failures_remain_retry_only_and_cleanup_failure_is_rollback_pendin
         let root = root(fault);
         let mut db = seed(&root, true);
         let mut txn = db.begin_transaction().unwrap();
-        db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .unwrap();
         insert(&mut db, &mut txn);
         {
             let mut log = db.coordinator.as_ref().unwrap().borrow_mut();
@@ -3765,7 +3774,8 @@ fn commit_sync_failures_remain_retry_only_and_cleanup_failure_is_rollback_pendin
     let root = root("cleanup-pending");
     let mut db = seed(&root, true);
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     let mutation = txn.schema_mutation.as_ref().unwrap();
     let path = crate::schema_catalog_file::resolve(
         &mutation.catalog,
@@ -3798,7 +3808,8 @@ fn create_crash_child() {
     if std::env::var_os("NETBADB_CREATE_SKIP_SECOND_WRITE").is_none() {
         db.execute_in(&mut txn, "UPDATE teams SET id = 8").unwrap();
     }
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     insert(&mut db, &mut txn);
     assert_eq!(
         rows(db.execute_in(&mut txn, "SELECT * FROM projects").unwrap()),
@@ -3911,7 +3922,8 @@ fn subprocess_create_crash_matrix_reopens_three_times_with_exact_outcomes() {
             let mut db = Database::open_catalog(root.join("catalog")).unwrap();
             let mut txn = db.begin_transaction().unwrap();
             assert_eq!(
-                db.create_heap_table_in(&mut txn, spec("projects")).unwrap(),
+                db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+                    .unwrap(),
                 TableId(4)
             );
             db.commit_transaction(&mut txn).unwrap();
@@ -3930,7 +3942,7 @@ fn seed_rewrite_crash(root: &Path) {
     let mut db = seed(root, true);
     let mut create = db.begin_transaction().unwrap();
     let table = db
-        .create_heap_table_in(
+        .create_heap_table_legacy_in(
             &mut create,
             CreateTableSpec::new(
                 "projects",
@@ -4221,13 +4233,12 @@ fn drop_crash_child() {
         db.execute_in(&mut txn, "UPDATE users SET id = 7").unwrap();
     }
     if std::env::var_os("NETBADB_DROP_SQL").is_some() {
-        assert_eq!(
-            db.execute_in(&mut txn, "DROP TABLE users;").unwrap(),
-            ExecutionResult::AffectedRows(0)
-        );
+        let prepared = db.prepare_ddl_statement("DROP TABLE users;").unwrap();
+        let target = prepared.drop_table_target().unwrap();
+        db.drop_table_legacy_in(&mut txn, target).unwrap();
     } else {
         let target = db.resolve_drop_table("users").unwrap();
-        db.drop_table_in(&mut txn, target).unwrap();
+        db.drop_table_legacy_in(&mut txn, target).unwrap();
     }
     if std::env::var("NETBADB_DROP_CRASH_POINT")
         .unwrap_or_default()
@@ -4457,7 +4468,8 @@ fn journal_codec_roundtrip_truncation_duplicates_and_incarnation() {
     let root = root("codec");
     let mut db = seed(&root, true);
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     txn.rollback().unwrap();
     let journal = db.mutation_journal.as_ref().unwrap().borrow();
     let bytes = journal.encode().unwrap();
@@ -4489,7 +4501,7 @@ fn journal_rejects_create_reservation_below_retired_allocator_floor() {
     let mut db = seed(&root, true);
     let target = db.resolve_drop_table("users").unwrap();
     let mut txn = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut txn, target).unwrap();
+    db.drop_table_legacy_in(&mut txn, target).unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
 
@@ -4520,7 +4532,8 @@ fn exact_expectation_accepts_added_table_after_runtime_commit() {
     let mut db = seed(&root, true);
     let expected = Schema::new(db.schema().tables().to_vec()).unwrap();
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
     db.close().unwrap();
@@ -4540,7 +4553,10 @@ fn dropped_dirty_participant_blocks_schema_admission_without_reserving() {
         .unwrap();
     drop(dirty);
     let mut txn = db.begin_transaction().unwrap();
-    assert!(db.create_heap_table_in(&mut txn, spec("projects")).is_err());
+    assert!(
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .is_err()
+    );
     assert_eq!(db.next_table_id(), Some(TableId(3)));
     txn.rollback().unwrap();
     drop(txn);
@@ -4573,7 +4589,10 @@ fn failed_staging_requires_rollback_and_never_decides_commit() {
         b"injected create-new collision",
     )
     .unwrap();
-    assert!(db.create_heap_table_in(&mut txn, spec("projects")).is_err());
+    assert!(
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .is_err()
+    );
     assert_eq!(txn.state(), TransactionState::RollbackRequired);
     assert!(db.commit_transaction(&mut txn).is_err());
     assert_eq!(
@@ -4645,7 +4664,9 @@ fn existing_lsm_and_range_participants_commit_with_new_heap() {
         let mut txn = db.begin_transaction().unwrap();
         db.execute_in(&mut txn, "INSERT INTO users (id) VALUES (1)")
             .unwrap();
-        let id = db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+        let id = db
+            .create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .unwrap();
         insert(&mut db, &mut txn);
         db.commit_transaction(&mut txn).unwrap();
         drop(txn);
@@ -4692,7 +4713,7 @@ fn generation_and_identity_exhaustion_are_checked_before_staging() {
         db.committed = snapshot.committed;
         let mut txn = db.begin_transaction().unwrap();
         assert!(matches!(
-            db.create_heap_table_in(&mut txn, spec("projects")),
+            db.create_heap_table_legacy_in(&mut txn, spec("projects")),
             Err(crate::DatabaseError::SchemaMutation(
                 SchemaMutationError::IdentityExhausted(_)
             ))
@@ -4863,7 +4884,8 @@ fn write_schema_mutation_fuzz_corpus() {
     let root = root("fuzz-corpus");
     let mut db = seed(&root, true);
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     let mut journal = db.mutation_journal.as_ref().unwrap().borrow().clone();
     journal.incarnation = [7; 16];
     journal.coordinator = "coordinator".into();
@@ -4894,7 +4916,7 @@ fn write_schema_mutation_fuzz_corpus() {
     drop(txn);
     let target = db.resolve_drop_table("users").unwrap();
     let mut drop_loser = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_loser, target).unwrap();
+    db.drop_table_legacy_in(&mut drop_loser, target).unwrap();
     let drop_intent = db
         .mutation_journal
         .as_ref()
@@ -4925,7 +4947,7 @@ fn write_schema_mutation_fuzz_corpus() {
     )
     .unwrap();
     let mut drop_winner = db.begin_transaction().unwrap();
-    db.drop_table_in(&mut drop_winner, target).unwrap();
+    db.drop_table_legacy_in(&mut drop_winner, target).unwrap();
     db.commit_transaction(&mut drop_winner).unwrap();
     drop(drop_winner);
     let winner = db.mutation_journal.as_ref().unwrap().borrow().clone();
@@ -4970,7 +4992,7 @@ fn write_schema_mutation_fuzz_corpus() {
     let schema_drop_zero = std::fs::read(root.join("coordinator")).unwrap();
 
     let mut rewrite_create = db.begin_transaction().unwrap();
-    db.create_heap_table_in(
+    db.create_heap_table_legacy_in(
         &mut rewrite_create,
         CreateTableSpec::new(
             "rewrite_rows",
@@ -5454,6 +5476,126 @@ fn write_schema_mutation_fuzz_corpus() {
     .unwrap();
     recreate.rollback().unwrap();
     drop(recreate);
+
+    let mut table_create_loser = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut table_create_loser,
+        "CREATE TABLE round30_create_loser (id BIGINT)",
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/table-id-reservation-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut table_create_loser)
+        .unwrap();
+    let create_intent = db
+        .mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .encode()
+        .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/table-object-create-intent-v1"),
+        &create_intent,
+    )
+    .unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/table-object-create-truncated-v1"),
+        &create_intent[..create_intent.len() - 11],
+    )
+    .unwrap();
+    table_create_loser.rollback().unwrap();
+    drop(table_create_loser);
+    std::fs::write(
+        output.join("schema_mutation_decode/table-object-create-loser-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut table_create_winner = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut table_create_winner,
+        "CREATE TABLE round30_table (id BIGINT)",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut table_create_winner,
+        "ALTER TABLE round30_table ADD COLUMN note TEXT",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut table_create_winner,
+        "CREATE INDEX round30_note_idx ON round30_table(note)",
+    )
+    .unwrap();
+    db.commit_transaction(&mut table_create_winner).unwrap();
+    drop(table_create_winner);
+    std::fs::write(
+        output.join("schema_mutation_decode/table-object-create-winner-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut same_name = db.begin_transaction().unwrap();
+    db.execute_in(&mut same_name, "DROP TABLE round30_table")
+        .unwrap();
+    db.execute_in(
+        &mut same_name,
+        "CREATE TABLE round30_table (replacement BIGINT)",
+    )
+    .unwrap();
+    db.ensure_schema_materialized(&mut same_name).unwrap();
+    std::fs::write(
+        output.join("schema_mutation_decode/table-object-drop-create-intent-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    same_name.rollback().unwrap();
+    drop(same_name);
+
+    let mut create_drop_noop = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut create_drop_noop,
+        "CREATE TABLE round30_dead (id BIGINT)",
+    )
+    .unwrap();
+    db.execute_in(&mut create_drop_noop, "DROP TABLE round30_dead")
+        .unwrap();
+    db.commit_transaction(&mut create_drop_noop).unwrap();
+    drop(create_drop_noop);
+    std::fs::write(
+        output.join("schema_mutation_decode/table-object-create-drop-noop-v1"),
+        db.mutation_journal
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
     std::fs::write(
         output.join("coordinator_log_decode/schema-composition-decision-v2"),
         std::fs::read(root.join("coordinator")).unwrap(),
@@ -5530,7 +5672,7 @@ fn subsequent_winner_recovers_past_prior_completed_journal_history() {
     let root = root("second-winner");
     let mut db = seed(&root, true);
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, CreateTableSpec::new("first", vec![]))
+    db.create_heap_table_legacy_in(&mut txn, CreateTableSpec::new("first", vec![]))
         .unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
@@ -5551,7 +5693,8 @@ fn dropped_schema_handle_requires_recovery_and_consumes_ids() {
     let root = root("dropped-schema");
     let mut db = seed(&root, true);
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     insert(&mut db, &mut txn);
     drop(txn);
     assert!(matches!(
@@ -5615,7 +5758,8 @@ fn uncertain_rollback_journal_sync_requires_recovery_without_publishing() {
     let root = root("rollback-sync");
     let mut db = seed(&root, true);
     let mut txn = db.begin_transaction().unwrap();
-    db.create_heap_table_in(&mut txn, spec("projects")).unwrap();
+    db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+        .unwrap();
     insert(&mut db, &mut txn);
     db.mutation_journal
         .as_ref()
@@ -5657,7 +5801,8 @@ fn empty_journal_reopen_completes_activation_before_reservation() {
     let mut db = Database::open_catalog(&catalog).unwrap();
     let mut txn = db.begin_transaction().unwrap();
     assert_eq!(
-        db.create_heap_table_in(&mut txn, spec("projects")).unwrap(),
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .unwrap(),
         TableId(3)
     );
     assert!(root.join("catalog.mutations.state").is_file());
@@ -5707,7 +5852,10 @@ fn journal_capacity_rejects_before_reservation_and_leaves_resolution_room() {
     db.close().unwrap();
     let mut db = Database::open_catalog(&catalog).unwrap();
     let mut txn = db.begin_transaction().unwrap();
-    assert!(db.create_heap_table_in(&mut txn, spec("projects")).is_err());
+    assert!(
+        db.create_heap_table_legacy_in(&mut txn, spec("projects"))
+            .is_err()
+    );
     assert_eq!(txn.state(), TransactionState::Active);
     assert_eq!(db.next_table_id(), Some(TableId(32770)));
     assert_eq!(db.next_storage_id(), Some(StorageId(32770)));

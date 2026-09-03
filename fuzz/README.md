@@ -259,3 +259,15 @@ final allocator floors, and noncanonical table order. The coordinator corpus add
 a real mixed composition decision; CORD remains v2. Run all thirteen registered
 targets for 1,000 runs with `-seed=29`, using copied temporary corpora so random
 mutations and artifacts never enter the repository.
+
+## Round 30 table-object composition records
+
+`schema_mutation_decode` keeps tags 1–25 byte-for-byte compatible and adds
+reviewed NBSJ seeds for the tag-26 logical `TableId` reservation, tag-27 typed
+table-object aggregate, tag-28 rewrite/drop retirement, and tag-29/30
+table-object GC intent/completion records. Generated seeds cover CreateHeap,
+DropHeap plus same-name CreateHeap, CREATE→DROP no-effective-change, loser and
+winner histories, final created-table column/index inventories, and truncated
+table-object input. Run the same thirteen targets for 1,000 iterations with
+`-seed=30`; use copied temporary corpora so generated mutations are never
+written into the reviewed repository corpus.

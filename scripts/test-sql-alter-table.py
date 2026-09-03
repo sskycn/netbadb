@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 29 real-client schema/index composition acceptance."""
+"""Rounds 29-30 real-client schema/index/table composition acceptance."""
 from __future__ import annotations
 
 import io
@@ -40,14 +40,36 @@ DROP INDEX projects_active_idx;
 ALTER TABLE projects DROP COLUMN active;
 COMMIT;
 SELECT id, title FROM projects ORDER BY id;
+BEGIN;
+CREATE TABLE psql_composed (id BIGINT NOT NULL, name TEXT);
+ALTER TABLE psql_composed ADD COLUMN active BOOLEAN;
+CREATE INDEX psql_composed_name_idx ON psql_composed(name);
+INSERT INTO psql_composed VALUES (30, 'thirty', true);
+SELECT id, name, active FROM psql_composed;
+COMMIT;
+BEGIN;
+CREATE TABLE psql_noop (id BIGINT);
+DROP TABLE psql_noop;
+COMMIT;
+BEGIN;
+ALTER TABLE projects ADD COLUMN doomed BOOLEAN;
+CREATE INDEX projects_doomed_idx ON projects(doomed);
+DROP TABLE projects;
+CREATE TABLE projects (id BIGINT NOT NULL, replacement TEXT);
+COMMIT;
 """,
         text=True,
         capture_output=True,
     )
     assert composed.returncode == 0, composed.stderr
-    assert composed.stdout.strip().splitlines() == ["1|one|", "1|one"], composed.stdout
+    assert composed.stdout.strip().splitlines() == [
+        "1|one|",
+        "1|one",
+        "30|thirty|t",
+    ], composed.stdout
     print(
-        f"{version}: ALTER + CREATE INDEX and DROP INDEX + DROP COLUMN transactions PASS"
+        f"{version}: schema/index composition plus CREATE/ALTER/INDEX, CREATE/DROP "
+        "elision, and ALTER/DROP + same-name CREATE PASS"
     )
 
 
@@ -69,12 +91,34 @@ def psycopg_probe(dsn: str) -> None:
             with connection.cursor() as cursor:
                 cursor.execute("DROP INDEX projects_active_idx", prepare=True)
                 cursor.execute("ALTER TABLE projects DROP COLUMN active")
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "CREATE TABLE psycopg_composed (id BIGINT NOT NULL, name TEXT)",
+                    prepare=True,
+                )
+                cursor.execute(
+                    "ALTER TABLE psycopg_composed ADD COLUMN active BOOLEAN",
+                    prepare=True,
+                )
+                cursor.execute(
+                    "CREATE INDEX psycopg_composed_name_idx "
+                    "ON psycopg_composed(name)",
+                    prepare=True,
+                )
+                cursor.execute(
+                    "INSERT INTO psycopg_composed VALUES (%s, %s, %s)",
+                    (30, "thirty", True),
+                )
+                cursor.execute("SELECT * FROM psycopg_composed", prepare=True)
+                assert cursor.fetchall() == [(30, "thirty", True)]
         with connection.cursor() as cursor:
             cursor.execute("SELECT id, title FROM projects ORDER BY id", prepare=True)
             assert cursor.fetchall() == [(1, "one")]
         connection.commit()
     print(
-        f"psycopg {psycopg.__version__}: prepare=True mixed create/drop index transactions PASS"
+        f"psycopg {psycopg.__version__}: prepare=True schema/index transactions and "
+        "CREATE/ALTER/INDEX + parameterized INSERT materialization PASS"
     )
 
 
@@ -136,10 +180,34 @@ def sqlalchemy_probe(dsn: str) -> None:
         "title",
     ]
     assert before_oid != add_oid and add_oid != rename_oid
+
+    composed_metadata = sa.MetaData()
+    composed = sa.Table(
+        "sqlalchemy_composed",
+        composed_metadata,
+        sa.Column("id", sa.BigInteger(), nullable=False),
+        sa.Column("name", sa.Text()),
+    )
+    noop = sa.Table(
+        "sqlalchemy_noop",
+        composed_metadata,
+        sa.Column("id", sa.BigInteger()),
+    )
+    with engine.begin() as connection:
+        composed.create(connection, checkfirst=False)
+        connection.exec_driver_sql(
+            "ALTER TABLE sqlalchemy_composed ADD COLUMN active BOOLEAN"
+        )
+        composed_index = sa.Index("sqlalchemy_composed_name_idx", composed.c.name)
+        composed_index.create(connection)
+    with engine.begin() as connection:
+        noop.create(connection, checkfirst=False)
+        noop.drop(connection, checkfirst=False)
     engine.dispose()
     print(
         f"SQLAlchemy {sa.__version__}: Index.create/drop in mixed DDL transactions PASS; "
-        f"fingerprint-keyed table OIDs {before_oid} -> {add_oid} -> {rename_oid}"
+        f"fingerprint-keyed table OIDs {before_oid} -> {add_oid} -> {rename_oid}; "
+        "Table.create + ALTER + Index.create and Table.create/drop elision PASS"
     )
 
 
@@ -230,10 +298,37 @@ def alembic_probe(dsn: str) -> None:
     assert "projects_blocked_idx" not in {
         index["name"] for index in sa.inspect(engine).get_indexes("projects")
     }
+
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        operations.create_table(
+            "alembic_composed",
+            sa.Column("id", sa.BigInteger(), nullable=False),
+            sa.Column("name", sa.Text(), nullable=True),
+        )
+        operations.add_column(
+            "alembic_composed", sa.Column("active", sa.Boolean(), nullable=True)
+        )
+        operations.create_index(
+            "alembic_composed_name_idx", "alembic_composed", ["name"]
+        )
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        operations.create_table(
+            "alembic_noop", sa.Column("id", sa.BigInteger(), nullable=True)
+        )
+        operations.create_index("alembic_noop_id_idx", "alembic_noop", ["id"])
+        operations.drop_table("alembic_noop")
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        operations.drop_index("projects_name_idx", table_name="projects")
+        operations.drop_table("projects")
     print(
         f"Alembic {alembic.__version__}: schema + index composition PASS; plan is "
         + " | ".join(planned_sql)
-        + "; DROP INDEX projects_blocked_idx | ALTER TABLE projects DROP COLUMN blocked"
+        + "; DROP INDEX projects_blocked_idx | ALTER TABLE projects DROP COLUMN blocked; "
+        + "ordinary create_table/add_column/create_index, create/drop elision, and "
+        + "drop_index/drop_table PASS"
     )
     engine.dispose()
 
@@ -259,11 +354,12 @@ def main() -> None:
         check=True,
     )
     for probe in (psql_probe, psycopg_probe, sqlalchemy_probe, alembic_probe):
+        probe_environment = dict(environment, NETBADB_ROUND30_PROBE=probe.__name__)
         with tempfile.TemporaryFile(mode="w+") as trace:
             process = subprocess.Popen(
                 [str(TARGET / "debug/examples/sql_alter_table_fixture")],
                 cwd=ROOT,
-                env=environment,
+                env=probe_environment,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=trace,

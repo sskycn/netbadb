@@ -90,21 +90,39 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
     }
+    let probe = std::env::var("NETBADB_ROUND30_PROBE")?;
+    let (base, required, absent) = match probe.as_str() {
+        "psql_probe" => (Some("projects"), "psql_composed", Some("psql_noop")),
+        "psycopg_probe" => (Some("projects"), "psycopg_composed", None),
+        "sqlalchemy_probe" => (Some("work"), "sqlalchemy_composed", Some("sqlalchemy_noop")),
+        "alembic_probe" => (None, "alembic_composed", Some("alembic_noop")),
+        _ => return Err(format!("unknown Round 30 probe {probe}").into()),
+    };
     for _ in 0..3 {
         let reopened = Database::open_catalog(&catalog)?;
-        let table = reopened
+        let composed = reopened
             .schema()
-            .tables()
-            .iter()
-            .find(|table| table.id == TableId(2))
-            .ok_or("runtime-created table identity disappeared")?;
-        if reopened.table_schema_version(TableId(2)).is_none() || table.columns.is_empty() {
-            return Err("ALTER target identity/version is invalid after reopen".into());
+            .table(required)
+            .ok_or("client-created table disappeared after reopen")?;
+        if reopened.table_schema_version(composed.id).is_none() || composed.columns.is_empty() {
+            return Err("composed table identity/version is invalid after reopen".into());
+        }
+        if let Some(base) = base {
+            let table = reopened
+                .schema()
+                .table(base)
+                .ok_or("base table disappeared after table-object composition")?;
+            if reopened.table_schema_version(table.id).is_none() || table.columns.is_empty() {
+                return Err("base table identity/version is invalid after reopen".into());
+            }
+        }
+        if absent.is_some_and(|name| reopened.schema().table(name).is_some()) {
+            return Err("CREATE-to-DROP no-op table survived reopen".into());
         }
         reopened.close()?;
     }
     println!(
-        "REOPEN PASS: TableId 2 and its final ALTER schema survived three catalog-only opens; manifest unchanged"
+        "REOPEN PASS: {probe} final table-object schema survived three catalog-only opens; transient no-op absent; manifest unchanged"
     );
     Ok(())
 }

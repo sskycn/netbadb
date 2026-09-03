@@ -253,6 +253,17 @@ participant. IndexCatalog v9 remains committed allocator authority, with retaine
 NBSJ reservations supplying the post-catalog effective floor. One CORD v2 decision
 coordinates both strategies, and index-only transactions carry no fake NBSC.
 
+[Round 30](table-ddl-composition-round30.md) brings managed runtime Single-Heap
+CREATE/DROP TABLE into that aggregate. CREATE acceptance durably reserves only a
+TableId and maintains a private V1 table/index namespace; physical StorageId and
+Heap allocation wait until materialization. DROP records exact logical absence.
+Final TableId-ordered classification emits CreateHeap, DropHeap, RewriteHeap, or
+InPlaceIndexDelta plans. CREATE-to-DROP burns only the TableId, ALTER-to-DROP
+elides replacement work, and DropHeap contributes no fake physical participant.
+One prepared NBSC and one CORD decision publish every surviving object. NBSJ v1
+tags 26--30 record TableId reservation, the typed table-object aggregate,
+predecessor retirement, and exact-resource GC without changing older tag bytes.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

@@ -842,10 +842,19 @@ table. Index-only commits preserve NBSC generation/epoch, table version, and
 StorageId while advancing runtime revision once. NBSJ v1 adds distinct tags 24/25;
 CORD v2 and IndexCatalog v9 remain unchanged.
 
-Next: **Round 30 — CREATE/DROP TABLE Composition Foundation**. The first target is
-one final created Heap for CREATE TABLE + ALTER + CREATE INDEX, plus CREATE/DROP and
-ALTER/DROP elision with permanently consumed logical identities. Any remaining
-IndexId or in-place participant recovery gap takes priority over table composition.
+### CREATE / DROP TABLE composition foundation — Round 30
+
+[Round 30](table-ddl-composition-round30.md) extends the aggregate to managed
+runtime Single Heaps created or dropped in the transaction. Accepted CREATE burns
+a durable TableId but delays StorageId and Heap creation until materialization;
+DROP is exact logical absence. Final TableId-ordered CreateHeap, DropHeap,
+RewriteHeap, and InPlaceIndexDelta plans use one prepared NBSC and one CORD
+decision. CREATE-to-DROP allocates no storage, ALTER-to-DROP creates no replacement,
+and same-name recreation is a distinct TableId. NBSJ v1 tags 26--30 retain typed
+recovery and exact-resource GC evidence; all earlier tag bytes remain unchanged.
+
+Next: audit a controlled migration-DML phase for DDL--DML--DDL workflows without
+removing the global materialization seal or weakening exact identity recovery.
 
 ## Phase 6 — SDK and tooling
 

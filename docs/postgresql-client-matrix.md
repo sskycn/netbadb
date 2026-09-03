@@ -159,9 +159,12 @@ CARGO_TARGET_DIR=/private/tmp/netbadb-round19-target \
 Install the exact existing `scripts/requirements-postgresql-orm.txt` dependencies.
 The prior psql/ORM/Alembic index-only regression scripts continue on separate fresh
 `postgres_driver_fixture` databases with explicit schema_admin and table grants.
-`scripts/test-sql-alter-table.py` additionally runs Round 29 mixed transactions
-through psql 17.11, psycopg 3.2.13, SQLAlchemy 2.0.52, and Alembic 1.16.5, then
-performs three catalog-only reopens for each fresh fixture.
+`scripts/test-sql-alter-table.py` additionally runs Round 29 schema/index and
+Round 30 table-object transactions through psql 17.11, psycopg 3.2.13,
+SQLAlchemy 2.0.52, and Alembic 1.16.5. It covers CREATE/ALTER/CREATE INDEX,
+parameterized DML materialization, CREATE/DROP elision, ALTER/DROP with same-name
+recreation, and Alembic drop-index/drop-table, then performs three catalog-only
+reopens for each fresh fixture.
 
 ## Round 21 real DROP TABLE fixture
 

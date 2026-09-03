@@ -112,10 +112,13 @@ Single Heap schema rewrites with the same TableId and a new StorageId. [Round 26
 maps six generic SQL `ALTER TABLE` actions through exact typed HIR to that existing
 Core lifecycle. [Round 28](docs/core-multi-alter-round28.md) composes multiple
 ALTER statements over one or many runtime Single Heaps into one final rewrite per
-dirty table, one NBSC, and one Coordinator decision. It is intentionally ALTER-only;
-table DDL cannot be mixed yet. [Round 29](docs/schema-index-composition-round29.md)
+dirty table, one NBSC, and one Coordinator decision. [Round 29](docs/schema-index-composition-round29.md)
 adds logical CREATE/DROP INDEX to that aggregate, with durable IndexId reservation,
-final replacement inventories, and index-only in-place participants. [Round 23](docs/schema-evolution-round23.md) records the row-format
+final replacement inventories, and index-only in-place participants.
+[Round 30](docs/table-ddl-composition-round30.md) adds managed runtime CREATE/DROP
+TABLE with durable private TableIds, deferred final Heap creation, exact logical
+absence, same-name identity separation, and CREATE/DROP or ALTER/DROP physical
+elision. [Round 23](docs/schema-evolution-round23.md) records the row-format
 audit that selected this architecture. [Round 25](docs/replacement-retired-gc-round25.md)
 extends explicit safe single-resource GC to old runtime Heaps retired by schema
 rewrite without treating their still-active TableId as dropped.
@@ -319,8 +322,11 @@ qualified/multi-table DROP, and general migration execution remain unsupported.
 Basic transactional Heap ALTER supports rename table/column, nullable ADD, restricted
 DROP, and SET/DROP NOT NULL through native SQL and PostgreSQL Simple/Extended Query.
 Real Alembic support includes bounded atomic ALTER + CREATE/DROP INDEX composition
-within current runtime-created Single-Heap limits. CREATE/DROP TABLE mixing remains
-unsupported and rolls back; complete `pg_catalog` or `information_schema`,
+within current runtime-created Single-Heap limits. The same aggregate accepts
+CREATE/ALTER/CREATE INDEX, DROP/CREATE same-name, ALTER/DROP, and CREATE/DROP
+table-object sequences for managed runtime Heaps. DML materializes and seals the
+aggregate, so DDL after user data access remains unsupported. Imported/bootstrap,
+LSM, and partitioned table composition also remain unsupported; complete `pg_catalog` or `information_schema`,
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
@@ -583,8 +589,9 @@ targets, and LSM/range DROP are unsupported. Basic SQL ALTER maps exact prepared
 table/column identities to the embedded typed Core rewrite surface. Multiple
 ALTER and CREATE/DROP INDEX statements compose atomically with one final rewrite per
 schema-dirty table or one in-place participant per index-only table; physical type
-conversion, defaults, constraints, ADD NOT NULL, mixed table DDL, LSM/
-range/imported ALTER, and automatic GC remain unsupported. See the
+conversion, defaults, constraints, ADD NOT NULL, DDL after materializing DML, LSM/
+range/imported composition, and automatic GC remain unsupported. See the
+[Round 30 table-object composition report](docs/table-ddl-composition-round30.md),
 [Round 29 schema/index composition report](docs/schema-index-composition-round29.md),
 [Round 28 composition report](docs/core-multi-alter-round28.md),
 [Round 26 SQL ALTER report](docs/sql-alter-table-round26.md), the

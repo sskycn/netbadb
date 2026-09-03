@@ -104,7 +104,9 @@ including same-table and cross-table actions and post-final-ALTER DML. CREATE/DR
 TABLE mixing, CREATE/DROP INDEX mixing, multiple index DDL, savepoints, defaults or
 backfill, physical conversion, constraints, LSM/range/imported storage, online
 schema evolution, cross-process writers, automatic GC, and NBSJ/CORD compaction are
-deferred by that round. [Round 29](schema-index-composition-round29.md) now extends
-the same aggregate with logical CREATE/DROP INDEX, durable IndexId reservations,
-final replacement inventories, and index-only in-place participants; CREATE/DROP
-TABLE composition remains deferred.
+deferred by that round. [Round 29](schema-index-composition-round29.md) extends the
+same aggregate with logical CREATE/DROP INDEX, durable IndexId reservations,
+final replacement inventories, and index-only in-place participants.
+[Round 30](table-ddl-composition-round30.md) further extends it with private
+CREATE TABLE identities, logical DROP TABLE absence, final CreateHeap/DropHeap
+classification, and one table/index aggregate decision.

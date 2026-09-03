@@ -283,10 +283,14 @@ precede every executed user data access in its transaction.
 Real psql 17.11, psycopg 3.2.13 `prepare=True`, SQLAlchemy 2.0.52 transport/
 reflection and native `Index.create/drop`, and Alembic 1.16.5 Operations pass.
 ALTER plus CREATE/DROP INDEX composes within one transaction for runtime-created
-Single Heaps. Defaults, constraints, ADD NOT NULL, physical type
+Single Heaps. Round 30 also composes managed runtime CREATE/DROP TABLE with ALTER
+and index DDL, including CREATE/DROP physical elision, ALTER/DROP rewrite elision,
+and same-name recreation as a new TableId. DML materializes and seals the
+transaction, so later DDL remains unsupported. Defaults, constraints, ADD NOT NULL, physical type
 conversion, dependent-column DROP, qualified/quoted/IF EXISTS/CASCADE forms,
-CREATE/DROP TABLE mixing, non-Heap placement, online ALTER, and automatic GC are
-unsupported. See [Round 29](schema-index-composition-round29.md) and
+imported/bootstrap, LSM or partitioned composition, online ALTER, and automatic GC are
+unsupported. See [Round 30](table-ddl-composition-round30.md),
+[Round 29](schema-index-composition-round29.md), and
 [Round 26](sql-alter-table-round26.md).
 
 ## Compatibility tracing

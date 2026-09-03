@@ -207,9 +207,8 @@ ADD NOT NULL backfill, constraints/FKs/generated columns, physical conversion,
 LSM/range/imported storage, online evolution, cross-process writers, automatic GC,
 and NBSJ/CORD compaction remain deferred.
 
-If validation remains green, Round 30 should add CREATE/DROP TABLE object-lifecycle
-composition: private new TableIds, logical absence, same-name recreation,
-CREATE-to-DROP elision with consumed identities, ALTER-to-DROP rewrite elision,
-new-table final index inventories, grants/manifest behavior, and one final NBSC/CORD
-decision. It should not proceed by weakening the exact IndexId or in-place recovery
-model established here.
+[Round 30](table-ddl-composition-round30.md) now adds that CREATE/DROP TABLE
+object-lifecycle composition. It keeps Round 29's exact IndexId and in-place
+recovery model, reserves private new TableIds, elides CREATE-to-DROP and
+ALTER-to-DROP physical work, supports same-name recreation as a distinct identity,
+and commits the final table/index inventory through one NBSC/CORD decision.

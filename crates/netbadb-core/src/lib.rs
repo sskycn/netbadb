@@ -2157,6 +2157,35 @@ impl Database {
                     .and_then(|transaction| transaction.schema_composition.plan())
                     .into_iter()
                     .flat_map(|plan| plan.touched.iter())
+                    .filter(|(table_id, _)| {
+                        transaction
+                            .and_then(|transaction| transaction.schema_composition.plan())
+                            .is_some_and(|plan| {
+                                plan.overlay
+                                    .schema
+                                    .tables()
+                                    .iter()
+                                    .any(|table| table.id == **table_id)
+                            })
+                    })
+                    .flat_map(|(table_id, table)| {
+                        table.indexes.active.iter().filter_map(move |index| {
+                            index.name.as_ref().map(|name| IndexNameBinding {
+                                name: name.clone(),
+                                target: DropIndexTarget {
+                                    table_id: *table_id,
+                                    index_id: index.id,
+                                },
+                            })
+                        })
+                    }),
+            )
+            .chain(
+                transaction
+                    .and_then(|transaction| transaction.schema_composition.plan())
+                    .into_iter()
+                    .flat_map(|plan| plan.created.iter())
+                    .filter(|(_, table)| table.present)
                     .flat_map(|(table_id, table)| {
                         table.indexes.active.iter().filter_map(move |index| {
                             index.name.as_ref().map(|name| IndexNameBinding {
@@ -2269,7 +2298,9 @@ impl Database {
                     transaction.schema_composition.is_started()
                         && !matches!(
                             compiled,
-                            CompiledDdlStatement::AlterTable(_)
+                            CompiledDdlStatement::CreateTable(_)
+                                | CompiledDdlStatement::DropTable(_)
+                                | CompiledDdlStatement::AlterTable(_)
                                 | CompiledDdlStatement::CreateIndex(_)
                                 | CompiledDdlStatement::DropIndex(_)
                         )
@@ -2441,7 +2472,9 @@ impl Database {
         if transaction.schema_composition.is_started()
             && !matches!(
                 prepared.compiled,
-                CompiledDdlStatement::AlterTable(_)
+                CompiledDdlStatement::CreateTable(_)
+                    | CompiledDdlStatement::DropTable(_)
+                    | CompiledDdlStatement::AlterTable(_)
                     | CompiledDdlStatement::CreateIndex(_)
                     | CompiledDdlStatement::DropIndex(_)
             )
@@ -7171,3 +7204,5 @@ mod sql_alter_table_tests;
 mod sql_create_table_tests;
 #[cfg(test)]
 mod sql_drop_table_tests;
+#[cfg(test)]
+mod table_ddl_composition_tests;

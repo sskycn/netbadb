@@ -1,6 +1,6 @@
 use super::*;
 use netbadb_schema::{ColumnDef, TypeSpec};
-use netbadb_types::{ColumnId, SemanticType};
+use netbadb_types::{ColumnId, IndexName, SemanticType};
 use std::path::{Path, PathBuf};
 
 const CREATE: &str =
@@ -143,8 +143,16 @@ fn sql_rollback_commit_overlay_identity_generation_and_catalog_only_reopen() {
     assert_eq!(db.catalog_generation(), 0);
     assert_eq!(db.next_table_id(), Some(TableId(4)));
     assert_eq!(db.next_storage_id(), Some(StorageId(4)));
+    let mut rejected = db.begin_transaction().unwrap();
+    db.execute_in(&mut rejected, "UPDATE users SET id = 2")
+        .unwrap();
+    assert_eq!(
+        db.execute_in(&mut rejected, CREATE).unwrap_err().kind(),
+        DatabaseErrorKind::TransactionState
+    );
+    rejected.rollback().unwrap();
+    drop(rejected);
     let mut txn = db.begin_transaction().unwrap();
-    db.execute_in(&mut txn, "UPDATE users SET id = 2").unwrap();
     db.execute_in(&mut txn, CREATE).unwrap();
     db.execute_in(
         &mut txn,
@@ -153,6 +161,7 @@ fn sql_rollback_commit_overlay_identity_generation_and_catalog_only_reopen() {
     .unwrap();
     db.commit_transaction(&mut txn).unwrap();
     drop(txn);
+    db.execute("UPDATE users SET id = 2").unwrap();
     assert_eq!(
         rows(db.execute_prepared(&old, &[]).unwrap()),
         vec![vec![ScalarValue::Int64(2)]]
@@ -235,34 +244,34 @@ fn sql_and_direct_core_creation_have_identical_schema_and_placement() {
 }
 
 #[test]
-fn sql_rejects_multiple_creates_and_index_mixing_and_enforces_not_null() {
+fn sql_composes_multiple_creates_and_indexes_and_enforces_not_null() {
     let root = root("mixing");
     let mut db = seed(&root);
     let mut txn = db.begin_transaction().unwrap();
     db.execute_in(&mut txn, CREATE).unwrap();
-    for sql in [
-        "CREATE TABLE other (id INT64)",
-        "CREATE INDEX i ON projects (id)",
-        "DROP INDEX missing",
-    ] {
-        assert_eq!(
-            db.execute_in(&mut txn, sql).unwrap_err().kind(),
-            DatabaseErrorKind::FeatureNotSupported
-        );
-    }
+    db.execute_in(&mut txn, "CREATE TABLE other (id INT64)")
+        .unwrap();
+    db.execute_in(&mut txn, "CREATE INDEX i ON projects (id)")
+        .unwrap();
+    assert_eq!(
+        db.execute_in(&mut txn, "DROP INDEX missing")
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::UndefinedObject
+    );
     assert!(
         db.execute_in(&mut txn, "INSERT INTO projects VALUES (NULL, 'bad', true)")
             .is_err()
     );
     txn.rollback().unwrap();
     drop(txn);
-    db.execute("CREATE INDEX existing ON users (id)").unwrap();
+    db.execute("CREATE TABLE managed (id BIGINT)").unwrap();
+    let managed = db.schema().table("managed").unwrap().id;
+    db.create_named_index(IndexName::new("existing").unwrap(), managed, ColumnId(1))
+        .unwrap();
     let mut txn = db.begin_transaction().unwrap();
     db.execute_in(&mut txn, "DROP INDEX existing").unwrap();
-    assert_eq!(
-        db.execute_in(&mut txn, CREATE).unwrap_err().kind(),
-        DatabaseErrorKind::FeatureNotSupported
-    );
+    db.execute_in(&mut txn, CREATE).unwrap();
     txn.rollback().unwrap();
     drop(txn);
     db.close().unwrap();
@@ -292,7 +301,11 @@ fn sql_staging_failure_consumes_reservations_only_after_execute() {
         b"injected collision",
     )
     .unwrap();
-    assert!(db.execute_ddl_in(&mut txn, &prepared).is_err());
+    db.execute_ddl_in(&mut txn, &prepared).unwrap();
+    assert!(
+        db.execute_in(&mut txn, "INSERT INTO projects VALUES (10, 'demo', true)",)
+            .is_err()
+    );
     assert_eq!(txn.state(), TransactionState::RollbackRequired);
     assert!(db.commit_transaction(&mut txn).is_err());
     txn.rollback().unwrap();

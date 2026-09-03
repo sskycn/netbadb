@@ -34,6 +34,17 @@ pub(crate) fn seed(name: &str) -> (PathBuf, Database) {
     .unwrap();
     (root, db)
 }
+
+pub(crate) fn managed_seed(name: &str) -> (PathBuf, Database) {
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-round30-server-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let mut db = Database::create_catalog(root.join("catalog"), Vec::new(), None).unwrap();
+    db.execute("CREATE TABLE users (id BIGINT)").unwrap();
+    (root, db)
+}
 pub(crate) fn principal(schema_admin: bool) -> PrincipalAuthorization {
     AuthorizationPolicy::new(
         TransportKind::PlaintextLoopback,

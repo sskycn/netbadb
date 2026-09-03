@@ -592,6 +592,7 @@ impl DatabaseTransaction {
             .cloned()
             .collect())
     }
+    #[cfg(test)]
     pub(crate) fn enlist_staged(
         &mut self,
         mut storage: netbadb_storage::TableStorage,
@@ -736,10 +737,13 @@ impl DatabaseTransaction {
     pub fn owns_staged_table(&self, table: netbadb_types::TableId) -> bool {
         self.state() == TransactionState::Active
             && (self.staged_binding(table).is_some()
-                || self
-                    .schema_composition
-                    .plan()
-                    .is_some_and(|plan| plan.touched.contains_key(&table)))
+                || self.schema_composition.plan().is_some_and(|plan| {
+                    plan.touched.contains_key(&table)
+                        || plan
+                            .created
+                            .get(&table)
+                            .is_some_and(|created| created.present)
+                }))
     }
 
     pub(crate) fn staged_binding(&self, table: netbadb_types::TableId) -> Option<StorageId> {
@@ -763,6 +767,12 @@ impl DatabaseTransaction {
                             .iter()
                             .find_map(|plan| {
                                 match plan {
+                            crate::schema_mutation_journal::SchemaIndexTablePlan::CreateHeap {
+                                target,
+                                ..
+                            } if target.committed.schema.tables()[0].id == table => {
+                                Some(target.storages[0].id)
+                            }
                             crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap {
                                 replacement,
                                 ..

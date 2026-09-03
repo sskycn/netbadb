@@ -1,6 +1,6 @@
 use super::*;
 use crate::authorization::{AuthorizationPolicy, PrincipalGrants};
-use crate::sql_create_table_test_support::{files, principal, seed};
+use crate::sql_create_table_test_support::{files, managed_seed, principal, seed};
 use netbadb_types::TableId;
 
 fn session(db: &Database, authorization: PrincipalAuthorization) -> PgWorkerSession {
@@ -41,7 +41,7 @@ fn state(messages: &[BackendMessage], expected: &str) {
 
 #[test]
 fn pg_extended_drop_parse_bind_describe_are_pure_and_execute_has_exact_tag() {
-    let (root, mut db) = seed("pg-drop-extended");
+    let (root, mut db) = managed_seed("pg-drop-extended");
     let mut session = session(&db, principal(true));
     let before = files(&root);
     assert_eq!(
@@ -112,7 +112,7 @@ fn pg_extended_drop_parse_bind_describe_are_pure_and_execute_has_exact_tag() {
 
 #[test]
 fn pg_prepared_drop_does_not_rebind_after_other_session_recreates_name() {
-    let (root, mut db) = seed("pg-drop-stale");
+    let (root, mut db) = managed_seed("pg-drop-stale");
     let mut first = session(&db, principal(true));
     let mut second = session(&db, principal(true));
     ok(&first.handle(
@@ -155,7 +155,7 @@ fn pg_prepared_drop_does_not_rebind_after_other_session_recreates_name() {
 
 #[test]
 fn pg_drop_authorization_errors_and_transaction_state_are_side_effect_free() {
-    let (root, mut db) = seed("pg-drop-auth-txn");
+    let (root, mut db) = managed_seed("pg-drop-auth-txn");
     let before = files(&root);
     let mut denied = session(&db, principal(false));
     state(&sql(&mut denied, &mut db, "DROP TABLE users"), "42501");
@@ -198,7 +198,7 @@ fn pg_drop_authorization_errors_and_transaction_state_are_side_effect_free() {
 
 #[test]
 fn pg_schema_admin_can_drop_without_any_table_data_grant() {
-    let (root, mut db) = seed("pg-drop-schema-only");
+    let (root, mut db) = managed_seed("pg-drop-schema-only");
     let authorization = AuthorizationPolicy::new(
         TransportKind::PlaintextLoopback,
         Some(PrincipalGrants {
@@ -220,6 +220,49 @@ fn pg_schema_admin_can_drop_without_any_table_data_grant() {
         ]
     );
     assert!(db.schema().table("users").is_none());
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_imported_heap_drop_remains_explicitly_outside_composition() {
+    let (root, mut db) = seed("pg-drop-imported");
+    let before = files(&root);
+    let mut simple = session(&db, principal(true));
+    state(&sql(&mut simple, &mut db, "DROP TABLE users"), "0A000");
+    assert_eq!(files(&root), before);
+
+    let mut extended = session(&db, principal(true));
+    ok(&extended.handle(
+        &mut db,
+        FrontendMessage::Parse {
+            statement: "drop".into(),
+            query: "DROP TABLE users".into(),
+            parameter_types: vec![],
+        },
+    ));
+    ok(&extended.handle(
+        &mut db,
+        FrontendMessage::Bind {
+            portal: "drop".into(),
+            statement: "drop".into(),
+            parameter_formats: vec![],
+            parameters: vec![],
+            result_formats: vec![],
+        },
+    ));
+    state(
+        &extended.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "drop".into(),
+                max_rows: 0,
+            },
+        ),
+        "0A000",
+    );
+    assert_eq!(files(&root), before);
+    assert!(db.schema().table("users").is_some());
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

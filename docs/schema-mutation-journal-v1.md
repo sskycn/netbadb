@@ -249,6 +249,29 @@ columns on replacement tables, and terminal/decision mismatches. Tags 1–23 ret
 their prior bytes and meanings. Older readers reject tags 24/25, so downgrade after
 Round 29 history is unsupported.
 
+Round 30 keeps tags 1--25 byte-for-byte and adds tags 26--30. Tag 26 is a
+transaction-scoped TableId reservation with the checked successor floor. Tag 27
+is the table-object aggregate: optional target generation/epoch/NBSC digest plus
+canonical TableId-ordered `CreateHeap`, `DropHeap`, `RewriteHeap`, and
+`InPlaceIndexDelta` plans. CreateHeap binds a private final V1 TableDef, one newly
+allocated StorageId, final index inventory and allocator floors; DropHeap binds the
+exact committed predecessor but has no physical participant. RewriteHeap and
+InPlaceIndexDelta retain the Round 29 meanings. Only CreateHeap, RewriteHeap, and
+InPlaceIndexDelta StorageIds appear in the canonical CORD participant set.
+
+Tag 28 records a typed predecessor retirement for one tag-27 RewriteHeap or
+DropHeap. Tags 29/30 record retry-only GC intent/completion for that exact retired
+table object and fixed component manifest. Replay rejects a CreateHeap without a
+matching earlier tag-26 TableId reservation, duplicate or noncanonical table,
+participant, StorageId, or predecessor identities, reused old/new storage,
+incorrect V1/generation/epoch/floor transitions, retirement of a non-retiring plan,
+and terminal, decision, or GC ordering conflicts. Recovery before a decision
+removes only exact private CreateHeap/RewriteHeap artifacts. Winner recovery
+finishes physical participants, persists all tag-28 retirements before publishing
+the prepared NBSC, then completes CORD and records the generic winner. A DropHeap-
+only decision is valid with zero physical participants. Older readers reject tags
+26--30, so downgrade after Round 30 history is unsupported.
+
 Dropping an unresolved schema handle requires reopen. Unknown/unlisted files are
 not garbage-collected. Startup does not choose GC candidates. Journal compaction
 and general aborted-resource GC are deferred. See
@@ -267,6 +290,9 @@ index-only, mixed rewrite/in-place, no-op, loser/winner, and checksum-valid malf
 seeds for truncation, duplicate IDs/names/table plans, unknown columns, wrong
 storage/version/fingerprint, low final floors, and noncanonical table order; CORD v2
 itself remains unchanged.
+Round 30 adds TableId reservation, CreateHeap, DropHeap, mixed table-object,
+CREATE-to-DROP no-op, loser/winner, same-name replacement and truncated tag-27--30
+seeds; the same bounded decoder rejects malformed typed plans without replaying SQL.
 
 An empty journal without its activation witness is an interrupted initialization,
 not reservation history. Read-only reopen preserves it; the next mutation completes

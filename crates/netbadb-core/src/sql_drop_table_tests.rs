@@ -16,24 +16,15 @@ fn root(name: &str) -> PathBuf {
 }
 
 fn seed(root: &Path) -> Database {
-    let table = TableDef::new(
-        TableId(1),
-        "projects",
-        vec![ColumnDef::new(
-            ColumnId(1),
-            "id",
-            TypeSpec::Physical(PhysicalType::Int64),
-        )],
-    );
-    Database::create_catalog(
+    let mut db = Database::create_catalog(
         root.join("catalog"),
-        vec![TableStorageCreateSpec::heap(
-            root.join("projects.heap"),
-            table,
-        )],
+        vec![],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )
-    .unwrap()
+    .unwrap();
+    db.execute("CREATE TABLE projects (id BIGINT NOT NULL)")
+        .unwrap();
+    db
 }
 
 fn files(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -67,7 +58,7 @@ fn sql_prepare_is_pure_and_access_carries_only_the_exact_schema_target() {
     };
     assert_eq!(generic.drop_table_target(), Some(target));
     assert_eq!(files(&root), before);
-    assert_eq!(db.schema_generation(), SchemaGeneration(1));
+    assert_eq!(db.schema_generation(), SchemaGeneration(2));
     assert_eq!(db.next_table_id(), Some(TableId(2)));
     assert_eq!(db.next_storage_id(), Some(StorageId(2)));
     db.close().unwrap();
@@ -109,13 +100,15 @@ fn sql_drop_rollback_then_commit_preserves_overlay_indexes_retirement_and_reopen
     db.commit_transaction(&mut transaction).unwrap();
     drop(transaction);
     assert!(db.schema().table("projects").is_none());
-    assert_eq!(db.schema_generation(), SchemaGeneration(2));
+    assert_eq!(db.schema_generation(), SchemaGeneration(3));
     assert_eq!((db.next_table_id(), db.next_storage_id()), high_waters);
     let retired = db.inspect_retired_table_resources();
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].table_id, target.table_id);
     assert_eq!(retired[0].fingerprint, target.fingerprint);
-    assert!(root.join("projects.heap").is_file());
+    let retired_path =
+        crate::schema_catalog_file::resolve(&root.join("catalog"), &retired[0].relative_locator);
+    assert!(retired_path.is_file());
     db.close().unwrap();
     for _ in 0..3 {
         let reopened = Database::open_catalog(root.join("catalog")).unwrap();
@@ -124,7 +117,7 @@ fn sql_drop_rollback_then_commit_preserves_overlay_indexes_retirement_and_reopen
         reopened.close().unwrap();
     }
     let retired_heap = netbadb_storage::TableStorage::open_heap(
-        root.join("projects.heap"),
+        retired_path,
         TableDef::new(
             TableId(1),
             "projects",
@@ -175,7 +168,7 @@ fn prepared_sql_drop_never_rebinds_to_a_same_name_replacement() {
         db.table_schema_version(replacement),
         Some(TableSchemaVersion(1))
     );
-    assert_eq!(db.schema_generation(), SchemaGeneration(3));
+    assert_eq!(db.schema_generation(), SchemaGeneration(4));
     assert_eq!(db.next_table_id(), Some(TableId(3)));
     assert_eq!(db.next_storage_id(), Some(StorageId(3)));
     assert_eq!(db.indexes(replacement).unwrap(), []);
@@ -190,7 +183,11 @@ fn prepared_sql_drop_never_rebinds_to_a_same_name_replacement() {
     );
     assert_eq!(db.schema().table("projects").unwrap().id, replacement);
     assert!(db.query("SELECT * FROM projects").unwrap().rows.is_empty());
-    assert!(root.join("projects.heap").is_file());
+    let retired = &db.inspect_retired_table_resources()[0];
+    assert!(
+        crate::schema_catalog_file::resolve(&root.join("catalog"), &retired.relative_locator,)
+            .is_file()
+    );
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

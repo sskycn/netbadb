@@ -1,5 +1,6 @@
 //! Frontend-independent transactional Heap creation. No SQL parsing occurs here.
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -9,28 +10,32 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use netbadb_schema::{ColumnDef, DropTableTarget, Schema, SchemaFingerprint, TableDef, TypeSpec};
+#[cfg(test)]
+use netbadb_schema::Schema;
+use netbadb_schema::{ColumnDef, DropTableTarget, SchemaFingerprint, TableDef, TypeSpec};
 use netbadb_storage::{HeapRewriteIndexes, TableStorage};
 #[cfg(test)]
 use netbadb_types::ScalarValue;
 use netbadb_types::{
-    ColumnId, DatabaseTxnId, SemanticType, StorageId, TableId, TableSchemaVersion,
+    ColumnId, DatabaseTxnId, SchemaGeneration, SemanticType, StorageId, TableId, TableSchemaVersion,
 };
 use sha2::{Digest, Sha256};
 
 use crate::coordinator_log::{CoordinatorLog, SchemaParticipantReference};
+#[cfg(test)]
 use crate::partition_catalog::{CatalogTable, PartitionCatalog};
 use crate::registry::TablePlacement;
-use crate::schema_catalog::{
-    CatalogStorage, CatalogStorageKind, CommittedCatalogState, SchemaCatalogError,
-    SchemaCatalogSnapshot, TableLineage,
-};
+#[cfg(test)]
+use crate::schema_catalog::{CatalogStorage, CommittedCatalogState, TableLineage};
+use crate::schema_catalog::{CatalogStorageKind, SchemaCatalogError, SchemaCatalogSnapshot};
 use crate::schema_catalog_file as file;
+#[cfg(test)]
+use crate::schema_mutation_journal::namespace;
 use crate::schema_mutation_journal::{
     CompositionRecord, CompositionResolution, CompositionTablePlan, CreateIntent, DropIntent,
     Reservation, RetiredHeapGcRecord, RewriteIntent, RewriteReservation, SchemaChangeSetIntent,
-    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal, final_locator,
-    namespace, prepared_locator, stage_locator,
+    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal,
+    TableObjectChangeSetIntent, final_locator, prepared_locator, stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -1232,6 +1237,15 @@ impl Database {
         transaction: &mut Transaction,
         target: DropTableTarget,
     ) -> Result<(), DatabaseError> {
+        self.compose_drop_table_in(transaction, target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_table_legacy_in(
+        &mut self,
+        transaction: &mut Transaction,
+        target: DropTableTarget,
+    ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
         if transaction.schema_mutation.is_some() || transaction.has_pending_schema_mutations() {
             return Err(DatabaseError::UnsupportedDdlCombination);
@@ -1485,24 +1499,33 @@ impl Database {
             .as_ref()
             .into_iter()
             .flat_map(|journal| {
-                journal
-                    .borrow()
+                let journal = journal.borrow();
+                let mut resources = journal
                     .drops
                     .values()
                     .filter(|drop| drop.retired && drop.resolved == Some(true))
-                    .map(|drop| {
-                        let table = &drop.fragment.committed.schema.tables()[0];
-                        RetiredTableResource {
-                            table_id: table.id,
-                            table_version: drop.fragment.committed.tables[0].version,
-                            fingerprint: drop.fragment.placements.tables[0].schema_fingerprint,
-                            storage_id: drop.fragment.storages[0].id,
-                            engine: netbadb_storage::StorageKind::Heap,
-                            relative_locator: drop.fragment.storages[0].locator.clone(),
-                            retired_generation: drop.target_generation,
-                        }
-                    })
-                    .collect::<Vec<_>>()
+                    .map(retired_resource)
+                    .collect::<Vec<_>>();
+                resources.extend(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            composition.resolution == Some(CompositionResolution::Winner)
+                        })
+                        .filter_map(|composition| composition.table_intent.as_ref())
+                        .flat_map(|intent| {
+                            intent.tables.iter().filter_map(|plan| match plan {
+                                SchemaIndexTablePlan::DropHeap {
+                                    base,
+                                    retired: true,
+                                    ..
+                                } => Some(table_object_drop_resource(intent, base)),
+                                _ => None,
+                            })
+                        }),
+                );
+                resources
             })
             .collect()
     }
@@ -1563,6 +1586,25 @@ impl Database {
                                 .filter_map(SchemaIndexTablePlan::replacement)
                                 .filter(|plan| plan.retired)
                                 .map(|plan| schema_index_replacement_resource(intent, plan))
+                        }),
+                );
+                resources.extend(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            composition.resolution == Some(CompositionResolution::Winner)
+                        })
+                        .filter_map(|composition| composition.table_intent.as_ref())
+                        .flat_map(|intent| {
+                            intent.tables.iter().filter_map(|plan| match plan {
+                                SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                                    if replacement.retired =>
+                                {
+                                    Some(table_object_replacement_resource(intent, replacement))
+                                }
+                                _ => None,
+                            })
                         }),
                 );
                 resources
@@ -1702,6 +1744,9 @@ impl Database {
                 RetiredHeapIntent::SchemaComposition { plan, .. } => journal
                     .borrow()
                     .prepare_composition_gc(intent.transaction(), plan.table(), &gc)?,
+                RetiredHeapIntent::TableObjectComposition { plan, .. } => journal
+                    .borrow()
+                    .prepare_table_object_gc(intent.transaction(), plan.table(), &gc)?,
                 _ => journal.borrow().prepare_gc(intent.transaction(), &gc)?,
             }
 
@@ -1733,6 +1778,9 @@ impl Database {
                 RetiredHeapIntent::SchemaComposition { plan, .. } => journal
                     .borrow_mut()
                     .composition_gc_intent(intent.transaction(), plan.table(), gc)?,
+                RetiredHeapIntent::TableObjectComposition { plan, .. } => journal
+                    .borrow_mut()
+                    .table_object_gc_intent(intent.transaction(), plan.table(), gc)?,
                 _ => journal.borrow_mut().gc_intent(intent.transaction(), gc)?,
             }
             crash("gc-intent-durable");
@@ -1773,6 +1821,17 @@ impl Database {
                                 .find(|candidate| candidate.table() == plan.table())
                         })
                         .and_then(|candidate| candidate.gc.as_ref()),
+                    RetiredHeapIntent::TableObjectComposition { plan, .. } => journal
+                        .compositions
+                        .get(&intent.transaction())
+                        .and_then(|record| record.table_intent.as_ref())
+                        .and_then(|composition| {
+                            composition
+                                .tables
+                                .iter()
+                                .find(|candidate| candidate.table() == plan.table())
+                        })
+                        .and_then(table_object_plan_gc),
                     _ => None,
                 })
                 .map(|gc| gc.coordinator_horizon)
@@ -1791,6 +1850,15 @@ impl Database {
     /// may precede/follow creation. Use `prepare_statement_in` for its private
     /// schema and `commit_transaction` to publish it; rollback never reuses IDs.
     pub fn create_heap_table_in(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: CreateTableSpec,
+    ) -> Result<TableId, DatabaseError> {
+        self.compose_create_heap_table_in(transaction, spec)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_heap_table_legacy_in(
         &mut self,
         transaction: &mut Transaction,
         spec: CreateTableSpec,
@@ -2423,6 +2491,40 @@ fn schema_index_replacement_resource(
     }
 }
 
+fn table_object_drop_resource(
+    intent: &TableObjectChangeSetIntent,
+    base: &SchemaCatalogSnapshot,
+) -> RetiredTableResource {
+    let table = &base.committed.schema.tables()[0];
+    RetiredTableResource {
+        table_id: table.id,
+        table_version: base.committed.tables[0].version,
+        fingerprint: base.placements.tables[0].schema_fingerprint,
+        storage_id: base.storages[0].id,
+        engine: netbadb_storage::StorageKind::Heap,
+        relative_locator: base.storages[0].locator.clone(),
+        retired_generation: intent.target_generation,
+    }
+}
+
+fn table_object_replacement_resource(
+    intent: &TableObjectChangeSetIntent,
+    plan: &CompositionTablePlan,
+) -> ReplacementRetiredHeap {
+    ReplacementRetiredHeap {
+        table_id: plan.table(),
+        base_table_version: plan.base.committed.tables[0].version,
+        target_table_version: plan.target.committed.tables[0].version,
+        base_fingerprint: plan.base.placements.tables[0].schema_fingerprint,
+        target_fingerprint: plan.target.placements.tables[0].schema_fingerprint,
+        old_storage_id: plan.old_storage(),
+        new_storage_id: plan.new_storage(),
+        old_relative_locator: plan.base.storages[0].locator.clone(),
+        replacement_transaction: intent.transaction,
+        retired_generation: intent.target_generation,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RetiredHeapIntent {
     TableDrop(Box<DropIntent>),
@@ -2432,6 +2534,13 @@ enum RetiredHeapIntent {
         snapshot_digest: [u8; 32],
         plan: Box<CompositionTablePlan>,
     },
+    TableObjectComposition {
+        transaction: DatabaseTxnId,
+        snapshot_digest: [u8; 32],
+        target_epoch: u64,
+        target_generation: SchemaGeneration,
+        plan: Box<SchemaIndexTablePlan>,
+    },
 }
 
 impl RetiredHeapIntent {
@@ -2440,6 +2549,7 @@ impl RetiredHeapIntent {
             Self::TableDrop(intent) => intent.transaction,
             Self::SchemaRewrite(intent) => intent.reservation.transaction,
             Self::SchemaComposition { transaction, .. } => *transaction,
+            Self::TableObjectComposition { transaction, .. } => *transaction,
         }
     }
 
@@ -2448,6 +2558,7 @@ impl RetiredHeapIntent {
             Self::TableDrop(intent) => intent.table(),
             Self::SchemaRewrite(intent) => intent.table(),
             Self::SchemaComposition { plan, .. } => plan.table(),
+            Self::TableObjectComposition { plan, .. } => plan.table(),
         }
     }
 
@@ -2456,6 +2567,11 @@ impl RetiredHeapIntent {
             Self::TableDrop(intent) => intent.storage(),
             Self::SchemaRewrite(intent) => intent.old_storage(),
             Self::SchemaComposition { plan, .. } => plan.old_storage(),
+            Self::TableObjectComposition { plan, .. } => match plan.as_ref() {
+                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => replacement.old_storage(),
+                SchemaIndexTablePlan::DropHeap { base, .. } => base.storages[0].id,
+                _ => unreachable!("retired table-object intent must own an old Heap"),
+            },
         }
     }
 
@@ -2464,6 +2580,11 @@ impl RetiredHeapIntent {
             Self::TableDrop(intent) => &intent.fragment,
             Self::SchemaRewrite(intent) => &intent.base,
             Self::SchemaComposition { plan, .. } => &plan.base,
+            Self::TableObjectComposition { plan, .. } => match plan.as_ref() {
+                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => &replacement.base,
+                SchemaIndexTablePlan::DropHeap { base, .. } => base,
+                _ => unreachable!("retired table-object intent must own an old Heap"),
+            },
         }
     }
 
@@ -2476,6 +2597,11 @@ impl RetiredHeapIntent {
             Self::TableDrop(intent) => intent.gc.as_ref(),
             Self::SchemaRewrite(intent) => intent.gc.as_ref(),
             Self::SchemaComposition { plan, .. } => plan.gc.as_ref(),
+            Self::TableObjectComposition { plan, .. } => match plan.as_ref() {
+                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => replacement.gc.as_ref(),
+                SchemaIndexTablePlan::DropHeap { gc, .. } => gc.as_ref(),
+                _ => None,
+            },
         }
     }
 
@@ -2501,7 +2627,54 @@ impl RetiredHeapIntent {
                 };
                 RetiredHeapGcTarget::SchemaRewrite(composition_replacement_resource(&intent, plan))
             }
+            Self::TableObjectComposition {
+                transaction,
+                snapshot_digest,
+                target_epoch,
+                target_generation,
+                plan,
+            } => {
+                let intent = TableObjectChangeSetIntent {
+                    transaction: *transaction,
+                    base_generation: plan_base(plan).committed.generation,
+                    target_generation: *target_generation,
+                    base_epoch: plan_base(plan).epoch,
+                    target_epoch: *target_epoch,
+                    action_count: 1,
+                    action_digest: [0; 32],
+                    snapshot_digest: *snapshot_digest,
+                    tables: vec![(**plan).clone()],
+                };
+                match plan.as_ref() {
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                        RetiredHeapGcTarget::SchemaRewrite(table_object_replacement_resource(
+                            &intent,
+                            replacement,
+                        ))
+                    }
+                    SchemaIndexTablePlan::DropHeap { base, .. } => {
+                        RetiredHeapGcTarget::TableDrop(table_object_drop_resource(&intent, base))
+                    }
+                    _ => unreachable!("retired table-object intent must own an old Heap"),
+                }
+            }
         }
+    }
+}
+
+fn plan_base(plan: &SchemaIndexTablePlan) -> &SchemaCatalogSnapshot {
+    match plan {
+        SchemaIndexTablePlan::RewriteHeap { replacement, .. } => &replacement.base,
+        SchemaIndexTablePlan::DropHeap { base, .. } => base,
+        _ => unreachable!("retired table-object intent must own an old Heap"),
+    }
+}
+
+fn table_object_plan_gc(plan: &SchemaIndexTablePlan) -> Option<&RetiredHeapGcRecord> {
+    match plan {
+        SchemaIndexTablePlan::RewriteHeap { replacement, .. } => replacement.gc.as_ref(),
+        SchemaIndexTablePlan::DropHeap { gc, .. } => gc.as_ref(),
+        _ => None,
     }
 }
 
@@ -2515,7 +2688,28 @@ fn retired_intent_for_target(
             .values()
             .find(|drop| drop.storage() == resource.storage_id && drop.retired)
             .cloned()
-            .map(|drop| RetiredHeapIntent::TableDrop(Box::new(drop))),
+            .map(|drop| RetiredHeapIntent::TableDrop(Box::new(drop)))
+            .or_else(|| {
+                journal.compositions.values().find_map(|composition| {
+                    let intent = composition.table_intent.as_ref()?;
+                    intent.tables.iter().find_map(|plan| match plan {
+                        SchemaIndexTablePlan::DropHeap {
+                            base,
+                            retired: true,
+                            ..
+                        } if base.storages[0].id == resource.storage_id => {
+                            Some(RetiredHeapIntent::TableObjectComposition {
+                                transaction: intent.transaction,
+                                snapshot_digest: intent.snapshot_digest,
+                                target_epoch: intent.target_epoch,
+                                target_generation: intent.target_generation,
+                                plan: Box::new(plan.clone()),
+                            })
+                        }
+                        _ => None,
+                    })
+                })
+            }),
         RetiredHeapGcTarget::SchemaRewrite(resource) => journal
             .rewrites
             .values()
@@ -2535,6 +2729,42 @@ fn retired_intent_for_target(
                             snapshot_digest: intent.snapshot_digest,
                             plan: Box::new(plan),
                         })
+                })
+            })
+            .or_else(|| {
+                journal.compositions.values().find_map(|composition| {
+                    let intent = composition.index_intent.as_ref()?;
+                    intent
+                        .tables
+                        .iter()
+                        .filter_map(SchemaIndexTablePlan::replacement)
+                        .find(|plan| plan.old_storage() == resource.old_storage_id && plan.retired)
+                        .cloned()
+                        .map(|plan| RetiredHeapIntent::SchemaComposition {
+                            transaction: intent.transaction,
+                            snapshot_digest: intent.snapshot_digest.unwrap_or([0; 32]),
+                            plan: Box::new(plan),
+                        })
+                })
+            })
+            .or_else(|| {
+                journal.compositions.values().find_map(|composition| {
+                    let intent = composition.table_intent.as_ref()?;
+                    intent.tables.iter().find_map(|plan| match plan {
+                        SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                            if replacement.old_storage() == resource.old_storage_id
+                                && replacement.retired =>
+                        {
+                            Some(RetiredHeapIntent::TableObjectComposition {
+                                transaction: intent.transaction,
+                                snapshot_digest: intent.snapshot_digest,
+                                target_epoch: intent.target_epoch,
+                                target_generation: intent.target_generation,
+                                plan: Box::new(plan.clone()),
+                            })
+                        }
+                        _ => None,
+                    })
                 })
             }),
     }
@@ -2575,6 +2805,68 @@ fn create_transaction_for_storage(
                     .then_some(intent.transaction)
             })
         })
+        .or_else(|| {
+            journal.compositions.values().find_map(|composition| {
+                let intent = composition.index_intent.as_ref()?;
+                intent
+                    .tables
+                    .iter()
+                    .filter_map(SchemaIndexTablePlan::replacement)
+                    .any(|plan| plan.new_storage() == storage && plan.retired)
+                    .then_some(intent.transaction)
+            })
+        })
+        .or_else(|| {
+            journal.compositions.values().find_map(|composition| {
+                let intent = composition.table_intent.as_ref()?;
+                intent
+                    .tables
+                    .iter()
+                    .any(|plan| match plan {
+                        SchemaIndexTablePlan::CreateHeap { target, .. } => {
+                            target.storages[0].id == storage
+                        }
+                        SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                            replacement.new_storage() == storage
+                        }
+                        _ => false,
+                    })
+                    .then_some(intent.transaction)
+            })
+        })
+}
+
+fn composition_retired_storage_gc_complete(
+    journal: &SchemaMutationJournal,
+    storage: StorageId,
+) -> bool {
+    journal.compositions.values().any(|composition| {
+        composition.intent.as_ref().is_some_and(|intent| {
+            intent.tables.iter().any(|plan| {
+                plan.old_storage() == storage && plan.gc.as_ref().is_some_and(|gc| gc.complete)
+            })
+        }) || composition.index_intent.as_ref().is_some_and(|intent| {
+            intent
+                .tables
+                .iter()
+                .filter_map(SchemaIndexTablePlan::replacement)
+                .any(|plan| {
+                    plan.old_storage() == storage && plan.gc.as_ref().is_some_and(|gc| gc.complete)
+                })
+        }) || composition.table_intent.as_ref().is_some_and(|intent| {
+            intent.tables.iter().any(|plan| {
+                let retired_storage = match plan {
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                        Some(replacement.old_storage())
+                    }
+                    SchemaIndexTablePlan::DropHeap { base, .. } => Some(base.storages[0].id),
+                    _ => None,
+                };
+                retired_storage == Some(storage)
+                    && table_object_plan_gc(plan).is_some_and(|gc| gc.complete)
+            })
+        })
+    })
 }
 
 fn gc_components(
@@ -2705,6 +2997,20 @@ fn coordinator_horizon(
             {
                 return Err(SchemaMutationError::Corrupt(
                     "coordinator/composition retirement mismatch",
+                ));
+            }
+        }
+        RetiredHeapIntent::TableObjectComposition {
+            snapshot_digest,
+            target_epoch,
+            ..
+        } => {
+            if reference.incarnation != intent.fragment().incarnation
+                || reference.target_epoch != *target_epoch
+                || reference.digest != *snapshot_digest
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "coordinator/table-object retirement mismatch",
                 ));
             }
         }
@@ -2842,6 +3148,40 @@ fn validate_retirement_lineage(
                 *transaction,
             )?;
         }
+        RetiredHeapIntent::TableObjectComposition {
+            transaction, plan, ..
+        } => match plan.as_ref() {
+            SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                if !replacement.retired {
+                    return Err(SchemaMutationError::Corrupt(
+                        "table-object replacement retirement is not terminal",
+                    ));
+                }
+                validate_replacement_lineage(
+                    active,
+                    journal,
+                    fragment_incarnation(&replacement.target),
+                    *transaction,
+                )?;
+            }
+            SchemaIndexTablePlan::DropHeap {
+                base,
+                retired: true,
+                ..
+            } => {
+                let table = base.committed.schema.tables()[0].id;
+                if active_incarnation(active, table)?.is_some() {
+                    return Err(SchemaMutationError::Corrupt(
+                        "table-object dropped TableId remains active",
+                    ));
+                }
+            }
+            _ => {
+                return Err(SchemaMutationError::Corrupt(
+                    "table-object retirement is not terminal",
+                ));
+            }
+        },
     }
     Ok(())
 }
@@ -2915,6 +3255,58 @@ fn validate_replacement_lineage(
             current = fragment_incarnation(&next.target);
             transaction = next_transaction;
             continue;
+        }
+        if let Some((next_transaction, next, plan_base_snapshot)) =
+            journal.compositions.values().find_map(|composition| {
+                (composition.resolution == Some(CompositionResolution::Winner))
+                    .then_some(composition.table_intent.as_ref())
+                    .flatten()
+                    .and_then(|intent| {
+                        intent.tables.iter().find_map(|plan| match plan {
+                            SchemaIndexTablePlan::RewriteHeap { replacement, .. }
+                                if replacement.old_storage() == current.storage
+                                    && replacement.retired =>
+                            {
+                                Some((intent.transaction, Some(replacement.as_ref()), None))
+                            }
+                            SchemaIndexTablePlan::DropHeap {
+                                base,
+                                retired: true,
+                                ..
+                            } if base.storages[0].id == current.storage => {
+                                Some((intent.transaction, None, Some(base.as_ref())))
+                            }
+                            _ => None,
+                        })
+                    })
+            })
+        {
+            if next_transaction.0 <= transaction.0 {
+                return Err(SchemaMutationError::Corrupt(
+                    "table-object replacement lineage is nonmonotonic",
+                ));
+            }
+            if let Some(replacement) = next {
+                if fragment_incarnation(&replacement.base) != current {
+                    return Err(SchemaMutationError::Corrupt(
+                        "table-object replacement lineage is inconsistent",
+                    ));
+                }
+                current = fragment_incarnation(&replacement.target);
+                transaction = next_transaction;
+                continue;
+            }
+            let dropped = plan_base_snapshot.ok_or(SchemaMutationError::Corrupt(
+                "table-object drop lineage absent",
+            ))?;
+            if fragment_incarnation(dropped) != current
+                || active_incarnation(active, current.table)?.is_some()
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "table-object replacement-to-drop lineage is inconsistent",
+                ));
+            }
+            return Ok(());
         }
         if let Some(drop) = journal.drops.values().find(|candidate| {
             candidate.storage() == current.storage
@@ -3117,6 +3509,17 @@ fn resume_gc_intent(
                         .find(|candidate| candidate.table() == plan.table())
                 })
                 .and_then(|candidate| candidate.gc.as_ref()),
+            RetiredHeapIntent::TableObjectComposition { plan, .. } => journal
+                .compositions
+                .get(&intent.transaction())
+                .and_then(|record| record.table_intent.as_ref())
+                .and_then(|composition| {
+                    composition
+                        .tables
+                        .iter()
+                        .find(|candidate| candidate.table() == plan.table())
+                })
+                .and_then(table_object_plan_gc),
             _ => None,
         })
         .ok_or(SchemaMutationError::Corrupt(
@@ -3199,6 +3602,9 @@ fn resume_gc_intent(
         RetiredHeapIntent::SchemaComposition { plan, .. } => {
             journal.complete_composition_gc(intent.transaction(), plan.table())?
         }
+        RetiredHeapIntent::TableObjectComposition { plan, .. } => {
+            journal.complete_table_object_gc(intent.transaction(), plan.table())?
+        }
         _ => journal.complete_gc(intent.transaction())?,
     }
     crash("gc-complete-durable");
@@ -3234,6 +3640,17 @@ fn validate_retired_resource(
         RetiredHeapIntent::SchemaComposition { plan, .. } => {
             validate_composition_source(catalog, plan)
         }
+        RetiredHeapIntent::TableObjectComposition { plan, .. } => match plan.as_ref() {
+            SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                validate_composition_source(catalog, replacement)
+            }
+            SchemaIndexTablePlan::DropHeap { base, .. } => {
+                validate_table_object_source(catalog, base)
+            }
+            _ => Err(
+                SchemaMutationError::Corrupt("non-retiring table-object plan reached GC").into(),
+            ),
+        },
     }
 }
 
@@ -3586,6 +4003,10 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 .into());
             }
         } else if let Some(composition) = journal.compositions.get(&decision.database_txn_id) {
+            if let Some(intent) = &composition.table_intent {
+                validate_table_object_decision(intent, decision)?;
+                continue;
+            }
             if let Some(intent) = &composition.index_intent {
                 validate_schema_index_decision(intent, decision)?;
                 continue;
@@ -3666,6 +4087,26 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                         })
                 })
         }))
+        .chain(journal.compositions.values().flat_map(|composition| {
+            composition
+                .table_intent
+                .as_ref()
+                .into_iter()
+                .flat_map(|intent| {
+                    intent
+                        .tables
+                        .iter()
+                        .filter(|plan| table_object_plan_gc(plan).is_some())
+                        .cloned()
+                        .map(|plan| RetiredHeapIntent::TableObjectComposition {
+                            transaction: intent.transaction,
+                            snapshot_digest: intent.snapshot_digest,
+                            target_epoch: intent.target_epoch,
+                            target_generation: intent.target_generation,
+                            plan: Box::new(plan),
+                        })
+                })
+        }))
         .collect::<Vec<_>>();
     durable_gc.sort_by_key(RetiredHeapIntent::transaction);
     for intent in durable_gc {
@@ -3679,6 +4120,18 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         let decision = decisions
             .iter()
             .find(|decision| decision.database_txn_id == txn);
+        if let Some(intent) = composition.table_intent.as_ref() {
+            recover_table_object_composition(
+                catalog,
+                marker.incarnation,
+                &mut journal,
+                &mut coordinator,
+                &composition,
+                intent,
+                decision,
+            )?;
+            continue;
+        }
         if let Some(intent) = composition.index_intent.as_ref() {
             recover_schema_index_composition(
                 catalog,
@@ -3848,38 +4301,41 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                             decision.database_txn_id == rewrite.reservation.transaction
                         })
                 });
-                let later_composition = journal.compositions.values().find_map(|composition| {
-                    composition
-                        .intent
-                        .as_ref()
-                        .and_then(|intent| {
-                            intent.tables.iter().find(|plan| {
-                                intent.transaction.0 > reservation.transaction.0
-                                    && plan.table() == reservation.table
+                let later_composition = journal.compositions.values().any(|composition| {
+                    let decided = decisions
+                        .iter()
+                        .any(|decision| decision.database_txn_id == composition.transaction);
+                    decided
+                        && composition.transaction.0 > reservation.transaction.0
+                        && (composition.intent.as_ref().is_some_and(|intent| {
+                            intent.tables.iter().any(|plan| {
+                                plan.table() == reservation.table
                                     && plan.old_storage() == reservation.storage
-                                    && decisions.iter().any(|decision| {
-                                        decision.database_txn_id == intent.transaction
-                                    })
                             })
-                        })
-                        .or_else(|| {
-                            composition.index_intent.as_ref().and_then(|intent| {
-                                intent
-                                    .tables
-                                    .iter()
-                                    .filter_map(SchemaIndexTablePlan::replacement)
-                                    .find(|plan| {
-                                        intent.transaction.0 > reservation.transaction.0
-                                            && plan.table() == reservation.table
-                                            && plan.old_storage() == reservation.storage
-                                            && decisions.iter().any(|decision| {
-                                                decision.database_txn_id == intent.transaction
-                                            })
-                                    })
+                        }) || composition.index_intent.as_ref().is_some_and(|intent| {
+                            intent
+                                .tables
+                                .iter()
+                                .filter_map(SchemaIndexTablePlan::replacement)
+                                .any(|plan| {
+                                    plan.table() == reservation.table
+                                        && plan.old_storage() == reservation.storage
+                                })
+                        }) || composition.table_intent.as_ref().is_some_and(|intent| {
+                            intent.tables.iter().any(|plan| match plan {
+                                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                                    replacement.table() == reservation.table
+                                        && replacement.old_storage() == reservation.storage
+                                }
+                                SchemaIndexTablePlan::DropHeap { base, .. } => {
+                                    plan.table() == reservation.table
+                                        && base.storages[0].id == reservation.storage
+                                }
+                                _ => false,
                             })
-                        })
+                        }))
                 });
-                if later_drop.is_none() && later_rewrite.is_none() && later_composition.is_none() {
+                if later_drop.is_none() && later_rewrite.is_none() && !later_composition {
                     let active = file::load(catalog)?;
                     verify_published(&active, &reservation)?;
                 }
@@ -3903,8 +4359,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                     .is_some_and(|drop| drop.gc.as_ref().is_some_and(|gc| gc.complete))
                     || later_rewrite
                         .is_some_and(|rewrite| rewrite.gc.as_ref().is_some_and(|gc| gc.complete))
-                    || later_composition
-                        .is_some_and(|plan| plan.gc.as_ref().is_some_and(|gc| gc.complete));
+                    || composition_retired_storage_gc_complete(&journal, reservation.storage);
                 if !physical_deleted
                     && file::read(&file::suffix(&final_path, ".owner"))?
                         != owner_bytes(
@@ -4276,10 +4731,15 @@ fn validate_schema_index_decision(
         }
     }
     for plan in &intent.tables {
+        let storage = plan
+            .participant_storage()
+            .ok_or(SchemaMutationError::Corrupt(
+                "table-object plan in schema/index decision",
+            ))?;
         if !decision
             .participants
             .iter()
-            .any(|participant| participant.storage_id == plan.participant_storage())
+            .any(|participant| participant.storage_id == storage)
         {
             return Err(SchemaMutationError::Corrupt(
                 "schema/index decision participant mismatch",
@@ -4290,6 +4750,418 @@ fn validate_schema_index_decision(
         return Err(SchemaMutationError::Corrupt(
             "schema/index decision has extra participant",
         ));
+    }
+    Ok(())
+}
+
+fn table_object_reservation(
+    intent: &TableObjectChangeSetIntent,
+    fragment: &SchemaCatalogSnapshot,
+    resolved: Option<bool>,
+) -> Reservation {
+    Reservation {
+        transaction: intent.transaction,
+        table: fragment.committed.schema.tables()[0].id,
+        storage: fragment.storages[0].id,
+        base_generation: intent.base_generation,
+        base_epoch: intent.base_epoch,
+        intent: Some(CreateIntent {
+            fragment: fragment.clone(),
+            snapshot_digest: intent.snapshot_digest,
+        }),
+        resolved,
+    }
+}
+
+fn validate_table_object_decision(
+    intent: &TableObjectChangeSetIntent,
+    decision: &crate::CoordinatorDecision,
+) -> Result<(), SchemaMutationError> {
+    let reference = decision
+        .schema
+        .as_ref()
+        .ok_or(SchemaMutationError::Corrupt(
+            "table-object decision has no schema reference",
+        ))?;
+    let incarnation = intent
+        .tables
+        .first()
+        .map(|plan| match plan {
+            SchemaIndexTablePlan::CreateHeap { target, .. } => target.incarnation,
+            SchemaIndexTablePlan::DropHeap { base, .. } => base.incarnation,
+            SchemaIndexTablePlan::RewriteHeap { replacement, .. } => replacement.target.incarnation,
+            SchemaIndexTablePlan::InPlaceIndexDelta { .. } => reference.incarnation,
+        })
+        .ok_or(SchemaMutationError::Corrupt("empty table-object intent"))?;
+    if reference.incarnation != incarnation
+        || reference.target_epoch != intent.target_epoch
+        || reference.digest != intent.snapshot_digest
+    {
+        return Err(SchemaMutationError::Corrupt(
+            "table-object coordinator reference mismatch",
+        ));
+    }
+    let expected = intent
+        .tables
+        .iter()
+        .filter_map(SchemaIndexTablePlan::participant_storage)
+        .collect::<BTreeSet<_>>();
+    let actual = decision
+        .participants
+        .iter()
+        .map(|participant| participant.storage_id)
+        .collect::<BTreeSet<_>>();
+    if expected != actual || actual.len() != decision.participants.len() {
+        return Err(SchemaMutationError::Corrupt(
+            "table-object decision participant mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_table_object_composition(
+    catalog: &Path,
+    incarnation: [u8; 16],
+    journal: &mut SchemaMutationJournal,
+    coordinator: &mut CoordinatorLog,
+    composition: &CompositionRecord,
+    intent: &TableObjectChangeSetIntent,
+    decision: Option<&crate::CoordinatorDecision>,
+) -> Result<(), DatabaseError> {
+    if let Some(decision) = decision {
+        validate_table_object_decision(intent, decision)?;
+        if matches!(
+            composition.resolution,
+            Some(CompositionResolution::Loser | CompositionResolution::NoEffectiveChange)
+        ) {
+            return Err(
+                SchemaMutationError::Corrupt("table-object loser has commit decision").into(),
+            );
+        }
+        if composition.resolution == Some(CompositionResolution::Winner) {
+            if !decision.complete
+                || intent.tables.iter().any(|plan| match plan {
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => !replacement.retired,
+                    SchemaIndexTablePlan::DropHeap { retired, .. } => !*retired,
+                    _ => false,
+                })
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "resolved table-object winner is incomplete",
+                )
+                .into());
+            }
+            let active = file::load(catalog)?;
+            verify_table_object_published(&active, intent, false)?;
+            for plan in intent.tables.iter().filter(|plan| {
+                matches!(
+                    plan,
+                    SchemaIndexTablePlan::RewriteHeap { .. }
+                        | SchemaIndexTablePlan::DropHeap { .. }
+                )
+            }) {
+                let retired = RetiredHeapIntent::TableObjectComposition {
+                    transaction: intent.transaction,
+                    snapshot_digest: intent.snapshot_digest,
+                    target_epoch: intent.target_epoch,
+                    target_generation: intent.target_generation,
+                    plan: Box::new(plan.clone()),
+                };
+                validate_retirement_lineage(&active, journal, &retired)?;
+                if retired.gc().is_none() {
+                    validate_retired_resource(catalog, &retired)?;
+                } else if !retired.gc().is_some_and(|gc| gc.complete) {
+                    return Err(SchemaMutationError::Corrupt(
+                        "table-object GC recovery incomplete",
+                    )
+                    .into());
+                }
+            }
+            let database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+            // A resolved table-object winner may have arbitrarily newer DML or
+            // index-only commits on the surviving Heap. Opening the current
+            // catalog proves its physical identity; exact final inventory was
+            // already checked before this winner became terminal.
+            database.close()?;
+            cleanup_table_object_prepared(catalog, incarnation, intent, Some(true))?;
+            return Ok(());
+        }
+
+        for plan in &intent.tables {
+            match plan {
+                SchemaIndexTablePlan::RewriteHeap {
+                    replacement,
+                    base_indexes,
+                    ..
+                } => validate_schema_index_source(catalog, replacement, base_indexes)?,
+                SchemaIndexTablePlan::DropHeap { base, .. } => {
+                    validate_table_object_source(catalog, base)?;
+                }
+                _ => {}
+            }
+        }
+        let reference = decision
+            .schema
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt(
+                "table-object reference absent",
+            ))?;
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, incarnation, intent.transaction)?,
+        );
+        let bytes = file::read(&prepared)?;
+        if digest(&bytes) != reference.digest || reference.digest != intent.snapshot_digest {
+            return Err(
+                SchemaMutationError::Corrupt("prepared table-object NBSC digest mismatch").into(),
+            );
+        }
+        let target = SchemaCatalogSnapshot::decode(&bytes)?;
+        verify_table_object_published(&target, intent, true)?;
+        for plan in &intent.tables {
+            let fragment = match plan {
+                SchemaIndexTablePlan::CreateHeap { target, .. } => Some(target.as_ref()),
+                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => Some(&replacement.target),
+                _ => None,
+            };
+            if let Some(fragment) = fragment {
+                promote(
+                    catalog,
+                    &table_object_reservation(intent, fragment, None),
+                    reference,
+                )?;
+            }
+        }
+        for plan in &intent.tables {
+            if matches!(
+                plan,
+                SchemaIndexTablePlan::RewriteHeap { .. } | SchemaIndexTablePlan::DropHeap { .. }
+            ) {
+                journal.retire_table_object(intent.transaction, plan.table())?;
+            }
+        }
+        let mut database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
+        verify_table_object_inventory(&mut database, intent, true)?;
+        database.close()?;
+        file::publish_runtime(catalog, &target)?;
+        coordinator.complete(intent.transaction)?;
+        journal.resolve_composition(intent.transaction, CompositionResolution::Winner)?;
+        cleanup_table_object_prepared(catalog, incarnation, intent, Some(true))?;
+        return Ok(());
+    }
+
+    if composition.resolution == Some(CompositionResolution::Winner)
+        || intent.tables.iter().any(|plan| match plan {
+            SchemaIndexTablePlan::RewriteHeap { replacement, .. } => replacement.retired,
+            SchemaIndexTablePlan::DropHeap { retired, .. } => *retired,
+            _ => false,
+        })
+    {
+        return Err(
+            SchemaMutationError::Corrupt("table-object winner lacks coordinator decision").into(),
+        );
+    }
+    if composition.resolution.is_none() {
+        let active = file::load(catalog)?;
+        let mut database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+        verify_table_object_inventory(&mut database, intent, false)?;
+        database.close()?;
+        for plan in &intent.tables {
+            let fragment = match plan {
+                SchemaIndexTablePlan::CreateHeap { target, .. } => Some(target.as_ref()),
+                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => Some(&replacement.target),
+                _ => None,
+            };
+            if let Some(fragment) = fragment {
+                cleanup_staged_loser(
+                    catalog,
+                    &table_object_reservation(intent, fragment, Some(false)),
+                    incarnation,
+                )?;
+            }
+        }
+        cleanup_table_object_prepared(catalog, incarnation, intent, Some(false))?;
+        journal.resolve_composition(intent.transaction, CompositionResolution::Loser)?;
+    }
+    Ok(())
+}
+
+fn cleanup_table_object_prepared(
+    catalog: &Path,
+    incarnation: [u8; 16],
+    intent: &TableObjectChangeSetIntent,
+    resolved: Option<bool>,
+) -> Result<(), SchemaMutationError> {
+    if let Some(fragment) = intent.tables.iter().find_map(|plan| match plan {
+        SchemaIndexTablePlan::CreateHeap { target, .. } => Some(target.as_ref()),
+        SchemaIndexTablePlan::RewriteHeap { replacement, .. } => Some(&replacement.target),
+        _ => None,
+    }) {
+        cleanup_prepared(
+            catalog,
+            &table_object_reservation(intent, fragment, resolved),
+            incarnation,
+        )?;
+    } else {
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, incarnation, intent.transaction)?,
+        );
+        remove_file(&prepared)?;
+        remove_file(&file::suffix(&prepared, ".next"))?;
+    }
+    Ok(())
+}
+
+fn validate_table_object_source(
+    catalog: &Path,
+    base: &SchemaCatalogSnapshot,
+) -> Result<(), DatabaseError> {
+    let path = file::resolve(catalog, &base.storages[0].locator);
+    validate_resource_path(catalog, &path)?;
+    let storage = TableStorage::open_heap(&path, base.committed.schema.tables()[0].clone())?;
+    if storage.storage_id() != base.storages[0].id {
+        return Err(SchemaMutationError::Corrupt("table-object source StorageId mismatch").into());
+    }
+    storage.close()?;
+    Ok(())
+}
+
+fn verify_table_object_inventory(
+    database: &mut Database,
+    intent: &TableObjectChangeSetIntent,
+    final_state: bool,
+) -> Result<(), DatabaseError> {
+    for plan in &intent.tables {
+        let expected = match (final_state, plan) {
+            (
+                true,
+                SchemaIndexTablePlan::CreateHeap {
+                    target,
+                    final_indexes,
+                },
+            ) => Some((target.storages[0].id, final_indexes)),
+            (false, SchemaIndexTablePlan::CreateHeap { .. }) => None,
+            (true, SchemaIndexTablePlan::DropHeap { .. }) => None,
+            (false, SchemaIndexTablePlan::DropHeap { base, .. }) => {
+                let indexes = database
+                    .registry
+                    .get_mut(base.storages[0].id)
+                    .ok_or(SchemaMutationError::Corrupt("DropHeap base absent"))?
+                    .heap_rewrite_indexes()?;
+                if indexes.active.iter().any(|index| index.id.0 == 0) {
+                    return Err(SchemaMutationError::Corrupt("invalid DropHeap base index").into());
+                }
+                continue;
+            }
+            (
+                true,
+                SchemaIndexTablePlan::RewriteHeap {
+                    replacement,
+                    final_indexes,
+                    ..
+                },
+            ) => Some((replacement.new_storage(), final_indexes)),
+            (
+                false,
+                SchemaIndexTablePlan::RewriteHeap {
+                    replacement,
+                    base_indexes,
+                    ..
+                },
+            ) => Some((replacement.old_storage(), base_indexes)),
+            (
+                _,
+                SchemaIndexTablePlan::InPlaceIndexDelta {
+                    storage,
+                    base_indexes,
+                    final_indexes,
+                    ..
+                },
+            ) => Some((
+                *storage,
+                if final_state {
+                    final_indexes
+                } else {
+                    base_indexes
+                },
+            )),
+        };
+        if let Some((storage, indexes)) = expected {
+            let actual = database
+                .registry
+                .get_mut(storage)
+                .ok_or(SchemaMutationError::Corrupt("table-object Heap absent"))?
+                .heap_rewrite_indexes()?;
+            if actual != *indexes {
+                return Err(
+                    SchemaMutationError::Corrupt("table-object index inventory mismatch").into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_table_object_published(
+    snapshot: &SchemaCatalogSnapshot,
+    intent: &TableObjectChangeSetIntent,
+    exact: bool,
+) -> Result<(), DatabaseError> {
+    if if exact {
+        snapshot.epoch != intent.target_epoch
+            || snapshot.committed.generation != intent.target_generation
+    } else {
+        snapshot.epoch < intent.target_epoch
+            || snapshot.committed.generation < intent.target_generation
+    } {
+        return Err(
+            SchemaMutationError::Corrupt("table-object publication generation mismatch").into(),
+        );
+    }
+    if exact {
+        for plan in &intent.tables {
+            match plan {
+                SchemaIndexTablePlan::CreateHeap { target, .. } => {
+                    if !snapshot
+                        .committed
+                        .schema
+                        .tables()
+                        .contains(&target.committed.schema.tables()[0])
+                        || !snapshot.storages.contains(&target.storages[0])
+                    {
+                        return Err(
+                            SchemaMutationError::Corrupt("CreateHeap missing from target").into(),
+                        );
+                    }
+                }
+                SchemaIndexTablePlan::DropHeap { base, .. } => {
+                    if snapshot
+                        .committed
+                        .schema
+                        .tables()
+                        .iter()
+                        .any(|table| table.id == base.committed.schema.tables()[0].id)
+                        || snapshot
+                            .storages
+                            .iter()
+                            .any(|storage| storage.id == base.storages[0].id)
+                    {
+                        return Err(
+                            SchemaMutationError::Corrupt("DropHeap remains in target").into()
+                        );
+                    }
+                }
+                SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                    if !snapshot.storages.contains(&replacement.target.storages[0]) {
+                        return Err(
+                            SchemaMutationError::Corrupt("RewriteHeap target missing").into()
+                        );
+                    }
+                }
+                SchemaIndexTablePlan::InPlaceIndexDelta { .. } => {}
+            }
+        }
     }
     Ok(())
 }
@@ -4455,6 +5327,12 @@ fn verify_schema_index_inventory(
 ) -> Result<(), DatabaseError> {
     for plan in &intent.tables {
         let (table, storage, expected) = match plan {
+            SchemaIndexTablePlan::CreateHeap { .. } | SchemaIndexTablePlan::DropHeap { .. } => {
+                return Err(SchemaMutationError::Corrupt(
+                    "table-object plan in schema/index inventory",
+                )
+                .into());
+            }
             SchemaIndexTablePlan::RewriteHeap {
                 replacement,
                 final_indexes,
@@ -4514,6 +5392,12 @@ fn verify_schema_index_base_inventory(
 ) -> Result<(), DatabaseError> {
     for plan in &intent.tables {
         let (table, storage, expected) = match plan {
+            SchemaIndexTablePlan::CreateHeap { .. } | SchemaIndexTablePlan::DropHeap { .. } => {
+                return Err(SchemaMutationError::Corrupt(
+                    "table-object plan in schema/index base inventory",
+                )
+                .into());
+            }
             SchemaIndexTablePlan::RewriteHeap {
                 replacement,
                 base_indexes,
@@ -4589,6 +5473,11 @@ fn verify_current_schema_index_inventory(
                             .iter()
                             .any(|later_plan| later_plan.table() == table)
                     }) || later.index_intent.as_ref().is_some_and(|later_intent| {
+                        later_intent
+                            .tables
+                            .iter()
+                            .any(|later_plan| later_plan.table() == table)
+                    }) || later.table_intent.as_ref().is_some_and(|later_intent| {
                         later_intent
                             .tables
                             .iter()

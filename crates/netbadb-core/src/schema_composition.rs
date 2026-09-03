@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use netbadb_index::IndexDefinition;
-use netbadb_schema::{Schema, TableDef};
+use netbadb_schema::{ColumnDef, DropTableTarget, Schema, TableDef, TypeSpec};
 use netbadb_storage::{HeapRewriteIndex, HeapRewriteIndexes, TableStorage};
 use netbadb_types::{
     ColumnId, DatabaseTxnId, IndexId, ScalarValue, StorageId, TableId, TableSchemaVersion,
@@ -22,15 +22,16 @@ use crate::schema_catalog::{
 };
 use crate::schema_catalog_file as file;
 use crate::schema_mutation::{
-    AlterTableOperation, AlterTableSpec, SchemaDependency, SchemaMutationError, SchemaWriter,
-    SharedMutationJournal, build_alter_target, cleanup_prepared, cleanup_staged_loser, crash,
-    digest, ensure_parent, open_winner_heap, promote, validate_resource_path, write_owner,
+    AlterTableOperation, AlterTableSpec, CreateTableSpec, SchemaDependency, SchemaMutationError,
+    SchemaWriter, SharedMutationJournal, build_alter_target, cleanup_prepared,
+    cleanup_staged_loser, crash, digest, ensure_parent, open_winner_heap, promote,
+    validate_resource_path, write_owner,
 };
 use crate::schema_mutation_journal::{
     CompositionColumnReservation, CompositionIndexReservation, CompositionResolution,
-    CompositionTablePlan, CreateIntent, Reservation, SchemaChangeSetIntent,
-    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal, final_locator,
-    namespace, prepared_locator, stage_locator,
+    CompositionTablePlan, CompositionTableReservation, CreateIntent, Reservation,
+    SchemaChangeSetIntent, SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal,
+    TableObjectChangeSetIntent, final_locator, namespace, prepared_locator, stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -146,16 +147,24 @@ pub(crate) struct ComposedTable {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct TransactionCreatedTable {
+    pub(crate) indexes: HeapRewriteIndexes,
+    pub(crate) present: bool,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct SchemaTransactionPlan {
     pub(crate) transaction: DatabaseTxnId,
     pub(crate) catalog: PathBuf,
     pub(crate) base: SchemaCatalogSnapshot,
     pub(crate) overlay: crate::schema_catalog::CommittedCatalogState,
     pub(crate) touched: BTreeMap<TableId, ComposedTable>,
+    pub(crate) created: BTreeMap<TableId, TransactionCreatedTable>,
     pub(crate) action_evidence: Vec<[u8; 32]>,
     pub(crate) reservation_count: usize,
     pub(crate) index_reservation_count: usize,
     pub(crate) index_actions: usize,
+    pub(crate) table_actions: usize,
     pub(crate) journal: SharedMutationJournal,
     pub(crate) writer: SchemaWriter,
 }
@@ -220,7 +229,7 @@ pub(crate) struct MaterializedSchemaIndexTransaction {
     pub(crate) logical: SchemaTransactionPlan,
     pub(crate) target: Option<SchemaCatalogSnapshot>,
     pub(crate) reference: Option<SchemaParticipantReference>,
-    pub(crate) intent: SchemaIndexChangeSetIntent,
+    pub(crate) intent: TableObjectChangeSetIntent,
     pub(crate) staged: BTreeMap<StorageId, TableStorage>,
     pub(crate) publications: Vec<IndexPublication>,
 }
@@ -476,13 +485,257 @@ impl Database {
             overlay,
             base,
             touched: BTreeMap::new(),
+            created: BTreeMap::new(),
             action_evidence: Vec::new(),
             reservation_count: 0,
             index_reservation_count: 0,
             index_actions: 0,
+            table_actions: 0,
             journal,
             writer: Rc::clone(&self.schema_writer),
         })
+    }
+
+    pub(crate) fn compose_create_heap_table_in(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: CreateTableSpec,
+    ) -> Result<TableId, DatabaseError> {
+        self.ensure_composition_started(transaction)?;
+        let result = self.apply_composed_create_table(transaction, spec);
+        self.handle_composition_accept_result(transaction, &result);
+        result
+    }
+
+    fn apply_composed_create_table(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: CreateTableSpec,
+    ) -> Result<TableId, DatabaseError> {
+        let transaction_id = transaction.id();
+        let plan = match &mut transaction.schema_composition {
+            SchemaCompositionState::Composing(plan) => plan,
+            _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
+        };
+        if plan.action_count() >= MAX_SCHEMA_ACTIONS {
+            return Err(SchemaMutationError::CompositionLimitExceeded("schema actions").into());
+        }
+        if plan.touched.len() + plan.created.len() >= MAX_TOUCHED_TABLES {
+            return Err(SchemaMutationError::CompositionLimitExceeded("touched tables").into());
+        }
+        if spec.columns.len() > 4096 {
+            return Err(SchemaCatalogError::CapacityExceeded("columns").into());
+        }
+        let table_id = plan
+            .journal
+            .borrow()
+            .effective_table(plan.overlay.next_table_id)
+            .ok_or(SchemaMutationError::IdentityExhausted("TableId"))?;
+        let next_table_id = table_id.0.checked_add(1).map(TableId);
+        if next_table_id.is_none() {
+            return Err(SchemaMutationError::IdentityExhausted("TableId").into());
+        }
+        let mut columns = Vec::with_capacity(spec.columns.len());
+        for (position, column) in spec.columns.into_iter().enumerate() {
+            let id = u32::try_from(position + 1)
+                .map_err(|_| SchemaMutationError::IdentityExhausted("ColumnId"))?;
+            let type_spec = match column.data_type.name {
+                Some(name) => TypeSpec::Semantic {
+                    physical: column.data_type.physical,
+                    name,
+                },
+                None => TypeSpec::Physical(column.data_type.physical),
+            };
+            columns.push(
+                ColumnDef::new(ColumnId(id), column.name, type_spec).nullable(column.nullable),
+            );
+        }
+        let next_column_id = u32::try_from(columns.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .map(ColumnId)
+            .ok_or(SchemaMutationError::IdentityExhausted("ColumnId"))?;
+        let table = TableDef::new(table_id, spec.name, columns);
+        let mut candidate = plan.overlay.schema.clone();
+        candidate.add_table(table.clone())?;
+        let reservation = CompositionTableReservation {
+            transaction: transaction_id,
+            table: table_id,
+            next_table_id,
+        };
+        if let Err(error) = plan
+            .journal
+            .borrow_mut()
+            .reserve_composition_table(reservation)
+        {
+            return if plan.journal.borrow().ensure_ready().is_err() {
+                Err(SchemaMutationError::RecoveryRequired.into())
+            } else {
+                Err(error.into())
+            };
+        }
+        crash("composition-table-reservation-durable");
+        plan.overlay.schema = candidate;
+        plan.overlay.next_table_id = next_table_id;
+        plan.overlay.tables.push(TableLineage {
+            table_id,
+            version: TableSchemaVersion(1),
+            next_column_id: Some(next_column_id),
+        });
+        plan.created.insert(
+            table_id,
+            TransactionCreatedTable {
+                indexes: HeapRewriteIndexes {
+                    next_index_id: IndexId(1),
+                    active: Vec::new(),
+                },
+                present: true,
+            },
+        );
+        plan.table_actions += 1;
+        let mut evidence = Sha256::new();
+        evidence.update(b"create-table");
+        evidence.update(table_id.0.to_le_bytes());
+        evidence.update(table.fingerprint()?.as_bytes());
+        plan.action_evidence.push(evidence.finalize().into());
+        Ok(table_id)
+    }
+
+    pub(crate) fn compose_drop_table_in(
+        &mut self,
+        transaction: &mut Transaction,
+        target: DropTableTarget,
+    ) -> Result<(), DatabaseError> {
+        if !transaction.schema_composition.is_started() {
+            self.preflight_composed_drop_table(&target)?;
+        }
+        self.ensure_composition_started(transaction)?;
+        let result = self.apply_composed_drop_table(transaction, target);
+        self.handle_composition_accept_result(transaction, &result);
+        result
+    }
+
+    /// Rejects committed tables that table-object composition cannot own before
+    /// starting the durable mutation journal. A table created inside an active
+    /// composition deliberately bypasses this check because it has no committed
+    /// placement yet.
+    fn preflight_composed_drop_table(&self, target: &DropTableTarget) -> Result<(), DatabaseError> {
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == target.table_id)
+            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?;
+        let lineage = self
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == target.table_id)
+            .ok_or(SchemaMutationError::Corrupt("active table lineage absent"))?;
+        if lineage.version != target.table_version || table.fingerprint()? != target.fingerprint {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+
+        let catalog = self
+            .catalog_path
+            .as_ref()
+            .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
+        let base = file::load(catalog)?;
+        if base.committed != self.committed {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let catalog_table = base
+            .placements
+            .tables
+            .iter()
+            .find(|entry| entry.table_id == target.table_id)
+            .ok_or(SchemaMutationError::Corrupt(
+                "base composition placement absent",
+            ))?;
+        let old_storage = match catalog_table.placement {
+            TablePlacement::Single { storage_id, .. } => storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(SchemaMutationError::UnsupportedPlacement.into());
+            }
+        };
+        let descriptor = base
+            .storages
+            .iter()
+            .find(|storage| storage.id == old_storage)
+            .ok_or(SchemaMutationError::Corrupt(
+                "base composition storage absent",
+            ))?;
+        if catalog_table.schema_fingerprint != target.fingerprint
+            || !matches!(descriptor.kind, CatalogStorageKind::Heap)
+            || descriptor.locator != final_locator(catalog, base.incarnation, old_storage)?
+        {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        Ok(())
+    }
+
+    fn apply_composed_drop_table(
+        &mut self,
+        transaction: &mut Transaction,
+        target: DropTableTarget,
+    ) -> Result<(), DatabaseError> {
+        let plan = match &mut transaction.schema_composition {
+            SchemaCompositionState::Composing(plan) => plan,
+            _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
+        };
+        if plan.action_count() >= MAX_SCHEMA_ACTIONS {
+            return Err(SchemaMutationError::CompositionLimitExceeded("schema actions").into());
+        }
+        if plan.dependency(target.table_id)?
+            != (SchemaDependency {
+                table_id: target.table_id,
+                table_version: target.table_version,
+                fingerprint: target.fingerprint,
+            })
+        {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let table = plan
+            .overlay
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == target.table_id)
+            .cloned()
+            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?;
+        if let Some(created) = plan.created.get_mut(&target.table_id) {
+            if !created.present {
+                return Err(SchemaMutationError::TableNotFound(target.table_id).into());
+            }
+            created.present = false;
+        } else if !plan.touched.contains_key(&target.table_id) {
+            if plan.touched.len() + plan.created.len() >= MAX_TOUCHED_TABLES {
+                return Err(SchemaMutationError::CompositionLimitExceeded("touched tables").into());
+            }
+            let touched = self.capture_composed_table(&plan.base, &table, target.fingerprint)?;
+            plan.touched.insert(target.table_id, touched);
+        }
+        plan.overlay.schema = Schema::new(
+            plan.overlay
+                .schema
+                .tables()
+                .iter()
+                .filter(|candidate| candidate.id != target.table_id)
+                .cloned()
+                .collect(),
+        )?;
+        plan.overlay
+            .tables
+            .retain(|lineage| lineage.table_id != target.table_id);
+        plan.table_actions += 1;
+        let mut evidence = Sha256::new();
+        evidence.update(b"drop-table");
+        evidence.update(target.table_id.0.to_le_bytes());
+        evidence.update(target.table_version.0.to_le_bytes());
+        evidence.update(target.fingerprint.as_bytes());
+        plan.action_evidence.push(evidence.finalize().into());
+        Ok(())
     }
 
     fn apply_composed_alter(
@@ -508,6 +761,86 @@ impl Database {
             .clone();
         if plan.dependency(spec.target.table_id)? != spec.target {
             return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        if plan
+            .created
+            .get(&spec.target.table_id)
+            .is_some_and(|created| created.present)
+        {
+            let current_lineage = plan
+                .overlay
+                .tables
+                .iter()
+                .find(|lineage| lineage.table_id == spec.target.table_id)
+                .cloned()
+                .ok_or(SchemaMutationError::Corrupt("created table lineage absent"))?;
+            let created = plan
+                .created
+                .get(&spec.target.table_id)
+                .ok_or(SchemaMutationError::Corrupt("created table origin absent"))?;
+            if let AlterTableOperation::DropColumn { column_id } = &spec.operation {
+                if current_table
+                    .column_by_id(*column_id)
+                    .is_some_and(|column| column.primary_key)
+                {
+                    return Err(SchemaMutationError::PrimaryKeyColumn(*column_id).into());
+                }
+                if created
+                    .indexes
+                    .active
+                    .iter()
+                    .any(|index| index.column_id == *column_id)
+                {
+                    return Err(SchemaMutationError::IndexedColumn(*column_id).into());
+                }
+            }
+            let reserved_column = matches!(
+                &spec.operation,
+                AlterTableOperation::AddNullableColumn { .. }
+            )
+            .then_some(
+                current_lineage
+                    .next_column_id
+                    .ok_or(SchemaMutationError::IdentityExhausted("ColumnId"))?,
+            );
+            let candidate = build_alter_target(&current_table, &spec.operation, reserved_column)?;
+            let candidate_schema = Schema::new(
+                plan.overlay
+                    .schema
+                    .tables()
+                    .iter()
+                    .map(|table| {
+                        if table.id == candidate.id {
+                            candidate.clone()
+                        } else {
+                            table.clone()
+                        }
+                    })
+                    .collect(),
+            )?;
+            plan.overlay.schema = candidate_schema;
+            let lineage = plan
+                .overlay
+                .tables
+                .iter_mut()
+                .find(|lineage| lineage.table_id == spec.target.table_id)
+                .ok_or(SchemaMutationError::Corrupt(
+                    "created table lineage disappeared",
+                ))?;
+            lineage.version = TableSchemaVersion(1);
+            if let Some(column) = reserved_column {
+                lineage.next_column_id = column.0.checked_add(1).map(ColumnId);
+                if lineage.next_column_id.is_none() {
+                    return Err(SchemaMutationError::IdentityExhausted("ColumnId").into());
+                }
+            }
+            let mut evidence = Sha256::new();
+            evidence.update(spec.target.table_id.0.to_le_bytes());
+            evidence.update(TableSchemaVersion(1).0.to_le_bytes());
+            evidence.update(candidate.fingerprint()?.as_bytes());
+            evidence.update(reserved_column.map_or(0, |column| column.0).to_le_bytes());
+            plan.action_evidence.push(evidence.finalize().into());
+            return Ok(());
         }
         let first_touch = !plan.touched.contains_key(&spec.target.table_id);
         if first_touch && plan.touched.len() >= MAX_TOUCHED_TABLES {
@@ -711,6 +1044,45 @@ impl Database {
         if current_table.column_by_id(statement.column_id).is_none() {
             return Err(SchemaMutationError::StaleSchemaDependency.into());
         }
+        if let Some(created) = plan
+            .created
+            .get_mut(&statement.target.table_id)
+            .filter(|created| created.present)
+        {
+            if created
+                .indexes
+                .active
+                .iter()
+                .any(|index| index.column_id == statement.column_id)
+            {
+                return Err(netbadb_storage::StorageError::from(
+                    netbadb_index::IndexError::IndexAlreadyExists {
+                        column_id: statement.column_id,
+                    },
+                )
+                .into());
+            }
+            let index = created.indexes.next_index_id;
+            created.indexes.next_index_id = index
+                .0
+                .checked_add(1)
+                .map(IndexId)
+                .ok_or(SchemaMutationError::IdentityExhausted("IndexId"))?;
+            created.indexes.active.push(HeapRewriteIndex {
+                id: index,
+                name: Some(statement.name.clone()),
+                column_id: statement.column_id,
+            });
+            plan.index_actions += 1;
+            let mut evidence = Sha256::new();
+            evidence.update(b"create-index");
+            evidence.update(statement.target.table_id.0.to_le_bytes());
+            evidence.update(index.0.to_le_bytes());
+            evidence.update(statement.column_id.0.to_le_bytes());
+            evidence.update(statement.name.as_str().as_bytes());
+            plan.action_evidence.push(evidence.finalize().into());
+            return Ok(crate::DdlOutcome::Created);
+        }
         let first_touch = !plan.touched.contains_key(&statement.target.table_id);
         if first_touch && plan.touched.len() >= MAX_TOUCHED_TABLES {
             return Err(SchemaMutationError::CompositionLimitExceeded("touched tables").into());
@@ -823,6 +1195,26 @@ impl Database {
             .ok_or(SchemaMutationError::TableNotFound(target.table_id))?
             .clone();
         let dependency = plan.dependency(target.table_id)?;
+        if let Some(created) = plan
+            .created
+            .get_mut(&target.table_id)
+            .filter(|created| created.present)
+        {
+            let position = created
+                .indexes
+                .active
+                .iter()
+                .position(|index| index.id == target.index_id)
+                .ok_or(DatabaseError::UndefinedIndex)?;
+            created.indexes.active.remove(position);
+            plan.index_actions += 1;
+            let mut evidence = Sha256::new();
+            evidence.update(b"drop-index");
+            evidence.update(target.table_id.0.to_le_bytes());
+            evidence.update(target.index_id.0.to_le_bytes());
+            plan.action_evidence.push(evidence.finalize().into());
+            return Ok(crate::DdlOutcome::Dropped);
+        }
         let mut touched = if let Some(touched) = plan.touched.get(&target.table_id) {
             touched.clone()
         } else {
@@ -855,28 +1247,42 @@ impl Database {
         transaction: &Transaction,
         target: crate::DropIndexTarget,
     ) -> Option<HeapRewriteIndex> {
-        transaction
-            .schema_composition
-            .plan()
-            .and_then(|plan| plan.touched.get(&target.table_id))
-            .and_then(|table| {
-                table
-                    .indexes
-                    .active
+        if let Some(plan) = transaction.schema_composition.plan() {
+            if let Some(created) = plan.created.get(&target.table_id) {
+                return created.present.then(|| {
+                    created
+                        .indexes
+                        .active
+                        .iter()
+                        .find(|index| index.id == target.index_id)
+                        .cloned()
+                })?;
+            }
+            if let Some(table) = plan.touched.get(&target.table_id) {
+                return plan
+                    .overlay
+                    .schema
+                    .tables()
                     .iter()
-                    .find(|index| index.id == target.index_id)
-                    .cloned()
-            })
-            .or_else(|| {
-                self.indexes(target.table_id)
-                    .ok()?
-                    .iter()
-                    .find(|index| index.id == target.index_id)
-                    .map(|index| HeapRewriteIndex {
-                        id: index.id,
-                        name: index.name.clone(),
-                        column_id: index.column_id,
-                    })
+                    .any(|candidate| candidate.id == target.table_id)
+                    .then(|| {
+                        table
+                            .indexes
+                            .active
+                            .iter()
+                            .find(|index| index.id == target.index_id)
+                            .cloned()
+                    })?;
+            }
+        }
+        self.indexes(target.table_id)
+            .ok()?
+            .iter()
+            .find(|index| index.id == target.index_id)
+            .map(|index| HeapRewriteIndex {
+                id: index.id,
+                name: index.name.clone(),
+                column_id: index.column_id,
             })
     }
 
@@ -1003,7 +1409,9 @@ impl Database {
             return Err(SchemaMutationError::Corrupt("composition state transition").into());
         };
         let rollback_logical = logical.clone();
-        let materialized = if logical.index_actions == 0 {
+        let materialized = if logical.table_actions > 0 {
+            self.materialize_table_object_composition(transaction, *logical)
+        } else if logical.index_actions == 0 {
             self.materialize_schema_composition(transaction, *logical)
         } else {
             self.materialize_schema_index_composition(transaction, *logical)
@@ -1367,6 +1775,378 @@ impl Database {
         Ok(())
     }
 
+    fn materialize_table_object_composition(
+        &mut self,
+        transaction: &mut Transaction,
+        logical: SchemaTransactionPlan,
+    ) -> Result<(), DatabaseError> {
+        let schema_dirty = logical.created.values().any(|created| created.present)
+            || logical.touched.iter().any(|(table_id, touched)| {
+                logical
+                    .overlay
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == *table_id)
+                    .is_none_or(|table| table != &touched.base_table)
+            });
+        if !schema_dirty {
+            return self.materialize_schema_index_composition(transaction, logical);
+        }
+        self.catalog_generation
+            .checked_add(1)
+            .ok_or(SchemaMutationError::IdentityExhausted(
+                "runtime catalog revision",
+            ))?;
+        let target_generation = logical
+            .base
+            .committed
+            .generation
+            .0
+            .checked_add(1)
+            .map(netbadb_types::SchemaGeneration)
+            .ok_or(SchemaMutationError::IdentityExhausted("SchemaGeneration"))?;
+        let target_epoch = logical
+            .base
+            .epoch
+            .checked_add(1)
+            .ok_or(SchemaMutationError::IdentityExhausted("catalog epoch"))?;
+
+        let mut allocation_ids = BTreeSet::new();
+        allocation_ids.extend(
+            logical
+                .created
+                .iter()
+                .filter(|(_, created)| created.present)
+                .map(|(table, _)| *table),
+        );
+        allocation_ids.extend(logical.touched.iter().filter_map(|(table, touched)| {
+            logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .find(|candidate| candidate.id == *table)
+                .filter(|candidate| *candidate != &touched.base_table)
+                .map(|_| *table)
+        }));
+        let mut next_storage = self
+            .next_storage_id()
+            .ok_or(SchemaMutationError::IdentityExhausted("StorageId"))?;
+        let mut allocations = BTreeMap::new();
+        for table in allocation_ids {
+            allocations.insert(table, next_storage);
+            next_storage = next_storage
+                .0
+                .checked_add(1)
+                .map(StorageId)
+                .ok_or(SchemaMutationError::IdentityExhausted("StorageId"))?;
+        }
+        let coordinator_locator = logical
+            .base
+            .coordinator
+            .clone()
+            .unwrap_or_else(|| logical.journal.borrow().coordinator.clone());
+        let mut target = logical.base.clone();
+        target.epoch = target_epoch;
+        target.committed = logical.overlay.clone();
+        target.committed.generation = target_generation;
+        target.committed.next_storage_id = Some(next_storage);
+        target.coordinator = Some(coordinator_locator.clone());
+
+        let mut table_ids = logical.touched.keys().copied().collect::<BTreeSet<_>>();
+        table_ids.extend(logical.created.keys().copied());
+        let mut table_plans = Vec::new();
+        for table_id in table_ids {
+            if let Some(created) = logical.created.get(&table_id) {
+                if !created.present {
+                    continue;
+                }
+                let final_table = target
+                    .committed
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == table_id)
+                    .cloned()
+                    .ok_or(SchemaMutationError::Corrupt("created target table absent"))?;
+                let storage = allocations[&table_id];
+                let descriptor = CatalogStorage {
+                    id: storage,
+                    table_id,
+                    locator: final_locator(&logical.catalog, target.incarnation, storage)?,
+                    kind: CatalogStorageKind::Heap,
+                };
+                let placement = CatalogTable {
+                    table_id,
+                    schema_fingerprint: final_table.fingerprint()?,
+                    placement: TablePlacement::Single {
+                        table_id,
+                        storage_id: storage,
+                    },
+                };
+                target.placements.tables.push(placement.clone());
+                target.storages.push(descriptor.clone());
+                let lineage = target
+                    .committed
+                    .tables
+                    .iter()
+                    .find(|lineage| lineage.table_id == table_id)
+                    .cloned()
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "created target lineage absent",
+                    ))?;
+                if lineage.version != TableSchemaVersion(1) {
+                    return Err(
+                        SchemaMutationError::Corrupt("created table version is not one").into(),
+                    );
+                }
+                let fragment = one_table_fragment(
+                    &target,
+                    final_table,
+                    lineage,
+                    placement,
+                    descriptor,
+                    coordinator_locator.clone(),
+                )?;
+                table_plans.push(SchemaIndexTablePlan::CreateHeap {
+                    target: Box::new(fragment),
+                    final_indexes: created.indexes.clone(),
+                });
+                continue;
+            }
+            let touched = logical
+                .touched
+                .get(&table_id)
+                .ok_or(SchemaMutationError::Corrupt("table-object origin absent"))?;
+            let final_table = target
+                .committed
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == table_id)
+                .cloned();
+            let base_fragment = one_table_fragment(
+                &logical.base,
+                touched.base_table.clone(),
+                touched.base_lineage.clone(),
+                touched.catalog_table.clone(),
+                touched.descriptor.clone(),
+                coordinator_locator.clone(),
+            )?;
+            let Some(final_table) = final_table else {
+                target
+                    .placements
+                    .tables
+                    .retain(|placement| placement.table_id != table_id);
+                target
+                    .storages
+                    .retain(|storage| storage.id != touched.old_storage);
+                table_plans.push(SchemaIndexTablePlan::DropHeap {
+                    base: Box::new(base_fragment),
+                    retired: false,
+                    gc: None,
+                });
+                continue;
+            };
+            if final_table != touched.base_table {
+                let storage = allocations[&table_id];
+                let descriptor = CatalogStorage {
+                    id: storage,
+                    table_id,
+                    locator: final_locator(&logical.catalog, target.incarnation, storage)?,
+                    kind: CatalogStorageKind::Heap,
+                };
+                let placement = CatalogTable {
+                    table_id,
+                    schema_fingerprint: final_table.fingerprint()?,
+                    placement: TablePlacement::Single {
+                        table_id,
+                        storage_id: storage,
+                    },
+                };
+                *target
+                    .placements
+                    .tables
+                    .iter_mut()
+                    .find(|entry| entry.table_id == table_id)
+                    .ok_or(SchemaMutationError::Corrupt("rewrite placement absent"))? =
+                    placement.clone();
+                *target
+                    .storages
+                    .iter_mut()
+                    .find(|entry| entry.id == touched.old_storage)
+                    .ok_or(SchemaMutationError::Corrupt("rewrite storage absent"))? =
+                    descriptor.clone();
+                let lineage = target
+                    .committed
+                    .tables
+                    .iter()
+                    .find(|lineage| lineage.table_id == table_id)
+                    .cloned()
+                    .ok_or(SchemaMutationError::Corrupt("rewrite lineage absent"))?;
+                let target_fragment = one_table_fragment(
+                    &target,
+                    final_table,
+                    lineage,
+                    placement,
+                    descriptor,
+                    coordinator_locator.clone(),
+                )?;
+                table_plans.push(SchemaIndexTablePlan::RewriteHeap {
+                    replacement: Box::new(CompositionTablePlan {
+                        base: base_fragment,
+                        target: target_fragment,
+                        retired: false,
+                        gc: None,
+                    }),
+                    base_indexes: touched.base_indexes.clone(),
+                    final_indexes: touched.indexes.clone(),
+                });
+            } else if touched.indexes.active != touched.base_indexes.active {
+                if let Some(lineage) = target
+                    .committed
+                    .tables
+                    .iter_mut()
+                    .find(|lineage| lineage.table_id == table_id)
+                {
+                    lineage.version = touched.base_lineage.version;
+                }
+                table_plans.push(SchemaIndexTablePlan::InPlaceIndexDelta {
+                    table: table_id,
+                    table_version: touched.base_lineage.version,
+                    fingerprint: touched.base_table.fingerprint()?,
+                    storage: touched.old_storage,
+                    base_indexes: touched.base_indexes.clone(),
+                    final_indexes: touched.indexes.clone(),
+                });
+            } else if let Some(lineage) = target
+                .committed
+                .tables
+                .iter_mut()
+                .find(|lineage| lineage.table_id == table_id)
+            {
+                lineage.version = touched.base_lineage.version;
+            }
+        }
+        if table_plans.is_empty() {
+            transaction.schema_composition =
+                SchemaCompositionState::SealedNoEffectiveChange(Box::new(logical));
+            return Ok(());
+        }
+        target.placements.tables.sort_by_key(|entry| entry.table_id);
+        target.storages.sort_by_key(|entry| entry.id);
+        target.committed.tables.sort_by_key(|entry| entry.table_id);
+        target.validate()?;
+        let bytes = target.encode()?;
+        let intent = TableObjectChangeSetIntent {
+            transaction: transaction.id(),
+            base_generation: logical.base.committed.generation,
+            target_generation,
+            base_epoch: logical.base.epoch,
+            target_epoch,
+            action_count: u32::try_from(logical.action_count())
+                .map_err(|_| SchemaMutationError::CompositionLimitExceeded("schema actions"))?,
+            action_digest: logical.action_digest(),
+            snapshot_digest: digest(&bytes),
+            tables: table_plans,
+        };
+        crash("composition-before-intent");
+        let intent_result = logical
+            .journal
+            .borrow_mut()
+            .table_object_intent(intent.clone());
+        if let Err(error) = intent_result {
+            return if logical.journal.borrow().ensure_ready().is_err() {
+                Err(SchemaMutationError::RecoveryRequired.into())
+            } else {
+                Err(error.into())
+            };
+        }
+        crash("composition-intent-durable");
+        let coordinator = match &self.coordinator {
+            Some(coordinator) => Rc::clone(coordinator),
+            None => {
+                let path = file::resolve(&logical.catalog, &coordinator_locator);
+                validate_resource_path(&logical.catalog, &path)?;
+                ensure_parent(&path)?;
+                let log = if path
+                    .try_exists()
+                    .map_err(|error| file::io("inspect schema coordinator", &path, error))?
+                {
+                    CoordinatorLog::open(&path)?
+                } else {
+                    CoordinatorLog::create(&path)?
+                };
+                Rc::new(std::cell::RefCell::new(log))
+            }
+        };
+        transaction.set_coordinator(coordinator);
+        let reference = SchemaParticipantReference {
+            incarnation: target.incarnation,
+            target_epoch,
+            digest: intent.snapshot_digest,
+        };
+        transaction.schema_composition = SchemaCompositionState::SealingAndMaterializingIndex(
+            Box::new(MaterializedSchemaIndexTransaction {
+                logical,
+                target: Some(target),
+                reference: Some(reference),
+                intent: intent.clone(),
+                staged: BTreeMap::new(),
+                publications: Vec::new(),
+            }),
+        );
+        for (position, plan) in intent.tables.iter().enumerate() {
+            match plan {
+                SchemaIndexTablePlan::CreateHeap {
+                    target,
+                    final_indexes,
+                } => self.materialize_created_heap(transaction, target, final_indexes, position)?,
+                SchemaIndexTablePlan::DropHeap { .. } => {}
+                SchemaIndexTablePlan::RewriteHeap {
+                    replacement,
+                    final_indexes,
+                    ..
+                } => self.materialize_schema_index_rewrite(
+                    transaction,
+                    replacement,
+                    final_indexes,
+                    position,
+                )?,
+                SchemaIndexTablePlan::InPlaceIndexDelta {
+                    storage,
+                    base_indexes,
+                    final_indexes,
+                    ..
+                } => {
+                    let publication = self.materialize_in_place_index_delta(
+                        transaction,
+                        *storage,
+                        base_indexes,
+                        final_indexes,
+                    )?;
+                    transaction
+                        .schema_composition
+                        .materialized_index_mut()
+                        .ok_or(SchemaMutationError::Corrupt("table-object state absent"))?
+                        .publications
+                        .push(publication);
+                }
+            }
+        }
+        crash("composition-all-targets-staged");
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        let SchemaCompositionState::SealingAndMaterializingIndex(materialized) = previous else {
+            return Err(SchemaMutationError::Corrupt("table-object materialization state").into());
+        };
+        transaction.schema_composition = SchemaCompositionState::MaterializedIndex(materialized);
+        Ok(())
+    }
+
     fn materialize_schema_index_composition(
         &mut self,
         transaction: &mut Transaction,
@@ -1632,7 +2412,7 @@ impl Database {
                 logical,
                 target,
                 reference,
-                intent: intent.clone(),
+                intent: intent.clone().into(),
                 staged: BTreeMap::new(),
                 publications: Vec::new(),
             }),
@@ -1640,6 +2420,12 @@ impl Database {
 
         for (position, table_plan) in intent.tables.iter().enumerate() {
             match table_plan {
+                SchemaIndexTablePlan::CreateHeap { .. } | SchemaIndexTablePlan::DropHeap { .. } => {
+                    return Err(SchemaMutationError::Corrupt(
+                        "table-object plan in Round 29 materializer",
+                    )
+                    .into());
+                }
                 SchemaIndexTablePlan::RewriteHeap {
                     replacement,
                     final_indexes,
@@ -1837,6 +2623,111 @@ impl Database {
         Ok(())
     }
 
+    fn materialize_created_heap(
+        &mut self,
+        transaction: &mut Transaction,
+        target: &SchemaCatalogSnapshot,
+        final_indexes: &HeapRewriteIndexes,
+        position: usize,
+    ) -> Result<(), DatabaseError> {
+        let table = target.committed.schema.tables()[0].clone();
+        let storage = target.storages[0].id;
+        let catalog = &transaction
+            .schema_composition
+            .plan()
+            .ok_or(SchemaMutationError::Corrupt("composition plan absent"))?
+            .catalog;
+        let stage = file::resolve(
+            catalog,
+            &stage_locator(catalog, target.incarnation, transaction.id(), storage)?,
+        );
+        validate_resource_path(catalog, &stage)?;
+        ensure_parent(&stage)?;
+        write_owner(
+            &file::suffix(&stage, ".owner"),
+            target.incarnation,
+            transaction.id(),
+            table.id,
+            storage,
+            table.fingerprint()?,
+        )?;
+        crash("composition-stage-first-file");
+        let heap = TableStorage::create_heap_with_storage_id(&stage, table, storage)?;
+        crash(&format!("composition-after-target-create-{}", position + 1));
+        heap.flush()?;
+        file::sync_parent(&stage)?;
+        transaction.enlist_composed_staged(heap)?;
+        transaction.with_composed_staged_write(storage, |heap, context| {
+            heap.install_heap_rewrite_indexes_in(context, final_indexes)
+        })?;
+        crash(&format!(
+            "composition-after-create-indexes-{}",
+            position + 1
+        ));
+        Ok(())
+    }
+
+    fn materialize_in_place_index_delta(
+        &mut self,
+        transaction: &mut Transaction,
+        storage: StorageId,
+        base_indexes: &HeapRewriteIndexes,
+        final_indexes: &HeapRewriteIndexes,
+    ) -> Result<IndexPublication, DatabaseError> {
+        let drops = base_indexes
+            .active
+            .iter()
+            .filter(|base| {
+                !final_indexes
+                    .active
+                    .iter()
+                    .any(|final_index| final_index.id == base.id && final_index == *base)
+            })
+            .map(|index| index.id)
+            .collect::<Vec<_>>();
+        let creates = final_indexes
+            .active
+            .iter()
+            .filter(|final_index| {
+                !base_indexes
+                    .active
+                    .iter()
+                    .any(|base| base.id == final_index.id && base == *final_index)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let target_floor = final_indexes.next_index_id;
+        Ok(
+            transaction.with_write_storage(storage, &mut self.registry, |table, context| {
+                for id in &drops {
+                    table.drop_index_in(context, *id)?;
+                }
+                table.advance_index_id_floor_in(context, target_floor)?;
+                let mut definitions = Vec::with_capacity(creates.len());
+                for create in &creates {
+                    let name = create
+                        .name
+                        .clone()
+                        .ok_or(netbadb_storage::StorageError::from(
+                            netbadb_index::IndexError::InvalidIndexHighWater(target_floor),
+                        ))?;
+                    definitions.push(table.create_named_index_with_reserved_id_in(
+                        context,
+                        name,
+                        create.column_id,
+                        create.id,
+                        target_floor,
+                    )?);
+                }
+                Ok(IndexPublication {
+                    storage,
+                    drops: drops.clone(),
+                    creates: definitions,
+                })
+            })?,
+        )
+    }
+
     pub(crate) fn finish_composition_commit(
         &mut self,
         transaction: &mut Transaction,
@@ -1984,64 +2875,128 @@ impl Database {
             }
             materialized.staged.clear();
             for plan in &materialized.intent.tables {
-                if let Some(replacement) = plan.replacement() {
-                    transaction.release_staged_context(replacement.new_storage());
+                match plan {
+                    SchemaIndexTablePlan::CreateHeap { target, .. } => {
+                        transaction.release_staged_context(target.storages[0].id);
+                    }
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                        transaction.release_staged_context(replacement.new_storage());
+                    }
+                    SchemaIndexTablePlan::DropHeap { .. }
+                    | SchemaIndexTablePlan::InPlaceIndexDelta { .. } => {}
                 }
             }
             let decisions = transaction.coordinator_decisions()?;
+            let mut created = Vec::new();
             let mut winners = Vec::new();
+            let mut dropped = Vec::new();
             for (position, plan) in materialized.intent.tables.iter().enumerate() {
-                let Some(replacement) = plan.replacement() else {
-                    continue;
-                };
-                let reference =
-                    materialized
-                        .reference
-                        .as_ref()
-                        .ok_or(SchemaMutationError::Corrupt(
-                            "rewrite schema reference absent",
-                        ))?;
-                let reservation =
-                    schema_index_physical_reservation(&materialized.intent, replacement, None);
-                promote(&materialized.logical.catalog, &reservation, reference)?;
-                crash(&format!("composition-after-promotion-{}", position + 1));
-                let final_path = file::resolve(
-                    &materialized.logical.catalog,
-                    &final_locator(
-                        &materialized.logical.catalog,
-                        replacement.target.incarnation,
-                        replacement.new_storage(),
-                    )?,
-                );
-                let storage = open_winner_heap(&final_path, &reservation, &decisions)?;
-                storage.flush()?;
-                let source = self.registry.get(replacement.old_storage()).ok_or(
-                    SchemaMutationError::Corrupt("composition source disappeared"),
-                )?;
-                if source.table() != &replacement.base.committed.schema.tables()[0]
-                    || source.storage_id() != replacement.old_storage()
-                {
-                    return Err(SchemaMutationError::Corrupt(
-                        "composition source identity changed",
-                    )
-                    .into());
+                match plan {
+                    SchemaIndexTablePlan::CreateHeap { target, .. } => {
+                        let reference =
+                            materialized
+                                .reference
+                                .as_ref()
+                                .ok_or(SchemaMutationError::Corrupt(
+                                    "CreateHeap schema reference absent",
+                                ))?;
+                        let reservation =
+                            create_physical_reservation(&materialized.intent, target, None);
+                        promote(&materialized.logical.catalog, &reservation, reference)?;
+                        crash(&format!("composition-after-promotion-{}", position + 1));
+                        let final_path = file::resolve(
+                            &materialized.logical.catalog,
+                            &target.storages[0].locator,
+                        );
+                        let storage = open_winner_heap(&final_path, &reservation, &decisions)?;
+                        storage.flush()?;
+                        created.push((plan.table(), storage));
+                    }
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                        let reference =
+                            materialized
+                                .reference
+                                .as_ref()
+                                .ok_or(SchemaMutationError::Corrupt(
+                                    "rewrite schema reference absent",
+                                ))?;
+                        let reservation = schema_index_physical_reservation(
+                            &materialized.intent,
+                            replacement,
+                            None,
+                        );
+                        promote(&materialized.logical.catalog, &reservation, reference)?;
+                        crash(&format!("composition-after-promotion-{}", position + 1));
+                        let final_path = file::resolve(
+                            &materialized.logical.catalog,
+                            &replacement.target.storages[0].locator,
+                        );
+                        let storage = open_winner_heap(&final_path, &reservation, &decisions)?;
+                        storage.flush()?;
+                        let source = self.registry.get(replacement.old_storage()).ok_or(
+                            SchemaMutationError::Corrupt("composition source disappeared"),
+                        )?;
+                        if source.table() != &replacement.base.committed.schema.tables()[0]
+                            || source.storage_id() != replacement.old_storage()
+                        {
+                            return Err(SchemaMutationError::Corrupt(
+                                "composition source identity changed",
+                            )
+                            .into());
+                        }
+                        winners.push((replacement.table(), replacement.old_storage(), storage));
+                    }
+                    SchemaIndexTablePlan::DropHeap { base, .. } => {
+                        let storage = base.storages[0].id;
+                        let source = self
+                            .registry
+                            .get(storage)
+                            .ok_or(SchemaMutationError::Corrupt("DropHeap source disappeared"))?;
+                        if source.table() != &base.committed.schema.tables()[0] {
+                            return Err(SchemaMutationError::Corrupt(
+                                "DropHeap source identity changed",
+                            )
+                            .into());
+                        }
+                        dropped.push((plan.table(), storage));
+                    }
+                    SchemaIndexTablePlan::InPlaceIndexDelta { .. } => {}
                 }
-                winners.push((replacement.table(), replacement.old_storage(), storage));
             }
             crash("composition-final-heaps-synced");
             for (position, plan) in materialized.intent.tables.iter().enumerate() {
-                if let Some(replacement) = plan.replacement() {
-                    materialized
+                if matches!(
+                    plan,
+                    SchemaIndexTablePlan::RewriteHeap { .. }
+                        | SchemaIndexTablePlan::DropHeap { .. }
+                ) {
+                    let table_object = materialized
                         .logical
                         .journal
-                        .borrow_mut()
-                        .retire_composition_table(
-                            materialized.intent.transaction,
-                            replacement.table(),
-                        )?;
+                        .borrow()
+                        .compositions
+                        .get(&materialized.intent.transaction)
+                        .is_some_and(|record| record.table_intent.is_some());
+                    if table_object {
+                        materialized
+                            .logical
+                            .journal
+                            .borrow_mut()
+                            .retire_table_object(materialized.intent.transaction, plan.table())?;
+                    } else {
+                        materialized
+                            .logical
+                            .journal
+                            .borrow_mut()
+                            .retire_composition_table(
+                                materialized.intent.transaction,
+                                plan.table(),
+                            )?;
+                    }
                     crash(&format!("composition-after-retirement-{}", position + 1));
                 }
             }
+            crash("composition-retirements-durable");
             let revision = self.catalog_generation.checked_add(1).ok_or(
                 SchemaMutationError::IdentityExhausted("runtime catalog revision"),
             )?;
@@ -2054,6 +3009,9 @@ impl Database {
             } else {
                 None
             };
+            if published.is_some() {
+                crash("composition-nbsc-durable");
+            }
             transaction.finish_schema_decision()?;
             crash("composition-after-cord-complete");
             crash("composition-before-winner-resolution");
@@ -2066,25 +3024,35 @@ impl Database {
                     CompositionResolution::Winner,
                 )?;
             crash("composition-after-winner-resolution");
-            if let Some(replacement) = materialized
-                .intent
-                .tables
-                .iter()
-                .find_map(SchemaIndexTablePlan::replacement)
-            {
+            if let Some(plan) = materialized.intent.tables.iter().find(|plan| {
+                matches!(
+                    plan,
+                    SchemaIndexTablePlan::CreateHeap { .. }
+                        | SchemaIndexTablePlan::RewriteHeap { .. }
+                )
+            }) {
+                let reservation = match plan {
+                    SchemaIndexTablePlan::CreateHeap { target, .. } => {
+                        create_physical_reservation(&materialized.intent, target, Some(true))
+                    }
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                        schema_index_physical_reservation(
+                            &materialized.intent,
+                            replacement,
+                            Some(true),
+                        )
+                    }
+                    _ => return Err(SchemaMutationError::Corrupt("prepared cleanup plan").into()),
+                };
                 cleanup_prepared(
                     &materialized.logical.catalog,
-                    &schema_index_physical_reservation(
-                        &materialized.intent,
-                        replacement,
-                        Some(true),
-                    ),
+                    &reservation,
                     materialized.logical.base.incarnation,
                 )?;
             }
-            Ok((published, revision, winners))
+            Ok((published, revision, created, winners, dropped))
         })();
-        let (published, revision, winners) = match completion {
+        let (published, revision, created, winners, dropped) = match completion {
             Ok(completion) => completion,
             Err(error) => {
                 transaction.schema_composition =
@@ -2093,13 +3061,29 @@ impl Database {
             }
         };
         crash("composition-before-memory-publication");
-        let mut predecessors = Vec::with_capacity(winners.len());
+        let mut predecessors = Vec::with_capacity(winners.len() + dropped.len());
+        for (table, storage) in dropped {
+            predecessors.push(
+                self.registry
+                    .publish_dropped(storage)
+                    .ok_or(SchemaMutationError::Corrupt("DropHeap source disappeared"))?,
+            );
+            self.bindings.publish_dropped(table);
+        }
         for (table, old_storage, storage) in winners {
             let new_storage = storage.storage_id();
             predecessors.push(self.registry.publish_replaced(old_storage, storage).ok_or(
                 SchemaMutationError::Corrupt("composition source disappeared"),
             )?);
             self.bindings.publish_replaced(table, new_storage);
+        }
+        for (table, storage) in created {
+            let storage_id = storage.storage_id();
+            self.registry.publish_created(storage);
+            self.bindings.publish_created(TablePlacement::Single {
+                table_id: table,
+                storage_id,
+            });
         }
         for publication in &materialized.publications {
             let storage =
@@ -2176,7 +3160,7 @@ fn composition_physical_reservation(
 }
 
 fn schema_index_physical_reservation(
-    intent: &SchemaIndexChangeSetIntent,
+    intent: &TableObjectChangeSetIntent,
     plan: &CompositionTablePlan,
     resolved: Option<bool>,
 ) -> Reservation {
@@ -2188,7 +3172,26 @@ fn schema_index_physical_reservation(
         base_epoch: intent.base_epoch,
         intent: Some(CreateIntent {
             fragment: plan.target.clone(),
-            snapshot_digest: intent.snapshot_digest.unwrap_or([0; 32]),
+            snapshot_digest: intent.snapshot_digest,
+        }),
+        resolved,
+    }
+}
+
+fn create_physical_reservation(
+    intent: &TableObjectChangeSetIntent,
+    target: &SchemaCatalogSnapshot,
+    resolved: Option<bool>,
+) -> Reservation {
+    Reservation {
+        transaction: intent.transaction,
+        table: target.committed.schema.tables()[0].id,
+        storage: target.storages[0].id,
+        base_generation: intent.base_generation,
+        base_epoch: intent.base_epoch,
+        intent: Some(CreateIntent {
+            fragment: target.clone(),
+            snapshot_digest: intent.snapshot_digest,
         }),
         resolved,
     }
@@ -2241,33 +3244,39 @@ pub(crate) fn cleanup_composition_loser(
         | SchemaCompositionState::MaterializedIndex(mut materialized)
         | SchemaCompositionState::RollbackRequiredMaterializedIndex(mut materialized) => {
             materialized.staged.clear();
-            let replacements = materialized
-                .intent
-                .tables
-                .iter()
-                .filter_map(SchemaIndexTablePlan::replacement)
-                .cloned()
-                .collect::<Vec<_>>();
-            let transaction = materialized.intent.transaction;
-            let snapshot_digest = materialized.intent.snapshot_digest;
-            let intent = (!replacements.is_empty()).then(|| SchemaChangeSetIntent {
-                transaction,
-                base_generation: materialized.intent.base_generation,
-                target_generation: materialized
-                    .intent
-                    .target_generation
-                    .unwrap_or(materialized.intent.base_generation),
-                base_epoch: materialized.intent.base_epoch,
-                target_epoch: materialized
-                    .intent
-                    .target_epoch
-                    .unwrap_or(materialized.intent.base_epoch),
-                action_count: materialized.intent.action_count,
-                action_digest: materialized.intent.action_digest,
-                snapshot_digest: snapshot_digest.unwrap_or([0; 32]),
-                tables: replacements,
-            });
-            (materialized.logical, intent)
+            let mut first = None;
+            for table in &materialized.intent.tables {
+                let reservation = match table {
+                    SchemaIndexTablePlan::CreateHeap { target, .. } => Some(
+                        create_physical_reservation(&materialized.intent, target, Some(false)),
+                    ),
+                    SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                        Some(schema_index_physical_reservation(
+                            &materialized.intent,
+                            replacement,
+                            Some(false),
+                        ))
+                    }
+                    SchemaIndexTablePlan::DropHeap { .. }
+                    | SchemaIndexTablePlan::InPlaceIndexDelta { .. } => None,
+                };
+                if let Some(reservation) = reservation {
+                    cleanup_staged_loser(
+                        &materialized.logical.catalog,
+                        &reservation,
+                        materialized.logical.base.incarnation,
+                    )?;
+                    first.get_or_insert(reservation);
+                }
+            }
+            if let Some(reservation) = first {
+                cleanup_prepared(
+                    &materialized.logical.catalog,
+                    &reservation,
+                    materialized.logical.base.incarnation,
+                )?;
+            }
+            (materialized.logical, None)
         }
         SchemaCompositionState::None => return Ok(()),
     };

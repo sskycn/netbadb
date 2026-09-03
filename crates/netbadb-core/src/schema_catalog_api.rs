@@ -973,6 +973,34 @@ pub(crate) fn recover_physical(
                         )
                         .map(crate::schema_mutation_journal::CompositionTablePlan::old_storage),
                 )
+                .chain(
+                    journal
+                        .compositions
+                        .values()
+                        .filter(|composition| {
+                            !matches!(
+                                composition.resolution,
+                                Some(
+                                    crate::schema_mutation_journal::CompositionResolution::Loser
+                                        | crate::schema_mutation_journal::CompositionResolution::NoEffectiveChange
+                                )
+                            )
+                        })
+                        .filter_map(|composition| composition.table_intent.as_ref())
+                        .flat_map(|intent| intent.tables.iter())
+                        .filter_map(|plan| match plan {
+                            crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap {
+                                replacement,
+                                ..
+                            } if replacement.retired => Some(replacement.old_storage()),
+                            crate::schema_mutation_journal::SchemaIndexTablePlan::DropHeap {
+                                base,
+                                retired: true,
+                                ..
+                            } => Some(base.storages[0].id),
+                            _ => None,
+                        }),
+                )
         })
         .collect::<Vec<_>>();
     let coordinator = coordinator_locator.map(|p| {
