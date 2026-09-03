@@ -24,14 +24,15 @@ use crate::schema_catalog_file as file;
 use crate::schema_mutation::{
     AlterTableOperation, AlterTableSpec, CreateTableSpec, SchemaDependency, SchemaMutationError,
     SchemaWriter, SharedMutationJournal, build_alter_target, cleanup_prepared,
-    cleanup_staged_loser, crash, digest, ensure_parent, open_winner_heap, promote,
+    cleanup_staged_loser, crash, digest, ensure_parent, open_winner_heap, promote, retarget_owner,
     validate_resource_path, write_owner,
 };
 use crate::schema_mutation_journal::{
     CompositionColumnReservation, CompositionIndexReservation, CompositionResolution,
-    CompositionTablePlan, CompositionTableReservation, CreateIntent, Reservation,
-    SchemaChangeSetIntent, SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal,
-    TableObjectChangeSetIntent, final_locator, namespace, prepared_locator, stage_locator,
+    CompositionTablePlan, CompositionTableReservation, CreateIntent, FinalizationIntent,
+    Reservation, SchemaChangeSetIntent, SchemaIndexChangeSetIntent, SchemaIndexTablePlan,
+    SchemaMutationJournal, StageResourceIntent, TableObjectChangeSetIntent, final_locator,
+    namespace, prepared_locator, stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -46,6 +47,14 @@ pub(crate) enum SchemaCompositionState {
     Composing(Box<SchemaTransactionPlan>),
     SealingAndMaterializing(Box<MaterializedSchemaTransaction>),
     Materialized(Box<MaterializedSchemaTransaction>),
+    BackfillMaterializing(Box<MaterializedSchemaTransaction>),
+    BackfillOpen(Box<MaterializedSchemaTransaction>),
+    Refining(Box<MaterializedSchemaTransaction>),
+    Finalizing(Box<MaterializedSchemaTransaction>),
+    Finalized(Box<MaterializedSchemaTransaction>),
+    BackfillOpenIndex(Box<MaterializedSchemaIndexTransaction>),
+    RefiningIndex(Box<MaterializedSchemaIndexTransaction>),
+    FinalizedIndex(Box<MaterializedSchemaIndexTransaction>),
     SealingAndMaterializingIndex(Box<MaterializedSchemaIndexTransaction>),
     MaterializedIndex(Box<MaterializedSchemaIndexTransaction>),
     SealedNoEffectiveChange(Box<SchemaTransactionPlan>),
@@ -72,6 +81,10 @@ impl SchemaCompositionState {
             self,
             Self::SealingAndMaterializing(_)
                 | Self::Materialized(_)
+                | Self::BackfillMaterializing(_)
+                | Self::Finalizing(_)
+                | Self::Finalized(_)
+                | Self::FinalizedIndex(_)
                 | Self::SealingAndMaterializingIndex(_)
                 | Self::MaterializedIndex(_)
                 | Self::SealedNoEffectiveChange(_)
@@ -88,9 +101,17 @@ impl SchemaCompositionState {
             | Self::RollbackRequiredLogical(plan) => Some(plan),
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
+            | Self::BackfillMaterializing(materialized)
+            | Self::BackfillOpen(materialized)
+            | Self::Refining(materialized)
+            | Self::Finalizing(materialized)
+            | Self::Finalized(materialized)
             | Self::RollbackRequiredMaterialized(materialized) => Some(&materialized.logical),
             Self::SealingAndMaterializingIndex(materialized)
             | Self::MaterializedIndex(materialized)
+            | Self::BackfillOpenIndex(materialized)
+            | Self::RefiningIndex(materialized)
+            | Self::FinalizedIndex(materialized)
             | Self::RollbackRequiredMaterializedIndex(materialized) => Some(&materialized.logical),
             Self::None => None,
         }
@@ -100,6 +121,9 @@ impl SchemaCompositionState {
         match self {
             Self::SealingAndMaterializingIndex(materialized)
             | Self::MaterializedIndex(materialized)
+            | Self::BackfillOpenIndex(materialized)
+            | Self::RefiningIndex(materialized)
+            | Self::FinalizedIndex(materialized)
             | Self::RollbackRequiredMaterializedIndex(materialized) => Some(materialized),
             _ => None,
         }
@@ -111,6 +135,9 @@ impl SchemaCompositionState {
         match self {
             Self::SealingAndMaterializingIndex(materialized)
             | Self::MaterializedIndex(materialized)
+            | Self::BackfillOpenIndex(materialized)
+            | Self::RefiningIndex(materialized)
+            | Self::FinalizedIndex(materialized)
             | Self::RollbackRequiredMaterializedIndex(materialized) => Some(materialized),
             _ => None,
         }
@@ -120,6 +147,11 @@ impl SchemaCompositionState {
         match self {
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
+            | Self::BackfillMaterializing(materialized)
+            | Self::BackfillOpen(materialized)
+            | Self::Refining(materialized)
+            | Self::Finalizing(materialized)
+            | Self::Finalized(materialized)
             | Self::RollbackRequiredMaterialized(materialized) => Some(materialized),
             _ => None,
         }
@@ -129,7 +161,52 @@ impl SchemaCompositionState {
         match self {
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
+            | Self::BackfillMaterializing(materialized)
+            | Self::BackfillOpen(materialized)
+            | Self::Refining(materialized)
+            | Self::Finalizing(materialized)
+            | Self::Finalized(materialized)
             | Self::RollbackRequiredMaterialized(materialized) => Some(materialized),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn backfill(&self) -> Option<&MaterializedSchemaTransaction> {
+        match self {
+            Self::BackfillMaterializing(materialized)
+            | Self::BackfillOpen(materialized)
+            | Self::Refining(materialized)
+            | Self::Finalizing(materialized)
+            | Self::Finalized(materialized) => Some(materialized),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn backfill_mut(&mut self) -> Option<&mut MaterializedSchemaTransaction> {
+        match self {
+            Self::BackfillMaterializing(materialized)
+            | Self::BackfillOpen(materialized)
+            | Self::Refining(materialized)
+            | Self::Finalizing(materialized)
+            | Self::Finalized(materialized) => Some(materialized),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn backfill_index(&self) -> Option<&MaterializedSchemaIndexTransaction> {
+        match self {
+            Self::BackfillOpenIndex(materialized)
+            | Self::RefiningIndex(materialized)
+            | Self::FinalizedIndex(materialized) => Some(materialized),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn backfill_index_mut(&mut self) -> Option<&mut MaterializedSchemaIndexTransaction> {
+        match self {
+            Self::BackfillOpenIndex(materialized)
+            | Self::RefiningIndex(materialized)
+            | Self::FinalizedIndex(materialized) => Some(materialized),
             _ => None,
         }
     }
@@ -215,6 +292,7 @@ pub(crate) struct MaterializedSchemaTransaction {
     pub(crate) reference: SchemaParticipantReference,
     pub(crate) intent: SchemaChangeSetIntent,
     pub(crate) staged: BTreeMap<StorageId, TableStorage>,
+    pub(crate) backfill: bool,
 }
 
 #[derive(Debug)]
@@ -232,6 +310,7 @@ pub(crate) struct MaterializedSchemaIndexTransaction {
     pub(crate) intent: TableObjectChangeSetIntent,
     pub(crate) staged: BTreeMap<StorageId, TableStorage>,
     pub(crate) publications: Vec<IndexPublication>,
+    pub(crate) backfill: bool,
 }
 
 impl MaterializedSchemaIndexTransaction {
@@ -372,10 +451,568 @@ impl Database {
         transaction: &mut Transaction,
         spec: AlterTableSpec,
     ) -> Result<(), DatabaseError> {
+        if matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::BackfillOpen(_)
+                | SchemaCompositionState::Refining(_)
+                | SchemaCompositionState::BackfillOpenIndex(_)
+                | SchemaCompositionState::RefiningIndex(_)
+        ) {
+            if transaction.schema_composition.backfill_index().is_some() {
+                return self.apply_created_backfill_refinement(transaction, spec);
+            }
+            return self.apply_backfill_refinement(transaction, spec);
+        }
         self.ensure_composition_started(transaction)?;
         let result = self.apply_composed_alter(transaction, spec);
         self.handle_composition_accept_result(transaction, &result);
         result
+    }
+
+    fn apply_backfill_refinement(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        let materialized = transaction
+            .schema_composition
+            .backfill()
+            .ok_or(SchemaMutationError::Corrupt("backfill state absent"))?;
+        let table_id = spec.target.table_id;
+        if materialized.logical.dependency(table_id)? != spec.target {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let touched = materialized
+            .logical
+            .touched
+            .get(&table_id)
+            .ok_or(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::MultipleTargets,
+            ))?
+            .clone();
+        let current = materialized
+            .logical
+            .overlay
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == table_id)
+            .cloned()
+            .ok_or(SchemaMutationError::TableNotFound(table_id))?;
+        let visible_schema = materialized.logical.overlay.schema.clone();
+        let column_id = match spec.operation {
+            AlterTableOperation::RenameTable { .. } => None,
+            AlterTableOperation::RenameColumn { column_id, .. }
+            | AlterTableOperation::SetNotNull { column_id }
+            | AlterTableOperation::DropNotNull { column_id } => Some(column_id),
+            AlterTableOperation::AddNullableColumn { .. }
+            | AlterTableOperation::DropColumn { .. }
+            | AlterTableOperation::ChangeNominalType { .. } => {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+        };
+        if let Some(column_id) = column_id {
+            if current.column_by_id(column_id).is_none() {
+                return Err(SchemaMutationError::ColumnNotFound(column_id).into());
+            }
+            if matches!(
+                spec.operation,
+                AlterTableOperation::SetNotNull { .. } | AlterTableOperation::DropNotNull { .. }
+            ) && touched
+                .indexes
+                .active
+                .iter()
+                .any(|index| index.column_id == column_id)
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::IndexedNullability(column_id),
+                )
+                .into());
+            }
+        }
+        if matches!(spec.operation, AlterTableOperation::SetNotNull { .. }) {
+            let column_id = column_id.ok_or(SchemaMutationError::Corrupt(
+                "SET NOT NULL column identity absent",
+            ))?;
+            self.validate_backfill_not_null(transaction, table_id, column_id)?;
+        }
+        let candidate = build_alter_target(&current, &spec.operation, None)?;
+        let schema = Schema::new(
+            visible_schema
+                .tables()
+                .iter()
+                .map(|table| {
+                    if table.id == table_id {
+                        candidate.clone()
+                    } else {
+                        table.clone()
+                    }
+                })
+                .collect(),
+        )?;
+        let materialized = transaction
+            .schema_composition
+            .backfill_mut()
+            .ok_or(SchemaMutationError::Corrupt("backfill state disappeared"))?;
+        materialized.logical.overlay.schema = schema.clone();
+        materialized.target.committed.schema = schema;
+        if let Some(placement) = materialized
+            .target
+            .placements
+            .tables
+            .iter_mut()
+            .find(|placement| placement.table_id == table_id)
+        {
+            placement.schema_fingerprint = candidate.fingerprint()?;
+        }
+        let table_plan = materialized
+            .intent
+            .tables
+            .iter_mut()
+            .find(|plan| plan.table() == table_id)
+            .ok_or(SchemaMutationError::Corrupt("backfill table plan absent"))?;
+        table_plan.target.committed.schema = Schema::new(vec![candidate.clone()])?;
+        table_plan.target.placements.tables[0].schema_fingerprint = candidate.fingerprint()?;
+        table_plan.target.storages[0].table_id = table_id;
+        transaction.schema_composition = match std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        ) {
+            SchemaCompositionState::BackfillOpen(materialized) => {
+                SchemaCompositionState::Refining(materialized)
+            }
+            SchemaCompositionState::Refining(materialized) => {
+                SchemaCompositionState::Refining(materialized)
+            }
+            other => other,
+        };
+        Ok(())
+    }
+
+    fn apply_created_backfill_refinement(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        let (table_id, current, visible_schema) = {
+            let materialized = transaction.schema_composition.backfill_index().ok_or(
+                SchemaMutationError::Corrupt("created backfill state absent"),
+            )?;
+            let table_id = spec.target.table_id;
+            if materialized.logical.dependency(table_id)? != spec.target {
+                return Err(SchemaMutationError::StaleSchemaDependency.into());
+            }
+            let current = materialized
+                .logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == table_id)
+                .cloned()
+                .ok_or(SchemaMutationError::TableNotFound(table_id))?;
+            (
+                table_id,
+                current,
+                materialized.logical.overlay.schema.clone(),
+            )
+        };
+        let column_id = match spec.operation {
+            AlterTableOperation::RenameTable { .. } => None,
+            AlterTableOperation::RenameColumn { column_id, .. }
+            | AlterTableOperation::SetNotNull { column_id }
+            | AlterTableOperation::DropNotNull { column_id } => Some(column_id),
+            _ => {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+        };
+        if let Some(column_id) = column_id {
+            if current.column_by_id(column_id).is_none() {
+                return Err(SchemaMutationError::ColumnNotFound(column_id).into());
+            }
+        }
+        if let Some(column_id) =
+            column_id.filter(|_| matches!(&spec.operation, AlterTableOperation::SetNotNull { .. }))
+        {
+            self.validate_backfill_not_null(transaction, table_id, column_id)?;
+        }
+        let candidate = build_alter_target(&current, &spec.operation, None)?;
+        let schema = Schema::new(
+            visible_schema
+                .tables()
+                .iter()
+                .map(|table| {
+                    if table.id == table_id {
+                        candidate.clone()
+                    } else {
+                        table.clone()
+                    }
+                })
+                .collect(),
+        )?;
+        let materialized = transaction.schema_composition.backfill_index_mut().ok_or(
+            SchemaMutationError::Corrupt("created backfill state disappeared"),
+        )?;
+        materialized.logical.overlay.schema = schema.clone();
+        if let Some(target) = materialized.target.as_mut() {
+            target.committed.schema = schema;
+            if let Some(placement) = target
+                .placements
+                .tables
+                .iter_mut()
+                .find(|placement| placement.table_id == table_id)
+            {
+                placement.schema_fingerprint = candidate.fingerprint()?;
+            }
+        }
+        let plan = materialized
+            .intent
+            .tables
+            .iter_mut()
+            .find_map(|plan| match plan {
+                SchemaIndexTablePlan::CreateHeap { target, .. }
+                    if target.committed.schema.tables()[0].id == table_id =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            })
+            .ok_or(SchemaMutationError::Corrupt(
+                "created backfill table plan absent",
+            ))?;
+        plan.committed.schema = Schema::new(vec![candidate.clone()])?;
+        plan.placements.tables[0].schema_fingerprint = candidate.fingerprint()?;
+        let target_bytes = materialized
+            .target
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt(
+                "created backfill target absent",
+            ))?
+            .encode()?;
+        materialized.intent.snapshot_digest = digest(&target_bytes);
+        if let Some(reference) = materialized.reference.as_mut() {
+            reference.digest = materialized.intent.snapshot_digest;
+        }
+        transaction.schema_composition = match std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        ) {
+            SchemaCompositionState::BackfillOpenIndex(materialized) => {
+                SchemaCompositionState::RefiningIndex(materialized)
+            }
+            SchemaCompositionState::RefiningIndex(materialized) => {
+                SchemaCompositionState::RefiningIndex(materialized)
+            }
+            other => other,
+        };
+        Ok(())
+    }
+
+    fn validate_backfill_not_null(
+        &mut self,
+        transaction: &mut Transaction,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DatabaseError> {
+        let storage_id =
+            transaction
+                .staged_binding(table_id)
+                .ok_or(SchemaMutationError::Corrupt(
+                    "backfill staged binding absent",
+                ))?;
+        let view = transaction.begin_read_view(&[storage_id], &mut self.registry)?;
+        let storage_view = view
+            .iter()
+            .find_map(|(id, view)| (id == storage_id).then_some(view))
+            .ok_or(SchemaMutationError::Corrupt("backfill staged view absent"))?;
+        let storage = transaction
+            .execution_staged_storages_mut()
+            .into_iter()
+            .find(|storage| storage.storage_id() == storage_id)
+            .ok_or(SchemaMutationError::Corrupt("backfill staged Heap absent"))?;
+        if storage
+            .scan_columns_with_view(&[column_id], storage_view)?
+            .iter()
+            .any(|(_, values)| {
+                values
+                    .iter()
+                    .any(|value| matches!(value, ScalarValue::Null))
+            })
+        {
+            return Err(SchemaMutationError::NotNullViolation(column_id).into());
+        }
+        Ok(())
+    }
+
+    /// Closes the open backfill after all compatible DDL has been accepted.
+    /// The staged Heap is retargeted in place, then the final NBSC digest used
+    /// by the existing coordinator path is refreshed.  No row or index page is
+    /// copied a second time.
+    pub(crate) fn finalize_backfill(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        if transaction.schema_composition.backfill_index().is_some() {
+            return self.finalize_created_backfill(transaction);
+        }
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        let mut materialized = match previous {
+            SchemaCompositionState::BackfillOpen(materialized)
+            | SchemaCompositionState::Refining(materialized) => materialized,
+            other => {
+                transaction.schema_composition = other;
+                return Ok(());
+            }
+        };
+        if !materialized.backfill {
+            transaction.schema_composition = SchemaCompositionState::Finalized(materialized);
+            return Ok(());
+        }
+        let result = (|| {
+            let plan = materialized
+                .intent
+                .tables
+                .first()
+                .ok_or(SchemaMutationError::Corrupt("backfill table plan absent"))?;
+            let storage_id = plan.new_storage();
+            let final_table = materialized
+                .target
+                .committed
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == plan.table())
+                .cloned()
+                .ok_or(SchemaMutationError::TableNotFound(plan.table()))?;
+            let storage = materialized
+                .staged
+                .get_mut(&storage_id)
+                .ok_or(SchemaMutationError::Corrupt("backfill staged Heap absent"))?;
+            let expected = storage.table().clone();
+            let old_fingerprint = expected.fingerprint()?;
+            crash("backfill-before-retarget");
+            let owner = file::resolve(
+                &materialized.logical.catalog,
+                &stage_locator(
+                    &materialized.logical.catalog,
+                    materialized.target.incarnation,
+                    materialized.intent.transaction,
+                    storage_id,
+                )?,
+            );
+            storage.retarget_private_schema(&expected, final_table)?;
+            crash("backfill-after-heap-retarget");
+            retarget_owner(
+                &file::suffix(&owner, ".owner"),
+                materialized.target.incarnation,
+                materialized.intent.transaction,
+                plan.table(),
+                storage_id,
+                old_fingerprint,
+                storage.table().fingerprint()?,
+            )?;
+            crash("backfill-after-owner-retarget");
+            materialized.target.validate()?;
+            let target_bytes = materialized.target.encode()?;
+            materialized.intent.snapshot_digest = digest(&target_bytes);
+            materialized.reference.digest = materialized.intent.snapshot_digest;
+            materialized
+                .logical
+                .journal
+                .borrow_mut()
+                .replace_composition_intent(materialized.intent.clone())?;
+            crash("backfill-before-finalization-intent");
+            materialized
+                .logical
+                .journal
+                .borrow_mut()
+                .finalization_intent(FinalizationIntent {
+                    transaction: materialized.intent.transaction,
+                    table: plan.table(),
+                    storage: storage_id,
+                    final_snapshot: materialized.target.clone(),
+                    stage_locator: stage_locator(
+                        &materialized.logical.catalog,
+                        materialized.target.incarnation,
+                        materialized.intent.transaction,
+                        storage_id,
+                    )?,
+                    final_locator: final_locator(
+                        &materialized.logical.catalog,
+                        materialized.target.incarnation,
+                        storage_id,
+                    )?,
+                    digest: materialized.intent.snapshot_digest,
+                })?;
+            crash("backfill-finalization-intent-durable");
+            Ok::<(), DatabaseError>(())
+        })();
+        match result {
+            Ok(()) => {
+                transaction.schema_composition = SchemaCompositionState::Finalized(materialized);
+                Ok(())
+            }
+            Err(error) => {
+                transaction.schema_composition = SchemaCompositionState::Finalizing(materialized);
+                transaction.require_schema_rollback();
+                Err(error)
+            }
+        }
+    }
+
+    fn finalize_created_backfill(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        let mut materialized = match previous {
+            SchemaCompositionState::BackfillOpenIndex(materialized)
+            | SchemaCompositionState::RefiningIndex(materialized) => materialized,
+            other => {
+                transaction.schema_composition = other;
+                return Ok(());
+            }
+        };
+        if !materialized.backfill {
+            transaction.schema_composition = SchemaCompositionState::FinalizedIndex(materialized);
+            return Ok(());
+        }
+        let result = (|| {
+            let (table_id, storage_id, final_table) = {
+                let plan = materialized
+                    .intent
+                    .tables
+                    .first()
+                    .ok_or(SchemaMutationError::Corrupt("created backfill plan absent"))?;
+                let table_id = plan.table();
+                let storage_id = plan
+                    .participant_storage()
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "created backfill storage absent",
+                    ))?;
+                let final_table = materialized
+                    .target
+                    .as_ref()
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "created backfill target absent",
+                    ))?
+                    .committed
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == table_id)
+                    .cloned()
+                    .ok_or(SchemaMutationError::TableNotFound(table_id))?;
+                (table_id, storage_id, final_table)
+            };
+            let expected = materialized
+                .staged
+                .get(&storage_id)
+                .ok_or(SchemaMutationError::Corrupt("created staged Heap absent"))?
+                .table()
+                .clone();
+            let old_fingerprint = expected.fingerprint()?;
+            crash("backfill-before-retarget");
+            let owner = file::resolve(
+                &materialized.logical.catalog,
+                &stage_locator(
+                    &materialized.logical.catalog,
+                    materialized.logical.base.incarnation,
+                    materialized.intent.transaction,
+                    storage_id,
+                )?,
+            );
+            materialized
+                .staged
+                .get_mut(&storage_id)
+                .ok_or(SchemaMutationError::Corrupt("created staged Heap absent"))?
+                .retarget_private_schema(&expected, final_table)?;
+            crash("backfill-after-heap-retarget");
+            let new_fingerprint = materialized
+                .staged
+                .get(&storage_id)
+                .ok_or(SchemaMutationError::Corrupt("created staged Heap absent"))?
+                .table()
+                .fingerprint()?;
+            retarget_owner(
+                &file::suffix(&owner, ".owner"),
+                materialized.logical.base.incarnation,
+                materialized.intent.transaction,
+                table_id,
+                storage_id,
+                old_fingerprint,
+                new_fingerprint,
+            )?;
+            crash("backfill-after-owner-retarget");
+            let target = materialized
+                .target
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "created backfill target absent",
+                ))?;
+            let target_bytes = target.encode()?;
+            materialized.intent.snapshot_digest = digest(&target_bytes);
+            if let Some(reference) = materialized.reference.as_mut() {
+                reference.digest = materialized.intent.snapshot_digest;
+            }
+            materialized
+                .logical
+                .journal
+                .borrow_mut()
+                .replace_table_object_intent(materialized.intent.clone())?;
+            crash("backfill-before-finalization-intent");
+            materialized
+                .logical
+                .journal
+                .borrow_mut()
+                .finalization_intent(FinalizationIntent {
+                    transaction: materialized.intent.transaction,
+                    table: table_id,
+                    storage: storage_id,
+                    final_snapshot: materialized.target.clone().ok_or(
+                        SchemaMutationError::Corrupt("created backfill target absent"),
+                    )?,
+                    stage_locator: stage_locator(
+                        &materialized.logical.catalog,
+                        materialized.logical.base.incarnation,
+                        materialized.intent.transaction,
+                        storage_id,
+                    )?,
+                    final_locator: final_locator(
+                        &materialized.logical.catalog,
+                        materialized.logical.base.incarnation,
+                        storage_id,
+                    )?,
+                    digest: materialized.intent.snapshot_digest,
+                })?;
+            crash("backfill-finalization-intent-durable");
+            Ok::<(), DatabaseError>(())
+        })();
+        match result {
+            Ok(()) => {
+                transaction.schema_composition =
+                    SchemaCompositionState::FinalizedIndex(materialized);
+                Ok(())
+            }
+            Err(error) => {
+                transaction.schema_composition =
+                    SchemaCompositionState::RefiningIndex(materialized);
+                transaction.require_schema_rollback();
+                Err(error)
+            }
+        }
     }
 
     fn ensure_composition_started(
@@ -405,6 +1042,17 @@ impl Database {
             transaction.schema_composition = SchemaCompositionState::Composing(Box::new(plan));
         }
         Ok(())
+    }
+
+    pub(crate) fn is_backfill_candidate(logical: &SchemaTransactionPlan) -> bool {
+        logical.table_actions == 0
+            && logical.index_actions == 0
+            && logical.created.is_empty()
+            && logical.touched.len() == 1
+            && logical.touched.values().all(|table| {
+                matches!(table.descriptor.kind, CatalogStorageKind::Heap)
+                    && matches!(table.catalog_table.placement, TablePlacement::Single { .. })
+            })
     }
 
     fn handle_composition_accept_result<T>(
@@ -924,6 +1572,27 @@ impl Database {
                 }
             }
         }
+        let indexed_nullability = match &spec.operation {
+            AlterTableOperation::SetNotNull { column_id }
+            | AlterTableOperation::DropNotNull { column_id } => Some(*column_id),
+            _ => None,
+        };
+        if indexed_nullability.is_some_and(|column_id| {
+            touched
+                .indexes
+                .active
+                .iter()
+                .any(|index| index.column_id == column_id)
+        }) {
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::IndexedNullability(
+                    indexed_nullability.ok_or(SchemaMutationError::Corrupt(
+                        "indexed nullability column absent",
+                    ))?,
+                ),
+            )
+            .into());
+        }
         if let AlterTableOperation::SetNotNull { column_id } = &spec.operation {
             self.validate_composed_not_null(&touched, *column_id)?;
         }
@@ -1398,6 +2067,14 @@ impl Database {
         &mut self,
         transaction: &mut Transaction,
     ) -> Result<(), DatabaseError> {
+        self.ensure_schema_materialized_with_backfill(transaction, false)
+    }
+
+    pub(crate) fn ensure_schema_materialized_with_backfill(
+        &mut self,
+        transaction: &mut Transaction,
+        activate_backfill: bool,
+    ) -> Result<(), DatabaseError> {
         if !transaction.schema_composition.is_composing() {
             return Ok(());
         }
@@ -1410,9 +2087,9 @@ impl Database {
         };
         let rollback_logical = logical.clone();
         let materialized = if logical.table_actions > 0 {
-            self.materialize_table_object_composition(transaction, *logical)
+            self.materialize_table_object_composition(transaction, *logical, activate_backfill)
         } else if logical.index_actions == 0 {
-            self.materialize_schema_composition(transaction, *logical)
+            self.materialize_schema_composition(transaction, *logical, activate_backfill)
         } else {
             self.materialize_schema_index_composition(transaction, *logical)
         };
@@ -1445,7 +2122,9 @@ impl Database {
         &mut self,
         transaction: &mut Transaction,
         logical: SchemaTransactionPlan,
+        activate_backfill: bool,
     ) -> Result<(), DatabaseError> {
+        let backfill = activate_backfill && Self::is_backfill_candidate(&logical);
         let effective = logical
             .touched
             .iter()
@@ -1616,6 +2295,38 @@ impl Database {
             };
         }
         crash("composition-intent-durable");
+        if backfill {
+            let table_plan = intent
+                .tables
+                .first()
+                .ok_or(SchemaMutationError::Corrupt("backfill table plan absent"))?;
+            let stage_path = stage_locator(
+                &logical.catalog,
+                logical.base.incarnation,
+                intent.transaction,
+                table_plan.new_storage(),
+            )?;
+            let final_path = final_locator(
+                &logical.catalog,
+                logical.base.incarnation,
+                table_plan.new_storage(),
+            )?;
+            logical
+                .journal
+                .borrow_mut()
+                .stage_resource_intent(StageResourceIntent {
+                    transaction: intent.transaction,
+                    table: table_plan.table(),
+                    storage: table_plan.new_storage(),
+                    base_generation: intent.base_generation,
+                    base_epoch: intent.base_epoch,
+                    provisional: table_plan.target.clone(),
+                    stage_locator: stage_path,
+                    final_locator: final_path,
+                    digest: digest(&table_plan.target.encode()?),
+                })?;
+            crash("backfill-stage-intent-durable");
+        }
 
         let coordinator = match &self.coordinator {
             Some(coordinator) => Rc::clone(coordinator),
@@ -1640,15 +2351,19 @@ impl Database {
             target_epoch,
             digest: intent.snapshot_digest,
         };
-        transaction.schema_composition = SchemaCompositionState::SealingAndMaterializing(Box::new(
-            MaterializedSchemaTransaction {
-                logical,
-                target,
-                reference,
-                intent: intent.clone(),
-                staged: BTreeMap::new(),
-            },
-        ));
+        let materialized = MaterializedSchemaTransaction {
+            logical,
+            target,
+            reference,
+            intent: intent.clone(),
+            staged: BTreeMap::new(),
+            backfill,
+        };
+        transaction.schema_composition = if backfill {
+            SchemaCompositionState::BackfillMaterializing(Box::new(materialized))
+        } else {
+            SchemaCompositionState::SealingAndMaterializing(Box::new(materialized))
+        };
 
         for (position, table_plan) in intent.tables.iter().enumerate() {
             let table_id = table_plan.table();
@@ -1768,10 +2483,20 @@ impl Database {
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
         );
-        let SchemaCompositionState::SealingAndMaterializing(materialized) = previous else {
-            return Err(SchemaMutationError::Corrupt("composition materialization state").into());
+        let (materialized, backfill) = match previous {
+            SchemaCompositionState::SealingAndMaterializing(materialized) => (materialized, false),
+            SchemaCompositionState::BackfillMaterializing(materialized) => (materialized, true),
+            _ => {
+                return Err(
+                    SchemaMutationError::Corrupt("composition materialization state").into(),
+                );
+            }
         };
-        transaction.schema_composition = SchemaCompositionState::Materialized(materialized);
+        transaction.schema_composition = if backfill {
+            SchemaCompositionState::BackfillOpen(materialized)
+        } else {
+            SchemaCompositionState::Materialized(materialized)
+        };
         Ok(())
     }
 
@@ -1779,7 +2504,13 @@ impl Database {
         &mut self,
         transaction: &mut Transaction,
         logical: SchemaTransactionPlan,
+        activate_backfill: bool,
     ) -> Result<(), DatabaseError> {
+        let backfill = activate_backfill
+            && logical.created.len() == 1
+            && logical.touched.is_empty()
+            && logical.index_actions == 0
+            && logical.created.values().all(|created| created.present);
         let schema_dirty = logical.created.values().any(|created| created.present)
             || logical.touched.iter().any(|(table_id, touched)| {
                 logical
@@ -2064,6 +2795,42 @@ impl Database {
             };
         }
         crash("composition-intent-durable");
+        if backfill {
+            let (table_id, storage, provisional) = match intent.tables.first() {
+                Some(SchemaIndexTablePlan::CreateHeap { target, .. }) => (
+                    intent.tables[0].table(),
+                    target.storages[0].id,
+                    target.as_ref().clone(),
+                ),
+                _ => {
+                    return Err(SchemaMutationError::Corrupt("created backfill plan absent").into());
+                }
+            };
+            logical
+                .journal
+                .borrow_mut()
+                .stage_resource_intent(StageResourceIntent {
+                    transaction: intent.transaction,
+                    table: table_id,
+                    storage,
+                    base_generation: intent.base_generation,
+                    base_epoch: intent.base_epoch,
+                    provisional: provisional.clone(),
+                    stage_locator: stage_locator(
+                        &logical.catalog,
+                        logical.base.incarnation,
+                        intent.transaction,
+                        storage,
+                    )?,
+                    final_locator: final_locator(
+                        &logical.catalog,
+                        logical.base.incarnation,
+                        storage,
+                    )?,
+                    digest: digest(&provisional.encode()?),
+                })?;
+            crash("backfill-stage-intent-durable");
+        }
         let coordinator = match &self.coordinator {
             Some(coordinator) => Rc::clone(coordinator),
             None => {
@@ -2095,6 +2862,7 @@ impl Database {
                 intent: intent.clone(),
                 staged: BTreeMap::new(),
                 publications: Vec::new(),
+                backfill,
             }),
         );
         for (position, plan) in intent.tables.iter().enumerate() {
@@ -2143,7 +2911,11 @@ impl Database {
         let SchemaCompositionState::SealingAndMaterializingIndex(materialized) = previous else {
             return Err(SchemaMutationError::Corrupt("table-object materialization state").into());
         };
-        transaction.schema_composition = SchemaCompositionState::MaterializedIndex(materialized);
+        transaction.schema_composition = if backfill {
+            SchemaCompositionState::BackfillOpenIndex(materialized)
+        } else {
+            SchemaCompositionState::MaterializedIndex(materialized)
+        };
         Ok(())
     }
 
@@ -2415,6 +3187,7 @@ impl Database {
                 intent: intent.clone().into(),
                 staged: BTreeMap::new(),
                 publications: Vec::new(),
+                backfill: false,
             }),
         );
 
@@ -2739,9 +3512,14 @@ impl Database {
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
         );
-        let SchemaCompositionState::Materialized(mut materialized) = state else {
-            transaction.schema_composition = state;
-            return Err(SchemaMutationError::Corrupt("materialized composition absent").into());
+        let mut materialized = match state {
+            SchemaCompositionState::Materialized(materialized)
+            | SchemaCompositionState::BackfillOpen(materialized)
+            | SchemaCompositionState::Finalized(materialized) => materialized,
+            state => {
+                transaction.schema_composition = state;
+                return Err(SchemaMutationError::Corrupt("materialized composition absent").into());
+            }
         };
         let completion =
             (|| -> Result<CompositionCompletion, DatabaseError> {
@@ -2862,12 +3640,16 @@ impl Database {
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
         );
-        let SchemaCompositionState::MaterializedIndex(mut materialized) = state else {
-            transaction.schema_composition = state;
-            return Err(SchemaMutationError::Corrupt(
-                "materialized schema/index composition absent",
-            )
-            .into());
+        let mut materialized = match state {
+            SchemaCompositionState::MaterializedIndex(materialized)
+            | SchemaCompositionState::FinalizedIndex(materialized) => materialized,
+            state => {
+                transaction.schema_composition = state;
+                return Err(SchemaMutationError::Corrupt(
+                    "materialized schema/index composition absent",
+                )
+                .into());
+            }
         };
         let completion = (|| -> Result<_, DatabaseError> {
             for storage in materialized.staged.values() {
@@ -3235,6 +4017,11 @@ pub(crate) fn cleanup_composition_loser(
         | SchemaCompositionState::RollbackRequiredLogical(plan) => (*plan, None),
         SchemaCompositionState::SealingAndMaterializing(mut materialized)
         | SchemaCompositionState::Materialized(mut materialized)
+        | SchemaCompositionState::BackfillMaterializing(mut materialized)
+        | SchemaCompositionState::BackfillOpen(mut materialized)
+        | SchemaCompositionState::Refining(mut materialized)
+        | SchemaCompositionState::Finalizing(mut materialized)
+        | SchemaCompositionState::Finalized(mut materialized)
         | SchemaCompositionState::RollbackRequiredMaterialized(mut materialized) => {
             materialized.staged.clear();
             let intent = materialized.intent.clone();
@@ -3242,6 +4029,9 @@ pub(crate) fn cleanup_composition_loser(
         }
         SchemaCompositionState::SealingAndMaterializingIndex(mut materialized)
         | SchemaCompositionState::MaterializedIndex(mut materialized)
+        | SchemaCompositionState::BackfillOpenIndex(mut materialized)
+        | SchemaCompositionState::RefiningIndex(mut materialized)
+        | SchemaCompositionState::FinalizedIndex(mut materialized)
         | SchemaCompositionState::RollbackRequiredMaterializedIndex(mut materialized) => {
             materialized.staged.clear();
             let mut first = None;

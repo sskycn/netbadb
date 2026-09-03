@@ -47,7 +47,7 @@ fn rows(result: ExecutionResult) -> Vec<Vec<ScalarValue>> {
 }
 
 #[test]
-fn staged_backfill_is_read_your_writes_but_production_refinement_is_sealed() {
+fn staged_backfill_is_read_your_writes_and_allows_compatible_refinement() {
     let root = root("staged-backfill");
     let mut db = seed(&root);
     let projects = db.schema().table("projects").unwrap().id;
@@ -119,6 +119,21 @@ fn staged_backfill_is_read_your_writes_but_production_refinement_is_sealed() {
             SchemaMutationError::NotNullViolation(column)
         )) if column == normalized
     ));
+    let error = db
+        .execute_in(
+            &mut transaction,
+            "ALTER TABLE projects ALTER COLUMN normalized_name SET NOT NULL",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DatabaseError::SchemaMutation(SchemaMutationError::NotNullViolation(column))
+            if column == normalized
+    ));
+    assert!(matches!(
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::BackfillOpen(_)
+    ));
 
     db.execute_in(
         &mut transaction,
@@ -176,15 +191,24 @@ fn staged_backfill_is_read_your_writes_but_production_refinement_is_sealed() {
         refined.fingerprint().unwrap()
     );
 
-    let error = db
-        .execute_in(
-            &mut transaction,
-            "ALTER TABLE projects ALTER COLUMN normalized_name SET NOT NULL",
-        )
-        .unwrap_err();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ALTER COLUMN normalized_name SET NOT NULL",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects RENAME COLUMN normalized_name TO canonical_name",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects RENAME TO filled_projects",
+    )
+    .unwrap();
     assert!(matches!(
-        error,
-        DatabaseError::SchemaMutation(SchemaMutationError::SchemaMutationAfterMaterialization)
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::Refining(_)
     ));
     assert_eq!(transaction.state(), TransactionState::Active);
     assert!(matches!(
@@ -194,18 +218,22 @@ fn staged_backfill_is_read_your_writes_but_production_refinement_is_sealed() {
         ))
     ));
 
-    transaction.rollback().unwrap();
-    assert_eq!(db.schema_generation(), base_generation);
-    assert_eq!(db.bindings.resolve_single(projects), Ok(base_storage));
+    db.commit_transaction(&mut transaction).unwrap();
+    assert_eq!(
+        db.schema_generation(),
+        SchemaGeneration(base_generation.0 + 1)
+    );
+    assert_ne!(db.bindings.resolve_single(projects), Ok(base_storage));
     assert!(
-        db.schema()
-            .table("projects")
+        !db.schema()
+            .table("filled_projects")
             .unwrap()
-            .column("normalized_name")
-            .is_none()
+            .column("canonical_name")
+            .unwrap()
+            .nullable
     );
     assert_eq!(
-        db.query("SELECT id, name FROM projects ORDER BY id")
+        db.query("SELECT id, name FROM filled_projects ORDER BY id")
             .unwrap()
             .rows,
         vec![
@@ -220,10 +248,10 @@ fn staged_backfill_is_read_your_writes_but_production_refinement_is_sealed() {
         assert!(
             reopened
                 .schema()
-                .table("projects")
+                .table("filled_projects")
                 .unwrap()
-                .column("normalized_name")
-                .is_none()
+                .column("canonical_name")
+                .is_some_and(|column| !column.nullable)
         );
         reopened.close().unwrap();
     }
@@ -231,7 +259,7 @@ fn staged_backfill_is_read_your_writes_but_production_refinement_is_sealed() {
 }
 
 #[test]
-fn transaction_created_heap_reads_own_rows_before_sealed_refinement_rejection() {
+fn transaction_created_heap_reads_own_rows_before_compatible_refinement() {
     let root = root("created-backfill");
     let mut db = seed(&root);
     let mut transaction = db.begin_transaction().unwrap();
@@ -252,18 +280,17 @@ fn transaction_created_heap_reads_own_rows_before_sealed_refinement_rejection() 
             ScalarValue::Text("seven".into())
         ]]
     );
-    let error = db
-        .execute_in(
-            &mut transaction,
-            "ALTER TABLE imported ALTER COLUMN label SET NOT NULL",
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        DatabaseError::SchemaMutation(SchemaMutationError::SchemaMutationAfterMaterialization)
-    ));
-    transaction.rollback().unwrap();
-    assert!(db.schema().table("imported").is_none());
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE imported ALTER COLUMN label SET NOT NULL",
+    )
+    .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    assert!(
+        db.schema()
+            .table("imported")
+            .is_some_and(|table| !table.column("label").unwrap().nullable)
+    );
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -348,5 +375,183 @@ fn predecision_crash_discards_private_backfill_and_preserves_base_winner() {
         );
         reopened.close().unwrap();
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn backfill_retarget_crash_matrix_has_one_base_or_final_winner() {
+    let points = [
+        ("backfill-before-retarget", false),
+        ("backfill-after-heap-retarget", false),
+        ("backfill-after-owner-retarget", false),
+        ("backfill-before-finalization-intent", false),
+        ("backfill-finalization-intent-durable", false),
+        ("backfill-participants-prepared", false),
+        ("backfill-before-coordinator-decision", false),
+        ("before-coordinator-decision", false),
+        ("coordinator-durable", true),
+        ("staged-heap-committed", true),
+    ];
+    for (point, final_winner) in points {
+        let root = root(&format!("backfill-crash-{point}"));
+        let seeded = seed(&root);
+        let projects = seeded.schema().table("projects").unwrap().id;
+        let base_storage = seeded.bindings.resolve_single(projects).unwrap();
+        seeded.close().unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "migration_backfill_audit_tests::backfill_retarget_crash_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_ROUND32_BACKFILL_CHILD", &root)
+            .env("NETBADB_BACKFILL_CRASH_POINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(90),
+            "{point}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+            let table = reopened.schema().table("projects").unwrap();
+            if final_winner {
+                assert!(!table.column("normalized_name").unwrap().nullable);
+                assert_ne!(reopened.bindings.resolve_single(projects), Ok(base_storage));
+                assert_eq!(
+                    reopened
+                        .query("SELECT id, normalized_name FROM projects ORDER BY id")
+                        .unwrap()
+                        .rows,
+                    vec![
+                        vec![ScalarValue::Int64(1), ScalarValue::Text("filled".into())],
+                        vec![ScalarValue::Int64(2), ScalarValue::Text("filled".into())],
+                    ]
+                );
+            } else {
+                assert!(table.column("normalized_name").is_none());
+                assert_eq!(reopened.bindings.resolve_single(projects), Ok(base_storage));
+                assert_eq!(
+                    reopened
+                        .query("SELECT id, name FROM projects ORDER BY id")
+                        .unwrap()
+                        .rows,
+                    vec![
+                        vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                        vec![ScalarValue::Int64(2), ScalarValue::Text("two".into())],
+                    ]
+                );
+            }
+            reopened.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn backfill_retarget_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_ROUND32_BACKFILL_CHILD") else {
+        return;
+    };
+    let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ADD COLUMN normalized_name TEXT",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE projects SET normalized_name = 'filled'",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ALTER COLUMN normalized_name SET NOT NULL",
+    )
+    .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+}
+
+#[test]
+fn backfill_phase_rejects_layout_changes_and_data_access_after_refinement() {
+    let root = root("backfill-boundaries");
+    let mut db = seed(&root);
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ADD COLUMN normalized_name TEXT",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE projects SET normalized_name = 'filled'",
+    )
+    .unwrap();
+    let error = db
+        .execute_in(
+            &mut transaction,
+            "ALTER TABLE projects ADD COLUMN rejected TEXT",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DatabaseError::SchemaMutation(SchemaMutationError::UnsupportedBackfillRefinement(_))
+    ));
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ALTER COLUMN normalized_name SET NOT NULL",
+    )
+    .unwrap();
+    let error = db
+        .execute_in(
+            &mut transaction,
+            "UPDATE projects SET normalized_name = 'changed'",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DatabaseError::SchemaMutation(SchemaMutationError::MigrationDataAccessAfterRefinement)
+    ));
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn backfill_phase_rejects_indexed_nullability_refinement() {
+    let root = root("backfill-indexed-nullability");
+    let mut db = seed(&root);
+    db.execute("CREATE INDEX projects_name_idx ON projects (name)")
+        .unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE projects ADD COLUMN normalized_name TEXT",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE projects SET normalized_name = 'filled'",
+    )
+    .unwrap();
+    let error = db
+        .execute_in(
+            &mut transaction,
+            "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DatabaseError::SchemaMutation(SchemaMutationError::UnsupportedBackfillRefinement(
+            schema_mutation::BackfillRefinementReason::IndexedNullability(_)
+        ))
+    ));
+    transaction.rollback().unwrap();
+    db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

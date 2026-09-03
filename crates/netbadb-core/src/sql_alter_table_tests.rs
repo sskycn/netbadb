@@ -1513,15 +1513,32 @@ fn six_sql_alters_use_one_rewrite_lifecycle_and_preserve_logical_identities() {
     db.commit_transaction(&mut add).unwrap();
     drop(add);
 
-    for sql in [
-        "ALTER TABLE projects RENAME COLUMN name TO title",
-        "ALTER TABLE projects ALTER COLUMN title SET NOT NULL",
-        "ALTER TABLE projects ALTER COLUMN title DROP NOT NULL",
-        "ALTER TABLE projects DROP COLUMN active",
-        "ALTER TABLE projects RENAME TO work",
-    ] {
-        assert_eq!(db.execute(sql).unwrap(), ExecutionResult::AffectedRows(0));
-    }
+    assert_eq!(
+        db.execute("ALTER TABLE projects RENAME COLUMN name TO title")
+            .unwrap(),
+        ExecutionResult::AffectedRows(0)
+    );
+    let error = db
+        .execute("ALTER TABLE projects ALTER COLUMN title SET NOT NULL")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DatabaseError::SchemaMutation(SchemaMutationError::UnsupportedBackfillRefinement(
+            schema_mutation::BackfillRefinementReason::IndexedNullability(_)
+        ))
+    ));
+    let drop_error = db
+        .execute("ALTER TABLE projects ALTER COLUMN title DROP NOT NULL")
+        .unwrap_err();
+    assert!(matches!(
+        drop_error,
+        DatabaseError::SchemaMutation(SchemaMutationError::InvalidSchemaEvolution(
+            "column is already nullable"
+        ))
+    ));
+    db.execute("ALTER TABLE projects DROP COLUMN active")
+        .unwrap();
+    db.execute("ALTER TABLE projects RENAME TO work").unwrap();
 
     let table = db.schema().table("work").unwrap();
     assert_eq!(table.id, table_id);
@@ -1534,15 +1551,15 @@ fn six_sql_alters_use_one_rewrite_lifecycle_and_preserve_logical_identities() {
     assert_eq!(db.indexes(table_id).unwrap()[0].column_id, ColumnId(2));
     assert_eq!(
         db.bindings.resolve_single(table_id).unwrap(),
-        StorageId(initial_storage.0 + 6)
+        StorageId(initial_storage.0 + 4)
     );
     assert_eq!(
         db.table_schema_version(table_id),
-        Some(TableSchemaVersion(7))
+        Some(TableSchemaVersion(5))
     );
     assert_eq!(
         db.schema_generation(),
-        SchemaGeneration(initial_generation.0 + 6)
+        SchemaGeneration(initial_generation.0 + 4)
     );
     assert_eq!(
         db.query("SELECT id, title FROM work ORDER BY id")
@@ -1555,7 +1572,7 @@ fn six_sql_alters_use_one_rewrite_lifecycle_and_preserve_logical_identities() {
         ]
     );
     let retired = db.inspect_replacement_retired_heaps();
-    assert_eq!(retired.len(), 6);
+    assert_eq!(retired.len(), 4);
     assert_eq!(retired[0].old_storage_id, initial_storage);
     assert_eq!(
         db.gc_replacement_retired_heap(&retired[0]).unwrap().state,
@@ -1567,7 +1584,7 @@ fn six_sql_alters_use_one_rewrite_lifecycle_and_preserve_logical_identities() {
         assert_eq!(reopened.schema().table("work").unwrap().id, table_id);
         assert_eq!(
             reopened.table_schema_version(table_id),
-            Some(TableSchemaVersion(7))
+            Some(TableSchemaVersion(5))
         );
         assert_eq!(reopened.indexes(table_id).unwrap()[0].id, index.id);
         assert_eq!(

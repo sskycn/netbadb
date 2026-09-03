@@ -90,27 +90,35 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
     }
-    if let Ok(probe) = std::env::var("NETBADB_ROUND31_PROBE") {
+    if let Ok(probe) = std::env::var("NETBADB_ROUND32_PROBE") {
         for _ in 0..3 {
             let mut reopened = Database::open_catalog(&catalog)?;
             let projects = reopened
                 .schema()
                 .table("projects")
-                .ok_or("Round 31 base table disappeared")?;
-            if projects.column("normalized_name").is_some() || projects.columns.len() != 2 {
-                return Err("failed Round 31 transaction published provisional schema".into());
+                .ok_or("Round 32 final table disappeared")?;
+            if !projects
+                .column("normalized_name")
+                .is_some_and(|column| !column.nullable)
+                || projects.columns.len() != 3
+            {
+                return Err("failed Round 32 transaction published final schema".into());
             }
             if reopened
-                .query("SELECT id, name FROM projects ORDER BY id")?
+                .query("SELECT id, name, normalized_name FROM projects ORDER BY id")?
                 .rows
-                != [vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())]]
+                != [vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("one".into()),
+                    ScalarValue::Text("filled".into()),
+                ]]
             {
-                return Err("failed Round 31 transaction changed base rows".into());
+                return Err("failed Round 32 transaction changed final rows".into());
             }
             reopened.close()?;
         }
         println!(
-            "REOPEN PASS: {probe} observed 25000 and rollback; base schema/data won three catalog-only opens; manifest unchanged"
+            "REOPEN PASS: {probe} final schema/data and private retarget survived three catalog-only opens; manifest unchanged"
         );
         return Ok(());
     }

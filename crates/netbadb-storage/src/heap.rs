@@ -557,6 +557,54 @@ impl HeapStorage {
         &self.indexes
     }
 
+    /// Retargets only the schema fingerprint stored in a private staged Heap.
+    ///
+    /// The staged Heap is disposable until the coordinator decision, so this
+    /// transition deliberately has no WAL record of its own.  The metadata
+    /// page is flushed (including any already-written DML WAL) before the
+    /// in-memory table is changed.  Callers must persist their durable
+    /// finalization intent only after this method returns successfully.
+    pub fn retarget_private_schema(
+        &mut self,
+        expected: &TableDef,
+        target: TableDef,
+    ) -> Result<(), StorageError> {
+        if self.table != *expected
+            || expected.id != target.id
+            || expected.columns.len() != target.columns.len()
+            || expected
+                .columns
+                .iter()
+                .zip(&target.columns)
+                .any(|(old, new)| old.id != new.id || old.semantic_type() != new.semantic_type())
+            || self
+                .indexes
+                .iter()
+                .any(|index| target.column_by_id(index.column_id).is_none())
+        {
+            return Err(StorageError::UnsupportedOperation {
+                operation: "private Heap schema retarget",
+                storage_kind: "Heap schema/layout mismatch",
+            });
+        }
+        let fingerprint = validate_table(&target)?;
+        {
+            let mut header = self.buffer.write_page(HEADER_PAGE)?;
+            let catalog_root = self.index_catalog_root;
+            let storage_id = self.storage_id;
+            write_heap_metadata(
+                header.page_mut().bytes_mut(),
+                &target,
+                fingerprint,
+                catalog_root,
+                storage_id,
+            );
+        }
+        self.flush()?;
+        self.table = target;
+        Ok(())
+    }
+
     pub(crate) fn rewrite_indexes(&mut self) -> Result<HeapRewriteIndexes, StorageError> {
         let catalog = self.read_index_catalog(self.index_catalog_root)?;
         Ok(HeapRewriteIndexes {

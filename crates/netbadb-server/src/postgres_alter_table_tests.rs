@@ -96,14 +96,11 @@ fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
         &mut db,
         "INSERT INTO projects VALUES (2, 'two', true)",
     ));
-    state(
-        &sql(
-            &mut session,
-            &mut db,
-            "ALTER TABLE projects RENAME COLUMN title TO name",
-        ),
-        "25000",
-    );
+    ok(&sql(
+        &mut session,
+        &mut db,
+        "ALTER TABLE projects RENAME COLUMN title TO name",
+    ));
     ok(&sql(&mut session, &mut db, "ROLLBACK"));
     assert!(
         db.schema()

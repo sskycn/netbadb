@@ -593,6 +593,22 @@ impl TableStorage {
         }
     }
 
+    /// Retargets metadata on a private staged Heap without rewriting rows or
+    /// indexes.  Non-Heap storage is intentionally not eligible.
+    pub fn retarget_private_schema(
+        &mut self,
+        expected: &TableDef,
+        target: TableDef,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => storage.retarget_private_schema(expected, target),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "private Heap schema retarget",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     pub fn read_view(&self) -> Result<StorageReadView, StorageError> {
         match self {
             Self::Heap(storage) => Ok(StorageReadView::heap(

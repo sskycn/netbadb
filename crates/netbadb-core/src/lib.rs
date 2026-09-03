@@ -608,7 +608,8 @@ impl DatabaseError {
                 SchemaMutationError::UnsupportedConstraint
                 | SchemaMutationError::UnsupportedPlacement
                 | SchemaMutationError::MultipleCreatesUnsupported
-                | SchemaMutationError::UnsupportedSchemaEvolution,
+                | SchemaMutationError::UnsupportedSchemaEvolution
+                | SchemaMutationError::UnsupportedBackfillRefinement(_),
             ) => DatabaseErrorKind::FeatureNotSupported,
             Self::SchemaMutation(
                 SchemaMutationError::TableNotFound(_) | SchemaMutationError::UndefinedTable(_),
@@ -634,7 +635,8 @@ impl DatabaseError {
                 | SchemaMutationError::StaleSchemaDependency
                 | SchemaMutationError::RecoveryRequired
                 | SchemaMutationError::TransactionNotPristine
-                | SchemaMutationError::SchemaMutationAfterMaterialization,
+                | SchemaMutationError::SchemaMutationAfterMaterialization
+                | SchemaMutationError::MigrationDataAccessAfterRefinement,
             ) => DatabaseErrorKind::TransactionState,
             Self::SchemaMutation(_) => DatabaseErrorKind::Operational,
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
@@ -2486,6 +2488,15 @@ impl Database {
             };
         }
         self.validate_transaction(transaction)?;
+        if (transaction.schema_composition.backfill().is_some()
+            || transaction.schema_composition.backfill_index().is_some())
+            && !matches!(prepared.compiled, CompiledDdlStatement::AlterTable(_))
+        {
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+            )
+            .into());
+        }
         match &prepared.compiled {
             CompiledDdlStatement::CreateTable(statement) => {
                 self.create_heap_table_in(transaction, CreateTableSpec::from(statement))?;
@@ -2594,6 +2605,16 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         transaction.validate_commit_owner(&self.transaction_owner)?;
         self.ensure_schema_materialized(transaction)?;
+        if (transaction.schema_composition.backfill().is_some()
+            || transaction.schema_composition.backfill_index().is_some())
+            && !matches!(
+                transaction.schema_composition,
+                schema_composition::SchemaCompositionState::Finalized(_)
+                    | schema_composition::SchemaCompositionState::FinalizedIndex(_)
+            )
+        {
+            self.finalize_backfill(transaction)?;
+        }
         let no_effective = matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::SealedNoEffectiveChange(_)
@@ -2782,7 +2803,36 @@ impl Database {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
-        self.ensure_schema_materialized(transaction)?;
+        if let Some(composition) = transaction.schema_composition.plan()
+            && Self::is_backfill_candidate(composition)
+        {
+            let target = composition
+                .touched
+                .keys()
+                .next()
+                .copied()
+                .ok_or(SchemaMutationError::Corrupt("backfill target absent"))?;
+            if logical
+                .read_tables()
+                .into_iter()
+                .chain(logical.write_tables())
+                .any(|table| table != target)
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+                )
+                .into());
+            }
+        }
+        self.ensure_schema_materialized_with_backfill(transaction, true)?;
+        if matches!(
+            transaction.schema_composition,
+            schema_composition::SchemaCompositionState::Refining(_)
+                | schema_composition::SchemaCompositionState::RefiningIndex(_)
+        ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
+        {
+            return Err(SchemaMutationError::MigrationDataAccessAfterRefinement.into());
+        }
         let physical = self.plan_logical_statement_in(&logical, transaction);
         if let PhysicalStatement::Query(plan) = &physical {
             let storage_ids = self.storage_ids_for_tables_in(logical.read_tables(), transaction)?;

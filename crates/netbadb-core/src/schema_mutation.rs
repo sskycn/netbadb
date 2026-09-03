@@ -341,12 +341,47 @@ pub struct RetiredHeapGcReport {
 }
 
 #[derive(Debug)]
+pub enum BackfillRefinementReason {
+    UnsupportedOperation,
+    IndexedNullability(ColumnId),
+    MultipleTargets,
+    CrossTableAccess,
+    UnsupportedPlacement,
+}
+
+impl fmt::Display for BackfillRefinementReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedOperation => {
+                f.write_str("operation is not compatible with a staged backfill")
+            }
+            Self::IndexedNullability(column) => {
+                write!(
+                    f,
+                    "column {} is indexed and cannot change nullability during backfill",
+                    column.0
+                )
+            }
+            Self::MultipleTargets => {
+                f.write_str("backfill requires exactly one physical table target")
+            }
+            Self::CrossTableAccess => {
+                f.write_str("backfill transaction cannot access another table")
+            }
+            Self::UnsupportedPlacement => f.write_str("backfill requires one runtime-created Heap"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum SchemaMutationError {
     SchemaBusy,
     RecoveryRequired,
     MultipleCreatesUnsupported,
     TransactionNotPristine,
     SchemaMutationAfterMaterialization,
+    UnsupportedBackfillRefinement(BackfillRefinementReason),
+    MigrationDataAccessAfterRefinement,
     CompositionLimitExceeded(&'static str),
     UnsupportedConstraint,
     UnsupportedPlacement,
@@ -385,6 +420,12 @@ impl fmt::Display for SchemaMutationError {
             Self::SchemaMutationAfterMaterialization => f.write_str(
                 "schema mutation is not allowed after transaction schema materialization",
             ),
+            Self::UnsupportedBackfillRefinement(reason) => {
+                write!(f, "unsupported backfill refinement: {reason}")
+            }
+            Self::MigrationDataAccessAfterRefinement => {
+                f.write_str("data access is not allowed after backfill schema refinement")
+            }
             Self::CompositionLimitExceeded(limit) => {
                 write!(f, "schema transaction composition limit exceeded: {limit}")
             }
@@ -2424,6 +2465,27 @@ pub(crate) fn write_owner(
         .and_then(|_| file.sync_all())
         .map_err(|e| file::io("sync staged owner", path, e))?;
     file::sync_parent(path)?;
+    Ok(())
+}
+
+pub(crate) fn retarget_owner(
+    path: &Path,
+    incarnation: [u8; 16],
+    txn: DatabaseTxnId,
+    table: TableId,
+    storage: StorageId,
+    old_fingerprint: SchemaFingerprint,
+    new_fingerprint: SchemaFingerprint,
+) -> Result<(), SchemaMutationError> {
+    let expected = owner_bytes(incarnation, txn, table, storage, old_fingerprint)?;
+    let actual = std::fs::read(path).map_err(|e| file::io("read staged owner", path, e))?;
+    if actual != expected {
+        return Err(SchemaMutationError::Corrupt(
+            "staged owner identity mismatch",
+        ));
+    }
+    let replacement = owner_bytes(incarnation, txn, table, storage, new_fingerprint)?;
+    file::atomic_write(path, &replacement, false)?;
     Ok(())
 }
 
@@ -5862,6 +5924,7 @@ pub(crate) fn crash(point: &str) {
         || std::env::var("NETBADB_DROP_CRASH_POINT").as_deref() == Ok(point)
         || std::env::var("NETBADB_GC_CRASH_POINT").as_deref() == Ok(point)
         || std::env::var("NETBADB_REWRITE_CRASH_POINT").as_deref() == Ok(point)
+        || std::env::var("NETBADB_BACKFILL_CRASH_POINT").as_deref() == Ok(point)
     {
         std::process::exit(90);
     }

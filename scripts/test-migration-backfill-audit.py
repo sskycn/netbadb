@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 31 real-client audit of the current DDL-DML-DDL seal boundary."""
+"""Round 32 real-client audit of controlled DDL-DML-DDL finalization."""
 from __future__ import annotations
 
 import io
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from sqlalchemy import event
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = Path(os.environ.get("CARGO_TARGET_DIR", "/private/tmp/netbadb-round31-target"))
+TARGET = Path(os.environ.get("CARGO_TARGET_DIR", "/private/tmp/netbadb-round32-target"))
 PSQL = os.environ.get("PSQL", "/opt/local/lib/pgsql/bin/psql")
 
 ADD = "ALTER TABLE projects ADD COLUMN normalized_name TEXT"
@@ -24,11 +24,13 @@ BACKFILL = "UPDATE projects SET normalized_name = 'filled'"
 REFINE = "ALTER TABLE projects ALTER COLUMN normalized_name SET NOT NULL"
 
 
-def verify_base(dsn: str) -> None:
+def verify_final(dsn: str) -> None:
     with psycopg.connect(dsn) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id, name FROM projects ORDER BY id")
-            assert cursor.fetchall() == [(1, "one")]
+            cursor.execute(
+                "SELECT id, name, normalized_name FROM projects ORDER BY id"
+            )
+            assert cursor.fetchall() == [(1, "one", "filled")]
 
 
 def psql_probe(dsn: str) -> None:
@@ -36,48 +38,37 @@ def psql_probe(dsn: str) -> None:
     assert "17.11" in version, version
     result = subprocess.run(
         [PSQL, "-X", "-w", "-qAt", "-v", "ON_ERROR_STOP=1", dsn],
-        input=f"\\set VERBOSITY verbose\nBEGIN;\n{ADD};\n{BACKFILL};\n{REFINE};\nCOMMIT;\n",
+        input=f"BEGIN;\n{ADD};\n{BACKFILL};\n{REFINE};\nCOMMIT;\n",
         text=True,
         capture_output=True,
     )
-    assert result.returncode != 0, result.stdout
-    assert "25000" in result.stderr, result.stderr
-    verify_base(dsn)
-    print(f"{version}: current final refinement rejected with 25000; disconnect rollback PASS")
+    assert result.returncode == 0, result.stderr
+    verify_final(dsn)
+    print(f"{version}: ADD + UPDATE + SET NOT NULL + COMMIT PASS")
 
 
 def psycopg_probe(dsn: str) -> None:
     assert psycopg.__version__ == "3.2.13", psycopg.__version__
     with psycopg.connect(dsn) as connection:
-        try:
-            with connection.transaction():
-                with connection.cursor() as cursor:
-                    cursor.execute(ADD, prepare=True)
-                    cursor.execute(BACKFILL, prepare=True)
-                    cursor.execute(REFINE, prepare=True)
-        except psycopg.errors.InvalidTransactionState as error:
-            assert error.sqlstate == "25000"
-        else:
-            raise AssertionError("current post-DML refinement unexpectedly succeeded")
-    verify_base(dsn)
-    print(f"psycopg {psycopg.__version__}: prepare=True 25000 + rollback PASS")
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute(ADD, prepare=True)
+                cursor.execute(BACKFILL, prepare=True)
+                cursor.execute(REFINE, prepare=True)
+    verify_final(dsn)
+    print(f"psycopg {psycopg.__version__}: prepare=True controlled finalization PASS")
 
 
 def sqlalchemy_probe(dsn: str) -> None:
     assert sa.__version__ == "2.0.52", sa.__version__
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://", 1))
-    try:
-        with engine.begin() as connection:
-            connection.exec_driver_sql(ADD)
-            connection.execute(sa.text(BACKFILL))
-            connection.exec_driver_sql(REFINE)
-    except sa.exc.DBAPIError as error:
-        assert error.orig.sqlstate == "25000", error
-    else:
-        raise AssertionError("current post-DML refinement unexpectedly succeeded")
-    verify_base(dsn)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(ADD)
+        connection.execute(sa.text(BACKFILL))
+        connection.exec_driver_sql(REFINE)
+    verify_final(dsn)
     engine.dispose()
-    print(f"SQLAlchemy {sa.__version__}: text UPDATE, 25000, context rollback PASS")
+    print(f"SQLAlchemy {sa.__version__}: text UPDATE + controlled finalization PASS")
 
 
 def alembic_probe(dsn: str) -> None:
@@ -104,23 +95,18 @@ def alembic_probe(dsn: str) -> None:
     for name in ("begin", "commit", "rollback"):
         event.listen(engine, name, lambda _connection, name=name: boundaries.append(name.upper()))
 
-    try:
-        with engine.begin() as connection:
-            operations = Operations(MigrationContext.configure(connection))
-            operations.add_column(
-                "projects", sa.Column("normalized_name", sa.Text(), nullable=True)
-            )
-            operations.execute(sa.text(BACKFILL))
-            operations.alter_column("projects", "normalized_name", nullable=False)
-    except sa.exc.DBAPIError as error:
-        assert error.orig.sqlstate == "25000", error
-    else:
-        raise AssertionError("current Alembic post-DML refinement unexpectedly succeeded")
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        operations.add_column(
+            "projects", sa.Column("normalized_name", sa.Text(), nullable=True)
+        )
+        operations.execute(sa.text(BACKFILL))
+        operations.alter_column("projects", "normalized_name", nullable=False)
     assert generated == planned, generated
-    assert boundaries == ["BEGIN", "ROLLBACK"], boundaries
-    verify_base(dsn)
+    assert boundaries == ["BEGIN", "COMMIT"], boundaries
+    verify_final(dsn)
     engine.dispose()
-    print(f"Alembic {alembic.__version__}: exact SQL + BEGIN/ROLLBACK + 25000 PASS")
+    print(f"Alembic {alembic.__version__}: exact SQL + BEGIN/COMMIT + finalization PASS")
 
 
 def main() -> None:
@@ -130,7 +116,7 @@ def main() -> None:
         cwd=ROOT, env=environment, check=True,
     )
     for probe in (psql_probe, psycopg_probe, sqlalchemy_probe, alembic_probe):
-        probe_environment = dict(environment, NETBADB_ROUND31_PROBE=probe.__name__)
+        probe_environment = dict(environment, NETBADB_ROUND32_PROBE=probe.__name__)
         with tempfile.TemporaryFile(mode="w+") as trace:
             process = subprocess.Popen(
                 [str(TARGET / "debug/examples/sql_alter_table_fixture")],

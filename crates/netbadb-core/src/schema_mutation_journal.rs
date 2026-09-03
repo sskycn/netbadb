@@ -269,6 +269,35 @@ pub(crate) struct CompositionRecord {
     pub(crate) resolution: Option<CompositionResolution>,
 }
 
+/// Durable proof that the one private staged resource was allocated before its
+/// files were created. It contains only exact locators and a single-table
+/// provisional fragment; it is not a committed schema claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageResourceIntent {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) table: TableId,
+    pub(crate) storage: StorageId,
+    pub(crate) base_generation: SchemaGeneration,
+    pub(crate) base_epoch: u64,
+    pub(crate) provisional: SchemaCatalogSnapshot,
+    pub(crate) stage_locator: String,
+    pub(crate) final_locator: String,
+    pub(crate) digest: [u8; 32],
+}
+
+/// Durable proof that private metadata was retargeted and the final NBSC
+/// digest was prepared. CORD is allowed to publish this only after this record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalizationIntent {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) table: TableId,
+    pub(crate) storage: StorageId,
+    pub(crate) final_snapshot: SchemaCatalogSnapshot,
+    pub(crate) stage_locator: String,
+    pub(crate) final_locator: String,
+    pub(crate) digest: [u8; 32],
+}
+
 fn composition_replacement(
     record: &CompositionRecord,
     table: TableId,
@@ -393,6 +422,8 @@ pub(crate) struct SchemaMutationJournal {
     pub(crate) rewrites: BTreeMap<DatabaseTxnId, RewriteIntent>,
     pub(crate) rewrite_losers: BTreeSet<DatabaseTxnId>,
     pub(crate) compositions: BTreeMap<DatabaseTxnId, CompositionRecord>,
+    pub(crate) stage_intents: BTreeMap<DatabaseTxnId, StageResourceIntent>,
+    pub(crate) finalization_intents: BTreeMap<DatabaseTxnId, FinalizationIntent>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_sync: bool,
@@ -400,6 +431,10 @@ pub(crate) struct SchemaMutationJournal {
 
 fn corrupt(reason: &'static str) -> SchemaMutationError {
     SchemaMutationError::Corrupt(reason)
+}
+
+fn digest_snapshot(snapshot: &SchemaCatalogSnapshot) -> Result<[u8; 32], SchemaMutationError> {
+    Ok(crate::schema_mutation::digest(&snapshot.encode()?))
 }
 
 pub(crate) fn namespace(
@@ -593,6 +628,33 @@ impl SchemaMutationJournal {
                 }
             }
         }
+        for intent in journal.stage_intents.values() {
+            if intent.stage_locator
+                != stage_locator(catalog, incarnation, intent.transaction, intent.storage)?
+                || intent.final_locator != final_locator(catalog, incarnation, intent.storage)?
+                || intent.provisional.incarnation != incarnation
+                || intent.provisional.storages.len() != 1
+                || intent.provisional.storages[0].id != intent.storage
+                || intent.digest != digest_snapshot(&intent.provisional)?
+            {
+                return Err(corrupt("backfill stage intent locator or digest mismatch"));
+            }
+        }
+        for intent in journal.finalization_intents.values() {
+            let stage = journal
+                .stage_intents
+                .get(&intent.transaction)
+                .ok_or(corrupt("backfill finalization lacks stage intent"))?;
+            if intent.stage_locator != stage.stage_locator
+                || intent.final_locator != stage.final_locator
+                || intent.storage != stage.storage
+                || intent.table != stage.table
+                || intent.final_snapshot.incarnation != incarnation
+                || intent.digest != digest_snapshot(&intent.final_snapshot)?
+            {
+                return Err(corrupt("backfill finalization locator or digest mismatch"));
+            }
+        }
         if activated {
             if open_envelope(&file::read(&witness)?, b"NBSA")? != incarnation {
                 return Err(corrupt("mutation activation incarnation mismatch"));
@@ -601,6 +663,8 @@ impl SchemaMutationJournal {
             || !journal.drops.is_empty()
             || !journal.rewrite_reservations.is_empty()
             || !journal.compositions.is_empty()
+            || !journal.stage_intents.is_empty()
+            || !journal.finalization_intents.is_empty()
         {
             return Err(corrupt("reservation history has no activation witness"));
         }
@@ -630,6 +694,8 @@ impl SchemaMutationJournal {
                     rewrites: BTreeMap::new(),
                     rewrite_losers: BTreeSet::new(),
                     compositions: BTreeMap::new(),
+                    stage_intents: BTreeMap::new(),
+                    finalization_intents: BTreeMap::new(),
                     poisoned: false,
                     #[cfg(test)]
                     fail_next_sync: false,
@@ -1203,6 +1269,83 @@ impl SchemaMutationJournal {
                 resolution: None,
             })
             .intent = Some(intent);
+        self.persist()
+    }
+
+    pub(crate) fn replace_composition_intent(
+        &mut self,
+        intent: SchemaChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let record = self
+            .compositions
+            .get_mut(&intent.transaction)
+            .ok_or(corrupt("backfill composition intent is absent"))?;
+        if record.intent.is_none() || record.resolution.is_some() {
+            return Err(corrupt("backfill composition intent is not replaceable"));
+        }
+        record.intent = Some(intent);
+        self.persist()
+    }
+
+    pub(crate) fn replace_table_object_intent(
+        &mut self,
+        intent: TableObjectChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let record = self
+            .compositions
+            .get_mut(&intent.transaction)
+            .ok_or(corrupt("backfill table-object intent is absent"))?;
+        if record.table_intent.is_none() || record.resolution.is_some() {
+            return Err(corrupt("backfill table-object intent is not replaceable"));
+        }
+        record.table_intent = Some(intent);
+        self.persist()
+    }
+
+    pub(crate) fn stage_resource_intent(
+        &mut self,
+        intent: StageResourceIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.stage_intents.contains_key(&intent.transaction)
+            || self.finalization_intents.contains_key(&intent.transaction)
+            || !self.compositions.contains_key(&intent.transaction)
+        {
+            return Err(corrupt("duplicate or out-of-order backfill stage intent"));
+        }
+        if intent.provisional.storages.len() != 1
+            || intent.provisional.storages[0].id != intent.storage
+            || intent.provisional.committed.schema.tables().len() != 1
+            || intent.provisional.committed.schema.tables()[0].id != intent.table
+            || intent.digest != digest_snapshot(&intent.provisional)?
+        {
+            return Err(corrupt("invalid backfill stage resource identity"));
+        }
+        self.stage_intents.insert(intent.transaction, intent);
+        self.persist()
+    }
+
+    pub(crate) fn finalization_intent(
+        &mut self,
+        intent: FinalizationIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let stage = self
+            .stage_intents
+            .get(&intent.transaction)
+            .ok_or(corrupt("backfill finalization lacks stage intent"))?;
+        if self.finalization_intents.contains_key(&intent.transaction)
+            || stage.table != intent.table
+            || stage.storage != intent.storage
+            || stage.stage_locator != intent.stage_locator
+            || stage.final_locator != intent.final_locator
+            || intent.digest != digest_snapshot(&intent.final_snapshot)?
+        {
+            return Err(corrupt("invalid backfill finalization identity"));
+        }
+        self.finalization_intents.insert(intent.transaction, intent);
         self.persist()
     }
 
@@ -1852,10 +1995,16 @@ impl SchemaMutationJournal {
                     })
             })
             .sum::<usize>();
+        let intent_count = self
+            .stage_intents
+            .len()
+            .checked_add(self.finalization_intents.len())
+            .ok_or(corrupt("too many backfill intents"))?;
         let count = create_count
             .checked_add(drop_count)
             .and_then(|count| count.checked_add(rewrite_count))
             .and_then(|count| count.checked_add(composition_count))
+            .and_then(|count| count.checked_add(intent_count))
             .ok_or(corrupt("too many journal records"))?;
         w.u32(u32::try_from(count).map_err(|_| corrupt("too many journal records"))?);
         let mut transactions = self
@@ -1864,9 +2013,12 @@ impl SchemaMutationJournal {
             .chain(self.drops.keys())
             .chain(self.rewrite_reservations.keys())
             .chain(self.compositions.keys())
+            .chain(self.stage_intents.keys())
+            .chain(self.finalization_intents.keys())
             .copied()
             .collect::<Vec<_>>();
         transactions.sort_unstable();
+        transactions.dedup();
         for txn in transactions {
             if let Some(r) = self.reservations.get(&txn) {
                 let mut record = Writer(vec![1]);
@@ -2196,6 +2348,40 @@ impl SchemaMutationJournal {
                 }
             }
         }
+        for intent in self.stage_intents.values() {
+            let mut record = Writer(vec![31]);
+            record.u64(intent.transaction.0);
+            record.u64(intent.table.0);
+            record.u64(intent.storage.0);
+            record.u64(intent.base_generation.0);
+            record.u64(intent.base_epoch);
+            record.string(&intent.stage_locator)?;
+            record.string(&intent.final_locator)?;
+            record.0.extend_from_slice(&intent.digest);
+            let snapshot = intent.provisional.encode()?;
+            record.u32(
+                u32::try_from(snapshot.len())
+                    .map_err(|_| corrupt("backfill stage snapshot too large"))?,
+            );
+            record.0.extend_from_slice(&snapshot);
+            put_record(&mut w, &record.0)?;
+        }
+        for intent in self.finalization_intents.values() {
+            let mut record = Writer(vec![32]);
+            record.u64(intent.transaction.0);
+            record.u64(intent.table.0);
+            record.u64(intent.storage.0);
+            record.string(&intent.stage_locator)?;
+            record.string(&intent.final_locator)?;
+            record.0.extend_from_slice(&intent.digest);
+            let snapshot = intent.final_snapshot.encode()?;
+            record.u32(
+                u32::try_from(snapshot.len())
+                    .map_err(|_| corrupt("backfill final snapshot too large"))?,
+            );
+            record.0.extend_from_slice(&snapshot);
+            put_record(&mut w, &record.0)?;
+        }
         let bytes = envelope(b"NBSJ", &w.0)?;
         Self::decode(&bytes)?;
         Ok(bytes)
@@ -2224,6 +2410,8 @@ impl SchemaMutationJournal {
         let mut rewrites: BTreeMap<DatabaseTxnId, RewriteIntent> = BTreeMap::new();
         let mut rewrite_losers = BTreeSet::new();
         let mut compositions: BTreeMap<DatabaseTxnId, CompositionRecord> = BTreeMap::new();
+        let mut stage_intents = BTreeMap::new();
+        let mut finalization_intents = BTreeMap::new();
         let mut last_columns: BTreeMap<TableId, ColumnId> = BTreeMap::new();
         let mut last_indexes: BTreeMap<TableId, IndexId> = BTreeMap::new();
         let mut last = (0, 0, 0, 0, 0);
@@ -3384,6 +3572,70 @@ impl SchemaMutationJournal {
                     }
                     gc.complete = true;
                 }
+                31 => {
+                    let table = TableId(record.u64()?);
+                    let storage = StorageId(record.u64()?);
+                    let base_generation = SchemaGeneration(record.u64()?);
+                    let base_epoch = record.u64()?;
+                    let stage_locator = record.string()?;
+                    let final_locator = record.string()?;
+                    let digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("backfill stage digest"))?;
+                    let length = usize::try_from(record.u32()?)
+                        .map_err(|_| corrupt("backfill stage snapshot length"))?;
+                    let provisional = SchemaCatalogSnapshot::decode(record.take(length)?)?;
+                    if stage_intents
+                        .insert(
+                            txn,
+                            StageResourceIntent {
+                                transaction: txn,
+                                table,
+                                storage,
+                                base_generation,
+                                base_epoch,
+                                provisional,
+                                stage_locator,
+                                final_locator,
+                                digest,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(corrupt("duplicate backfill stage intent"));
+                    }
+                }
+                32 => {
+                    let table = TableId(record.u64()?);
+                    let storage = StorageId(record.u64()?);
+                    let stage_locator = record.string()?;
+                    let final_locator = record.string()?;
+                    let digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("backfill finalization digest"))?;
+                    let length = usize::try_from(record.u32()?)
+                        .map_err(|_| corrupt("backfill final snapshot length"))?;
+                    let final_snapshot = SchemaCatalogSnapshot::decode(record.take(length)?)?;
+                    if finalization_intents
+                        .insert(
+                            txn,
+                            FinalizationIntent {
+                                transaction: txn,
+                                table,
+                                storage,
+                                final_snapshot,
+                                stage_locator,
+                                final_locator,
+                                digest,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(corrupt("duplicate backfill finalization intent"));
+                    }
+                }
                 _ => return Err(corrupt("unknown journal record tag")),
             }
             if !record.0.is_empty() {
@@ -3461,6 +3713,29 @@ impl SchemaMutationJournal {
                         }
                     }
                 }
+            }
+        }
+        for intent in stage_intents.values() {
+            let composition = compositions
+                .get(&intent.transaction)
+                .ok_or(corrupt("backfill stage intent has no composition"))?;
+            let matches_table = composition.intent.as_ref().is_some_and(|aggregate| {
+                aggregate.tables.iter().any(|plan| {
+                    plan.table() == intent.table && plan.new_storage() == intent.storage
+                })
+            }) || composition.table_intent.as_ref().is_some_and(|aggregate| {
+                aggregate.tables.iter().any(|plan| {
+                    plan.table() == intent.table
+                        && plan.participant_storage() == Some(intent.storage)
+                })
+            });
+            if !matches_table {
+                return Err(corrupt("backfill stage target is absent from composition"));
+            }
+        }
+        for intent in finalization_intents.values() {
+            if !stage_intents.contains_key(&intent.transaction) {
+                return Err(corrupt("backfill finalization has no stage authority"));
             }
         }
         let mut retired = BTreeMap::new();
@@ -3543,6 +3818,8 @@ impl SchemaMutationJournal {
             rewrites,
             rewrite_losers,
             compositions,
+            stage_intents,
+            finalization_intents,
             poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,

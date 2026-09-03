@@ -1,12 +1,20 @@
 # Migration backfill / DDL–DML–DDL architecture audit — Round 31
 
+Round 32 implements the selected controlled single-Heap slice described by
+this audit. The current implementation details and exact remaining scope are
+recorded in [`controlled-backfill-round32.md`](controlled-backfill-round32.md).
+
 ## 1. Commits / integration
 
 Repository is `gostartkit/netbadb`. The audit began from `395c97c05ffafe93730430a965844071aff9b903` in isolated branch `codex/migration-backfill-round31` and worktree `netbadb-migration-backfill-round31`. Final task commit, merge, origin verification, and cleanup are recorded in the completion report after they occur.
 
 ## 2. Current seal behavior
 
-`SchemaCompositionState::Composing` accepts ordered DDL. The first prepared relational execution calls `ensure_schema_materialized` before planning or opening its statement view. This applies to `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; COMMIT also calls it. The state becomes `SealingAndMaterializing*`, then `Materialized*`. Any later schema/index mutation fails with `SchemaMutationAfterMaterialization`. Native Core leaves the transaction active; PostgreSQL maps the error through `DatabaseErrorKind::TransactionState` to SQLSTATE `25000`, after which client transaction handling rolls back.
+`SchemaCompositionState::Composing` accepts ordered DDL. An eligible one-target
+transaction enters `BackfillOpen` on its first relational statement and keeps
+using the private staged Heap. Compatible rename/nullability DDL enters
+`Refining`; data access then fails with a typed transaction-state error. Other
+compositions retain the original `Materialized*` seal.
 
 ## 3. Current materialization protocol
 
@@ -26,11 +34,11 @@ The direct Core test updates row 1 in S2, starts a new statement view from S2's 
 
 ## 7. SET NOT NULL afterbackfill validation
 
-A `#[cfg(test)]` validator scans the candidate column in transaction-visible S2. Partial backfill returns exact `NotNullViolation(ColumnId(3))`; full backfill succeeds. This proves statement-time validation is possible. Production still rejects the final ALTER at the seal and does not mutate schema metadata.
+A `#[cfg(test)]` validator scans the candidate column in transaction-visible S2. Partial backfill returns exact `NotNullViolation(ColumnId(3))`; full backfill succeeds. Round 32 routes the same validation through the controlled refinement path: a failed statement leaves `BackfillOpen` unchanged, while a successful statement updates the private logical target and enters `Refining`.
 
 ## 8. Transaction-created table backfill
 
-A direct test composes `CREATE TABLE imported`, materializes it on first INSERT, and reads its own inserted row from the private CreateHeap. A following `SET NOT NULL` is rejected by the same seal; rollback removes the private table. Thus created tables share the read-view capability, but not yet the future refinement protocol.
+A direct test composes `CREATE TABLE imported`, materializes it on first INSERT, reads its own inserted row from the private CreateHeap, and accepts a compatible `SET NOT NULL` refinement before commit. Rollback still removes the private table.
 
 ## 9. Heap metadata binding
 
@@ -176,23 +184,26 @@ Candidate A retains one base-to-S2 copy and peak S1+S2 main files; Candidate B a
 
 ## 36. Alembic probe
 
-Alembic 1.16.5 generated exactly `ALTER ... ADD`, deterministic supported `UPDATE`, and `ALTER ... SET NOT NULL`. Online execution recorded `BEGIN`, those three statements, then `ROLLBACK`; final ALTER returned SQLSTATE `25000`. Three reopen checks retained two-column base schema and original row. Expression support such as `normalized_name = name` remains a separate SQL capability; the probe intentionally used a literal.
+The Round 31 probe recorded the pre-Round32 seal behavior: Alembic 1.16.5 generated `ALTER ... ADD`, deterministic supported `UPDATE`, and `ALTER ... SET NOT NULL`, after which the final ALTER returned SQLSTATE `25000` and the context rolled back. Round 32's native and server tests now cover the controlled success path; an updated external-client run remains environment-dependent.
 
 ## 37. psql
 
-psql 17.11 ran one explicit transaction. ADD and UPDATE reached the current materialized path; final ALTER returned verbose SQLSTATE `25000`. Connection termination rolled back, and subsequent client plus three catalog-only opens observed unchanged base data/schema.
+psql 17.11 previously observed the sealed Round 31 behavior and rollback. Round 32 preserves that failure behavior for non-eligible or unsupported cases while allowing the managed single-Heap compatible path; the external retest is deferred until the client dependency environment is available.
 
 ## 38. psycopg
 
-psycopg 3.2.13 with `prepare=True` observed `InvalidTransactionState`, SQLSTATE `25000`; its transaction context rolled back. Base verification and three reopens passed.
+psycopg 3.2.13 previously observed `InvalidTransactionState`, SQLSTATE `25000`, for the Round 31 seal. Round 32's prepared-statement semantics are covered by the native regression suite; the external compatibility retest remains pending.
 
 ## 39. SQLAlchemy
 
-SQLAlchemy 2.0.52 used `engine.begin()`, `exec_driver_sql(ADD)`, `execute(text(UPDATE))`, and final `exec_driver_sql(ALTER)`. The DBAPI error carried `25000`; context rollback, base query, and three reopens passed.
+SQLAlchemy 2.0.52 previously carried SQLSTATE `25000` through the Round 31 `engine.begin()` context. Round 32's compatible refinement path is covered by the server protocol tests; the external ORM retest remains pending.
 
 ## 40. Persistent-format implications
 
-Round 31 changes no production persistent bytes. Heap v5, Page v5, WAL v4/record v3, transaction status v1, BTree v3, IndexCatalog v9, NBSC v1, NBSJ v1, and CORD v2 remain. Round 32 requires new NBSJ stage/finalization tags and owner replacement semantics; it should retain CORD/NBSC/Heap formats if the crash-safe retarget primitive can use existing Heap v5 fields.
+Heap v5, Page v5, WAL v4/record v3, transaction status v1, BTree v3,
+IndexCatalog v9, NBSC v1, and CORD v2 remain. NBSJ v1 now carries the new
+stage/finalization records, and owner replacement uses the existing envelope
+format with exact atomic replacement.
 
 ## 41. Crash matrix design
 
@@ -209,19 +220,27 @@ Round 31 changes no production persistent bytes. Heap v5, Page v5, WAL v4/record
 
 ## 42. Tests
 
-Round 31 adds Core tests for partial/full staged validation, staged SQL read-your-writes, transaction-created tables, global writer lifetime, current exact seal error/state, intent target finality, Fa→Fb dependency change, rollback/reopen, and abrupt predecision crash. Storage tests cover baseline mismatch, raw private retarget, unchanged row pages/WAL/status/RowIds, indexed nullability mismatch, and indexed rename success. All helpers are `#[cfg(test)]` or example/script probes.
+Round 32 adds Core tests for partial/full staged validation, staged SQL read-your-writes, multiple compatible refinements, transaction-created tables, global writer lifetime, typed boundary errors, intent target finality, Fa→Fb dependency change, rollback/reopen, and abrupt predecision cleanup. Storage tests cover baseline mismatch, raw private retarget, unchanged row pages/WAL/status/RowIds, indexed nullability mismatch, and indexed rename success. All helpers are `#[cfg(test)]` or example/script probes.
 
 ## 43. Fuzz
 
-Existing parser/compiler/schema/catalog/journal/coordinator/storage fuzz targets remain applicable. Round 31 introduces no decoder. Round 32 must add malformed/truncated new intent records and retarget crash sequencing to the fuzz/crash matrix before enabling production behavior.
+Existing parser/compiler/schema/catalog/journal/coordinator/storage fuzz targets remain applicable. Round 32 adds bounded decoding and validation for the new intent records plus explicit retarget crash points; broader fuzz corpus expansion remains follow-up work.
 
 ## 44. Compatibility
 
-Existing Round 30 DDL-only and DDL→DML commit behavior remains unchanged. Native and PostgreSQL still reject post-materialization DDL; README feature claims remain unchanged. No wire, SDK, manifest, schema-spec, public Core, planner, executor, or storage API compatibility is changed.
+Existing Round 30 DDL-only behavior remains unchanged. Native controlled
+backfill now permits the narrow compatible post-DML refinement phase; all other
+post-materialization DDL remains rejected. No wire, SDK, manifest, schema-spec,
+planner, or executor boundary changed.
 
 ## 45. Unsupported/deferred
 
-Deferred: physical/semantic type conversion; ADD/DROP/reorder column after DML; indexed-column nullability retarget; post-DML index/table creation/drop; savepoints; online migration; cross-process writers; resumable backfill; DEFAULT/backfill syntax; generated columns and broader constraints; arbitrary expressions; LSM, partitioned, imported/external storage; in-place committed metadata mutation; repeated DDL–DML cycles.
+Deferred: physical/semantic type conversion; ADD/DROP/reorder column after DML;
+indexed-column nullability retarget; post-DML index/table creation/drop;
+savepoints; online migration; cross-process writers; resumable backfill;
+DEFAULT/backfill syntax; generated columns and broader constraints; arbitrary
+expressions; LSM, partitioned, imported/external storage; repeated DDL–DML
+cycles; and external-client acceptance runs for this round.
 
 ## 46. NBSJ/CORD compaction debt
 

@@ -260,6 +260,7 @@ impl DatabaseTransaction {
         if self.write_participants.len() > 1
             || self.schema_mutation.is_some()
             || self.schema_composition.materialized().is_some()
+            || self.schema_composition.backfill().is_some()
             || self.schema_composition.materialized_index().is_some()
         {
             return self.commit_multi_write();
@@ -418,6 +419,11 @@ impl DatabaseTransaction {
                 crate::schema_mutation::crash("participants-prepared");
                 mutation.prepare()?;
                 crate::schema_mutation::crash("before-coordinator-decision");
+            } else if let Some(composition) = self.schema_composition.backfill() {
+                crate::schema_mutation::crash("backfill-participants-prepared");
+                composition.prepare()?;
+                crate::schema_mutation::crash("backfill-before-coordinator-decision");
+                crate::schema_mutation::crash("before-coordinator-decision");
             } else if let Some(composition) = self.schema_composition.materialized() {
                 crate::schema_mutation::crash("composition-participants-prepared");
                 crate::schema_mutation::crash("participants-prepared");
@@ -463,6 +469,12 @@ impl DatabaseTransaction {
                     &decision_participants,
                     Some(&mutation.reference),
                 )?;
+            } else if let Some(composition) = self.schema_composition.backfill() {
+                log.commit_schema_decision(
+                    self.id,
+                    &decision_participants,
+                    Some(&composition.reference),
+                )?;
             } else if let Some(composition) = self.schema_composition.materialized() {
                 log.commit_schema_decision(
                     self.id,
@@ -482,6 +494,7 @@ impl DatabaseTransaction {
             self.state = TransactionState::CommitDecided;
             if self.schema_mutation.is_some()
                 || self.schema_composition.materialized().is_some()
+                || self.schema_composition.backfill().is_some()
                 || self.schema_composition.materialized_index().is_some()
             {
                 crate::schema_mutation::crash("coordinator-durable");
@@ -521,6 +534,7 @@ impl DatabaseTransaction {
 
         if self.schema_mutation.is_some()
             || self.schema_composition.materialized().is_some()
+            || self.schema_composition.backfill().is_some()
             || self.schema_composition.materialized_index().is_some()
         {
             return Ok(());
@@ -633,6 +647,8 @@ impl DatabaseTransaction {
             materialized.staged.insert(id, storage).is_some()
         } else if let Some(materialized) = self.schema_composition.materialized_index_mut() {
             materialized.staged.insert(id, storage).is_some()
+        } else if let Some(materialized) = self.schema_composition.backfill_mut() {
+            materialized.staged.insert(id, storage).is_some()
         } else {
             return Err(
                 SchemaMutationError::Corrupt("composed enlist outside materialization").into(),
@@ -660,8 +676,18 @@ impl DatabaseTransaction {
             | SchemaCompositionState::RollbackRequiredMaterialized(materialized) => {
                 return materialized.staged.values_mut().collect();
             }
+            SchemaCompositionState::BackfillMaterializing(materialized)
+            | SchemaCompositionState::BackfillOpen(materialized)
+            | SchemaCompositionState::Refining(materialized)
+            | SchemaCompositionState::Finalizing(materialized)
+            | SchemaCompositionState::Finalized(materialized) => {
+                return materialized.staged.values_mut().collect();
+            }
             SchemaCompositionState::SealingAndMaterializingIndex(materialized)
             | SchemaCompositionState::MaterializedIndex(materialized)
+            | SchemaCompositionState::BackfillOpenIndex(materialized)
+            | SchemaCompositionState::RefiningIndex(materialized)
+            | SchemaCompositionState::FinalizedIndex(materialized)
             | SchemaCompositionState::RollbackRequiredMaterializedIndex(materialized) => {
                 return materialized.staged.values_mut().collect();
             }
@@ -718,6 +744,12 @@ impl DatabaseTransaction {
         let storage = if let Some(storage) = self
             .schema_composition
             .materialized_mut()
+            .and_then(|materialized| materialized.staged.get_mut(&storage_id))
+        {
+            storage
+        } else if let Some(storage) = self
+            .schema_composition
+            .backfill_mut()
             .and_then(|materialized| materialized.staged.get_mut(&storage_id))
         {
             storage
@@ -781,6 +813,16 @@ impl DatabaseTransaction {
                         }
                             })
                     })
+            })
+            .or_else(|| {
+                self.schema_composition.backfill().and_then(|materialized| {
+                    materialized
+                        .intent
+                        .tables
+                        .iter()
+                        .find(|plan| plan.table() == table)
+                        .map(|plan| plan.new_storage())
+                })
             })
             .or_else(|| {
                 self.schema_mutation
@@ -849,15 +891,22 @@ impl DatabaseTransaction {
             {
                 Some(storage) => storage,
                 None => match self
-                    .schema_mutation
-                    .as_mut()
-                    .and_then(|m| m.staged.as_mut())
-                    .filter(|s| s.storage_id() == storage_id)
+                    .schema_composition
+                    .backfill_mut()
+                    .and_then(|materialized| materialized.staged.get_mut(&storage_id))
                 {
                     Some(storage) => storage,
-                    None => registry
-                        .get_mut(storage_id)
-                        .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+                    None => match self
+                        .schema_mutation
+                        .as_mut()
+                        .and_then(|m| m.staged.as_mut())
+                        .filter(|s| s.storage_id() == storage_id)
+                    {
+                        Some(storage) => storage,
+                        None => registry
+                            .get_mut(storage_id)
+                            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?,
+                    },
                 },
             },
         };
