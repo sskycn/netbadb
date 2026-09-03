@@ -2490,7 +2490,12 @@ impl Database {
         self.validate_transaction(transaction)?;
         if (transaction.schema_composition.backfill().is_some()
             || transaction.schema_composition.backfill_index().is_some())
-            && !matches!(prepared.compiled, CompiledDdlStatement::AlterTable(_))
+            && !matches!(
+                prepared.compiled,
+                CompiledDdlStatement::AlterTable(_)
+                    | CompiledDdlStatement::CreateIndex(_)
+                    | CompiledDdlStatement::DropIndex(_)
+            )
         {
             return Err(SchemaMutationError::UnsupportedBackfillRefinement(
                 crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
@@ -2828,6 +2833,7 @@ impl Database {
         if matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::Refining(_)
+                | schema_composition::SchemaCompositionState::IndexFinalizing(_)
                 | schema_composition::SchemaCompositionState::RefiningIndex(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
         {
@@ -7286,6 +7292,8 @@ mod tests {
 
 #[cfg(test)]
 mod migration_backfill_audit_tests;
+#[cfg(test)]
+mod migration_backfill_index_tests;
 #[cfg(test)]
 mod sql_alter_table_tests;
 #[cfg(test)]

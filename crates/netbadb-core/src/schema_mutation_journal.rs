@@ -264,6 +264,9 @@ pub(crate) struct CompositionRecord {
     pub(crate) reservations: Vec<CompositionColumnReservation>,
     pub(crate) intent: Option<SchemaChangeSetIntent>,
     pub(crate) index_reservations: Vec<CompositionIndexReservation>,
+    /// Round33 reservations are a distinct journal record because they are
+    /// accepted after the Round32 schema intent is durable.
+    pub(crate) migration_index_reservations: Vec<CompositionIndexReservation>,
     pub(crate) index_intent: Option<SchemaIndexChangeSetIntent>,
     pub(crate) table_intent: Option<TableObjectChangeSetIntent>,
     pub(crate) resolution: Option<CompositionResolution>,
@@ -295,6 +298,23 @@ pub(crate) struct FinalizationIntent {
     pub(crate) final_snapshot: SchemaCatalogSnapshot,
     pub(crate) stage_locator: String,
     pub(crate) final_locator: String,
+    pub(crate) digest: [u8; 32],
+}
+
+/// Durable exact final index truth for a post-backfill migration. The logical
+/// schema remains authoritative in the prepared NBSC; this record binds the
+/// staged Heap's final IndexCatalog inventory without duplicating that NBSC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationIndexFinalizationIntent {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) table: TableId,
+    pub(crate) storage: StorageId,
+    pub(crate) final_table_version: TableSchemaVersion,
+    pub(crate) final_fingerprint: SchemaFingerprint,
+    pub(crate) final_snapshot_digest: [u8; 32],
+    pub(crate) stage_locator: String,
+    pub(crate) final_locator: String,
+    pub(crate) final_indexes: HeapRewriteIndexes,
     pub(crate) digest: [u8; 32],
 }
 
@@ -424,6 +444,8 @@ pub(crate) struct SchemaMutationJournal {
     pub(crate) compositions: BTreeMap<DatabaseTxnId, CompositionRecord>,
     pub(crate) stage_intents: BTreeMap<DatabaseTxnId, StageResourceIntent>,
     pub(crate) finalization_intents: BTreeMap<DatabaseTxnId, FinalizationIntent>,
+    pub(crate) migration_finalization_intents:
+        BTreeMap<DatabaseTxnId, MigrationIndexFinalizationIntent>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_sync: bool,
@@ -655,6 +677,22 @@ impl SchemaMutationJournal {
                 return Err(corrupt("backfill finalization locator or digest mismatch"));
             }
         }
+        for intent in journal.migration_finalization_intents.values() {
+            let stage = journal
+                .stage_intents
+                .get(&intent.transaction)
+                .ok_or(corrupt("migration finalization lacks stage intent"))?;
+            if intent.stage_locator != stage.stage_locator
+                || intent.final_locator != stage.final_locator
+                || intent.storage != stage.storage
+                || intent.table != stage.table
+                || intent.final_table_version.0 == 0
+                || intent.final_indexes.next_index_id.0 == 0
+                || intent.digest == [0; 32]
+            {
+                return Err(corrupt("migration finalization identity mismatch"));
+            }
+        }
         if activated {
             if open_envelope(&file::read(&witness)?, b"NBSA")? != incarnation {
                 return Err(corrupt("mutation activation incarnation mismatch"));
@@ -665,6 +703,7 @@ impl SchemaMutationJournal {
             || !journal.compositions.is_empty()
             || !journal.stage_intents.is_empty()
             || !journal.finalization_intents.is_empty()
+            || !journal.migration_finalization_intents.is_empty()
         {
             return Err(corrupt("reservation history has no activation witness"));
         }
@@ -696,6 +735,7 @@ impl SchemaMutationJournal {
                     compositions: BTreeMap::new(),
                     stage_intents: BTreeMap::new(),
                     finalization_intents: BTreeMap::new(),
+                    migration_finalization_intents: BTreeMap::new(),
                     poisoned: false,
                     #[cfg(test)]
                     fail_next_sync: false,
@@ -814,6 +854,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -861,6 +902,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -904,6 +946,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -947,6 +990,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1000,6 +1044,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1113,7 +1158,12 @@ impl SchemaMutationJournal {
     pub(crate) fn effective_index(&self, table: TableId, floor: IndexId) -> Option<IndexId> {
         self.compositions
             .values()
-            .flat_map(|record| record.index_reservations.iter())
+            .flat_map(|record| {
+                record
+                    .index_reservations
+                    .iter()
+                    .chain(record.migration_index_reservations.iter())
+            })
             .filter(|reservation| reservation.table == table)
             .map(|reservation| reservation.index.0)
             .max()
@@ -1197,6 +1247,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1219,6 +1270,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1241,12 +1293,49 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
             })
             .index_reservations
             .push(reservation);
+        self.persist()
+    }
+
+    pub(crate) fn reserve_migration_index(
+        &mut self,
+        reservation: CompositionIndexReservation,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        if self.reservations.contains_key(&reservation.transaction)
+            || self.drops.contains_key(&reservation.transaction)
+            || self
+                .rewrite_reservations
+                .contains_key(&reservation.transaction)
+        {
+            return Err(corrupt(
+                "migration index reservation overlaps legacy mutation",
+            ));
+        }
+        let duplicate = self
+            .compositions
+            .values()
+            .flat_map(|entry| entry.migration_index_reservations.iter())
+            .any(|existing| {
+                existing.table == reservation.table && existing.index == reservation.index
+            });
+        let record = self
+            .compositions
+            .get_mut(&reservation.transaction)
+            .ok_or(corrupt("migration index reservation lacks composition"))?;
+        if record.resolution.is_some() || duplicate {
+            return Err(corrupt("duplicate migration IndexId reservation"));
+        }
+        record.migration_index_reservations.push(reservation);
+        record
+            .migration_index_reservations
+            .sort_by_key(|entry| (entry.table, entry.index));
         self.persist()
     }
 
@@ -1264,6 +1353,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1349,6 +1439,32 @@ impl SchemaMutationJournal {
         self.persist()
     }
 
+    pub(crate) fn migration_finalization_intent(
+        &mut self,
+        intent: MigrationIndexFinalizationIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let stage = self
+            .stage_intents
+            .get(&intent.transaction)
+            .ok_or(corrupt("migration finalization lacks stage intent"))?;
+        if self
+            .migration_finalization_intents
+            .contains_key(&intent.transaction)
+            || stage.table != intent.table
+            || stage.storage != intent.storage
+            || stage.stage_locator != intent.stage_locator
+            || stage.final_locator != intent.final_locator
+            || intent.final_snapshot_digest == [0; 32]
+            || intent.digest == [0; 32]
+        {
+            return Err(corrupt("invalid migration finalization identity"));
+        }
+        self.migration_finalization_intents
+            .insert(intent.transaction, intent);
+        self.persist()
+    }
+
     pub(crate) fn schema_index_intent(
         &mut self,
         intent: SchemaIndexChangeSetIntent,
@@ -1363,6 +1479,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1387,6 +1504,7 @@ impl SchemaMutationJournal {
                 reservations: Vec::new(),
                 intent: None,
                 index_reservations: Vec::new(),
+                migration_index_reservations: Vec::new(),
                 index_intent: None,
                 table_intent: None,
                 resolution: None,
@@ -1932,6 +2050,7 @@ impl SchemaMutationJournal {
                 record.table_reservations.len()
                     + record.reservations.len()
                     + record.index_reservations.len()
+                    + record.migration_index_reservations.len()
                     + usize::from(record.intent.is_some())
                     + usize::from(record.index_intent.is_some())
                     + usize::from(record.table_intent.is_some())
@@ -1999,6 +2118,7 @@ impl SchemaMutationJournal {
             .stage_intents
             .len()
             .checked_add(self.finalization_intents.len())
+            .and_then(|count| count.checked_add(self.migration_finalization_intents.len()))
             .ok_or(corrupt("too many backfill intents"))?;
         let count = create_count
             .checked_add(drop_count)
@@ -2015,6 +2135,7 @@ impl SchemaMutationJournal {
             .chain(self.compositions.keys())
             .chain(self.stage_intents.keys())
             .chain(self.finalization_intents.keys())
+            .chain(self.migration_finalization_intents.keys())
             .copied()
             .collect::<Vec<_>>();
         transactions.sort_unstable();
@@ -2146,6 +2267,23 @@ impl SchemaMutationJournal {
                 index_reservations.sort_by_key(|entry| (entry.table, entry.index));
                 for reservation in index_reservations {
                     let mut record = Writer(vec![24]);
+                    record.u64(txn.0);
+                    record.u64(reservation.table.0);
+                    record.u64(reservation.table_version.0);
+                    record
+                        .0
+                        .extend_from_slice(reservation.fingerprint.as_bytes());
+                    record.u64(reservation.index.0);
+                    record.u64(reservation.next_index_id.map_or(0, |index| index.0));
+                    put_record(&mut w, &record.0)?;
+                }
+                let mut migration_reservations = composition
+                    .migration_index_reservations
+                    .iter()
+                    .collect::<Vec<_>>();
+                migration_reservations.sort_by_key(|entry| (entry.table, entry.index));
+                for reservation in migration_reservations {
+                    let mut record = Writer(vec![33]);
                     record.u64(txn.0);
                     record.u64(reservation.table.0);
                     record.u64(reservation.table_version.0);
@@ -2382,6 +2520,22 @@ impl SchemaMutationJournal {
             record.0.extend_from_slice(&snapshot);
             put_record(&mut w, &record.0)?;
         }
+        for intent in self.migration_finalization_intents.values() {
+            let mut record = Writer(vec![34]);
+            record.u64(intent.transaction.0);
+            record.u64(intent.table.0);
+            record.u64(intent.storage.0);
+            record.u64(intent.final_table_version.0);
+            record
+                .0
+                .extend_from_slice(intent.final_fingerprint.as_bytes());
+            record.0.extend_from_slice(&intent.final_snapshot_digest);
+            record.string(&intent.stage_locator)?;
+            record.string(&intent.final_locator)?;
+            record.0.extend_from_slice(&intent.digest);
+            encode_heap_indexes(&mut record, &intent.final_indexes)?;
+            put_record(&mut w, &record.0)?;
+        }
         let bytes = envelope(b"NBSJ", &w.0)?;
         Self::decode(&bytes)?;
         Ok(bytes)
@@ -2412,6 +2566,7 @@ impl SchemaMutationJournal {
         let mut compositions: BTreeMap<DatabaseTxnId, CompositionRecord> = BTreeMap::new();
         let mut stage_intents = BTreeMap::new();
         let mut finalization_intents = BTreeMap::new();
+        let mut migration_finalization_intents = BTreeMap::new();
         let mut last_columns: BTreeMap<TableId, ColumnId> = BTreeMap::new();
         let mut last_indexes: BTreeMap<TableId, IndexId> = BTreeMap::new();
         let mut last = (0, 0, 0, 0, 0);
@@ -2875,6 +3030,7 @@ impl SchemaMutationJournal {
                                 reservations: Vec::new(),
                                 intent: None,
                                 index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
                                 index_intent: None,
                                 table_intent: None,
                                 resolution: None,
@@ -2946,6 +3102,7 @@ impl SchemaMutationJournal {
                                 reservations: Vec::new(),
                                 intent: None,
                                 index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
                                 index_intent: None,
                                 table_intent: None,
                                 resolution: None,
@@ -3018,6 +3175,7 @@ impl SchemaMutationJournal {
                                 reservations: Vec::new(),
                                 intent: None,
                                 index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
                                 index_intent: None,
                                 table_intent: None,
                                 resolution: None,
@@ -3164,6 +3322,7 @@ impl SchemaMutationJournal {
                                 reservations: Vec::new(),
                                 intent: None,
                                 index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
                                 index_intent: None,
                                 table_intent: None,
                                 resolution: None,
@@ -3275,6 +3434,7 @@ impl SchemaMutationJournal {
                                 reservations: Vec::new(),
                                 intent: None,
                                 index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
                                 index_intent: None,
                                 table_intent: None,
                                 resolution: None,
@@ -3320,6 +3480,7 @@ impl SchemaMutationJournal {
                                 reservations: Vec::new(),
                                 intent: None,
                                 index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
                                 index_intent: None,
                                 table_intent: None,
                                 resolution: None,
@@ -3636,6 +3797,73 @@ impl SchemaMutationJournal {
                         return Err(corrupt("duplicate backfill finalization intent"));
                     }
                 }
+                33 => {
+                    let table = TableId(record.u64()?);
+                    let table_version = TableSchemaVersion(record.u64()?);
+                    let fingerprint = SchemaFingerprint::from_bytes(
+                        record
+                            .take(32)?
+                            .try_into()
+                            .map_err(|_| corrupt("migration IndexId fingerprint"))?,
+                    );
+                    let index = IndexId(record.u64()?);
+                    let next_index_id = record.u64()?;
+                    let composition = compositions
+                        .get_mut(&txn)
+                        .ok_or(corrupt("migration IndexId reservation without composition"))?;
+                    composition
+                        .migration_index_reservations
+                        .push(CompositionIndexReservation {
+                            transaction: txn,
+                            table,
+                            table_version,
+                            fingerprint,
+                            index,
+                            next_index_id: (next_index_id != 0).then_some(IndexId(next_index_id)),
+                        });
+                }
+                34 => {
+                    let table = TableId(record.u64()?);
+                    let storage = StorageId(record.u64()?);
+                    let final_table_version = TableSchemaVersion(record.u64()?);
+                    let final_fingerprint = SchemaFingerprint::from_bytes(
+                        record
+                            .take(32)?
+                            .try_into()
+                            .map_err(|_| corrupt("migration final fingerprint"))?,
+                    );
+                    let final_snapshot_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("migration final snapshot digest"))?;
+                    let stage_locator = record.string()?;
+                    let final_locator = record.string()?;
+                    let digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("migration finalization digest"))?;
+                    let final_indexes = decode_heap_indexes(&mut record)?;
+                    if migration_finalization_intents
+                        .insert(
+                            txn,
+                            MigrationIndexFinalizationIntent {
+                                transaction: txn,
+                                table,
+                                storage,
+                                final_table_version,
+                                final_fingerprint,
+                                final_snapshot_digest,
+                                stage_locator,
+                                final_locator,
+                                final_indexes,
+                                digest,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(corrupt("duplicate migration finalization intent"));
+                    }
+                }
                 _ => return Err(corrupt("unknown journal record tag")),
             }
             if !record.0.is_empty() {
@@ -3738,6 +3966,25 @@ impl SchemaMutationJournal {
                 return Err(corrupt("backfill finalization has no stage authority"));
             }
         }
+        for intent in migration_finalization_intents.values() {
+            if !stage_intents.contains_key(&intent.transaction) {
+                return Err(corrupt("migration finalization has no stage authority"));
+            }
+            let composition = compositions
+                .get(&intent.transaction)
+                .ok_or(corrupt("migration finalization has no composition"))?;
+            if composition
+                .migration_index_reservations
+                .iter()
+                .any(|reservation| {
+                    reservation.table != intent.table
+                        || reservation.table_version != intent.final_table_version
+                        || reservation.index >= intent.final_indexes.next_index_id
+                })
+            {
+                return Err(corrupt("migration IndexId reservation identity mismatch"));
+            }
+        }
         let mut retired = BTreeMap::new();
         for intent in drops.values().filter(|d| d.retired) {
             if let Some(previous) = retired.insert(intent.storage(), intent.table()) {
@@ -3820,6 +4067,7 @@ impl SchemaMutationJournal {
             compositions,
             stage_intents,
             finalization_intents,
+            migration_finalization_intents,
             poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,
