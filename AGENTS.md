@@ -237,7 +237,9 @@ executor, and SDK crates SHOULD contain no unsafe code.
 
 The local PostgreSQL installation used for repository development is located at
 `/opt/local/lib/pgsql`. Commands and tests that need PostgreSQL MUST use this
-installation unless the task explicitly specifies another one.
+installation unless the task explicitly specifies another one. Its required ICU
+libraries are located at `/opt/local/lib/icu/lib`; PostgreSQL commands and tests
+MUST use that library path.
 
 Before changing code:
 
