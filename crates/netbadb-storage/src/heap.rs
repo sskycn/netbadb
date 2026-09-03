@@ -6176,6 +6176,145 @@ mod tests {
     }
 
     #[test]
+    fn indexed_nullability_drop_retarget_rebuild_preserves_rows_and_retired_ownership() {
+        let path = test_path("round34-index-evacuation");
+        let omitted_path = test_path("round34-index-omitted");
+        cleanup(&path);
+        cleanup(&omitted_path);
+        let provisional = backfill_table(true);
+        let final_table = backfill_table(false);
+        let storage_id = StorageId(34);
+        let mut storage =
+            HeapStorage::create_with_storage_id(&path, provisional.clone(), storage_id)
+                .expect("create indexed provisional Heap");
+        let mut expected = Vec::new();
+        for id in 0_i64..128 {
+            let row = vec![
+                ScalarValue::Int64(id),
+                ScalarValue::Text(format!("name-{id:03}")),
+                ScalarValue::Text(format!("filled-{id:03}-{}", "x".repeat(96))),
+            ];
+            let row_id = storage.insert(&row).expect("insert indexed fixture row");
+            expected.push((row_id, row));
+        }
+        let old = storage
+            .create_named_index(
+                IndexName::new("projects_normalized_name_idx").unwrap(),
+                ColumnId(3),
+            )
+            .expect("build nullable old index");
+        assert_eq!(old.id, IndexId(1));
+        storage.flush().unwrap();
+        let bytes_with_old = std::fs::metadata(&path).unwrap().len();
+        let before = std::fs::read(&path).unwrap();
+        let row_pages = expected
+            .iter()
+            .map(|(row_id, _)| row_id.page)
+            .collect::<std::collections::BTreeSet<_>>();
+        let row_page_images = row_pages
+            .iter()
+            .map(|page| {
+                let start = usize::try_from(page.0).unwrap() * crate::PAGE_SIZE;
+                (*page, before[start..start + crate::PAGE_SIZE].to_vec())
+            })
+            .collect::<Vec<_>>();
+
+        storage.drop_index(old.id).expect("retire exact old index");
+        storage.flush().unwrap();
+        let bytes_after_drop = std::fs::metadata(&path).unwrap().len();
+        assert!(storage.indexes().is_empty());
+        assert_eq!(storage.retired_indexes(), std::slice::from_ref(&old));
+
+        storage
+            .retarget_private_schema(&provisional, final_table.clone())
+            .expect("retarget after incompatible active index evacuation");
+        storage.flush().unwrap();
+        let bytes_after_retarget = std::fs::metadata(&path).unwrap().len();
+        let replacement = storage
+            .create_named_index(
+                IndexName::new("projects_normalized_name_idx").unwrap(),
+                ColumnId(3),
+            )
+            .expect("build final non-null index");
+        assert_eq!(replacement.id, IndexId(2));
+        assert_ne!(replacement.id, old.id);
+        assert_ne!(replacement.handle.meta_page, old.handle.meta_page);
+        assert_eq!(
+            storage.btree().spec(replacement.handle).unwrap(),
+            IndexSpec {
+                data_type: SemanticType::physical(PhysicalType::Text),
+                nullable: false,
+            }
+        );
+        storage.flush().unwrap();
+        let bytes_after_rebuild = std::fs::metadata(&path).unwrap().len();
+        let after = std::fs::read(&path).unwrap();
+        for (page, image) in &row_page_images {
+            let start = usize::try_from(page.0).unwrap() * crate::PAGE_SIZE;
+            assert_eq!(&after[start..start + crate::PAGE_SIZE], image);
+        }
+        storage.close().expect("close rebuilt Heap");
+
+        let mut reopened = HeapStorage::open(&path, final_table.clone())
+            .expect("retired nullable index is not validated as active");
+        assert_eq!(reopened.storage_id(), storage_id);
+        assert_eq!(reopened.indexes(), std::slice::from_ref(&replacement));
+        assert!(reopened.retired_indexes().is_empty());
+        let ownership = reopened.inspect_index_reclaim().unwrap();
+        assert_eq!(ownership.pending.len(), 1);
+        assert_eq!(ownership.pending[0].index_id, old.id);
+        assert!(ownership.pending[0].meta_page.is_none());
+        assert!(
+            ownership
+                .allocations
+                .iter()
+                .all(|page| page.owner != old.id)
+        );
+        assert_eq!(reopened.scan().unwrap(), expected);
+        let probe = &expected[73];
+        assert_eq!(
+            reopened
+                .btree()
+                .lookup(replacement.handle, &probe.1[2])
+                .unwrap(),
+            vec![probe.0]
+        );
+        reopened.close().unwrap();
+
+        let mut omitted =
+            HeapStorage::create_with_storage_id(&omitted_path, provisional.clone(), storage_id)
+                .expect("create provisional Heap without old index");
+        for (_, row) in &expected {
+            omitted
+                .insert(row)
+                .expect("insert omitted-index fixture row");
+        }
+        omitted
+            .retarget_private_schema(&provisional, final_table.clone())
+            .expect("retarget index-free provisional Heap");
+        let omitted_replacement = omitted
+            .create_index_from_floor(
+                Some(IndexName::new("projects_normalized_name_idx").unwrap()),
+                ColumnId(3),
+                replacement.id,
+            )
+            .expect("build same final index from reserved floor");
+        assert_eq!(omitted_replacement.id, replacement.id);
+        omitted.flush().unwrap();
+        let bytes_without_old = std::fs::metadata(&omitted_path).unwrap().len();
+        eprintln!(
+            "round34 bytes: with_old={bytes_with_old} after_drop={bytes_after_drop} \
+             after_retarget={bytes_after_retarget} after_rebuild={bytes_after_rebuild} \
+             built_without_old={bytes_without_old}"
+        );
+        assert!(bytes_after_rebuild >= bytes_without_old);
+        omitted.close().unwrap();
+
+        cleanup(&path);
+        cleanup(&omitted_path);
+    }
+
+    #[test]
     fn physical_storage_identity_survives_reopen_and_rejects_zero() {
         let path = test_path("heap-storage-identity");
         cleanup(&path);

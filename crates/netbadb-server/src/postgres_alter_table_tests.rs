@@ -135,6 +135,54 @@ fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
 }
 
 #[test]
+fn pg_index_drop_then_dml_rejects_indexed_nullability_refinement_and_enters_e() {
+    let (root, mut db) = project("pg-round34-indexed-nullability");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let mut admin = session(&db, true);
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(&mut admin, &mut db, "DROP INDEX projects_name_idx"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+    ));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+        ),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .nullable
+    );
+    assert_eq!(db.indexes(TableId(2)).unwrap().len(), 1);
+    assert_eq!(
+        db.query("SELECT name FROM projects WHERE id = 2")
+            .unwrap()
+            .rows,
+        vec![vec![netbadb_types::ScalarValue::Null]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pg_extended_parse_bind_describe_are_pure_and_execute_is_exact() {
     let (root, mut db) = project("pg-alter-extended");
     let mut first = session(&db, true);

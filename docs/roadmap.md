@@ -876,6 +876,22 @@ ADD/DROP column after DML, indexed nullability, physical conversion, index/table
 DDL after DML, savepoints, online/resumable migration, and non-Heap placements
 remain deferred. Current global seal and README feature claims remain unchanged.
 
+### Indexed nullability rebuild / preparatory index drop audit — Round 34
+
+[Round 34](indexed-nullability-backfill-round34.md) keeps indexed nullability
+unsupported and preserves the monotonic indexed-column guard. Evidence pins that
+a DROP-first transaction materializes index-only DDL and DML in-place on S1,
+while a private Heap must physically retire an incompatible active BTree before
+its nullable metadata can be retargeted and the final-spec replacement rebuilt.
+
+Round 35 should implement only the selected Staged Index Evacuation Lifecycle
+for an already-BackfillOpen managed Single Heap: DML on S2, exact index DROP that
+closes DML, physical incompatible-index retirement, constrained refinement,
+one Heap/owner retarget, final-index build, exact tag-34 inventory proof,
+prepared NBSC, and one CORD v2 decision. Direct DROP INDEX--UPDATE--ALTER of an
+otherwise unchanged table, physical-only same-schema cloning, late S1 participant
+detach, and production SQL exposure remain deferred.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

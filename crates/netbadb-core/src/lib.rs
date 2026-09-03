@@ -7291,6 +7291,8 @@ mod tests {
 }
 
 #[cfg(test)]
+mod indexed_nullability_audit_tests;
+#[cfg(test)]
 mod migration_backfill_audit_tests;
 #[cfg(test)]
 mod migration_backfill_index_tests;
