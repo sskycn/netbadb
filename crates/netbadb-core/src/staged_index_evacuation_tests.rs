@@ -89,6 +89,12 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
         .unwrap()
         .id;
     let base_storage = db.bindings.resolve_single(users).unwrap();
+    let base_version = db.table_schema_version(users).unwrap();
+    let base_generation = db.schema_generation();
+    let base_epoch = crate::schema_catalog_file::load(&root.join("catalog"))
+        .unwrap()
+        .epoch;
+    let base_revision = db.catalog_generation();
     let old_email = db
         .indexes(users)
         .unwrap()
@@ -103,6 +109,11 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
         .find(|index| index.column_id != email)
         .unwrap()
         .clone();
+    assert_eq!(users, TableId(2));
+    assert_eq!(base_storage, StorageId(2));
+    assert_eq!(base_version, TableSchemaVersion(1));
+    assert_eq!(surviving.id, IndexId(1));
+    assert_eq!(old_email.id, IndexId(2));
 
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
@@ -114,6 +125,7 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
     .unwrap();
     let staged_storage = transaction.staged_binding(users).unwrap();
     assert_ne!(staged_storage, base_storage);
+    assert_eq!(staged_storage, StorageId(3));
 
     db.evacuate_staged_backfill_index_in(
         &mut transaction,
@@ -176,8 +188,26 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
         .iter()
         .find(|index| index.column_id == email)
         .unwrap();
-    assert_ne!(replacement.id, old_email.id);
-    assert!(replacement.id > old_email.id);
+    assert_eq!(replacement.id, IndexId(3));
+    assert_eq!(db.next_storage_id(), Some(StorageId(4)));
+    assert_eq!(
+        db.registry
+            .get_mut(staged_storage)
+            .unwrap()
+            .heap_rewrite_indexes()
+            .unwrap()
+            .next_index_id,
+        IndexId(4)
+    );
+    assert_eq!(db.table_schema_version(users), Some(TableSchemaVersion(2)));
+    assert_eq!(db.schema_generation().0, base_generation.0 + 1);
+    assert_eq!(
+        crate::schema_catalog_file::load(&root.join("catalog"))
+            .unwrap()
+            .epoch,
+        base_epoch + 1
+    );
+    assert_eq!(db.catalog_generation(), base_revision + 1);
     assert!(
         !db.schema()
             .table("users")
@@ -218,6 +248,47 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
                 .unwrap()
                 .nullable
         );
+        reopened.close().unwrap();
+    }
+
+    let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    let retired = reopened
+        .inspect_replacement_retired_heaps()
+        .into_iter()
+        .find(|resource| resource.old_storage_id == base_storage)
+        .unwrap();
+    let before_gc = reopened
+        .inspect_replacement_retired_heap_gc(&retired)
+        .unwrap();
+    let gc = reopened.gc_replacement_retired_heap(&retired).unwrap();
+    assert_eq!(gc.bytes_deleted, before_gc.total_present_bytes);
+    assert_eq!(reopened.bindings.resolve_single(users), Ok(staged_storage));
+    let indexes = reopened.indexes(users).unwrap();
+    assert_eq!(indexes.len(), 2);
+    assert!(indexes.iter().any(|index| index.id == surviving.id));
+    assert!(indexes.iter().any(|index| index.id > old_email.id));
+    assert_eq!(
+        reopened
+            .query("SELECT id, email FROM users ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("filled@example.test".into())
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::Text("two@example.test".into())
+            ]
+        ]
+    );
+    reopened.close().unwrap();
+
+    for _ in 0..3 {
+        let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(reopened.bindings.resolve_single(users), Ok(staged_storage));
+        assert_eq!(reopened.indexes(users).unwrap().len(), 2);
         reopened.close().unwrap();
     }
     std::fs::remove_dir_all(root).unwrap();

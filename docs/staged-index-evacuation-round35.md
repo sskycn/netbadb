@@ -101,7 +101,8 @@ again, then retargets the owner envelope. It copies no row or index page.
 ## 18. Replacement index reservation
 
 CREATE after refinement reuses Round 33 durable reservation. Inew burns a fresh
-IndexId and cannot inherit Iold's identity.
+IndexId and cannot inherit Iold's identity. The representative fixture preserves
+the unrelated I1, evacuates I2, creates I3, and leaves the next floor at I4.
 
 ## 19. Final index construction
 
@@ -130,14 +131,15 @@ independent generation-bearing handle; numeric page reuse is not identity reuse.
 
 ## 24. StorageId
 
-The lifecycle uses one replacement S2 StorageId. It creates no S3 and performs
-no late clone or selective detach from S1.
+The representative fixture moves TableId 2 from StorageId 2 to StorageId 3;
+the next floor is StorageId 4. It creates no second replacement and performs no
+late clone or selective detach from S1.
 
 ## 25. TableVersion / Generation / epoch / revision
 
-Publication follows existing one-step composition: one TableVersion increment,
-one SchemaGeneration increment, one NBSC epoch increment, and one runtime
-revision increment.
+For TableId 2 the fixture records TableVersion 1 to 2, plus exactly one
+SchemaGeneration increment, one NBSC epoch increment, and one runtime revision
+increment.
 
 ## 26. Persistent journal
 
@@ -202,7 +204,8 @@ composition and coordinator evidence.
 ## 38. Replacement GC
 
 Existing retired-Heap GC applies to S1 as one owned bundle. No automatic or
-index-specific deletion policy is added.
+index-specific deletion policy is added. The Round 35 lifecycle test explicitly
+deletes S1, then verifies StorageId 3, I1/I3, rows, and three further reopens.
 
 ## 39. Multiple incompatible indexes
 
@@ -232,8 +235,10 @@ This is a private Core lifecycle foundation.
 
 ## 44. Physical cost
 
-No fixed byte saving is claimed. Retirement retains established ownership
-metadata, and final CREATE may reuse pages only under generation-safe rules.
+The 128-row physical fixture remains 77,824 bytes (19 x 4-KiB pages) with Iold,
+after DROP, after retarget, and after Inew rebuild because retired pages are
+reused. The source Heap row visitor runs once during S1-to-S2 materialization;
+evacuation/refinement/finalization perform zero further row copies and create no S3.
 
 ## 45. Crash matrix
 
@@ -255,9 +260,10 @@ deployment manifest v4.
 
 Native coverage includes replacement, exact-target no-op, commit gate, failed
 validation, no-replacement commit, multiple evacuations, compatible rename,
-DML closure, one S2 participant, and reopen/crash recovery. Existing public
-negative tests remain unchanged. Full all-feature workspace check, Clippy, and
-tests pass on the pinned toolchain; psql 17.11 passes the three external probes.
+DML closure, one S2 participant, replacement GC, and reopen/crash recovery.
+Existing public negative tests remain unchanged. Full all-feature workspace
+check, Clippy, and tests pass on the pinned toolchain; psql 17.11 passes the
+three external probes.
 
 ## 48. Fuzz
 
