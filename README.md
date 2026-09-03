@@ -71,6 +71,12 @@ Page manager / database file
 The core does not depend on Go, a network runtime, JSON execution IR, or
 application-specific Rust structs.
 
+Round 33 extends controlled backfill with a post-backfill `CREATE INDEX` /
+`DROP INDEX` phase. Index IDs are durably reserved before overlay mutation;
+finalization retargets the same staged Heap first and then builds only the
+exact final index delta from transaction-visible rows. See
+[controlled-backfill-round33](docs/controlled-backfill-round33.md).
+
 ## Strong types
 
 Internal identifiers are newtypes such as `TableId`, `PartitionId`,

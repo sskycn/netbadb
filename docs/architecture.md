@@ -276,6 +276,14 @@ one private Heap/owner metadata retarget, an immutable resource-only stage inten
 then an immutable finalization intent, one prepared NBSC, and one CORD v2 decision.
 No intermediate nullable schema is published and recovery never replays SQL.
 
+[Round 33](controlled-backfill-round33.md) extends this lifecycle with
+`IndexFinalizing`: after DML and compatible refinement, logical CREATE/DROP
+INDEX operations update an exact transaction-local inventory and reserve new
+IndexIds durably. Finalization retargets the staged Heap first, applies only
+the staged-to-final index delta from transaction-visible rows, and records a
+new index-aware NBSJ finalization tag. The same StorageId and one CORD decision
+are retained; the existing Round 32 tag 32 remains schema-only.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

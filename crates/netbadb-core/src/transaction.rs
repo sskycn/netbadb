@@ -763,6 +763,24 @@ impl DatabaseTransaction {
         };
         Ok(operation(storage, context)?)
     }
+
+    pub(crate) fn with_detached_composed_staged_write<T>(
+        &mut self,
+        storage_id: StorageId,
+        storage: &mut netbadb_storage::TableStorage,
+        operation: impl FnOnce(
+            &mut netbadb_storage::TableStorage,
+            &mut StorageTransaction,
+        ) -> Result<T, StorageError>,
+    ) -> Result<T, CoordinatorError> {
+        self.ensure_active()?;
+        let context = &mut self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?
+            .context;
+        Ok(operation(storage, context)?)
+    }
     /// Whether this active transaction privately owns a staged table identity.
     /// This reports lifecycle state only; authorization remains a server policy.
     #[must_use]
