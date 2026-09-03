@@ -235,6 +235,10 @@ executor, and SDK crates SHOULD contain no unsafe code.
 
 ## 7. Development workflow
 
+The local PostgreSQL installation used for repository development is located at
+`/opt/local/lib/pgsql`. Commands and tests that need PostgreSQL MUST use this
+installation unless the task explicitly specifies another one.
+
 Before changing code:
 
 1. Read this file and every applicable scoped `AGENTS.md`.
