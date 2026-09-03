@@ -3428,7 +3428,7 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 mod tests {
     use super::{
         ConsumerProjection, HeapStorage, decode_row, decode_row_columns, decode_row_for_consumer,
-        decode_value, encode_row, resolve_projection,
+        decode_value, encode_row, resolve_projection, write_heap_metadata,
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
@@ -3471,6 +3471,37 @@ mod tests {
         let wal = wal_path(path);
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    fn audit_retarget_heap_metadata(path: &std::path::Path, table: &TableDef, id: StorageId) {
+        let mut pages = PageManager::open(path).expect("open audit Heap pages");
+        let mut header = pages.read_page(PageId(0)).expect("read audit Heap header");
+        write_heap_metadata(
+            header.bytes_mut(),
+            table,
+            table.fingerprint().expect("target fingerprint"),
+            PageId(1),
+            id,
+        );
+        pages.write_page(&header).expect("write audit Heap header");
+        pages.sync().expect("sync audit Heap header");
+    }
+
+    fn backfill_table(nullable: bool) -> TableDef {
+        TableDef::new(
+            TableId(31),
+            "projects",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+                ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "normalized_name",
+                    TypeSpec::Physical(PhysicalType::Text),
+                )
+                .nullable(nullable),
+            ],
+        )
     }
 
     #[test]
@@ -5962,6 +5993,138 @@ mod tests {
             ))
         ));
         cleanup(&path);
+    }
+
+    #[test]
+    fn private_heap_metadata_retarget_preserves_rows_and_row_ids_without_rewrite() {
+        let path = test_path("round31-private-retarget");
+        cleanup(&path);
+        let provisional = backfill_table(true);
+        let mut final_table = backfill_table(false);
+        final_table.name = "work".into();
+        let storage_id = StorageId(31);
+        let mut storage =
+            HeapStorage::create_with_storage_id(&path, provisional.clone(), storage_id)
+                .expect("create provisional Heap");
+        let first = storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("one".into()),
+                ScalarValue::Text("ONE".into()),
+            ])
+            .expect("insert first backfilled row");
+        let second = storage
+            .insert(&[
+                ScalarValue::Int64(2),
+                ScalarValue::Text("two".into()),
+                ScalarValue::Text("TWO".into()),
+            ])
+            .expect("insert second backfilled row");
+        storage.close().expect("close provisional Heap");
+
+        assert!(matches!(
+            HeapStorage::open(&path, final_table.clone()),
+            Err(StorageError::SchemaMismatch { .. })
+        ));
+        let before = std::fs::read(&path).expect("read provisional Heap");
+        let wal_before = std::fs::read(wal_path(&path)).expect("read provisional WAL");
+        let status_before = std::fs::read(txn_status_path(&path)).expect("read provisional status");
+        audit_retarget_heap_metadata(&path, &final_table, storage_id);
+        let after = std::fs::read(&path).expect("read retargeted Heap");
+        assert_eq!(&before[crate::PAGE_SIZE..], &after[crate::PAGE_SIZE..]);
+        assert_eq!(wal_before, std::fs::read(wal_path(&path)).unwrap());
+        assert_eq!(
+            status_before,
+            std::fs::read(txn_status_path(&path)).unwrap()
+        );
+
+        let mut reopened =
+            HeapStorage::open(&path, final_table).expect("open retargeted final Heap");
+        let rows = reopened.scan().expect("scan retargeted rows");
+        assert_eq!(rows[0].0, first);
+        assert_eq!(rows[1].0, second);
+        assert_eq!(
+            rows.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("one".into()),
+                    ScalarValue::Text("ONE".into()),
+                ],
+                vec![
+                    ScalarValue::Int64(2),
+                    ScalarValue::Text("two".into()),
+                    ScalarValue::Text("TWO".into()),
+                ],
+            ]
+        );
+        reopened.close().expect("close retargeted Heap");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn indexed_private_heap_retarget_distinguishes_spec_change_from_rename() {
+        let nullability_path = test_path("round31-indexed-nullability-retarget");
+        cleanup(&nullability_path);
+        let provisional = backfill_table(true);
+        let final_table = backfill_table(false);
+        let storage_id = StorageId(32);
+        let mut storage =
+            HeapStorage::create_with_storage_id(&nullability_path, provisional.clone(), storage_id)
+                .expect("create indexed provisional Heap");
+        storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("one".into()),
+                ScalarValue::Text("ONE".into()),
+            ])
+            .expect("insert indexed row");
+        storage
+            .create_index(ColumnId(3))
+            .expect("create provisional index");
+        storage.close().expect("close indexed provisional Heap");
+        let before = std::fs::read(&nullability_path).unwrap();
+        audit_retarget_heap_metadata(&nullability_path, &final_table, storage_id);
+        let after = std::fs::read(&nullability_path).unwrap();
+        assert_eq!(&before[crate::PAGE_SIZE..], &after[crate::PAGE_SIZE..]);
+        assert!(matches!(
+            HeapStorage::open(&nullability_path, final_table),
+            Err(StorageError::Index(IndexError::CatalogSpecMismatch {
+                column_id: ColumnId(3),
+                ..
+            }))
+        ));
+        cleanup(&nullability_path);
+
+        let rename_path = test_path("round31-indexed-rename-retarget");
+        cleanup(&rename_path);
+        let mut storage =
+            HeapStorage::create_with_storage_id(&rename_path, provisional.clone(), storage_id)
+                .expect("create rename provisional Heap");
+        storage
+            .insert(&[
+                ScalarValue::Int64(1),
+                ScalarValue::Text("one".into()),
+                ScalarValue::Text("ONE".into()),
+            ])
+            .expect("insert rename row");
+        let index = storage
+            .create_index(ColumnId(3))
+            .expect("create rename index");
+        storage.close().expect("close rename provisional Heap");
+        let mut renamed = provisional;
+        renamed.name = "work".into();
+        renamed.columns[2].name = "canonical_name".into();
+        let before = std::fs::read(&rename_path).unwrap();
+        audit_retarget_heap_metadata(&rename_path, &renamed, storage_id);
+        let after = std::fs::read(&rename_path).unwrap();
+        assert_eq!(&before[crate::PAGE_SIZE..], &after[crate::PAGE_SIZE..]);
+        let mut reopened =
+            HeapStorage::open(&rename_path, renamed).expect("rename keeps BTree spec valid");
+        assert_eq!(reopened.indexes(), std::slice::from_ref(&index));
+        assert_eq!(reopened.scan().unwrap().len(), 1);
+        reopened.close().unwrap();
+        cleanup(&rename_path);
     }
 
     #[test]

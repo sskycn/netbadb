@@ -2807,6 +2807,42 @@ impl Database {
         }
     }
 
+    /// Round 31 audit probe only: validate a prospective `SET NOT NULL`
+    /// against the transaction-visible private staged Heap. This deliberately
+    /// does not mutate schema state or make post-materialization DDL legal.
+    #[cfg(test)]
+    fn audit_validate_staged_not_null(
+        &mut self,
+        transaction: &mut Transaction,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let storage_id = transaction
+            .staged_binding(table_id)
+            .ok_or(SchemaMutationError::Corrupt("audit staged binding absent"))?;
+        let view = transaction.begin_read_view(&[storage_id], &mut self.registry)?;
+        let storage_view = view
+            .iter()
+            .find_map(|(id, view)| (id == storage_id).then_some(view))
+            .ok_or(SchemaMutationError::Corrupt(
+                "audit staged read view absent",
+            ))?;
+        let storage = transaction
+            .execution_staged_storages_mut()
+            .into_iter()
+            .find(|storage| storage.storage_id() == storage_id)
+            .ok_or(SchemaMutationError::Corrupt("audit staged Heap absent"))?;
+        let rows = storage.scan_columns_with_view(&[column_id], storage_view)?;
+        if rows
+            .iter()
+            .any(|(_, values)| matches!(values.as_slice(), [ScalarValue::Null]))
+        {
+            return Err(SchemaMutationError::NotNullViolation(column_id).into());
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn schema(&self) -> &Schema {
         &self.committed.schema
@@ -7198,6 +7234,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod migration_backfill_audit_tests;
 #[cfg(test)]
 mod sql_alter_table_tests;
 #[cfg(test)]

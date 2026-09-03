@@ -856,6 +856,26 @@ recovery and exact-resource GC evidence; all earlier tag bytes remain unchanged.
 Next: audit a controlled migration-DML phase for DDL--DML--DDL workflows without
 removing the global materialization seal or weakening exact identity recovery.
 
+### Migration backfill / DDL--DML--DDL architecture audit — Round 31
+
+[Round 31](migration-backfill-round31.md) completes that audit without enabling
+production DDL after DML. Core evidence proves staged read-your-writes, partial
+and complete transaction-visible NOT NULL validation, transaction-created Heap
+visibility, writer exclusion, aggregate-intent finality, and base-winner recovery
+after an abrupt predecision backfill crash. Heap v5 experiments prove that S2 can
+become final Fb through a private page-0/owner metadata retarget when row layout
+and BTree specs are unchanged; indexed nullability correctly fails because its
+BTree metadata still binds Fa.
+
+Round 32 should implement exactly the selected Controlled Backfill Phase + Private
+Heap Metadata Retarget Foundation for managed Single-Heap CreateHeap/RewriteHeap
+plans: BackfillOpen DML on private targets; then a DML-closing final-refinement
+phase limited to non-indexed SET/DROP NOT NULL and rename; immutable resource-only
+stage and finalization intents; one retarget, prepared NBSC, and CORD v2 decision.
+ADD/DROP column after DML, indexed nullability, physical conversion, index/table
+DDL after DML, savepoints, online/resumable migration, and non-Heap placements
+remain deferred. Current global seal and README feature claims remain unchanged.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

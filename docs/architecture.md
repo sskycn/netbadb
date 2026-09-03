@@ -264,6 +264,18 @@ One prepared NBSC and one CORD decision publish every surviving object. NBSJ v1
 tags 26--30 record TableId reservation, the typed table-object aggregate,
 predecessor retirement, and exact-resource GC without changing older tag bytes.
 
+[Round 31](migration-backfill-round31.md) audits the still-sealed migration-
+backfill boundary without enabling it. Direct transaction-view tests prove that
+ordinary DML reads and writes the private materialized Heap, and a test-only scan
+validates `SET NOT NULL` against those writes. Heap v5 experiments prove that an
+unindexed, layout-compatible provisional Heap can be retargeted to its final
+fingerprint without rewriting rows, while indexed nullability also binds BTree
+`IndexSpec` and is not Heap-header-only. The selected Round 32 architecture is a
+controlled BackfillOpen phase followed by a DML-closing final-refinement phase,
+one private Heap/owner metadata retarget, an immutable resource-only stage intent,
+then an immutable finalization intent, one prepared NBSC, and one CORD v2 decision.
+No intermediate nullable schema is published and recovery never replays SQL.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

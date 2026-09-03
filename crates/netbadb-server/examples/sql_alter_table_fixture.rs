@@ -2,7 +2,7 @@
 use netbadb_core::{Database, DatabaseCoordinatorConfig, TableStorageCreateSpec};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{PostgresTcpServer, ServerConfig};
-use netbadb_types::{ColumnId, PhysicalType, TableId};
+use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 use serde_json::json;
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -89,6 +89,30 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Ok(probe) = std::env::var("NETBADB_ROUND31_PROBE") {
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 31 base table disappeared")?;
+            if projects.column("normalized_name").is_some() || projects.columns.len() != 2 {
+                return Err("failed Round 31 transaction published provisional schema".into());
+            }
+            if reopened
+                .query("SELECT id, name FROM projects ORDER BY id")?
+                .rows
+                != [vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())]]
+            {
+                return Err("failed Round 31 transaction changed base rows".into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} observed 25000 and rollback; base schema/data won three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     let probe = std::env::var("NETBADB_ROUND30_PROBE")?;
     let (base, required, absent) = match probe.as_str() {
