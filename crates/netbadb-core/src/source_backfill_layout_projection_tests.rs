@@ -377,55 +377,78 @@ fn late_add_drop_noop_burns_column_without_allocating_a_target_heap() {
 }
 
 #[test]
-fn rollback_burns_all_late_columns_and_preserves_the_source_layout() {
-    let root = root("rollback-burn");
-    let mut db = seed(&root, true);
-    let table = db.schema().table("users").unwrap().id;
-    let source_storage = db.bindings.resolve_single(table).unwrap();
-    let first = db.next_column_id(table).unwrap();
-    let storage_floor = db.next_storage_id();
-    let mut transaction = db.begin_transaction().unwrap();
-    drop_source_indexes(&mut db, &mut transaction);
-    db.execute_in(&mut transaction, "DELETE FROM users WHERE id = 2")
-        .unwrap();
-    for name in ["first_loser", "second_loser"] {
-        apply_layout(
-            &mut db,
-            &mut transaction,
-            AlterTableOperation::AddNullableColumn {
-                name: name.into(),
-                data_type: SemanticType::physical(PhysicalType::Text),
-            },
-        )
-        .unwrap();
-    }
-    assert_eq!(db.next_column_id(table), Some(ColumnId(first.0 + 2)));
-    transaction.rollback().unwrap();
-    drop(transaction);
-    db.close().unwrap();
+fn public_sql_rollback_matrix_preserves_source_layout_and_column_burns() {
+    for (name, statements, burned_columns) in [
+        (
+            "rollback-add",
+            &["ALTER TABLE users ADD COLUMN first_loser TEXT"] as &[&str],
+            1,
+        ),
+        (
+            "rollback-drop",
+            &["ALTER TABLE users DROP COLUMN legacy"] as &[&str],
+            0,
+        ),
+        (
+            "rollback-same-name",
+            &[
+                "ALTER TABLE users DROP COLUMN legacy",
+                "ALTER TABLE users ADD COLUMN legacy TEXT",
+            ] as &[&str],
+            1,
+        ),
+        (
+            "rollback-multiple-add",
+            &[
+                "ALTER TABLE users ADD COLUMN first_loser TEXT",
+                "ALTER TABLE users ADD COLUMN second_loser TEXT",
+            ] as &[&str],
+            2,
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, true);
+        let table = db.schema().table("users").unwrap().id;
+        let source_storage = db.bindings.resolve_single(table).unwrap();
+        let first = db.next_column_id(table).unwrap();
+        let storage_floor = db.next_storage_id();
+        let mut transaction = db.begin_transaction().unwrap();
+        drop_source_indexes(&mut db, &mut transaction);
+        db.execute_in(&mut transaction, "DELETE FROM users WHERE id = 2")
+            .unwrap();
+        for statement in statements {
+            db.execute_in(&mut transaction, statement).unwrap();
+        }
+        assert_eq!(
+            db.next_column_id(table),
+            Some(ColumnId(first.0 + burned_columns))
+        );
+        transaction.rollback().unwrap();
+        drop(transaction);
+        db.close().unwrap();
 
-    let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
-    assert_eq!(reopened.bindings.resolve_single(table), Ok(source_storage));
-    assert_eq!(reopened.next_storage_id(), storage_floor);
-    assert_eq!(reopened.next_column_id(table), Some(ColumnId(first.0 + 2)));
-    assert!(
-        reopened
-            .schema()
-            .table("users")
-            .unwrap()
-            .column("first_loser")
-            .is_none()
-    );
-    assert_eq!(
-        reopened
-            .query("SELECT id FROM users ORDER BY id")
-            .unwrap()
-            .rows
-            .len(),
-        3
-    );
-    reopened.close().unwrap();
-    std::fs::remove_dir_all(root).unwrap();
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(reopened.bindings.resolve_single(table), Ok(source_storage));
+        assert_eq!(reopened.next_storage_id(), storage_floor);
+        assert_eq!(
+            reopened.next_column_id(table),
+            Some(ColumnId(first.0 + burned_columns))
+        );
+        let users = reopened.schema().table("users").unwrap();
+        assert_eq!(users.column("legacy").unwrap().id, ColumnId(2));
+        assert!(users.column("first_loser").is_none());
+        assert!(users.column("second_loser").is_none());
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM users ORDER BY id")
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+        reopened.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
