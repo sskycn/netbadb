@@ -997,6 +997,20 @@ UPDATE→ADD/DROP, new-column indexes, public new-column NOT NULL, conversions,
 defaults, broader placements, and general Alembic support remain deferred; no
 persistent or wire format changes.
 
+### Post-DML source adoption architecture audit — Round 43
+
+[Round 43](post-dml-source-adoption-round43.md) keeps the production SQL surface
+closed and chooses Candidate B for a future bounded implementation: late-adopt
+the sole ordinary row-data S1 participant, acquire the schema writer only after
+an exact T/V/F/S1/P1 and strict one-table preflight, preserve allocator history
+with ordinary tag 16, and create the real rewrite/tag35/stage/tag34 authority
+only if the final layout is effective. Test-only experiments reject an identity
+tag-25 carrier, prove a clean ADD+DROP no-op on S1, and reuse one transaction-
+visible S1→S2 projection plus existing CORD recovery. Round 44 should initially
+cover only nullable ADD, unindexed non-PK DROP, and table/column rename; no new
+persistent record, protocol surface, SDK behavior, or generic ALTER-after-DML
+claim is introduced here.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

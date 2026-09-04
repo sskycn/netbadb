@@ -388,6 +388,16 @@ fn pg_drop_first_layout_rejections_enter_failed_transaction_state() {
             "ALTER TABLE accounts DROP COLUMN legacy",
             "25000",
         ),
+        (
+            "no-authority-rename",
+            "ALTER TABLE accounts RENAME COLUMN email TO contact",
+            "25000",
+        ),
+        (
+            "no-authority-not-null",
+            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
+            "25000",
+        ),
     ] {
         let (root, mut db) = layout_project(name);
         let mut admin = session(&db, true);

@@ -176,6 +176,46 @@ enum SchemaIndexMaterialization {
         source_storage: StorageId,
         source_physical_txn_id: netbadb_types::TxnId,
     },
+    #[cfg(test)]
+    AdoptedSourceBackfill {
+        source_storage: StorageId,
+        source_physical_txn_id: netbadb_types::TxnId,
+    },
+}
+
+impl SchemaIndexMaterialization {
+    fn source(self) -> Option<(StorageId, netbadb_types::TxnId)> {
+        match self {
+            Self::Ordinary => None,
+            Self::SourceBackfill {
+                source_storage,
+                source_physical_txn_id,
+            } => Some((source_storage, source_physical_txn_id)),
+            #[cfg(test)]
+            Self::AdoptedSourceBackfill {
+                source_storage,
+                source_physical_txn_id,
+            } => Some((source_storage, source_physical_txn_id)),
+        }
+    }
+
+    fn replaces_existing_index_intent(self) -> bool {
+        matches!(self, Self::SourceBackfill { .. })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PostDmlSourceAdoptionEvidence {
+    pub(crate) table: TableId,
+    pub(crate) table_version: TableSchemaVersion,
+    pub(crate) fingerprint: netbadb_schema::SchemaFingerprint,
+    pub(crate) storage: StorageId,
+    pub(crate) physical_txn_id: netbadb_types::TxnId,
+    pub(crate) source_locator: String,
+    pub(crate) base_generation: netbadb_types::SchemaGeneration,
+    pub(crate) base_epoch: u64,
+    pub(crate) index_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2228,6 +2268,240 @@ impl Database {
             transaction.schema_composition = SchemaCompositionState::Composing(Box::new(plan));
         }
         Ok(())
+    }
+
+    /// Round 43 executable audit only. This checks the proposed strict
+    /// one-table adoption predicate without changing production SQL routing.
+    #[cfg(test)]
+    pub(crate) fn audit_post_dml_source_adoption_evidence(
+        &mut self,
+        transaction: &Transaction,
+        target: &SchemaDependency,
+    ) -> Result<PostDmlSourceAdoptionEvidence, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        if transaction.schema_mutation.is_some()
+            || !transaction.schema_composition.is_none()
+            || transaction.has_pending_index_creations()
+            || transaction.has_pending_index_drops()
+        {
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+            )
+            .into());
+        }
+        if self.schema_writer.get().is_some() || Rc::strong_count(&self.transaction_owner) != 2 {
+            return Err(SchemaMutationError::SchemaBusy.into());
+        }
+        if transaction.participant_count() != 1 {
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+            )
+            .into());
+        }
+        let source_storage = transaction.write_participant().ok_or(
+            SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+            ),
+        )?;
+        if !transaction.is_only_write_participant(source_storage) {
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+            )
+            .into());
+        }
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == target.table_id)
+            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?;
+        let lineage = self
+            .committed
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == target.table_id)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source adoption lineage absent",
+            ))?;
+        let fingerprint = table.fingerprint()?;
+        if lineage.version != target.table_version || fingerprint != target.fingerprint {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        if !matches!(
+            self.bindings.placement(target.table_id),
+            Ok(TablePlacement::Single { storage_id, .. }) if *storage_id == source_storage
+        ) {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        let catalog = self
+            .catalog_path
+            .as_ref()
+            .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
+        let snapshot = file::load(catalog)?;
+        if snapshot.committed != self.committed {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let descriptor = snapshot
+            .storages
+            .iter()
+            .find(|descriptor| descriptor.id == source_storage)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source adoption descriptor absent",
+            ))?;
+        let expected_locator = final_locator(catalog, snapshot.incarnation, source_storage)?;
+        if descriptor.table_id != target.table_id
+            || !matches!(descriptor.kind, CatalogStorageKind::Heap)
+            || descriptor.locator != expected_locator
+        {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        let source = self
+            .registry
+            .get_mut(source_storage)
+            .ok_or(SchemaMutationError::Corrupt("source adoption Heap absent"))?;
+        if source.kind() != netbadb_storage::StorageKind::Heap
+            || source.storage_id() != source_storage
+            || source.table() != table
+            || source.table().fingerprint()? != fingerprint
+        {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        let indexes = source.heap_rewrite_indexes()?;
+        let physical_txn_id = transaction.physical_transaction_id(source_storage).ok_or(
+            SchemaMutationError::Corrupt("source adoption physical transaction absent"),
+        )?;
+        Ok(PostDmlSourceAdoptionEvidence {
+            table: target.table_id,
+            table_version: lineage.version,
+            fingerprint,
+            storage: source_storage,
+            physical_txn_id,
+            source_locator: descriptor.locator.clone(),
+            base_generation: snapshot.committed.generation,
+            base_epoch: snapshot.epoch,
+            index_digest: crate::schema_mutation_journal::heap_rewrite_indexes_digest(&indexes)?,
+        })
+    }
+
+    /// Round 43 Candidate B prototype. Validation and source capture complete
+    /// before the writer is acquired; the resulting state is reachable only
+    /// from crate tests.
+    #[cfg(test)]
+    pub(crate) fn audit_adopt_post_dml_source(
+        &mut self,
+        transaction: &mut Transaction,
+        target: &SchemaDependency,
+    ) -> Result<PostDmlSourceAdoptionEvidence, DatabaseError> {
+        let evidence = self.audit_post_dml_source_adoption_evidence(transaction, target)?;
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == target.table_id)
+            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?
+            .clone();
+        let mut logical = self.start_schema_composition(transaction.id())?;
+        let touched = self.capture_composed_table(&logical.base, &table, target.fingerprint)?;
+        if touched.old_storage != evidence.storage {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        logical.touched.insert(target.table_id, touched);
+        self.schema_writer.set(Some(transaction.id()));
+        transaction.schema_composition = SchemaCompositionState::Composing(Box::new(logical));
+        Ok(evidence)
+    }
+
+    /// Round 43 Candidate A probe. Current NBSJ validation deliberately
+    /// rejects an identity InPlaceIndexDelta before it can be persisted.
+    #[cfg(test)]
+    pub(crate) fn audit_candidate_a_identity_intent(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let logical = match &transaction.schema_composition {
+            SchemaCompositionState::Composing(logical) => logical,
+            _ => {
+                return Err(SchemaMutationError::Corrupt(
+                    "candidate A audit lacks adopted logical state",
+                )
+                .into());
+            }
+        };
+        let (table, touched) =
+            logical
+                .touched
+                .iter()
+                .next()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "candidate A audit source absent",
+                ))?;
+        logical
+            .journal
+            .borrow_mut()
+            .schema_index_intent(SchemaIndexChangeSetIntent {
+                transaction: transaction.id(),
+                base_generation: logical.base.committed.generation,
+                target_generation: None,
+                base_epoch: logical.base.epoch,
+                target_epoch: None,
+                action_count: 1,
+                action_digest: [0x43; 32],
+                snapshot_digest: None,
+                tables: vec![SchemaIndexTablePlan::InPlaceIndexDelta {
+                    table: *table,
+                    table_version: touched.base_lineage.version,
+                    fingerprint: touched.base_table.fingerprint()?,
+                    storage: touched.old_storage,
+                    base_indexes: touched.base_indexes.clone(),
+                    final_indexes: touched.base_indexes.clone(),
+                }],
+            })?;
+        Ok(())
+    }
+
+    /// Round 43 Candidate B prototype finalization. It creates the real
+    /// rewrite intent rather than replacing a synthetic index intent.
+    #[cfg(test)]
+    pub(crate) fn audit_finalize_adopted_source(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        let logical = match previous {
+            SchemaCompositionState::Composing(logical) => *logical,
+            other => {
+                transaction.schema_composition = other;
+                return Err(
+                    SchemaMutationError::Corrupt("candidate B audit state is not logical").into(),
+                );
+            }
+        };
+        let source_storage = logical
+            .touched
+            .values()
+            .next()
+            .ok_or(SchemaMutationError::Corrupt(
+                "candidate B audit source absent",
+            ))?
+            .old_storage;
+        let source_physical_txn_id = transaction.physical_transaction_id(source_storage).ok_or(
+            SchemaMutationError::Corrupt("candidate B audit physical transaction absent"),
+        )?;
+        self.materialize_schema_index_composition(
+            transaction,
+            logical,
+            SchemaIndexMaterialization::AdoptedSourceBackfill {
+                source_storage,
+                source_physical_txn_id,
+            },
+        )
     }
 
     pub(crate) fn is_backfill_candidate(logical: &SchemaTransactionPlan) -> bool {
@@ -4763,22 +5037,20 @@ impl Database {
             snapshot_digest,
             tables: table_plans,
         };
-        if matches!(
-            materialization,
-            SchemaIndexMaterialization::SourceBackfill { .. }
-        ) {
+        if materialization.source().is_some() {
             crash("source-backfill-target-reserved");
         }
         crash("composition-before-intent");
-        let intent_result = match materialization {
-            SchemaIndexMaterialization::Ordinary => logical
+        let intent_result = if materialization.replaces_existing_index_intent() {
+            logical
                 .journal
                 .borrow_mut()
-                .schema_index_intent(intent.clone()),
-            SchemaIndexMaterialization::SourceBackfill { .. } => logical
+                .replace_schema_index_intent(intent.clone())
+        } else {
+            logical
                 .journal
                 .borrow_mut()
-                .replace_schema_index_intent(intent.clone()),
+                .schema_index_intent(intent.clone())
         };
         if let Err(error) = intent_result {
             return if logical.journal.borrow().ensure_ready().is_err() {
@@ -4819,11 +5091,7 @@ impl Database {
                 );
             }
         };
-        if let SchemaIndexMaterialization::SourceBackfill {
-            source_storage,
-            source_physical_txn_id,
-        } = materialization
-        {
+        if let Some((source_storage, source_physical_txn_id)) = materialization.source() {
             let target_snapshot = target.as_ref().ok_or(SchemaMutationError::Corrupt(
                 "source-backfill target snapshot absent",
             ))?;
@@ -4919,13 +5187,10 @@ impl Database {
             #[cfg(test)]
             source_rows_copied: 0,
         });
-        transaction.schema_composition = match materialization {
-            SchemaIndexMaterialization::Ordinary => {
-                SchemaCompositionState::SealingAndMaterializingIndex(materialized)
-            }
-            SchemaIndexMaterialization::SourceBackfill { .. } => {
-                SchemaCompositionState::LateCloneMaterializing(materialized)
-            }
+        transaction.schema_composition = if materialization.source().is_some() {
+            SchemaCompositionState::LateCloneMaterializing(materialized)
+        } else {
+            SchemaCompositionState::SealingAndMaterializingIndex(materialized)
         };
 
         for (position, table_plan) in intent.tables.iter().enumerate() {
