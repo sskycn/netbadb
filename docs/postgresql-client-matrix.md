@@ -57,6 +57,7 @@ production or build dependencies.
 | ALTER-only multi-statement transaction | yes, bounded | same/cross-table Core composition; one final rewrite per dirty table |
 | ALTER + CREATE/DROP INDEX transaction | yes, bounded | psql, psycopg `prepare=True`, SQLAlchemy `Index.create/drop`, and Alembic Operations |
 | DROP INDEX + DML + compatible ALTER + final index | psql yes, bounded | Round 39 managed Single Heap, one table, DROP-only prelude; Python clients unavailable/unverified |
+| DROP INDEX + DML + nullable ADD/exact DROP + final clone | psql yes, bounded | Round 42 exact Round 39 authority; new-column index/NOT NULL and later DML unsupported |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 

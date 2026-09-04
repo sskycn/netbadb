@@ -351,6 +351,14 @@ projection. Effective layouts retain the existing one-S2/one-CORD lifecycle;
 canonical ADD-then-DROP allocates no S2. Native and PostgreSQL SQL admission,
 persistent formats, storage policy, and wire capabilities remain unchanged.
 
+[Round 42](drop-first-layout-migration-sql-round42.md) changes only Execute-time
+admission: nullable ADD and exact-ID DROP may enter the same source lifecycle
+after the exact Round 39 DROP-only authority. ADD reserves a durable `ColumnId`
+at Execute, target-ordered projection gives new IDs NULL and omits dropped IDs,
+and prepared DROP cannot rebind to a same-name replacement. Multiple effective
+changes retain one S2 and one source stream; ADD-then-DROP burns its ID with no
+S2. PostgreSQL remains unaware of S1/S2 and recovery remains byte-driven.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

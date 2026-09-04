@@ -695,6 +695,8 @@ impl Database {
                 | AlterTableOperation::DropNotNull { .. }
                 | AlterTableOperation::RenameTable { .. }
                 | AlterTableOperation::RenameColumn { .. }
+                | AlterTableOperation::AddNullableColumn { .. }
+                | AlterTableOperation::DropColumn { .. }
         ) || !matches!(
             transaction.schema_composition,
             SchemaCompositionState::MaterializedIndex(_)
@@ -712,8 +714,8 @@ impl Database {
         Ok(true)
     }
 
-    /// Core-only layout-changing refinement. SQL admission intentionally never
-    /// calls this entry point; it exists for a future typed migration frontend.
+    /// Typed Core refinement entry point. Public SQL uses the narrower
+    /// execution-time dispatcher above and never calls this API directly.
     pub fn apply_source_backfill_layout_refinement(
         &mut self,
         transaction: &mut Transaction,
@@ -722,7 +724,12 @@ impl Database {
         self.validate_transaction(transaction)?;
         if !matches!(
             spec.operation,
-            AlterTableOperation::AddNullableColumn { .. } | AlterTableOperation::DropColumn { .. }
+            AlterTableOperation::SetNotNull { .. }
+                | AlterTableOperation::DropNotNull { .. }
+                | AlterTableOperation::RenameTable { .. }
+                | AlterTableOperation::RenameColumn { .. }
+                | AlterTableOperation::AddNullableColumn { .. }
+                | AlterTableOperation::DropColumn { .. }
         ) {
             return Err(SchemaMutationError::UnsupportedBackfillRefinement(
                 crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
@@ -777,16 +784,27 @@ impl Database {
                 .schema_composition
                 .source_backfill()
                 .ok_or(SchemaMutationError::Corrupt("source-backfill state absent"))?;
+            let touched = materialized
+                .logical
+                .touched
+                .get(&spec.target.table_id)
+                .ok_or(SchemaMutationError::StaleSchemaDependency)?;
+            let current_dependency = materialized.logical.dependency(spec.target.table_id)?;
+            let base_dependency = SchemaDependency {
+                table_id: touched.base_table.id,
+                table_version: touched.base_lineage.version,
+                fingerprint: touched.base_table.fingerprint()?,
+            };
+            let layout_target_is_exact = matches!(
+                &spec.operation,
+                AlterTableOperation::AddNullableColumn { .. }
+                    | AlterTableOperation::DropColumn { .. }
+            ) && spec.target == base_dependency;
             if materialized.logical.touched.len() != 1
-                || !materialized
-                    .logical
-                    .touched
-                    .contains_key(&spec.target.table_id)
-                || materialized.logical.dependency(spec.target.table_id)? != spec.target
+                || (current_dependency != spec.target && !layout_target_is_exact)
             {
                 return Err(SchemaMutationError::StaleSchemaDependency.into());
             }
-            let touched = &materialized.logical.touched[&spec.target.table_id];
             let current = materialized
                 .logical
                 .overlay
@@ -823,11 +841,17 @@ impl Database {
                 AlterTableOperation::SetNotNull { .. }
                 | AlterTableOperation::DropNotNull { .. }
                 | AlterTableOperation::RenameTable { .. }
-                | AlterTableOperation::RenameColumn { .. },
+                | AlterTableOperation::RenameColumn { .. }
+                | AlterTableOperation::AddNullableColumn { .. }
+                | AlterTableOperation::DropColumn { .. },
             )
             | (
                 SourceBackfillRefinementScope::CoreLayout,
-                AlterTableOperation::AddNullableColumn { .. }
+                AlterTableOperation::SetNotNull { .. }
+                | AlterTableOperation::DropNotNull { .. }
+                | AlterTableOperation::RenameTable { .. }
+                | AlterTableOperation::RenameColumn { .. }
+                | AlterTableOperation::AddNullableColumn { .. }
                 | AlterTableOperation::DropColumn { .. },
             ) => {}
             _ => {
@@ -868,6 +892,14 @@ impl Database {
             AlterTableOperation::ChangeNominalType { .. } => None,
         };
         if let Some(column_id) = indexed_nullability {
+            if scope == SourceBackfillRefinementScope::PublicCompatible
+                && base_table.column_by_id(column_id).is_none()
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
             let materialized = transaction
                 .schema_composition
                 .source_backfill()

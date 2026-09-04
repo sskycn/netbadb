@@ -331,21 +331,13 @@ fn late_add_drop_noop_burns_column_without_allocating_a_target_heap() {
         "UPDATE users SET email = 'changed@example.test' WHERE id = 3",
     )
     .unwrap();
-    apply_layout(
-        &mut db,
+    db.execute_in(
         &mut transaction,
-        AlterTableOperation::AddNullableColumn {
-            name: "temporary".into(),
-            data_type: SemanticType::physical(PhysicalType::Bool),
-        },
+        "ALTER TABLE users ADD COLUMN temporary BOOLEAN",
     )
     .unwrap();
-    apply_layout(
-        &mut db,
-        &mut transaction,
-        AlterTableOperation::DropColumn { column_id: column },
-    )
-    .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN temporary")
+        .unwrap();
     db.finalize_source_backfill(&mut transaction).unwrap();
     assert!(matches!(
         transaction.schema_composition,
@@ -463,9 +455,12 @@ fn policy_b_allows_empty_new_not_null_but_rejects_nonempty_during_projection() {
             },
         )
         .unwrap();
-        db.execute_in(
+        apply_layout(
+            &mut db,
             &mut transaction,
-            "ALTER TABLE users ALTER COLUMN required_later SET NOT NULL",
+            AlterTableOperation::SetNotNull {
+                column_id: new_column,
+            },
         )
         .unwrap();
         if rows {
@@ -509,7 +504,7 @@ fn policy_b_allows_empty_new_not_null_but_rejects_nonempty_during_projection() {
 }
 
 #[test]
-fn public_layout_sql_and_final_index_on_new_column_remain_unsupported() {
+fn public_layout_sql_requires_source_authority_and_keeps_new_column_restrictions() {
     for sql in [
         "ALTER TABLE users ADD COLUMN public_add TEXT",
         "ALTER TABLE users DROP COLUMN legacy",
@@ -517,7 +512,6 @@ fn public_layout_sql_and_final_index_on_new_column_remain_unsupported() {
         let root = root("public-negative");
         let mut db = seed(&root, true);
         let mut transaction = db.begin_transaction().unwrap();
-        drop_source_indexes(&mut db, &mut transaction);
         db.execute_in(
             &mut transaction,
             "UPDATE users SET legacy = 'changed' WHERE id = 1",
@@ -529,8 +523,8 @@ fn public_layout_sql_and_final_index_on_new_column_remain_unsupported() {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    let root = root("new-index-negative");
-    let mut db = seed(&root, true);
+    let index_root = root("new-index-negative");
+    let mut db = seed(&index_root, true);
     let mut transaction = db.begin_transaction().unwrap();
     drop_source_indexes(&mut db, &mut transaction);
     db.execute_in(
@@ -538,13 +532,9 @@ fn public_layout_sql_and_final_index_on_new_column_remain_unsupported() {
         "UPDATE users SET email = email WHERE id = -1",
     )
     .unwrap();
-    apply_layout(
-        &mut db,
+    db.execute_in(
         &mut transaction,
-        AlterTableOperation::AddNullableColumn {
-            name: "unindexed".into(),
-            data_type: SemanticType::physical(PhysicalType::Text),
-        },
+        "ALTER TABLE users ADD COLUMN unindexed TEXT",
     )
     .unwrap();
     assert!(matches!(
@@ -557,6 +547,276 @@ fn public_layout_sql_and_final_index_on_new_column_remain_unsupported() {
         ))
     ));
     transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(index_root).unwrap();
+
+    let not_null_root = root("new-not-null-negative");
+    let mut db = seed(&not_null_root, true);
+    let mut transaction = db.begin_transaction().unwrap();
+    drop_source_indexes(&mut db, &mut transaction);
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = email WHERE id = 1",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ADD COLUMN nullable_only TEXT",
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN nullable_only SET NOT NULL",
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedBackfillRefinement(_)
+        ))
+    ));
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(not_null_root).unwrap();
+}
+
+#[test]
+fn public_sql_routes_drop_add_and_compatible_refinements_through_one_late_clone() {
+    let root = root("public-end-to-end");
+    let mut db = seed(&root, true);
+    let catalog_path = root.join("catalog");
+    let table = db.schema().table("users").unwrap().id;
+    let source_storage = db.bindings.resolve_single(table).unwrap();
+    let target_storage = db.next_storage_id().unwrap();
+    let base_version = db.table_schema_version(table).unwrap();
+    let base_generation = db.schema_generation();
+    let base_epoch = schema_catalog_file::load(&catalog_path).unwrap().epoch;
+    let base_revision = db.catalog_generation();
+    let mut transaction = db.begin_transaction().unwrap();
+    for source in [
+        "DROP INDEX users_legacy_idx",
+        "DROP INDEX users_email_idx",
+        "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+        "INSERT INTO users VALUES (4, 'old-four', 'four@example.test')",
+        "DELETE FROM users WHERE id = 2",
+        "ALTER TABLE users DROP COLUMN legacy",
+        "ALTER TABLE users ADD COLUMN legacy TEXT",
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        "ALTER TABLE users RENAME COLUMN email TO canonical_email",
+        "CREATE INDEX users_email_idx ON users(canonical_email)",
+    ] {
+        db.execute_in(&mut transaction, source)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    }
+    assert!(matches!(
+        db.execute_in(&mut transaction, "SELECT id FROM users"),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::MigrationDataAccessAfterRefinement
+        ))
+    ));
+    db.finalize_source_backfill(&mut transaction).unwrap();
+    let materialized = transaction.schema_composition.source_backfill().unwrap();
+    assert_eq!(materialized.source_copy_passes, 1);
+    assert_eq!(materialized.source_rows_copied, 3);
+    db.commit_transaction(&mut transaction).unwrap();
+
+    let final_table = db.schema().table("users").unwrap();
+    assert_eq!(final_table.id, table);
+    assert_eq!(
+        final_table
+            .columns
+            .iter()
+            .map(|column| column.id)
+            .collect::<Vec<_>>(),
+        [ColumnId(1), ColumnId(3), ColumnId(4)]
+    );
+    assert_eq!(final_table.column("legacy").unwrap().id, ColumnId(4));
+    assert_eq!(db.bindings.resolve_single(table), Ok(target_storage));
+    assert_ne!(source_storage, target_storage);
+    assert_eq!(
+        db.table_schema_version(table),
+        Some(TableSchemaVersion(base_version.0 + 1))
+    );
+    assert_eq!(db.schema_generation().0, base_generation.0 + 1);
+    assert_eq!(
+        schema_catalog_file::load(&catalog_path).unwrap().epoch,
+        base_epoch + 1
+    );
+    assert_eq!(db.catalog_generation(), base_revision + 1);
+    assert_eq!(db.next_storage_id(), Some(StorageId(target_storage.0 + 1)));
+    assert_eq!(
+        db.query("SELECT id, canonical_email, legacy FROM users ORDER BY id")
+            .unwrap()
+            .rows,
+        [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("filled@example.test".into()),
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(3),
+                ScalarValue::Text("three@example.test".into()),
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(4),
+                ScalarValue::Text("four@example.test".into()),
+                ScalarValue::Null,
+            ],
+        ]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn public_sql_multiple_adds_share_one_version_heap_and_source_scan() {
+    let root = root("public-multiple-add");
+    let mut db = seed(&root, true);
+    let table = db.schema().table("users").unwrap().id;
+    let version = db.table_schema_version(table).unwrap();
+    let target_storage = db.next_storage_id().unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    drop_source_indexes(&mut db, &mut transaction);
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = email WHERE id = 1",
+    )
+    .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ADD COLUMN score BIGINT",
+    )
+    .unwrap();
+    assert_eq!(db.next_column_id(table), Some(ColumnId(6)));
+    db.finalize_source_backfill(&mut transaction).unwrap();
+    let materialized = transaction.schema_composition.source_backfill().unwrap();
+    assert_eq!(
+        (
+            materialized.source_copy_passes,
+            materialized.source_rows_copied
+        ),
+        (1, 3)
+    );
+    db.commit_transaction(&mut transaction).unwrap();
+    assert_eq!(
+        db.table_schema_version(table),
+        Some(TableSchemaVersion(version.0 + 1))
+    );
+    assert_eq!(db.bindings.resolve_single(table), Ok(target_storage));
+    assert_eq!(
+        db.schema()
+            .table("users")
+            .unwrap()
+            .column("marker")
+            .unwrap()
+            .id,
+        ColumnId(4)
+    );
+    assert_eq!(
+        db.schema()
+            .table("users")
+            .unwrap()
+            .column("score")
+            .unwrap()
+            .id,
+        ColumnId(5)
+    );
+    assert!(
+        db.query("SELECT marker, score FROM users")
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row == &[ScalarValue::Null, ScalarValue::Null])
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn prepared_public_drop_and_add_are_pure_exact_and_reserve_once_on_execute() {
+    let root = root("prepared-public-layout");
+    let mut db = seed(&root, true);
+    let table = db.schema().table("users").unwrap().id;
+    let old_legacy = db
+        .schema()
+        .table("users")
+        .unwrap()
+        .column("legacy")
+        .unwrap()
+        .id;
+    let column_floor = db.next_column_id(table).unwrap();
+    let storage_floor = db.next_storage_id();
+    let drop_legacy = db
+        .prepare_ddl_statement("ALTER TABLE users DROP COLUMN legacy")
+        .unwrap();
+    let add_marker = db
+        .prepare_ddl_statement("ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    assert_eq!(db.next_column_id(table), Some(column_floor));
+    assert_eq!(db.next_storage_id(), storage_floor);
+
+    let mut transaction = db.begin_transaction().unwrap();
+    drop_source_indexes(&mut db, &mut transaction);
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = email WHERE id = 1",
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute_ddl_in(&mut transaction, &drop_legacy).unwrap(),
+        DdlOutcome::Altered
+    );
+    assert_eq!(db.next_column_id(table), Some(column_floor));
+    assert_eq!(
+        db.execute_ddl_in(&mut transaction, &add_marker).unwrap(),
+        DdlOutcome::Altered
+    );
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN legacy TEXT")
+        .unwrap();
+    assert_eq!(db.next_column_id(table), Some(ColumnId(column_floor.0 + 2)));
+    db.commit_transaction(&mut transaction).unwrap();
+
+    let replacement = db
+        .schema()
+        .table("users")
+        .unwrap()
+        .column("legacy")
+        .unwrap();
+    assert_eq!(replacement.id, ColumnId(column_floor.0 + 1));
+    assert_ne!(replacement.id, old_legacy);
+    assert_eq!(
+        db.schema()
+            .table("users")
+            .unwrap()
+            .column("marker")
+            .unwrap()
+            .id,
+        column_floor
+    );
+    assert!(
+        db.query("SELECT legacy FROM users")
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row == &[ScalarValue::Null])
+    );
+    let next_column = db.next_column_id(table);
+    let next_storage = db.next_storage_id();
+    assert!(db.execute_ddl(&add_marker).is_err());
+    assert!(db.execute_ddl(&drop_legacy).is_err());
+    assert_eq!(db.next_column_id(table), next_column);
+    assert_eq!(db.next_storage_id(), next_storage);
+    assert_eq!(
+        db.schema()
+            .table("users")
+            .unwrap()
+            .column("legacy")
+            .unwrap()
+            .id,
+        ColumnId(column_floor.0 + 1)
+    );
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -640,15 +900,8 @@ fn execute_crash_transaction(db: &mut Database) {
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    apply_layout(
-        db,
-        &mut transaction,
-        AlterTableOperation::AddNullableColumn {
-            name: "marker".into(),
-            data_type: SemanticType::physical(PhysicalType::Text),
-        },
-    )
-    .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
 }
 

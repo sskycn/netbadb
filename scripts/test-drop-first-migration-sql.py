@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 39 real-psql DROP-first migration acceptance."""
+"""Round 39/42 real-psql DROP-first migration acceptance."""
 from __future__ import annotations
 
 import os
@@ -14,14 +14,19 @@ PSQL = os.environ.get("PSQL", "/opt/local/lib/pgsql/bin/psql")
 FIXTURE = TARGET / "debug/examples/sql_alter_table_fixture"
 
 
-def run_fixture(probe: str, sql: str, expected: tuple[str, ...]) -> None:
+def run_fixture(
+    probe: str,
+    sql: str,
+    expected: tuple[str, ...],
+    round_number: int = 39,
+) -> None:
     environment = dict(
         os.environ,
         CARGO_TARGET_DIR=str(TARGET),
         DYLD_LIBRARY_PATH="/opt/local/lib/icu/lib",
         NETBADB_POSTGRES_TRACE="1",
-        NETBADB_ROUND39_PROBE=probe,
     )
+    environment[f"NETBADB_ROUND{round_number}_PROBE"] = probe
     with tempfile.TemporaryFile(mode="w+") as trace:
         process = subprocess.Popen(
             [str(FIXTURE)],
@@ -192,7 +197,6 @@ ROLLBACK;
         "rollback",
         r"""
 BEGIN;
-DROP INDEX projects_name_idx;
 UPDATE projects SET name = 'filled' WHERE name IS NULL;
 ALTER TABLE projects ADD COLUMN marker TEXT;
 \echo ADD_COLUMN_STATE :SQLSTATE
@@ -210,7 +214,6 @@ ROLLBACK;
         "rollback",
         r"""
 BEGIN;
-DROP INDEX projects_name_idx;
 UPDATE projects SET name = 'filled' WHERE name IS NULL;
 ALTER TABLE projects DROP COLUMN name;
 \echo DROP_COLUMN_STATE :SQLSTATE
@@ -224,7 +227,174 @@ ROLLBACK;
             "ROLLBACK",
         ),
     )
-    print(f"{version}: Round 39 DROP-first migration SQL acceptance PASS")
+
+    run_fixture(
+        "combined",
+        r"""
+\set ON_ERROR_STOP on
+BEGIN;
+DROP INDEX projects_legacy_idx;
+DROP INDEX projects_email_idx;
+UPDATE projects SET email = 'filled@example.test' WHERE email IS NULL;
+INSERT INTO projects VALUES (4, 'old-four', 'four@example.test');
+DELETE FROM projects WHERE id = 2;
+ALTER TABLE projects DROP COLUMN legacy;
+ALTER TABLE projects ADD COLUMN legacy TEXT;
+ALTER TABLE projects ALTER COLUMN email SET NOT NULL;
+ALTER TABLE projects RENAME COLUMN email TO contact;
+CREATE INDEX projects_contact_idx ON projects(contact);
+COMMIT;
+SELECT id, contact, legacy FROM projects ORDER BY id;
+\d projects
+""",
+        (
+            "UPDATE 1",
+            "INSERT 0 1",
+            "DELETE 1",
+            "ALTER TABLE",
+            "CREATE INDEX",
+            "COMMIT",
+            "1|filled@example.test|",
+            "3|three@example.test|",
+            "4|four@example.test|",
+            "contact|text||not null|",
+        ),
+        42,
+    )
+    run_fixture(
+        "add",
+        r"""
+\set ON_ERROR_STOP on
+BEGIN;
+DROP INDEX projects_legacy_idx;
+DROP INDEX projects_email_idx;
+UPDATE projects SET email = email WHERE id = 1;
+ALTER TABLE projects ADD COLUMN marker TEXT;
+COMMIT;
+SELECT id, marker FROM projects ORDER BY id;
+""",
+        ("ALTER TABLE", "COMMIT", "1|", "2|", "3|"),
+        42,
+    )
+    run_fixture(
+        "drop",
+        r"""
+\set ON_ERROR_STOP on
+BEGIN;
+DROP INDEX projects_legacy_idx;
+DROP INDEX projects_email_idx;
+UPDATE projects SET email = email WHERE id = 1;
+ALTER TABLE projects DROP COLUMN legacy;
+COMMIT;
+SELECT id, email FROM projects ORDER BY id;
+""",
+        ("ALTER TABLE", "COMMIT", "2|two@example.test"),
+        42,
+    )
+    run_fixture(
+        "multiple-add",
+        r"""
+\set ON_ERROR_STOP on
+BEGIN;
+DROP INDEX projects_legacy_idx;
+DROP INDEX projects_email_idx;
+UPDATE projects SET email = email WHERE id = 1;
+ALTER TABLE projects ADD COLUMN marker TEXT;
+ALTER TABLE projects ADD COLUMN score BIGINT;
+COMMIT;
+SELECT id, marker, score FROM projects ORDER BY id;
+""",
+        ("ALTER TABLE", "COMMIT", "1||", "2||", "3||"),
+        42,
+    )
+    run_fixture(
+        "noop",
+        r"""
+\set ON_ERROR_STOP on
+BEGIN;
+DROP INDEX projects_legacy_idx;
+DROP INDEX projects_email_idx;
+UPDATE projects SET email = email WHERE id = 1;
+ALTER TABLE projects ADD COLUMN temporary BOOLEAN;
+ALTER TABLE projects DROP COLUMN temporary;
+COMMIT;
+""",
+        ("ALTER TABLE", "COMMIT"),
+        42,
+    )
+    run_fixture(
+        "rollback",
+        r"""
+\set ON_ERROR_STOP on
+BEGIN;
+DROP INDEX projects_legacy_idx;
+DROP INDEX projects_email_idx;
+UPDATE projects SET email = 'changed' WHERE id = 1;
+ALTER TABLE projects DROP COLUMN legacy;
+ALTER TABLE projects ADD COLUMN legacy TEXT;
+ROLLBACK;
+""",
+        ("ALTER TABLE", "ROLLBACK"),
+        42,
+    )
+    for probe, setup, failing, marker, sqlstate in (
+        (
+            "post-dml",
+            "DROP INDEX projects_legacy_idx;\nDROP INDEX projects_email_idx;\n"
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "INSERT INTO projects VALUES (4, 'four', 'four@example.test', NULL);",
+            "POST_DML_STATE",
+            "25000",
+        ),
+        (
+            "no-authority-add",
+            "UPDATE projects SET email = email WHERE id = 1;",
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "NO_AUTH_ADD_STATE",
+            "25000",
+        ),
+        (
+            "no-authority-drop",
+            "UPDATE projects SET email = email WHERE id = 1;",
+            "ALTER TABLE projects DROP COLUMN legacy;",
+            "NO_AUTH_DROP_STATE",
+            "25000",
+        ),
+        (
+            "new-index",
+            "DROP INDEX projects_legacy_idx;\nDROP INDEX projects_email_idx;\n"
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "CREATE INDEX projects_marker_idx ON projects(marker);",
+            "NEW_INDEX_STATE",
+            "0A000",
+        ),
+        (
+            "new-not-null",
+            "DROP INDEX projects_legacy_idx;\nDROP INDEX projects_email_idx;\n"
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "ALTER TABLE projects ALTER COLUMN marker SET NOT NULL;",
+            "NEW_NOT_NULL_STATE",
+            "0A000",
+        ),
+    ):
+        run_fixture(
+            probe,
+            f"""
+BEGIN;
+{setup}
+{failing}
+\echo {marker} :SQLSTATE
+SELECT id FROM projects;
+\echo FAILED_STATE :SQLSTATE
+ROLLBACK;
+""",
+            (f"{marker} {sqlstate}", "FAILED_STATE 25P02", "ROLLBACK"),
+            42,
+        )
+    print(f"{version}: Round 39 + Round 42 DROP-first migration SQL acceptance PASS")
 
 
 if __name__ == "__main__":

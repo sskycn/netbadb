@@ -124,7 +124,9 @@ IndexCatalog v9, BTree v3, NBTR v1, Heap WAL v4/record v5, LSM formats, native
 Protocol v1, PostgreSQL framing v3, Manifest v4, and SDK Schema Spec v1 remain
 unchanged. NBSJ and CORD compaction remain separate work.
 
-Round 40 subsequently audits layout-changing late-clone projection without
-changing this public boundary. Real psql now permanently pins post-DML `ADD
-COLUMN` and `DROP COLUMN` at SQLSTATE `25000`; the accepted nullability/rename
-set above is unchanged. See [late-clone layout projection architecture audit](late-clone-layout-projection-round40.md).
+Round 40 audited layout-changing late-clone projection and Round 41 implemented
+its Core-only foundation. [Round 42](drop-first-layout-migration-sql-round42.md)
+now admits nullable ADD and exact-ID DROP only behind this document's exact
+DROP-first source authority. The negative boundary moves to post-DML ADD/DROP
+without that authority, which remains SQLSTATE `25000`; all other Round 39
+activation and positive behavior remains unchanged.

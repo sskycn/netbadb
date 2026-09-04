@@ -65,6 +65,420 @@ fn project(name: &str) -> (std::path::PathBuf, Database) {
     (root, db)
 }
 
+fn layout_project(name: &str) -> (std::path::PathBuf, Database) {
+    let (root, mut db) = seed(name);
+    db.execute("CREATE TABLE accounts (id BIGINT NOT NULL, legacy TEXT, email TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO accounts VALUES (1, 'old-one', NULL)")
+        .unwrap();
+    db.execute("INSERT INTO accounts VALUES (2, 'old-two', 'two@example.test')")
+        .unwrap();
+    db.execute("INSERT INTO accounts VALUES (3, 'old-three', 'three@example.test')")
+        .unwrap();
+    db.execute("CREATE INDEX accounts_legacy_idx ON accounts(legacy)")
+        .unwrap();
+    db.execute("CREATE INDEX accounts_email_idx ON accounts(email)")
+        .unwrap();
+    (root, db)
+}
+
+#[test]
+fn pg_simple_drop_first_layout_sql_publishes_one_projected_replacement() {
+    let (root, mut db) = layout_project("pg-round42-simple");
+    let table = db.schema().table("accounts").unwrap().id;
+    let old_legacy = db
+        .schema()
+        .table("accounts")
+        .unwrap()
+        .column("legacy")
+        .unwrap()
+        .id;
+    let version = db.table_schema_version(table).unwrap();
+    let generation = db.schema_generation();
+    let target_storage = db.next_storage_id().unwrap();
+    let mut admin = session(&db, true);
+
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        ("DROP INDEX accounts_legacy_idx", "DROP INDEX"),
+        ("DROP INDEX accounts_email_idx", "DROP INDEX"),
+        (
+            "UPDATE accounts SET email = 'filled@example.test' WHERE email IS NULL",
+            "UPDATE 1",
+        ),
+        (
+            "INSERT INTO accounts VALUES (4, 'old-four', 'four@example.test')",
+            "INSERT 0 1",
+        ),
+        ("DELETE FROM accounts WHERE id = 2", "DELETE 1"),
+        ("ALTER TABLE accounts DROP COLUMN legacy", "ALTER TABLE"),
+        ("ALTER TABLE accounts ADD COLUMN legacy TEXT", "ALTER TABLE"),
+        (
+            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        (
+            "ALTER TABLE accounts RENAME COLUMN email TO contact",
+            "ALTER TABLE",
+        ),
+        (
+            "CREATE INDEX accounts_contact_idx ON accounts(contact)",
+            "CREATE INDEX",
+        ),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' })
+            ],
+            "{source}"
+        );
+    }
+
+    let accounts = db.schema().table("accounts").unwrap();
+    let replacement = accounts.column("legacy").unwrap();
+    assert_eq!(replacement.id, ColumnId(4));
+    assert_ne!(replacement.id, old_legacy);
+    assert!(!accounts.column("contact").unwrap().nullable);
+    assert_eq!(db.table_schema_version(table).unwrap().0, version.0 + 1);
+    assert_eq!(db.schema_generation().0, generation.0 + 1);
+    assert_eq!(db.next_storage_id().unwrap().0, target_storage.0 + 1);
+    assert_eq!(db.indexes(table).unwrap().len(), 1);
+    assert_eq!(db.indexes(table).unwrap()[0].column_id, ColumnId(3));
+    assert_eq!(
+        db.query("SELECT id, contact, legacy FROM accounts ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![
+                netbadb_types::ScalarValue::Int64(1),
+                netbadb_types::ScalarValue::Text("filled@example.test".into()),
+                netbadb_types::ScalarValue::Null,
+            ],
+            vec![
+                netbadb_types::ScalarValue::Int64(3),
+                netbadb_types::ScalarValue::Text("three@example.test".into()),
+                netbadb_types::ScalarValue::Null,
+            ],
+            vec![
+                netbadb_types::ScalarValue::Int64(4),
+                netbadb_types::ScalarValue::Text("four@example.test".into()),
+                netbadb_types::ScalarValue::Null,
+            ],
+        ]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_extended_add_is_pure_until_execute_and_reserves_once() {
+    let (root, mut db) = layout_project("pg-round42-extended-add");
+    let table = db.schema().table("accounts").unwrap().id;
+    let column_floor = db.next_column_id(table).unwrap();
+    let storage_floor = db.next_storage_id();
+    let before = files(&root);
+    let mut admin = session(&db, true);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "add-marker".into(),
+                query: "ALTER TABLE accounts ADD COLUMN marker TEXT".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "add-marker".into(),
+                statement: "add-marker".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "add-marker".into(),
+            },
+        ),
+        [
+            BackendMessage::ParameterDescription(vec![]),
+            BackendMessage::NoData
+        ]
+    );
+    assert_eq!(files(&root), before);
+    assert_eq!(db.next_column_id(table), Some(column_floor));
+    assert_eq!(db.next_storage_id(), storage_floor);
+    for source in [
+        "BEGIN",
+        "DROP INDEX accounts_legacy_idx",
+        "DROP INDEX accounts_email_idx",
+        "UPDATE accounts SET email = email WHERE id = 1",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "add-marker".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("ALTER TABLE".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    assert_eq!(db.next_column_id(table), Some(ColumnId(column_floor.0 + 1)));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    let next_column = db.next_column_id(table);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "add-again".into(),
+                statement: "add-marker".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    state(
+        &admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "add-again".into(),
+                max_rows: 0,
+            },
+        ),
+        "25000",
+    );
+    assert_eq!(db.next_column_id(table), next_column);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_extended_drop_keeps_exact_column_identity_after_same_name_add() {
+    let (root, mut db) = layout_project("pg-round42-extended-drop");
+    let table = db.schema().table("accounts").unwrap().id;
+    let column_floor = db.next_column_id(table).unwrap();
+    let before = files(&root);
+    let mut admin = session(&db, true);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "drop-legacy".into(),
+                query: "ALTER TABLE accounts DROP COLUMN legacy".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "drop-legacy".into(),
+                statement: "drop-legacy".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(files(&root), before);
+    for source in [
+        "BEGIN",
+        "DROP INDEX accounts_legacy_idx",
+        "DROP INDEX accounts_email_idx",
+        "UPDATE accounts SET email = email WHERE id = 1",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "drop-legacy".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("ALTER TABLE".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "ALTER TABLE accounts ADD COLUMN legacy TEXT",
+    ));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    assert_eq!(
+        db.schema()
+            .table("accounts")
+            .unwrap()
+            .column("legacy")
+            .unwrap()
+            .id,
+        column_floor
+    );
+    let next_column = db.next_column_id(table);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "drop-again".into(),
+                statement: "drop-legacy".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    state(
+        &admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "drop-again".into(),
+                max_rows: 0,
+            },
+        ),
+        "25000",
+    );
+    assert_eq!(db.next_column_id(table), next_column);
+    assert_eq!(
+        db.schema()
+            .table("accounts")
+            .unwrap()
+            .column("legacy")
+            .unwrap()
+            .id,
+        column_floor
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_drop_first_layout_rejections_enter_failed_transaction_state() {
+    for (name, source, expected) in [
+        (
+            "no-authority-add",
+            "ALTER TABLE accounts ADD COLUMN marker TEXT",
+            "25000",
+        ),
+        (
+            "no-authority-drop",
+            "ALTER TABLE accounts DROP COLUMN legacy",
+            "25000",
+        ),
+    ] {
+        let (root, mut db) = layout_project(name);
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET email = email WHERE id = 1",
+        ));
+        state(&sql(&mut admin, &mut db, source), expected);
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    let (root, mut db) = layout_project("new-column-not-null");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "DROP INDEX accounts_legacy_idx",
+        "DROP INDEX accounts_email_idx",
+        "UPDATE accounts SET email = email WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE accounts ALTER COLUMN marker SET NOT NULL",
+        ),
+        "0A000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (root, mut db) = layout_project("indexed-drop");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "DROP INDEX accounts_email_idx",
+        "UPDATE accounts SET email = email WHERE id = 1",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE accounts DROP COLUMN legacy",
+        ),
+        "2BP01",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (root, mut db) = layout_project("post-refinement-dml");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "DROP INDEX accounts_legacy_idx",
+        "DROP INDEX accounts_email_idx",
+        "UPDATE accounts SET email = email WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "INSERT INTO accounts VALUES (4, 'old-four', 'four@example.test', NULL)",
+        ),
+        "25000",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
     let (root, mut db) = project("pg-alter-simple");

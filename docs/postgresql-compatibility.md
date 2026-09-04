@@ -202,6 +202,15 @@ and returns `23502` for a remaining NULL. COMMIT constructs one final S2, while
 rollback restores S1. See
 [Round 39](drop-first-migration-sql-round39.md) for exact limits.
 
+Round 42 extends only that same exact Core-selected route to nullable ADD COLUMN
+and exact-ID DROP COLUMN. Parse/Bind/Describe stay allocation-free; ADD reserves
+its new ID only at Execute. Same-name DROP+ADD produces a new NULL-valued column,
+and the first successful refinement still closes DML. New-column indexes and
+public new-column NOT NULL remain `0A000`; no-authority post-DML ADD/DROP and
+post-refinement DML are `25000`, followed by `25P02` in a failed transaction.
+The adapter still has no migration-state logic. See
+[Round 42](drop-first-layout-migration-sql-round42.md).
+
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections
 refresh through committed catalog_generation; neither psql nor SQLAlchemy needs

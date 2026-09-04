@@ -984,6 +984,19 @@ recovery lifecycle. Policy B, final indexes on new columns, broader placements,
 conversions/defaults/constraints, and SQL exposure remain explicit boundaries;
 all persistent and wire formats are unchanged.
 
+### DROP-first layout migration SQL — Round 42
+
+[Round 42](drop-first-layout-migration-sql-round42.md) exposes the Round 41
+projection foundation only after the exact Round 39 managed-Single-Heap,
+one-table, DROP-only source authority. Native SQL and PostgreSQL Simple/Extended
+Query may execute nullable ADD and exact-ID DROP alongside compatible existing
+refinements. ADD reserves `ColumnId` at Execute, same-name DROP+ADD synthesizes
+NULL under a fresh identity, multiple ADDs share one S2/source scan, and an
+ADD+DROP no-op burns its ID without allocating S2. DML then closes. Generic
+UPDATE→ADD/DROP, new-column indexes, public new-column NOT NULL, conversions,
+defaults, broader placements, and general Alembic support remain deferred; no
+persistent or wire format changes.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

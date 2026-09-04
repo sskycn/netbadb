@@ -29,6 +29,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round36_probe = std::env::var("NETBADB_ROUND36_PROBE").ok();
     let round37_probe = std::env::var("NETBADB_ROUND37_PROBE").ok();
     let round39_probe = std::env::var("NETBADB_ROUND39_PROBE").ok();
+    let round42_probe = std::env::var("NETBADB_ROUND42_PROBE").ok();
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -46,11 +47,20 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")?;
-    db.execute("CREATE INDEX projects_name_idx ON projects (name)")?;
-    db.execute("INSERT INTO projects VALUES (1, 'one')")?;
-    if round36_probe.is_some() || round37_probe.is_some() || round39_probe.is_some() {
-        db.execute("INSERT INTO projects VALUES (2, NULL)")?;
+    if round42_probe.is_some() {
+        db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, email TEXT)")?;
+        db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
+        db.execute("CREATE INDEX projects_email_idx ON projects (email)")?;
+        db.execute("INSERT INTO projects VALUES (1, 'old-one', NULL)")?;
+        db.execute("INSERT INTO projects VALUES (2, 'old-two', 'two@example.test')")?;
+        db.execute("INSERT INTO projects VALUES (3, 'old-three', 'three@example.test')")?;
+    } else {
+        db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")?;
+        db.execute("CREATE INDEX projects_name_idx ON projects (name)")?;
+        db.execute("INSERT INTO projects VALUES (1, 'one')")?;
+        if round36_probe.is_some() || round37_probe.is_some() || round39_probe.is_some() {
+            db.execute("INSERT INTO projects VALUES (2, NULL)")?;
+        }
     }
     let old_index_id = db.indexes(TableId(2))?[0].id;
     let base_version = db
@@ -77,6 +87,18 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("runtime storage path is not UTF-8")?;
 
     let manifest = root.join("server.json");
+    let project_columns = if round42_probe.is_some() {
+        json!([
+            {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
+            {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
+            {"id": 3, "name": "email", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false}
+        ])
+    } else {
+        json!([
+            {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
+            {"id": 2, "name": "name", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false}
+        ])
+    };
     let config = serde_json::to_vec_pretty(&json!({
         "version": 4,
         "listen": "127.0.0.1:0",
@@ -87,10 +109,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
             {"path": "seed", "id": 1, "name": "seed", "columns": [
                 {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false}
             ]},
-            {"path": project_relative, "id": 2, "name": "projects", "columns": [
-                {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
-                {"id": 2, "name": "name", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false}
-            ]}
+            {"path": project_relative, "id": 2, "name": "projects", "columns": project_columns}
         ]
     }))?;
     std::fs::write(&manifest, &config)?;
@@ -101,6 +120,102 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round42_probe {
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 42 projects table disappeared")?
+                .clone();
+            let rows = reopened.query("SELECT * FROM projects ORDER BY id")?.rows;
+            let indexes = reopened.indexes(TableId(2))?;
+            match probe.as_str() {
+                "combined" => {
+                    if projects.column("legacy").map(|column| column.id) != Some(ColumnId(4))
+                        || projects.column("contact").map(|column| column.id) != Some(ColumnId(3))
+                        || projects
+                            .column("contact")
+                            .is_none_or(|column| column.nullable)
+                        || indexes.len() != 1
+                        || indexes[0].column_id != ColumnId(3)
+                        || rows
+                            != [
+                                vec![
+                                    ScalarValue::Int64(1),
+                                    ScalarValue::Text("filled@example.test".into()),
+                                    ScalarValue::Null,
+                                ],
+                                vec![
+                                    ScalarValue::Int64(3),
+                                    ScalarValue::Text("three@example.test".into()),
+                                    ScalarValue::Null,
+                                ],
+                                vec![
+                                    ScalarValue::Int64(4),
+                                    ScalarValue::Text("four@example.test".into()),
+                                    ScalarValue::Null,
+                                ],
+                            ]
+                    {
+                        return Err("Round 42 combined result is incorrect".into());
+                    }
+                }
+                "add" => {
+                    if projects.column("marker").map(|column| column.id) != Some(ColumnId(4))
+                        || rows
+                            .iter()
+                            .any(|row| row.last() != Some(&ScalarValue::Null))
+                    {
+                        return Err("Round 42 ADD result is incorrect".into());
+                    }
+                }
+                "drop" => {
+                    if projects.column("legacy").is_some() || projects.columns.len() != 2 {
+                        return Err("Round 42 DROP result is incorrect".into());
+                    }
+                }
+                "multiple-add" => {
+                    if projects.column("marker").map(|column| column.id) != Some(ColumnId(4))
+                        || projects.column("score").map(|column| column.id) != Some(ColumnId(5))
+                        || rows.iter().any(|row| {
+                            row.get(3) != Some(&ScalarValue::Null)
+                                || row.get(4) != Some(&ScalarValue::Null)
+                        })
+                    {
+                        return Err("Round 42 multiple ADD result is incorrect".into());
+                    }
+                }
+                "noop" => {
+                    if projects.column("temporary").is_some()
+                        || projects.columns.len() != 3
+                        || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                        || reopened.schema_generation() != base_generation
+                        || reopened.next_storage_id() != Some(target_storage)
+                    {
+                        return Err("Round 42 ADD/DROP no-op result is incorrect".into());
+                    }
+                }
+                "rollback" | "post-dml" | "no-authority-add" | "no-authority-drop"
+                | "new-index" | "new-not-null" => {
+                    if projects.columns.len() != 3
+                        || projects.column("legacy").map(|column| column.id) != Some(ColumnId(2))
+                        || indexes.len() != 2
+                        || rows.len() != 3
+                        || reopened.next_storage_id() != Some(target_storage)
+                    {
+                        return Err("Round 42 rollback/negative result is incorrect".into());
+                    }
+                }
+                _ => return Err(format!("unknown Round 42 probe {probe}").into()),
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 42 layout result survived three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round39_probe {
         for _ in 0..3 {

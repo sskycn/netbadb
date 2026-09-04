@@ -349,12 +349,14 @@ sequence: a prior schema rewrite must first materialize private S2 through DML;
 an exact `DROP INDEX` then physically evacuates S2 and permanently closes further
 DML before compatible nullability ALTER and final index changes. This is not the
 Round 39 source route. Round 39 additionally supports a bounded, single-table
-transactional `DROP INDEX` → data backfill → layout-compatible ALTER → final
-index rebuild for managed Single Heaps. It holds the offline schema writer,
-allows only a DROP-index prelude, and does not support pre-DML CREATE INDEX,
-layout-changing ALTER, cross-table work, online migration, or general Alembic
-migration execution. See
-[`docs/drop-first-migration-sql-round39.md`](docs/drop-first-migration-sql-round39.md).
+transactional `DROP INDEX` → data backfill → compatible ALTER → final index
+rebuild for managed Single Heaps. Round 42 extends only that exact DROP-first
+authority to nullable ADD COLUMN and exact-ID DROP COLUMN before one late final
+clone. New columns receive fresh IDs and NULL values; DML closes after the first
+refinement, and new-column indexes and public new-column NOT NULL remain
+unsupported. This is not generic ALTER-after-DML or general Alembic migration
+support. See [Round 39](docs/drop-first-migration-sql-round39.md) and
+[the Round 42 layout slice](docs/drop-first-layout-migration-sql-round42.md).
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
