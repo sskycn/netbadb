@@ -176,7 +176,6 @@ enum SchemaIndexMaterialization {
         source_storage: StorageId,
         source_physical_txn_id: netbadb_types::TxnId,
     },
-    #[cfg(test)]
     AdoptedSourceBackfill {
         source_storage: StorageId,
         source_physical_txn_id: netbadb_types::TxnId,
@@ -191,7 +190,6 @@ impl SchemaIndexMaterialization {
                 source_storage,
                 source_physical_txn_id,
             } => Some((source_storage, source_physical_txn_id)),
-            #[cfg(test)]
             Self::AdoptedSourceBackfill {
                 source_storage,
                 source_physical_txn_id,
@@ -204,18 +202,17 @@ impl SchemaIndexMaterialization {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PostDmlSourceAdoptionEvidence {
-    pub(crate) table: TableId,
-    pub(crate) table_version: TableSchemaVersion,
-    pub(crate) fingerprint: netbadb_schema::SchemaFingerprint,
-    pub(crate) storage: StorageId,
-    pub(crate) physical_txn_id: netbadb_types::TxnId,
+#[derive(Debug, Clone)]
+pub(crate) struct AdoptedSourceTransaction {
+    pub(crate) logical: SchemaTransactionPlan,
+    pub(crate) source_storage: StorageId,
+    pub(crate) source_physical_txn_id: netbadb_types::TxnId,
+    pub(crate) source_table_version: TableSchemaVersion,
+    pub(crate) source_fingerprint: netbadb_schema::SchemaFingerprint,
     pub(crate) source_locator: String,
     pub(crate) base_generation: netbadb_types::SchemaGeneration,
     pub(crate) base_epoch: u64,
-    pub(crate) index_digest: [u8; 32],
+    pub(crate) source_index_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +225,7 @@ enum SourceBackfillRefinementScope {
 pub(crate) enum SchemaCompositionState {
     None,
     Composing(Box<SchemaTransactionPlan>),
+    AdoptedSourceRefining(Box<AdoptedSourceTransaction>),
     SealingAndMaterializing(Box<MaterializedSchemaTransaction>),
     Materialized(Box<MaterializedSchemaTransaction>),
     BackfillMaterializing(Box<MaterializedSchemaTransaction>),
@@ -298,6 +296,7 @@ impl SchemaCompositionState {
             Self::Composing(plan)
             | Self::SealedNoEffectiveChange(plan)
             | Self::RollbackRequiredLogical(plan) => Some(plan),
+            Self::AdoptedSourceRefining(adopted) => Some(&adopted.logical),
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
             | Self::BackfillMaterializing(materialized)
@@ -1249,6 +1248,24 @@ impl Database {
         if self.try_apply_source_backfill_refinement(transaction, &spec)? {
             return Ok(());
         }
+        if let SchemaCompositionState::AdoptedSourceRefining(adopted) =
+            &transaction.schema_composition
+        {
+            if !Self::is_adopted_source_operation(&spec.operation) {
+                return Err(SchemaMutationError::TransactionNotPristine.into());
+            }
+            if adopted.logical.touched.len() != 1
+                || !adopted.logical.touched.contains_key(&spec.target.table_id)
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+                )
+                .into());
+            }
+            let result = self.apply_composed_alter(transaction, spec);
+            self.handle_composition_accept_result(transaction, &result);
+            return result;
+        }
         if matches!(
             &transaction.schema_composition,
             SchemaCompositionState::BackfillOpen(_)
@@ -1269,6 +1286,12 @@ impl Database {
                 return self.apply_created_backfill_refinement(transaction, spec);
             }
             return self.apply_backfill_refinement(transaction, spec);
+        }
+        if transaction.schema_composition.is_none()
+            && transaction.write_participant().is_some()
+            && Self::is_adopted_source_operation(&spec.operation)
+        {
+            return self.adopt_post_dml_source_and_refine(transaction, spec);
         }
         self.ensure_composition_started(transaction)?;
         let result = self.apply_composed_alter(transaction, spec);
@@ -2270,15 +2293,27 @@ impl Database {
         Ok(())
     }
 
-    /// Round 43 executable audit only. This checks the proposed strict
-    /// one-table adoption predicate without changing production SQL routing.
-    #[cfg(test)]
-    pub(crate) fn audit_post_dml_source_adoption_evidence(
+    fn is_adopted_source_operation(operation: &AlterTableOperation) -> bool {
+        matches!(
+            operation,
+            AlterTableOperation::AddNullableColumn { .. }
+                | AlterTableOperation::DropColumn { .. }
+                | AlterTableOperation::RenameTable { .. }
+                | AlterTableOperation::RenameColumn { .. }
+        )
+    }
+
+    /// Captures the exact ordinary one-Heap DML authority before either the
+    /// schema writer or the mutation journal is changed.
+    fn preflight_post_dml_source_adoption(
         &mut self,
         transaction: &Transaction,
-        target: &SchemaDependency,
-    ) -> Result<PostDmlSourceAdoptionEvidence, DatabaseError> {
+        spec: &AlterTableSpec,
+    ) -> Result<AdoptedSourceTransaction, DatabaseError> {
         self.validate_transaction(transaction)?;
+        if !Self::is_adopted_source_operation(&spec.operation) {
+            return Err(SchemaMutationError::TransactionNotPristine.into());
+        }
         if transaction.schema_mutation.is_some()
             || !transaction.schema_composition.is_none()
             || transaction.has_pending_index_creations()
@@ -2289,38 +2324,34 @@ impl Database {
             )
             .into());
         }
-        if self.schema_writer.get().is_some() || Rc::strong_count(&self.transaction_owner) != 2 {
-            return Err(SchemaMutationError::SchemaBusy.into());
-        }
-        if transaction.participant_count() != 1 {
-            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
-                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
-            )
-            .into());
-        }
         let source_storage = transaction.write_participant().ok_or(
             SchemaMutationError::UnsupportedBackfillRefinement(
                 crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
             ),
         )?;
-        if !transaction.is_only_write_participant(source_storage) {
+        if !transaction.is_only_participant(source_storage)
+            || !transaction.is_only_write_participant(source_storage)
+        {
             return Err(SchemaMutationError::UnsupportedBackfillRefinement(
                 crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
             )
             .into());
         }
+        let target = &spec.target;
         let table = self
             .committed
             .schema
             .tables()
             .iter()
             .find(|table| table.id == target.table_id)
+            .cloned()
             .ok_or(SchemaMutationError::TableNotFound(target.table_id))?;
         let lineage = self
             .committed
             .tables
             .iter()
             .find(|lineage| lineage.table_id == target.table_id)
+            .cloned()
             .ok_or(SchemaMutationError::Corrupt(
                 "source adoption lineage absent",
             ))?;
@@ -2346,6 +2377,7 @@ impl Database {
             .storages
             .iter()
             .find(|descriptor| descriptor.id == source_storage)
+            .cloned()
             .ok_or(SchemaMutationError::Corrupt(
                 "source adoption descriptor absent",
             ))?;
@@ -2362,7 +2394,7 @@ impl Database {
             .ok_or(SchemaMutationError::Corrupt("source adoption Heap absent"))?;
         if source.kind() != netbadb_storage::StorageKind::Heap
             || source.storage_id() != source_storage
-            || source.table() != table
+            || source.table() != &table
             || source.table().fingerprint()? != fingerprint
         {
             return Err(SchemaMutationError::UnsupportedPlacement.into());
@@ -2371,46 +2403,166 @@ impl Database {
         let physical_txn_id = transaction.physical_transaction_id(source_storage).ok_or(
             SchemaMutationError::Corrupt("source adoption physical transaction absent"),
         )?;
-        Ok(PostDmlSourceAdoptionEvidence {
-            table: target.table_id,
-            table_version: lineage.version,
-            fingerprint,
-            storage: source_storage,
-            physical_txn_id,
-            source_locator: descriptor.locator.clone(),
-            base_generation: snapshot.committed.generation,
-            base_epoch: snapshot.epoch,
-            index_digest: crate::schema_mutation_journal::heap_rewrite_indexes_digest(&indexes)?,
-        })
-    }
-
-    /// Round 43 Candidate B prototype. Validation and source capture complete
-    /// before the writer is acquired; the resulting state is reachable only
-    /// from crate tests.
-    #[cfg(test)]
-    pub(crate) fn audit_adopt_post_dml_source(
-        &mut self,
-        transaction: &mut Transaction,
-        target: &SchemaDependency,
-    ) -> Result<PostDmlSourceAdoptionEvidence, DatabaseError> {
-        let evidence = self.audit_post_dml_source_adoption_evidence(transaction, target)?;
-        let table = self
-            .committed
-            .schema
-            .tables()
-            .iter()
-            .find(|table| table.id == target.table_id)
-            .ok_or(SchemaMutationError::TableNotFound(target.table_id))?
-            .clone();
+        let source_index_digest =
+            crate::schema_mutation_journal::heap_rewrite_indexes_digest(&indexes)?;
+        if self.schema_writer.get().is_some() || Rc::strong_count(&self.transaction_owner) != 2 {
+            return Err(SchemaMutationError::SchemaBusy.into());
+        }
         let mut logical = self.start_schema_composition(transaction.id())?;
         let touched = self.capture_composed_table(&logical.base, &table, target.fingerprint)?;
-        if touched.old_storage != evidence.storage {
+        if touched.old_storage != source_storage
+            || touched.base_lineage.version != lineage.version
+            || touched.base_table.fingerprint()? != fingerprint
+            || crate::schema_mutation_journal::heap_rewrite_indexes_digest(&touched.base_indexes)?
+                != source_index_digest
+        {
             return Err(SchemaMutationError::StaleSchemaDependency.into());
         }
         logical.touched.insert(target.table_id, touched);
+        Self::validate_adopted_source_alter(&logical, spec)?;
+        Ok(AdoptedSourceTransaction {
+            logical,
+            source_storage,
+            source_physical_txn_id: physical_txn_id,
+            source_table_version: lineage.version,
+            source_fingerprint: fingerprint,
+            source_locator: descriptor.locator.clone(),
+            base_generation: snapshot.committed.generation,
+            base_epoch: snapshot.epoch,
+            source_index_digest,
+        })
+    }
+
+    fn validate_adopted_source_alter(
+        logical: &SchemaTransactionPlan,
+        spec: &AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        if logical.action_count() >= MAX_SCHEMA_ACTIONS {
+            return Err(SchemaMutationError::CompositionLimitExceeded("schema actions").into());
+        }
+        if logical.dependency(spec.target.table_id)? != spec.target {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let current = logical
+            .overlay
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == spec.target.table_id)
+            .ok_or(SchemaMutationError::TableNotFound(spec.target.table_id))?;
+        let touched = logical
+            .touched
+            .get(&spec.target.table_id)
+            .ok_or(SchemaMutationError::Corrupt("adopted source table absent"))?;
+        if let AlterTableOperation::DropColumn { column_id } = spec.operation {
+            if current
+                .column_by_id(column_id)
+                .is_some_and(|column| column.primary_key)
+            {
+                return Err(SchemaMutationError::PrimaryKeyColumn(column_id).into());
+            }
+            if touched
+                .indexes
+                .active
+                .iter()
+                .any(|index| index.column_id == column_id)
+            {
+                return Err(SchemaMutationError::IndexedColumn(column_id).into());
+            }
+        }
+        let lineage = logical
+            .overlay
+            .tables
+            .iter()
+            .find(|lineage| lineage.table_id == spec.target.table_id)
+            .ok_or(SchemaMutationError::Corrupt(
+                "adopted source lineage absent",
+            ))?;
+        let reserved = matches!(
+            spec.operation,
+            AlterTableOperation::AddNullableColumn { .. }
+        )
+        .then_some(
+            lineage
+                .next_column_id
+                .ok_or(SchemaMutationError::IdentityExhausted("ColumnId"))?,
+        );
+        if let Some(column) = reserved {
+            if logical.reservation_count >= MAX_COLUMN_RESERVATIONS {
+                return Err(
+                    SchemaMutationError::CompositionLimitExceeded("ColumnId reservations").into(),
+                );
+            }
+            column
+                .0
+                .checked_add(1)
+                .ok_or(SchemaMutationError::IdentityExhausted("ColumnId"))?;
+        }
+        touched
+            .base_lineage
+            .version
+            .0
+            .checked_add(1)
+            .ok_or(SchemaMutationError::IdentityExhausted("TableSchemaVersion"))?;
+        let candidate = build_alter_target(current, &spec.operation, reserved)?;
+        Schema::new(
+            logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .map(|table| {
+                    if table.id == candidate.id {
+                        candidate.clone()
+                    } else {
+                        table.clone()
+                    }
+                })
+                .collect(),
+        )?;
+        for index in &touched.indexes.active {
+            let target = candidate
+                .column_by_id(index.column_id)
+                .ok_or(SchemaMutationError::IndexedColumn(index.column_id))?;
+            if let Some(source) = touched.base_table.column_by_id(index.column_id) {
+                if source.semantic_type().physical != target.semantic_type().physical {
+                    return Err(SchemaMutationError::UnsupportedSchemaEvolution.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn adopt_post_dml_source_and_refine(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        let adopted = self.preflight_post_dml_source_adoption(transaction, &spec)?;
+        crash("post-dml-adoption-preflight-complete");
         self.schema_writer.set(Some(transaction.id()));
-        transaction.schema_composition = SchemaCompositionState::Composing(Box::new(logical));
-        Ok(evidence)
+        transaction.schema_composition =
+            SchemaCompositionState::AdoptedSourceRefining(Box::new(adopted));
+        crash("post-dml-adopted-source-installed");
+        let result = self.apply_composed_alter(transaction, spec);
+        self.handle_composition_accept_result(transaction, &result);
+        if result.is_ok() {
+            crash("post-dml-first-refinement-accepted");
+        } else if !matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::RollbackRequiredLogical(_)
+        ) {
+            let previous = std::mem::replace(
+                &mut transaction.schema_composition,
+                SchemaCompositionState::None,
+            );
+            if let SchemaCompositionState::AdoptedSourceRefining(adopted) = previous {
+                adopted.logical.writer.set(None);
+            } else {
+                transaction.schema_composition = previous;
+            }
+        }
+        result
     }
 
     /// Round 43 Candidate A probe. Current NBSJ validation deliberately
@@ -2422,7 +2574,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
         let logical = match &transaction.schema_composition {
-            SchemaCompositionState::Composing(logical) => logical,
+            SchemaCompositionState::AdoptedSourceRefining(adopted) => &adopted.logical,
             _ => {
                 return Err(SchemaMutationError::Corrupt(
                     "candidate A audit lacks adopted logical state",
@@ -2462,46 +2614,129 @@ impl Database {
         Ok(())
     }
 
-    /// Round 43 Candidate B prototype finalization. It creates the real
-    /// rewrite intent rather than replacing a synthetic index intent.
-    #[cfg(test)]
-    pub(crate) fn audit_finalize_adopted_source(
+    /// Seals an adopted ordinary DML source. Effective changes create the
+    /// first real rewrite intent; canonical no-ops retain S1 and only resolve
+    /// allocator history.
+    pub(crate) fn finalize_adopted_source(
         &mut self,
         transaction: &mut Transaction,
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
+        let adopted = match &transaction.schema_composition {
+            SchemaCompositionState::AdoptedSourceRefining(adopted) => adopted,
+            _ => {
+                return Err(
+                    SchemaMutationError::Corrupt("adopted source state is not logical").into(),
+                );
+            }
+        };
+        let current_snapshot = file::load(&adopted.logical.catalog)?;
+        if current_snapshot.incarnation != adopted.logical.base.incarnation
+            || current_snapshot.committed != adopted.logical.base.committed
+            || current_snapshot.committed.generation != adopted.base_generation
+            || current_snapshot.epoch != adopted.base_epoch
+        {
+            return Err(SchemaMutationError::Corrupt("adopted source catalog drift").into());
+        }
+        if !transaction.is_only_participant(adopted.source_storage)
+            || !transaction.is_only_write_participant(adopted.source_storage)
+            || transaction.physical_transaction_id(adopted.source_storage)
+                != Some(adopted.source_physical_txn_id)
+            || !matches!(
+                self.bindings.placement(
+                    adopted
+                        .logical
+                        .touched
+                        .keys()
+                        .next()
+                        .copied()
+                        .ok_or(SchemaMutationError::Corrupt("adopted source table absent"))?
+                ),
+                Ok(TablePlacement::Single { storage_id, .. })
+                    if *storage_id == adopted.source_storage
+            )
+        {
+            return Err(SchemaMutationError::Corrupt("adopted source transaction drift").into());
+        }
+        let touched = adopted
+            .logical
+            .touched
+            .values()
+            .next()
+            .ok_or(SchemaMutationError::Corrupt("adopted source table absent"))?;
+        let descriptor = current_snapshot
+            .storages
+            .iter()
+            .find(|descriptor| descriptor.id == adopted.source_storage)
+            .ok_or(SchemaMutationError::Corrupt(
+                "adopted source descriptor absent",
+            ))?;
+        let source = self
+            .registry
+            .get_mut(adopted.source_storage)
+            .ok_or(SchemaMutationError::Corrupt("adopted source Heap absent"))?;
+        if touched.old_storage != adopted.source_storage
+            || touched.base_lineage.version != adopted.source_table_version
+            || touched.base_table.fingerprint()? != adopted.source_fingerprint
+            || descriptor.table_id != touched.base_table.id
+            || !matches!(descriptor.kind, CatalogStorageKind::Heap)
+            || descriptor.locator != adopted.source_locator
+            || descriptor.locator
+                != final_locator(
+                    &adopted.logical.catalog,
+                    current_snapshot.incarnation,
+                    adopted.source_storage,
+                )?
+            || source.kind() != netbadb_storage::StorageKind::Heap
+            || source.storage_id() != adopted.source_storage
+            || source.table() != &touched.base_table
+            || crate::schema_mutation_journal::heap_rewrite_indexes_digest(
+                &source.heap_rewrite_indexes()?,
+            )? != adopted.source_index_digest
+        {
+            return Err(SchemaMutationError::Corrupt("adopted source authority drift").into());
+        }
         let previous = std::mem::replace(
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
         );
-        let logical = match previous {
-            SchemaCompositionState::Composing(logical) => *logical,
+        let adopted = match previous {
+            SchemaCompositionState::AdoptedSourceRefining(adopted) => *adopted,
             other => {
                 transaction.schema_composition = other;
                 return Err(
-                    SchemaMutationError::Corrupt("candidate B audit state is not logical").into(),
+                    SchemaMutationError::Corrupt("adopted source state is not logical").into(),
                 );
             }
         };
-        let source_storage = logical
-            .touched
-            .values()
-            .next()
-            .ok_or(SchemaMutationError::Corrupt(
-                "candidate B audit source absent",
-            ))?
-            .old_storage;
-        let source_physical_txn_id = transaction.physical_transaction_id(source_storage).ok_or(
-            SchemaMutationError::Corrupt("candidate B audit physical transaction absent"),
-        )?;
-        self.materialize_schema_index_composition(
+        let rollback_logical = adopted.logical.clone();
+        let result = self.materialize_schema_index_composition(
             transaction,
-            logical,
+            adopted.logical,
             SchemaIndexMaterialization::AdoptedSourceBackfill {
-                source_storage,
-                source_physical_txn_id,
+                source_storage: adopted.source_storage,
+                source_physical_txn_id: adopted.source_physical_txn_id,
             },
-        )
+        );
+        if let Err(error) = result {
+            transaction.require_schema_rollback();
+            let previous = std::mem::replace(
+                &mut transaction.schema_composition,
+                SchemaCompositionState::None,
+            );
+            transaction.schema_composition = match previous {
+                SchemaCompositionState::SealingAndMaterializingIndex(materialized)
+                | SchemaCompositionState::LateCloneMaterializing(materialized) => {
+                    SchemaCompositionState::RollbackRequiredMaterializedIndex(materialized)
+                }
+                SchemaCompositionState::None => {
+                    SchemaCompositionState::RollbackRequiredLogical(Box::new(rollback_logical))
+                }
+                other => other,
+            };
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn is_backfill_candidate(logical: &SchemaTransactionPlan) -> bool {
@@ -2534,6 +2769,9 @@ impl Database {
             transaction.schema_composition = match previous {
                 SchemaCompositionState::Composing(plan) => {
                     SchemaCompositionState::RollbackRequiredLogical(plan)
+                }
+                SchemaCompositionState::AdoptedSourceRefining(adopted) => {
+                    SchemaCompositionState::RollbackRequiredLogical(Box::new(adopted.logical))
                 }
                 other => other,
             };
@@ -2854,6 +3092,7 @@ impl Database {
         let transaction_id = transaction.id();
         let plan = match &mut transaction.schema_composition {
             SchemaCompositionState::Composing(plan) => plan,
+            SchemaCompositionState::AdoptedSourceRefining(adopted) => &mut adopted.logical,
             _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
         };
         if plan.action_count() >= MAX_SCHEMA_ACTIONS {
@@ -6158,6 +6397,7 @@ pub(crate) fn cleanup_composition_loser(
         SchemaCompositionState::Composing(plan)
         | SchemaCompositionState::SealedNoEffectiveChange(plan)
         | SchemaCompositionState::RollbackRequiredLogical(plan) => (*plan, None),
+        SchemaCompositionState::AdoptedSourceRefining(adopted) => (adopted.logical, None),
         SchemaCompositionState::SealingAndMaterializing(mut materialized)
         | SchemaCompositionState::Materialized(mut materialized)
         | SchemaCompositionState::BackfillMaterializing(mut materialized)

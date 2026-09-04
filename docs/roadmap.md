@@ -993,9 +993,10 @@ Query may execute nullable ADD and exact-ID DROP alongside compatible existing
 refinements. ADD reserves `ColumnId` at Execute, same-name DROP+ADD synthesizes
 NULL under a fresh identity, multiple ADDs share one S2/source scan, and an
 ADD+DROP no-op burns its ID without allocating S2. DML then closes. Generic
-UPDATE→ADD/DROP, new-column indexes, public new-column NOT NULL, conversions,
-defaults, broader placements, and general Alembic support remain deferred; no
-persistent or wire format changes.
+UPDATE→ADD/DROP was still deferred at this milestone; Round 44 below supersedes
+that narrow boundary. New-column indexes, public new-column NOT NULL,
+conversions, defaults, broader placements, and general Alembic support remain
+deferred; no persistent or wire format changes.
 
 ### Post-DML source adoption architecture audit — Round 43
 
@@ -1010,6 +1011,27 @@ visible S1→S2 projection plus existing CORD recovery. Round 44 should initiall
 cover only nullable ADD, unindexed non-PK DROP, and table/column rename; no new
 persistent record, protocol surface, SDK behavior, or generic ALTER-after-DML
 claim is introduced here.
+
+### Post-DML source adoption vertical slice — Round 44
+
+[Round 44](post-dml-source-adoption-round44.md) implements Candidate B in
+production Core. An active transaction whose participants and write
+participants are exactly one managed Single Heap S1 may adopt its ordinary
+INSERT/UPDATE/DELETE P1 as the source for nullable ADD, unindexed non-PK DROP,
+and table/column rename. The explicit private adopted-source carrier captures
+exact schema, storage, locator, physical transaction, generation/epoch, and
+index-digest authority before acquiring the schema writer. Same-S1 reads and
+zero-row DML qualify; read-only, cross-table, pending-index, broader ALTER, and
+post-refinement DML do not.
+
+Multiple refinements share one final V+1/G+1/E+1 publication. ADD uses ordinary
+tag 16; same-name DROP+ADD synthesizes NULL under a fresh ID. ADD+DROP and
+rename-back no-ops commit DML on S1 without S2 or catalog advancement.
+Effective finalization verifies the captured authority, creates the first real
+rewrite intent, and reuses tag35, one transaction-visible source pass into one
+S2, tag34, prepared NBSC, CORD, retirement, and existing recovery. Round 42's
+DROP-first nullability/final-index route remains intact. PostgreSQL requires no
+production adapter branch and no persistent/wire format changes.
 
 ## Phase 6 — SDK and tooling
 

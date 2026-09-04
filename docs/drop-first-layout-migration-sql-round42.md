@@ -1,5 +1,11 @@
 # DROP-first layout migration SQL (Round 42)
 
+> Round 44 supersession: ordinary one-S1 INSERT/UPDATE/DELETE can now adopt
+> that exact managed Heap for nullable ADD, eligible DROP, and table/column
+> rename without a DROP-first prelude. This document remains authoritative for
+> the distinct DROP-first route, including surviving-column SET/DROP NOT NULL
+> and final CREATE INDEX.
+
 Round 42 exposes the Round 41 late-clone row-projection foundation through
 ordinary native SQL and PostgreSQL Simple/Extended Query. This is a routing
 change, not generic ALTER-after-DML support.
@@ -28,7 +34,8 @@ Activation remains exact: one managed Single Heap, one touched table, the same
 transaction and exact table version/fingerprint, the sole S1 write participant,
 and a durable strict DROP-only `InPlaceIndexDelta`. There may be no target/S2,
 staged storage, table action, or cross-table work when the first refinement is
-admitted. An ordinary `UPDATE` followed by ADD/DROP does not qualify.
+admitted. Round 44 separately permits bounded adoption after ordinary one-S1
+DML; it does not use this DROP-first authority.
 
 ## Identity and projection
 
@@ -78,7 +85,7 @@ S1/S2, source authority, projection, reservation, CORD, or recovery state.
 | new-column CREATE INDEX | `0A000` |
 | public new-column SET/DROP NOT NULL | `0A000` |
 | post-refinement relational statement | `25000` |
-| post-DML ADD/DROP without source authority | `25000` |
+| post-DML operation outside the Round 44 bounded adoption set | `25000` |
 | command after an error in an explicit transaction | `25P02` |
 
 ## Physical and recovery boundary

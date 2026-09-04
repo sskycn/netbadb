@@ -1,5 +1,9 @@
 # Post-DML source adoption architecture audit (Round 43)
 
+> Implemented by [Round 44](post-dml-source-adoption-round44.md). This document
+> records the selection evidence; its statements that the production surface
+> is closed describe the historical Round 43 baseline.
+
 Round 43 is an architecture audit and a `#[cfg(test)]` executable experiment.
 It does not expose generic ALTER-after-DML. Production native SQL and
 PostgreSQL continue to reject `UPDATE` followed by ADD, DROP, RENAME, or

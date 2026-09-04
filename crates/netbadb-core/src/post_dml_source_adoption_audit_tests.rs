@@ -90,17 +90,41 @@ fn assert_source_adoption_rejected(error: DatabaseError) {
 }
 
 #[test]
-fn production_update_then_alter_surface_remains_closed() {
+fn production_update_then_bounded_alter_surface_is_open() {
     for (name, alter) in [
-        ("negative-add", "ALTER TABLE users ADD COLUMN marker TEXT"),
-        ("negative-drop", "ALTER TABLE users DROP COLUMN legacy"),
+        ("positive-add", "ALTER TABLE users ADD COLUMN marker TEXT"),
+        ("positive-drop", "ALTER TABLE users DROP COLUMN legacy"),
         (
-            "negative-rename",
+            "positive-rename-column",
             "ALTER TABLE users RENAME COLUMN email TO contact",
         ),
         (
-            "negative-not-null",
+            "positive-rename-table",
+            "ALTER TABLE users RENAME TO accounts",
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, false);
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET email = email WHERE id = 1",
+        )
+        .unwrap();
+        db.execute_in(&mut transaction, alter).unwrap();
+        db.commit_transaction(&mut transaction).unwrap();
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    for (name, alter) in [
+        (
+            "negative-set-not-null",
             "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        ),
+        (
+            "negative-drop-not-null",
+            "ALTER TABLE users ALTER COLUMN id DROP NOT NULL",
         ),
     ] {
         let root = root(name);
@@ -135,7 +159,7 @@ fn schema_is_stable_and_late_writer_requires_exclusive_transaction_ownership() {
     db.execute_in(&mut reader, "SELECT id FROM users").unwrap();
     let journal = journal_bytes(&db);
     assert!(matches!(
-        db.audit_post_dml_source_adoption_evidence(&writer, &target),
+        db.execute_in(&mut writer, "ALTER TABLE users ADD COLUMN marker TEXT"),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::SchemaBusy
         ))
@@ -146,12 +170,17 @@ fn schema_is_stable_and_late_writer_requires_exclusive_transaction_ownership() {
 
     reader.rollback().unwrap();
     drop(reader);
-    let evidence = db
-        .audit_adopt_post_dml_source(&mut writer, &target)
+    db.execute_in(&mut writer, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
-    assert_eq!(evidence.table, TableId(2));
-    assert_eq!(evidence.table_version, target.table_version);
-    assert_eq!(evidence.fingerprint, target.fingerprint);
+    let SchemaCompositionState::AdoptedSourceRefining(evidence) = &writer.schema_composition else {
+        panic!("expected adopted source state");
+    };
+    assert_eq!(
+        evidence.logical.touched.keys().copied().collect::<Vec<_>>(),
+        [TableId(2)]
+    );
+    assert_eq!(evidence.source_table_version, target.table_version);
+    assert_eq!(evidence.source_fingerprint, target.fingerprint);
     assert_eq!(evidence.base_generation, db.schema_generation());
     assert_eq!(
         evidence.base_epoch,
@@ -159,10 +188,10 @@ fn schema_is_stable_and_late_writer_requires_exclusive_transaction_ownership() {
             .unwrap()
             .epoch
     );
-    assert_eq!(evidence.storage, writer.write_participant().unwrap());
+    assert_eq!(evidence.source_storage, writer.write_participant().unwrap());
     assert_eq!(
-        Some(evidence.physical_txn_id),
-        writer.physical_transaction_id(evidence.storage)
+        Some(evidence.source_physical_txn_id),
+        writer.physical_transaction_id(evidence.source_storage)
     );
     assert_eq!(db.schema_writer.get(), Some(writer.id()));
     assert!(matches!(
@@ -184,6 +213,7 @@ fn zero_row_insert_update_and_delete_all_provide_the_same_source_identity() {
             "zero-row-update",
             "UPDATE users SET email = email WHERE id = -1",
         ),
+        ("zero-row-delete", "DELETE FROM users WHERE id = -1"),
         (
             "insert-first",
             "INSERT INTO users VALUES (4, 'old-four', 'four@example.test')",
@@ -196,25 +226,272 @@ fn zero_row_insert_update_and_delete_all_provide_the_same_source_identity() {
     ] {
         let root = root(name);
         let mut db = seed(&root, false);
-        let target = users_target(&db);
         let mut transaction = db.begin_transaction().unwrap();
         db.execute_in(&mut transaction, dml).unwrap();
-        let evidence = db
-            .audit_post_dml_source_adoption_evidence(&transaction, &target)
+        db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
             .unwrap();
+        let SchemaCompositionState::AdoptedSourceRefining(evidence) =
+            &transaction.schema_composition
+        else {
+            panic!("expected adopted source state");
+        };
         assert_eq!(transaction.participant_count(), 1);
-        assert_eq!(transaction.write_participant(), Some(evidence.storage));
+        assert_eq!(
+            transaction.write_participant(),
+            Some(evidence.source_storage)
+        );
         assert!(
             transaction
-                .physical_transaction_id(evidence.storage)
+                .physical_transaction_id(evidence.source_storage)
                 .is_some()
         );
         assert!(!evidence.source_locator.is_empty());
-        assert_ne!(evidence.index_digest, [0; 32]);
+        assert_ne!(evidence.source_index_digest, [0; 32]);
         transaction.rollback().unwrap();
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn activation_discriminates_same_source_reads_from_read_only_transactions() {
+    let same_source_root = root("same-source-read");
+    let mut db = seed(&same_source_root, false);
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(&mut transaction, "SELECT email FROM users WHERE id = 1")
+        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = email WHERE id = 1",
+    )
+    .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    assert!(
+        db.schema()
+            .table("users")
+            .unwrap()
+            .column("marker")
+            .is_some()
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(same_source_root).unwrap();
+
+    let root = root("read-only");
+    let mut db = seed(&root, false);
+    let before = journal_bytes(&db);
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(&mut transaction, "SELECT email FROM users")
+        .unwrap();
+    assert!(matches!(
+        db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT"),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::TransactionNotPristine
+        ))
+    ));
+    assert!(db.schema_writer.get().is_none());
+    assert_eq!(journal_bytes(&db), before);
+    assert_eq!(transaction.state(), TransactionState::Active);
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn first_refinement_closes_relational_access_and_keeps_narrow_ddl_boundary() {
+    for (name, statement, migration_access_error) in [
+        ("select-closed", "SELECT id FROM users", true),
+        (
+            "insert-closed",
+            "INSERT INTO users VALUES (4, 'four', 'four@example.test', NULL)",
+            true,
+        ),
+        (
+            "update-closed",
+            "UPDATE users SET email = email WHERE id = 1",
+            true,
+        ),
+        ("delete-closed", "DELETE FROM users WHERE id = 1", true),
+        (
+            "not-null-closed",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            false,
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, false);
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET email = email WHERE id = 1",
+        )
+        .unwrap();
+        db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+            .unwrap();
+        let error = db.execute_in(&mut transaction, statement).unwrap_err();
+        if migration_access_error {
+            assert!(
+                matches!(
+                    &error,
+                    DatabaseError::SchemaMutation(
+                        SchemaMutationError::MigrationDataAccessAfterRefinement
+                    )
+                ),
+                "{name}: {error:?}"
+            );
+        } else {
+            assert!(matches!(
+                error,
+                DatabaseError::SchemaMutation(SchemaMutationError::TransactionNotPristine)
+            ));
+        }
+        transaction.rollback().unwrap();
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    for (name, statement) in [
+        (
+            "create-index-closed",
+            "CREATE INDEX users_marker_idx ON users(marker)",
+        ),
+        ("drop-index-closed", "DROP INDEX users_email_idx"),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, false);
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET email = email WHERE id = 1",
+        )
+        .unwrap();
+        db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+            .unwrap();
+        assert!(db.execute_in(&mut transaction, statement).is_err());
+        transaction.rollback().unwrap();
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn multiple_refinements_publish_one_final_version_and_preserve_identities() {
+    let root = root("multiple-refinements");
+    let mut db = seed(&root, false);
+    let table = db.schema().table("users").unwrap().id;
+    let id = db.schema().table("users").unwrap().column("id").unwrap().id;
+    let email = db
+        .schema()
+        .table("users")
+        .unwrap()
+        .column("email")
+        .unwrap()
+        .id;
+    let index = db.indexes(table).unwrap()[0].id;
+    let version = db.table_schema_version(table).unwrap();
+    let generation = db.schema_generation();
+    let epoch = schema_catalog_file::load(&root.join("catalog"))
+        .unwrap()
+        .epoch;
+    let revision = db.catalog_generation();
+    let target_storage = db.next_storage_id().unwrap();
+    let first_new = db.next_column_id(table).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    for statement in [
+        "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+        "INSERT INTO users VALUES (4, 'old-four', 'four@example.test')",
+        "DELETE FROM users WHERE id = 2",
+        "ALTER TABLE users ADD COLUMN marker TEXT",
+        "ALTER TABLE users ADD COLUMN score BIGINT",
+        "ALTER TABLE users RENAME COLUMN email TO contact",
+        "ALTER TABLE users DROP COLUMN legacy",
+        "ALTER TABLE users RENAME TO accounts",
+    ] {
+        db.execute_in(&mut transaction, statement).unwrap();
+    }
+    db.commit_transaction(&mut transaction).unwrap();
+    let final_table = db.schema().table("accounts").unwrap();
+    assert_eq!(final_table.id, table);
+    assert_eq!(final_table.column("id").unwrap().id, id);
+    assert_eq!(final_table.column("contact").unwrap().id, email);
+    assert_eq!(final_table.column("marker").unwrap().id, first_new);
+    assert_eq!(
+        final_table.column("score").unwrap().id,
+        ColumnId(first_new.0 + 1)
+    );
+    assert_eq!(db.next_column_id(table), Some(ColumnId(first_new.0 + 2)));
+    assert_eq!(db.indexes(table).unwrap()[0].id, index);
+    assert_eq!(
+        db.table_schema_version(table),
+        Some(TableSchemaVersion(version.0 + 1))
+    );
+    assert_eq!(db.schema_generation().0, generation.0 + 1);
+    assert_eq!(
+        schema_catalog_file::load(&root.join("catalog"))
+            .unwrap()
+            .epoch,
+        epoch + 1
+    );
+    assert_eq!(db.catalog_generation(), revision + 1);
+    assert_eq!(db.bindings.resolve_single(table), Ok(target_storage));
+    assert_eq!(
+        db.query("SELECT id, contact, marker, score FROM accounts ORDER BY id")
+            .unwrap()
+            .rows,
+        [
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("filled@example.test".into()),
+                ScalarValue::Null,
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(3),
+                ScalarValue::Text("three@example.test".into()),
+                ScalarValue::Null,
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(4),
+                ScalarValue::Text("four@example.test".into()),
+                ScalarValue::Null,
+                ScalarValue::Null,
+            ],
+        ]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rename_back_is_a_schema_noop_and_commits_dml_on_s1() {
+    let root = root("rename-back-noop");
+    let mut db = seed(&root, false);
+    let table = db.schema().table("users").unwrap().id;
+    let source = db.bindings.resolve_single(table).unwrap();
+    let version = db.table_schema_version(table).unwrap();
+    let storage_floor = db.next_storage_id();
+    let mut transaction = db.begin_transaction().unwrap();
+    for statement in [
+        "UPDATE users SET legacy = 'winner' WHERE id = 1",
+        "ALTER TABLE users RENAME COLUMN email TO temporary_name",
+        "ALTER TABLE users RENAME COLUMN temporary_name TO email",
+    ] {
+        db.execute_in(&mut transaction, statement).unwrap();
+    }
+    db.commit_transaction(&mut transaction).unwrap();
+    assert_eq!(db.bindings.resolve_single(table), Ok(source));
+    assert_eq!(db.table_schema_version(table), Some(version));
+    assert_eq!(db.next_storage_id(), storage_floor);
+    assert_eq!(
+        db.query("SELECT legacy FROM users WHERE id = 1")
+            .unwrap()
+            .rows,
+        [vec![ScalarValue::Text("winner".into())]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -244,13 +521,15 @@ fn strict_one_table_policy_rejects_cross_table_reads_writes_and_targets() {
     ] {
         let root = root(name);
         let mut db = seed(&root, true);
-        let target = db.resolve_alter_table(target_name).unwrap();
         let mut transaction = db.begin_transaction().unwrap();
         for statement in setup {
             db.execute_in(&mut transaction, statement).unwrap();
         }
         let error = db
-            .audit_post_dml_source_adoption_evidence(&transaction, &target)
+            .execute_in(
+                &mut transaction,
+                &format!("ALTER TABLE {target_name} ADD COLUMN marker TEXT"),
+            )
             .unwrap_err();
         assert_source_adoption_rejected(error);
         assert!(db.schema_writer.get().is_none());
@@ -258,6 +537,24 @@ fn strict_one_table_policy_rejects_cross_table_reads_writes_and_targets() {
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    let root = root("second-alter-target");
+    let mut db = seed(&root, true);
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = email WHERE id = 1",
+    )
+    .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    assert_source_adoption_rejected(
+        db.execute_in(&mut transaction, "ALTER TABLE teams ADD COLUMN marker TEXT")
+            .unwrap_err(),
+    );
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -271,7 +568,6 @@ fn pending_index_writes_are_not_misclassified_as_row_source_provenance() {
     ] {
         let root = root(name);
         let mut db = seed(&root, false);
-        let target = users_target(&db);
         let mut transaction = db.begin_transaction().unwrap();
         db.execute_in(
             &mut transaction,
@@ -282,7 +578,7 @@ fn pending_index_writes_are_not_misclassified_as_row_source_provenance() {
         assert!(transaction.schema_composition.is_none());
         assert!(transaction.has_pending_index_creations() || transaction.has_pending_index_drops());
         let error = db
-            .audit_post_dml_source_adoption_evidence(&transaction, &target)
+            .execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
             .unwrap_err();
         assert_source_adoption_rejected(error);
         transaction.rollback().unwrap();
@@ -295,14 +591,13 @@ fn pending_index_writes_are_not_misclassified_as_row_source_provenance() {
 fn candidate_a_identity_index_intent_is_rejected_without_journal_mutation() {
     let root = root("candidate-a");
     let mut db = seed(&root, false);
-    let target = users_target(&db);
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(
         &mut transaction,
         "UPDATE users SET email = email WHERE id = 1",
     )
     .unwrap();
-    db.audit_adopt_post_dml_source(&mut transaction, &target)
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
     let before = journal_bytes(&db);
     assert!(matches!(
@@ -332,8 +627,6 @@ fn candidate_b_reservation_before_intent_rolls_back_schema_but_burns_column() {
         "UPDATE users SET legacy = 'loser' WHERE id = 1",
     )
     .unwrap();
-    db.audit_adopt_post_dml_source(&mut transaction, &target)
-        .unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
     assert_eq!(db.next_column_id(table), Some(ColumnId(column.0 + 1)));
@@ -390,8 +683,6 @@ fn candidate_b_add_drop_noop_commits_dml_on_s1_without_schema_publication() {
         "UPDATE users SET legacy = 'winner' WHERE id = 1",
     )
     .unwrap();
-    db.audit_adopt_post_dml_source(&mut transaction, &target)
-        .unwrap();
     db.execute_in(
         &mut transaction,
         "ALTER TABLE users ADD COLUMN temporary TEXT",
@@ -399,7 +690,7 @@ fn candidate_b_add_drop_noop_commits_dml_on_s1_without_schema_publication() {
     .unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN temporary")
         .unwrap();
-    db.audit_finalize_adopted_source(&mut transaction).unwrap();
+    db.finalize_adopted_source(&mut transaction).unwrap();
     assert!(matches!(
         transaction.schema_composition,
         SchemaCompositionState::SealedNoEffectiveChange(_)
@@ -458,12 +749,13 @@ fn candidate_b_effective_change_uses_transaction_view_one_s2_and_one_pass() {
     ] {
         db.execute_in(&mut transaction, statement).unwrap();
     }
-    let evidence = db
-        .audit_adopt_post_dml_source(&mut transaction, &target)
-        .unwrap();
-    assert_eq!(evidence.storage, source);
     db.execute_ddl_in(&mut transaction, &prepared_add).unwrap();
-    db.audit_finalize_adopted_source(&mut transaction).unwrap();
+    let adopted = match &transaction.schema_composition {
+        SchemaCompositionState::AdoptedSourceRefining(adopted) => adopted,
+        _ => panic!("expected adopted source state"),
+    };
+    assert_eq!(adopted.source_storage, source);
+    db.finalize_adopted_source(&mut transaction).unwrap();
     let materialized = transaction.schema_composition.source_backfill().unwrap();
     assert_eq!(materialized.source_copy_passes, 1);
     assert_eq!(materialized.source_rows_copied, 3);
@@ -507,7 +799,6 @@ fn candidate_b_effective_change_uses_transaction_view_one_s2_and_one_pass() {
 fn candidate_b_transaction_prepared_alter_remains_exact_after_dml() {
     let root = root("candidate-b-transaction-prepare");
     let mut db = seed(&root, false);
-    let target = users_target(&db);
     let mut transaction = db.begin_transaction().unwrap();
     let PreparedSqlStatement::Ddl(prepared_rename) = db
         .prepare_sql_statement_in(
@@ -524,11 +815,8 @@ fn candidate_b_transaction_prepared_alter_remains_exact_after_dml() {
         "UPDATE users SET email = email WHERE id = 1",
     )
     .unwrap();
-    db.audit_adopt_post_dml_source(&mut transaction, &target)
-        .unwrap();
     db.execute_ddl_in(&mut transaction, &prepared_rename)
         .unwrap();
-    db.audit_finalize_adopted_source(&mut transaction).unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     assert!(
         db.schema()
@@ -572,12 +860,9 @@ fn candidate_b_prepared_drop_keeps_exact_column_identity() {
         "UPDATE users SET email = email WHERE id = 1",
     )
     .unwrap();
-    db.audit_adopt_post_dml_source(&mut transaction, &target)
-        .unwrap();
     db.execute_ddl_in(&mut transaction, &prepared_drop).unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN legacy TEXT")
         .unwrap();
-    db.audit_finalize_adopted_source(&mut transaction).unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     let replacement = db
         .schema()
@@ -600,23 +885,91 @@ fn candidate_b_prepared_drop_keeps_exact_column_identity() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn post_dml_adoption_rollback_matrix_restores_s1_rows_schema_and_indexes() {
+    for (name, alters) in [
+        (
+            "rollback-add",
+            &["ALTER TABLE users ADD COLUMN marker TEXT"] as &[&str],
+        ),
+        (
+            "rollback-drop",
+            &["ALTER TABLE users DROP COLUMN legacy"] as &[&str],
+        ),
+        (
+            "rollback-rename",
+            &["ALTER TABLE users RENAME COLUMN email TO contact"] as &[&str],
+        ),
+        (
+            "rollback-same-name",
+            &[
+                "ALTER TABLE users DROP COLUMN legacy",
+                "ALTER TABLE users ADD COLUMN legacy TEXT",
+            ] as &[&str],
+        ),
+        (
+            "rollback-multiple-add",
+            &[
+                "ALTER TABLE users ADD COLUMN marker TEXT",
+                "ALTER TABLE users ADD COLUMN score BIGINT",
+            ] as &[&str],
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, false);
+        let table = db.schema().table("users").unwrap().id;
+        let source = db.bindings.resolve_single(table).unwrap();
+        let base_schema = db.schema().clone();
+        let base_indexes = db.indexes(table).unwrap().to_vec();
+        let base_storage_floor = db.next_storage_id();
+        let column_floor = db.next_column_id(table).unwrap();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET legacy = 'loser' WHERE id = 1",
+        )
+        .unwrap();
+        for alter in alters {
+            db.execute_in(&mut transaction, alter).unwrap();
+        }
+        transaction.rollback().unwrap();
+        assert!(db.schema_writer.get().is_none());
+        assert_eq!(db.schema(), &base_schema);
+        assert_eq!(db.bindings.resolve_single(table), Ok(source));
+        assert_eq!(db.indexes(table).unwrap(), base_indexes);
+        assert_eq!(db.next_storage_id(), base_storage_floor);
+        let burns = alters
+            .iter()
+            .filter(|alter| alter.contains("ADD COLUMN"))
+            .count() as u32;
+        assert_eq!(
+            db.next_column_id(table),
+            Some(ColumnId(column_floor.0 + burns))
+        );
+        assert_eq!(
+            db.query("SELECT legacy FROM users WHERE id = 1")
+                .unwrap()
+                .rows,
+            [vec![ScalarValue::Text("old-one".into())]]
+        );
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn execute_candidate_b_crash_transaction(db: &mut Database) {
-    let target = users_target(db);
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(
         &mut transaction,
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    db.audit_adopt_post_dml_source(&mut transaction, &target)
-        .unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
-    db.audit_finalize_adopted_source(&mut transaction).unwrap();
     db.commit_transaction(&mut transaction).unwrap();
 }
 
-fn assert_candidate_b_loser(root: &Path, source: StorageId) {
+fn assert_candidate_b_loser(root: &Path, source: StorageId, next_column: ColumnId) {
     for _ in 0..3 {
         let mut db = Database::open_catalog(root.join("catalog")).unwrap();
         let table = db.schema().table("users").unwrap().id;
@@ -628,7 +981,7 @@ fn assert_candidate_b_loser(root: &Path, source: StorageId) {
                 .column("marker")
                 .is_none()
         );
-        assert_eq!(db.next_column_id(table), Some(ColumnId(5)));
+        assert_eq!(db.next_column_id(table), Some(next_column));
         assert_eq!(
             db.query("SELECT email FROM users WHERE id = 1")
                 .unwrap()
@@ -680,6 +1033,10 @@ fn candidate_b_crash_child() {
 #[test]
 fn candidate_b_pre_cord_crashes_are_losers_and_keep_allocator_history() {
     for point in [
+        "post-dml-adoption-preflight-complete",
+        "post-dml-adopted-source-installed",
+        "composition-column-reservation-durable",
+        "post-dml-first-refinement-accepted",
         "composition-intent-durable",
         "source-backfill-intent-durable",
         "source-backfill-stage-intent-durable",
@@ -705,7 +1062,15 @@ fn candidate_b_pre_cord_crashes_are_losers_and_keep_allocator_history() {
             "{point}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_candidate_b_loser(&root, source);
+        let next_column = if matches!(
+            point,
+            "post-dml-adoption-preflight-complete" | "post-dml-adopted-source-installed"
+        ) {
+            ColumnId(4)
+        } else {
+            ColumnId(5)
+        };
+        assert_candidate_b_loser(&root, source, next_column);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -773,10 +1138,6 @@ fn cost_observation(name: &str, adopted: bool) -> CostObservation {
     )
     .unwrap();
     let source_after_dml = resource_bytes(&root);
-    if adopted {
-        db.audit_adopt_post_dml_source(&mut transaction, &target)
-            .unwrap();
-    }
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
     if !adopted {
@@ -787,7 +1148,7 @@ fn cost_observation(name: &str, adopted: bool) -> CostObservation {
         .unwrap();
         db.finalize_source_backfill(&mut transaction).unwrap();
     } else {
-        db.audit_finalize_adopted_source(&mut transaction).unwrap();
+        db.finalize_adopted_source(&mut transaction).unwrap();
     }
     let materialized = transaction.schema_composition.source_backfill().unwrap();
     let source_passes = materialized.source_copy_passes;

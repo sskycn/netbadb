@@ -527,24 +527,41 @@ fn policy_b_allows_empty_new_not_null_but_rejects_nonempty_during_projection() {
 }
 
 #[test]
-fn public_layout_sql_requires_source_authority_and_keeps_new_column_restrictions() {
-    for sql in [
+fn public_layout_sql_adopts_ordinary_dml_but_keeps_index_and_new_column_restrictions() {
+    let adopted_root = root("public-adopted-add");
+    let mut db = seed(&adopted_root, true);
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET legacy = 'changed' WHERE id = 1",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
         "ALTER TABLE users ADD COLUMN public_add TEXT",
-        "ALTER TABLE users DROP COLUMN legacy",
-    ] {
-        let root = root("public-negative");
-        let mut db = seed(&root, true);
-        let mut transaction = db.begin_transaction().unwrap();
-        db.execute_in(
-            &mut transaction,
-            "UPDATE users SET legacy = 'changed' WHERE id = 1",
-        )
-        .unwrap();
-        assert!(db.execute_in(&mut transaction, sql).is_err());
-        transaction.rollback().unwrap();
-        db.close().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
+    )
+    .unwrap();
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(adopted_root).unwrap();
+
+    let indexed_root = root("public-indexed-drop");
+    let mut db = seed(&indexed_root, true);
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET legacy = 'changed' WHERE id = 1",
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN legacy"),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::IndexedColumn(ColumnId(2))
+        ))
+    ));
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(indexed_root).unwrap();
 
     let index_root = root("new-index-negative");
     let mut db = seed(&index_root, true);

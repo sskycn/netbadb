@@ -30,6 +30,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round37_probe = std::env::var("NETBADB_ROUND37_PROBE").ok();
     let round39_probe = std::env::var("NETBADB_ROUND39_PROBE").ok();
     let round42_probe = std::env::var("NETBADB_ROUND42_PROBE").ok();
+    let round44_probe = std::env::var("NETBADB_ROUND44_PROBE").ok();
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -47,9 +48,11 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    if round42_probe.is_some() {
+    if round42_probe.is_some() || round44_probe.is_some() {
         db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, email TEXT)")?;
-        db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
+        if round42_probe.is_some() {
+            db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
+        }
         db.execute("CREATE INDEX projects_email_idx ON projects (email)")?;
         db.execute("INSERT INTO projects VALUES (1, 'old-one', NULL)")?;
         db.execute("INSERT INTO projects VALUES (2, 'old-two', 'two@example.test')")?;
@@ -87,7 +90,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("runtime storage path is not UTF-8")?;
 
     let manifest = root.join("server.json");
-    let project_columns = if round42_probe.is_some() {
+    let project_columns = if round42_probe.is_some() || round44_probe.is_some() {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
             {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
@@ -120,6 +123,118 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round44_probe {
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let final_name = if probe == "rename-table" {
+                "accounts"
+            } else {
+                "projects"
+            };
+            let projects = reopened
+                .schema()
+                .table(final_name)
+                .ok_or("Round 44 final table disappeared")?
+                .clone();
+            let indexes = reopened.indexes(TableId(2))?;
+            match probe.as_str() {
+                "add" => {
+                    if projects.column("marker").map(|column| column.id) != Some(ColumnId(4))
+                        || reopened.next_storage_id().map(|storage| storage.0)
+                            != Some(target_storage.0 + 1)
+                    {
+                        return Err("Round 44 ADD result is incorrect".into());
+                    }
+                }
+                "drop" => {
+                    if projects.column("legacy").is_some() || indexes.len() != 1 {
+                        return Err("Round 44 DROP result is incorrect".into());
+                    }
+                }
+                "rename-column" => {
+                    if projects.column("contact").map(|column| column.id) != Some(ColumnId(3))
+                        || indexes.len() != 1
+                        || indexes[0].id != old_index_id
+                        || indexes[0].column_id != ColumnId(3)
+                    {
+                        return Err("Round 44 column rename result is incorrect".into());
+                    }
+                }
+                "rename-table" => {
+                    if projects.id != TableId(2) || reopened.schema().table("projects").is_some() {
+                        return Err("Round 44 table rename result is incorrect".into());
+                    }
+                }
+                "multiple-add" => {
+                    if projects.column("marker").map(|column| column.id) != Some(ColumnId(4))
+                        || projects.column("score").map(|column| column.id) != Some(ColumnId(5))
+                    {
+                        return Err("Round 44 multiple ADD result is incorrect".into());
+                    }
+                }
+                "same-name" => {
+                    if projects.column("legacy").map(|column| column.id) != Some(ColumnId(4)) {
+                        return Err("Round 44 same-name replacement is incorrect".into());
+                    }
+                }
+                "noop" => {
+                    if projects.column("temporary").is_some()
+                        || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                        || reopened.schema_generation() != base_generation
+                        || reopened.next_storage_id() != Some(target_storage)
+                        || reopened.next_column_id(TableId(2)) != Some(ColumnId(5))
+                    {
+                        return Err("Round 44 no-op result is incorrect".into());
+                    }
+                }
+                "mixed" => {
+                    let rows = reopened
+                        .query("SELECT id, contact, marker FROM projects ORDER BY id")?
+                        .rows;
+                    if projects.column("legacy").is_some()
+                        || projects.column("contact").map(|column| column.id) != Some(ColumnId(3))
+                        || projects.column("marker").map(|column| column.id) != Some(ColumnId(4))
+                        || rows
+                            != [
+                                vec![
+                                    ScalarValue::Int64(1),
+                                    ScalarValue::Text("filled@example.test".into()),
+                                    ScalarValue::Null,
+                                ],
+                                vec![
+                                    ScalarValue::Int64(3),
+                                    ScalarValue::Text("three@example.test".into()),
+                                    ScalarValue::Null,
+                                ],
+                                vec![
+                                    ScalarValue::Int64(4),
+                                    ScalarValue::Text("four@example.test".into()),
+                                    ScalarValue::Null,
+                                ],
+                            ]
+                    {
+                        return Err("Round 44 mixed DML result is incorrect".into());
+                    }
+                }
+                "rollback" | "set-not-null" | "dml-after" | "indexed-drop" | "index-after"
+                | "cross-table" => {
+                    if projects.columns.len() != 3
+                        || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                        || reopened.schema_generation() != base_generation
+                        || reopened.next_storage_id() != Some(target_storage)
+                    {
+                        return Err("Round 44 rollback/negative result is incorrect".into());
+                    }
+                }
+                _ => return Err(format!("unknown Round 44 probe {probe}").into()),
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 44 post-DML adoption result survived three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round42_probe {
         for _ in 0..3 {
@@ -197,8 +312,8 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
                         return Err("Round 42 ADD/DROP no-op result is incorrect".into());
                     }
                 }
-                "rollback" | "post-dml" | "no-authority-add" | "no-authority-drop"
-                | "new-index" | "new-not-null" => {
+                "rollback" | "post-dml" | "read-only-add" | "pending-index" | "new-index"
+                | "new-not-null" => {
                     if projects.columns.len() != 3
                         || projects.column("legacy").map(|column| column.id) != Some(ColumnId(2))
                         || indexes.len() != 2

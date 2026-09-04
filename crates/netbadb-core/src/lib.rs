@@ -2623,6 +2623,12 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         transaction.validate_commit_owner(&self.transaction_owner)?;
         self.ensure_schema_materialized(transaction)?;
+        if matches!(
+            transaction.schema_composition,
+            schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
+        ) {
+            self.finalize_adopted_source(transaction)?;
+        }
         if transaction.schema_composition.source_backfill().is_some() {
             self.finalize_source_backfill(transaction)?;
         }
@@ -2879,6 +2885,7 @@ impl Database {
                 | schema_composition::SchemaCompositionState::SourceIndexFinalizing(_)
                 | schema_composition::SchemaCompositionState::LateCloneMaterializing(_)
                 | schema_composition::SchemaCompositionState::LateCloneReady(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
         {
             return Err(SchemaMutationError::MigrationDataAccessAfterRefinement.into());

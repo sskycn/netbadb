@@ -211,6 +211,16 @@ post-refinement DML are `25000`, followed by `25P02` in a failed transaction.
 The adapter still has no migration-state logic. See
 [Round 42](drop-first-layout-migration-sql-round42.md).
 
+Round 44 adds a separate Core-selected path for ordinary one-S1 DML followed by
+nullable ADD COLUMN, unindexed non-PK DROP COLUMN, RENAME TABLE, or RENAME
+COLUMN. INSERT/UPDATE/DELETE, mixed DML, zero-row writes, and a prior read of
+the same S1 qualify. Read-only, cross-table, pending-index, SET/DROP NOT NULL,
+and index DDL do not. Parse/Bind/Describe remain pure; Execute performs the
+late adoption and any tag-16 reservation. The first accepted refinement closes
+relational execution with `25000`, and the next command in the failed explicit
+transaction receives `25P02`. Indexed DROP remains `2BP01`. The adapter has no
+Round 44 branch; see [Round 44](post-dml-source-adoption-round44.md).
+
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections
 refresh through committed catalog_generation; neither psql nor SQLAlchemy needs

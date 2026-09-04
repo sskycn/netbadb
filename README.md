@@ -350,13 +350,18 @@ an exact `DROP INDEX` then physically evacuates S2 and permanently closes furthe
 DML before compatible nullability ALTER and final index changes. This is not the
 Round 39 source route. Round 39 additionally supports a bounded, single-table
 transactional `DROP INDEX` → data backfill → compatible ALTER → final index
-rebuild for managed Single Heaps. Round 42 extends only that exact DROP-first
+rebuild for managed Single Heaps. Round 42 extends that exact DROP-first
 authority to nullable ADD COLUMN and exact-ID DROP COLUMN before one late final
 clone. New columns receive fresh IDs and NULL values; DML closes after the first
 refinement, and new-column indexes and public new-column NOT NULL remain
-unsupported. This is not generic ALTER-after-DML or general Alembic migration
-support. See [Round 39](docs/drop-first-migration-sql-round39.md) and
-[the Round 42 layout slice](docs/drop-first-layout-migration-sql-round42.md).
+unsupported. Round 44 adds a separate narrow route: a single-table transaction
+on one managed Single Heap may perform ordinary INSERT/UPDATE/DELETE and then
+adopt that exact S1 for nullable ADD, unindexed non-PK DROP, or table/column
+rename. The first accepted refinement closes relational access; an effective
+layout is copied once into one final S2. This is not arbitrary ALTER-after-DML,
+online migration, or general Alembic support. See [Round 39](docs/drop-first-migration-sql-round39.md),
+[Round 42](docs/drop-first-layout-migration-sql-round42.md), and
+[Round 44](docs/post-dml-source-adoption-round44.md).
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

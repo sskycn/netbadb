@@ -201,11 +201,14 @@ UPDATE projects SET name = 'filled' WHERE name IS NULL;
 ALTER TABLE projects ADD COLUMN marker TEXT;
 \echo ADD_COLUMN_STATE :SQLSTATE
 SELECT id FROM projects;
+\echo ADD_COLUMN_DML_STATE :SQLSTATE
+SELECT id FROM projects;
 \echo ADD_COLUMN_FAILED_STATE :SQLSTATE
 ROLLBACK;
 """,
         (
-            "ADD_COLUMN_STATE 25000",
+            "ADD_COLUMN_STATE 00000",
+            "ADD_COLUMN_DML_STATE 25000",
             "ADD_COLUMN_FAILED_STATE 25P02",
             "ROLLBACK",
         ),
@@ -222,7 +225,7 @@ SELECT id FROM projects;
 ROLLBACK;
 """,
         (
-            "DROP_COLUMN_STATE 25000",
+            "DROP_COLUMN_STATE 2BP01",
             "DROP_COLUMN_FAILED_STATE 25P02",
             "ROLLBACK",
         ),
@@ -348,18 +351,19 @@ ROLLBACK;
             "25000",
         ),
         (
-            "no-authority-add",
-            "UPDATE projects SET email = email WHERE id = 1;",
+            "read-only-add",
+            "SELECT email FROM projects WHERE id = 1;",
             "ALTER TABLE projects ADD COLUMN marker TEXT;",
-            "NO_AUTH_ADD_STATE",
+            "READ_ONLY_ADD_STATE",
             "25000",
         ),
         (
-            "no-authority-drop",
-            "UPDATE projects SET email = email WHERE id = 1;",
-            "ALTER TABLE projects DROP COLUMN legacy;",
-            "NO_AUTH_DROP_STATE",
-            "25000",
+            "pending-index",
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "CREATE INDEX projects_id_idx ON projects(id);",
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "PENDING_INDEX_STATE",
+            "0A000",
         ),
         (
             "new-index",

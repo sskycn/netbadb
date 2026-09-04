@@ -359,6 +359,18 @@ and prepared DROP cannot rebind to a same-name replacement. Multiple effective
 changes retain one S2 and one source stream; ADD-then-DROP burns its ID with no
 S2. PostgreSQL remains unaware of S1/S2 and recovery remains byte-driven.
 
+[Round 44](post-dml-source-adoption-round44.md) productionizes the Round 43
+Candidate B decision. An exact ordinary one-table INSERT/UPDATE/DELETE
+transaction on a managed Single Heap may late-adopt S1/P1 for nullable ADD,
+unindexed non-PK DROP, and table/column rename. A private
+`AdoptedSourceTransaction` binds T/V/F/S1/P1, locator, generation/epoch, and
+index digest before writer acquisition; the first accepted refinement closes
+relational execution. Canonical no-op commits DML on S1 with no physical
+intent. Effective finalization creates the first real rewrite intent and reuses
+tag35, one S2, `RowProjection`, tag34, prepared NBSC, and CORD. DROP-first
+Round 42 remains a separate broader refinement route. No persistent or wire
+meaning changes.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

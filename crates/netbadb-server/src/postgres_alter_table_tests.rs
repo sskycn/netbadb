@@ -83,6 +83,233 @@ fn layout_project(name: &str) -> (std::path::PathBuf, Database) {
 }
 
 #[test]
+fn pg_simple_post_dml_adoption_supports_bounded_alter_and_exact_tags() {
+    let (root, mut db) = layout_project("pg-round44-simple");
+    let table = db.schema().table("accounts").unwrap().id;
+    let email = db
+        .schema()
+        .table("accounts")
+        .unwrap()
+        .column("email")
+        .unwrap()
+        .id;
+    let index = db
+        .indexes(table)
+        .unwrap()
+        .iter()
+        .find(|index| index.column_id == email)
+        .unwrap()
+        .id;
+    let mut admin = session(&db, true);
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        (
+            "UPDATE accounts SET email = 'filled@example.test' WHERE email IS NULL",
+            "UPDATE 1",
+        ),
+        ("ALTER TABLE accounts ADD COLUMN marker TEXT", "ALTER TABLE"),
+        (
+            "ALTER TABLE accounts RENAME COLUMN email TO contact",
+            "ALTER TABLE",
+        ),
+        (
+            "ALTER TABLE accounts RENAME TO customer_accounts",
+            "ALTER TABLE",
+        ),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+            ],
+            "{source}"
+        );
+    }
+    let users = db.schema().table("customer_accounts").unwrap();
+    assert_eq!(users.id, table);
+    assert_eq!(users.column("contact").unwrap().id, email);
+    assert_eq!(db.indexes(table).unwrap()[1].id, index);
+    assert_eq!(
+        db.query("SELECT contact, marker FROM customer_accounts WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![
+            netbadb_types::ScalarValue::Text("filled@example.test".into()),
+            netbadb_types::ScalarValue::Null,
+        ]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (root, mut db) = project("pg-round44-delete-drop");
+    db.execute("INSERT INTO projects VALUES (2, 'two')")
+        .unwrap();
+    let mut admin = session(&db, true);
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        ("DELETE FROM projects WHERE id = 2", "DELETE 1"),
+        ("ALTER TABLE projects DROP COLUMN name", "ALTER TABLE"),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+            ],
+            "{source}"
+        );
+    }
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .is_none()
+    );
+    assert_eq!(
+        db.query("SELECT id FROM projects ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![vec![netbadb_types::ScalarValue::Int64(1)]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_extended_post_dml_add_is_pure_until_execute() {
+    let (root, mut db) = project("pg-round44-extended");
+    let table = db.schema().table("projects").unwrap().id;
+    let column_floor = db.next_column_id(table).unwrap();
+    let storage_floor = db.next_storage_id();
+    let before = files(&root);
+    let mut admin = session(&db, true);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "post-dml-add".into(),
+                query: "ALTER TABLE projects ADD COLUMN marker TEXT".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "post-dml-add".into(),
+                statement: "post-dml-add".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "post-dml-add".into(),
+            },
+        ),
+        [
+            BackendMessage::ParameterDescription(vec![]),
+            BackendMessage::NoData,
+        ]
+    );
+    assert_eq!(db.next_column_id(table), Some(column_floor));
+    assert_eq!(db.next_storage_id(), storage_floor);
+    assert_eq!(files(&root), before);
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = name WHERE id = 1",
+    ));
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "post-dml-add".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("ALTER TABLE".into())]
+    );
+    assert_eq!(db.next_column_id(table), Some(ColumnId(column_floor.0 + 1)));
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("marker")
+            .is_some()
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_post_dml_adoption_error_boundaries_enter_failed_transaction() {
+    let (root, mut db) = project("pg-round44-errors");
+    let mut admin = session(&db, true);
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = name WHERE id = 1",
+    ));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+        ),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = name WHERE id = 1",
+    ));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "ALTER TABLE projects ADD COLUMN marker TEXT",
+    ));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET name = name WHERE id = 1",
+        ),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pg_simple_drop_first_layout_sql_publishes_one_projected_replacement() {
     let (root, mut db) = layout_project("pg-round42-simple");
     let table = db.schema().table("accounts").unwrap().id;
@@ -376,46 +603,30 @@ fn pg_extended_drop_keeps_exact_column_identity_after_same_name_add() {
 }
 
 #[test]
-fn pg_drop_first_layout_rejections_enter_failed_transaction_state() {
-    for (name, source, expected) in [
-        (
-            "no-authority-add",
-            "ALTER TABLE accounts ADD COLUMN marker TEXT",
-            "25000",
-        ),
-        (
-            "no-authority-drop",
-            "ALTER TABLE accounts DROP COLUMN legacy",
-            "25000",
-        ),
-        (
-            "no-authority-rename",
-            "ALTER TABLE accounts RENAME COLUMN email TO contact",
-            "25000",
-        ),
-        (
-            "no-authority-not-null",
-            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
-            "25000",
-        ),
-    ] {
-        let (root, mut db) = layout_project(name);
-        let mut admin = session(&db, true);
-        ok(&sql(&mut admin, &mut db, "BEGIN"));
-        ok(&sql(
+fn pg_post_dml_layout_rejections_enter_failed_transaction_state() {
+    let (root, mut db) = layout_project("post-dml-not-null");
+    let mut admin = session(&db, true);
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE accounts SET email = email WHERE id = 1",
+    ));
+    state(
+        &sql(
             &mut admin,
             &mut db,
-            "UPDATE accounts SET email = email WHERE id = 1",
-        ));
-        state(&sql(&mut admin, &mut db, source), expected);
-        state(
-            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
-            "25P02",
-        );
-        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
-        db.close().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
+            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
+        ),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 
     let (root, mut db) = layout_project("new-column-not-null");
     let mut admin = session(&db, true);
