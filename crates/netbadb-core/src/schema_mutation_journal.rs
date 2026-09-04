@@ -946,6 +946,97 @@ impl SchemaMutationJournal {
         self.activate()
     }
 
+    pub(crate) fn prepare_source_backfill_column_reservation(
+        &self,
+        reservation: &CompositionColumnReservation,
+        authoritative_floor: ColumnId,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let next_column_id = reservation.column.0.checked_add(1).map(ColumnId);
+        if reservation.table.0 == 0
+            || reservation.column.0 == 0
+            || reservation.next_column_id != next_column_id
+            || reservation.column != authoritative_floor
+            || self.effective_column(reservation.table, Some(authoritative_floor))
+                != Some(authoritative_floor)
+            || self.reservations.contains_key(&reservation.transaction)
+            || self.drops.contains_key(&reservation.transaction)
+            || self
+                .rewrite_reservations
+                .contains_key(&reservation.transaction)
+            || self.stage_intents.contains_key(&reservation.transaction)
+            || self
+                .finalization_intents
+                .contains_key(&reservation.transaction)
+            || self
+                .migration_finalization_intents
+                .contains_key(&reservation.transaction)
+            || self
+                .source_backfill_intents
+                .contains_key(&reservation.transaction)
+            || self.compositions.values().any(|record| {
+                record.reservations.iter().any(|existing| {
+                    existing.table == reservation.table && existing.column == reservation.column
+                })
+            })
+        {
+            return Err(corrupt("invalid source-backfill ColumnId reservation"));
+        }
+        let record = self
+            .compositions
+            .get(&reservation.transaction)
+            .ok_or(corrupt(
+                "source-backfill ColumnId reservation lacks composition",
+            ))?;
+        let drop_only_source = record.index_intent.as_ref().is_some_and(|intent| {
+            intent.transaction == reservation.transaction
+                && intent.target_generation.is_none()
+                && intent.target_epoch.is_none()
+                && intent.snapshot_digest.is_none()
+                && matches!(
+                    intent.tables.as_slice(),
+                    [SchemaIndexTablePlan::InPlaceIndexDelta {
+                        table,
+                        base_indexes,
+                        final_indexes,
+                        ..
+                    }] if *table == reservation.table
+                        && final_indexes.active.len() < base_indexes.active.len()
+                        && final_indexes.active.iter().all(|final_index| {
+                            base_indexes.active.iter().any(|base| base == final_index)
+                        })
+                )
+        });
+        if record.transaction != reservation.transaction
+            || record.intent.is_some()
+            || record.table_intent.is_some()
+            || record.resolution.is_some()
+            || !record.table_reservations.is_empty()
+            || !record.index_reservations.is_empty()
+            || !record.migration_index_reservations.is_empty()
+            || !drop_only_source
+        {
+            return Err(corrupt(
+                "source-backfill ColumnId reservation lacks exact authority",
+            ));
+        }
+        let mut projected = self.clone();
+        projected
+            .compositions
+            .get_mut(&reservation.transaction)
+            .ok_or(corrupt("source-backfill composition disappeared"))?
+            .reservations
+            .push(reservation.clone());
+        projected
+            .compositions
+            .get_mut(&reservation.transaction)
+            .ok_or(corrupt("source-backfill composition disappeared"))?
+            .reservations
+            .sort_by_key(|entry| (entry.table, entry.column));
+        projected.encode()?;
+        self.activate()
+    }
+
     pub(crate) fn prepare_composition_table_reservation(
         &self,
         reservation: &CompositionTableReservation,
@@ -1323,6 +1414,23 @@ impl SchemaMutationJournal {
             })
             .reservations
             .push(reservation);
+        self.persist()
+    }
+
+    pub(crate) fn reserve_source_backfill_column(
+        &mut self,
+        reservation: CompositionColumnReservation,
+        authoritative_floor: ColumnId,
+    ) -> Result<(), SchemaMutationError> {
+        self.prepare_source_backfill_column_reservation(&reservation, authoritative_floor)?;
+        let record = self
+            .compositions
+            .get_mut(&reservation.transaction)
+            .ok_or(corrupt("source-backfill composition disappeared"))?;
+        record.reservations.push(reservation);
+        record
+            .reservations
+            .sort_by_key(|entry| (entry.table, entry.column));
         self.persist()
     }
 
@@ -4144,6 +4252,38 @@ impl SchemaMutationJournal {
                 return Err(corrupt("composition has multiple aggregate intents"));
             }
             if let Some(intent) = &composition.index_intent {
+                for reservation in &composition.reservations {
+                    let plan = intent
+                        .tables
+                        .iter()
+                        .find(|plan| plan.table() == reservation.table)
+                        .ok_or(corrupt("ColumnId reservation table absent from intent"))?;
+                    let target = match plan {
+                        SchemaIndexTablePlan::RewriteHeap { replacement, .. } => {
+                            Some(&replacement.target)
+                        }
+                        SchemaIndexTablePlan::CreateHeap { target, .. } => Some(target.as_ref()),
+                        SchemaIndexTablePlan::InPlaceIndexDelta { .. } => None,
+                        SchemaIndexTablePlan::DropHeap { .. } => {
+                            return Err(corrupt("ColumnId reservation targets dropped table"));
+                        }
+                    };
+                    if let Some(target) = target {
+                        let lineage = target
+                            .committed
+                            .tables
+                            .iter()
+                            .find(|lineage| lineage.table_id == reservation.table)
+                            .ok_or(corrupt("ColumnId reservation target lineage absent"))?;
+                        if lineage.next_column_id.is_none_or(|next| {
+                            reservation
+                                .next_column_id
+                                .is_none_or(|reserved_next| reserved_next.0 > next.0)
+                        }) {
+                            return Err(corrupt("ColumnId reservation exceeds target high-water"));
+                        }
+                    }
+                }
                 for reservation in &composition.index_reservations {
                     let plan = intent
                         .tables

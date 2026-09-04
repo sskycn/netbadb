@@ -7345,6 +7345,8 @@ mod migration_backfill_index_tests;
 #[cfg(test)]
 mod migration_clone_audit_tests;
 #[cfg(test)]
+mod source_backfill_layout_projection_tests;
+#[cfg(test)]
 mod source_backfill_tests;
 #[cfg(test)]
 mod sql_alter_table_tests;

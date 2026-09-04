@@ -969,6 +969,21 @@ after a materialized source index intent; Round 41 must narrowly extend and
 crash-test that state transition before any SQL exposure. ADD/DROP after DML
 remain SQLSTATE `25000`, and no persistent format changes.
 
+### Core-only late-clone row projection foundation — Round 41
+
+[Round 41](late-clone-row-projection-round41.md) implements the audited design
+without public SQL exposure. Ordinary rewrite and late clone share one checked,
+target-ordered ColumnId projection; exact compatible survivors copy, dropped
+IDs disappear, and durably reserved new IDs synthesize NULL. NBSJ v1 narrowly
+admits existing tag 16 after the exact one-table managed-Heap drop-only tag-25
+source intent and retains allocator burns across rollback and crash. Core typed
+ADD nullable and DROP compose with existing rename/nullability, use one frozen
+transaction-visible S1 stream and at most one final S2, preserve canonical
+ADD-then-DROP no-op behavior, and reuse the existing two-participant CORD and
+recovery lifecycle. Policy B, final indexes on new columns, broader placements,
+conversions/defaults/constraints, and SQL exposure remain explicit boundaries;
+all persistent and wire formats are unchanged.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

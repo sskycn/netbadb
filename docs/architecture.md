@@ -339,6 +339,18 @@ reservation after the source index intent. Tag 35, stage/finalization evidence,
 prepared NBSC, CORD, recovery, retirement, row format, and public SQL remain
 unchanged in Round 40.
 
+[Round 41](late-clone-row-projection-round41.md) implements that Core-only
+foundation. One shared checked `RowProjection` now drives ordinary rewrite and
+late clone by exact ColumnId, target order, survivor semantic/physical type,
+and durable-new-column authority. The NBSJ state machine narrowly permits the
+existing tag-16 reservation after the exact one-table drop-only tag-25 source
+intent; rollback and predecision crashes retain its high-water burn. Nullable
+ADD synthesizes NULL, DROP omits the exact ID, same-name replacement cannot
+alias old data, and Policy B rejects a non-empty newly-NOT-NULL column during
+projection. Effective layouts retain the existing one-S2/one-CORD lifecycle;
+canonical ADD-then-DROP allocates no S2. Native and PostgreSQL SQL admission,
+persistent formats, storage policy, and wire capabilities remain unchanged.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old
