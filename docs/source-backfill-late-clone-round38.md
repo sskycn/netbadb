@@ -110,3 +110,9 @@ Preparatory CREATE INDEX, multi-table source backfill, layout/type changes,
 same-V/F physical replacement, participant detach, savepoints, resumable
 migration, non-Heap placements, automatic GC, and NBSJ/CORD compaction remain
 deferred.
+
+Round 40 audits whether this same predecision row stream can change column
+layout. It confirms that the existing materializer already derives source
+positions from `ColumnId`, emits final `TableDef` order, and selects the S1
+transaction view before projection. Public ADD/DROP admission remains disabled;
+see [late-clone layout projection architecture audit](late-clone-layout-projection-round40.md).

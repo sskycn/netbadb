@@ -956,6 +956,19 @@ were unavailable and remain unverified. Round 40 should audit late-clone column
 projection for post-DML DROP COLUMN or nullable ADD COLUMN before considering
 physical type conversion.
 
+### Late-clone layout projection architecture audit — Round 40
+
+[Round 40](late-clone-layout-projection-round40.md) selects one-pass,
+target-ordered ColumnId projection. Tests prove survivor copy, DROP omission,
+nullable ADD as NULL, same-name new-ID separation, rename composition, multiple
+adds, strict semantic/physical survivor compatibility, and one final S2 in the
+existing ordinary rewrite. The Round 38 source path independently proves the
+transaction-visible UPDATE/INSERT/DELETE row set. Existing tag 16 is sufficient
+durable identity authority, but its current ordering guard rejects reservation
+after a materialized source index intent; Round 41 must narrowly extend and
+crash-test that state transition before any SQL exposure. ADD/DROP after DML
+remain SQLSTATE `25000`, and no persistent format changes.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

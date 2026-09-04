@@ -188,6 +188,42 @@ ROLLBACK;
 """,
         ("ALTER TABLE", "CREATE INDEX", "ROLLBACK"),
     )
+    run_fixture(
+        "rollback",
+        r"""
+BEGIN;
+DROP INDEX projects_name_idx;
+UPDATE projects SET name = 'filled' WHERE name IS NULL;
+ALTER TABLE projects ADD COLUMN marker TEXT;
+\echo ADD_COLUMN_STATE :SQLSTATE
+SELECT id FROM projects;
+\echo ADD_COLUMN_FAILED_STATE :SQLSTATE
+ROLLBACK;
+""",
+        (
+            "ADD_COLUMN_STATE 25000",
+            "ADD_COLUMN_FAILED_STATE 25P02",
+            "ROLLBACK",
+        ),
+    )
+    run_fixture(
+        "rollback",
+        r"""
+BEGIN;
+DROP INDEX projects_name_idx;
+UPDATE projects SET name = 'filled' WHERE name IS NULL;
+ALTER TABLE projects DROP COLUMN name;
+\echo DROP_COLUMN_STATE :SQLSTATE
+SELECT id FROM projects;
+\echo DROP_COLUMN_FAILED_STATE :SQLSTATE
+ROLLBACK;
+""",
+        (
+            "DROP_COLUMN_STATE 25000",
+            "DROP_COLUMN_FAILED_STATE 25P02",
+            "ROLLBACK",
+        ),
+    )
     print(f"{version}: Round 39 DROP-first migration SQL acceptance PASS")
 
 

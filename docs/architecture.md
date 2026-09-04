@@ -329,6 +329,16 @@ SET NOT NULL stays open for repair, successful refinement closes relation
 execution, and final index DDL is logical until the one late clone at COMMIT.
 No SQL look-ahead or persistent-format change is introduced.
 
+[Round 40](late-clone-layout-projection-round40.md) audits layout-changing
+projection without exposing it. The selected design builds a target-ordered
+mapping by `ColumnId`, streams the existing transaction-visible S1 view once,
+omits dropped IDs, and synthesizes database NULL for durably reserved new IDs.
+The existing materializer already has these physical mechanics; Round 41 must
+make the projection invariant explicit and safely permit tag-16 ColumnId
+reservation after the source index intent. Tag 35, stage/finalization evidence,
+prepared NBSC, CORD, recovery, retirement, row format, and public SQL remain
+unchanged in Round 40.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old
