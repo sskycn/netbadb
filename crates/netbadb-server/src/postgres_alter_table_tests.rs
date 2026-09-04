@@ -135,11 +135,91 @@ fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
 }
 
 #[test]
-fn pg_index_drop_then_dml_rejects_indexed_nullability_refinement_and_enters_e() {
-    let (root, mut db) = project("pg-round34-indexed-nullability");
+fn pg_drop_first_source_backfill_publishes_one_fresh_replacement() {
+    let (root, mut db) = project("pg-round39-drop-first");
     db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
     db.execute("CREATE INDEX projects_name_idx ON projects(name)")
         .unwrap();
+    let old = db.indexes(TableId(2)).unwrap()[0].clone();
+    let base_version = db.table_schema_version(TableId(2)).unwrap();
+    let base_generation = db.schema_generation();
+    let target_storage = db.next_storage_id().unwrap();
+    let mut admin = session(&db, true);
+
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        ("DROP INDEX projects_name_idx", "DROP INDEX"),
+        (
+            "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+            "UPDATE 1",
+        ),
+        (
+            "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        (
+            "CREATE INDEX projects_name_idx ON projects(name)",
+            "CREATE INDEX",
+        ),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' })
+            ],
+            "{source}"
+        );
+    }
+
+    let table = db.schema().table("projects").unwrap();
+    assert_eq!(table.id, TableId(2));
+    assert!(!table.column("name").unwrap().nullable);
+    assert_eq!(
+        db.table_schema_version(TableId(2)).unwrap().0,
+        base_version.0 + 1
+    );
+    assert_eq!(db.schema_generation().0, base_generation.0 + 1);
+    assert_eq!(db.next_storage_id().unwrap().0, target_storage.0 + 1);
+    let replacement = db.indexes(TableId(2)).unwrap();
+    assert_eq!(replacement.len(), 1);
+    assert_ne!(replacement[0].id, old.id);
+    assert_eq!(replacement[0].name.as_ref(), old.name.as_ref());
+    assert_eq!(replacement[0].column_id, old.column_id);
+    assert_eq!(
+        db.query("SELECT id, name FROM projects ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![
+                netbadb_types::ScalarValue::Int64(1),
+                netbadb_types::ScalarValue::Text("one".into()),
+            ],
+            vec![
+                netbadb_types::ScalarValue::Int64(2),
+                netbadb_types::ScalarValue::Text("filled".into()),
+            ],
+        ]
+    );
+    assert_eq!(db.inspect_replacement_retired_heaps().len(), 1);
+    db.close().unwrap();
+    for _ in 0..3 {
+        Database::open_catalog(root.join("catalog"))
+            .unwrap()
+            .close()
+            .unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_drop_first_partial_backfill_and_post_refinement_dml_enter_e() {
+    let (root, mut db) = project("pg-round39-errors");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let old = db.indexes(TableId(2)).unwrap()[0].clone();
     let mut admin = session(&db, true);
 
     ok(&sql(&mut admin, &mut db, "BEGIN"));
@@ -147,7 +227,7 @@ fn pg_index_drop_then_dml_rejects_indexed_nullability_refinement_and_enters_e() 
     ok(&sql(
         &mut admin,
         &mut db,
-        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "UPDATE projects SET name = 'one-updated' WHERE id = 1",
     ));
     state(
         &sql(
@@ -155,7 +235,7 @@ fn pg_index_drop_then_dml_rejects_indexed_nullability_refinement_and_enters_e() 
             &mut db,
             "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
         ),
-        "25000",
+        "23502",
     );
     state(
         &sql(&mut admin, &mut db, "SELECT id FROM projects"),
@@ -172,12 +252,234 @@ fn pg_index_drop_then_dml_rejects_indexed_nullability_refinement_and_enters_e() 
             .nullable
     );
     assert_eq!(db.indexes(TableId(2)).unwrap().len(), 1);
+    assert_eq!(db.indexes(TableId(2)).unwrap(), std::slice::from_ref(&old));
     assert_eq!(
         db.query("SELECT name FROM projects WHERE id = 2")
             .unwrap()
             .rows,
         vec![vec![netbadb_types::ScalarValue::Null]]
     );
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    for source in [
+        "DROP INDEX projects_name_idx",
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET name = 'late' WHERE id = 1",
+        ),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    assert_eq!(db.indexes(TableId(2)).unwrap(), [old]);
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_drop_update_commit_remains_the_ordinary_source_path() {
+    let (root, mut db) = project("pg-round39-no-alter");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let version = db.table_schema_version(TableId(2)).unwrap();
+    let generation = db.schema_generation();
+    let storage_floor = db.next_storage_id();
+    let mut admin = session(&db, true);
+
+    for source in [
+        "BEGIN",
+        "DROP INDEX projects_name_idx",
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "COMMIT",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    assert_eq!(db.table_schema_version(TableId(2)), Some(version));
+    assert_eq!(db.schema_generation(), generation);
+    assert_eq!(db.next_storage_id(), storage_floor);
+    assert!(db.indexes(TableId(2)).unwrap().is_empty());
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .nullable
+    );
+    assert!(db.inspect_replacement_retired_heaps().is_empty());
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_extended_drop_first_alter_is_pure_until_execute() {
+    let (root, mut db) = project("pg-round39-extended-alter");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let old = db.indexes(TableId(2)).unwrap()[0].clone();
+    let mut admin = session(&db, true);
+    let before_prepare = files(&root);
+
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "round39-alter".into(),
+                query: "ALTER TABLE projects ALTER COLUMN name SET NOT NULL".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(files(&root), before_prepare);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "round39-alter".into(),
+                statement: "round39-alter".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "round39-alter".into(),
+            },
+        ),
+        [BackendMessage::NoData]
+    );
+    assert_eq!(files(&root), before_prepare);
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(&mut admin, &mut db, "DROP INDEX projects_name_idx"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+    ));
+    ok(&sql(&mut admin, &mut db, "SELECT id FROM projects"));
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "round39-alter".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("ALTER TABLE".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "CREATE INDEX projects_name_idx ON projects(name)",
+    ));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+
+    let replacement = db.indexes(TableId(2)).unwrap();
+    assert_eq!(replacement.len(), 1);
+    assert_ne!(replacement[0].id, old.id);
+    assert!(
+        !db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_extended_create_prepared_under_f1_stales_before_reservation() {
+    let (root, mut db) = project("pg-round39-extended-stale-create");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let old = db.indexes(TableId(2)).unwrap()[0].clone();
+    let mut admin = session(&db, true);
+
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "old-create".into(),
+                query: "CREATE INDEX projects_name_idx ON projects(name)".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "old-create".into(),
+                statement: "old-create".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    for source in [
+        "DROP INDEX projects_name_idx",
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "old-create".into(),
+                max_rows: 0,
+            },
+        ),
+        "25000",
+    );
+    assert_eq!(
+        admin.handle(&mut db, FrontendMessage::Sync),
+        [BackendMessage::ReadyForQuery(b'E')]
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    assert_eq!(db.indexes(TableId(2)).unwrap(), [old]);
+
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

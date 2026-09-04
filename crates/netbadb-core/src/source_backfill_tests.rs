@@ -1,4 +1,5 @@
 use super::*;
+use netbadb_inspect::{PlanNodeInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, StorageId, TableId};
 use std::path::{Path, PathBuf};
@@ -44,18 +45,9 @@ fn seed(root: &Path) -> Database {
 }
 
 fn execute_foundation_transaction(db: &mut Database) {
-    let users = db.schema().table("users").unwrap().id;
-    let email = db
-        .schema()
-        .table("users")
-        .unwrap()
-        .column("email")
-        .unwrap()
-        .id;
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
         .unwrap();
-    db.open_source_backfill(&mut transaction).unwrap();
     db.execute_in(
         &mut transaction,
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
@@ -68,18 +60,9 @@ fn execute_foundation_transaction(db: &mut Database) {
     .unwrap();
     db.execute_in(&mut transaction, "DELETE FROM users WHERE id = 2")
         .unwrap();
-    let dependency = transaction
-        .schema_composition
-        .plan()
-        .unwrap()
-        .dependency(users)
-        .unwrap();
-    db.apply_source_backfill_refinement(
+    db.execute_in(
         &mut transaction,
-        AlterTableSpec::new(
-            dependency,
-            AlterTableOperation::SetNotNull { column_id: email },
-        ),
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
     )
     .unwrap();
     db.execute_in(
@@ -193,19 +176,32 @@ fn resource_family_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+fn plan_uses_index(node: &PlanNodeInspection) -> bool {
+    match node {
+        PlanNodeInspection::IndexScan { .. } | PlanNodeInspection::RangeIndexScan { .. } => true,
+        PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
+        | PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Limit { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::IndexNestedLoopJoin { left: input, .. } => plan_uses_index(input),
+        PlanNodeInspection::HashJoin { left, right, .. }
+        | PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            plan_uses_index(left) || plan_uses_index(right)
+        }
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::PartitionedScan { .. } => false,
+    }
+}
+
 #[test]
 fn source_backfill_physical_cost_is_delayed_and_uses_one_copy_pass() {
     let root = root("physical-cost");
     let mut db = seed(&root);
     let catalog_path = root.join("catalog");
     let users = db.schema().table("users").unwrap().id;
-    let email = db
-        .schema()
-        .table("users")
-        .unwrap()
-        .column("email")
-        .unwrap()
-        .id;
     let source_storage = db.bindings.resolve_single(users).unwrap();
     let initial = schema_catalog_file::load(&catalog_path).unwrap();
     let source_locator = &initial
@@ -221,7 +217,6 @@ fn source_backfill_physical_cost_is_delayed_and_uses_one_copy_pass() {
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
         .unwrap();
-    db.open_source_backfill(&mut transaction).unwrap();
     db.execute_in(
         &mut transaction,
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
@@ -237,18 +232,9 @@ fn source_backfill_physical_cost_is_delayed_and_uses_one_copy_pass() {
     let source_during = resource_family_bytes(&source_path);
     let before_target = tree_bytes(&root);
     assert_eq!(db.next_storage_id(), Some(target_floor));
-    let dependency = transaction
-        .schema_composition
-        .plan()
-        .unwrap()
-        .dependency(users)
-        .unwrap();
-    db.apply_source_backfill_refinement(
+    db.execute_in(
         &mut transaction,
-        AlterTableSpec::new(
-            dependency,
-            AlterTableOperation::SetNotNull { column_id: email },
-        ),
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
     )
     .unwrap();
     db.execute_in(
@@ -303,28 +289,19 @@ fn source_backfill_clones_transaction_visible_rows_once_into_final_heap() {
     let root = root("primary");
     let mut db = seed(&root);
     let users = db.schema().table("users").unwrap().id;
-    let email = db
-        .schema()
-        .table("users")
-        .unwrap()
-        .column("email")
-        .unwrap()
-        .id;
     let source_storage = db.bindings.resolve_single(users).unwrap();
     let source_version = db.table_schema_version(users).unwrap();
+    let source_fingerprint = db.schema().table("users").unwrap().fingerprint().unwrap();
     let source_generation = db.schema_generation();
+    let source_epoch = schema_catalog_file::load(&root.join("catalog"))
+        .unwrap()
+        .epoch;
+    let source_runtime_revision = db.catalog_generation();
     let old_index = db.indexes(users).unwrap()[0].id;
 
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
         .unwrap();
-    db.open_source_backfill(&mut transaction).unwrap();
-    assert!(matches!(
-        transaction.schema_composition,
-        schema_composition::SchemaCompositionState::SourceBackfillOpen(_)
-    ));
-    assert_eq!(transaction.participant_count(), 1);
-    assert_eq!(transaction.write_participant(), Some(source_storage));
     db.execute_in(
         &mut transaction,
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
@@ -337,21 +314,17 @@ fn source_backfill_clones_transaction_visible_rows_once_into_final_heap() {
     .unwrap();
     db.execute_in(&mut transaction, "DELETE FROM users WHERE id = 2")
         .unwrap();
-
-    let dependency = transaction
-        .schema_composition
-        .plan()
-        .unwrap()
-        .dependency(users)
-        .unwrap();
-    db.apply_source_backfill_refinement(
+    assert_eq!(transaction.participant_count(), 1);
+    assert_eq!(transaction.write_participant(), Some(source_storage));
+    db.execute_in(
         &mut transaction,
-        AlterTableSpec::new(
-            dependency,
-            AlterTableOperation::SetNotNull { column_id: email },
-        ),
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
     )
     .unwrap();
+    assert!(matches!(
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::SourceRefining(_)
+    ));
     assert!(matches!(
         db.execute_in(&mut transaction, "SELECT id FROM users"),
         Err(DatabaseError::SchemaMutation(
@@ -376,6 +349,40 @@ fn source_backfill_clones_transaction_visible_rows_once_into_final_heap() {
     let indexes = db.indexes(users).unwrap();
     assert_eq!(indexes.len(), 1);
     assert_ne!(indexes[0].id, old_index);
+    let new_index = indexes[0].id;
+    let target_version = db.table_schema_version(users).unwrap();
+    let target_fingerprint = db.schema().table("users").unwrap().fingerprint().unwrap();
+    let target_generation = db.schema_generation();
+    let target_epoch = schema_catalog_file::load(&root.join("catalog"))
+        .unwrap()
+        .epoch;
+    let target_runtime_revision = db.catalog_generation();
+    eprintln!(
+        "ROUND39_IDENTITIES T={} V={}->{} F={}->{} G={}->{} E={}->{} R={}->{} S={}->{} I={}->{}",
+        users.0,
+        source_version.0,
+        target_version.0,
+        source_fingerprint,
+        target_fingerprint,
+        source_generation.0,
+        target_generation.0,
+        source_epoch,
+        target_epoch,
+        source_runtime_revision,
+        target_runtime_revision,
+        source_storage.0,
+        target_storage.0,
+        old_index.0,
+        new_index.0,
+    );
+    let StatementPlanInspection::Query { root: plan_root } = db
+        .inspect_statement("SELECT id FROM users WHERE email = 'filled@example.test'")
+        .unwrap()
+        .plan
+    else {
+        panic!("expected query plan");
+    };
+    assert!(plan_uses_index(&plan_root));
     assert_eq!(
         db.query("SELECT id, email FROM users ORDER BY id")
             .unwrap()
@@ -697,20 +704,12 @@ fn failed_source_validation_can_be_backfilled_and_retried_without_early_target()
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
         .unwrap();
-    db.open_source_backfill(&mut transaction).unwrap();
-    let dependency = transaction
-        .schema_composition
-        .plan()
-        .unwrap()
-        .dependency(users)
+    db.execute_in(&mut transaction, "SELECT id FROM users")
         .unwrap();
     assert!(matches!(
-        db.apply_source_backfill_refinement(
+        db.execute_in(
             &mut transaction,
-            AlterTableSpec::new(
-                dependency,
-                AlterTableOperation::SetNotNull { column_id: email },
-            ),
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
         ),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::NotNullViolation(column)
@@ -734,18 +733,9 @@ fn failed_source_validation_can_be_backfilled_and_retried_without_early_target()
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    let dependency = transaction
-        .schema_composition
-        .plan()
-        .unwrap()
-        .dependency(users)
-        .unwrap();
-    db.apply_source_backfill_refinement(
+    db.execute_in(
         &mut transaction,
-        AlterTableSpec::new(
-            dependency,
-            AlterTableOperation::SetNotNull { column_id: email },
-        ),
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
     )
     .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
@@ -760,13 +750,6 @@ fn no_alter_and_schema_net_noop_never_allocate_a_target() {
         let root = root(if net_noop { "net-noop" } else { "no-alter" });
         let mut db = seed(&root);
         let users = db.schema().table("users").unwrap().id;
-        let email = db
-            .schema()
-            .table("users")
-            .unwrap()
-            .column("email")
-            .unwrap()
-            .id;
         let source_storage = db.bindings.resolve_single(users).unwrap();
         let source_version = db.table_schema_version(users).unwrap();
         let source_generation = db.schema_generation();
@@ -774,45 +757,20 @@ fn no_alter_and_schema_net_noop_never_allocate_a_target() {
         let mut transaction = db.begin_transaction().unwrap();
         db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
             .unwrap();
-        db.open_source_backfill(&mut transaction).unwrap();
         db.execute_in(
             &mut transaction,
             "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
         )
         .unwrap();
         if net_noop {
-            let dependency = transaction
-                .schema_composition
-                .plan()
-                .unwrap()
-                .dependency(users)
-                .unwrap();
-            db.apply_source_backfill_refinement(
+            db.execute_in(
                 &mut transaction,
-                AlterTableSpec::new(
-                    dependency,
-                    AlterTableOperation::RenameColumn {
-                        column_id: email,
-                        new_name: "contact".into(),
-                    },
-                ),
+                "ALTER TABLE users RENAME COLUMN email TO contact",
             )
             .unwrap();
-            let dependency = transaction
-                .schema_composition
-                .plan()
-                .unwrap()
-                .dependency(users)
-                .unwrap();
-            db.apply_source_backfill_refinement(
+            db.execute_in(
                 &mut transaction,
-                AlterTableSpec::new(
-                    dependency,
-                    AlterTableOperation::RenameColumn {
-                        column_id: email,
-                        new_name: "email".into(),
-                    },
-                ),
+                "ALTER TABLE users RENAME COLUMN contact TO email",
             )
             .unwrap();
         }
@@ -845,6 +803,155 @@ fn no_alter_and_schema_net_noop_never_allocate_a_target() {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn public_sql_multiple_refinements_keep_one_version_and_final_fingerprint() {
+    let root = root("multiple-refinements");
+    let mut db = seed(&root);
+    let users = db.schema().table("users").unwrap().id;
+    let base_version = db.table_schema_version(users).unwrap();
+    let base_generation = db.schema_generation();
+    let old_index = db.indexes(users).unwrap()[0].id;
+    let mut transaction = db.begin_transaction().unwrap();
+    for source in [
+        "DROP INDEX users_email_idx",
+        "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        "ALTER TABLE users RENAME COLUMN email TO canonical_email",
+        "ALTER TABLE users RENAME TO app_users",
+        "CREATE INDEX users_email_idx ON app_users(canonical_email)",
+    ] {
+        db.execute_in(&mut transaction, source).unwrap();
+    }
+    db.commit_transaction(&mut transaction).unwrap();
+
+    let table = db.schema().table("app_users").unwrap();
+    assert_eq!(table.id, users);
+    assert!(!table.column("canonical_email").unwrap().nullable);
+    assert_eq!(
+        db.table_schema_version(users).unwrap().0,
+        base_version.0 + 1
+    );
+    assert_eq!(db.schema_generation().0, base_generation.0 + 1);
+    let indexes = db.indexes(users).unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_ne!(indexes[0].id, old_index);
+    assert_eq!(
+        indexes[0].column_id,
+        table.column("canonical_email").unwrap().id
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stale_prepared_create_reserves_nothing_and_old_drop_is_exact() {
+    let root = root("prepared-identities");
+    let mut db = seed(&root);
+    let users = db.schema().table("users").unwrap().id;
+    let old_index = db.indexes(users).unwrap()[0].clone();
+    let prepared_drop = db
+        .prepare_ddl_statement("DROP INDEX users_email_idx")
+        .unwrap();
+    let prepared_create = db
+        .prepare_ddl_statement("CREATE INDEX users_email_idx ON users(email)")
+        .unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_ddl_in(&mut transaction, &prepared_drop).unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute_ddl_in(&mut transaction, &prepared_create),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StaleSchemaDependency
+        ))
+    ));
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX users_email_idx ON users(email)",
+    )
+    .unwrap();
+    assert!(matches!(
+        db.execute_ddl_in(&mut transaction, &prepared_drop),
+        Err(DatabaseError::UndefinedIndex)
+    ));
+    db.commit_transaction(&mut transaction).unwrap();
+    let replacement = db.indexes(users).unwrap();
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(replacement[0].id.0, old_index.id.0 + 1);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rolled_back_replacement_burns_index_id_without_burning_storage_id() {
+    let root = root("allocator-rollback");
+    let mut db = seed(&root);
+    let users = db.schema().table("users").unwrap().id;
+    let old_index = db.indexes(users).unwrap()[0].clone();
+    let storage_floor = db.next_storage_id();
+    let mut transaction = db.begin_transaction().unwrap();
+    for source in [
+        "DROP INDEX users_email_idx",
+        "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        "CREATE INDEX users_email_idx ON users(email)",
+    ] {
+        db.execute_in(&mut transaction, source).unwrap();
+    }
+    transaction.rollback().unwrap();
+    drop(transaction);
+    assert_eq!(db.next_storage_id(), storage_floor);
+    db.execute("DROP INDEX users_email_idx").unwrap();
+    db.execute("CREATE INDEX users_email_idx ON users(email)")
+        .unwrap();
+    assert_eq!(db.indexes(users).unwrap()[0].id.0, old_index.id.0 + 2);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn second_write_participant_prevents_source_backfill_activation() {
+    let root = root("second-write-participant");
+    let mut db = seed(&root);
+    let users = db.schema().table("users").unwrap().id;
+    let source_storage = db.bindings.resolve_single(users).unwrap();
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
+        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+    )
+    .unwrap();
+    db.execute_in(&mut transaction, "INSERT INTO seed VALUES (1)")
+        .unwrap();
+    assert!(matches!(
+        db.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::SchemaMutationAfterMaterialization
+        ))
+    ));
+    assert!(matches!(
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::MaterializedIndex(_)
+    ));
+    assert_eq!(db.next_storage_id(), Some(StorageId(source_storage.0 + 1)));
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

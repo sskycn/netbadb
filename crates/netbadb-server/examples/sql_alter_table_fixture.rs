@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round36_probe = std::env::var("NETBADB_ROUND36_PROBE").ok();
     let round37_probe = std::env::var("NETBADB_ROUND37_PROBE").ok();
+    let round39_probe = std::env::var("NETBADB_ROUND39_PROBE").ok();
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -48,10 +49,15 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")?;
     db.execute("CREATE INDEX projects_name_idx ON projects (name)")?;
     db.execute("INSERT INTO projects VALUES (1, 'one')")?;
-    if round36_probe.is_some() || round37_probe.is_some() {
+    if round36_probe.is_some() || round37_probe.is_some() || round39_probe.is_some() {
         db.execute("INSERT INTO projects VALUES (2, NULL)")?;
     }
     let old_index_id = db.indexes(TableId(2))?[0].id;
+    let base_version = db
+        .table_schema_version(TableId(2))
+        .ok_or("projects version missing")?;
+    let base_generation = db.schema_generation();
+    let target_storage = db.next_storage_id().ok_or("StorageId floor missing")?;
     db.close()?;
 
     let runtime_directory = std::fs::read_dir(root)?
@@ -95,6 +101,100 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round39_probe {
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let name_nullable = reopened
+                .schema()
+                .table("projects")
+                .and_then(|table| table.column("name"))
+                .ok_or("Round 39 projects.name disappeared")?
+                .nullable;
+            let indexes = reopened.indexes(TableId(2))?.to_vec();
+            let rows = reopened
+                .query("SELECT id, name FROM projects ORDER BY id")?
+                .rows;
+            match probe.as_str() {
+                "replacement" | "no-replacement" => {
+                    if name_nullable
+                        || reopened
+                            .table_schema_version(TableId(2))
+                            .map(|version| version.0)
+                            != Some(base_version.0 + 1)
+                        || reopened.schema_generation().0 != base_generation.0 + 1
+                        || reopened.next_storage_id().map(|storage| storage.0)
+                            != Some(target_storage.0 + 1)
+                        || rows
+                            != [
+                                vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                                vec![ScalarValue::Int64(2), ScalarValue::Text("filled".into())],
+                            ]
+                    {
+                        return Err("Round 39 final schema/identity/rows are incorrect".into());
+                    }
+                    if probe == "replacement"
+                        && (indexes.len() != 1
+                            || indexes[0].id == old_index_id
+                            || indexes[0].column_id != ColumnId(2)
+                            || indexes[0]
+                                .name
+                                .as_ref()
+                                .is_none_or(|name| name.as_str() != "projects_name_idx"))
+                    {
+                        return Err("Round 39 replacement index identity is incorrect".into());
+                    }
+                    if probe == "no-replacement" && !indexes.is_empty() {
+                        return Err("Round 39 no-replacement migration kept an index".into());
+                    }
+                    let retired = reopened.inspect_replacement_retired_heaps();
+                    if retired.len() != 1
+                        || retired[0].table_id != TableId(2)
+                        || retired[0].new_storage_id != target_storage
+                    {
+                        return Err("Round 39 source retirement evidence is incorrect".into());
+                    }
+                }
+                "no-alter" | "net-noop" => {
+                    if !name_nullable
+                        || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                        || reopened.schema_generation() != base_generation
+                        || reopened.next_storage_id() != Some(target_storage)
+                        || !indexes.is_empty()
+                        || !reopened.inspect_replacement_retired_heaps().is_empty()
+                        || rows
+                            != [
+                                vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                                vec![ScalarValue::Int64(2), ScalarValue::Text("filled".into())],
+                            ]
+                    {
+                        return Err("Round 39 ordinary/no-op source result is incorrect".into());
+                    }
+                }
+                "partial" | "dml-after" | "rollback" => {
+                    if !name_nullable
+                        || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                        || reopened.schema_generation() != base_generation
+                        || reopened.next_storage_id() != Some(target_storage)
+                        || indexes.len() != 1
+                        || indexes[0].id != old_index_id
+                        || rows
+                            != [
+                                vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                                vec![ScalarValue::Int64(2), ScalarValue::Null],
+                            ]
+                    {
+                        return Err("Round 39 rollback did not restore the base".into());
+                    }
+                }
+                _ => return Err(format!("unknown Round 39 probe {probe}").into()),
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 39 DROP-first result survived three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round37_probe {
         for _ in 0..3 {

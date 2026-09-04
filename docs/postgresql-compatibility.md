@@ -192,6 +192,16 @@ commit. Any DDL error fails the transaction (`E` / `25P02`) until rollback.
 Prepared DROP is bound to the resolved ID and never drops a replacement index
 that reused the same name. Prepared queries replan using current active paths.
 
+Round 39 adds one bounded DDL-after-DML exception for a managed Single Heap:
+exact DROP-only index preparation, same-table transaction-visible DML, a
+layout-compatible SET/DROP NOT NULL or rename ALTER, and final logical index
+changes. The route is selected by Core only when the ALTER executes; no SQL
+sequence is buffered or recognized by this adapter. The first successful ALTER
+closes all relation execution (`25000`). SET NOT NULL scans current S1 changes
+and returns `23502` for a remaining NULL. COMMIT constructs one final S2, while
+rollback restores S1. See
+[Round 39](drop-first-migration-sql-round39.md) for exact limits.
+
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections
 refresh through committed catalog_generation; neither psql nor SQLAlchemy needs

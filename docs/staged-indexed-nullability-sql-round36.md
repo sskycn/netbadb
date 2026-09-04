@@ -86,7 +86,8 @@ LSM manifest v2/WAL v1/SSTable v2; native protocol v1; PostgreSQL wire v3;
 SDK Schema Spec v1; deployment manifest v4.
 
 Round 38 later adds NBSJ tag 35 for a distinct crate-private source-backfill
-path. It does not reinterpret this lifecycle or expose DROP-first ALTER SQL.
+path. Round 39 exposes that separate DROP-first route without reinterpreting
+this already-private-S2 lifecycle.
 
 ## Authorization, prepared, and Extended Query
 
@@ -99,14 +100,15 @@ Execute-time transaction phase.
 ## External acceptance
 
 The real `/opt/local/lib/pgsql/bin/psql` 17.11 acceptance covers the replacement
-sequence, no-replacement commit, direct DROP-first `25000`, DML-after-evacuation
+sequence, no-replacement commit, direct DROP-first rollback, DML-after-evacuation
 `25000`, partial-backfill `23502` followed by `25P02`, commit-before-refinement
 `25000`, and three catalog-only reopens for each successful final state.
 psycopg, SQLAlchemy, and Alembic were unavailable in the test environment.
 
 ## Explicit limitation
 
-This still fails and rolls back with the original schema, rows, and Iold:
+This sequence now enters the separate Round 39 source-participant route and an
+explicit rollback restores the original schema, rows, and Iold:
 
 ```sql
 BEGIN;
@@ -116,7 +118,5 @@ ALTER TABLE users ALTER COLUMN email SET NOT NULL;
 ROLLBACK;
 ```
 
-Many migration tools, including common Alembic recipes, naturally emit this
-DROP-first ordering. Round 36 must not be described as general Alembic indexed-
-nullability support. MigrationCloneHeap, same-version/fingerprint physical
-replacement, late S1 clone, and selective participant detach remain deferred.
+Round 36 itself must not be described as DROP-first or general Alembic support;
+its staged-S2 invariants remain distinct from Round 39.

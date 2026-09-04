@@ -348,7 +348,13 @@ One deliberately narrower exception is the Round 36 staged indexed-nullability
 sequence: a prior schema rewrite must first materialize private S2 through DML;
 an exact `DROP INDEX` then physically evacuates S2 and permanently closes further
 DML before compatible nullability ALTER and final index changes. This is not the
-common DROP-first Alembic sequence and does not make arbitrary DDL-after-DML legal.
+Round 39 source route. Round 39 additionally supports a bounded, single-table
+transactional `DROP INDEX` → data backfill → layout-compatible ALTER → final
+index rebuild for managed Single Heaps. It holds the offline schema writer,
+allows only a DROP-index prelude, and does not support pre-DML CREATE INDEX,
+layout-changing ALTER, cross-table work, online migration, or general Alembic
+migration execution. See
+[`docs/drop-first-migration-sql-round39.md`](docs/drop-first-migration-sql-round39.md).
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

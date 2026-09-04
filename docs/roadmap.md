@@ -940,7 +940,21 @@ Candidate B lifecycle: drop-only index prelude and transaction-visible S1 DML,
 source-view validation, DML closure, one late final S2 clone, final indexes,
 S1+S2 in one CORD winner decision, mutated-S1 replacement retirement, and exact
 partial-participant startup convergence. NBSJ v1 adds tag 35; other persistent
-and wire formats remain unchanged. Public SQL routing remains deferred.
+and wire formats remain unchanged.
+
+### DROP-first migration SQL vertical slice — Round 39
+
+[Round 39](drop-first-migration-sql-round39.md) exposes Candidate B through the
+public Core SQL dispatcher and PostgreSQL Simple/Extended Query. Activation is
+at exact ALTER Execute only, after a one-table managed-Heap drop-only prelude
+and S1 relation execution. SET NOT NULL validates the transaction-visible S1;
+successful refinement closes DML; final CREATE/DROP INDEX is logical; COMMIT
+reuses the one-pass late clone, S1+S2 CORD winner, replacement retirement, and
+recovery proof. Real psql 17.11 passes replacement/no-replacement, no-ALTER,
+net-no-op, errors, rollback, reflection, and three-reopen cases. Python clients
+were unavailable and remain unverified. Round 40 should audit late-clone column
+projection for post-DML DROP COLUMN or nullable ADD COLUMN before considering
+physical type conversion.
 
 ## Phase 6 — SDK and tooling
 

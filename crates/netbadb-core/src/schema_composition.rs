@@ -70,7 +70,6 @@ pub(crate) enum SchemaCompositionState {
     FinalizedIndex(Box<MaterializedSchemaIndexTransaction>),
     SealingAndMaterializingIndex(Box<MaterializedSchemaIndexTransaction>),
     MaterializedIndex(Box<MaterializedSchemaIndexTransaction>),
-    #[cfg_attr(not(test), allow(dead_code))]
     SourceBackfillOpen(Box<MaterializedSchemaIndexTransaction>),
     SourceRefining(Box<MaterializedSchemaIndexTransaction>),
     SourceIndexFinalizing(Box<MaterializedSchemaIndexTransaction>),
@@ -459,15 +458,36 @@ impl MaterializedSchemaTransaction {
 }
 
 impl Database {
-    /// Enters the crate-private Candidate B foundation after preparatory index
-    /// drops have been accepted. Public SQL never calls this transition.
-    #[cfg(test)]
-    pub(crate) fn open_source_backfill(
+    /// Routes one exact post-execution-barrier ALTER into Candidate B when the
+    /// current physical participant and drop-only index prelude prove that the
+    /// existing Heap can be used as the transaction-visible source.  A false
+    /// result leaves the prior dispatcher behavior unchanged.
+    pub(crate) fn try_apply_source_backfill_refinement(
         &mut self,
         transaction: &mut Transaction,
-    ) -> Result<(), DatabaseError> {
+        spec: &AlterTableSpec,
+    ) -> Result<bool, DatabaseError> {
         self.validate_transaction(transaction)?;
-        self.ensure_schema_materialized_with_backfill(transaction, false)?;
+        if matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::SourceBackfillOpen(_)
+                | SchemaCompositionState::SourceRefining(_)
+        ) {
+            self.apply_source_backfill_refinement(transaction, spec.clone())?;
+            return Ok(true);
+        }
+        if !matches!(
+            spec.operation,
+            AlterTableOperation::SetNotNull { .. }
+                | AlterTableOperation::DropNotNull { .. }
+                | AlterTableOperation::RenameTable { .. }
+                | AlterTableOperation::RenameColumn { .. }
+        ) || !matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::MaterializedIndex(_)
+        ) {
+            return Ok(false);
+        }
         let previous = std::mem::replace(
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
@@ -482,21 +502,44 @@ impl Database {
                 .into());
             }
         };
-        let eligible = materialized.logical.table_actions == 0
+        let table_id = spec.target.table_id;
+        let current_source = materialized
+            .logical
+            .touched
+            .get(&table_id)
+            .map(|touched| touched.old_storage);
+        let eligible = self.schema_writer.get() == Some(transaction.id())
+            && materialized.logical.transaction == transaction.id()
+            && materialized.intent.transaction == transaction.id()
+            && materialized.logical.table_actions == 0
             && materialized.logical.created.is_empty()
             && materialized.logical.touched.len() == 1
+            && materialized.logical.touched.contains_key(&table_id)
+            && materialized
+                .logical
+                .dependency(table_id)
+                .is_ok_and(|dependency| dependency == spec.target)
             && materialized.intent.tables.len() == 1
             && materialized.target.is_none()
             && materialized.reference.is_none()
             && materialized.staged.is_empty()
+            && current_source.is_some_and(|source| {
+                matches!(
+                    self.bindings.placement(table_id),
+                    Ok(TablePlacement::Single { storage_id, .. }) if *storage_id == source
+                )
+            })
             && matches!(
                 &materialized.intent.tables[0],
                 SchemaIndexTablePlan::InPlaceIndexDelta {
+                    table,
                     storage,
                     base_indexes,
                     final_indexes,
                     ..
-                } if transaction.is_write_participant(*storage)
+                } if *table == table_id
+                    && Some(*storage) == current_source
+                    && transaction.is_only_write_participant(*storage)
                     && final_indexes.active.len() < base_indexes.active.len()
                     && final_indexes.active.iter().all(|final_index| {
                         base_indexes.active.iter().any(|base| base == final_index)
@@ -505,13 +548,11 @@ impl Database {
         if !eligible {
             transaction.schema_composition =
                 SchemaCompositionState::MaterializedIndex(materialized);
-            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
-                crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
-            )
-            .into());
+            return Ok(false);
         }
         transaction.schema_composition = SchemaCompositionState::SourceBackfillOpen(materialized);
-        Ok(())
+        self.apply_source_backfill_refinement(transaction, spec.clone())?;
+        Ok(true)
     }
 
     /// Applies one layout-compatible refinement against the transaction-visible
@@ -834,12 +875,8 @@ impl Database {
         transaction: &mut Transaction,
         spec: AlterTableSpec,
     ) -> Result<(), DatabaseError> {
-        if matches!(
-            transaction.schema_composition,
-            SchemaCompositionState::SourceBackfillOpen(_)
-                | SchemaCompositionState::SourceRefining(_)
-        ) {
-            return self.apply_source_backfill_refinement(transaction, spec);
+        if self.try_apply_source_backfill_refinement(transaction, &spec)? {
+            return Ok(());
         }
         if matches!(
             &transaction.schema_composition,

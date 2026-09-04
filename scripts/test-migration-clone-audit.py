@@ -106,9 +106,9 @@ ALTER TABLE projects ALTER COLUMN name SET NOT NULL;
 \echo DROP_FIRST_ALTER_STATE :SQLSTATE
 ROLLBACK;
 """,
-        ("DROP_FIRST_ALTER_STATE 25000",),
+        ("DROP_FIRST_ALTER_STATE 00000",),
     )
-    print(f"{version}: Round 37 ordinary commit and current 25000 baseline PASS")
+    print(f"{version}: Round 37 ordinary commit and Round 39 routed ALTER rollback PASS")
 
 
 if __name__ == "__main__":

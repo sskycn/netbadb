@@ -3,6 +3,8 @@
 > Round 38 implements this selected Candidate B core foundation and its
 > partial-winner recovery. See
 > [Source-participant backfill and late final clone](source-backfill-late-clone-round38.md).
+> Round 39 exposes the bounded public SQL route. See
+> [DROP-first migration SQL vertical slice](drop-first-migration-sql-round39.md).
 
 ## Decision
 
@@ -56,11 +58,10 @@ The fact-pinning Core module is
 - a rename away and back before materialization is a final schema no-op. Index
   and DML changes commit through S1; no S2 is created.
 
-`scripts/test-migration-clone-audit.py` runs the actual PostgreSQL 17.11 client.
-It proves the existing ordinary commit succeeds and the natural DROP-first
-migration still fails at `ALTER ... SET NOT NULL` with `25000`; both outcomes
-survive three catalog-only reopens. `psycopg`, SQLAlchemy, and Alembic were absent,
-so no Python client was installed or claimed.
+`scripts/test-migration-clone-audit.py` still proves the existing ordinary
+DROP+UPDATE commit. After Round 39, its second probe observes successful ALTER
+execution followed by explicit rollback; both outcomes survive three catalog-
+only reopens. The original `25000` result remains historical Round 37 evidence.
 
 ## Current state, exactly
 

@@ -318,8 +318,16 @@ foundation. Same-table DML remains in a transaction-private S1 view until an
 accepted layout-compatible refinement closes relation execution. Commit creates
 one final S2 from that view, prepares S1+S2 and one NBSC, and writes one CORD
 decision. Exact tag-35/stage/tag-34/NBSC evidence lets startup finish either
-partial participant order before retiring S1 and publishing S2. Public
-DROP-first ALTER dispatch remains disabled.
+partial participant order before retiring S1 and publishing S2.
+
+[Round 39](drop-first-migration-sql-round39.md) adds the Core Execute-time route
+from a one-table, drop-only `MaterializedIndex` source participant to that
+unchanged lifecycle. The exact typed ALTER, current S1 participant, schema-
+writer owner, managed Single-Heap placement, and absence of S2 are checked in
+Core; PostgreSQL remains a thin authorization/SQLSTATE adapter. Failed native
+SET NOT NULL stays open for repair, successful refinement closes relation
+execution, and final index DDL is logical until the one late clone at COMMIT.
+No SQL look-ahead or persistent-format change is introduced.
 
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;

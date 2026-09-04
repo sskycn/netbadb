@@ -104,7 +104,9 @@ Heap WAL v4/record v5, NBCO/CORD envelopes and schema reference, Protocol v1, PG
 framing v3, Manifest v4, and SDK Schema Spec v1 are unchanged. NBSJ remains v1
 and adds record tag 35 only. Older readers reject the unknown tag explicitly.
 
-Public DROP-first ALTER routing, preparatory CREATE INDEX, multi-table source
-backfill, layout/type changes, same-V/F physical replacement, participant detach,
-savepoints, resumable migration, non-Heap placements, automatic GC, and NBSJ/CORD
-compaction remain deferred.
+Round 39 subsequently exposes the bounded DROP-first ALTER route documented in
+[DROP-first migration SQL vertical slice](drop-first-migration-sql-round39.md).
+Preparatory CREATE INDEX, multi-table source backfill, layout/type changes,
+same-V/F physical replacement, participant detach, savepoints, resumable
+migration, non-Heap placements, automatic GC, and NBSJ/CORD compaction remain
+deferred.

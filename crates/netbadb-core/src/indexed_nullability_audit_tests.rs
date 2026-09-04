@@ -138,7 +138,7 @@ fn direct_index_drop_then_dml_uses_the_committed_heap_participant() {
 }
 
 #[test]
-fn sql_primary_sequence_is_sealed_after_s1_dml_and_rejects_refinement() {
+fn sql_primary_sequence_routes_from_the_s1_participant_at_alter_execute() {
     let root = root("sql-primary-sequence");
     let mut db = seed(&root);
     let users = db.schema().table("users").unwrap().id;
@@ -152,21 +152,15 @@ fn sql_primary_sequence_is_sealed_after_s1_dml_and_rejects_refinement() {
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    let error = db
-        .execute_in(
-            &mut transaction,
-            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-        )
-        .unwrap_err();
-    assert!(matches!(
-        &error,
-        DatabaseError::SchemaMutation(SchemaMutationError::SchemaMutationAfterMaterialization)
-    ));
-    assert_eq!(error.kind(), DatabaseErrorKind::TransactionState);
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+    )
+    .unwrap();
     assert_eq!(transaction.state(), TransactionState::Active);
     assert!(matches!(
         transaction.schema_composition,
-        schema_composition::SchemaCompositionState::MaterializedIndex(_)
+        schema_composition::SchemaCompositionState::SourceRefining(_)
     ));
     assert_eq!(transaction.write_participant(), Some(storage));
     assert_eq!(transaction.staged_binding(users), None);

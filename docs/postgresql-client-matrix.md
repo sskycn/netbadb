@@ -56,6 +56,7 @@ production or build dependencies.
 | SQLAlchemy ALTER transport/reflection | yes | `exec_driver_sql`; Inspector sees committed rename/columns/indexes |
 | ALTER-only multi-statement transaction | yes, bounded | same/cross-table Core composition; one final rewrite per dirty table |
 | ALTER + CREATE/DROP INDEX transaction | yes, bounded | psql, psycopg `prepare=True`, SQLAlchemy `Index.create/drop`, and Alembic Operations |
+| DROP INDEX + DML + compatible ALTER + final index | psql yes, bounded | Round 39 managed Single Heap, one table, DROP-only prelude; Python clients unavailable/unverified |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 

@@ -164,6 +164,10 @@ impl DatabaseTransaction {
         self.write_participants.contains(&storage_id)
     }
 
+    pub(crate) fn is_only_write_participant(&self, storage_id: StorageId) -> bool {
+        self.write_participants.len() == 1 && self.write_participants.contains(&storage_id)
+    }
+
     pub(crate) fn physical_transaction_id(
         &self,
         storage_id: StorageId,
