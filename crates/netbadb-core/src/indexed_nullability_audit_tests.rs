@@ -177,7 +177,7 @@ fn sql_primary_sequence_is_sealed_after_s1_dml_and_rejects_refinement() {
 }
 
 #[test]
-fn staged_drop_keeps_historical_index_guard_and_physical_tree_until_finalization() {
+fn staged_sql_drop_keeps_history_but_physically_evacuates_before_refinement() {
     let root = root("staged-historical-guard");
     let mut db = seed(&root);
     let users = db.schema().table("users").unwrap().id;
@@ -218,24 +218,21 @@ fn staged_drop_keeps_historical_index_guard_and_physical_tree_until_finalization
             .is_empty()
     );
     assert!(materialized.backfill_indexed_columns.contains(&email));
-    let staged_old = &materialized.staged[&staged_storage].indexes()[0];
-    assert_eq!(staged_old.id, old_index.id);
-    assert_eq!(staged_old.name, old_index.name);
-    assert_eq!(staged_old.column_id, old_index.column_id);
+    assert!(materialized.staged[&staged_storage].indexes().is_empty());
+    assert!(materialized.staged_indexes[&users].active.is_empty());
     assert!(matches!(
         transaction.schema_composition,
-        schema_composition::SchemaCompositionState::IndexFinalizing(_)
+        schema_composition::SchemaCompositionState::IndexEvacuating(_)
     ));
 
-    let error = db
-        .execute_in(
-            &mut transaction,
-            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-        )
-        .unwrap_err();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+    )
+    .unwrap();
     assert!(matches!(
-        error,
-        DatabaseError::SchemaMutation(SchemaMutationError::SchemaMutationAfterMaterialization)
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::RefiningAfterEvacuation(_)
     ));
     assert!(
         transaction

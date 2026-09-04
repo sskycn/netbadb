@@ -114,6 +114,9 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
     assert_eq!(base_version, TableSchemaVersion(1));
     assert_eq!(surviving.id, IndexId(1));
     assert_eq!(old_email.id, IndexId(2));
+    let prepared_drop = db
+        .prepare_ddl_statement("DROP INDEX users_email_idx")
+        .unwrap();
 
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
@@ -127,14 +130,10 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
     assert_ne!(staged_storage, base_storage);
     assert_eq!(staged_storage, StorageId(3));
 
-    db.evacuate_staged_backfill_index_in(
-        &mut transaction,
-        DropIndexTarget {
-            table_id: users,
-            index_id: old_email.id,
-        },
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute_ddl_in(&mut transaction, &prepared_drop).unwrap(),
+        DdlOutcome::Dropped
+    );
     assert!(matches!(
         transaction.schema_composition,
         schema_composition::SchemaCompositionState::IndexEvacuating(_)
@@ -298,7 +297,6 @@ fn evacuation_refinement_and_replacement_reuse_one_staged_heap() {
 fn evacuation_requires_successful_refinement_before_commit() {
     let root = root("commit-gate");
     let mut db = seed(&root);
-    let users = db.schema().table("users").unwrap().id;
     let email = db
         .schema()
         .table("users")
@@ -306,26 +304,16 @@ fn evacuation_requires_successful_refinement_before_commit() {
         .column("email")
         .unwrap()
         .id;
-    let old = db
-        .indexes(users)
-        .unwrap()
-        .iter()
-        .find(|index| index.column_id == email)
-        .unwrap()
-        .clone();
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
     db.execute_in(&mut transaction, "UPDATE users SET marker = 'ready'")
         .unwrap();
-    db.evacuate_staged_backfill_index_in(
-        &mut transaction,
-        DropIndexTarget {
-            table_id: users,
-            index_id: old.id,
-        },
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
+            .unwrap(),
+        ExecutionResult::AffectedRows(0)
+    );
 
     let error = db.commit_transaction(&mut transaction).unwrap_err();
     assert!(matches!(
@@ -415,14 +403,26 @@ fn exact_target_failure_is_a_noop_and_refined_evacuation_needs_no_replacement() 
         before
     );
 
-    db.evacuate_staged_backfill_index_in(
-        &mut transaction,
-        DropIndexTarget {
-            table_id: users,
-            index_id: old.id,
-        },
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute_in(&mut transaction, "DROP INDEX IF EXISTS missing_idx")
+            .unwrap(),
+        ExecutionResult::AffectedRows(0)
+    );
+    assert!(matches!(
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::BackfillOpen(_)
+    ));
+    assert_eq!(
+        transaction
+            .schema_composition
+            .materialized()
+            .unwrap()
+            .staged_indexes[&users],
+        before
+    );
+
+    db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
+        .unwrap();
     db.execute_in(
         &mut transaction,
         "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
@@ -478,14 +478,9 @@ fn multiple_evacuations_preserve_a_compatible_index_across_rename() {
     )
     .unwrap();
     for index in &evacuated {
-        db.evacuate_staged_backfill_index_in(
-            &mut transaction,
-            DropIndexTarget {
-                table_id: users,
-                index_id: index.id,
-            },
-        )
-        .unwrap();
+        let name = index.name.as_ref().unwrap();
+        db.execute_in(&mut transaction, &format!("DROP INDEX {name}"))
+            .unwrap();
         assert!(matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::IndexEvacuating(_)
@@ -521,26 +516,63 @@ fn multiple_evacuations_preserve_a_compatible_index_across_rename() {
 }
 
 #[test]
+fn sql_evacuation_rejects_cross_table_drop_without_touching_either_heap() {
+    let root = root("cross-table");
+    let mut db = seed(&root);
+    db.execute("CREATE TABLE teams (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO teams VALUES (1, 'one')").unwrap();
+    db.execute("CREATE INDEX teams_name_idx ON teams(name)")
+        .unwrap();
+    let users = db.schema().table("users").unwrap().id;
+    let teams = db.schema().table("teams").unwrap().id;
+    let team_index = db.indexes(teams).unwrap()[0].clone();
+
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    db.execute_in(&mut transaction, "UPDATE users SET marker = 'ready'")
+        .unwrap();
+    let users_inventory = transaction
+        .schema_composition
+        .materialized()
+        .unwrap()
+        .staged_indexes[&users]
+        .clone();
+
+    assert!(matches!(
+        db.execute_in(&mut transaction, "DROP INDEX teams_name_idx"),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess
+            )
+        ))
+    ));
+    assert!(matches!(
+        transaction.schema_composition,
+        schema_composition::SchemaCompositionState::BackfillOpen(_)
+    ));
+    assert_eq!(
+        transaction
+            .schema_composition
+            .materialized()
+            .unwrap()
+            .staged_indexes[&users],
+        users_inventory
+    );
+    assert_eq!(db.indexes(teams).unwrap(), [team_index]);
+
+    transaction.rollback().unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn evacuation_crash_child() {
     let Ok(root) = std::env::var("NETBADB_ROUND35_CRASH_ROOT") else {
         return;
     };
     let mut db = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
-    let users = db.schema().table("users").unwrap().id;
-    let email = db
-        .schema()
-        .table("users")
-        .unwrap()
-        .column("email")
-        .unwrap()
-        .id;
-    let old = db
-        .indexes(users)
-        .unwrap()
-        .iter()
-        .find(|index| index.column_id == email)
-        .unwrap()
-        .id;
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
@@ -549,14 +581,8 @@ fn evacuation_crash_child() {
         "UPDATE users SET marker = 'ready', email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    db.evacuate_staged_backfill_index_in(
-        &mut transaction,
-        DropIndexTarget {
-            table_id: users,
-            index_id: old,
-        },
-    )
-    .unwrap();
+    db.execute_in(&mut transaction, "DROP INDEX users_email_idx")
+        .unwrap();
     db.execute_in(
         &mut transaction,
         "ALTER TABLE users ALTER COLUMN email SET NOT NULL",

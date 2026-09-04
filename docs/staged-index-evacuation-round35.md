@@ -230,8 +230,11 @@ observes SQLSTATE `25000`; rollback restores the exact old index.
 
 ## 43. Public SQL exposure status
 
-No SQL, HIR mode, server API, protocol capability, CLI, or SDK selects evacuation.
-This is a private Core lifecycle foundation.
+Round 35 itself is the private Core lifecycle foundation. Round 36 now lets
+ordinary SQL select it only for an exact index on an already-BackfillOpen private
+managed Single Heap; see
+[staged-indexed-nullability-sql-round36.md](staged-indexed-nullability-sql-round36.md).
+Direct DROP-first remains outside the lifecycle.
 
 ## 44. Physical cost
 
@@ -293,6 +296,7 @@ task commit, merge/push of main, remote containment proof, and clean task cleanu
 
 ## 53. Round36 recommendation
 
-Audit production orchestration before SQL exposure: authorization, prepared
-targets, retry/error mapping, external clients, and whether DROP-first remains a
-separate workflow. Do not broaden storage placement or recovery scope.
+Round 36 completed the restricted SQL exposure without broadening storage or
+recovery. Round 37 should audit MigrationCloneHeap architecture before attempting
+DROP-first-before-private-S2; it must not disguise a same-V/F physical replacement
+as an ordinary schema rewrite.

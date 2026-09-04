@@ -45,3 +45,8 @@ Round 35 preserves public Round 33 CREATE/DROP behavior and IndexId reservation.
 Its private branch feeds `RefiningAfterEvacuation` into `IndexFinalizing`, while
 finalization now diffs the current physical S2 inventory rather than the base
 inventory, preventing a second retirement of an evacuated index.
+
+Round 36 exposes only the pre-refinement DROP as an immediate SQL evacuation
+when an exact private S2 is already `BackfillOpen`. After refinement begins,
+DROP in `IndexFinalizing` remains this Round 33 logical final-inventory delta.
+The transaction phase, not the SQL spelling, selects the two semantics.

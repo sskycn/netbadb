@@ -427,3 +427,7 @@ Round 35 implements that private Core foundation in
 [staged-index-evacuation-round35.md](staged-index-evacuation-round35.md). Public
 SQL remains blocked, the monotonic guard remains authoritative outside the new
 typed states, and no persistent format changes were required.
+
+Round 36 exposes the restricted Candidate D SQL ordering documented in
+[staged-indexed-nullability-sql-round36.md](staged-indexed-nullability-sql-round36.md).
+It does not implement Candidate B or make DROP-first migrations eligible.

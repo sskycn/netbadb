@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run(root: &Path) -> Result<(), Box<dyn Error>> {
+    let round36_probe = std::env::var("NETBADB_ROUND36_PROBE").ok();
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -46,6 +47,10 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")?;
     db.execute("CREATE INDEX projects_name_idx ON projects (name)")?;
     db.execute("INSERT INTO projects VALUES (1, 'one')")?;
+    if round36_probe.is_some() {
+        db.execute("INSERT INTO projects VALUES (2, NULL)")?;
+    }
+    let old_index_id = db.indexes(TableId(2))?[0].id;
     db.close()?;
 
     let runtime_directory = std::fs::read_dir(root)?
@@ -89,6 +94,63 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round36_probe {
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 36 final table disappeared")?;
+            if projects.column("migration_marker").is_none()
+                || projects.column("name").is_none_or(|column| column.nullable)
+            {
+                return Err("Round 36 final nullability is incorrect".into());
+            }
+            let indexes = reopened.indexes(TableId(2))?;
+            match probe.as_str() {
+                "replacement" => {
+                    if indexes.len() != 1
+                        || indexes[0].id == old_index_id
+                        || indexes[0]
+                            .name
+                            .as_ref()
+                            .is_none_or(|name| name.as_str() != "projects_name_idx")
+                        || indexes[0].column_id != ColumnId(2)
+                    {
+                        return Err("Round 36 replacement index identity is incorrect".into());
+                    }
+                }
+                "no-replacement" if indexes.is_empty() => {}
+                "no-replacement" => {
+                    return Err("Round 36 no-replacement migration kept an index".into());
+                }
+                _ => return Err(format!("unknown Round 36 probe {probe}").into()),
+            }
+            if reopened
+                .query("SELECT id, name, migration_marker FROM projects ORDER BY id")?
+                .rows
+                != [
+                    vec![
+                        ScalarValue::Int64(1),
+                        ScalarValue::Text("one".into()),
+                        ScalarValue::Text("done".into()),
+                    ],
+                    vec![
+                        ScalarValue::Int64(2),
+                        ScalarValue::Text("filled".into()),
+                        ScalarValue::Text("done".into()),
+                    ],
+                ]
+            {
+                return Err("Round 36 final rows are incorrect".into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} staged indexed-nullability schema/data/index survived three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Ok(probe) = std::env::var("NETBADB_ROUND32_PROBE") {
         for _ in 0..3 {

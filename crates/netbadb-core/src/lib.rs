@@ -2525,6 +2525,16 @@ impl Database {
                 let Some(target) = self.validate_drop_target(statement, Some(transaction))? else {
                     return Ok(DdlOutcome::Unchanged);
                 };
+                if self.should_route_drop_index_to_backfill_evacuation(transaction, target) {
+                    self.evacuate_staged_backfill_index_in(transaction, target)?;
+                    return Ok(DdlOutcome::Dropped);
+                }
+                if self.is_cross_table_drop_during_backfill_evacuation(transaction, target) {
+                    return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                        crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+                    )
+                    .into());
+                }
                 if self.should_compose_index_ddl(transaction, target.table_id)? {
                     return self.compose_drop_index_in(transaction, target);
                 }

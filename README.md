@@ -77,6 +77,13 @@ finalization retargets the same staged Heap first and then builds only the
 exact final index delta from transaction-visible rows. See
 [controlled-backfill-round33](docs/controlled-backfill-round33.md).
 
+Round 36 exposes the Round 35 exact staged-index evacuation through SQL for an
+already-materialized private managed Single-Heap backfill. All DML must precede
+the preparatory `DROP INDEX`; compatible ALTER and optional fresh-ID replacement
+CREATE then reuse one staged Heap and one CORD decision. Direct
+`DROP INDEX → UPDATE → ALTER` remains unsupported. See
+[staged-indexed-nullability-sql-round36](docs/staged-indexed-nullability-sql-round36.md).
+
 ## Strong types
 
 Internal identifiers are newtypes such as `TableId`, `PartitionId`,
@@ -336,6 +343,12 @@ LSM, and partitioned table composition also remain unsupported; complete `pg_cat
 TLS/password authentication, actual cancellation, and simultaneous native plus
 PostgreSQL listeners remain unsupported. The reproducible client matrix is in
 [`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
+
+One deliberately narrower exception is the Round 36 staged indexed-nullability
+sequence: a prior schema rewrite must first materialize private S2 through DML;
+an exact `DROP INDEX` then physically evacuates S2 and permanently closes further
+DML before compatible nullability ALTER and final index changes. This is not the
+common DROP-first Alembic sequence and does not make arbitrary DDL-after-DML legal.
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

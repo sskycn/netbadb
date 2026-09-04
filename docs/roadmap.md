@@ -902,9 +902,19 @@ physical staged inventory before retarget/build/tag-34/NBSC/CORD publication.
 Multiple exact evacuations, unrelated compatible indexes, no-replacement commit,
 and predecision crash recovery are covered without a new NBSJ tag or S3 copy.
 
-Round 36 should audit the production orchestration and external-client contract
-before exposing this path. Direct DROP-first migration, broader placements,
-online/resumable work, and public indexed-nullability SQL remain deferred.
+### Staged indexed-nullability SQL vertical slice — Round 36
+
+[Round 36](staged-indexed-nullability-sql-round36.md) exposes ordinary SQL DROP
+only for the exact already-private S2 lifecycle. Execute-time routing preserves
+prepared IndexId identity, authorization, `IF EXISTS`, normal DROP paths, DML
+closure, physical compatibility checks, fresh replacement identity, tag 34,
+one prepared NBSC, and one CORD decision. Real psql 17.11 covers the positive,
+no-replacement, DROP-first, DML-closure, partial-backfill, and commit-gate paths.
+
+Round 37 should audit MigrationCloneHeap before considering DROP-first-before-S2.
+Same-V/F physical replacement, late S1 clone, participant detach, broader
+placements, online/resumable work, and general Alembic indexed-nullability
+support remain deferred.
 
 ## Phase 6 — SDK and tooling
 

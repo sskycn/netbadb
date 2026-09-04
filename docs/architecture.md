@@ -293,6 +293,14 @@ fresh-ID final indexes, validates the exact catalog, and then reuses tag 34, one
 prepared NBSC, and one CORD decision. Public DROP-first indexed-nullability SQL
 remains unsupported and no persistent format changes.
 
+[Round 36](staged-indexed-nullability-sql-round36.md) adds an Execute-time SQL
+dispatcher for that exact branch. It requires `BackfillOpen`/`IndexEvacuating`,
+the one private managed Single-Heap target, and the exact IndexId in actual S2.
+Ordinary DROP behavior is unchanged elsewhere. SQL evacuation closes DML,
+public ALTER reuses the physical S2 compatibility proof, and replacement CREATE
+reuses Round 33 finalization. DROP-first-before-S2 remains unsupported; no
+persistent or protocol format changes.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

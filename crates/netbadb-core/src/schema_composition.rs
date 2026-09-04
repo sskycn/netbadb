@@ -49,13 +49,6 @@ pub(crate) enum SchemaCompositionState {
     Materialized(Box<MaterializedSchemaTransaction>),
     BackfillMaterializing(Box<MaterializedSchemaTransaction>),
     BackfillOpen(Box<MaterializedSchemaTransaction>),
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Round 35 internal migration orchestration is intentionally not public SQL"
-        )
-    )]
     IndexEvacuating(Box<MaterializedSchemaTransaction>),
     RefiningAfterEvacuation(Box<MaterializedSchemaTransaction>),
     Refining(Box<MaterializedSchemaTransaction>),
@@ -512,16 +505,79 @@ impl Database {
         result
     }
 
+    /// Returns whether an exact SQL DROP can enter the private staged-index
+    /// evacuation lifecycle. The execution-time phase and physical S2
+    /// inventory are authoritative; committed or in-place participants never
+    /// qualify.
+    pub(crate) fn should_route_drop_index_to_backfill_evacuation(
+        &self,
+        transaction: &Transaction,
+        target: crate::DropIndexTarget,
+    ) -> bool {
+        if transaction.state() != TransactionState::Active {
+            return false;
+        }
+        let materialized = match &transaction.schema_composition {
+            SchemaCompositionState::BackfillOpen(materialized)
+            | SchemaCompositionState::IndexEvacuating(materialized) => materialized,
+            _ => return false,
+        };
+        if !materialized.backfill
+            || materialized.logical.touched.len() != 1
+            || !materialized.logical.touched.contains_key(&target.table_id)
+            || materialized.staged.len() != 1
+            || materialized.intent.tables.len() != 1
+        {
+            return false;
+        }
+        let table_plan = &materialized.intent.tables[0];
+        if table_plan.table() != target.table_id
+            || table_plan.old_storage() == table_plan.new_storage()
+            || transaction.staged_binding(target.table_id) != Some(table_plan.new_storage())
+        {
+            return false;
+        }
+        let Some(storage) = materialized.staged.get(&table_plan.new_storage()) else {
+            return false;
+        };
+        if storage.kind() != netbadb_storage::StorageKind::Heap
+            || storage.table().id != target.table_id
+        {
+            return false;
+        }
+        materialized
+            .staged_indexes
+            .get(&target.table_id)
+            .is_some_and(|indexes| {
+                indexes
+                    .active
+                    .iter()
+                    .any(|index| index.id == target.index_id)
+            })
+            && materialized.logical.touched[&target.table_id]
+                .indexes
+                .active
+                .iter()
+                .any(|index| index.id == target.index_id)
+    }
+
+    pub(crate) fn is_cross_table_drop_during_backfill_evacuation(
+        &self,
+        transaction: &Transaction,
+        target: crate::DropIndexTarget,
+    ) -> bool {
+        let materialized = match &transaction.schema_composition {
+            SchemaCompositionState::BackfillOpen(materialized)
+            | SchemaCompositionState::IndexEvacuating(materialized) => materialized,
+            _ => return false,
+        };
+        materialized.logical.touched.len() == 1
+            && !materialized.logical.touched.contains_key(&target.table_id)
+    }
+
     /// Immediately retires one exact incompatible index from the private S2
-    /// Heap. This is an internal migration primitive; public SQL DROP INDEX
-    /// continues through the conservative logical Round 33 path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Round 35 internal migration orchestration is intentionally not public SQL"
-        )
-    )]
+    /// Heap. SQL reaches this typed primitive only through the exact
+    /// execution-time predicate above.
     pub(crate) fn evacuate_staged_backfill_index_in(
         &mut self,
         transaction: &mut Transaction,

@@ -183,6 +183,155 @@ fn pg_index_drop_then_dml_rejects_indexed_nullability_refinement_and_enters_e() 
 }
 
 #[test]
+fn pg_staged_index_evacuation_closes_dml_and_publishes_a_fresh_replacement() {
+    let (root, mut db) = project("pg-round36-staged-indexed-nullability");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let old = db.indexes(TableId(2)).unwrap()[0].clone();
+    let mut admin = session(&db, true);
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "ALTER TABLE projects ADD COLUMN migration_marker TEXT",
+    ));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+    ));
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET migration_marker = 'done'",
+    ));
+    assert_eq!(
+        sql(&mut admin, &mut db, "DROP INDEX projects_name_idx"),
+        [
+            BackendMessage::CommandComplete("DROP INDEX".into()),
+            BackendMessage::ReadyForQuery(b'T')
+        ]
+    );
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET migration_marker = 'late'",
+        ),
+        "25000",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    for source in [
+        "ALTER TABLE projects ADD COLUMN migration_marker TEXT",
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "UPDATE projects SET migration_marker = 'done'",
+        "DROP INDEX projects_name_idx",
+        "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+        "CREATE INDEX projects_name_idx ON projects(name)",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+
+    let table = db.schema().table("projects").unwrap();
+    assert!(!table.column("name").unwrap().nullable);
+    assert!(table.column("migration_marker").is_some());
+    let replacement = db.indexes(TableId(2)).unwrap();
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(replacement[0].name.as_ref(), old.name.as_ref());
+    assert_ne!(replacement[0].id, old.id);
+    assert_eq!(replacement[0].column_id, old.column_id);
+    assert_eq!(
+        db.query("SELECT id, name, migration_marker FROM projects ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![
+                netbadb_types::ScalarValue::Int64(1),
+                netbadb_types::ScalarValue::Text("one".into()),
+                netbadb_types::ScalarValue::Text("done".into()),
+            ],
+            vec![
+                netbadb_types::ScalarValue::Int64(2),
+                netbadb_types::ScalarValue::Text("filled".into()),
+                netbadb_types::ScalarValue::Text("done".into()),
+            ],
+        ]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_staged_index_evacuation_reports_partial_backfill_and_allows_no_replacement() {
+    let (root, mut db) = project("pg-round36-partial-and-no-replacement");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let old = db.indexes(TableId(2)).unwrap()[0].clone();
+    let mut admin = session(&db, true);
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    for source in [
+        "ALTER TABLE projects ADD COLUMN migration_marker TEXT",
+        "UPDATE projects SET migration_marker = 'done'",
+        "DROP INDEX projects_name_idx",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+        ),
+        "23502",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .nullable
+    );
+    assert_eq!(db.indexes(TableId(2)).unwrap(), [old]);
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    for source in [
+        "ALTER TABLE projects ADD COLUMN migration_marker TEXT",
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "UPDATE projects SET migration_marker = 'done'",
+        "DROP INDEX projects_name_idx",
+        "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    assert!(
+        !db.schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .nullable
+    );
+    assert!(db.indexes(TableId(2)).unwrap().is_empty());
+
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pg_extended_parse_bind_describe_are_pure_and_execute_is_exact() {
     let (root, mut db) = project("pg-alter-extended");
     let mut first = session(&db, true);
@@ -268,6 +417,99 @@ fn pg_extended_parse_bind_describe_are_pure_and_execute_is_exact() {
         ),
         "25000",
     );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_extended_staged_drop_evacuation_occurs_only_on_execute() {
+    let (root, mut db) = project("pg-round36-extended-drop");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let mut admin = session(&db, true);
+    let before_parse = files(&root);
+
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "drop".into(),
+                query: "DROP INDEX projects_name_idx".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(files(&root), before_parse);
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    for source in [
+        "ALTER TABLE projects ADD COLUMN migration_marker TEXT",
+        "UPDATE projects SET name = 'filled' WHERE name IS NULL",
+        "UPDATE projects SET migration_marker = 'done'",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    let before_bind = files(&root);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "drop".into(),
+                statement: "drop".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "drop".into(),
+            },
+        ),
+        [BackendMessage::NoData]
+    );
+    assert_eq!(files(&root), before_bind);
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET migration_marker = 'still-open'",
+    ));
+
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "drop".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("DROP INDEX".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET migration_marker = 'closed'",
+        ),
+        "25000",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    assert_eq!(db.indexes(TableId(2)).unwrap().len(), 1);
+    assert!(
+        db.schema()
+            .table("projects")
+            .unwrap()
+            .column("migration_marker")
+            .is_none()
+    );
+
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
