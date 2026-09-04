@@ -976,29 +976,7 @@ impl Database {
             if matches!(spec.operation, AlterTableOperation::SetNotNull { .. })
                 && base_table.column_by_id(column_id).is_some()
             {
-                let view = transaction.begin_read_view(&[source_storage], &mut self.registry)?;
-                let source_view = view
-                    .iter()
-                    .find_map(|(storage, view)| (storage == source_storage).then_some(view))
-                    .ok_or(SchemaMutationError::Corrupt(
-                        "source-backfill read view absent",
-                    ))?;
-                if self
-                    .registry
-                    .get_mut(source_storage)
-                    .ok_or(SchemaMutationError::Corrupt(
-                        "source-backfill source Heap absent",
-                    ))?
-                    .scan_columns_with_view(&[column_id], source_view)?
-                    .iter()
-                    .any(|(_, values)| {
-                        values
-                            .iter()
-                            .any(|value| matches!(value, ScalarValue::Null))
-                    })
-                {
-                    return Err(SchemaMutationError::NotNullViolation(column_id).into());
-                }
+                self.validate_source_view_not_null(transaction, source_storage, column_id)?;
             }
         }
         let reserved_column = if matches!(
@@ -2314,6 +2292,14 @@ impl Database {
         if !Self::is_adopted_source_operation(&spec.operation) {
             return Err(SchemaMutationError::TransactionNotPristine.into());
         }
+        self.capture_post_dml_source_adoption(transaction, spec)
+    }
+
+    fn capture_post_dml_source_adoption(
+        &mut self,
+        transaction: &Transaction,
+        spec: &AlterTableSpec,
+    ) -> Result<AdoptedSourceTransaction, DatabaseError> {
         if transaction.schema_mutation.is_some()
             || !transaction.schema_composition.is_none()
             || transaction.has_pending_index_creations()
@@ -2431,6 +2417,132 @@ impl Database {
             base_epoch: snapshot.epoch,
             source_index_digest,
         })
+    }
+
+    fn validate_source_view_not_null(
+        &mut self,
+        transaction: &mut Transaction,
+        source_storage: StorageId,
+        column_id: ColumnId,
+    ) -> Result<(), DatabaseError> {
+        let view = transaction.begin_read_view(&[source_storage], &mut self.registry)?;
+        let source_view = view
+            .iter()
+            .find_map(|(storage, view)| (storage == source_storage).then_some(view))
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill read view absent",
+            ))?;
+        if self
+            .registry
+            .get_mut(source_storage)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill source Heap absent",
+            ))?
+            .scan_columns_with_view(&[column_id], source_view)?
+            .iter()
+            .any(|(_, values)| {
+                values
+                    .iter()
+                    .any(|value| matches!(value, ScalarValue::Null))
+            })
+        {
+            return Err(SchemaMutationError::NotNullViolation(column_id).into());
+        }
+        Ok(())
+    }
+
+    /// Round 45 executable audit hook. It deliberately bypasses the public
+    /// operation allowlist while retaining the real adopted-source carrier,
+    /// transaction-visible validation, logical overlay, and finalizer.
+    #[cfg(test)]
+    pub(crate) fn audit_apply_adopted_source_nullability(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        let column_id = match spec.operation {
+            AlterTableOperation::SetNotNull { column_id }
+            | AlterTableOperation::DropNotNull { column_id } => column_id,
+            _ => {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+        };
+        let first = transaction.schema_composition.is_none();
+        let source_storage = if first {
+            self.validate_transaction(transaction)?;
+            let adopted = self.capture_post_dml_source_adoption(transaction, &spec)?;
+            let touched = adopted
+                .logical
+                .touched
+                .get(&spec.target.table_id)
+                .ok_or(SchemaMutationError::Corrupt("adopted source table absent"))?;
+            if touched.base_table.column_by_id(column_id).is_none() {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+            let source_storage = adopted.source_storage;
+            if matches!(spec.operation, AlterTableOperation::SetNotNull { .. }) {
+                self.validate_source_view_not_null(transaction, source_storage, column_id)?;
+            }
+            self.schema_writer.set(Some(transaction.id()));
+            transaction.schema_composition =
+                SchemaCompositionState::AdoptedSourceRefining(Box::new(adopted));
+            source_storage
+        } else {
+            let adopted = match &transaction.schema_composition {
+                SchemaCompositionState::AdoptedSourceRefining(adopted) => adopted,
+                _ => {
+                    return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+                }
+            };
+            if adopted.logical.touched.len() != 1
+                || !adopted.logical.touched.contains_key(&spec.target.table_id)
+                || adopted.logical.touched[&spec.target.table_id]
+                    .base_table
+                    .column_by_id(column_id)
+                    .is_none()
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+            let source_storage = adopted.source_storage;
+            if matches!(spec.operation, AlterTableOperation::SetNotNull { .. }) {
+                self.validate_source_view_not_null(transaction, source_storage, column_id)?;
+            }
+            source_storage
+        };
+        debug_assert_eq!(
+            transaction.write_participant(),
+            Some(source_storage),
+            "audit must retain the exact adopted source"
+        );
+        let result = self.apply_composed_alter_for_audit(transaction, spec);
+        self.handle_composition_accept_result(transaction, &result);
+        if first
+            && result.is_err()
+            && !matches!(
+                transaction.schema_composition,
+                SchemaCompositionState::RollbackRequiredLogical(_)
+            )
+        {
+            let previous = std::mem::replace(
+                &mut transaction.schema_composition,
+                SchemaCompositionState::None,
+            );
+            if let SchemaCompositionState::AdoptedSourceRefining(adopted) = previous {
+                adopted.logical.writer.set(None);
+            } else {
+                transaction.schema_composition = previous;
+            }
+        }
+        result
     }
 
     fn validate_adopted_source_alter(
@@ -3089,6 +3201,25 @@ impl Database {
         transaction: &mut Transaction,
         spec: AlterTableSpec,
     ) -> Result<(), DatabaseError> {
+        self.apply_composed_alter_with_options(transaction, spec, false, false)
+    }
+
+    #[cfg(test)]
+    fn apply_composed_alter_for_audit(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        self.apply_composed_alter_with_options(transaction, spec, true, true)
+    }
+
+    fn apply_composed_alter_with_options(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+        allow_indexed_nullability: bool,
+        source_not_null_already_validated: bool,
+    ) -> Result<(), DatabaseError> {
         let transaction_id = transaction.id();
         let plan = match &mut transaction.schema_composition {
             SchemaCompositionState::Composing(plan) => plan,
@@ -3276,13 +3407,15 @@ impl Database {
             | AlterTableOperation::DropNotNull { column_id } => Some(*column_id),
             _ => None,
         };
-        if indexed_nullability.is_some_and(|column_id| {
-            touched
-                .indexes
-                .active
-                .iter()
-                .any(|index| index.column_id == column_id)
-        }) {
+        if !allow_indexed_nullability
+            && indexed_nullability.is_some_and(|column_id| {
+                touched
+                    .indexes
+                    .active
+                    .iter()
+                    .any(|index| index.column_id == column_id)
+            })
+        {
             return Err(SchemaMutationError::UnsupportedBackfillRefinement(
                 crate::schema_mutation::BackfillRefinementReason::IndexedNullability(
                     indexed_nullability.ok_or(SchemaMutationError::Corrupt(
@@ -3292,8 +3425,10 @@ impl Database {
             )
             .into());
         }
-        if let AlterTableOperation::SetNotNull { column_id } = &spec.operation {
-            self.validate_composed_not_null(&touched, *column_id)?;
+        if !source_not_null_already_validated {
+            if let AlterTableOperation::SetNotNull { column_id } = &spec.operation {
+                self.validate_composed_not_null(&touched, *column_id)?;
+            }
         }
 
         if let Some(column) = reserved_column {
@@ -3666,6 +3801,25 @@ impl Database {
         transaction: &mut Transaction,
         statement: &crate::TypedCreateIndex,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
+        self.apply_composed_create_index_with_options(transaction, statement, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_apply_adopted_source_create_index(
+        &mut self,
+        transaction: &mut Transaction,
+        statement: &crate::TypedCreateIndex,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        self.apply_composed_create_index_with_options(transaction, statement, true)
+    }
+
+    fn apply_composed_create_index_with_options(
+        &mut self,
+        transaction: &mut Transaction,
+        statement: &crate::TypedCreateIndex,
+        allow_adopted_source: bool,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
         if let Some(binding) = self
             .index_name_bindings(Some(transaction))
             .into_iter()
@@ -3683,6 +3837,9 @@ impl Database {
         let transaction_id = transaction.id();
         let plan = match &mut transaction.schema_composition {
             SchemaCompositionState::Composing(plan) => plan,
+            SchemaCompositionState::AdoptedSourceRefining(adopted) if allow_adopted_source => {
+                &mut adopted.logical
+            }
             _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
         };
         if plan.action_count() >= MAX_SCHEMA_ACTIONS {

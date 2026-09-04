@@ -1033,6 +1033,27 @@ S2, tag34, prepared NBSC, CORD, retirement, and existing recovery. Round 42's
 DROP-first nullability/final-index route remains intact. PostgreSQL requires no
 production adapter branch and no persistent/wire format changes.
 
+### Adopted-source refinement expansion audit — Round 45
+
+[Round 45](adopted-source-refinement-expansion-round45.md) keeps every new
+surface production-negative and selects exactly one Round 46 target:
+surviving-base-column SET/DROP NOT NULL on the adopted one-table Heap source.
+A test-only executable path proves that SET validates the exact
+transaction-visible S1 before first writer acquisition or against the same
+frozen source after an earlier refinement; DROP is overlay-only. Indexed and
+unindexed survivors work, existing logical index identity survives the S2
+rebuild, nullability round trips remain clean S1 no-ops, and existing pre-CORD
+loser/post-CORD winner recovery needs no new branch or format.
+
+The audit rejects final index DDL as the next slice because, although the
+existing durable IndexId reservation and ADD-Cnew effective rewrite work, a
+table-no-op/index-effective transaction has no honest current finalizer.
+Post-refinement relational DML is broader still: rename-only is physically
+compatible, nullability requires overlay-aware enforcement, and ADD/DROP rows
+do not fit S1. Round 46 should include indexed surviving base columns, but must
+continue to exclude new-column NOT NULL, final index DDL, and all relational
+execution after the first successful refinement.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

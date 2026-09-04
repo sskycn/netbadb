@@ -14,14 +14,16 @@ PSQL = os.environ.get("PSQL", "/opt/local/lib/pgsql/bin/psql")
 FIXTURE = TARGET / "debug/examples/sql_alter_table_fixture"
 
 
-def run_fixture(probe: str, sql: str, expected: tuple[str, ...]) -> None:
+def run_fixture(
+    probe: str, sql: str, expected: tuple[str, ...], *, round_number: int = 44
+) -> None:
     environment = dict(
         os.environ,
         CARGO_TARGET_DIR=str(TARGET),
         DYLD_LIBRARY_PATH="/opt/local/lib/icu/lib",
         NETBADB_POSTGRES_TRACE="1",
-        NETBADB_ROUND44_PROBE=probe,
     )
+    environment[f"NETBADB_ROUND{round_number}_PROBE"] = probe
     with tempfile.TemporaryFile(mode="w+") as trace:
         process = subprocess.Popen(
             [str(FIXTURE)],
@@ -251,7 +253,73 @@ ROLLBACK;
 """,
             (f"{marker} {sqlstate}", "FAILED_STATE 25P02", "ROLLBACK"),
         )
-    print(f"{version}: Round 44 post-DML source adoption SQL acceptance PASS")
+
+    for probe, setup, failing, marker in (
+        (
+            "set-not-null",
+            "UPDATE projects SET email = email WHERE id = 1;",
+            "ALTER TABLE projects ALTER COLUMN email SET NOT NULL;",
+            "ROUND45_SET_NOT_NULL_STATE",
+        ),
+        (
+            "drop-not-null",
+            "UPDATE projects SET email = email WHERE id = 1;",
+            "ALTER TABLE projects ALTER COLUMN email DROP NOT NULL;",
+            "ROUND45_DROP_NOT_NULL_STATE",
+        ),
+        (
+            "create-index",
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "CREATE INDEX projects_marker_idx ON projects(marker);",
+            "ROUND45_CREATE_INDEX_STATE",
+        ),
+        (
+            "select-after",
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "SELECT id, marker FROM projects;",
+            "ROUND45_SELECT_STATE",
+        ),
+        (
+            "insert-after",
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "INSERT INTO projects VALUES (4, 'old-four', 'four@example.test', NULL);",
+            "ROUND45_INSERT_STATE",
+        ),
+        (
+            "update-after",
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "UPDATE projects SET email = email WHERE id = 1;",
+            "ROUND45_UPDATE_STATE",
+        ),
+        (
+            "delete-after",
+            "UPDATE projects SET email = email WHERE id = 1;\n"
+            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "DELETE FROM projects WHERE id = 1;",
+            "ROUND45_DELETE_STATE",
+        ),
+    ):
+        run_fixture(
+            probe,
+            f"""
+BEGIN;
+{setup}
+{failing}
+\\echo {marker} :SQLSTATE
+SELECT id FROM projects;
+\\echo ROUND45_FAILED_STATE :SQLSTATE
+ROLLBACK;
+""",
+            (f"{marker} 25000", "ROUND45_FAILED_STATE 25P02", "ROLLBACK"),
+            round_number=45,
+        )
+    print(
+        f"{version}: Round 44 post-DML source adoption and Round 45 negative SQL acceptance PASS"
+    )
 
 
 if __name__ == "__main__":

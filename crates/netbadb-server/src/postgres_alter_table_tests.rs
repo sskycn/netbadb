@@ -701,6 +701,73 @@ fn pg_post_dml_layout_rejections_enter_failed_transaction_state() {
 }
 
 #[test]
+fn pg_round45_refinement_expansion_candidates_remain_unsupported() {
+    for (name, statement) in [
+        (
+            "set-not-null",
+            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
+        ),
+        (
+            "drop-not-null",
+            "ALTER TABLE accounts ALTER COLUMN email DROP NOT NULL",
+        ),
+    ] {
+        let (root, mut db) = layout_project(&format!("round45-{name}"));
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET email = email WHERE id = 1",
+        ));
+        state(&sql(&mut admin, &mut db, statement), "25000");
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    for (name, statement) in [
+        (
+            "create-index",
+            "CREATE INDEX accounts_marker_idx ON accounts(marker)",
+        ),
+        ("select", "SELECT id, marker FROM accounts"),
+        (
+            "insert",
+            "INSERT INTO accounts VALUES (4, 'old-four', 'four@example.test', NULL)",
+        ),
+        ("update", "UPDATE accounts SET email = email WHERE id = 1"),
+        ("delete", "DELETE FROM accounts WHERE id = 1"),
+    ] {
+        let (root, mut db) = layout_project(&format!("round45-{name}"));
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET email = email WHERE id = 1",
+        ));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        ));
+        state(&sql(&mut admin, &mut db, statement), "25000");
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn pg_simple_query_covers_all_six_alter_actions_and_transactional_dml() {
     let (root, mut db) = project("pg-alter-simple");
     let mut session = session(&db, true);

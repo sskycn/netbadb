@@ -31,6 +31,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round39_probe = std::env::var("NETBADB_ROUND39_PROBE").ok();
     let round42_probe = std::env::var("NETBADB_ROUND42_PROBE").ok();
     let round44_probe = std::env::var("NETBADB_ROUND44_PROBE").ok();
+    let round45_probe = std::env::var("NETBADB_ROUND45_PROBE").ok();
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -48,7 +49,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    if round42_probe.is_some() || round44_probe.is_some() {
+    if round42_probe.is_some() || round44_probe.is_some() || round45_probe.is_some() {
         db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, email TEXT)")?;
         if round42_probe.is_some() {
             db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
@@ -90,7 +91,10 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("runtime storage path is not UTF-8")?;
 
     let manifest = root.join("server.json");
-    let project_columns = if round42_probe.is_some() || round44_probe.is_some() {
+    let project_columns = if round42_probe.is_some()
+        || round44_probe.is_some()
+        || round45_probe.is_some()
+    {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
             {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
@@ -123,6 +127,46 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round45_probe {
+        for _ in 0..3 {
+            let reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 45 baseline table disappeared")?;
+            let indexes = reopened.indexes(TableId(2))?;
+            let known_probe = matches!(
+                probe.as_str(),
+                "set-not-null"
+                    | "drop-not-null"
+                    | "create-index"
+                    | "select-after"
+                    | "insert-after"
+                    | "update-after"
+                    | "delete-after"
+            );
+            if !known_probe
+                || projects.columns.len() != 3
+                || projects.column("legacy").map(|column| column.id) != Some(ColumnId(2))
+                || projects
+                    .column("email")
+                    .map(|column| (column.id, column.nullable))
+                    != Some((ColumnId(3), true))
+                || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                || reopened.schema_generation() != base_generation
+                || reopened.next_storage_id() != Some(target_storage)
+                || indexes.len() != 1
+                || indexes[0].id != old_index_id
+            {
+                return Err(format!("Round 45 negative probe {probe} changed the base").into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 45 unsupported candidate left the base intact across three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round44_probe {
         for _ in 0..3 {
