@@ -41,6 +41,15 @@ All integers are fixed-width unsigned little-endian. Every envelope is:
 length followed by a complete `NBSR` envelope. Inner and outer checksums both apply.
 `NBSA` activation payload is exactly the same 16-byte incarnation.
 
+Round 38 retains the NBSJ/NBSR envelope versions and adds tag 35,
+`SourceBackfillIntent`. It contains the incarnation and database transaction;
+source TableId, StorageId, schema identity, locator, and exact physical TxnId;
+target StorageId and schema identity; generation/epoch transition; target
+stage/final locators; final-index digest; and clone-plan digest. It is synced
+before the existing stage intent and before target files. Decoder validation
+binds it to one schema/index `RewriteHeap`, tag 34, and exact recovery evidence.
+Tags 1–34 are unchanged.
+
 ## Records
 
 Every NBSR payload starts with tag u8 and nonzero DatabaseTxnId u64.

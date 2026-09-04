@@ -78,11 +78,15 @@ evacuation is never dropped twice. Round 35 tag 34, StageResourceIntent, one
 prepared NBSC, and one CORD v2 decision are reused. Recovery does not know that
 the evacuation originated in SQL and never replays SQL or rebuilds after CORD.
 
-No persistent or wire format changes: TableSchema v1; NBSC/NBSM/NBSJ/NBSA v1
-with NBSJ tags 1–34; NBPC v1; NBCO/CORD v1/v2; Heap/Page v5; NBMV v1;
+Round 36 made no persistent or wire format changes: TableSchema v1;
+NBSC/NBSM/NBSJ/NBSA v1 with its NBSJ tags 1–34; NBPC v1; NBCO/CORD v1/v2;
+Heap/Page v5; NBMV v1;
 IndexCatalog v9; BTree v3; NBTR v1; Heap WAL v4/current record v5; NBTS v1;
 LSM manifest v2/WAL v1/SSTable v2; native protocol v1; PostgreSQL wire v3;
 SDK Schema Spec v1; deployment manifest v4.
+
+Round 38 later adds NBSJ tag 35 for a distinct crate-private source-backfill
+path. It does not reinterpret this lifecycle or expose DROP-first ALTER SQL.
 
 ## Authorization, prepared, and Extended Query
 

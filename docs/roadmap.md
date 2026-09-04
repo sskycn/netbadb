@@ -933,6 +933,15 @@ replacement, participant detach, ADD/DROP/type conversion, cross-table work,
 broader placements, online/resumable work, and general Alembic exposure remain
 deferred.
 
+### Source-participant backfill and late final clone — Round 38
+
+[Round 38](source-backfill-late-clone-round38.md) implements the internal
+Candidate B lifecycle: drop-only index prelude and transaction-visible S1 DML,
+source-view validation, DML closure, one late final S2 clone, final indexes,
+S1+S2 in one CORD winner decision, mutated-S1 replacement retirement, and exact
+partial-participant startup convergence. NBSJ v1 adds tag 35; other persistent
+and wire formats remain unchanged. Public SQL routing remains deferred.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

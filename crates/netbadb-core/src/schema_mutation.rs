@@ -13,7 +13,7 @@ use std::rc::Rc;
 #[cfg(test)]
 use netbadb_schema::Schema;
 use netbadb_schema::{ColumnDef, DropTableTarget, SchemaFingerprint, TableDef, TypeSpec};
-use netbadb_storage::{HeapRewriteIndexes, TableStorage};
+use netbadb_storage::{HeapRewriteIndexes, PreparedTransactionState, TableStorage};
 #[cfg(test)]
 use netbadb_types::ScalarValue;
 use netbadb_types::{
@@ -34,8 +34,9 @@ use crate::schema_mutation_journal::namespace;
 use crate::schema_mutation_journal::{
     CompositionRecord, CompositionResolution, CompositionTablePlan, CreateIntent, DropIntent,
     Reservation, RetiredHeapGcRecord, RewriteIntent, RewriteReservation, SchemaChangeSetIntent,
-    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal,
-    TableObjectChangeSetIntent, final_locator, prepared_locator, stage_locator,
+    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal, SourceBackfillIntent,
+    TableObjectChangeSetIntent, final_locator, heap_rewrite_indexes_digest, prepared_locator,
+    stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -1858,12 +1859,25 @@ impl Database {
                     RetiredHeapIntent::SchemaComposition { plan, .. } => journal
                         .compositions
                         .get(&intent.transaction())
-                        .and_then(|record| record.intent.as_ref())
-                        .and_then(|composition| {
-                            composition
-                                .tables
-                                .iter()
-                                .find(|candidate| candidate.table() == plan.table())
+                        .and_then(|record| {
+                            record
+                                .intent
+                                .as_ref()
+                                .and_then(|composition| {
+                                    composition
+                                        .tables
+                                        .iter()
+                                        .find(|candidate| candidate.table() == plan.table())
+                                })
+                                .or_else(|| {
+                                    record.index_intent.as_ref().and_then(|composition| {
+                                        composition.tables.iter().find_map(|candidate| {
+                                            candidate.replacement().filter(|replacement| {
+                                                replacement.table() == plan.table()
+                                            })
+                                        })
+                                    })
+                                })
                         })
                         .and_then(|candidate| candidate.gc.as_ref()),
                     RetiredHeapIntent::TableObjectComposition { plan, .. } => journal
@@ -3567,12 +3581,25 @@ fn resume_gc_intent(
             RetiredHeapIntent::SchemaComposition { plan, .. } => journal
                 .compositions
                 .get(&intent.transaction())
-                .and_then(|record| record.intent.as_ref())
-                .and_then(|composition| {
-                    composition
-                        .tables
-                        .iter()
-                        .find(|candidate| candidate.table() == plan.table())
+                .and_then(|record| {
+                    record
+                        .intent
+                        .as_ref()
+                        .and_then(|composition| {
+                            composition
+                                .tables
+                                .iter()
+                                .find(|candidate| candidate.table() == plan.table())
+                        })
+                        .or_else(|| {
+                            record.index_intent.as_ref().and_then(|composition| {
+                                composition.tables.iter().find_map(|candidate| {
+                                    candidate
+                                        .replacement()
+                                        .filter(|replacement| replacement.table() == plan.table())
+                                })
+                            })
+                        })
                 })
                 .and_then(|candidate| candidate.gc.as_ref()),
             RetiredHeapIntent::TableObjectComposition { plan, .. } => journal
@@ -4002,6 +4029,114 @@ pub(crate) fn cleanup_staged_loser(
     Ok(())
 }
 
+#[derive(Debug)]
+struct CommitParticipantAuthority<'a> {
+    storage: StorageId,
+    table: &'a TableDef,
+    locator: &'a str,
+}
+
+/// Finishes a durable schema winner only when every CORD participant resolves
+/// through the exact base/target fragments carried by that mutation.  This is
+/// deliberately separate from active-NBSC discovery: a not-yet-published
+/// target is known by durable mutation authority, while any unexplained
+/// participant remains corruption.
+fn finish_exact_heap_commit_participants(
+    catalog: &Path,
+    decisions: &[crate::CoordinatorDecision],
+    decision: &crate::CoordinatorDecision,
+    authorities: &[CommitParticipantAuthority<'_>],
+) -> Result<(), DatabaseError> {
+    for participant in &decision.participants {
+        let authority = authorities
+            .iter()
+            .find(|authority| authority.storage == participant.storage_id)
+            .ok_or(DatabaseError::MissingCommitParticipant {
+                database_txn_id: decision.database_txn_id,
+                storage_id: participant.storage_id,
+                physical_txn_id: participant.physical_txn_id,
+            })?;
+        let path = file::resolve(catalog, authority.locator);
+        validate_resource_path(catalog, &path)?;
+        let inspection = TableStorage::inspect_heap_recovery(&path, authority.table)?;
+        if inspection.storage_id != participant.storage_id {
+            return Err(SchemaMutationError::Corrupt(
+                "schema winner participant StorageId mismatch",
+            )
+            .into());
+        }
+        let prepared = inspection
+            .prepared_transactions
+            .iter()
+            .find(|prepared| prepared.database_txn_id == decision.database_txn_id)
+            .ok_or(DatabaseError::MissingCommitParticipant {
+                database_txn_id: decision.database_txn_id,
+                storage_id: participant.storage_id,
+                physical_txn_id: participant.physical_txn_id,
+            })?;
+        if prepared.physical_txn_id != participant.physical_txn_id
+            || prepared.state == PreparedTransactionState::RolledBack
+        {
+            return Err(DatabaseError::PreparedParticipantMismatch {
+                database_txn_id: decision.database_txn_id,
+                storage_id: participant.storage_id,
+                physical_txn_id: participant.physical_txn_id,
+            });
+        }
+        let resolutions = inspection
+            .prepared_transactions
+            .iter()
+            .map(|prepared| {
+                crate::resolution_for_prepared(prepared, participant.storage_id, decisions)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        TableStorage::open_heap_with_prepared_resolutions(
+            &path,
+            authority.table.clone(),
+            &resolutions,
+        )?
+        .close()?;
+    }
+    Ok(())
+}
+
+/// Opens the exact target Heap inventory after its CORD participants have
+/// already been finished above.  Omitting the coordinator here cannot choose a
+/// transaction outcome; it only validates the committed winner bytes before
+/// NBSC publication.
+fn open_finished_heap_snapshot(
+    catalog: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+) -> Result<Database, DatabaseError> {
+    let mut storages = Vec::with_capacity(snapshot.storages.len());
+    for descriptor in &snapshot.storages {
+        if !matches!(descriptor.kind, CatalogStorageKind::Heap) {
+            return Err(SchemaMutationError::UnsupportedPlacement.into());
+        }
+        let table = snapshot
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == descriptor.table_id)
+            .cloned()
+            .ok_or(SchemaMutationError::Corrupt(
+                "winner storage table definition absent",
+            ))?;
+        let path = file::resolve(catalog, &descriptor.locator);
+        validate_resource_path(catalog, &path)?;
+        let storage = TableStorage::open_heap(path, table)?;
+        if storage.storage_id() != descriptor.id {
+            return Err(SchemaMutationError::Corrupt(
+                "winner storage descriptor identity mismatch",
+            )
+            .into());
+        }
+        storages.push(storage);
+    }
+    Database::compose_recovered(snapshot.committed.clone(), storages, None, None)
+}
+
 /// Resolve schema obligations before strict active NBSC/state pair validation.
 pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, DatabaseError> {
     let marker = file::marker(catalog)?
@@ -4019,7 +4154,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         return Ok(Some(journal));
     }
     let mut coordinator = CoordinatorLog::open(&coordinator_path)?;
-    let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+    let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
     for decision in decisions
         .iter()
         .filter(|decision| decision.schema.is_none())
@@ -4029,7 +4164,13 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             .get(&decision.database_txn_id)
             .and_then(|composition| composition.index_intent.as_ref())
         {
-            validate_schema_index_decision(intent, decision)?;
+            validate_schema_index_decision(
+                intent,
+                decision,
+                journal
+                    .source_backfill_intents
+                    .get(&decision.database_txn_id),
+            )?;
         }
     }
     for decision in decisions.iter().filter(|d| d.schema.is_some()) {
@@ -4074,7 +4215,13 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 continue;
             }
             if let Some(intent) = &composition.index_intent {
-                validate_schema_index_decision(intent, decision)?;
+                validate_schema_index_decision(
+                    intent,
+                    decision,
+                    journal
+                        .source_backfill_intents
+                        .get(&decision.database_txn_id),
+                )?;
                 continue;
             }
             let intent = composition
@@ -4103,6 +4250,202 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 SchemaMutationError::Corrupt("schema decision has no mutation intent").into(),
             );
         }
+    }
+    // A source-participant rewrite can name both the currently published S1
+    // and the not-yet-published S2. Resolve that exact durable winner before
+    // older terminal journal records reopen the active snapshot and encounter
+    // the newer incomplete CORD decision.
+    let mut source_participant_rewrites = journal
+        .rewrites
+        .values()
+        .filter(|rewrite| rewrite.resolved.is_none())
+        .filter_map(|rewrite| {
+            decisions
+                .iter()
+                .find(|decision| {
+                    decision.database_txn_id == rewrite.reservation.transaction
+                        && !decision.complete
+                        && decision
+                            .participants
+                            .iter()
+                            .any(|participant| participant.storage_id == rewrite.old_storage())
+                })
+                .map(|decision| (rewrite.clone(), decision.clone()))
+        })
+        .collect::<Vec<_>>();
+    source_participant_rewrites.sort_by_key(|(rewrite, _)| rewrite.reservation.transaction);
+    for (rewrite, decision) in source_participant_rewrites {
+        let reference = decision
+            .schema
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-participant rewrite lacks schema reference",
+            ))?;
+        validate_rewrite_reference(&rewrite, reference)?;
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, marker.incarnation, rewrite.reservation.transaction)?,
+        );
+        let bytes = file::read(&prepared)?;
+        if digest(&bytes) != reference.digest {
+            return Err(
+                SchemaMutationError::Corrupt("prepared rewrite NBSC digest mismatch").into(),
+            );
+        }
+        let target = SchemaCatalogSnapshot::decode(&bytes)?;
+        verify_rewrite_published(&target, &rewrite, true)?;
+        let reservation = rewrite_physical_reservation(&rewrite);
+        promote(catalog, &reservation, reference)?;
+        let authorities = [
+            CommitParticipantAuthority {
+                storage: rewrite.old_storage(),
+                table: &rewrite.base.committed.schema.tables()[0],
+                locator: &rewrite.base.storages[0].locator,
+            },
+            CommitParticipantAuthority {
+                storage: rewrite.new_storage(),
+                table: &rewrite.target.committed.schema.tables()[0],
+                locator: &rewrite.target.storages[0].locator,
+            },
+        ];
+        finish_exact_heap_commit_participants(catalog, &decisions, &decision, &authorities)?;
+        journal.retire_rewrite(rewrite.reservation.transaction)?;
+        crash("rewrite-retirement-durable");
+        open_finished_heap_snapshot(catalog, &target)?.close()?;
+        validate_rewrite_source(catalog, &rewrite)?;
+        file::publish_runtime(catalog, &target)?;
+        coordinator.complete(rewrite.reservation.transaction)?;
+        decisions
+            .iter_mut()
+            .find(|candidate| candidate.database_txn_id == rewrite.reservation.transaction)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-participant decision disappeared",
+            ))?
+            .complete = true;
+        journal.resolve_rewrite(rewrite.reservation.transaction, true)?;
+        cleanup_prepared(catalog, &reservation, marker.incarnation)?;
+    }
+    // Candidate-B late clones carry their source authority in tag 35 rather
+    // than the legacy rewrite map. Resolve these decisions before any older
+    // completed record attempts to open the active catalog through generic
+    // participant discovery.
+    let mut source_backfills = journal
+        .source_backfill_intents
+        .values()
+        .filter_map(|source| {
+            let composition = journal.compositions.get(&source.transaction)?;
+            if composition.resolution.is_some() {
+                return None;
+            }
+            let intent = composition.index_intent.as_ref()?;
+            let decision = decisions
+                .iter()
+                .find(|decision| decision.database_txn_id == source.transaction)?;
+            Some((source.clone(), intent.clone(), decision.clone()))
+        })
+        .collect::<Vec<_>>();
+    source_backfills.sort_by_key(|(source, _, _)| source.transaction);
+    for (source, intent, decision) in source_backfills {
+        validate_schema_index_decision(&intent, &decision, Some(&source))?;
+        let stage =
+            journal
+                .stage_intents
+                .get(&source.transaction)
+                .ok_or(SchemaMutationError::Corrupt(
+                    "source-backfill winner lacks stage authority",
+                ))?;
+        let finalization = journal
+            .migration_finalization_intents
+            .get(&source.transaction)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill winner lacks final index authority",
+            ))?;
+        let (replacement, final_indexes) = match intent.tables.as_slice() {
+            [
+                SchemaIndexTablePlan::RewriteHeap {
+                    replacement,
+                    final_indexes,
+                    ..
+                },
+            ] => (replacement.as_ref(), final_indexes),
+            _ => {
+                return Err(SchemaMutationError::Corrupt(
+                    "source-backfill winner is not one rewrite",
+                )
+                .into());
+            }
+        };
+        if stage.table != source.table
+            || stage.storage != source.target_storage
+            || stage.stage_locator != source.target_stage_locator
+            || stage.final_locator != source.target_final_locator
+            || finalization.table != source.table
+            || finalization.storage != source.target_storage
+            || finalization.stage_locator != source.target_stage_locator
+            || finalization.final_locator != source.target_final_locator
+            || finalization.final_table_version != source.target_table_version
+            || finalization.final_fingerprint != source.target_fingerprint
+            || finalization.final_indexes != *final_indexes
+            || heap_rewrite_indexes_digest(final_indexes)? != source.final_index_digest
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "source-backfill durable authorities disagree",
+            )
+            .into());
+        }
+        let reference = decision
+            .schema
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill winner lacks schema reference",
+            ))?;
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, marker.incarnation, source.transaction)?,
+        );
+        let bytes = file::read(&prepared)?;
+        if digest(&bytes) != reference.digest
+            || reference.digest != finalization.final_snapshot_digest
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "source-backfill prepared NBSC digest mismatch",
+            )
+            .into());
+        }
+        let target = SchemaCatalogSnapshot::decode(&bytes)?;
+        verify_schema_index_published(&target, &intent, true)?;
+        let reservation = schema_index_reservation(&intent, replacement, None);
+        promote(catalog, &reservation, reference)?;
+        let authorities = [
+            CommitParticipantAuthority {
+                storage: source.source_storage,
+                table: &replacement.base.committed.schema.tables()[0],
+                locator: &source.source_locator,
+            },
+            CommitParticipantAuthority {
+                storage: source.target_storage,
+                table: &replacement.target.committed.schema.tables()[0],
+                locator: &source.target_final_locator,
+            },
+        ];
+        finish_exact_heap_commit_participants(catalog, &decisions, &decision, &authorities)?;
+        let mut target_database = open_finished_heap_snapshot(catalog, &target)?;
+        verify_schema_index_inventory(&mut target_database, &intent)?;
+        target_database.close()?;
+        validate_composition_source(catalog, replacement)?;
+        journal.retire_composition_table(source.transaction, source.table)?;
+        crash("source-backfill-retirement-durable");
+        file::publish_runtime(catalog, &target)?;
+        coordinator.complete(source.transaction)?;
+        decisions
+            .iter_mut()
+            .find(|candidate| candidate.database_txn_id == source.transaction)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill decision disappeared",
+            ))?
+            .complete = true;
+        journal.resolve_composition(source.transaction, CompositionResolution::Winner)?;
+        cleanup_prepared(catalog, &reservation, marker.incarnation)?;
     }
     // Startup never chooses a candidate. It only resumes or verifies deletions
     // that already crossed the durable retry-only GC-intent boundary.
@@ -4768,6 +5111,7 @@ fn schema_index_reservation(
 fn validate_schema_index_decision(
     intent: &SchemaIndexChangeSetIntent,
     decision: &crate::CoordinatorDecision,
+    source_backfill: Option<&SourceBackfillIntent>,
 ) -> Result<(), SchemaMutationError> {
     if decision.schema.is_some() != intent.snapshot_digest.is_some() {
         return Err(SchemaMutationError::Corrupt(
@@ -4812,7 +5156,21 @@ fn validate_schema_index_decision(
             ));
         }
     }
-    if decision.participants.len() != intent.tables.len() {
+    if let Some(source) = source_backfill {
+        let source_matches = decision.participants.iter().any(|participant| {
+            participant.storage_id == source.source_storage
+                && participant.physical_txn_id == source.source_physical_txn_id
+        });
+        let target_matches = decision
+            .participants
+            .iter()
+            .any(|participant| participant.storage_id == source.target_storage);
+        if decision.participants.len() != 2 || !source_matches || !target_matches {
+            return Err(SchemaMutationError::Corrupt(
+                "source-backfill coordinator participant mismatch",
+            ));
+        }
+    } else if decision.participants.len() != intent.tables.len() {
         return Err(SchemaMutationError::Corrupt(
             "schema/index decision has extra participant",
         ));
@@ -5242,7 +5600,11 @@ fn recover_schema_index_composition(
     decision: Option<&crate::CoordinatorDecision>,
 ) -> Result<(), DatabaseError> {
     if let Some(decision) = decision {
-        validate_schema_index_decision(intent, decision)?;
+        validate_schema_index_decision(
+            intent,
+            decision,
+            journal.source_backfill_intents.get(&intent.transaction),
+        )?;
         if matches!(
             composition.resolution,
             Some(CompositionResolution::Loser | CompositionResolution::NoEffectiveChange)

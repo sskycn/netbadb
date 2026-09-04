@@ -1,5 +1,9 @@
 # DROP-first migration architecture audit (Round 37)
 
+> Round 38 implements this selected Candidate B core foundation and its
+> partial-winner recovery. See
+> [Source-participant backfill and late final clone](source-backfill-late-clone-round38.md).
+
 ## Decision
 
 **Chosen Round 38 architecture = B: late final clone from the transaction-visible

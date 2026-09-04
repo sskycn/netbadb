@@ -752,7 +752,7 @@ fn two_participant_schema_crash_child() {
 }
 
 #[test]
-fn partial_same_table_cord_winner_pins_the_current_recovery_blocker() {
+fn partial_same_table_cord_winner_finishes_all_participants() {
     let root = root("two-participant-crash");
     seed_users(&root).close().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -781,14 +781,14 @@ fn partial_same_table_cord_winner_pins_the_current_recovery_blocker() {
         .committed
         .next_storage_id
         .unwrap();
-    let error = match Database::open_catalog(root.join("catalog")) {
-        Ok(_) => panic!("current recovery unexpectedly accepted the omitted source participant"),
-        Err(error) => error,
-    };
-    assert!(
-        matches!(error, DatabaseError::MissingCommitParticipant { storage_id, .. } if storage_id == expected_target),
-        "{error:?}"
-    );
+    for _ in 0..3 {
+        let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            reopened.bindings.resolve_single(TableId(2)),
+            Ok(expected_target)
+        );
+        reopened.close().unwrap();
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 

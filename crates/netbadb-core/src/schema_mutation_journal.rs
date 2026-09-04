@@ -6,7 +6,7 @@ use netbadb_schema::{SchemaFingerprint, TypeSpec};
 use netbadb_storage::{HeapRewriteIndex, HeapRewriteIndexes};
 use netbadb_types::{
     ColumnId, DatabaseTxnId, IndexId, IndexName, PhysicalType, SchemaGeneration, SemanticType,
-    StorageId, TableId, TableSchemaVersion,
+    StorageId, TableId, TableSchemaVersion, TxnId,
 };
 
 use crate::schema_catalog::{Reader, SchemaCatalogSnapshot, Writer, envelope, open_envelope};
@@ -318,6 +318,33 @@ pub(crate) struct MigrationIndexFinalizationIntent {
     pub(crate) digest: [u8; 32],
 }
 
+/// Durable authority for a late clone whose source is an existing committed
+/// placement with a transaction-private write participant.  It binds both
+/// physical participants and the exact final target plan without persisting
+/// SQL or row data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceBackfillIntent {
+    pub(crate) transaction: DatabaseTxnId,
+    pub(crate) incarnation: [u8; 16],
+    pub(crate) table: TableId,
+    pub(crate) source_storage: StorageId,
+    pub(crate) source_table_version: TableSchemaVersion,
+    pub(crate) source_fingerprint: SchemaFingerprint,
+    pub(crate) source_locator: String,
+    pub(crate) source_physical_txn_id: TxnId,
+    pub(crate) target_storage: StorageId,
+    pub(crate) target_table_version: TableSchemaVersion,
+    pub(crate) target_fingerprint: SchemaFingerprint,
+    pub(crate) base_generation: SchemaGeneration,
+    pub(crate) target_generation: SchemaGeneration,
+    pub(crate) base_epoch: u64,
+    pub(crate) target_epoch: u64,
+    pub(crate) target_stage_locator: String,
+    pub(crate) target_final_locator: String,
+    pub(crate) final_index_digest: [u8; 32],
+    pub(crate) clone_plan_digest: [u8; 32],
+}
+
 fn composition_replacement(
     record: &CompositionRecord,
     table: TableId,
@@ -446,6 +473,7 @@ pub(crate) struct SchemaMutationJournal {
     pub(crate) finalization_intents: BTreeMap<DatabaseTxnId, FinalizationIntent>,
     pub(crate) migration_finalization_intents:
         BTreeMap<DatabaseTxnId, MigrationIndexFinalizationIntent>,
+    pub(crate) source_backfill_intents: BTreeMap<DatabaseTxnId, SourceBackfillIntent>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_sync: bool,
@@ -693,6 +721,45 @@ impl SchemaMutationJournal {
                 return Err(corrupt("migration finalization identity mismatch"));
             }
         }
+        for intent in journal.source_backfill_intents.values() {
+            if intent.incarnation != incarnation
+                || intent.source_storage == intent.target_storage
+                || intent.source_physical_txn_id.0 == 0
+                || intent.source_table_version.0 == 0
+                || intent.target_table_version.0
+                    != intent
+                        .source_table_version
+                        .0
+                        .checked_add(1)
+                        .ok_or(corrupt("source-backfill table version exhausted"))?
+                || intent.target_generation.0
+                    != intent
+                        .base_generation
+                        .0
+                        .checked_add(1)
+                        .ok_or(corrupt("source-backfill generation exhausted"))?
+                || intent.target_epoch
+                    != intent
+                        .base_epoch
+                        .checked_add(1)
+                        .ok_or(corrupt("source-backfill epoch exhausted"))?
+                || intent.source_locator
+                    != final_locator(catalog, incarnation, intent.source_storage)?
+                || intent.target_stage_locator
+                    != stage_locator(
+                        catalog,
+                        incarnation,
+                        intent.transaction,
+                        intent.target_storage,
+                    )?
+                || intent.target_final_locator
+                    != final_locator(catalog, incarnation, intent.target_storage)?
+                || intent.final_index_digest == [0; 32]
+                || intent.clone_plan_digest == [0; 32]
+            {
+                return Err(corrupt("source-backfill intent identity mismatch"));
+            }
+        }
         if activated {
             if open_envelope(&file::read(&witness)?, b"NBSA")? != incarnation {
                 return Err(corrupt("mutation activation incarnation mismatch"));
@@ -704,6 +771,7 @@ impl SchemaMutationJournal {
             || !journal.stage_intents.is_empty()
             || !journal.finalization_intents.is_empty()
             || !journal.migration_finalization_intents.is_empty()
+            || !journal.source_backfill_intents.is_empty()
         {
             return Err(corrupt("reservation history has no activation witness"));
         }
@@ -736,6 +804,7 @@ impl SchemaMutationJournal {
                     stage_intents: BTreeMap::new(),
                     finalization_intents: BTreeMap::new(),
                     migration_finalization_intents: BTreeMap::new(),
+                    source_backfill_intents: BTreeMap::new(),
                     poisoned: false,
                     #[cfg(test)]
                     fail_next_sync: false,
@@ -1465,6 +1534,81 @@ impl SchemaMutationJournal {
         self.persist()
     }
 
+    pub(crate) fn source_backfill_intent(
+        &mut self,
+        intent: SourceBackfillIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        let composition = self
+            .compositions
+            .get(&intent.transaction)
+            .ok_or(corrupt("source-backfill intent lacks composition"))?;
+        let replacement = composition
+            .index_intent
+            .as_ref()
+            .and_then(|aggregate| {
+                aggregate
+                    .tables
+                    .iter()
+                    .find_map(SchemaIndexTablePlan::replacement)
+            })
+            .ok_or(corrupt("source-backfill replacement plan absent"))?;
+        if self
+            .source_backfill_intents
+            .contains_key(&intent.transaction)
+            || self.stage_intents.contains_key(&intent.transaction)
+            || composition.resolution.is_some()
+            || replacement.table() != intent.table
+            || replacement.old_storage() != intent.source_storage
+            || replacement.new_storage() != intent.target_storage
+            || replacement.base.committed.tables[0].version != intent.source_table_version
+            || replacement.target.committed.tables[0].version != intent.target_table_version
+            || replacement.base.placements.tables[0].schema_fingerprint != intent.source_fingerprint
+            || replacement.target.placements.tables[0].schema_fingerprint
+                != intent.target_fingerprint
+            || replacement.base.storages[0].locator != intent.source_locator
+            || replacement.target.storages[0].locator != intent.target_final_locator
+        {
+            return Err(corrupt("invalid source-backfill intent authority"));
+        }
+        self.source_backfill_intents
+            .insert(intent.transaction, intent);
+        self.persist()
+    }
+
+    pub(crate) fn replace_schema_index_intent(
+        &mut self,
+        intent: SchemaIndexChangeSetIntent,
+    ) -> Result<(), SchemaMutationError> {
+        self.ensure_ready()?;
+        validate_schema_index_intent(
+            &intent.tables,
+            SchemaIndexValidationContext {
+                target_generation: intent.target_generation,
+                target_epoch: intent.target_epoch,
+                snapshot_digest: intent.snapshot_digest,
+                action_count: intent.action_count,
+                incarnation: self.incarnation,
+                coordinator: &self.coordinator,
+                base_generation: intent.base_generation,
+                base_epoch: intent.base_epoch,
+            },
+        )?;
+        let record = self
+            .compositions
+            .get_mut(&intent.transaction)
+            .ok_or(corrupt("source-backfill composition is absent"))?;
+        if record.index_intent.is_none()
+            || record.intent.is_some()
+            || record.table_intent.is_some()
+            || record.resolution.is_some()
+        {
+            return Err(corrupt("source-backfill composition is not replaceable"));
+        }
+        record.index_intent = Some(intent);
+        self.persist()
+    }
+
     pub(crate) fn schema_index_intent(
         &mut self,
         intent: SchemaIndexChangeSetIntent,
@@ -2119,6 +2263,7 @@ impl SchemaMutationJournal {
             .len()
             .checked_add(self.finalization_intents.len())
             .and_then(|count| count.checked_add(self.migration_finalization_intents.len()))
+            .and_then(|count| count.checked_add(self.source_backfill_intents.len()))
             .ok_or(corrupt("too many backfill intents"))?;
         let count = create_count
             .checked_add(drop_count)
@@ -2136,6 +2281,7 @@ impl SchemaMutationJournal {
             .chain(self.stage_intents.keys())
             .chain(self.finalization_intents.keys())
             .chain(self.migration_finalization_intents.keys())
+            .chain(self.source_backfill_intents.keys())
             .copied()
             .collect::<Vec<_>>();
         transactions.sort_unstable();
@@ -2371,29 +2517,6 @@ impl SchemaMutationJournal {
                         record.u64(replacement.table().0);
                         put_record(&mut w, &record.0)?;
                     }
-                    for replacement in intent
-                        .tables
-                        .iter()
-                        .filter_map(SchemaIndexTablePlan::replacement)
-                        .filter(|plan| plan.gc.is_some())
-                    {
-                        let gc = replacement
-                            .gc
-                            .as_ref()
-                            .ok_or(corrupt("schema/index composition GC disappeared"))?;
-                        let mut record = Writer(vec![22]);
-                        record.u64(txn.0);
-                        record.u64(replacement.table().0);
-                        record.u64(gc.coordinator_horizon.0);
-                        record.0.extend_from_slice(&gc.manifest_digest);
-                        put_record(&mut w, &record.0)?;
-                        if gc.complete {
-                            let mut record = Writer(vec![23]);
-                            record.u64(txn.0);
-                            record.u64(replacement.table().0);
-                            put_record(&mut w, &record.0)?;
-                        }
-                    }
                 }
                 if let Some(intent) = &composition.table_intent {
                     let mut record = Writer(vec![27]);
@@ -2441,6 +2564,31 @@ impl SchemaMutationJournal {
                     }]);
                     record.u64(txn.0);
                     put_record(&mut w, &record.0)?;
+                }
+                if let Some(intent) = &composition.index_intent {
+                    for replacement in intent
+                        .tables
+                        .iter()
+                        .filter_map(SchemaIndexTablePlan::replacement)
+                        .filter(|plan| plan.gc.is_some())
+                    {
+                        let gc = replacement
+                            .gc
+                            .as_ref()
+                            .ok_or(corrupt("schema/index composition GC disappeared"))?;
+                        let mut record = Writer(vec![22]);
+                        record.u64(txn.0);
+                        record.u64(replacement.table().0);
+                        record.u64(gc.coordinator_horizon.0);
+                        record.0.extend_from_slice(&gc.manifest_digest);
+                        put_record(&mut w, &record.0)?;
+                        if gc.complete {
+                            let mut record = Writer(vec![23]);
+                            record.u64(txn.0);
+                            record.u64(replacement.table().0);
+                            put_record(&mut w, &record.0)?;
+                        }
+                    }
                 }
                 if let Some(intent) = &composition.intent {
                     for plan in intent.tables.iter().filter(|plan| plan.gc.is_some()) {
@@ -2536,6 +2684,33 @@ impl SchemaMutationJournal {
             encode_heap_indexes(&mut record, &intent.final_indexes)?;
             put_record(&mut w, &record.0)?;
         }
+        for intent in self.source_backfill_intents.values() {
+            let mut record = Writer(vec![35]);
+            record.u64(intent.transaction.0);
+            record.0.extend_from_slice(&intent.incarnation);
+            record.u64(intent.table.0);
+            record.u64(intent.source_storage.0);
+            record.u64(intent.source_table_version.0);
+            record
+                .0
+                .extend_from_slice(intent.source_fingerprint.as_bytes());
+            record.string(&intent.source_locator)?;
+            record.u64(intent.source_physical_txn_id.0);
+            record.u64(intent.target_storage.0);
+            record.u64(intent.target_table_version.0);
+            record
+                .0
+                .extend_from_slice(intent.target_fingerprint.as_bytes());
+            record.u64(intent.base_generation.0);
+            record.u64(intent.target_generation.0);
+            record.u64(intent.base_epoch);
+            record.u64(intent.target_epoch);
+            record.string(&intent.target_stage_locator)?;
+            record.string(&intent.target_final_locator)?;
+            record.0.extend_from_slice(&intent.final_index_digest);
+            record.0.extend_from_slice(&intent.clone_plan_digest);
+            put_record(&mut w, &record.0)?;
+        }
         let bytes = envelope(b"NBSJ", &w.0)?;
         Self::decode(&bytes)?;
         Ok(bytes)
@@ -2567,6 +2742,7 @@ impl SchemaMutationJournal {
         let mut stage_intents = BTreeMap::new();
         let mut finalization_intents = BTreeMap::new();
         let mut migration_finalization_intents = BTreeMap::new();
+        let mut source_backfill_intents = BTreeMap::new();
         let mut last_columns: BTreeMap<TableId, ColumnId> = BTreeMap::new();
         let mut last_indexes: BTreeMap<TableId, IndexId> = BTreeMap::new();
         let mut last = (0, 0, 0, 0, 0);
@@ -3808,9 +3984,20 @@ impl SchemaMutationJournal {
                     );
                     let index = IndexId(record.u64()?);
                     let next_index_id = record.u64()?;
-                    let composition = compositions
-                        .get_mut(&txn)
-                        .ok_or(corrupt("migration IndexId reservation without composition"))?;
+                    let composition =
+                        compositions
+                            .entry(txn)
+                            .or_insert_with(|| CompositionRecord {
+                                transaction: txn,
+                                table_reservations: Vec::new(),
+                                reservations: Vec::new(),
+                                intent: None,
+                                index_reservations: Vec::new(),
+                                migration_index_reservations: Vec::new(),
+                                index_intent: None,
+                                table_intent: None,
+                                resolution: None,
+                            });
                     composition
                         .migration_index_reservations
                         .push(CompositionIndexReservation {
@@ -3864,6 +4051,74 @@ impl SchemaMutationJournal {
                         return Err(corrupt("duplicate migration finalization intent"));
                     }
                 }
+                35 => {
+                    let source_incarnation = record
+                        .take(16)?
+                        .try_into()
+                        .map_err(|_| corrupt("source-backfill incarnation"))?;
+                    let table = TableId(record.u64()?);
+                    let source_storage = StorageId(record.u64()?);
+                    let source_table_version = TableSchemaVersion(record.u64()?);
+                    let source_fingerprint = SchemaFingerprint::from_bytes(
+                        record
+                            .take(32)?
+                            .try_into()
+                            .map_err(|_| corrupt("source-backfill source fingerprint"))?,
+                    );
+                    let source_locator = record.string()?;
+                    let source_physical_txn_id = TxnId(record.u64()?);
+                    let target_storage = StorageId(record.u64()?);
+                    let target_table_version = TableSchemaVersion(record.u64()?);
+                    let target_fingerprint = SchemaFingerprint::from_bytes(
+                        record
+                            .take(32)?
+                            .try_into()
+                            .map_err(|_| corrupt("source-backfill target fingerprint"))?,
+                    );
+                    let base_generation = SchemaGeneration(record.u64()?);
+                    let target_generation = SchemaGeneration(record.u64()?);
+                    let base_epoch = record.u64()?;
+                    let target_epoch = record.u64()?;
+                    let target_stage_locator = record.string()?;
+                    let target_final_locator = record.string()?;
+                    let final_index_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("source-backfill index digest"))?;
+                    let clone_plan_digest = record
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| corrupt("source-backfill clone digest"))?;
+                    if source_backfill_intents
+                        .insert(
+                            txn,
+                            SourceBackfillIntent {
+                                transaction: txn,
+                                incarnation: source_incarnation,
+                                table,
+                                source_storage,
+                                source_table_version,
+                                source_fingerprint,
+                                source_locator,
+                                source_physical_txn_id,
+                                target_storage,
+                                target_table_version,
+                                target_fingerprint,
+                                base_generation,
+                                target_generation,
+                                base_epoch,
+                                target_epoch,
+                                target_stage_locator,
+                                target_final_locator,
+                                final_index_digest,
+                                clone_plan_digest,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(corrupt("duplicate source-backfill intent"));
+                    }
+                }
                 _ => return Err(corrupt("unknown journal record tag")),
             }
             if !record.0.is_empty() {
@@ -3874,6 +4129,13 @@ impl SchemaMutationJournal {
             return Err(corrupt("trailing journal bytes"));
         }
         for composition in compositions.values() {
+            if !composition.migration_index_reservations.is_empty()
+                && composition.intent.is_none()
+                && composition.index_intent.is_none()
+                && composition.table_intent.is_none()
+            {
+                return Err(corrupt("migration IndexId reservation without composition"));
+            }
             if usize::from(composition.intent.is_some())
                 + usize::from(composition.index_intent.is_some())
                 + usize::from(composition.table_intent.is_some())
@@ -3934,9 +4196,14 @@ impl SchemaMutationJournal {
                     for created in final_indexes.active.iter().filter(|created| {
                         !base_indexes.active.iter().any(|base| base.id == created.id)
                     }) {
-                        if !composition.index_reservations.iter().any(|reservation| {
-                            reservation.table == plan.table() && reservation.index == created.id
-                        }) {
+                        if !composition
+                            .index_reservations
+                            .iter()
+                            .chain(composition.migration_index_reservations.iter())
+                            .any(|reservation| {
+                                reservation.table == plan.table() && reservation.index == created.id
+                            })
+                        {
                             return Err(corrupt("schema/index create lacks IndexId reservation"));
                         }
                     }
@@ -3952,6 +4219,11 @@ impl SchemaMutationJournal {
                     plan.table() == intent.table && plan.new_storage() == intent.storage
                 })
             }) || composition.table_intent.as_ref().is_some_and(|aggregate| {
+                aggregate.tables.iter().any(|plan| {
+                    plan.table() == intent.table
+                        && plan.participant_storage() == Some(intent.storage)
+                })
+            }) || composition.index_intent.as_ref().is_some_and(|aggregate| {
                 aggregate.tables.iter().any(|plan| {
                     plan.table() == intent.table
                         && plan.participant_storage() == Some(intent.storage)
@@ -3983,6 +4255,81 @@ impl SchemaMutationJournal {
                 })
             {
                 return Err(corrupt("migration IndexId reservation identity mismatch"));
+            }
+        }
+        for intent in source_backfill_intents.values() {
+            let composition = compositions
+                .get(&intent.transaction)
+                .ok_or(corrupt("source-backfill intent has no composition"))?;
+            let aggregate = composition
+                .index_intent
+                .as_ref()
+                .ok_or(corrupt("source-backfill intent has no schema/index plan"))?;
+            let (replacement, final_indexes) = match aggregate.tables.as_slice() {
+                [
+                    SchemaIndexTablePlan::RewriteHeap {
+                        replacement,
+                        final_indexes,
+                        ..
+                    },
+                ] => (replacement.as_ref(), final_indexes),
+                _ => return Err(corrupt("source-backfill plan is not one rewrite")),
+            };
+            let snapshot_digest = aggregate
+                .snapshot_digest
+                .ok_or(corrupt("source-backfill target digest absent"))?;
+            let mut clone_plan = Vec::new();
+            clone_plan.extend_from_slice(&intent.transaction.0.to_le_bytes());
+            clone_plan.extend_from_slice(&intent.source_storage.0.to_le_bytes());
+            clone_plan.extend_from_slice(&intent.target_storage.0.to_le_bytes());
+            clone_plan.extend_from_slice(&aggregate.action_digest);
+            clone_plan.extend_from_slice(&snapshot_digest);
+            if replacement.table() != intent.table
+                || replacement.old_storage() != intent.source_storage
+                || replacement.new_storage() != intent.target_storage
+                || replacement.base.incarnation != intent.incarnation
+                || replacement.target.incarnation != intent.incarnation
+                || replacement.base.committed.tables[0].version != intent.source_table_version
+                || replacement.base.placements.tables[0].schema_fingerprint
+                    != intent.source_fingerprint
+                || replacement.base.storages[0].locator != intent.source_locator
+                || replacement.target.committed.tables[0].version != intent.target_table_version
+                || replacement.target.placements.tables[0].schema_fingerprint
+                    != intent.target_fingerprint
+                || replacement.target.storages[0].locator != intent.target_final_locator
+                || aggregate.base_generation != intent.base_generation
+                || aggregate.target_generation != Some(intent.target_generation)
+                || aggregate.base_epoch != intent.base_epoch
+                || aggregate.target_epoch != Some(intent.target_epoch)
+                || heap_rewrite_indexes_digest(final_indexes)? != intent.final_index_digest
+                || crate::schema_mutation::digest(&clone_plan) != intent.clone_plan_digest
+            {
+                return Err(corrupt("source-backfill plan authority mismatch"));
+            }
+            match stage_intents.get(&intent.transaction) {
+                Some(stage)
+                    if stage.table == intent.table
+                        && stage.storage == intent.target_storage
+                        && stage.stage_locator == intent.target_stage_locator
+                        && stage.final_locator == intent.target_final_locator
+                        && stage.provisional == replacement.target => {}
+                None if composition.resolution != Some(CompositionResolution::Winner)
+                    && !migration_finalization_intents.contains_key(&intent.transaction) => {}
+                _ => return Err(corrupt("source-backfill stage evidence mismatch")),
+            }
+            if let Some(finalization) = migration_finalization_intents.get(&intent.transaction) {
+                if finalization.table != intent.table
+                    || finalization.storage != intent.target_storage
+                    || finalization.final_table_version != intent.target_table_version
+                    || finalization.final_fingerprint != intent.target_fingerprint
+                    || finalization.final_snapshot_digest != snapshot_digest
+                    || finalization.final_indexes != *final_indexes
+                    || heap_rewrite_indexes_digest(&finalization.final_indexes)?
+                        != intent.final_index_digest
+                    || finalization.final_indexes.next_index_id.0 == 0
+                {
+                    return Err(corrupt("source-backfill final evidence mismatch"));
+                }
             }
         }
         let mut retired = BTreeMap::new();
@@ -4068,6 +4415,7 @@ impl SchemaMutationJournal {
             stage_intents,
             finalization_intents,
             migration_finalization_intents,
+            source_backfill_intents,
             poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,
@@ -4095,6 +4443,14 @@ fn encode_heap_indexes(
         writer.u32(index.column_id.0);
     }
     Ok(())
+}
+
+pub(crate) fn heap_rewrite_indexes_digest(
+    indexes: &HeapRewriteIndexes,
+) -> Result<[u8; 32], SchemaMutationError> {
+    let mut writer = Writer(Vec::new());
+    encode_heap_indexes(&mut writer, indexes)?;
+    Ok(crate::schema_mutation::digest(&writer.0))
 }
 
 fn decode_heap_indexes(reader: &mut Reader<'_>) -> Result<HeapRewriteIndexes, SchemaMutationError> {

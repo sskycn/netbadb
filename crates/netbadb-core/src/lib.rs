@@ -2623,6 +2623,9 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         transaction.validate_commit_owner(&self.transaction_owner)?;
         self.ensure_schema_materialized(transaction)?;
+        if transaction.schema_composition.source_backfill().is_some() {
+            self.finalize_source_backfill(transaction)?;
+        }
         if (transaction.schema_composition.backfill().is_some()
             || transaction.schema_composition.backfill_index().is_some())
             && !matches!(
@@ -2842,6 +2845,28 @@ impl Database {
                 .into());
             }
         }
+        if let Some(source_backfill) = transaction.schema_composition.source_backfill() {
+            let target = source_backfill
+                .logical
+                .touched
+                .keys()
+                .next()
+                .copied()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "source-backfill target absent",
+                ))?;
+            if logical
+                .read_tables()
+                .into_iter()
+                .chain(logical.write_tables())
+                .any(|table| table != target)
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+                )
+                .into());
+            }
+        }
         self.ensure_schema_materialized_with_backfill(transaction, true)?;
         if matches!(
             transaction.schema_composition,
@@ -2850,6 +2875,10 @@ impl Database {
                 | schema_composition::SchemaCompositionState::RefiningAfterEvacuation(_)
                 | schema_composition::SchemaCompositionState::IndexFinalizing(_)
                 | schema_composition::SchemaCompositionState::RefiningIndex(_)
+                | schema_composition::SchemaCompositionState::SourceRefining(_)
+                | schema_composition::SchemaCompositionState::SourceIndexFinalizing(_)
+                | schema_composition::SchemaCompositionState::LateCloneMaterializing(_)
+                | schema_composition::SchemaCompositionState::LateCloneReady(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
         {
             return Err(SchemaMutationError::MigrationDataAccessAfterRefinement.into());
@@ -7313,6 +7342,8 @@ mod migration_backfill_audit_tests;
 mod migration_backfill_index_tests;
 #[cfg(test)]
 mod migration_clone_audit_tests;
+#[cfg(test)]
+mod source_backfill_tests;
 #[cfg(test)]
 mod sql_alter_table_tests;
 #[cfg(test)]

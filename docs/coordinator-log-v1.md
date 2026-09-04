@@ -5,6 +5,13 @@ by explicitly coordinator-enabled local databases. It is not stored in a Heap
 participant WAL. All integers are unsigned little-endian. The log is
 append-only in v1 and has no GC/checkpoint.
 
+Round 38 startup may resolve a schema winner absent from the old active NBSC
+only through exact typed NBSJ stage/final authority and an exact CORD StorageId
+plus physical TxnId match. Both source and target are winners and must finish
+before final schema publication. Missing unexplained participants, rolled-back
+participants, and identity mismatches remain hard errors, and client admission
+waits for the whole decision to converge.
+
 ## File header
 
 The file begins with exactly 16 bytes:

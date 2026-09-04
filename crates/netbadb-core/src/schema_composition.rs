@@ -31,8 +31,9 @@ use crate::schema_mutation_journal::{
     CompositionColumnReservation, CompositionIndexReservation, CompositionResolution,
     CompositionTablePlan, CompositionTableReservation, CreateIntent, FinalizationIntent,
     MigrationIndexFinalizationIntent, Reservation, SchemaChangeSetIntent,
-    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal, StageResourceIntent,
-    TableObjectChangeSetIntent, final_locator, namespace, prepared_locator, stage_locator,
+    SchemaIndexChangeSetIntent, SchemaIndexTablePlan, SchemaMutationJournal, SourceBackfillIntent,
+    StageResourceIntent, TableObjectChangeSetIntent, final_locator, namespace, prepared_locator,
+    stage_locator,
 };
 use crate::{Database, DatabaseError, Transaction, TransactionState};
 
@@ -40,6 +41,15 @@ pub(crate) const MAX_SCHEMA_ACTIONS: usize = 128;
 pub(crate) const MAX_TOUCHED_TABLES: usize = 64;
 pub(crate) const MAX_COLUMN_RESERVATIONS: usize = 128;
 pub(crate) const MAX_INDEX_RESERVATIONS: usize = 128;
+
+#[derive(Debug, Clone, Copy)]
+enum SchemaIndexMaterialization {
+    Ordinary,
+    SourceBackfill {
+        source_storage: StorageId,
+        source_physical_txn_id: netbadb_types::TxnId,
+    },
+}
 
 #[derive(Debug)]
 pub(crate) enum SchemaCompositionState {
@@ -60,6 +70,12 @@ pub(crate) enum SchemaCompositionState {
     FinalizedIndex(Box<MaterializedSchemaIndexTransaction>),
     SealingAndMaterializingIndex(Box<MaterializedSchemaIndexTransaction>),
     MaterializedIndex(Box<MaterializedSchemaIndexTransaction>),
+    #[cfg_attr(not(test), allow(dead_code))]
+    SourceBackfillOpen(Box<MaterializedSchemaIndexTransaction>),
+    SourceRefining(Box<MaterializedSchemaIndexTransaction>),
+    SourceIndexFinalizing(Box<MaterializedSchemaIndexTransaction>),
+    LateCloneMaterializing(Box<MaterializedSchemaIndexTransaction>),
+    LateCloneReady(Box<MaterializedSchemaIndexTransaction>),
     SealedNoEffectiveChange(Box<SchemaTransactionPlan>),
     RollbackRequiredLogical(Box<SchemaTransactionPlan>),
     RollbackRequiredMaterialized(Box<MaterializedSchemaTransaction>),
@@ -93,6 +109,11 @@ impl SchemaCompositionState {
                 | Self::FinalizedIndex(_)
                 | Self::SealingAndMaterializingIndex(_)
                 | Self::MaterializedIndex(_)
+                | Self::SourceBackfillOpen(_)
+                | Self::SourceRefining(_)
+                | Self::SourceIndexFinalizing(_)
+                | Self::LateCloneMaterializing(_)
+                | Self::LateCloneReady(_)
                 | Self::SealedNoEffectiveChange(_)
                 | Self::RollbackRequiredLogical(_)
                 | Self::RollbackRequiredMaterialized(_)
@@ -118,6 +139,11 @@ impl SchemaCompositionState {
             | Self::RollbackRequiredMaterialized(materialized) => Some(&materialized.logical),
             Self::SealingAndMaterializingIndex(materialized)
             | Self::MaterializedIndex(materialized)
+            | Self::SourceBackfillOpen(materialized)
+            | Self::SourceRefining(materialized)
+            | Self::SourceIndexFinalizing(materialized)
+            | Self::LateCloneMaterializing(materialized)
+            | Self::LateCloneReady(materialized)
             | Self::BackfillOpenIndex(materialized)
             | Self::RefiningIndex(materialized)
             | Self::FinalizedIndex(materialized)
@@ -130,6 +156,11 @@ impl SchemaCompositionState {
         match self {
             Self::SealingAndMaterializingIndex(materialized)
             | Self::MaterializedIndex(materialized)
+            | Self::SourceBackfillOpen(materialized)
+            | Self::SourceRefining(materialized)
+            | Self::SourceIndexFinalizing(materialized)
+            | Self::LateCloneMaterializing(materialized)
+            | Self::LateCloneReady(materialized)
             | Self::BackfillOpenIndex(materialized)
             | Self::RefiningIndex(materialized)
             | Self::FinalizedIndex(materialized)
@@ -144,6 +175,11 @@ impl SchemaCompositionState {
         match self {
             Self::SealingAndMaterializingIndex(materialized)
             | Self::MaterializedIndex(materialized)
+            | Self::SourceBackfillOpen(materialized)
+            | Self::SourceRefining(materialized)
+            | Self::SourceIndexFinalizing(materialized)
+            | Self::LateCloneMaterializing(materialized)
+            | Self::LateCloneReady(materialized)
             | Self::BackfillOpenIndex(materialized)
             | Self::RefiningIndex(materialized)
             | Self::FinalizedIndex(materialized)
@@ -230,6 +266,21 @@ impl SchemaCompositionState {
             | Self::FinalizedIndex(materialized) => Some(materialized),
             _ => None,
         }
+    }
+
+    pub(crate) fn source_backfill(&self) -> Option<&MaterializedSchemaIndexTransaction> {
+        match self {
+            Self::SourceBackfillOpen(materialized)
+            | Self::SourceRefining(materialized)
+            | Self::SourceIndexFinalizing(materialized)
+            | Self::LateCloneMaterializing(materialized)
+            | Self::LateCloneReady(materialized) => Some(materialized),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_late_clone_materializing(&self) -> bool {
+        matches!(self, Self::LateCloneMaterializing(_))
     }
 }
 
@@ -338,6 +389,10 @@ pub(crate) struct MaterializedSchemaIndexTransaction {
     pub(crate) staged: BTreeMap<StorageId, TableStorage>,
     pub(crate) publications: Vec<IndexPublication>,
     pub(crate) backfill: bool,
+    #[cfg(test)]
+    pub(crate) source_copy_passes: u64,
+    #[cfg(test)]
+    pub(crate) source_rows_copied: u64,
 }
 
 impl MaterializedSchemaIndexTransaction {
@@ -404,6 +459,307 @@ impl MaterializedSchemaTransaction {
 }
 
 impl Database {
+    /// Enters the crate-private Candidate B foundation after preparatory index
+    /// drops have been accepted. Public SQL never calls this transition.
+    #[cfg(test)]
+    pub(crate) fn open_source_backfill(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        self.ensure_schema_materialized_with_backfill(transaction, false)?;
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        let materialized = match previous {
+            SchemaCompositionState::MaterializedIndex(materialized) => materialized,
+            other => {
+                transaction.schema_composition = other;
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+        };
+        let eligible = materialized.logical.table_actions == 0
+            && materialized.logical.created.is_empty()
+            && materialized.logical.touched.len() == 1
+            && materialized.intent.tables.len() == 1
+            && materialized.target.is_none()
+            && materialized.reference.is_none()
+            && materialized.staged.is_empty()
+            && matches!(
+                &materialized.intent.tables[0],
+                SchemaIndexTablePlan::InPlaceIndexDelta {
+                    storage,
+                    base_indexes,
+                    final_indexes,
+                    ..
+                } if transaction.is_write_participant(*storage)
+                    && final_indexes.active.len() < base_indexes.active.len()
+                    && final_indexes.active.iter().all(|final_index| {
+                        base_indexes.active.iter().any(|base| base == final_index)
+                    })
+            );
+        if !eligible {
+            transaction.schema_composition =
+                SchemaCompositionState::MaterializedIndex(materialized);
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+            )
+            .into());
+        }
+        transaction.schema_composition = SchemaCompositionState::SourceBackfillOpen(materialized);
+        Ok(())
+    }
+
+    /// Applies one layout-compatible refinement against the transaction-visible
+    /// S1 view. The first successful change closes all later relational access.
+    pub(crate) fn apply_source_backfill_refinement(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        if !matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::SourceBackfillOpen(_)
+                | SchemaCompositionState::SourceRefining(_)
+        ) {
+            return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+        }
+        let (table_id, source_storage, current, visible_schema, base_version) = {
+            let materialized = transaction
+                .schema_composition
+                .source_backfill()
+                .ok_or(SchemaMutationError::Corrupt("source-backfill state absent"))?;
+            if materialized.logical.touched.len() != 1
+                || !materialized
+                    .logical
+                    .touched
+                    .contains_key(&spec.target.table_id)
+                || materialized.logical.dependency(spec.target.table_id)? != spec.target
+            {
+                return Err(SchemaMutationError::StaleSchemaDependency.into());
+            }
+            let touched = &materialized.logical.touched[&spec.target.table_id];
+            let current = materialized
+                .logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == spec.target.table_id)
+                .cloned()
+                .ok_or(SchemaMutationError::TableNotFound(spec.target.table_id))?;
+            (
+                spec.target.table_id,
+                touched.old_storage,
+                current,
+                materialized.logical.overlay.schema.clone(),
+                touched.base_lineage.version,
+            )
+        };
+        let indexed_nullability = match &spec.operation {
+            AlterTableOperation::SetNotNull { column_id }
+            | AlterTableOperation::DropNotNull { column_id } => Some(*column_id),
+            AlterTableOperation::RenameTable { .. } | AlterTableOperation::RenameColumn { .. } => {
+                None
+            }
+            _ => {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::UnsupportedOperation,
+                )
+                .into());
+            }
+        };
+        if let Some(column_id) = indexed_nullability {
+            let materialized = transaction
+                .schema_composition
+                .source_backfill()
+                .ok_or(SchemaMutationError::Corrupt("source-backfill state absent"))?;
+            let touched = &materialized.logical.touched[&table_id];
+            let dropped = touched
+                .base_indexes
+                .active
+                .iter()
+                .filter(|index| index.column_id == column_id)
+                .all(|base| {
+                    !touched
+                        .indexes
+                        .active
+                        .iter()
+                        .any(|index| index.id == base.id)
+                        && materialized.publications.iter().any(|publication| {
+                            publication.storage == source_storage
+                                && publication.drops.contains(&base.id)
+                        })
+                });
+            if !dropped
+                || touched
+                    .indexes
+                    .active
+                    .iter()
+                    .any(|index| index.column_id == column_id)
+                || !transaction.is_write_participant(source_storage)
+            {
+                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::IndexedNullability(column_id),
+                )
+                .into());
+            }
+            if matches!(spec.operation, AlterTableOperation::SetNotNull { .. }) {
+                let view = transaction.begin_read_view(&[source_storage], &mut self.registry)?;
+                let source_view = view
+                    .iter()
+                    .find_map(|(storage, view)| (storage == source_storage).then_some(view))
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "source-backfill read view absent",
+                    ))?;
+                if self
+                    .registry
+                    .get_mut(source_storage)
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "source-backfill source Heap absent",
+                    ))?
+                    .scan_columns_with_view(&[column_id], source_view)?
+                    .iter()
+                    .any(|(_, values)| {
+                        values
+                            .iter()
+                            .any(|value| matches!(value, ScalarValue::Null))
+                    })
+                {
+                    return Err(SchemaMutationError::NotNullViolation(column_id).into());
+                }
+            }
+        }
+        let candidate = build_alter_target(&current, &spec.operation, None)?;
+        let candidate_schema = Schema::new(
+            visible_schema
+                .tables()
+                .iter()
+                .map(|table| {
+                    if table.id == table_id {
+                        candidate.clone()
+                    } else {
+                        table.clone()
+                    }
+                })
+                .collect(),
+        )?;
+        let target_version = base_version
+            .0
+            .checked_add(1)
+            .map(TableSchemaVersion)
+            .ok_or(SchemaMutationError::IdentityExhausted("TableSchemaVersion"))?;
+        let materialized = transaction
+            .schema_composition
+            .materialized_index_mut()
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill state disappeared",
+            ))?;
+        materialized.logical.overlay.schema = candidate_schema;
+        materialized
+            .logical
+            .overlay
+            .tables
+            .iter_mut()
+            .find(|lineage| lineage.table_id == table_id)
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill lineage disappeared",
+            ))?
+            .version = target_version;
+        let mut evidence = Sha256::new();
+        evidence.update(b"source-backfill-refinement");
+        evidence.update(table_id.0.to_le_bytes());
+        evidence.update(target_version.0.to_le_bytes());
+        evidence.update(candidate.fingerprint()?.as_bytes());
+        materialized
+            .logical
+            .action_evidence
+            .push(evidence.finalize().into());
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        transaction.schema_composition = match previous {
+            SchemaCompositionState::SourceBackfillOpen(materialized)
+            | SchemaCompositionState::SourceRefining(materialized) => {
+                SchemaCompositionState::SourceRefining(materialized)
+            }
+            other => other,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn finalize_source_backfill(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        let mut materialized = match previous {
+            SchemaCompositionState::SourceBackfillOpen(materialized) => {
+                transaction.schema_composition =
+                    SchemaCompositionState::MaterializedIndex(materialized);
+                return Ok(());
+            }
+            SchemaCompositionState::SourceRefining(materialized)
+            | SchemaCompositionState::SourceIndexFinalizing(materialized) => materialized,
+            other => {
+                transaction.schema_composition = other;
+                return Ok(());
+            }
+        };
+        let (table_id, source_storage, base_table) =
+            {
+                let (table_id, touched) = materialized.logical.touched.iter().next().ok_or(
+                    SchemaMutationError::Corrupt("source-backfill target absent"),
+                )?;
+                (*table_id, touched.old_storage, touched.base_table.clone())
+            };
+        let final_table = materialized
+            .logical
+            .overlay
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == table_id)
+            .cloned()
+            .ok_or(SchemaMutationError::TableNotFound(table_id))?;
+        if final_table == base_table {
+            materialized
+                .logical
+                .overlay
+                .tables
+                .iter_mut()
+                .find(|lineage| lineage.table_id == table_id)
+                .ok_or(SchemaMutationError::Corrupt(
+                    "source-backfill no-op lineage absent",
+                ))?
+                .version = materialized.logical.touched[&table_id].base_lineage.version;
+            transaction.schema_composition =
+                SchemaCompositionState::MaterializedIndex(materialized);
+            return Ok(());
+        }
+        let source_physical_txn_id = transaction.physical_transaction_id(source_storage).ok_or(
+            SchemaMutationError::Corrupt("source-backfill physical transaction absent"),
+        )?;
+        let logical = materialized.logical;
+        self.materialize_schema_index_composition(
+            transaction,
+            logical,
+            SchemaIndexMaterialization::SourceBackfill {
+                source_storage,
+                source_physical_txn_id,
+            },
+        )
+    }
+
     pub(crate) fn should_compose_index_ddl(
         &self,
         transaction: &Transaction,
@@ -478,6 +834,13 @@ impl Database {
         transaction: &mut Transaction,
         spec: AlterTableSpec,
     ) -> Result<(), DatabaseError> {
+        if matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::SourceBackfillOpen(_)
+                | SchemaCompositionState::SourceRefining(_)
+        ) {
+            return self.apply_source_backfill_refinement(transaction, spec);
+        }
         if matches!(
             &transaction.schema_composition,
             SchemaCompositionState::BackfillOpen(_)
@@ -2116,6 +2479,13 @@ impl Database {
     ) -> Result<crate::DdlOutcome, DatabaseError> {
         if matches!(
             transaction.schema_composition,
+            SchemaCompositionState::SourceRefining(_)
+                | SchemaCompositionState::SourceIndexFinalizing(_)
+        ) {
+            return self.apply_source_backfill_create_index(transaction, statement);
+        }
+        if matches!(
+            transaction.schema_composition,
             SchemaCompositionState::BackfillOpen(_)
                 | SchemaCompositionState::RefiningAfterEvacuation(_)
                 | SchemaCompositionState::Refining(_)
@@ -2274,6 +2644,126 @@ impl Database {
             | SchemaCompositionState::Refining(materialized)
             | SchemaCompositionState::IndexFinalizing(materialized) => {
                 SchemaCompositionState::IndexFinalizing(materialized)
+            }
+            other => other,
+        };
+        Ok(crate::DdlOutcome::Created)
+    }
+
+    fn apply_source_backfill_create_index(
+        &mut self,
+        transaction: &mut Transaction,
+        statement: &crate::TypedCreateIndex,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
+        if self
+            .index_name_bindings(Some(transaction))
+            .into_iter()
+            .any(|binding| binding.name == statement.name)
+        {
+            return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
+        }
+        let (dependency, mut touched, journal) = {
+            let plan =
+                transaction
+                    .schema_composition
+                    .plan()
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "source-backfill composition absent",
+                    ))?;
+            let dependency = plan.dependency(statement.target.table_id)?;
+            if dependency.table_version != statement.target.table_version
+                || dependency.fingerprint != statement.target.fingerprint
+            {
+                return Err(SchemaMutationError::StaleSchemaDependency.into());
+            }
+            let touched = plan
+                .touched
+                .get(&statement.target.table_id)
+                .cloned()
+                .ok_or(SchemaMutationError::UnsupportedBackfillRefinement(
+                    crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+                ))?;
+            (dependency, touched, Rc::clone(&plan.journal))
+        };
+        if transaction
+            .schema_composition
+            .plan()
+            .is_some_and(|plan| plan.index_reservation_count >= MAX_INDEX_RESERVATIONS)
+        {
+            return Err(
+                SchemaMutationError::CompositionLimitExceeded("IndexId reservations").into(),
+            );
+        }
+        touched.indexes.next_index_id = journal
+            .borrow()
+            .effective_index(statement.target.table_id, touched.indexes.next_index_id)
+            .ok_or(SchemaMutationError::IdentityExhausted("IndexId"))?;
+        if touched
+            .indexes
+            .active
+            .iter()
+            .any(|index| index.column_id == statement.column_id)
+        {
+            return Err(netbadb_storage::StorageError::from(
+                netbadb_index::IndexError::IndexAlreadyExists {
+                    column_id: statement.column_id,
+                },
+            )
+            .into());
+        }
+        let index = touched.indexes.next_index_id;
+        let next_index_id = index
+            .0
+            .checked_add(1)
+            .map(IndexId)
+            .ok_or(SchemaMutationError::IdentityExhausted("IndexId"))?;
+        journal
+            .borrow_mut()
+            .reserve_migration_index(CompositionIndexReservation {
+                transaction: transaction.id(),
+                table: statement.target.table_id,
+                table_version: dependency.table_version,
+                fingerprint: dependency.fingerprint,
+                index,
+                next_index_id: Some(next_index_id),
+            })?;
+        touched.indexes.next_index_id = next_index_id;
+        touched.indexes.active.push(HeapRewriteIndex {
+            id: index,
+            name: Some(statement.name.clone()),
+            column_id: statement.column_id,
+        });
+        touched.indexes.active.sort_by_key(|entry| entry.id);
+        let materialized = transaction
+            .schema_composition
+            .materialized_index_mut()
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill materialization absent",
+            ))?;
+        materialized
+            .logical
+            .touched
+            .insert(statement.target.table_id, touched);
+        materialized.logical.index_reservation_count += 1;
+        materialized.logical.index_actions += 1;
+        let mut evidence = Sha256::new();
+        evidence.update(b"source-backfill-create-index");
+        evidence.update(statement.target.table_id.0.to_le_bytes());
+        evidence.update(index.0.to_le_bytes());
+        evidence.update(statement.column_id.0.to_le_bytes());
+        evidence.update(statement.name.as_str().as_bytes());
+        materialized
+            .logical
+            .action_evidence
+            .push(evidence.finalize().into());
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        transaction.schema_composition = match previous {
+            SchemaCompositionState::SourceRefining(materialized)
+            | SchemaCompositionState::SourceIndexFinalizing(materialized) => {
+                SchemaCompositionState::SourceIndexFinalizing(materialized)
             }
             other => other,
         };
@@ -2452,6 +2942,13 @@ impl Database {
     ) -> Result<crate::DdlOutcome, DatabaseError> {
         if matches!(
             transaction.schema_composition,
+            SchemaCompositionState::SourceRefining(_)
+                | SchemaCompositionState::SourceIndexFinalizing(_)
+        ) {
+            return self.apply_source_backfill_drop_index(transaction, target);
+        }
+        if matches!(
+            transaction.schema_composition,
             SchemaCompositionState::BackfillOpen(_)
                 | SchemaCompositionState::Refining(_)
                 | SchemaCompositionState::IndexFinalizing(_)
@@ -2506,6 +3003,54 @@ impl Database {
             | SchemaCompositionState::Refining(materialized)
             | SchemaCompositionState::IndexFinalizing(materialized) => {
                 SchemaCompositionState::IndexFinalizing(materialized)
+            }
+            other => other,
+        };
+        Ok(crate::DdlOutcome::Dropped)
+    }
+
+    fn apply_source_backfill_drop_index(
+        &mut self,
+        transaction: &mut Transaction,
+        target: crate::DropIndexTarget,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
+        let materialized = transaction
+            .schema_composition
+            .materialized_index_mut()
+            .ok_or(SchemaMutationError::Corrupt(
+                "source-backfill materialization absent",
+            ))?;
+        let table = materialized
+            .logical
+            .touched
+            .get_mut(&target.table_id)
+            .ok_or(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+            ))?;
+        let position = table
+            .indexes
+            .active
+            .iter()
+            .position(|index| index.id == target.index_id)
+            .ok_or(DatabaseError::UndefinedIndex)?;
+        table.indexes.active.remove(position);
+        materialized.logical.index_actions += 1;
+        let mut evidence = Sha256::new();
+        evidence.update(b"source-backfill-drop-index");
+        evidence.update(target.table_id.0.to_le_bytes());
+        evidence.update(target.index_id.0.to_le_bytes());
+        materialized
+            .logical
+            .action_evidence
+            .push(evidence.finalize().into());
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        transaction.schema_composition = match previous {
+            SchemaCompositionState::SourceRefining(materialized)
+            | SchemaCompositionState::SourceIndexFinalizing(materialized) => {
+                SchemaCompositionState::SourceIndexFinalizing(materialized)
             }
             other => other,
         };
@@ -2762,7 +3307,11 @@ impl Database {
         } else if logical.index_actions == 0 {
             self.materialize_schema_composition(transaction, *logical, activate_backfill)
         } else {
-            self.materialize_schema_index_composition(transaction, *logical)
+            self.materialize_schema_index_composition(
+                transaction,
+                *logical,
+                SchemaIndexMaterialization::Ordinary,
+            )
         };
         match materialized {
             Ok(()) => Ok(()),
@@ -3214,7 +3763,11 @@ impl Database {
                     .is_none_or(|table| table != &touched.base_table)
             });
         if !schema_dirty {
-            return self.materialize_schema_index_composition(transaction, logical);
+            return self.materialize_schema_index_composition(
+                transaction,
+                logical,
+                SchemaIndexMaterialization::Ordinary,
+            );
         }
         self.catalog_generation
             .checked_add(1)
@@ -3555,6 +4108,10 @@ impl Database {
                 staged: BTreeMap::new(),
                 publications: Vec::new(),
                 backfill,
+                #[cfg(test)]
+                source_copy_passes: 0,
+                #[cfg(test)]
+                source_rows_copied: 0,
             }),
         );
         for (position, plan) in intent.tables.iter().enumerate() {
@@ -3615,6 +4172,7 @@ impl Database {
         &mut self,
         transaction: &mut Transaction,
         logical: SchemaTransactionPlan,
+        materialization: SchemaIndexMaterialization,
     ) -> Result<(), DatabaseError> {
         let effective = logical
             .touched
@@ -3827,12 +4385,24 @@ impl Database {
             snapshot_digest,
             tables: table_plans,
         };
+        if matches!(
+            materialization,
+            SchemaIndexMaterialization::SourceBackfill { .. }
+        ) {
+            crash("source-backfill-target-reserved");
+        }
         crash("composition-before-intent");
-        if let Err(error) = logical
-            .journal
-            .borrow_mut()
-            .schema_index_intent(intent.clone())
-        {
+        let intent_result = match materialization {
+            SchemaIndexMaterialization::Ordinary => logical
+                .journal
+                .borrow_mut()
+                .schema_index_intent(intent.clone()),
+            SchemaIndexMaterialization::SourceBackfill { .. } => logical
+                .journal
+                .borrow_mut()
+                .replace_schema_index_intent(intent.clone()),
+        };
+        if let Err(error) = intent_result {
             return if logical.journal.borrow().ensure_ready().is_err() {
                 Err(SchemaMutationError::RecoveryRequired.into())
             } else {
@@ -3871,17 +4441,114 @@ impl Database {
                 );
             }
         };
-        transaction.schema_composition = SchemaCompositionState::SealingAndMaterializingIndex(
-            Box::new(MaterializedSchemaIndexTransaction {
-                logical,
-                target,
-                reference,
-                intent: intent.clone().into(),
-                staged: BTreeMap::new(),
-                publications: Vec::new(),
-                backfill: false,
-            }),
-        );
+        if let SchemaIndexMaterialization::SourceBackfill {
+            source_storage,
+            source_physical_txn_id,
+        } = materialization
+        {
+            let target_snapshot = target.as_ref().ok_or(SchemaMutationError::Corrupt(
+                "source-backfill target snapshot absent",
+            ))?;
+            let (replacement, final_indexes) = match intent.tables.as_slice() {
+                [
+                    SchemaIndexTablePlan::RewriteHeap {
+                        replacement,
+                        final_indexes,
+                        ..
+                    },
+                ] if replacement.old_storage() == source_storage => {
+                    (replacement.as_ref(), final_indexes)
+                }
+                _ => {
+                    return Err(SchemaMutationError::Corrupt(
+                        "source-backfill final plan is not one rewrite",
+                    )
+                    .into());
+                }
+            };
+            let final_index_digest =
+                crate::schema_mutation_journal::heap_rewrite_indexes_digest(final_indexes)?;
+            let mut clone_plan = Sha256::new();
+            clone_plan.update(intent.transaction.0.to_le_bytes());
+            clone_plan.update(source_storage.0.to_le_bytes());
+            clone_plan.update(replacement.new_storage().0.to_le_bytes());
+            clone_plan.update(intent.action_digest);
+            clone_plan.update(intent.snapshot_digest.ok_or(SchemaMutationError::Corrupt(
+                "source-backfill snapshot digest absent",
+            ))?);
+            let source_intent =
+                SourceBackfillIntent {
+                    transaction: intent.transaction,
+                    incarnation: target_snapshot.incarnation,
+                    table: replacement.table(),
+                    source_storage,
+                    source_table_version: replacement.base.committed.tables[0].version,
+                    source_fingerprint: replacement.base.placements.tables[0].schema_fingerprint,
+                    source_locator: replacement.base.storages[0].locator.clone(),
+                    source_physical_txn_id,
+                    target_storage: replacement.new_storage(),
+                    target_table_version: replacement.target.committed.tables[0].version,
+                    target_fingerprint: replacement.target.placements.tables[0].schema_fingerprint,
+                    base_generation: intent.base_generation,
+                    target_generation: intent.target_generation.ok_or(
+                        SchemaMutationError::Corrupt("source-backfill target generation absent"),
+                    )?,
+                    base_epoch: intent.base_epoch,
+                    target_epoch: intent.target_epoch.ok_or(SchemaMutationError::Corrupt(
+                        "source-backfill target epoch absent",
+                    ))?,
+                    target_stage_locator: stage_locator(
+                        &logical.catalog,
+                        target_snapshot.incarnation,
+                        intent.transaction,
+                        replacement.new_storage(),
+                    )?,
+                    target_final_locator: replacement.target.storages[0].locator.clone(),
+                    final_index_digest,
+                    clone_plan_digest: clone_plan.finalize().into(),
+                };
+            logical
+                .journal
+                .borrow_mut()
+                .source_backfill_intent(source_intent.clone())?;
+            crash("source-backfill-intent-durable");
+            logical
+                .journal
+                .borrow_mut()
+                .stage_resource_intent(StageResourceIntent {
+                    transaction: intent.transaction,
+                    table: replacement.table(),
+                    storage: replacement.new_storage(),
+                    base_generation: intent.base_generation,
+                    base_epoch: intent.base_epoch,
+                    provisional: replacement.target.clone(),
+                    stage_locator: source_intent.target_stage_locator,
+                    final_locator: source_intent.target_final_locator,
+                    digest: digest(&replacement.target.encode()?),
+                })?;
+            crash("source-backfill-stage-intent-durable");
+        }
+        let materialized = Box::new(MaterializedSchemaIndexTransaction {
+            logical,
+            target,
+            reference,
+            intent: intent.clone().into(),
+            staged: BTreeMap::new(),
+            publications: Vec::new(),
+            backfill: false,
+            #[cfg(test)]
+            source_copy_passes: 0,
+            #[cfg(test)]
+            source_rows_copied: 0,
+        });
+        transaction.schema_composition = match materialization {
+            SchemaIndexMaterialization::Ordinary => {
+                SchemaCompositionState::SealingAndMaterializingIndex(materialized)
+            }
+            SchemaIndexMaterialization::SourceBackfill { .. } => {
+                SchemaCompositionState::LateCloneMaterializing(materialized)
+            }
+        };
 
         for (position, table_plan) in intent.tables.iter().enumerate() {
             match table_plan {
@@ -3976,14 +4643,92 @@ impl Database {
             }
         }
         crash("composition-all-targets-staged");
+        if transaction.schema_composition.is_late_clone_materializing() {
+            let materialized = transaction
+                .schema_composition
+                .materialized_index_mut()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "late-clone materialization disappeared",
+                ))?;
+            let target = materialized
+                .target
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "late-clone target snapshot absent",
+                ))?;
+            target.validate()?;
+            let (replacement, final_indexes) = match intent.tables.as_slice() {
+                [
+                    SchemaIndexTablePlan::RewriteHeap {
+                        replacement,
+                        final_indexes,
+                        ..
+                    },
+                ] => (replacement.as_ref(), final_indexes),
+                _ => {
+                    return Err(SchemaMutationError::Corrupt(
+                        "late-clone final plan is not one rewrite",
+                    )
+                    .into());
+                }
+            };
+            materialized
+                .staged
+                .get_mut(&replacement.new_storage())
+                .ok_or(SchemaMutationError::Corrupt(
+                    "late-clone target Heap absent",
+                ))?
+                .validate_heap_rewrite_index_inventory(
+                    &replacement.target.committed.schema.tables()[0],
+                    final_indexes,
+                )?;
+            crash("source-backfill-target-validated");
+            let final_snapshot_digest = digest(&target.encode()?);
+            let mut evidence = Sha256::new();
+            evidence.update(final_snapshot_digest);
+            evidence.update(crate::schema_mutation_journal::heap_rewrite_indexes_digest(
+                final_indexes,
+            )?);
+            materialized
+                .logical
+                .journal
+                .borrow_mut()
+                .migration_finalization_intent(MigrationIndexFinalizationIntent {
+                    transaction: intent.transaction,
+                    table: replacement.table(),
+                    storage: replacement.new_storage(),
+                    final_table_version: replacement.target.committed.tables[0].version,
+                    final_fingerprint: replacement.target.placements.tables[0].schema_fingerprint,
+                    final_snapshot_digest,
+                    stage_locator: stage_locator(
+                        &materialized.logical.catalog,
+                        target.incarnation,
+                        intent.transaction,
+                        replacement.new_storage(),
+                    )?,
+                    final_locator: replacement.target.storages[0].locator.clone(),
+                    final_indexes: final_indexes.clone(),
+                    digest: evidence.finalize().into(),
+                })?;
+            crash("source-backfill-index-finalization-intent-durable");
+        }
         let previous = std::mem::replace(
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
         );
-        let SchemaCompositionState::SealingAndMaterializingIndex(materialized) = previous else {
-            return Err(SchemaMutationError::Corrupt("schema/index materialization state").into());
+        transaction.schema_composition = match previous {
+            SchemaCompositionState::SealingAndMaterializingIndex(materialized) => {
+                SchemaCompositionState::MaterializedIndex(materialized)
+            }
+            SchemaCompositionState::LateCloneMaterializing(materialized) => {
+                SchemaCompositionState::LateCloneReady(materialized)
+            }
+            _ => {
+                return Err(
+                    SchemaMutationError::Corrupt("schema/index materialization state").into(),
+                );
+            }
         };
-        transaction.schema_composition = SchemaCompositionState::MaterializedIndex(materialized);
         Ok(())
     }
 
@@ -4047,13 +4792,39 @@ impl Database {
                     .position(|old_column| old_column.id == target_column.id)
             })
             .collect::<Vec<_>>();
-        let source_view = self
-            .registry
-            .get(old_storage)
-            .ok_or(SchemaMutationError::Corrupt(
-                "composition source disappeared",
-            ))?
-            .read_view()?;
+        let transaction_view = if transaction.schema_composition.is_late_clone_materializing() {
+            Some(transaction.begin_read_view(&[old_storage], &mut self.registry)?)
+        } else {
+            None
+        };
+        let committed_view = if transaction_view.is_none() {
+            Some(
+                self.registry
+                    .get(old_storage)
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "composition source disappeared",
+                    ))?
+                    .read_view()?,
+            )
+        } else {
+            None
+        };
+        let source_view = match (&transaction_view, &committed_view) {
+            (Some(view), None) => view
+                .iter()
+                .find_map(|(storage, view)| (storage == old_storage).then_some(view))
+                .ok_or(SchemaMutationError::Corrupt(
+                    "source-backfill transaction view absent",
+                ))?,
+            (None, Some(view)) => view,
+            _ => {
+                return Err(
+                    SchemaMutationError::Corrupt("composition source view state invalid").into(),
+                );
+            }
+        };
+        let mut copied_rows = 0_u64;
+        let late_clone = transaction.schema_composition.is_late_clone_materializing();
         let flow = self
             .registry
             .get_mut(old_storage)
@@ -4062,7 +4833,7 @@ impl Database {
             ))?
             .visit_rows_with_view_control::<DatabaseError, _>(
                 &old_columns,
-                &source_view,
+                source_view,
                 |_row, old_values| {
                     let values = transform
                         .iter()
@@ -4074,6 +4845,15 @@ impl Database {
                     transaction.with_composed_staged_write(new_storage, |storage, context| {
                         storage.insert_in(context, &values).map(|_| ())
                     })?;
+                    copied_rows =
+                        copied_rows
+                            .checked_add(1)
+                            .ok_or(SchemaMutationError::Corrupt(
+                                "source-backfill copy count overflow",
+                            ))?;
+                    if late_clone && copied_rows == 1 {
+                        crash("source-backfill-mid-copy");
+                    }
                     Ok(ControlFlow::Continue(()))
                 },
             )?;
@@ -4083,7 +4863,24 @@ impl Database {
             )
             .into());
         }
+        #[cfg(test)]
+        if late_clone {
+            let materialized = transaction
+                .schema_composition
+                .materialized_index_mut()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "source-backfill copy instrumentation state absent",
+                ))?;
+            materialized.source_copy_passes =
+                materialized.source_copy_passes.checked_add(1).ok_or(
+                    SchemaMutationError::Corrupt("source-backfill copy pass count overflow"),
+                )?;
+            materialized.source_rows_copied = copied_rows;
+        }
         crash("composition-table-copy-complete");
+        if late_clone {
+            crash("source-backfill-final-indexes-built");
+        }
         crash(&format!("composition-after-table-copy-{}", position + 1));
         Ok(())
     }
@@ -4332,9 +5129,10 @@ impl Database {
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
         );
-        let mut materialized = match state {
+        let (mut materialized, late_clone) = match state {
             SchemaCompositionState::MaterializedIndex(materialized)
-            | SchemaCompositionState::FinalizedIndex(materialized) => materialized,
+            | SchemaCompositionState::FinalizedIndex(materialized) => (materialized, false),
+            SchemaCompositionState::LateCloneReady(materialized) => (materialized, true),
             state => {
                 transaction.schema_composition = state;
                 return Err(SchemaMutationError::Corrupt(
@@ -4529,8 +5327,11 @@ impl Database {
         let (published, revision, created, winners, dropped) = match completion {
             Ok(completion) => completion,
             Err(error) => {
-                transaction.schema_composition =
-                    SchemaCompositionState::MaterializedIndex(materialized);
+                transaction.schema_composition = if late_clone {
+                    SchemaCompositionState::LateCloneReady(materialized)
+                } else {
+                    SchemaCompositionState::MaterializedIndex(materialized)
+                };
                 return Err(error);
             }
         };
@@ -4724,6 +5525,11 @@ pub(crate) fn cleanup_composition_loser(
         }
         SchemaCompositionState::SealingAndMaterializingIndex(mut materialized)
         | SchemaCompositionState::MaterializedIndex(mut materialized)
+        | SchemaCompositionState::SourceBackfillOpen(mut materialized)
+        | SchemaCompositionState::SourceRefining(mut materialized)
+        | SchemaCompositionState::SourceIndexFinalizing(mut materialized)
+        | SchemaCompositionState::LateCloneMaterializing(mut materialized)
+        | SchemaCompositionState::LateCloneReady(mut materialized)
         | SchemaCompositionState::BackfillOpenIndex(mut materialized)
         | SchemaCompositionState::RefiningIndex(mut materialized)
         | SchemaCompositionState::FinalizedIndex(mut materialized)

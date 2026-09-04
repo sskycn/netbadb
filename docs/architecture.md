@@ -313,6 +313,14 @@ admission and must be generalized before any SQL exposure. Same-V/F eager
 physical replacement, participant detach, and new retirement causes are rejected
 for this migration path. Round 37 changes no persistent format or public behavior.
 
+[Round 38](source-backfill-late-clone-round38.md) implements that crate-private
+foundation. Same-table DML remains in a transaction-private S1 view until an
+accepted layout-compatible refinement closes relation execution. Commit creates
+one final S2 from that view, prepares S1+S2 and one NBSC, and writes one CORD
+decision. Exact tag-35/stage/tag-34/NBSC evidence lets startup finish either
+partial participant order before retiring S1 and publishing S2. Public
+DROP-first ALTER dispatch remains disabled.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

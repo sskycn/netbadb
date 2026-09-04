@@ -160,6 +160,19 @@ impl DatabaseTransaction {
         self.participants.len()
     }
 
+    pub(crate) fn is_write_participant(&self, storage_id: StorageId) -> bool {
+        self.write_participants.contains(&storage_id)
+    }
+
+    pub(crate) fn physical_transaction_id(
+        &self,
+        storage_id: StorageId,
+    ) -> Option<netbadb_types::TxnId> {
+        self.participants
+            .get(&storage_id)
+            .map(|participant| participant.context.id())
+    }
+
     #[cfg(test)]
     pub(crate) fn force_participant_rollback_for_prepare_failure(
         &mut self,
@@ -508,7 +521,15 @@ impl DatabaseTransaction {
             TransactionState::CommitDecided | TransactionState::ApplyingCommit
         ) {
             self.state = TransactionState::ApplyingCommit;
-            for (position, storage_id) in self.write_participants.iter().copied().enumerate() {
+            #[cfg(test)]
+            let mut commit_order = self.write_participants.iter().copied().collect::<Vec<_>>();
+            #[cfg(not(test))]
+            let commit_order = self.write_participants.iter().copied().collect::<Vec<_>>();
+            #[cfg(test)]
+            if std::env::var_os("NETBADB_REVERSE_PARTICIPANT_COMMIT").is_some() {
+                commit_order.reverse();
+            }
+            for (position, storage_id) in commit_order.into_iter().enumerate() {
                 let participant = self.participants.get_mut(&storage_id).ok_or(
                     CoordinatorError::ParticipantStateViolation {
                         storage_id,
@@ -688,6 +709,11 @@ impl DatabaseTransaction {
             }
             SchemaCompositionState::SealingAndMaterializingIndex(materialized)
             | SchemaCompositionState::MaterializedIndex(materialized)
+            | SchemaCompositionState::SourceBackfillOpen(materialized)
+            | SchemaCompositionState::SourceRefining(materialized)
+            | SchemaCompositionState::SourceIndexFinalizing(materialized)
+            | SchemaCompositionState::LateCloneMaterializing(materialized)
+            | SchemaCompositionState::LateCloneReady(materialized)
             | SchemaCompositionState::BackfillOpenIndex(materialized)
             | SchemaCompositionState::RefiningIndex(materialized)
             | SchemaCompositionState::FinalizedIndex(materialized)
