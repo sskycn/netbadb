@@ -301,6 +301,18 @@ public ALTER reuses the physical S2 compatibility proof, and replacement CREATE
 reuses Round 33 finalization. DROP-first-before-S2 remains unsupported; no
 persistent or protocol format changes.
 
+[Round 37](migration-clone-round37.md) audits DROP-first-before-S2 without
+enabling it. The selected Round 38 foundation keeps preparatory index DDL and DML
+on transaction-owned S1, closes DML at the first compatible refinement, and then
+streams the frozen S1 transaction view once into final-schema S2. S1 and S2 are
+winner write participants in one CORD decision; only S2 becomes active, while S1
+is immediately predecessor-retired under the existing real F1-to-F2 rewrite and
+Round 25 horizon. Current live commit, copy, and GC primitives are sufficient,
+but partial-participant schema recovery currently fails closed before client
+admission and must be generalized before any SQL exposure. Same-V/F eager
+physical replacement, participant detach, and new retirement causes are rejected
+for this migration path. Round 37 changes no persistent format or public behavior.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

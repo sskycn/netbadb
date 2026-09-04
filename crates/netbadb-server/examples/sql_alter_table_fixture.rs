@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round36_probe = std::env::var("NETBADB_ROUND36_PROBE").ok();
+    let round37_probe = std::env::var("NETBADB_ROUND37_PROBE").ok();
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -47,7 +48,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")?;
     db.execute("CREATE INDEX projects_name_idx ON projects (name)")?;
     db.execute("INSERT INTO projects VALUES (1, 'one')")?;
-    if round36_probe.is_some() {
+    if round36_probe.is_some() || round37_probe.is_some() {
         db.execute("INSERT INTO projects VALUES (2, NULL)")?;
     }
     let old_index_id = db.indexes(TableId(2))?[0].id;
@@ -94,6 +95,51 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round37_probe {
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 37 baseline table disappeared")?;
+            if projects
+                .column("name")
+                .is_none_or(|column| !column.nullable)
+            {
+                return Err("Round 37 baseline changed the logical schema".into());
+            }
+            let indexes = reopened.indexes(TableId(2))?;
+            let expected_rows = match probe.as_str() {
+                "ordinary" if indexes.is_empty() => [
+                    vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                    vec![ScalarValue::Int64(2), ScalarValue::Text("filled".into())],
+                ],
+                "negative" if indexes.len() == 1 && indexes[0].id == old_index_id => [
+                    vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                    vec![ScalarValue::Int64(2), ScalarValue::Null],
+                ],
+                "ordinary" => {
+                    return Err("Round 37 ordinary commit kept the dropped index".into());
+                }
+                "negative" => {
+                    return Err("Round 37 failed migration did not restore Iold".into());
+                }
+                _ => return Err(format!("unknown Round 37 probe {probe}").into()),
+            };
+            if reopened
+                .query("SELECT id, name FROM projects ORDER BY id")?
+                .rows
+                != expected_rows
+            {
+                return Err("Round 37 baseline rows are incorrect".into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 37 DROP-first baseline survived three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round36_probe {
         for _ in 0..3 {

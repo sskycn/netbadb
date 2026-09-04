@@ -911,10 +911,27 @@ closure, physical compatibility checks, fresh replacement identity, tag 34,
 one prepared NBSC, and one CORD decision. Real psql 17.11 covers the positive,
 no-replacement, DROP-first, DML-closure, partial-backfill, and commit-gate paths.
 
-Round 37 should audit MigrationCloneHeap before considering DROP-first-before-S2.
-Same-V/F physical replacement, late S1 clone, participant detach, broader
-placements, online/resumable work, and general Alembic indexed-nullability
-support remain deferred.
+### DROP-first migration clone architecture audit — Round 37
+
+[Round 37](migration-clone-round37.md) selects late final clone with a committed
+source participant. Preparatory DROP and DML remain on S1, preserving ordinary
+DROP+UPDATE+COMMIT. A compatible refinement closes DML; finalization streams the
+transaction-visible S1 rows once into F2/S2, prepares S1 and S2 in one CORD
+winner, retires S1 as the genuine F1 predecessor, and publishes only S2. Tests
+prove the streaming copy, direct final schema/index build, two same-table write
+participants, mutated-predecessor retirement/GC, and same-V/F catalog behavior.
+The current partial-participant schema recovery path fails closed before client
+admission, which is the explicit next foundation gap. No SQL behavior or format
+changes in this audit.
+
+Round 38 should implement only **Source-Participant Backfill + Late Final Clone
+Foundation** for one managed Single Heap: typed source-backfill phases, one
+layout-compatible final schema, one late S2, both participant roles validated
+against existing CORD and rewrite authority, and complete predecision/
+postdecision crash convergence before public SQL exposure. Same-V/F physical
+replacement, participant detach, ADD/DROP/type conversion, cross-table work,
+broader placements, online/resumable work, and general Alembic exposure remain
+deferred.
 
 ## Phase 6 — SDK and tooling
 

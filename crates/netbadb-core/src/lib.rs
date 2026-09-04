@@ -7312,6 +7312,8 @@ mod migration_backfill_audit_tests;
 #[cfg(test)]
 mod migration_backfill_index_tests;
 #[cfg(test)]
+mod migration_clone_audit_tests;
+#[cfg(test)]
 mod sql_alter_table_tests;
 #[cfg(test)]
 mod sql_create_table_tests;
