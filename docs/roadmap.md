@@ -1066,6 +1066,24 @@ physical S1 no-ops. Prepared dependencies remain exact, DML and index DDL stay
 closed after adoption, and recovery plus all persistent/wire formats are
 unchanged. Candidate B index DDL and Candidate C further DML remain deferred.
 
+### Adopted-source final indexes — Round 47 architecture audit
+
+[Round 47](adopted-source-index-finalization-round47.md) selects a terminal
+`AdoptedSourceIndexFinalizing` phase with hybrid finalization for Round 48.
+Executable test-only prototypes prove canonical-final-lineage tag24 reservation,
+one existing adopted S1→S2 rewrite when the table is effective, real in-place
+index delta on S1 when only indexes are effective, and direct S1 DML commit
+when both inventories return to base. The preferred tag33 hypothesis is rejected:
+its existing aggregate-intent prerequisite cannot represent reservation-only
+adoption and CREATE→DROP global no-op. No decoder is weakened or format added.
+
+Exact-ID replacement, transaction-visible index construction, rollback burns,
+source digest phase boundary and one-/two-participant recovery are exercised.
+Round 48 should expose only final single-column non-unique CREATE/DROP after
+adoption; the first accepted index statement permanently closes schema ALTER.
+Production adopted index DDL remains closed in Round 47. Round 42 DROP-first
+migrations keep their distinct SourceIndexFinalizing route.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

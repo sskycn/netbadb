@@ -2774,12 +2774,11 @@ impl Database {
         Ok(())
     }
 
-    /// Seals an adopted ordinary DML source. Effective changes create the
-    /// first real rewrite intent; canonical no-ops retain S1 and only resolve
-    /// allocator history.
-    pub(crate) fn finalize_adopted_source(
+    // Shared authority check; physical index finalization may consume this proof
+    // only before its authorized delta changes the captured source digest.
+    fn revalidate_adopted_source_authority(
         &mut self,
-        transaction: &mut Transaction,
+        transaction: &Transaction,
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
         let adopted = match &transaction.schema_composition {
@@ -2856,6 +2855,17 @@ impl Database {
         {
             return Err(SchemaMutationError::Corrupt("adopted source authority drift").into());
         }
+        Ok(())
+    }
+
+    /// Seals an adopted ordinary DML source. Effective changes create the
+    /// first real rewrite intent; canonical no-ops retain S1 and only resolve
+    /// allocator history.
+    pub(crate) fn finalize_adopted_source(
+        &mut self,
+        transaction: &mut Transaction,
+    ) -> Result<(), DatabaseError> {
+        self.revalidate_adopted_source_authority(transaction)?;
         let previous = std::mem::replace(
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
@@ -5712,6 +5722,8 @@ impl Database {
                                     create.id,
                                     target_floor,
                                 )?);
+                                #[cfg(test)]
+                                crash("adopted-index-delta-first-tree-built");
                             }
                             Ok(IndexPublication {
                                 storage: *storage,
@@ -6706,3 +6718,7 @@ pub(crate) fn cleanup_composition_loser(
     plan.writer.set(None);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "adopted_source_index_finalization_audit_tests.rs"]
+mod adopted_source_index_finalization_audit_tests;
