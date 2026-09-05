@@ -1,5 +1,25 @@
 # NetbaDB roadmap
 
+## Deferred new-column backfill audit (Round 49 complete; production deferred)
+
+- selected ordered deterministic deferred UPDATE programs as the next
+  new-column value-population authority;
+- proved with a test-only Core carrier that Execute can bind parameters, share
+  the typed executor evaluator, return exact affected rows, and revalidate the
+  same result during one final S1-to-S2 projection;
+- proved projected Cnew NOT NULL validation, partial-fill repair, multiple
+  assignments, ordered later-wins behavior, prior own-DML visibility, and final
+  physical BTree values;
+- bound canonical program semantics into the existing action/tag-25/tag-35
+  digest chain without adding a persistent format or replay requirement;
+- exercised pre-CORD losers and post-CORD winners across three reopens, and
+  compared persistent DEFAULT, RowId sidecar, early S2, and NOT-NULL-only
+  alternatives.
+
+Production post-refinement relational SQL and Cnew NOT NULL remain closed in
+Round 49. The proposed Round 50 slice is documented in
+[`deferred-new-column-backfill-round49.md`](deferred-new-column-backfill-round49.md).
+
 ## Columnar Phase 1 (complete)
 
 - immutable Heap/LSM-derived projections with stable projection, segment, and

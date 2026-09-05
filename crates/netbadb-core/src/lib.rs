@@ -7740,6 +7740,8 @@ mod tests {
 #[cfg(test)]
 mod adopted_source_refinement_expansion_audit_tests;
 #[cfg(test)]
+mod deferred_new_column_backfill_audit_tests;
+#[cfg(test)]
 mod indexed_nullability_audit_tests;
 #[cfg(test)]
 mod late_clone_layout_audit_tests;

@@ -6181,6 +6181,34 @@ fn evaluate(
     evaluate_values(expression, EvaluationValues::Contiguous(row), fields)
 }
 
+/// Evaluates one resolved expression against a typed row.
+///
+/// This is the side-effect-free scalar boundary shared by normal execution and
+/// schema-migration validation. Callers must supply the exact fields and values
+/// from the statement's frozen read view; unresolved parameters are rejected.
+pub fn evaluate_typed_row_expression(
+    expression: &Expr,
+    fields: &[OutputField],
+    row: &[ScalarValue],
+) -> Result<ScalarValue, ExecutionError> {
+    evaluate(expression, row, fields)
+}
+
+/// Applies SQL three-valued predicate semantics to one typed row.
+///
+/// Only `TRUE` matches. `FALSE` and `NULL` both return `false`, matching filter
+/// and UPDATE selection behavior in the executor.
+pub fn typed_row_predicate_matches(
+    expression: &Expr,
+    fields: &[OutputField],
+    row: &[ScalarValue],
+) -> Result<bool, ExecutionError> {
+    Ok(matches!(
+        evaluate_truth_values(expression, EvaluationValues::Contiguous(row), fields)?,
+        TruthValue::True
+    ))
+}
+
 fn evaluate_truth_values(
     expression: &Expr,
     values: EvaluationValues<'_>,

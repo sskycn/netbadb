@@ -151,6 +151,15 @@ impl RowProjection {
         &self,
         source_values: &[ScalarValue],
     ) -> Result<Vec<ScalarValue>, DatabaseError> {
+        let values = self.project_without_target_constraints(source_values)?;
+        self.validate_target_constraints(&values)?;
+        Ok(values)
+    }
+
+    pub(crate) fn project_without_target_constraints(
+        &self,
+        source_values: &[ScalarValue],
+    ) -> Result<Vec<ScalarValue>, DatabaseError> {
         if source_values.len() != self.source_width {
             return Err(
                 SchemaMutationError::Corrupt("row projection source width mismatch").into(),
@@ -158,32 +167,48 @@ impl RowProjection {
         }
         let mut values = Vec::with_capacity(self.target_entries.len());
         for entry in &self.target_entries {
-            let (column_id, target_nullable, value) = match entry {
+            let value = match entry {
+                RowProjectionEntry::Source {
+                    source_position, ..
+                } => source_values
+                    .get(*source_position)
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "row projection source ordinal out of bounds",
+                    ))?
+                    .clone(),
+                RowProjectionEntry::SynthesizedNull { .. } => ScalarValue::Null,
+            };
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    pub(crate) fn validate_target_constraints(
+        &self,
+        values: &[ScalarValue],
+    ) -> Result<(), DatabaseError> {
+        if values.len() != self.target_entries.len() {
+            return Err(
+                SchemaMutationError::Corrupt("row projection target width mismatch").into(),
+            );
+        }
+        for (entry, value) in self.target_entries.iter().zip(values) {
+            let (column_id, target_nullable) = match entry {
                 RowProjectionEntry::Source {
                     column_id,
-                    source_position,
                     target_nullable,
-                } => (
-                    *column_id,
-                    *target_nullable,
-                    source_values
-                        .get(*source_position)
-                        .ok_or(SchemaMutationError::Corrupt(
-                            "row projection source ordinal out of bounds",
-                        ))?
-                        .clone(),
-                ),
-                RowProjectionEntry::SynthesizedNull {
+                    ..
+                }
+                | RowProjectionEntry::SynthesizedNull {
                     column_id,
                     target_nullable,
-                } => (*column_id, *target_nullable, ScalarValue::Null),
+                } => (*column_id, *target_nullable),
             };
             if !target_nullable && matches!(value, ScalarValue::Null) {
                 return Err(SchemaMutationError::NotNullViolation(column_id).into());
             }
-            values.push(value);
         }
-        Ok(values)
+        Ok(())
     }
 }
 
@@ -285,7 +310,7 @@ enum IndexCompositionContext {
 }
 
 impl SchemaCompositionState {
-    fn adopted_source(&self) -> Option<&AdoptedSourceTransaction> {
+    pub(crate) fn adopted_source(&self) -> Option<&AdoptedSourceTransaction> {
         match self {
             Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
                 Some(adopted)
@@ -294,7 +319,7 @@ impl SchemaCompositionState {
         }
     }
 
-    fn adopted_source_mut(&mut self) -> Option<&mut AdoptedSourceTransaction> {
+    pub(crate) fn adopted_source_mut(&mut self) -> Option<&mut AdoptedSourceTransaction> {
         match self {
             Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
                 Some(adopted)
@@ -534,6 +559,9 @@ pub(crate) struct SchemaTransactionPlan {
     pub(crate) touched: BTreeMap<TableId, ComposedTable>,
     pub(crate) created: BTreeMap<TableId, TransactionCreatedTable>,
     pub(crate) action_evidence: Vec<[u8; 32]>,
+    #[cfg(test)]
+    pub(crate) deferred_backfill:
+        crate::deferred_new_column_backfill_audit_tests::DeferredBackfillProgram,
     pub(crate) reservation_count: usize,
     pub(crate) index_reservation_count: usize,
     pub(crate) index_actions: usize,
@@ -572,7 +600,7 @@ impl SchemaTransactionPlan {
         self.action_evidence.len()
     }
 
-    fn action_digest(&self) -> [u8; 32] {
+    pub(crate) fn action_digest(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         for evidence in &self.action_evidence {
             hash.update(evidence);
@@ -3052,6 +3080,9 @@ impl Database {
             touched: BTreeMap::new(),
             created: BTreeMap::new(),
             action_evidence: Vec::new(),
+            #[cfg(test)]
+            deferred_backfill:
+                crate::deferred_new_column_backfill_audit_tests::DeferredBackfillProgram::default(),
             reservation_count: 0,
             index_reservation_count: 0,
             index_actions: 0,
@@ -6067,6 +6098,15 @@ impl Database {
             table_plan.target.committed.tables[0].version,
             &reserved_new_columns,
         )?;
+        #[cfg(test)]
+        let deferred_backfill = transaction
+            .schema_composition
+            .plan()
+            .ok_or(SchemaMutationError::Corrupt("composition plan absent"))?
+            .deferred_backfill
+            .clone();
+        #[cfg(test)]
+        let mut deferred_observations = deferred_backfill.begin_finalization();
         let catalog = &transaction
             .schema_composition
             .plan()
@@ -6149,7 +6189,22 @@ impl Database {
                 &old_columns,
                 source_view,
                 |_row, old_values| {
+                    #[cfg(not(test))]
                     let values = projection.project(&old_values)?;
+                    #[cfg(test)]
+                    let values = {
+                        let mut values =
+                            projection.project_without_target_constraints(&old_values)?;
+                        if !deferred_backfill.is_empty() {
+                            deferred_backfill.apply_row(
+                                &old_values,
+                                &mut values,
+                                &mut deferred_observations,
+                            )?;
+                        }
+                        projection.validate_target_constraints(&values)?;
+                        values
+                    };
                     transaction.with_composed_staged_write(new_storage, |storage, context| {
                         storage.insert_in(context, &values).map(|_| ())
                     })?;
@@ -6171,6 +6226,8 @@ impl Database {
             )
             .into());
         }
+        #[cfg(test)]
+        deferred_backfill.verify_finalization(deferred_observations)?;
         #[cfg(test)]
         if late_clone {
             let materialized = transaction
