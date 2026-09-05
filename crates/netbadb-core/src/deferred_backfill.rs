@@ -401,6 +401,13 @@ fn expression_is_eligible(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn validate_expression_limits_for_test(expression: &Expr) -> Result<(), DatabaseError> {
+    let mut nodes = 0;
+    expression_is_eligible(expression, TableId(1), &BTreeSet::new(), 1, &mut nodes)?;
+    Ok(())
+}
+
 fn scan_and_predicate(
     input: &LogicalPlan,
 ) -> Option<(TableId, &[netbadb_rel::ColumnRef], Option<&Expr>)> {

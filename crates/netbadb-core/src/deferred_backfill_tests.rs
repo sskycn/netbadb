@@ -1,6 +1,8 @@
 use super::*;
 use crate::schema_composition::SchemaCompositionState;
+use netbadb_rel::{BinaryOp, Expr, ExprKind};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+use netbadb_types::{ExprType, IndexId, SemanticType};
 use sha2::{Digest, Sha256};
 
 fn root(name: &str) -> PathBuf {
@@ -241,12 +243,25 @@ fn real_execute_commit_reopen_and_final_index_populate_one_rewrite() {
         .plan()
         .unwrap()
         .action_digest();
+    database.finalize_adopted_source(&mut transaction).unwrap();
+    let materialized = transaction.schema_composition.materialized_index().unwrap();
+    assert_eq!(materialized.intent.action_digest, action_digest);
+    assert_eq!(materialized.source_copy_passes, 1);
+    assert_eq!(materialized.source_rows_copied, 3);
+    let crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap { replacement, .. } =
+        &materialized.intent.tables[0]
+    else {
+        panic!("expected one final Heap rewrite")
+    };
+    let materialized_target = replacement.new_storage();
+    assert_eq!(materialized_target, next_storage);
     database.commit_transaction(&mut transaction).unwrap();
     assert_eq!(
         database.next_storage_id().unwrap(),
         StorageId(next_storage.0 + 1)
     );
     let target = database.bindings.resolve_single(TableId(2)).unwrap();
+    assert_eq!(target, materialized_target);
     let (source_intent, snapshot_digest) = {
         let journal = database.mutation_journal.as_ref().unwrap().borrow();
         (
@@ -531,6 +546,82 @@ fn prepare_is_pure_stale_dependencies_do_not_append_and_bound_values_are_owned()
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn digest_scenario(name: &str, statements: &[&str]) -> (Vec<[u8; 32]>, [u8; 32]) {
+    let root = root(name);
+    let mut database = seed(&root);
+    let mut transaction = adopt(&mut database);
+    database
+        .execute_in(
+            &mut transaction,
+            "ALTER TABLE users ADD COLUMN marker_two TEXT",
+        )
+        .unwrap();
+    for statement in statements {
+        database.execute_in(&mut transaction, statement).unwrap();
+    }
+    let program = &transaction
+        .schema_composition
+        .plan()
+        .unwrap()
+        .deferred_backfill;
+    let digests = (0..program.len())
+        .map(|index| program.semantic_digest(index).unwrap())
+        .collect();
+    let action_digest = transaction
+        .schema_composition
+        .plan()
+        .unwrap()
+        .action_digest();
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    (digests, action_digest)
+}
+
+#[test]
+fn canonical_digest_is_sensitive_to_literal_target_predicate_operator_and_action_order() {
+    let (base, _) = digest_scenario(
+        "digest-base",
+        &["UPDATE users SET marker = 'value' WHERE id = 1"],
+    );
+    let (literal, _) = digest_scenario(
+        "digest-literal",
+        &["UPDATE users SET marker = 'different' WHERE id = 1"],
+    );
+    let (target, _) = digest_scenario(
+        "digest-target",
+        &["UPDATE users SET marker_two = 'value' WHERE id = 1"],
+    );
+    let (predicate, _) = digest_scenario(
+        "digest-predicate",
+        &["UPDATE users SET marker = 'value' WHERE id = 3"],
+    );
+    let (operator, _) = digest_scenario(
+        "digest-operator",
+        &["UPDATE users SET marker = 'value' WHERE id != 1"],
+    );
+    assert_ne!(base[0], literal[0]);
+    assert_ne!(base[0], target[0]);
+    assert_ne!(base[0], predicate[0]);
+    assert_ne!(base[0], operator[0]);
+
+    let (_, forward) = digest_scenario(
+        "digest-forward",
+        &[
+            "UPDATE users SET marker = 'first' WHERE id = 1",
+            "UPDATE users SET marker = 'second' WHERE id = 3",
+        ],
+    );
+    let (_, reverse) = digest_scenario(
+        "digest-reverse",
+        &[
+            "UPDATE users SET marker = 'second' WHERE id = 3",
+            "UPDATE users SET marker = 'first' WHERE id = 1",
+        ],
+    );
+    assert_ne!(forward, reverse);
+}
+
 #[test]
 fn empty_match_is_accepted_and_action_limit_is_checked_before_another_scan() {
     let root = root("limits");
@@ -570,6 +661,136 @@ fn empty_match_is_accepted_and_action_limit_is_checked_before_another_scan() {
     transaction.rollback().unwrap();
     database.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn balanced_predicate(first: usize, last: usize) -> String {
+    if first == last {
+        return format!("id = {first}");
+    }
+    let middle = first + (last - first) / 2;
+    format!(
+        "({} OR {})",
+        balanced_predicate(first, middle),
+        balanced_predicate(middle + 1, last)
+    )
+}
+
+fn balanced_boolean_expression(leaves: usize) -> Expr {
+    if leaves == 1 {
+        return Expr {
+            kind: ExprKind::Literal(ScalarValue::Bool(true)),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Bool),
+                nullable: false,
+            },
+        };
+    }
+    let left = leaves / 2;
+    Expr {
+        kind: ExprKind::Binary {
+            operator: BinaryOp::Or,
+            left: Box::new(balanced_boolean_expression(left)),
+            right: Box::new(balanced_boolean_expression(leaves - left)),
+        },
+        expr_type: ExprType {
+            data_type: SemanticType::physical(PhysicalType::Bool),
+            nullable: false,
+        },
+    }
+}
+
+#[test]
+fn assignment_node_and_depth_limits_fail_before_action_acceptance() {
+    let case_root = root("assignment-limit");
+    let mut database = seed(&case_root);
+    let mut transaction = adopt(&mut database);
+    for index in 0..32 {
+        database
+            .execute_in(
+                &mut transaction,
+                &format!("ALTER TABLE users ADD COLUMN extra_{index} TEXT"),
+            )
+            .unwrap();
+    }
+    let mut assignments = vec!["marker = 'x'".to_owned()];
+    assignments.extend((0..32).map(|index| format!("extra_{index} = 'x'")));
+    assert!(matches!(
+        database.execute_in(
+            &mut transaction,
+            &format!("UPDATE users SET {}", assignments.join(", "))
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::CompositionLimitExceeded("deferred assignments")
+        ))
+    ));
+    assert!(
+        transaction
+            .schema_composition
+            .plan()
+            .unwrap()
+            .deferred_backfill
+            .is_empty()
+    );
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(case_root).unwrap();
+
+    let case_root = root("depth-limit");
+    let mut database = seed(&case_root);
+    let mut transaction = adopt(&mut database);
+    let deep = format!(
+        "UPDATE users SET marker = 'x' WHERE {}id = 1",
+        "NOT ".repeat(33)
+    );
+    assert!(matches!(
+        database.execute_in(&mut transaction, &deep),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::CompositionLimitExceeded("deferred expression depth")
+        ))
+    ));
+    assert!(
+        transaction
+            .schema_composition
+            .plan()
+            .unwrap()
+            .deferred_backfill
+            .is_empty()
+    );
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(case_root).unwrap();
+
+    let case_root = root("node-limit");
+    let mut database = seed(&case_root);
+    let mut transaction = adopt(&mut database);
+    let wide = format!(
+        "UPDATE users SET marker = 'x' WHERE {}",
+        balanced_predicate(1, 128)
+    );
+    let wide_result = database.execute_in(&mut transaction, &wide);
+    assert!(
+        matches!(&wide_result, Err(DatabaseError::Compile(_))),
+        "{wide_result:?}"
+    );
+    assert!(matches!(
+        crate::deferred_backfill::validate_expression_limits_for_test(
+            &balanced_boolean_expression(129)
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::CompositionLimitExceeded("deferred expression nodes")
+        ))
+    ));
+    assert!(
+        transaction
+            .schema_composition
+            .plan()
+            .unwrap()
+            .deferred_backfill
+            .is_empty()
+    );
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(case_root).unwrap();
 }
 
 #[test]
@@ -750,6 +971,169 @@ fn surviving_not_null_refinement_remains_available_during_backfilling() {
     );
     database.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rollback_matrix_restores_s1_and_retains_only_accepted_identity_burns() {
+    for stage in 0..6 {
+        let root = root(&format!("rollback-stage-{stage}"));
+        let mut database = seed(&root);
+        let source = database.bindings.resolve_single(TableId(2)).unwrap();
+        let base_generation = database.schema_generation();
+        let base_version = database.table_schema_version(TableId(2)).unwrap();
+        let next_storage = database.next_storage_id().unwrap();
+        let source_index_digest = crate::schema_mutation_journal::heap_rewrite_indexes_digest(
+            &database
+                .registry
+                .get_mut(source)
+                .unwrap()
+                .heap_rewrite_indexes()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut transaction = adopt(&mut database);
+        database
+            .execute_in(
+                &mut transaction,
+                "UPDATE users SET marker = 'filled' WHERE id = 1",
+            )
+            .unwrap();
+
+        if stage == 2 {
+            assert!(matches!(
+                database.execute_in(
+                    &mut transaction,
+                    "ALTER TABLE users ALTER COLUMN marker SET NOT NULL"
+                ),
+                Err(DatabaseError::SchemaMutation(
+                    SchemaMutationError::NotNullViolation(_)
+                ))
+            ));
+        } else if stage >= 1 {
+            database
+                .execute_in(
+                    &mut transaction,
+                    "UPDATE users SET marker = 'filled' WHERE id != 1",
+                )
+                .unwrap();
+            if stage >= 3 {
+                database
+                    .execute_in(
+                        &mut transaction,
+                        "ALTER TABLE users ALTER COLUMN marker SET NOT NULL",
+                    )
+                    .unwrap();
+            }
+        }
+        if stage >= 4 {
+            database
+                .execute_in(
+                    &mut transaction,
+                    "CREATE INDEX users_marker_idx ON users(marker)",
+                )
+                .unwrap();
+        }
+        let staged_target = if stage == 5 {
+            database.finalize_adopted_source(&mut transaction).unwrap();
+            let materialized = transaction.schema_composition.materialized_index().unwrap();
+            let crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap {
+                replacement,
+                ..
+            } = &materialized.intent.tables[0]
+            else {
+                panic!("expected rollback target")
+            };
+            Some(replacement.new_storage())
+        } else {
+            None
+        };
+
+        transaction.rollback().unwrap();
+        assert_eq!(database.schema_generation(), base_generation);
+        assert_eq!(
+            database.table_schema_version(TableId(2)),
+            Some(base_version)
+        );
+        assert_eq!(database.bindings.resolve_single(TableId(2)), Ok(source));
+        assert!(
+            database
+                .schema()
+                .table("users")
+                .unwrap()
+                .column("marker")
+                .is_none()
+        );
+        assert!(database.indexes(TableId(2)).unwrap().is_empty());
+        assert_eq!(database.next_column_id(TableId(2)), Some(ColumnId(5)));
+        assert_eq!(
+            database
+                .registry
+                .get_mut(source)
+                .unwrap()
+                .heap_rewrite_indexes()
+                .unwrap()
+                .next_index_id,
+            IndexId(1)
+        );
+        assert_eq!(
+            database
+                .mutation_journal
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .effective_index(TableId(2), IndexId(1)),
+            Some(IndexId(if stage >= 4 { 2 } else { 1 }))
+        );
+        let rolled_back_index_digest = crate::schema_mutation_journal::heap_rewrite_indexes_digest(
+            &database
+                .registry
+                .get_mut(source)
+                .unwrap()
+                .heap_rewrite_indexes()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rolled_back_index_digest, source_index_digest);
+        assert_eq!(
+            database.next_storage_id(),
+            Some(StorageId(next_storage.0 + u64::from(stage == 5)))
+        );
+        if let Some(target) = staged_target {
+            assert!(database.registry.get_mut(target).is_none());
+        }
+        assert_eq!(
+            database
+                .query("SELECT id, legacy FROM users ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())],
+                vec![ScalarValue::Int64(2), ScalarValue::Text("two".into())],
+                vec![ScalarValue::Int64(3), ScalarValue::Null],
+            ]
+        );
+        let mut writer_probe = database.begin_transaction().unwrap();
+        database
+            .execute_in(
+                &mut writer_probe,
+                "UPDATE users SET legacy = legacy WHERE id = 999",
+            )
+            .unwrap();
+        writer_probe.rollback().unwrap();
+        database.close().unwrap();
+        database = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(database.bindings.resolve_single(TableId(2)), Ok(source));
+        assert!(
+            database
+                .schema()
+                .table("users")
+                .unwrap()
+                .column("marker")
+                .is_none()
+        );
+        database.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
