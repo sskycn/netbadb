@@ -137,14 +137,12 @@ fn candidate_a_transaction_visible_set_not_null_matrix() {
             db.execute("UPDATE users SET email = 'one@example.test' WHERE email IS NULL")
                 .unwrap();
         }
-        let spec = alter_spec(
-            &db,
-            None,
-            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-        );
         let mut transaction = db.begin_transaction().unwrap();
         db.execute_in(&mut transaction, setup).unwrap();
-        let result = db.audit_apply_adopted_source_nullability(&mut transaction, spec);
+        let result = db.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        );
         if succeeds {
             result.unwrap();
             db.commit_transaction(&mut transaction).unwrap();
@@ -176,16 +174,14 @@ fn candidate_a_transaction_visible_set_not_null_matrix() {
     let mut db = seed(&root, false, true);
     db.execute("UPDATE users SET email = 'one@example.test' WHERE email IS NULL")
         .unwrap();
-    let spec = alter_spec(
-        &db,
-        None,
-        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-    );
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "UPDATE users SET email = email")
         .unwrap();
-    db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+    )
+    .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -195,11 +191,6 @@ fn candidate_a_transaction_visible_set_not_null_matrix() {
 fn candidate_a_first_failure_is_pre_writer_and_native_repair_retry_works() {
     let root = root("repair-retry");
     let mut db = seed(&root, false, true);
-    let spec = alter_spec(
-        &db,
-        None,
-        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-    );
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(
         &mut transaction,
@@ -212,8 +203,12 @@ fn candidate_a_first_failure_is_pre_writer_and_native_repair_retry_works() {
     )
     .unwrap();
     let journal = journal_bytes(&db);
+    let storage_floor = db.next_storage_id();
     assert!(matches!(
-        db.audit_apply_adopted_source_nullability(&mut transaction, spec.clone()),
+        db.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL"
+        ),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::NotNullViolation(ColumnId(3))
         ))
@@ -222,13 +217,17 @@ fn candidate_a_first_failure_is_pre_writer_and_native_repair_retry_works() {
     assert_eq!(transaction.state(), TransactionState::Active);
     assert!(transaction.schema_composition.is_none());
     assert!(db.schema_writer.get().is_none());
+    assert_eq!(db.next_storage_id(), storage_floor);
     db.execute_in(
         &mut transaction,
         "UPDATE users SET email = 'four@example.test' WHERE id = 4",
     )
     .unwrap();
-    db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+    )
+    .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     assert_eq!(
         db.query("SELECT email FROM users WHERE id = 4")
@@ -249,13 +248,11 @@ fn candidate_a_subsequent_validation_keeps_dml_closed_but_allows_ddl_retry() {
         .unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
-    let set = alter_spec(
-        &db,
-        Some(&transaction),
-        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-    );
     assert!(matches!(
-        db.audit_apply_adopted_source_nullability(&mut transaction, set),
+        db.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL"
+        ),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::NotNullViolation(ColumnId(3))
         ))
@@ -290,24 +287,20 @@ fn candidate_a_subsequent_set_uses_one_final_projection_and_rejects_new_column()
     .unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
-    let marker_set = alter_spec(
-        &db,
-        Some(&transaction),
-        "ALTER TABLE users ALTER COLUMN marker SET NOT NULL",
-    );
     assert!(matches!(
-        db.audit_apply_adopted_source_nullability(&mut transaction, marker_set),
+        db.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN marker SET NOT NULL"
+        ),
         Err(DatabaseError::SchemaMutation(
-            SchemaMutationError::UnsupportedBackfillRefinement(_)
+            SchemaMutationError::TransactionNotPristine
         ))
     ));
-    let email_set = alter_spec(
-        &db,
-        Some(&transaction),
+    db.execute_in(
+        &mut transaction,
         "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-    );
-    db.audit_apply_adopted_source_nullability(&mut transaction, email_set)
-        .unwrap();
+    )
+    .unwrap();
     db.finalize_adopted_source(&mut transaction).unwrap();
     let materialized = transaction.schema_composition.source_backfill().unwrap();
     assert_eq!(materialized.source_copy_passes, 1);
@@ -348,8 +341,7 @@ fn candidate_a_indexed_and_unindexed_survivors_preserve_identity() {
             &format!("UPDATE users SET {column} = 'filled' WHERE {column} IS NULL"),
         )
         .unwrap();
-        db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-            .unwrap();
+        db.execute_in(&mut transaction, &sql).unwrap();
         db.commit_transaction(&mut transaction).unwrap();
         if let Some(index) = index {
             let final_index = &db.indexes(table).unwrap()[0];
@@ -377,16 +369,14 @@ fn candidate_a_indexed_and_unindexed_survivors_preserve_identity() {
     let mut db = seed(&root, true, true);
     let table = db.schema().table("users").unwrap().id;
     let index = db.indexes(table).unwrap()[0].clone();
-    let spec = alter_spec(
-        &db,
-        None,
-        "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
-    );
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(&mut transaction, "UPDATE users SET email = email")
         .unwrap();
-    db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-        .unwrap();
+    db.execute_in(
+        &mut transaction,
+        "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+    )
+    .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     assert!(
         db.schema()
@@ -431,12 +421,8 @@ fn candidate_a_nullability_round_trips_are_clean_s1_noops() {
             "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
         )
         .unwrap();
-        let first = alter_spec(&db, Some(&transaction), first);
-        db.audit_apply_adopted_source_nullability(&mut transaction, first)
-            .unwrap();
-        let second = alter_spec(&db, Some(&transaction), second);
-        db.audit_apply_adopted_source_nullability(&mut transaction, second)
-            .unwrap();
+        db.execute_in(&mut transaction, first).unwrap();
+        db.execute_in(&mut transaction, second).unwrap();
         db.finalize_adopted_source(&mut transaction).unwrap();
         assert!(matches!(
             transaction.schema_composition,
@@ -454,7 +440,7 @@ fn candidate_a_nullability_round_trips_are_clean_s1_noops() {
 }
 
 #[test]
-fn candidate_a_prepared_target_is_exact_and_production_remains_closed() {
+fn candidate_a_prepared_set_target_is_exact_and_executes_in_production() {
     let root = root("prepared");
     let mut db = seed(&root, false, true);
     let prepared = db
@@ -480,17 +466,639 @@ fn candidate_a_prepared_target_is_exact_and_production_remains_closed() {
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    assert!(matches!(
-        db.execute_ddl_in(&mut transaction, &prepared),
-        Err(DatabaseError::SchemaMutation(
-            SchemaMutationError::TransactionNotPristine
-        ))
-    ));
-    db.audit_apply_adopted_source_nullability(&mut transaction, exact)
-        .unwrap();
+    db.execute_ddl_in(&mut transaction, &prepared).unwrap();
     db.commit_transaction(&mut transaction).unwrap();
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn round46_effective_set_and_drop_publish_once_and_rebuild_final_index_spec() {
+    for (name, base_not_null, setup, alter, final_nullable, expected_scans) in [
+        (
+            "effective-set",
+            false,
+            "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            false,
+            1,
+        ),
+        (
+            "effective-drop",
+            true,
+            "UPDATE users SET email = email WHERE id = 1",
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+            true,
+            0,
+        ),
+    ] {
+        let root = root(name);
+        let catalog = root.join("catalog");
+        let mut db = seed(&root, base_not_null, true);
+        let table = db.schema().table("users").unwrap().id;
+        let source = db.bindings.resolve_single(table).unwrap();
+        let target = db.next_storage_id().unwrap();
+        let storage_floor = db.next_storage_id().unwrap();
+        let version = db.table_schema_version(table).unwrap();
+        let generation = db.schema_generation();
+        let epoch = schema_catalog_file::load(&catalog).unwrap().epoch;
+        let revision = db.catalog_generation();
+        let old_index = db.indexes(table).unwrap()[0].clone();
+        crate::schema_composition::reset_source_not_null_validation_count();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(&mut transaction, setup).unwrap();
+        db.execute_in(&mut transaction, alter).unwrap();
+        assert_eq!(db.next_storage_id(), Some(storage_floor));
+        db.finalize_adopted_source(&mut transaction).unwrap();
+        let materialized = transaction.schema_composition.source_backfill().unwrap();
+        assert_eq!(
+            (
+                materialized.source_copy_passes,
+                materialized.source_rows_copied
+            ),
+            (1, 3)
+        );
+        db.commit_transaction(&mut transaction).unwrap();
+        assert_eq!(
+            crate::schema_composition::source_not_null_validation_count(),
+            expected_scans
+        );
+        assert_eq!(db.bindings.resolve_single(table), Ok(target));
+        assert_ne!(source, target);
+        assert_eq!(db.next_storage_id(), Some(StorageId(storage_floor.0 + 1)));
+        assert_eq!(
+            db.table_schema_version(table),
+            Some(TableSchemaVersion(version.0 + 1))
+        );
+        assert_eq!(db.schema_generation(), SchemaGeneration(generation.0 + 1));
+        assert_eq!(
+            schema_catalog_file::load(&catalog).unwrap().epoch,
+            epoch + 1
+        );
+        assert_eq!(db.catalog_generation(), revision + 1);
+        let final_column = db.schema().table("users").unwrap().column("email").unwrap();
+        assert_eq!(
+            (final_column.id, final_column.nullable),
+            (ColumnId(3), final_nullable)
+        );
+        let final_index = &db.indexes(table).unwrap()[0];
+        assert_eq!(
+            (final_index.id, final_index.column_id, &final_index.name),
+            (old_index.id, old_index.column_id, &old_index.name)
+        );
+        assert_ne!(final_index.handle, old_index.handle);
+        db.close().unwrap();
+
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog).unwrap();
+            let final_table = reopened.schema().table("users").unwrap().clone();
+            let final_storage = reopened.bindings.resolve_single(table).unwrap();
+            let final_indexes = reopened
+                .registry
+                .get_mut(final_storage)
+                .unwrap()
+                .heap_rewrite_indexes()
+                .unwrap();
+            reopened
+                .registry
+                .get_mut(final_storage)
+                .unwrap()
+                .validate_heap_rewrite_index_inventory(&final_table, &final_indexes)
+                .unwrap();
+            assert_eq!(reopened.indexes(table).unwrap()[0].id, old_index.id);
+            reopened.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn round46_indexed_nullability_round_trips_are_physical_s1_noops() {
+    for (name, base_not_null, first, second, expected_scans) in [
+        (
+            "indexed-set-drop",
+            false,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+            1,
+        ),
+        (
+            "indexed-drop-set",
+            true,
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            1,
+        ),
+    ] {
+        let root = root(name);
+        let catalog = root.join("catalog");
+        let mut db = seed(&root, base_not_null, true);
+        let table = db.schema().table("users").unwrap().id;
+        let source = db.bindings.resolve_single(table).unwrap();
+        let storage_floor = db.next_storage_id();
+        let version = db.table_schema_version(table);
+        let generation = db.schema_generation();
+        let epoch = schema_catalog_file::load(&catalog).unwrap().epoch;
+        let revision = db.catalog_generation();
+        let old_index = db.indexes(table).unwrap()[0].clone();
+        crate::schema_composition::reset_source_not_null_validation_count();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
+        )
+        .unwrap();
+        db.execute_in(&mut transaction, first).unwrap();
+        db.execute_in(&mut transaction, second).unwrap();
+        db.finalize_adopted_source(&mut transaction).unwrap();
+        assert!(matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::SealedNoEffectiveChange(_)
+        ));
+        db.commit_transaction(&mut transaction).unwrap();
+        assert_eq!(
+            crate::schema_composition::source_not_null_validation_count(),
+            expected_scans
+        );
+        assert_eq!(db.bindings.resolve_single(table), Ok(source));
+        assert_eq!(db.next_storage_id(), storage_floor);
+        assert_eq!(db.table_schema_version(table), version);
+        assert_eq!(db.schema_generation(), generation);
+        assert_eq!(schema_catalog_file::load(&catalog).unwrap().epoch, epoch);
+        assert_eq!(db.catalog_generation(), revision);
+        assert_eq!(db.indexes(table).unwrap()[0], old_index);
+        db.close().unwrap();
+        let reopened = Database::open_catalog(&catalog).unwrap();
+        assert_eq!(reopened.indexes(table).unwrap()[0], old_index);
+        reopened.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn round46_composes_survivor_nullability_with_layout_and_combined_dml() {
+    for (name, before, after, final_table, final_column) in [
+        (
+            "rename-then-set",
+            "ALTER TABLE users RENAME COLUMN email TO contact",
+            "ALTER TABLE users ALTER COLUMN contact SET NOT NULL",
+            "users",
+            "contact",
+        ),
+        (
+            "set-then-rename",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            "ALTER TABLE users RENAME COLUMN email TO contact",
+            "users",
+            "contact",
+        ),
+        (
+            "add-then-set",
+            "ALTER TABLE users ADD COLUMN marker TEXT",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            "users",
+            "email",
+        ),
+        (
+            "drop-then-set",
+            "ALTER TABLE users DROP COLUMN legacy",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            "users",
+            "email",
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, false, true);
+        let table = db.schema().table("users").unwrap().id;
+        let index = db.indexes(table).unwrap()[0].clone();
+        let mut transaction = db.begin_transaction().unwrap();
+        for statement in [
+            "UPDATE users SET email = 'filled@example.test' WHERE id = 1",
+            "INSERT INTO users VALUES (4, 'old-four', 'four@example.test')",
+            "DELETE FROM users WHERE id = 2",
+            before,
+            after,
+        ] {
+            db.execute_in(&mut transaction, statement).unwrap();
+        }
+        db.finalize_adopted_source(&mut transaction).unwrap();
+        let materialized = transaction.schema_composition.source_backfill().unwrap();
+        assert_eq!(
+            (
+                materialized.source_copy_passes,
+                materialized.source_rows_copied
+            ),
+            (1, 3)
+        );
+        db.commit_transaction(&mut transaction).unwrap();
+        let final_def = db.schema().table(final_table).unwrap();
+        assert_eq!(final_def.column(final_column).unwrap().id, ColumnId(3));
+        assert!(!final_def.column(final_column).unwrap().nullable);
+        if name == "add-then-set" {
+            assert!(final_def.column("marker").unwrap().nullable);
+        }
+        if name == "drop-then-set" {
+            assert!(final_def.column("legacy").is_none());
+        }
+        let final_index = &db.indexes(table).unwrap()[0];
+        assert_eq!(
+            (final_index.id, final_index.column_id, &final_index.name),
+            (index.id, ColumnId(3), &index.name)
+        );
+        assert_eq!(
+            db.query(&format!(
+                "SELECT id, {final_column} FROM {final_table} ORDER BY id"
+            ))
+            .unwrap()
+            .rows,
+            vec![
+                vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("filled@example.test".into())
+                ],
+                vec![
+                    ScalarValue::Int64(3),
+                    ScalarValue::Text("three@example.test".into())
+                ],
+                vec![
+                    ScalarValue::Int64(4),
+                    ScalarValue::Text("four@example.test".into())
+                ],
+            ]
+        );
+        assert_eq!(
+            db.query(&format!(
+                "SELECT id FROM {final_table} WHERE {final_column} = 'four@example.test'"
+            ))
+            .unwrap()
+            .rows,
+            [vec![ScalarValue::Int64(4)]]
+        );
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn round46_prepared_drop_and_overlay_dependency_remain_exact() {
+    let drop_root = root("prepared-drop");
+    let mut db = seed(&drop_root, true, true);
+    let PreparedSqlStatement::Ddl(drop_not_null) = db
+        .prepare_sql_statement("ALTER TABLE users ALTER COLUMN email DROP NOT NULL", &[])
+        .unwrap()
+    else {
+        panic!("expected DDL");
+    };
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = email WHERE id = 1",
+    )
+    .unwrap();
+    db.execute_ddl_in(&mut transaction, &drop_not_null).unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    assert!(
+        db.schema()
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap()
+            .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(drop_root).unwrap();
+
+    let root = root("prepared-overlay-stale");
+    let mut db = seed(&root, false, true);
+    let PreparedSqlStatement::Ddl(old_set) = db
+        .prepare_sql_statement("ALTER TABLE users ALTER COLUMN email SET NOT NULL", &[])
+        .unwrap()
+    else {
+        panic!("expected DDL");
+    };
+    let mut transaction = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut transaction,
+        "UPDATE users SET email = 'filled' WHERE email IS NULL",
+    )
+    .unwrap();
+    db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    assert!(matches!(
+        db.execute_ddl_in(&mut transaction, &old_set),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StaleSchemaDependency
+        ))
+    ));
+    assert!(matches!(
+        transaction.schema_composition,
+        SchemaCompositionState::AdoptedSourceRefining(_)
+    ));
+    let PreparedSqlStatement::Ddl(new_set) = db
+        .prepare_sql_statement_in(
+            &transaction,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+            &[],
+        )
+        .unwrap()
+    else {
+        panic!("expected DDL");
+    };
+    let CompiledDdlStatement::AlterTable(statement) = &new_set.compiled else {
+        panic!("expected ALTER");
+    };
+    assert!(matches!(
+        statement.operation,
+        netbadb_compiler::TypedAlterTableOperation::SetNotNull {
+            column_id: ColumnId(3)
+        }
+    ));
+    db.execute_ddl_in(&mut transaction, &new_set).unwrap();
+    db.commit_transaction(&mut transaction).unwrap();
+    assert!(
+        !db.schema()
+            .table("users")
+            .unwrap()
+            .column("email")
+            .unwrap()
+            .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn round46_new_columns_dml_and_index_ddl_remain_closed() {
+    for operation in ["SET NOT NULL", "DROP NOT NULL"] {
+        let root = root(if operation.starts_with("SET") {
+            "cnew-set"
+        } else {
+            "cnew-drop"
+        });
+        let mut db = seed(&root, false, true);
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(&mut transaction, "UPDATE users SET legacy = legacy")
+            .unwrap();
+        db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
+            .unwrap();
+        let result = db.execute_in(
+            &mut transaction,
+            &format!("ALTER TABLE users ALTER COLUMN marker {operation}"),
+        );
+        if operation.starts_with("SET") {
+            assert!(
+                matches!(
+                    result,
+                    Err(DatabaseError::SchemaMutation(
+                        SchemaMutationError::TransactionNotPristine
+                    ))
+                ),
+                "{operation}: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(DatabaseError::SchemaMutation(
+                        SchemaMutationError::InvalidSchemaEvolution("column is already nullable")
+                    ))
+                ),
+                "{operation}: {result:?}"
+            );
+        }
+        transaction.rollback().unwrap();
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    for (name, base_not_null, alter) in [
+        (
+            "closed-set",
+            false,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        ),
+        (
+            "closed-drop",
+            true,
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, base_not_null, true);
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET email = 'filled' WHERE email IS NULL",
+        )
+        .unwrap();
+        db.execute_in(&mut transaction, alter).unwrap();
+        for statement in [
+            "SELECT id FROM users",
+            "INSERT INTO users VALUES (4, 'four', 'four@example.test')",
+            "UPDATE users SET legacy = legacy",
+            "DELETE FROM users WHERE id = 1",
+        ] {
+            assert!(matches!(
+                db.execute_in(&mut transaction, statement),
+                Err(DatabaseError::SchemaMutation(
+                    SchemaMutationError::MigrationDataAccessAfterRefinement
+                ))
+            ));
+        }
+        for statement in [
+            "CREATE INDEX users_legacy_idx ON users(legacy)",
+            "DROP INDEX users_email_idx",
+        ] {
+            assert_eq!(
+                db.execute_in(&mut transaction, statement)
+                    .unwrap_err()
+                    .kind(),
+                DatabaseErrorKind::TransactionState
+            );
+        }
+        transaction.rollback().unwrap();
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn round46_writer_contention_fails_before_validation_and_retries_cleanly() {
+    let root = root("writer-contention");
+    let mut db = seed(&root, false, true);
+    let journal = journal_bytes(&db);
+    let mut writer = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut writer,
+        "UPDATE users SET email = 'filled' WHERE email IS NULL",
+    )
+    .unwrap();
+    let mut blocker = db.begin_transaction().unwrap();
+    db.execute_in(&mut blocker, "SELECT id FROM users").unwrap();
+    crate::schema_composition::reset_source_not_null_validation_count();
+    assert!(matches!(
+        db.execute_in(
+            &mut writer,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL"
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::SchemaBusy
+        ))
+    ));
+    assert_eq!(
+        crate::schema_composition::source_not_null_validation_count(),
+        0
+    );
+    assert_eq!(writer.state(), TransactionState::Active);
+    assert!(writer.schema_composition.is_none());
+    assert!(db.schema_writer.get().is_none());
+    assert_eq!(journal_bytes(&db), journal);
+    blocker.rollback().unwrap();
+    drop(blocker);
+    db.execute_in(
+        &mut writer,
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::schema_composition::source_not_null_validation_count(),
+        1
+    );
+    db.commit_transaction(&mut writer).unwrap();
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn round46_retains_cross_table_read_only_pending_index_and_pristine_routing() {
+    let root = root("eligibility-boundaries");
+    let mut db = seed(&root, false, true);
+    db.execute("CREATE TABLE teams (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO teams VALUES (1, 'one')").unwrap();
+
+    let mut read_only = db.begin_transaction().unwrap();
+    db.execute_in(&mut read_only, "SELECT id FROM users")
+        .unwrap();
+    assert_eq!(
+        db.execute_in(
+            &mut read_only,
+            "ALTER TABLE users ALTER COLUMN legacy SET NOT NULL"
+        )
+        .unwrap_err()
+        .kind(),
+        DatabaseErrorKind::TransactionState
+    );
+    assert!(read_only.schema_composition.is_none());
+    read_only.rollback().unwrap();
+    drop(read_only);
+
+    let mut cross_table = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut cross_table,
+        "UPDATE users SET email = 'filled' WHERE email IS NULL",
+    )
+    .unwrap();
+    db.execute_in(&mut cross_table, "SELECT id FROM teams")
+        .unwrap();
+    assert_eq!(
+        db.execute_in(
+            &mut cross_table,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL"
+        )
+        .unwrap_err()
+        .kind(),
+        DatabaseErrorKind::FeatureNotSupported
+    );
+    assert!(cross_table.schema_composition.is_none());
+    cross_table.rollback().unwrap();
+    drop(cross_table);
+
+    let mut pending_index = db.begin_transaction().unwrap();
+    db.execute_in(
+        &mut pending_index,
+        "UPDATE users SET email = 'filled' WHERE email IS NULL",
+    )
+    .unwrap();
+    db.execute_in(
+        &mut pending_index,
+        "CREATE INDEX users_legacy_idx ON users(legacy)",
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute_in(
+            &mut pending_index,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL"
+        )
+        .unwrap_err()
+        .kind(),
+        DatabaseErrorKind::FeatureNotSupported
+    );
+    assert!(pending_index.schema_composition.is_none());
+    pending_index.rollback().unwrap();
+    drop(pending_index);
+
+    db.execute("ALTER TABLE users ALTER COLUMN legacy SET NOT NULL")
+        .unwrap();
+    assert!(
+        !db.schema()
+            .table("users")
+            .unwrap()
+            .column("legacy")
+            .unwrap()
+            .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn round46_set_and_drop_rollback_restore_exact_s1() {
+    for (name, base_not_null, alter) in [
+        (
+            "rollback-set",
+            false,
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        ),
+        (
+            "rollback-drop",
+            true,
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+        ),
+    ] {
+        let root = root(name);
+        let mut db = seed(&root, base_not_null, true);
+        let table = db.schema().table("users").unwrap().id;
+        let source = db.bindings.resolve_single(table).unwrap();
+        let schema = db.schema().clone();
+        let indexes = db.indexes(table).unwrap().to_vec();
+        let storage_floor = db.next_storage_id();
+        let mut transaction = db.begin_transaction().unwrap();
+        db.execute_in(
+            &mut transaction,
+            "UPDATE users SET email = 'filled' WHERE email IS NULL",
+        )
+        .unwrap();
+        db.execute_in(&mut transaction, alter).unwrap();
+        transaction.rollback().unwrap();
+        assert!(db.schema_writer.get().is_none());
+        assert_eq!(db.schema(), &schema);
+        assert_eq!(db.bindings.resolve_single(table), Ok(source));
+        assert_eq!(db.indexes(table).unwrap(), indexes);
+        assert_eq!(db.next_storage_id(), storage_floor);
+        assert_eq!(
+            db.query("SELECT email FROM users WHERE id = 1")
+                .unwrap()
+                .rows,
+            [vec![if base_not_null {
+                ScalarValue::Text("one@example.test".into())
+            } else {
+                ScalarValue::Null
+            }]]
+        );
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -723,13 +1331,11 @@ fn candidate_c_probes_show_rename_compatibility_and_layout_mismatches() {
         "UPDATE users SET email = 'filled' WHERE email IS NULL",
     )
     .unwrap();
-    let spec = alter_spec(
-        &db,
-        Some(&transaction),
+    db.execute_in(
+        &mut transaction,
         "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-    );
-    db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-        .unwrap();
+    )
+    .unwrap();
     assert!(
         db.registry
             .get(source)
@@ -754,33 +1360,27 @@ fn candidate_c_probes_show_rename_compatibility_and_layout_mismatches() {
 }
 
 #[test]
-fn production_round45_surfaces_stay_negative_and_round44_round42_stay_positive() {
-    for (name, statements) in [
+fn production_round46_nullability_and_round44_round42_stay_positive() {
+    for (name, base_not_null, setup, alter) in [
         (
-            "set-negative",
-            vec![
-                "UPDATE users SET email = email",
-                "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-            ],
+            "set-positive",
+            false,
+            "UPDATE users SET email = 'filled' WHERE email IS NULL",
+            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
         ),
         (
-            "drop-negative",
-            vec![
-                "UPDATE users SET email = email",
-                "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
-            ],
+            "drop-positive",
+            true,
+            "UPDATE users SET email = email",
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
         ),
     ] {
         let root = root(name);
-        let mut db = seed(&root, false, true);
+        let mut db = seed(&root, base_not_null, true);
         let mut transaction = db.begin_transaction().unwrap();
-        db.execute_in(&mut transaction, statements[0]).unwrap();
-        let error = db.execute_in(&mut transaction, statements[1]).unwrap_err();
-        assert!(matches!(
-            error,
-            DatabaseError::SchemaMutation(SchemaMutationError::TransactionNotPristine)
-        ));
-        transaction.rollback().unwrap();
+        db.execute_in(&mut transaction, setup).unwrap();
+        db.execute_in(&mut transaction, alter).unwrap();
+        db.commit_transaction(&mut transaction).unwrap();
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -864,12 +1464,14 @@ struct Observation {
     target: StorageId,
     passes: u64,
     rows: u64,
+    validation_scans: u64,
 }
 
 fn observe(name: &str, mode: &str) -> Observation {
     let root = root(name);
-    let mut db = seed(&root, false, false);
+    let mut db = seed(&root, mode == "drop", false);
     let target = db.next_storage_id().unwrap();
+    crate::schema_composition::reset_source_not_null_validation_count();
     let mut transaction = db.begin_transaction().unwrap();
     db.execute_in(
         &mut transaction,
@@ -883,13 +1485,18 @@ fn observe(name: &str, mode: &str) -> Observation {
                 .unwrap();
         }
         "nullability" => {
-            let spec = alter_spec(
-                &db,
-                Some(&transaction),
+            db.execute_in(
+                &mut transaction,
                 "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-            );
-            db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-                .unwrap();
+            )
+            .unwrap();
+        }
+        "drop" => {
+            db.execute_in(
+                &mut transaction,
+                "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+            )
+            .unwrap();
         }
         "index" => {
             db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
@@ -912,6 +1519,7 @@ fn observe(name: &str, mode: &str) -> Observation {
     db.commit_transaction(&mut transaction).unwrap();
     db.close().unwrap();
     let final_bytes = resource_bytes(&root);
+    let validation_scans = crate::schema_composition::source_not_null_validation_count();
     std::fs::remove_dir_all(root).unwrap();
     Observation {
         source_bytes,
@@ -920,6 +1528,7 @@ fn observe(name: &str, mode: &str) -> Observation {
         target,
         passes,
         rows,
+        validation_scans,
     }
 }
 
@@ -927,14 +1536,19 @@ fn observe(name: &str, mode: &str) -> Observation {
 fn fixed_fixture_observes_baseline_nullability_and_new_column_index() {
     let baseline = observe("observation-baseline", "baseline");
     let nullability = observe("observation-nullability", "nullability");
+    let drop = observe("observation-drop-nullability", "drop");
     let index = observe("observation-index", "index");
-    for observation in [&baseline, &nullability, &index] {
+    for observation in [&baseline, &nullability, &drop, &index] {
         assert_eq!((observation.passes, observation.rows), (1, 3));
         assert_eq!(observation.target, StorageId(3));
         assert!(observation.peak_bytes >= observation.source_bytes);
         assert!(observation.final_bytes >= observation.source_bytes);
     }
-    println!("ROUND45_COST baseline={baseline:?} nullability={nullability:?} index={index:?}");
+    assert_eq!(nullability.validation_scans, 1);
+    assert_eq!(drop.validation_scans, 0);
+    println!(
+        "ROUND46_COST baseline={baseline:?} set={nullability:?} drop={drop:?} index={index:?}"
+    );
 }
 
 fn execute_candidate_a_crash_transaction(db: &mut Database) {
@@ -944,13 +1558,11 @@ fn execute_candidate_a_crash_transaction(db: &mut Database) {
         "UPDATE users SET email = 'filled@example.test' WHERE email IS NULL",
     )
     .unwrap();
-    let spec = alter_spec(
-        db,
-        Some(&transaction),
+    db.execute_in(
+        &mut transaction,
         "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-    );
-    db.audit_apply_adopted_source_nullability(&mut transaction, spec)
-        .unwrap();
+    )
+    .unwrap();
     db.commit_transaction(&mut transaction).unwrap();
 }
 
@@ -989,8 +1601,13 @@ fn assert_candidate_a_outcome(root: &Path, winner: bool, expected_storage: Stora
 #[test]
 fn candidate_a_reuses_round44_pre_and_post_cord_recovery() {
     for point in [
+        "post-dml-adoption-preflight-complete",
+        "post-dml-not-null-validation-complete",
+        "post-dml-adopted-source-installed",
+        "post-dml-first-refinement-accepted",
         "composition-intent-durable",
         "source-backfill-intent-durable",
+        "source-backfill-stage-intent-durable",
         "source-backfill-mid-copy",
     ] {
         let root = root(point);

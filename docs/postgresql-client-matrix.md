@@ -59,6 +59,7 @@ production or build dependencies.
 | DROP INDEX + DML + compatible ALTER + final index | psql yes, bounded | Round 39 managed Single Heap, one table, DROP-only prelude; Python clients unavailable/unverified |
 | DROP INDEX + DML + nullable ADD/exact DROP + final clone | psql yes, bounded | Round 42 exact Round 39 authority; new-column index/NOT NULL and later DML unsupported |
 | One managed Heap DML + nullable ADD/eligible DROP/rename | psql yes, bounded | Round 44 exact one-S1 adoption; one final S2, no later DML or index DDL |
+| One managed Heap DML + surviving-column SET/DROP NOT NULL | psql yes, bounded | Round 46 transaction-visible SET validation; indexed survivors supported; new-column nullability and later DML/index DDL unsupported |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 

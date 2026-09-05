@@ -1,11 +1,10 @@
 # Adopted-source refinement expansion architecture audit (Round 45)
 
-Round 45 is an architecture audit with test-only executable probes. It does
-not change the production SQL surface selected in Round 43 and implemented in
-Round 44. Production still permits one-table DML followed by nullable ADD,
-eligible DROP, or table/column rename, and still rejects surviving-column
-SET/DROP NOT NULL, final index DDL, and every relational statement after the
-first accepted refinement.
+Round 45 is the historical architecture audit with test-only executable probes
+that selected Candidate A. Round 46 subsequently productionized only its
+surviving-base-column SET/DROP NOT NULL result. Final index DDL and every
+relational statement after the first refinement remain production-negative;
+see [Round 46](post-dml-source-nullability-round46.md).
 
 The decision is to implement **Candidate A, surviving-base-column SET/DROP NOT
 NULL, in Round 46**. Candidate A alone preserves S1/P1 as the only pre-final
@@ -196,7 +195,7 @@ only candidate for which the executable evidence preserves every Round 44
 late-clone, no-op, one-S2, and recovery invariant without a new identity or
 persistent state machine.
 
-Round 46 should expose only same-table SET/DROP NOT NULL for a surviving base
+Round 46 exposes only same-table SET/DROP NOT NULL for a surviving base
 ColumnId after eligible one-managed-Single-Heap DML. SET validates the exact
 transaction-visible frozen S1 before first writer acquisition or against the
 same frozen source after adoption. Indexed survivors are included because S2
@@ -249,7 +248,8 @@ new row/data-authority representation for C2/C3. No such B/C design is added.
 | Manifest v4 | unchanged | unchanged | unchanged unless new physical resources appear |
 | SDK Schema Spec v1 | unchanged | unchanged | unchanged |
 
-The production negative pins retain `25000` for the candidate transaction-state
-boundaries and `25P02` for the following PostgreSQL command. Round 44 positives
-and the richer Round 42 DROP-index -> DML -> nullability -> layout -> final
-CREATE-index route remain covered.
+Round 46 converted the Candidate A negative pins to production-positive tests.
+The outer transaction-state boundaries retain `25000` and the following
+PostgreSQL command receives `25P02`. Round 44 positives and the richer Round 42
+DROP-index -> DML -> nullability -> layout -> final CREATE-index route remain
+covered.

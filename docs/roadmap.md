@@ -1054,6 +1054,18 @@ do not fit S1. Round 46 should include indexed surviving base columns, but must
 continue to exclude new-column NOT NULL, final index DDL, and all relational
 execution after the first successful refinement.
 
+### Adopted-source surviving-base nullability — Round 46
+
+[Round 46](post-dml-source-nullability-round46.md) productionizes Candidate A.
+SET/DROP NOT NULL now accepts an indexed or unindexed surviving base ColumnId
+after exact one-S1 DML. SET validates the transaction-visible source before
+first writer acquisition and supports native repair/retry; DROP performs no
+validation scan. Effective changes publish once through one S2 and rebuild
+surviving BTree specs under final nullability, while SET→DROP and DROP→SET are
+physical S1 no-ops. Prepared dependencies remain exact, DML and index DDL stay
+closed after adoption, and recovery plus all persistent/wire formats are
+unchanged. Candidate B index DDL and Candidate C further DML remain deferred.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

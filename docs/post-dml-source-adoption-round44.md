@@ -12,9 +12,11 @@ ALTER TABLE users RENAME COLUMN email TO contact;
 COMMIT;
 ```
 
-The public operation set is nullable ADD COLUMN, unindexed non-primary-key DROP
-COLUMN, RENAME TABLE, and RENAME COLUMN. INSERT, UPDATE, DELETE, mixed DML, and
-zero-row UPDATE/DELETE qualify equally. A read of the same S1 before its write
+The original Round 44 public operation set is nullable ADD COLUMN, unindexed
+non-primary-key DROP COLUMN, RENAME TABLE, and RENAME COLUMN. Round 46 adds
+SET/DROP NOT NULL for a surviving base ColumnId through a dedicated pre-writer
+validation path; see [Round 46](post-dml-source-nullability-round46.md). INSERT,
+UPDATE, DELETE, mixed DML, and zero-row UPDATE/DELETE qualify equally. A read of the same S1 before its write
 also qualifies. Read-only, cross-table, pending-index, LSM, partitioned, and
 imported/bootstrap transactions do not.
 
@@ -52,8 +54,9 @@ the new column. Renames retain TableId/ColumnId, and existing indexes retain
 their IndexId/ColumnId identity.
 
 The first accepted refinement closes SELECT/INSERT/UPDATE/DELETE with
-`MigrationDataAccessAfterRefinement` (`25000`). Generic SET/DROP NOT NULL and
-CREATE/DROP INDEX remain closed on this route. Indexed DROP returns `2BP01` and
+`MigrationDataAccessAfterRefinement` (`25000`). Round 46 permits SET/DROP NOT
+NULL only for a surviving base ID; new-column nullability and CREATE/DROP INDEX
+remain closed on this route. Indexed DROP returns `2BP01` and
 there is no implicit CASCADE. The older Round 39/42 DROP-first route remains
 separate and retains its surviving-column nullability and final-index support.
 
@@ -105,7 +108,7 @@ ordinary adoption used S2=3, one source pass, and three copied rows, with
 248,924 final bytes. This is fixture evidence, not a general performance claim.
 
 Defaults, generated values, type/nominal conversion, USING, constraints,
-CASCADE, post-refinement DML, new-column NOT NULL/indexes, generic post-DML
-SET/DROP NOT NULL, cross-table adoption, savepoints, online/resumable migration,
+CASCADE, post-refinement DML, new-column NOT NULL/indexes, cross-table adoption,
+savepoints, online/resumable migration,
 participant detach, automatic GC, format compaction, and general Alembic
 support remain out of scope.

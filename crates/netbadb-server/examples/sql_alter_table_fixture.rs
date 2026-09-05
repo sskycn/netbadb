@@ -32,6 +32,10 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round42_probe = std::env::var("NETBADB_ROUND42_PROBE").ok();
     let round44_probe = std::env::var("NETBADB_ROUND44_PROBE").ok();
     let round45_probe = std::env::var("NETBADB_ROUND45_PROBE").ok();
+    let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
+    let round46_email_not_null = round46_probe
+        .as_deref()
+        .is_some_and(|probe| matches!(probe, "drop" | "indexed-drop" | "drop-set"));
     let catalog = root.join("catalog");
     let mut db = Database::create_catalog(
         &catalog,
@@ -49,13 +53,31 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    if round42_probe.is_some() || round44_probe.is_some() || round45_probe.is_some() {
-        db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, email TEXT)")?;
+    if round42_probe.is_some()
+        || round44_probe.is_some()
+        || round45_probe.is_some()
+        || round46_probe.is_some()
+    {
+        let nullability = if round46_email_not_null {
+            " NOT NULL"
+        } else {
+            ""
+        };
+        db.execute(&format!(
+            "CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, email TEXT{nullability})"
+        ))?;
         if round42_probe.is_some() {
             db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
         }
         db.execute("CREATE INDEX projects_email_idx ON projects (email)")?;
-        db.execute("INSERT INTO projects VALUES (1, 'old-one', NULL)")?;
+        let first_email = if round46_email_not_null {
+            "'one@example.test'"
+        } else {
+            "NULL"
+        };
+        db.execute(&format!(
+            "INSERT INTO projects VALUES (1, 'old-one', {first_email})"
+        ))?;
         db.execute("INSERT INTO projects VALUES (2, 'old-two', 'two@example.test')")?;
         db.execute("INSERT INTO projects VALUES (3, 'old-three', 'three@example.test')")?;
     } else {
@@ -94,11 +116,12 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let project_columns = if round42_probe.is_some()
         || round44_probe.is_some()
         || round45_probe.is_some()
+        || round46_probe.is_some()
     {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
             {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
-            {"id": 3, "name": "email", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false}
+            {"id": 3, "name": "email", "physical_type": "text", "semantic_type": null, "nullable": !round46_email_not_null, "primary_key": false}
         ])
     } else {
         json!([
@@ -127,6 +150,87 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round46_probe {
+        for _ in 0..3 {
+            let reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 46 table disappeared")?;
+            let indexes = reopened.indexes(TableId(2))?;
+            let effective_set = matches!(
+                probe.as_str(),
+                "set"
+                    | "indexed-set"
+                    | "own-update"
+                    | "own-delete"
+                    | "rename-set"
+                    | "add-set"
+                    | "extended-set"
+            );
+            let effective_drop = matches!(probe.as_str(), "drop" | "indexed-drop");
+            let no_op = matches!(probe.as_str(), "set-drop" | "drop-set");
+            let failure = matches!(
+                probe.as_str(),
+                "set-failure"
+                    | "own-insert-null"
+                    | "zero-row"
+                    | "cnew-set"
+                    | "cnew-drop"
+                    | "post-refinement-dml"
+            );
+            if !(effective_set || effective_drop || no_op || failure) {
+                return Err(format!("unknown Round 46 probe {probe}").into());
+            }
+            let email_name = if probe == "rename-set" {
+                "contact"
+            } else {
+                "email"
+            };
+            let expected_nullable = if effective_set {
+                false
+            } else if effective_drop {
+                true
+            } else {
+                probe != "drop-set"
+            };
+            let expected_effective = effective_set || effective_drop;
+            if projects
+                .column(email_name)
+                .map(|column| (column.id, column.nullable))
+                != Some((ColumnId(3), expected_nullable))
+                || indexes.len() != 1
+                || indexes[0].id != old_index_id
+                || indexes[0].column_id != ColumnId(3)
+                || reopened.table_schema_version(TableId(2))
+                    != Some(if expected_effective {
+                        netbadb_types::TableSchemaVersion(base_version.0 + 1)
+                    } else {
+                        base_version
+                    })
+                || reopened.schema_generation()
+                    != if expected_effective {
+                        netbadb_types::SchemaGeneration(base_generation.0 + 1)
+                    } else {
+                        base_generation
+                    }
+                || reopened.next_storage_id()
+                    != Some(if expected_effective {
+                        netbadb_types::StorageId(target_storage.0 + 1)
+                    } else {
+                        target_storage
+                    })
+                || (probe == "add-set" && projects.column("marker").is_none())
+            {
+                return Err(format!("Round 46 probe {probe} reopened incorrectly").into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 46 surviving-base nullability result survived three catalog-only opens; final index spec validated; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round45_probe {
         for _ in 0..3 {

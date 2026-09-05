@@ -371,6 +371,17 @@ tag35, one S2, `RowProjection`, tag34, prepared NBSC, and CORD. DROP-first
 Round 42 remains a separate broader refinement route. No persistent or wire
 meaning changes.
 
+[Round 46](post-dml-source-nullability-round46.md) adds only surviving-base-
+column SET/DROP NOT NULL to that adopted source. A dedicated production-private
+helper performs the complete Candidate-B preflight, proves base `ColumnId`
+identity, and validates SET against transaction-visible S1 before acquiring the
+schema writer. DROP does not scan. Indexed survivors keep logical identity;
+effective changes rebuild their final `IndexSpec` on the one S2, while SET/DROP
+round trips keep the original S1 and physical index. New-column nullability,
+adopted index DDL, and post-refinement relational execution remain closed. The
+existing tag35/stage/tag34/NBSC/CORD lifecycle and every persistent/wire format
+are unchanged.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

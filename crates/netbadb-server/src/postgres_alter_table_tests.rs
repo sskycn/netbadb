@@ -66,11 +66,28 @@ fn project(name: &str) -> (std::path::PathBuf, Database) {
 }
 
 fn layout_project(name: &str) -> (std::path::PathBuf, Database) {
+    layout_project_with_email_nullability(name, false)
+}
+
+fn layout_project_with_email_nullability(
+    name: &str,
+    email_not_null: bool,
+) -> (std::path::PathBuf, Database) {
     let (root, mut db) = seed(name);
-    db.execute("CREATE TABLE accounts (id BIGINT NOT NULL, legacy TEXT, email TEXT)")
-        .unwrap();
-    db.execute("INSERT INTO accounts VALUES (1, 'old-one', NULL)")
-        .unwrap();
+    let nullability = if email_not_null { " NOT NULL" } else { "" };
+    db.execute(&format!(
+        "CREATE TABLE accounts (id BIGINT NOT NULL, legacy TEXT, email TEXT{nullability})"
+    ))
+    .unwrap();
+    let first_email = if email_not_null {
+        "'one@example.test'"
+    } else {
+        "NULL"
+    };
+    db.execute(&format!(
+        "INSERT INTO accounts VALUES (1, 'old-one', {first_email})"
+    ))
+    .unwrap();
     db.execute("INSERT INTO accounts VALUES (2, 'old-two', 'two@example.test')")
         .unwrap();
     db.execute("INSERT INTO accounts VALUES (3, 'old-three', 'three@example.test')")
@@ -260,6 +277,7 @@ fn pg_extended_post_dml_add_is_pure_until_execute() {
 #[test]
 fn pg_post_dml_adoption_error_boundaries_enter_failed_transaction() {
     let (root, mut db) = project("pg-round44-errors");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
     let mut admin = session(&db, true);
     ok(&sql(&mut admin, &mut db, "BEGIN"));
     ok(&sql(
@@ -273,7 +291,7 @@ fn pg_post_dml_adoption_error_boundaries_enter_failed_transaction() {
             &mut db,
             "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
         ),
-        "25000",
+        "23502",
     );
     state(
         &sql(&mut admin, &mut db, "SELECT id FROM projects"),
@@ -618,7 +636,7 @@ fn pg_post_dml_layout_rejections_enter_failed_transaction_state() {
             &mut db,
             "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
         ),
-        "25000",
+        "23502",
     );
     state(
         &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
@@ -701,31 +719,53 @@ fn pg_post_dml_layout_rejections_enter_failed_transaction_state() {
 }
 
 #[test]
-fn pg_round45_refinement_expansion_candidates_remain_unsupported() {
-    for (name, statement) in [
+fn pg_round46_surviving_nullability_is_supported_and_round45_boundaries_remain() {
+    for (name, base_not_null, setup, statement) in [
         (
             "set-not-null",
+            false,
+            "UPDATE accounts SET email = 'filled' WHERE email IS NULL",
             "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
         ),
         (
             "drop-not-null",
+            true,
+            "UPDATE accounts SET email = email WHERE id = 1",
             "ALTER TABLE accounts ALTER COLUMN email DROP NOT NULL",
         ),
     ] {
-        let (root, mut db) = layout_project(&format!("round45-{name}"));
+        let (root, mut db) =
+            layout_project_with_email_nullability(&format!("round46-{name}"), base_not_null);
+        let table = db.schema().table("accounts").unwrap().id;
+        let old_index = db.indexes(table).unwrap()[1].clone();
         let mut admin = session(&db, true);
-        ok(&sql(&mut admin, &mut db, "BEGIN"));
-        ok(&sql(
-            &mut admin,
-            &mut db,
-            "UPDATE accounts SET email = email WHERE id = 1",
-        ));
-        state(&sql(&mut admin, &mut db, statement), "25000");
-        state(
-            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
-            "25P02",
+        for (source, tag) in [
+            ("BEGIN", "BEGIN"),
+            (setup, "UPDATE 1"),
+            (statement, "ALTER TABLE"),
+            ("COMMIT", "COMMIT"),
+        ] {
+            assert_eq!(
+                sql(&mut admin, &mut db, source),
+                [
+                    BackendMessage::CommandComplete(tag.into()),
+                    BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+                ],
+                "{source}"
+            );
+        }
+        let final_column = db
+            .schema()
+            .table("accounts")
+            .unwrap()
+            .column("email")
+            .unwrap();
+        assert_eq!(final_column.nullable, base_not_null);
+        let final_index = &db.indexes(table).unwrap()[1];
+        assert_eq!(
+            (final_index.id, final_index.column_id, &final_index.name),
+            (old_index.id, old_index.column_id, &old_index.name)
         );
-        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -765,6 +805,151 @@ fn pg_round45_refinement_expansion_candidates_remain_unsupported() {
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn pg_round46_extended_set_is_pure_until_execute_and_uses_transaction_view() {
+    let (root, mut db) = layout_project("round46-extended-set");
+    let table = db.schema().table("accounts").unwrap().id;
+    let version = db.table_schema_version(table);
+    let generation = db.schema_generation();
+    let storage_floor = db.next_storage_id();
+    let before = files(&root);
+    let mut admin = session(&db, true);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "round46-set".into(),
+                query: "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(files(&root), before);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "round46-set".into(),
+                statement: "round46-set".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "round46-set".into(),
+            },
+        ),
+        [
+            BackendMessage::ParameterDescription(vec![]),
+            BackendMessage::NoData,
+        ]
+    );
+    assert_eq!(files(&root), before);
+    assert_eq!(db.table_schema_version(table), version);
+    assert_eq!(db.schema_generation(), generation);
+    assert_eq!(db.next_storage_id(), storage_floor);
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    assert_eq!(
+        sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET email = 'filled' WHERE email IS NULL"
+        ),
+        [
+            BackendMessage::CommandComplete("UPDATE 1".into()),
+            BackendMessage::ReadyForQuery(b'T'),
+        ]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "round46-set".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("ALTER TABLE".into())]
+    );
+    assert_eq!(db.table_schema_version(table), version);
+    assert_eq!(db.schema_generation(), generation);
+    assert_eq!(db.next_storage_id(), storage_floor);
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    assert!(
+        !db.schema()
+            .table("accounts")
+            .unwrap()
+            .column("email")
+            .unwrap()
+            .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round46_sqlstate_boundaries_for_new_columns_and_closed_dml_are_stable() {
+    for (name, operation, expected) in [
+        ("cnew-set", "SET NOT NULL", "25000"),
+        ("cnew-drop", "DROP NOT NULL", "58000"),
+    ] {
+        let (root, mut db) = layout_project(&format!("round46-{name}"));
+        let mut admin = session(&db, true);
+        for statement in [
+            "BEGIN",
+            "UPDATE accounts SET legacy = legacy WHERE id = 1",
+            "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        ] {
+            ok(&sql(&mut admin, &mut db, statement));
+        }
+        state(
+            &sql(
+                &mut admin,
+                &mut db,
+                &format!("ALTER TABLE accounts ALTER COLUMN marker {operation}"),
+            ),
+            expected,
+        );
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    let (root, mut db) = layout_project("round46-dml-closed");
+    let mut admin = session(&db, true);
+    for statement in [
+        "BEGIN",
+        "UPDATE accounts SET email = 'filled' WHERE email IS NULL",
+        "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL",
+    ] {
+        ok(&sql(&mut admin, &mut db, statement));
+    }
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "DELETE FROM accounts WHERE id = 1"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

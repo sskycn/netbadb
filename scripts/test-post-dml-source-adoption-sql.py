@@ -210,13 +210,6 @@ ROLLBACK;
     )
     for probe, setup, failing, marker, sqlstate in (
         (
-            "set-not-null",
-            "UPDATE projects SET email = email WHERE id = 1;",
-            "ALTER TABLE projects ALTER COLUMN email SET NOT NULL;",
-            "SET_NOT_NULL_STATE",
-            "25000",
-        ),
-        (
             "dml-after",
             "UPDATE projects SET email = email WHERE id = 1;\n"
             "ALTER TABLE projects ADD COLUMN marker TEXT;",
@@ -255,18 +248,6 @@ ROLLBACK;
         )
 
     for probe, setup, failing, marker in (
-        (
-            "set-not-null",
-            "UPDATE projects SET email = email WHERE id = 1;",
-            "ALTER TABLE projects ALTER COLUMN email SET NOT NULL;",
-            "ROUND45_SET_NOT_NULL_STATE",
-        ),
-        (
-            "drop-not-null",
-            "UPDATE projects SET email = email WHERE id = 1;",
-            "ALTER TABLE projects ALTER COLUMN email DROP NOT NULL;",
-            "ROUND45_DROP_NOT_NULL_STATE",
-        ),
         (
             "create-index",
             "UPDATE projects SET email = email WHERE id = 1;\n"
@@ -318,7 +299,7 @@ ROLLBACK;
             round_number=45,
         )
     print(
-        f"{version}: Round 44 post-DML source adoption and Round 45 negative SQL acceptance PASS"
+        f"{version}: Round 44 post-DML adoption and retained Round 45 outer-boundary SQL acceptance PASS"
     )
 
 

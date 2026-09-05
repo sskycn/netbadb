@@ -116,35 +116,6 @@ fn production_update_then_bounded_alter_surface_is_open() {
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
-
-    for (name, alter) in [
-        (
-            "negative-set-not-null",
-            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-        ),
-        (
-            "negative-drop-not-null",
-            "ALTER TABLE users ALTER COLUMN id DROP NOT NULL",
-        ),
-    ] {
-        let root = root(name);
-        let mut db = seed(&root, false);
-        let mut transaction = db.begin_transaction().unwrap();
-        db.execute_in(
-            &mut transaction,
-            "UPDATE users SET email = email WHERE id = 1",
-        )
-        .unwrap();
-        assert!(matches!(
-            db.execute_in(&mut transaction, alter),
-            Err(DatabaseError::SchemaMutation(
-                SchemaMutationError::TransactionNotPristine
-            ))
-        ));
-        transaction.rollback().unwrap();
-        db.close().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }
 
 #[test]
@@ -300,24 +271,17 @@ fn activation_discriminates_same_source_reads_from_read_only_transactions() {
 
 #[test]
 fn first_refinement_closes_relational_access_and_keeps_narrow_ddl_boundary() {
-    for (name, statement, migration_access_error) in [
-        ("select-closed", "SELECT id FROM users", true),
+    for (name, statement) in [
+        ("select-closed", "SELECT id FROM users"),
         (
             "insert-closed",
             "INSERT INTO users VALUES (4, 'four', 'four@example.test', NULL)",
-            true,
         ),
         (
             "update-closed",
             "UPDATE users SET email = email WHERE id = 1",
-            true,
         ),
-        ("delete-closed", "DELETE FROM users WHERE id = 1", true),
-        (
-            "not-null-closed",
-            "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
-            false,
-        ),
+        ("delete-closed", "DELETE FROM users WHERE id = 1"),
     ] {
         let root = root(name);
         let mut db = seed(&root, false);
@@ -330,22 +294,15 @@ fn first_refinement_closes_relational_access_and_keeps_narrow_ddl_boundary() {
         db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
             .unwrap();
         let error = db.execute_in(&mut transaction, statement).unwrap_err();
-        if migration_access_error {
-            assert!(
-                matches!(
-                    &error,
-                    DatabaseError::SchemaMutation(
-                        SchemaMutationError::MigrationDataAccessAfterRefinement
-                    )
-                ),
-                "{name}: {error:?}"
-            );
-        } else {
-            assert!(matches!(
-                error,
-                DatabaseError::SchemaMutation(SchemaMutationError::TransactionNotPristine)
-            ));
-        }
+        assert!(
+            matches!(
+                &error,
+                DatabaseError::SchemaMutation(
+                    SchemaMutationError::MigrationDataAccessAfterRefinement
+                )
+            ),
+            "{name}: {error:?}"
+        );
         transaction.rollback().unwrap();
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();

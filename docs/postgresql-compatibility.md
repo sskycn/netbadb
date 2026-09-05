@@ -214,12 +214,22 @@ The adapter still has no migration-state logic. See
 Round 44 adds a separate Core-selected path for ordinary one-S1 DML followed by
 nullable ADD COLUMN, unindexed non-PK DROP COLUMN, RENAME TABLE, or RENAME
 COLUMN. INSERT/UPDATE/DELETE, mixed DML, zero-row writes, and a prior read of
-the same S1 qualify. Read-only, cross-table, pending-index, SET/DROP NOT NULL,
-and index DDL do not. Parse/Bind/Describe remain pure; Execute performs the
+the same S1 qualify. Read-only, cross-table, pending-index, and index DDL do not.
+Parse/Bind/Describe remain pure; Execute performs the
 late adoption and any tag-16 reservation. The first accepted refinement closes
 relational execution with `25000`, and the next command in the failed explicit
 transaction receives `25P02`. Indexed DROP remains `2BP01`. The adapter has no
 Round 44 branch; see [Round 44](post-dml-source-adoption-round44.md).
+
+Round 46 extends only this Core route with SET/DROP NOT NULL on a surviving base
+ColumnId, including an indexed survivor. SET scans transaction-visible S1 before
+writer acquisition; a remaining NULL is `23502`, followed by `25P02` under the
+normal PostgreSQL failed-transaction rule. DROP performs no scan. Successful
+refinement still closes later relational and index DDL with `25000`. A late-added
+nullable column retains the established boundaries: SET is `25000`, while an
+already-nullable DROP is rejected as an operational `58000`; neither enters the
+adopted nullability path. Simple and Extended Query require no adapter-specific
+state. See [Round 46](post-dml-source-nullability-round46.md).
 
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections

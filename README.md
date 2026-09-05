@@ -356,12 +356,16 @@ clone. New columns receive fresh IDs and NULL values; DML closes after the first
 refinement, and new-column indexes and public new-column NOT NULL remain
 unsupported. Round 44 adds a separate narrow route: a single-table transaction
 on one managed Single Heap may perform ordinary INSERT/UPDATE/DELETE and then
-adopt that exact S1 for nullable ADD, unindexed non-PK DROP, or table/column
-rename. The first accepted refinement closes relational access; an effective
-layout is copied once into one final S2. This is not arbitrary ALTER-after-DML,
-online migration, or general Alembic support. See [Round 39](docs/drop-first-migration-sql-round39.md),
+adopt that exact S1 for nullable ADD, unindexed non-PK DROP, table/column rename,
+or Round 46 surviving-base-column SET/DROP NOT NULL. SET validates the exact
+transaction-visible source before the first schema-writer acquisition; indexed
+survivors retain logical identity and are rebuilt on the one final S2. The first
+accepted refinement closes relational access. This is not arbitrary
+ALTER-after-DML, new-column nullability, adopted index DDL, online migration, or
+general Alembic support. See [Round 39](docs/drop-first-migration-sql-round39.md),
 [Round 42](docs/drop-first-layout-migration-sql-round42.md), and
-[Round 44](docs/post-dml-source-adoption-round44.md).
+[Round 44](docs/post-dml-source-adoption-round44.md), and
+[Round 46](docs/post-dml-source-nullability-round46.md).
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
