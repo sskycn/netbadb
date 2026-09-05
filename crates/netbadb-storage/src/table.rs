@@ -38,6 +38,8 @@ pub enum HeapResourceComponentKind {
     Wal,
     TransactionStatus,
     AlternateWal,
+    ChangeLog,
+    ChangeStreamGuard,
 }
 
 /// Storage-authored physical bundle member. Callers may add their own
@@ -74,6 +76,16 @@ pub fn heap_resource_components(path: impl AsRef<Path>) -> Vec<HeapResourceCompo
         HeapResourceComponent {
             kind: HeapResourceComponentKind::AlternateWal,
             path: crate::wal_alternate_path(wal),
+            required: false,
+        },
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::ChangeLog,
+            path: crate::heap_change_log_path(main),
+            required: false,
+        },
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::ChangeStreamGuard,
+            path: crate::change_stream_guard_path(crate::heap_change_log_path(main)),
             required: false,
         },
     ]
@@ -210,6 +222,13 @@ impl StorageRowHandle {
 pub struct StorageReadView {
     table_id: TableId,
     inner: StorageReadViewKind,
+}
+
+/// An atomic committed read view and matching storage-local change frontier.
+#[derive(Debug)]
+pub struct CommittedReadAnchor {
+    pub read_view: StorageReadView,
+    pub cursor: crate::ChangeStreamCursor,
 }
 
 #[derive(Debug)]
@@ -619,6 +638,53 @@ impl TableStorage {
                 storage.table().id,
                 storage.read_view()?,
             )),
+        }
+    }
+
+    pub fn enable_change_stream(&mut self) -> Result<crate::ChangeStreamCursor, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.enable_change_stream(),
+            Self::Lsm(storage) => storage.enable_change_stream(),
+        }
+    }
+
+    pub fn disable_change_stream(&mut self) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => storage.disable_change_stream(),
+            Self::Lsm(storage) => storage.disable_change_stream(),
+        }
+    }
+
+    pub fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.change_stream_cursor(),
+            Self::Lsm(storage) => storage.change_stream_cursor(),
+        }
+    }
+
+    pub fn committed_read_anchor(&self) -> Result<CommittedReadAnchor, StorageError> {
+        let read_view = self.read_view()?;
+        let cursor = self.change_stream_cursor()?;
+        Ok(CommittedReadAnchor { read_view, cursor })
+    }
+
+    pub fn read_changes(
+        &self,
+        cursor: crate::ChangeStreamCursor,
+        max_batches: usize,
+        max_bytes: u64,
+    ) -> Result<crate::ChangeReadResult, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.read_changes(cursor, max_batches, max_bytes),
+            Self::Lsm(storage) => storage.read_changes(cursor, max_batches, max_bytes),
+        }
+    }
+
+    #[must_use]
+    pub fn inspect_change_stream(&self) -> crate::ChangeStreamInspection {
+        match self {
+            Self::Heap(storage) => storage.change_stream_inspection(),
+            Self::Lsm(storage) => storage.change_stream_inspection(),
         }
     }
 

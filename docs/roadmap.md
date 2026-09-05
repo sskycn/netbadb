@@ -49,11 +49,21 @@ document remains the decision and rejected-alternatives record.
 - embedded Core/Rust SDK lifecycle and inspection APIs, Heap/LSM end-to-end
   tests, race/corruption/reopen coverage, and a focused benchmark target.
 
-Phase 2 may add catalog-managed projection locations, persisted cheap LSM
-content epochs, partitioned projections, compression, dictionaries, SIMD,
-spilling, wider columnar operator coverage, and incremental maintenance. It
-must not turn a projection into authoritative storage or introduce a global
-commit sequence.
+## Columnar Phase 2A (complete)
+
+- opt-in, storage-owned NBCL v1 committed change journals for Heap and LSM;
+- stream-incarnation-bound local frontiers with explicit before/after chain
+  validation, bounded replay, reopen recovery, and gap/context errors;
+- full canonical after-images, exact Heap and LSM row-version identities, and
+  transaction-local insert/update/delete coalescing;
+- prepared evidence synchronized before authoritative commit, durable finalize
+  markers, and coordinator `DatabaseTxnId` correlation without global order;
+- explicit enable/disable, unavailable-stream write blocking, stable
+  inspection, corruption tests, and write-overhead benchmarks.
+
+See [Columnar Phase 2A](columnar-phase2a-change-stream.md). Columnar Delta,
+Base+Delta merge, incremental projection maintenance, retention/acknowledgement
+GC, global CSN, `RowEntityId`, and network CDC remain deferred.
 
 ## Phase 0 — Rust foundation (complete)
 

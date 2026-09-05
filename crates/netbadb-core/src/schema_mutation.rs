@@ -293,6 +293,8 @@ pub enum RetiredHeapGcComponentKind {
     AlternateWal = 5,
     CatalogLink = 6,
     CatalogLinkShadow = 7,
+    ChangeLog = 8,
+    ChangeStreamGuard = 9,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2979,6 +2981,12 @@ fn gc_components(
                     netbadb_storage::HeapResourceComponentKind::AlternateWal => {
                         RetiredHeapGcComponentKind::AlternateWal
                     }
+                    netbadb_storage::HeapResourceComponentKind::ChangeLog => {
+                        RetiredHeapGcComponentKind::ChangeLog
+                    }
+                    netbadb_storage::HeapResourceComponentKind::ChangeStreamGuard => {
+                        RetiredHeapGcComponentKind::ChangeStreamGuard
+                    }
                 },
                 path: component.path,
                 required: component.required,
@@ -3016,7 +3024,16 @@ fn gc_manifest_digest(
         .ok_or(SchemaMutationError::Corrupt("catalog has no parent"))?;
     let mut digest = Sha256::new();
     digest.update(b"NetbaDB retired Heap bundle v1\0");
-    for component in components {
+    // Version 1 predates optional derived change-stream artifacts. Their paths
+    // are deterministically derived from the bound Heap path and are deleted
+    // by the GC state machine, but omitting them here preserves every durable
+    // v1 intent digest across an upgrade.
+    for component in components.iter().filter(|component| {
+        !matches!(
+            component.kind,
+            RetiredHeapGcComponentKind::ChangeLog | RetiredHeapGcComponentKind::ChangeStreamGuard
+        )
+    }) {
         digest.update([component.kind as u8, u8::from(component.required)]);
         let relative = component
             .path
@@ -3663,18 +3680,24 @@ fn resume_gc_intent(
     if present.get(1).is_some_and(|component| component.is_some()) {
         validate_retired_resource(catalog, intent)?;
     }
-    if present.get(5).is_some_and(|component| component.is_some())
+    if components
+        .iter()
+        .zip(&present)
+        .find(|(component, _)| component.kind == RetiredHeapGcComponentKind::CatalogLink)
+        .is_some_and(|(_, present)| present.is_some())
         && file::discover(&heap)? != catalog
     {
         return Err(SchemaMutationError::Corrupt("retired Heap catalog link mismatch").into());
     }
     crash("gc-before-first-delete");
-    const CRASH_POINTS: [&str; 7] = [
+    const CRASH_POINTS: [&str; 9] = [
         "gc-after-owner-delete",
         "gc-after-main-delete",
         "gc-after-wal-delete",
         "gc-after-status-delete",
         "gc-after-alternate-delete",
+        "gc-after-change-log-delete",
+        "gc-after-change-stream-guard-delete",
         "gc-after-link-delete",
         "gc-after-link-shadow-delete",
     ];

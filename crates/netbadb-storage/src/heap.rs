@@ -15,6 +15,7 @@ use netbadb_types::{
     ColumnId, IndexId, IndexName, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId,
 };
 
+use crate::change_stream::{AuthoritativeOutcome, ChangeStreamManager, SharedChangeStream};
 use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
 use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
 use crate::transaction::TransactionManager;
@@ -74,6 +75,7 @@ pub struct HeapStorage {
     table_statistics: Option<TableStatistics>,
     index_statistics: Vec<Option<IndexStatistics>>,
     index_catalog_root: PageId,
+    change_stream: SharedChangeStream,
     #[cfg(test)]
     skip_drop_flush: bool,
     #[cfg(test)]
@@ -312,6 +314,12 @@ impl HeapStorage {
             }
         };
         let statuses = Rc::new(RefCell::new(status_store));
+        let change_stream = Rc::new(RefCell::new(ChangeStreamManager::disabled(
+            crate::heap_change_log_path(path),
+            crate::ChangeStorageKind::Heap,
+            storage_id,
+            &table,
+        )?));
         let wal = Rc::new(RefCell::new(wal_manager));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
@@ -345,8 +353,13 @@ impl HeapStorage {
         }
         buffer.flush_all()?;
         let next_txn_id = wal.borrow().next_txn_id();
-        let transactions =
-            TransactionManager::new(wal, buffer.clone(), next_txn_id, statuses.clone())?;
+        let transactions = TransactionManager::new(
+            wal,
+            buffer.clone(),
+            next_txn_id,
+            statuses.clone(),
+            Some(change_stream.clone()),
+        )?;
         Ok(Self {
             buffer,
             table,
@@ -360,6 +373,7 @@ impl HeapStorage {
             table_statistics: None,
             index_statistics: Vec::new(),
             index_catalog_root: FIRST_MANAGED_PAGE,
+            change_stream,
             #[cfg(test)]
             skip_drop_flush: false,
             #[cfg(test)]
@@ -496,14 +510,30 @@ impl HeapStorage {
             ));
         }
         let wal = Rc::new(RefCell::new(wal_manager));
+        let change_stream = Rc::new(RefCell::new(ChangeStreamManager::open(
+            crate::heap_change_log_path(path),
+            crate::ChangeStorageKind::Heap,
+            storage_id,
+            &table,
+            |txn_id| match statuses.borrow().status(txn_id) {
+                Ok(crate::TxnStatus::Committed(_)) => AuthoritativeOutcome::Committed(None),
+                Ok(crate::TxnStatus::Aborted) => AuthoritativeOutcome::Aborted,
+                Ok(crate::TxnStatus::Active) | Err(_) => AuthoritativeOutcome::Unresolved,
+            },
+        )?));
         let buffer = BufferPool::with_wal(pages, buffer_pool_size, Rc::clone(&wal))?;
         {
             let header = buffer.read_page(HEADER_PAGE)?;
             validate_heap_metadata(header.page().bytes(), &table, fingerprint)?;
         }
         let next_txn_id = wal.borrow().next_txn_id();
-        let transactions =
-            TransactionManager::new(wal, buffer.clone(), next_txn_id, statuses.clone())?;
+        let transactions = TransactionManager::new(
+            wal,
+            buffer.clone(),
+            next_txn_id,
+            statuses.clone(),
+            Some(change_stream.clone()),
+        )?;
         let mut storage = Self {
             buffer,
             table,
@@ -517,6 +547,7 @@ impl HeapStorage {
             table_statistics: None,
             index_statistics: Vec::new(),
             index_catalog_root: catalog_root,
+            change_stream,
             #[cfg(test)]
             skip_drop_flush: false,
             #[cfg(test)]
@@ -2004,6 +2035,41 @@ impl HeapStorage {
         )
     }
 
+    pub(crate) fn enable_change_stream(
+        &mut self,
+    ) -> Result<crate::ChangeStreamCursor, StorageError> {
+        self.transactions.ensure_checkpoint_safe()?;
+        // A new incarnation defines its current authoritative state as F0.
+        // Heap CommitSeq also covers metadata transactions and therefore is
+        // deliberately not reused as the logical row-change frontier.
+        let baseline = netbadb_types::StorageDataVersion(0);
+        self.change_stream.borrow_mut().enable(baseline)
+    }
+
+    pub(crate) fn disable_change_stream(&mut self) -> Result<(), StorageError> {
+        self.transactions.ensure_checkpoint_safe()?;
+        self.change_stream.borrow_mut().disable()
+    }
+
+    pub(crate) fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
+        self.change_stream.borrow().cursor()
+    }
+
+    pub(crate) fn read_changes(
+        &self,
+        cursor: crate::ChangeStreamCursor,
+        max_batches: usize,
+        max_bytes: u64,
+    ) -> Result<crate::ChangeReadResult, StorageError> {
+        self.change_stream
+            .borrow()
+            .read(cursor, max_batches, max_bytes)
+    }
+
+    pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
+        self.change_stream.borrow().inspection()
+    }
+
     pub(crate) fn buffer(&self) -> &BufferPool {
         &self.buffer
     }
@@ -2026,6 +2092,7 @@ impl HeapStorage {
         values: &[ScalarValue],
     ) -> Result<RowId, StorageError> {
         self.validate_transaction(transaction)?;
+        transaction.ensure_change_stream_mutation_available()?;
         self.validate_row(values)?;
         let row_payload = encode_row(values)?;
         let payload = encode_tuple(
@@ -2075,6 +2142,7 @@ impl HeapStorage {
                 return Err(error);
             }
         }
+        transaction.record_heap_insert(self.storage_id, row_id, values);
         Ok(row_id)
     }
 
@@ -2146,6 +2214,7 @@ impl HeapStorage {
         values: &[ScalarValue],
     ) -> Result<RowId, StorageError> {
         self.validate_transaction(transaction)?;
+        transaction.ensure_change_stream_mutation_available()?;
         let view = transaction.current_read_view()?;
         let old_values = self
             .read_row_with_view(row_id, &view)?
@@ -2207,6 +2276,7 @@ impl HeapStorage {
                 return Err(error);
             }
         }
+        transaction.record_heap_update(self.storage_id, row_id, current_row_id, values);
         Ok(current_row_id)
     }
 
@@ -2306,6 +2376,7 @@ impl HeapStorage {
         row_id: RowId,
     ) -> Result<(), StorageError> {
         self.validate_transaction(transaction)?;
+        transaction.ensure_change_stream_mutation_available()?;
         let view = transaction.current_read_view()?;
         let old_values = self
             .read_row_with_view(row_id, &view)?
@@ -2327,6 +2398,7 @@ impl HeapStorage {
         self.crash_after_registered_publish(
             crate::crash_test::TestCrashPoint::RegisteredDeleteAfterFirstIndexPublish,
         )?;
+        transaction.record_heap_delete(self.storage_id, row_id);
         Ok(())
     }
 

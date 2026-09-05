@@ -2753,6 +2753,62 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
 }
 
 #[test]
+fn retired_heap_gc_removes_enabled_change_stream_history_and_guard() {
+    let root = root("retired-heap-change-stream-gc");
+    let mut db = seed(&root, true);
+    let mut create = db.begin_transaction().unwrap();
+    let table = db
+        .create_heap_table_legacy_in(
+            &mut create,
+            CreateTableSpec::new(
+                "events",
+                vec![CreateColumnSpec::new(
+                    "id",
+                    SemanticType::physical(PhysicalType::Int64),
+                    false,
+                )],
+            ),
+        )
+        .unwrap();
+    db.commit_transaction(&mut create).unwrap();
+    drop(create);
+    db.enable_change_stream(table).unwrap();
+    db.execute("INSERT INTO events VALUES (1)").unwrap();
+
+    let target = db.resolve_drop_table("events").unwrap();
+    let mut drop_txn = db.begin_transaction().unwrap();
+    db.drop_table_legacy_in(&mut drop_txn, target).unwrap();
+    db.commit_transaction(&mut drop_txn).unwrap();
+    drop(drop_txn);
+    let retired = db
+        .inspect_retired_table_resources()
+        .into_iter()
+        .find(|resource| resource.table_id == table)
+        .unwrap();
+    let inspection = db.inspect_retired_heap_gc(&retired).unwrap();
+    for kind in [
+        crate::RetiredHeapGcComponentKind::ChangeLog,
+        crate::RetiredHeapGcComponentKind::ChangeStreamGuard,
+    ] {
+        assert!(
+            inspection
+                .components
+                .iter()
+                .any(|component| component.kind == kind && component.present)
+        );
+    }
+    let paths = inspection
+        .components
+        .iter()
+        .map(|component| component.path.clone())
+        .collect::<Vec<_>>();
+    db.gc_retired_heap(&retired).unwrap();
+    assert!(paths.iter().all(|path| !path.exists()));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn retired_heap_gc_never_touches_same_name_recreation_with_index() {
     let root = root("retired-heap-gc-same-name");
     let mut db = seed(&root, true);

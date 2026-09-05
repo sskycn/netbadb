@@ -31,5 +31,9 @@ harness = false
 name = "columnar_scale"
 harness = false
 
+[[bench]]
+name = "change_stream_phase2a"
+harness = false
+
 [lints]
 workspace = true

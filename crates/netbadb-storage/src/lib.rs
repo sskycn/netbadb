@@ -3,6 +3,7 @@
 mod allocation_transition;
 mod btree;
 mod buffer;
+mod change_stream;
 mod columnar;
 #[cfg(test)]
 mod crash_test;
@@ -19,6 +20,13 @@ mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
+pub use change_stream::{
+    CHANGE_LOG_FORMAT_VERSION, CHANGE_LOG_MAGIC, CHANGE_LOG_MAX_MUTATIONS,
+    CHANGE_LOG_MAX_RECORD_BYTES, CHANGE_LOG_MAX_ROW_BYTES, ChangeBatch, ChangeBatchInspection,
+    ChangeReadResult, ChangeStorageKind, ChangeStreamCursor, ChangeStreamError,
+    ChangeStreamInspection, ChangeStreamStatus, StorageChange, StorageVersionKey,
+    change_stream_guard_path, heap_change_log_path, lsm_change_log_path, validate_change_log_file,
+};
 pub use columnar::{
     ColumnarBatch, ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics,
     ColumnarConstraint, ColumnarError, ColumnarProjection, ColumnarProjectionMetadata,
@@ -50,9 +58,9 @@ pub use recovery::{
     RecoveryError,
 };
 pub use table::{
-    AccessPathCapabilities, HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex,
-    HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath, StorageKind, StorageReadView,
-    StorageRowHandle, StorageTransaction, TableStorage, heap_resource_components,
+    AccessPathCapabilities, CommittedReadAnchor, HeapResourceComponent, HeapResourceComponentKind,
+    HeapRewriteIndex, HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath, StorageKind,
+    StorageReadView, StorageRowHandle, StorageTransaction, TableStorage, heap_resource_components,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
@@ -531,6 +539,7 @@ pub enum StorageError {
     Checkpoint(CheckpointError),
     Lsm(LsmError),
     Columnar(ColumnarError),
+    ChangeStream(ChangeStreamError),
     TableIdMismatch {
         expected: TableId,
         actual: TableId,
@@ -610,6 +619,7 @@ impl fmt::Display for StorageError {
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Lsm(error) => write!(formatter, "LSM error: {error}"),
             Self::Columnar(error) => error.fmt(formatter),
+            Self::ChangeStream(error) => error.fmt(formatter),
             Self::TableIdMismatch { expected, actual } => write!(
                 formatter,
                 "table ID mismatch: expected {}, found {}",
@@ -718,6 +728,7 @@ impl Error for StorageError {
             Self::Checkpoint(error) => Some(error),
             Self::Lsm(error) => Some(error),
             Self::Columnar(error) => Some(error),
+            Self::ChangeStream(error) => Some(error),
             _ => None,
         }
     }
@@ -732,6 +743,12 @@ impl From<std::io::Error> for StorageError {
 impl From<ColumnarError> for StorageError {
     fn from(error: ColumnarError) -> Self {
         Self::Columnar(error)
+    }
+}
+
+impl From<ChangeStreamError> for StorageError {
+    fn from(error: ChangeStreamError) -> Self {
+        Self::ChangeStream(error)
     }
 }
 

@@ -142,7 +142,6 @@ impl PhysicalBindings {
             .ok_or(StorageRegistryError::MissingPhysicalBinding { table_id })
     }
 
-    #[cfg(test)]
     pub(crate) fn resolve_single(
         &self,
         table_id: TableId,

@@ -2,8 +2,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use netbadb_types::{CommandId, CommitSeq, DatabaseTxnId, Lsn, TxnId};
+use netbadb_types::{
+    CommandId, CommitSeq, DatabaseTxnId, Lsn, RowId, ScalarValue, StorageId, TxnId,
+};
 
+use crate::StorageVersionKey;
+use crate::change_stream::{PendingChangeSet, PreparedChange, SharedChangeStream};
 use crate::mvcc::{IsolationLevel, ReadView, Snapshot};
 use crate::txn_status::SharedTxnStatus;
 use crate::wal::page_update_kind;
@@ -74,6 +78,9 @@ pub struct Transaction {
     rollback_start_lsn: Option<Lsn>,
     rollback_complete_lsn: Option<Lsn>,
     prepared_database_txn_id: Option<DatabaseTxnId>,
+    change_stream: Option<SharedChangeStream>,
+    changes: PendingChangeSet,
+    prepared_change: Option<PreparedChange>,
     #[cfg(test)]
     interrupt_rollback_after: Option<usize>,
 }
@@ -117,6 +124,7 @@ impl Transaction {
         }
         let commit_lsn = match self.state {
             TransactionState::Active => {
+                self.prepare_changes(None)?;
                 let mut wal = self
                     .wal
                     .try_borrow_mut()
@@ -140,7 +148,8 @@ impl Transaction {
             }
         };
 
-        self.finish_commit(commit_lsn)
+        self.finish_commit(commit_lsn)?;
+        self.publish_changes(None)
     }
 
     /// Durably prepares this physical participant for `database_txn_id`.
@@ -153,6 +162,7 @@ impl Transaction {
         }
         let prepare_lsn = match self.state {
             TransactionState::Active => {
+                self.prepare_changes(Some(database_txn_id))?;
                 let lsn = self
                     .wal
                     .try_borrow_mut()
@@ -226,7 +236,8 @@ impl Transaction {
                 .into());
             }
         };
-        self.finish_commit(commit_lsn)
+        self.finish_commit(commit_lsn)?;
+        self.publish_changes(None)
     }
 
     /// Rolls back a prepared participant only while no durable global commit
@@ -296,6 +307,7 @@ impl Transaction {
                 .map_err(|_| TransactionError::StatusBusy)?
                 .record_aborted(self.id)?;
             self.finish_rollback();
+            self.abandon_changes();
             return Ok(());
         }
 
@@ -343,6 +355,7 @@ impl Transaction {
             .map_err(|_| TransactionError::StatusBusy)?
             .record_aborted(self.id)?;
         self.finish_rollback();
+        self.abandon_changes();
         Ok(())
     }
 
@@ -403,6 +416,103 @@ impl Transaction {
         if self.state == TransactionState::Active {
             self.state = TransactionState::RollbackRequired;
         }
+    }
+
+    pub(crate) fn record_heap_insert(
+        &mut self,
+        storage_id: StorageId,
+        row_id: RowId,
+        after: &[ScalarValue],
+    ) {
+        if self
+            .change_stream
+            .as_ref()
+            .is_some_and(|stream| stream.borrow().requires_changes())
+        {
+            self.changes.record_insert(
+                StorageVersionKey::Heap { storage_id, row_id },
+                after.to_vec(),
+            );
+        }
+    }
+
+    pub(crate) fn ensure_change_stream_mutation_available(&self) -> Result<(), StorageError> {
+        if let Some(stream) = &self.change_stream {
+            stream.borrow().ensure_mutation_available()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_heap_update(
+        &mut self,
+        storage_id: StorageId,
+        old: RowId,
+        new: RowId,
+        after: &[ScalarValue],
+    ) {
+        if self
+            .change_stream
+            .as_ref()
+            .is_some_and(|stream| stream.borrow().requires_changes())
+        {
+            self.changes.record_update(
+                StorageVersionKey::Heap {
+                    storage_id,
+                    row_id: old,
+                },
+                StorageVersionKey::Heap {
+                    storage_id,
+                    row_id: new,
+                },
+                after.to_vec(),
+            );
+        }
+    }
+
+    pub(crate) fn record_heap_delete(&mut self, storage_id: StorageId, row_id: RowId) {
+        if self
+            .change_stream
+            .as_ref()
+            .is_some_and(|stream| stream.borrow().requires_changes())
+        {
+            self.changes
+                .record_delete(StorageVersionKey::Heap { storage_id, row_id });
+        }
+    }
+
+    fn prepare_changes(
+        &mut self,
+        database_txn_id: Option<DatabaseTxnId>,
+    ) -> Result<(), StorageError> {
+        if self.prepared_change.is_none() {
+            if let Some(stream) = &self.change_stream {
+                self.prepared_change = stream.borrow_mut().prepare(
+                    self.id,
+                    database_txn_id,
+                    self.changes.as_slice(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_changes(
+        &mut self,
+        lsm_commit: Option<netbadb_types::LsmCommitSeq>,
+    ) -> Result<(), StorageError> {
+        if let (Some(stream), Some(prepared)) = (&self.change_stream, self.prepared_change) {
+            stream.borrow_mut().publish(self.id, prepared, lsm_commit)?;
+        }
+        self.changes.clear();
+        Ok(())
+    }
+
+    fn abandon_changes(&mut self) {
+        if let Some(stream) = &self.change_stream {
+            stream.borrow_mut().abandon(self.id);
+        }
+        self.changes.clear();
+        self.prepared_change = None;
     }
 
     pub(crate) fn belongs_to(&self, wal: &SharedWal) -> bool {
@@ -787,6 +897,7 @@ pub(crate) struct TransactionManager {
     next_txn_id: TxnId,
     runtime: SharedRuntime,
     statuses: SharedTxnStatus,
+    change_stream: Option<SharedChangeStream>,
 }
 
 impl TransactionManager {
@@ -795,6 +906,7 @@ impl TransactionManager {
         buffer: BufferPool,
         next_txn_id: TxnId,
         statuses: SharedTxnStatus,
+        change_stream: Option<SharedChangeStream>,
     ) -> Result<Self, StorageError> {
         if next_txn_id.0 == 0 {
             return Err(TransactionError::IdExhausted.into());
@@ -809,6 +921,7 @@ impl TransactionManager {
                 outstanding: Cell::new(0),
             }),
             statuses,
+            change_stream,
         })
     }
 
@@ -866,6 +979,9 @@ impl TransactionManager {
             rollback_start_lsn: None,
             rollback_complete_lsn: None,
             prepared_database_txn_id: None,
+            change_stream: self.change_stream.clone(),
+            changes: PendingChangeSet::new(),
+            prepared_change: None,
             #[cfg(test)]
             interrupt_rollback_after: None,
         })
@@ -968,7 +1084,7 @@ mod tests {
             TxnStatusStore::create(page_path.with_extension("status"))
                 .expect("create transaction statuses"),
         ));
-        let manager = TransactionManager::new(Rc::clone(&wal), buffer, next_txn_id, statuses)
+        let manager = TransactionManager::new(Rc::clone(&wal), buffer, next_txn_id, statuses, None)
             .expect("transaction manager");
         (page_path, wal_path, wal, manager)
     }

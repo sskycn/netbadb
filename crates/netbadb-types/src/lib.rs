@@ -141,6 +141,13 @@ pub struct LsmRowId(pub u64);
 ///
 /// This is deliberately not a database-global timestamp domain.
 pub struct LsmCommitSeq(pub u64);
+/// Durable logical row-state frontier within one physical storage.
+/// Values are meaningful only together with the owning `StorageId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StorageDataVersion(pub u64);
+/// Incarnation of one explicitly enabled per-storage change stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChangeStreamGeneration(pub u64);
 // Monotonic MVCC commit order, currently derived from a durable Commit LSN.
 id_type!(CommitSeq, u64);
 // Transaction-local statement order used for own-write visibility.

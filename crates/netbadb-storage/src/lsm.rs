@@ -21,6 +21,10 @@ use netbadb_types::{
     TableId, TxnId,
 };
 
+use crate::StorageVersionKey;
+use crate::change_stream::{
+    AuthoritativeOutcome, ChangeStreamManager, PendingChangeSet, PreparedChange,
+};
 use crate::row_codec::{
     decode_row, decode_row_columns, decode_row_positions, encode_row, resolve_columns, validate_row,
 };
@@ -565,6 +569,7 @@ struct LsmShared {
     runtime: Rc<Runtime>,
     table_statistics: Option<TableStatistics>,
     access_statistics: Option<IndexStatistics>,
+    change_stream: ChangeStreamManager,
 }
 
 #[derive(Debug)]
@@ -615,6 +620,7 @@ pub struct LsmTransaction {
     last_lsn: Lsn,
     owns_writer: bool,
     registered: bool,
+    prepared_change: Option<PreparedChange>,
     shared: Rc<RefCell<LsmShared>>,
 }
 
@@ -780,6 +786,12 @@ impl LsmStorage {
                 outstanding_read_views: Cell::new(0),
                 amplification: AmplificationCounters::default(),
             });
+            let change_stream = ChangeStreamManager::disabled(
+                crate::lsm_change_log_path(&root),
+                crate::ChangeStorageKind::Lsm,
+                storage_id,
+                &table,
+            )?;
             Ok(Self {
                 table: table.clone(),
                 shared: Rc::new(RefCell::new(LsmShared {
@@ -798,6 +810,7 @@ impl LsmStorage {
                     runtime,
                     table_statistics: None,
                     access_statistics: None,
+                    change_stream,
                 })),
             })
         })();
@@ -840,6 +853,7 @@ impl LsmStorage {
         let mut memtable = BTreeMap::new();
         let mut max_commit = 0_u64;
         let mut recovery_commit = allocate_recovery_commit(&manifest, &recovered)?;
+        let mut change_outcomes = BTreeMap::new();
         for (txn_id, transaction) in &recovered {
             let decision = if let Some(commit) = transaction.commit {
                 Some((PreparedDecision::Commit, commit))
@@ -879,6 +893,19 @@ impl LsmStorage {
                 ))?;
                 apply_mutations(&mut memtable, mutations, commit)?;
                 max_commit = max_commit.max(commit.0);
+                change_outcomes.insert(*txn_id, AuthoritativeOutcome::Committed(Some(commit)));
+            } else if transaction.aborted
+                || transaction
+                    .prepared
+                    .and_then(|database_txn_id| {
+                        resolutions.iter().find(|resolution| {
+                            resolution.physical_txn_id == *txn_id
+                                && resolution.database_txn_id == database_txn_id
+                        })
+                    })
+                    .is_some_and(|resolution| resolution.decision == PreparedDecision::Abort)
+            {
+                change_outcomes.insert(*txn_id, AuthoritativeOutcome::Aborted);
             }
         }
         manifest.commit_reservation_end = manifest.commit_reservation_end.max(
@@ -894,6 +921,18 @@ impl LsmStorage {
             outstanding_read_views: Cell::new(0),
             amplification: AmplificationCounters::default(),
         });
+        let change_stream = ChangeStreamManager::open(
+            crate::lsm_change_log_path(&root),
+            crate::ChangeStorageKind::Lsm,
+            manifest.storage_id,
+            &table,
+            |txn_id| {
+                change_outcomes
+                    .get(&txn_id)
+                    .copied()
+                    .unwrap_or(AuthoritativeOutcome::Unresolved)
+            },
+        )?;
         Ok(Self {
             table: table.clone(),
             shared: Rc::new(RefCell::new(LsmShared {
@@ -912,6 +951,7 @@ impl LsmStorage {
                 runtime,
                 table_statistics: manifest.table_statistics,
                 access_statistics: manifest.access_statistics,
+                change_stream,
             })),
         })
     }
@@ -1062,6 +1102,57 @@ impl LsmStorage {
         new_read_view(&shared, None, BTreeMap::new(), shared.maximum_commit_seq())
     }
 
+    pub(crate) fn enable_change_stream(
+        &mut self,
+    ) -> Result<crate::ChangeStreamCursor, StorageError> {
+        let mut shared = self.shared.borrow_mut();
+        if shared.runtime.outstanding_transactions.get() != 0
+            || shared.runtime.writer.get().is_some()
+        {
+            return Err(TransactionError::OutstandingTransactions {
+                count: shared.runtime.outstanding_transactions.get(),
+            }
+            .into());
+        }
+        // The incarnation identity binds this F0 to the current authoritative
+        // state; later logical row commits alone advance the frontier.
+        let baseline = netbadb_types::StorageDataVersion(0);
+        shared.change_stream.enable(baseline)
+    }
+
+    pub(crate) fn disable_change_stream(&mut self) -> Result<(), StorageError> {
+        let mut shared = self.shared.borrow_mut();
+        if shared.runtime.outstanding_transactions.get() != 0
+            || shared.runtime.writer.get().is_some()
+        {
+            return Err(TransactionError::OutstandingTransactions {
+                count: shared.runtime.outstanding_transactions.get(),
+            }
+            .into());
+        }
+        shared.change_stream.disable()
+    }
+
+    pub(crate) fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
+        self.shared.borrow().change_stream.cursor()
+    }
+
+    pub(crate) fn read_changes(
+        &self,
+        cursor: crate::ChangeStreamCursor,
+        max_batches: usize,
+        max_bytes: u64,
+    ) -> Result<crate::ChangeReadResult, StorageError> {
+        self.shared
+            .borrow()
+            .change_stream
+            .read(cursor, max_batches, max_bytes)
+    }
+
+    pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
+        self.shared.borrow().change_stream.inspection()
+    }
+
     pub fn begin_transaction(&mut self) -> Result<LsmTransaction, StorageError> {
         self.begin_transaction_with_isolation(IsolationLevel::ReadCommitted)
     }
@@ -1093,6 +1184,7 @@ impl LsmStorage {
             last_lsn: Lsn(0),
             owns_writer: false,
             registered: true,
+            prepared_change: None,
             shared: Rc::clone(&self.shared),
         })
     }
@@ -1644,6 +1736,17 @@ impl LsmTransaction {
                 // manifest publication fails, the transaction remains Active
                 // without a durable batch that a retry could duplicate.
                 let commit_seq = LsmCommitSeq(shared.allocate_commit_seq()?);
+                if shared.change_stream.requires_changes() {
+                    let changes = self.canonical_changes(
+                        shared.manifest.storage_id,
+                        &shared.table,
+                        commit_seq,
+                    )?;
+                    self.prepared_change =
+                        shared
+                            .change_stream
+                            .prepare(self.id, None, changes.as_slice())?;
+                }
                 let batch_lsn = shared.wal.append(&WalRecord::MutationBatch {
                     txn_id: self.id,
                     mutations: batch.clone(),
@@ -1689,6 +1792,11 @@ impl LsmTransaction {
                 .ok_or(LsmError::InvalidWal("pending commit batch is missing"))?;
             apply_mutations(&mut shared.memtable, batch, commit_seq)?;
             shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+            if let Some(prepared) = self.prepared_change {
+                shared
+                    .change_stream
+                    .publish(self.id, prepared, Some(commit_seq))?;
+            }
             #[cfg(test)]
             maybe_lsm_crash("after-memtable-apply");
         }
@@ -1712,6 +1820,18 @@ impl LsmTransaction {
                 }
                 let batch = self.canonical_batch()?;
                 let mut shared = self.shared.borrow_mut();
+                if shared.change_stream.requires_changes() {
+                    let changes = self.canonical_changes(
+                        shared.manifest.storage_id,
+                        &shared.table,
+                        LsmCommitSeq(0),
+                    )?;
+                    self.prepared_change = shared.change_stream.prepare(
+                        self.id,
+                        Some(database_txn_id),
+                        changes.as_slice(),
+                    )?;
+                }
                 self.last_lsn = shared.wal.append(&WalRecord::MutationBatch {
                     txn_id: self.id,
                     mutations: batch.clone(),
@@ -1799,6 +1919,11 @@ impl LsmTransaction {
                 .ok_or(LsmError::InvalidWal("prepared mutation batch is missing"))?;
             apply_mutations(&mut shared.memtable, batch, commit_seq)?;
             shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+            if let Some(prepared) = self.prepared_change {
+                shared
+                    .change_stream
+                    .publish(self.id, prepared, Some(commit_seq))?;
+            }
         }
         self.finish_terminal(TransactionState::Committed);
         Ok(())
@@ -1834,6 +1959,7 @@ impl LsmTransaction {
             self.last_lsn = ensure_abort_record(&mut shared, self.id, self.last_lsn)?;
         }
         self.shared.borrow_mut().wal.sync()?;
+        self.shared.borrow_mut().change_stream.abandon(self.id);
         self.finish_terminal(TransactionState::RolledBack);
         Ok(())
     }
@@ -1843,6 +1969,7 @@ impl LsmTransaction {
             TransactionState::Active => {
                 self.pending.clear();
                 self.pending_bytes = 0;
+                self.shared.borrow_mut().change_stream.abandon(self.id);
                 self.finish_terminal(TransactionState::RolledBack);
                 Ok(())
             }
@@ -2042,6 +2169,47 @@ impl LsmTransaction {
             WalMutation::Put { key, .. } | WalMutation::Tombstone { key } => *key,
         });
         Ok(mutations)
+    }
+
+    fn canonical_changes(
+        &self,
+        storage_id: StorageId,
+        table: &TableDef,
+        new_version: LsmCommitSeq,
+    ) -> Result<PendingChangeSet, StorageError> {
+        let mut changes = PendingChangeSet::new();
+        for (row_id, pending) in &self.pending {
+            let new_key = StorageVersionKey::Lsm {
+                storage_id,
+                row_id: *row_id,
+                version: new_version,
+            };
+            match (pending.base_version, &pending.row) {
+                (None, Some(row)) => {
+                    changes.record_insert(new_key, decode_row(row, table)?);
+                }
+                (Some(old_version), Some(row)) => {
+                    changes.record_update(
+                        StorageVersionKey::Lsm {
+                            storage_id,
+                            row_id: *row_id,
+                            version: old_version,
+                        },
+                        new_key,
+                        decode_row(row, table)?,
+                    );
+                }
+                (Some(old_version), None) => {
+                    changes.record_delete(StorageVersionKey::Lsm {
+                        storage_id,
+                        row_id: *row_id,
+                        version: old_version,
+                    });
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(changes)
     }
 
     fn validate_database_txn(&self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {

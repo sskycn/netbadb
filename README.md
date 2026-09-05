@@ -81,6 +81,12 @@ lifecycle, structural planner costs, and a 10K–10M CSV scale benchmark. Heap a
 LSM remain authoritative and committed DML makes a projection stale until
 refresh.
 
+[Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
+durable per-storage committed change stream for Heap and LSM, with exact
+row-version identities, transaction coalescing, bounded replay, gap detection,
+and coordinator correlation. It remains an embedded storage capability; no
+network CDC or Columnar Delta is implemented.
+
 Round 33 extends controlled backfill with a post-backfill `CREATE INDEX` /
 `DROP INDEX` phase. Index IDs are durably reserved before overlay mutation;
 finalization retargets the same staged Heap first and then builds only the

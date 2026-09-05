@@ -53,7 +53,7 @@ use netbadb_planner::{
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
     ColumnarProjection, HeapRecoveryInspection, PreparedDecision, PreparedTransaction,
-    PreparedTransactionState, PreparedTxnResolution, StorageError, TableStorage,
+    PreparedTransactionState, PreparedTxnResolution, TableStorage,
 };
 use netbadb_types::{
     AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, DatabaseTxnId, IndexName,
@@ -80,12 +80,16 @@ pub use netbadb_executor::{
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
-    HistoricalOrphanAdoptionReport, IndexDefinition, IndexMaintenanceReport, IndexReclaimReport,
-    IndexStatistics, IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
-    LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
-    ReusablePageInspection, StorageKind, TableStatistics,
+    ChangeBatch, ChangeBatchInspection, ChangeReadResult, ChangeStreamCursor, ChangeStreamError,
+    ChangeStreamInspection, CommittedReadAnchor, HistoricalOrphanAdoptionReport, IndexDefinition,
+    IndexMaintenanceReport, IndexReclaimReport, IndexStatistics, IndexTailReclaimReport,
+    IsolationLevel, LsmInspection, LsmLevelInspection, LsmReadAmplification, LsmWriteAmplification,
+    PageReuseClass, PageReuseInspection, ReusablePageInspection, StorageChange, StorageError,
+    StorageKind, StorageVersionKey, TableStatistics,
 };
-pub use netbadb_types::{SchemaGeneration, TableSchemaVersion};
+pub use netbadb_types::{
+    ChangeStreamGeneration, SchemaGeneration, StorageDataVersion, TableSchemaVersion,
+};
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
 };
@@ -2386,6 +2390,68 @@ impl Database {
         }
         columnar::crash("drop-physical-cleanup");
         Ok(())
+    }
+
+    /// Enables a durable committed-change stream for one exactly placed table.
+    pub fn enable_change_stream(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<ChangeStreamCursor, DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .enable_change_stream()
+            .map_err(Into::into)
+    }
+
+    /// Explicitly abandons the current stream incarnation and its history.
+    pub fn disable_change_stream(&mut self, table_id: TableId) -> Result<(), DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        self.registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .disable_change_stream()
+            .map_err(Into::into)
+    }
+
+    pub fn read_changes(
+        &self,
+        table_id: TableId,
+        cursor: ChangeStreamCursor,
+        max_batches: usize,
+        max_bytes: u64,
+    ) -> Result<ChangeReadResult, DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        self.registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .read_changes(cursor, max_batches, max_bytes)
+            .map_err(Into::into)
+    }
+
+    pub fn committed_read_anchor(
+        &self,
+        table_id: TableId,
+    ) -> Result<CommittedReadAnchor, DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        self.registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .committed_read_anchor()
+            .map_err(Into::into)
+    }
+
+    pub fn inspect_change_stream(
+        &self,
+        table_id: TableId,
+    ) -> Result<ChangeStreamInspection, DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        Ok(self
+            .registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .inspect_change_stream())
     }
 
     #[must_use]
@@ -5018,6 +5084,70 @@ mod tests {
                 cleanup_mixed_crash_fixture(&root);
             }
         }
+    }
+
+    #[test]
+    fn change_stream_recovers_both_local_batches_after_durable_coordinator_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-core-change-stream-decision-crash-{}",
+            std::process::id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator) = mixed_crash_paths(&root);
+        let mut database = Database::create_storages_with_coordinator(
+            mixed_create_specs(&root),
+            DatabaseCoordinatorConfig::new(&coordinator),
+        )
+        .expect("create change-stream crash fixture");
+        let heap_cursor = database
+            .enable_change_stream(TableId(1))
+            .expect("enable Heap change stream");
+        let lsm_cursor = database
+            .enable_change_stream(TableId(2))
+            .expect("enable LSM change stream");
+        database.close().expect("close change-stream fixture");
+
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("core test executable"));
+        command
+            .arg("--exact")
+            .arg("tests::coordinator_crash_child_entrypoint")
+            .arg("--nocapture");
+        crate::coordinator_crash::configure_child(
+            &mut command,
+            "mixed:change-stream",
+            &root,
+            "after-durable-decision",
+        );
+        let status = command.status().expect("start change-stream crash child");
+        assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+
+        for pass in 0..2 {
+            let recovered = Database::open_storages_with_coordinator(
+                mixed_open_specs(&root),
+                DatabaseCoordinatorConfig::new(&coordinator),
+            )
+            .expect("recover change-stream database");
+            let heap = recovered
+                .read_changes(TableId(1), heap_cursor, 10, 1_000_000)
+                .expect("read recovered Heap changes");
+            let lsm = recovered
+                .read_changes(TableId(2), lsm_cursor, 10, 1_000_000)
+                .expect("read recovered LSM changes");
+            assert_eq!(heap.batches.len(), 1, "pass {pass}");
+            assert_eq!(lsm.batches.len(), 1, "pass {pass}");
+            assert_eq!(
+                heap.batches[0].database_txn_id, lsm.batches[0].database_txn_id,
+                "pass {pass}"
+            );
+            assert!(heap.batches[0].database_txn_id.is_some(), "pass {pass}");
+            assert_ne!(
+                heap.batches[0].storage_id, lsm.batches[0].storage_id,
+                "pass {pass}"
+            );
+            recovered.close().expect("close recovered database");
+        }
+        cleanup_mixed_crash_fixture(&root);
     }
 
     #[test]
