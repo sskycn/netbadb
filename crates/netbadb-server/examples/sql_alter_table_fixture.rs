@@ -32,6 +32,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round42_probe = std::env::var("NETBADB_ROUND42_PROBE").ok();
     let round44_probe = std::env::var("NETBADB_ROUND44_PROBE").ok();
     let round45_probe = std::env::var("NETBADB_ROUND45_PROBE").ok();
+    let round48_probe = std::env::var("NETBADB_ROUND48_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -57,6 +58,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round44_probe.is_some()
         || round45_probe.is_some()
         || round46_probe.is_some()
+        || round48_probe.is_some()
     {
         let nullability = if round46_email_not_null {
             " NOT NULL"
@@ -117,6 +119,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round44_probe.is_some()
         || round45_probe.is_some()
         || round46_probe.is_some()
+        || round48_probe.is_some()
     {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
@@ -150,6 +153,86 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round48_probe {
+        let dirty = matches!(probe.as_str(), "cnew" | "rename");
+        let rollback = probe == "rollback";
+        let names: &[&str] = match probe.as_str() {
+            "cnew" => &["projects_email_idx", "projects_marker_idx"],
+            "rename" => &["projects_contact_idx"],
+            "create" => &["projects_email_idx", "projects_legacy_idx"],
+            "drop" => &[],
+            "create-drop" | "rollback" | "replacement" => &["projects_email_idx"],
+            "multiple" => &["projects_legacy_idx", "projects_id_idx"],
+            _ => return Err(format!("unknown Round 48 probe {probe}").into()),
+        };
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 48 table absent")?;
+            if projects.column("marker").is_some() != (probe == "cnew")
+                || projects
+                    .column(if probe == "rename" {
+                        "contact"
+                    } else {
+                        "email"
+                    })
+                    .map(|column| column.id)
+                    != Some(ColumnId(3))
+                || reopened.table_schema_version(TableId(2))
+                    != Some(netbadb_types::TableSchemaVersion(
+                        base_version.0 + u64::from(dirty),
+                    ))
+                || reopened.schema_generation().0 != base_generation.0 + u64::from(dirty)
+                || reopened.next_storage_id()
+                    != Some(netbadb_types::StorageId(
+                        target_storage.0 + u64::from(dirty),
+                    ))
+            {
+                return Err(format!("Round 48 schema/placement mismatch: {probe}").into());
+            }
+            let indexes = reopened.indexes(TableId(2))?;
+            if indexes.len() != names.len()
+                || names.iter().any(|name| {
+                    !indexes.iter().any(|index| {
+                        index
+                            .name
+                            .as_ref()
+                            .is_some_and(|candidate| candidate.as_str() == *name)
+                    })
+                })
+                || (probe == "replacement" && indexes[0].id == old_index_id)
+            {
+                return Err(format!("Round 48 final index inventory mismatch: {probe}").into());
+            }
+            let expected = if rollback {
+                vec![(1, "old-one"), (2, "old-two"), (3, "old-three")]
+            } else {
+                vec![(1, "updated1"), (3, "old-three"), (4, "inserted4")]
+            };
+            let rows = reopened
+                .query("SELECT id, legacy FROM projects ORDER BY id")?
+                .rows;
+            let expected: Vec<Vec<netbadb_types::ScalarValue>> = expected
+                .into_iter()
+                .map(|(id, value)| {
+                    vec![
+                        netbadb_types::ScalarValue::Int64(id),
+                        netbadb_types::ScalarValue::Text(value.into()),
+                    ]
+                })
+                .collect();
+            if rows != expected {
+                return Err(format!("Round 48 visible rows mismatch: {probe}").into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: {probe} Round 48 final schema/index identity and visible rows verified across three opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round46_probe {
         for _ in 0..3 {

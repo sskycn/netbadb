@@ -377,10 +377,23 @@ helper performs the complete Candidate-B preflight, proves base `ColumnId`
 identity, and validates SET against transaction-visible S1 before acquiring the
 schema writer. DROP does not scan. Indexed survivors keep logical identity;
 effective changes rebuild their final `IndexSpec` on the one S2, while SET/DROP
-round trips keep the original S1 and physical index. New-column nullability,
-adopted index DDL, and post-refinement relational execution remain closed. The
+round trips keep the original S1 and physical index. New-column nullability
+and post-refinement relational execution remain closed. Round 48 adds the
+bounded terminal final-index phase described below. The
 existing tag35/stage/tag34/NBSC/CORD lifecycle and every persistent/wire format
 are unchanged.
+
+[Round 48](adopted-source-final-index-round48.md) adds the private
+`AdoptedSourceIndexFinalizing` state, owning the unchanged S1/P1 adoption proof.
+CREATE checks original prepared overlay T/V/F/ColumnId before durable tag24
+reservation against canonical final V/F. DROP addresses exact logical T/I.
+Neither statement changes physical S1 indexes. The existing adopted finalizer
+revalidates source authority once before choosing the existing rewrite path
+for a dirty TableDef, Ordinary InPlaceIndexDelta on the same P1 for an index-only
+change, or SealedNoEffectiveChange for global no-op. Only the rewrite branch
+allocates S2 and writes tag35/stage/tag34/NBSC. Index-only publication changes
+runtime revision once and leaves V/G/epoch unchanged; the old digest proof is
+consumed before the authorized physical delta. No persistent decoder changes.
 
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;

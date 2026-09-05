@@ -310,10 +310,10 @@ fn first_refinement_closes_relational_access_and_keeps_narrow_ddl_boundary() {
 
     for (name, statement) in [
         (
-            "create-index-closed",
+            "create-index-terminal",
             "CREATE INDEX users_marker_idx ON users(marker)",
         ),
-        ("drop-index-closed", "DROP INDEX users_email_idx"),
+        ("drop-index-terminal", "DROP INDEX users_email_idx"),
     ] {
         let root = root(name);
         let mut db = seed(&root, false);
@@ -325,7 +325,11 @@ fn first_refinement_closes_relational_access_and_keeps_narrow_ddl_boundary() {
         .unwrap();
         db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
             .unwrap();
-        assert!(db.execute_in(&mut transaction, statement).is_err());
+        db.execute_in(&mut transaction, statement).unwrap();
+        assert!(matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
+        ));
         transaction.rollback().unwrap();
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();

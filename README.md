@@ -361,11 +361,20 @@ or Round 46 surviving-base-column SET/DROP NOT NULL. SET validates the exact
 transaction-visible source before the first schema-writer acquisition; indexed
 survivors retain logical identity and are rebuilt on the one final S2. The first
 accepted refinement closes relational access. This is not arbitrary
-ALTER-after-DML, new-column nullability, adopted index DDL, online migration, or
+ALTER-after-DML, new-column nullability, online migration, or
 general Alembic support. See [Round 39](docs/drop-first-migration-sql-round39.md),
 [Round 42](docs/drop-first-layout-migration-sql-round42.md), and
 [Round 44](docs/post-dml-source-adoption-round44.md), and
 [Round 46](docs/post-dml-source-nullability-round46.md).
+
+[Round 48](docs/adopted-source-final-index-round48.md) allows final single-column
+non-unique CREATE/DROP INDEX after that bounded adopted-source refinement.
+The first accepted index statement freezes the schema and enters a terminal
+index phase; further same-table CREATE/DROP may compose, while ALTER and
+relational execution remain closed. A table-effective migration builds the
+complete final index inventory on one S2. A canonical table no-op applies an
+honest transactional index delta to S1; CREATE→DROP retains only the ID burn.
+
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable

@@ -1,5 +1,12 @@
 # Adopted-source final index architecture audit (Round 47)
 
+Historical audit: [Round 48](adopted-source-final-index-round48.md) now
+productionizes Candidate A. The test-only correctness implementation described
+below has been removed; its fixture delegates acceptance, state gates and
+finalization to production Core. The Round 47 real-client script now runs the
+Round 48 positives and terminal negatives. Historical alternatives and cost
+observations below explain the architecture decision, not current exclusions.
+
 Round 47 starts at `fbcd9fc5e4490873d71469390679ec5b5812bddf` and is an
 architecture audit with executable, test-only prototypes. Production adopted
 CREATE/DROP INDEX remains rejected. No README production claim is expanded.

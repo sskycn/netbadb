@@ -1,37 +1,29 @@
-//! Round 47 executable architecture, inaccessible to production SQL dispatch.
+//! Round 47 architecture evidence promoted to Round 48 production regression tests.
 use super::*;
 use crate::{
     CompiledDdlStatement, DdlOutcome, DropIndexTarget, PreparedSqlStatement, TypedCreateIndex,
 };
+use netbadb_types::IndexName;
 use std::path::Path;
 
-// Owns the transaction so callers cannot accidentally execute ALTER through the
-// prototype once final index truth has begun. The real adopted carrier remains
-// inside it, including P1, locator, digest and base catalog authority.
-struct FinalIndexPhase {
+// Fixture convenience only: every acceptance, phase gate and finalization below
+// calls production Core. There is no separate test correctness implementation.
+struct FinalIndexFixture {
     transaction: Transaction,
-    terminal: bool,
 }
 
-impl FinalIndexPhase {
+impl FinalIndexFixture {
     fn new(transaction: Transaction) -> Self {
-        assert!(matches!(
-            transaction.schema_composition,
-            SchemaCompositionState::AdoptedSourceRefining(_)
-        ));
-        Self {
-            transaction,
-            terminal: false,
-        }
+        Self { transaction }
     }
 
     fn logical_mut(&mut self) -> &mut SchemaTransactionPlan {
-        let SchemaCompositionState::AdoptedSourceRefining(adopted) =
-            &mut self.transaction.schema_composition
-        else {
-            panic!("adopted")
-        };
-        &mut adopted.logical
+        &mut self
+            .transaction
+            .schema_composition
+            .adopted_source_mut()
+            .unwrap()
+            .logical
     }
 
     fn prepare(&self, db: &Database, sql: &str) -> TypedCreateIndex {
@@ -52,69 +44,7 @@ impl FinalIndexPhase {
         db: &mut Database,
         statement: &TypedCreateIndex,
     ) -> Result<DdlOutcome, DatabaseError> {
-        db.validate_transaction(&self.transaction)?;
-        let plan = self.transaction.schema_composition.plan().unwrap();
-        let dependency = plan.dependency(statement.target.table_id)?;
-        if dependency.table_version != statement.target.table_version
-            || dependency.fingerprint != statement.target.fingerprint
-            || plan
-                .overlay
-                .schema
-                .tables()
-                .iter()
-                .find(|table| table.id == statement.target.table_id)
-                .and_then(|table| table.column_by_id(statement.column_id))
-                .is_none()
-        {
-            return Err(SchemaMutationError::StaleSchemaDependency.into());
-        }
-        // Prepared authority has now been checked against the original overlay.
-        // Canonicalize only the durable reservation's version; never resolve a
-        // name again or replace the prepared T/F/C dependency.
-        let old_version = dependency.table_version;
-        let base = plan.touched.get(&statement.target.table_id).ok_or(
-            SchemaMutationError::UnsupportedBackfillRefinement(
-                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
-            ),
-        )?;
-        let table = plan
-            .overlay
-            .schema
-            .tables()
-            .iter()
-            .find(|table| table.id == statement.target.table_id)
-            .unwrap();
-        let canonical = if table == &base.base_table {
-            base.base_lineage.version
-        } else {
-            old_version
-        };
-        let mut reservation_statement = statement.clone();
-        reservation_statement.target.table_version = canonical;
-        self.logical_mut()
-            .overlay
-            .tables
-            .iter_mut()
-            .find(|lineage| lineage.table_id == statement.target.table_id)
-            .unwrap()
-            .version = canonical;
-        let result = db
-            .audit_apply_adopted_source_create_index(&mut self.transaction, &reservation_statement);
-        if result.is_err() {
-            self.logical_mut()
-                .overlay
-                .tables
-                .iter_mut()
-                .find(|lineage| lineage.table_id == statement.target.table_id)
-                .unwrap()
-                .version = old_version;
-        } else {
-            self.terminal = true;
-            if matches!(result, Ok(DdlOutcome::Created)) {
-                crash("adopted-final-index-reservation-durable");
-            }
-        }
-        result
+        db.compose_create_index_in(&mut self.transaction, statement)
     }
 
     fn drop_index(
@@ -122,108 +52,15 @@ impl FinalIndexPhase {
         db: &mut Database,
         target: DropIndexTarget,
     ) -> Result<DdlOutcome, DatabaseError> {
-        db.validate_transaction(&self.transaction)?;
-        if !self.logical_mut().touched.contains_key(&target.table_id) {
-            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
-                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
-            )
-            .into());
-        }
-        // Reuse exact-ID logical delta acceptance while retaining every source
-        // field. This temporary state is confined to the test-only carrier.
-        let previous = std::mem::replace(
-            &mut self.transaction.schema_composition,
-            SchemaCompositionState::None,
-        );
-        let SchemaCompositionState::AdoptedSourceRefining(mut adopted) = previous else {
-            panic!("adopted")
-        };
-        self.transaction.schema_composition =
-            SchemaCompositionState::Composing(Box::new(adopted.logical.clone()));
-        let result = db.apply_composed_drop_index(&mut self.transaction, target);
-        let SchemaCompositionState::Composing(logical) = std::mem::replace(
-            &mut self.transaction.schema_composition,
-            SchemaCompositionState::None,
-        ) else {
-            panic!("logical")
-        };
-        adopted.logical = *logical;
-        self.transaction.schema_composition =
-            SchemaCompositionState::AdoptedSourceRefining(adopted);
-        if result.is_ok() {
-            let plan = self.logical_mut();
-            let touched = &plan.touched[&target.table_id];
-            if plan
-                .overlay
-                .schema
-                .tables()
-                .iter()
-                .find(|table| table.id == target.table_id)
-                == Some(&touched.base_table)
-            {
-                plan.overlay
-                    .tables
-                    .iter_mut()
-                    .find(|lineage| lineage.table_id == target.table_id)
-                    .unwrap()
-                    .version = touched.base_lineage.version;
-            }
-            self.terminal = true;
-        }
-        result
+        db.compose_drop_index_in(&mut self.transaction, target)
     }
 
     fn execute(&mut self, db: &mut Database, sql: &str) -> Result<(), DatabaseError> {
-        if self.terminal {
-            return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
-        }
         db.execute_in(&mut self.transaction, sql).map(|_| ())
     }
 
     fn finalize(&mut self, db: &mut Database) -> Result<(), DatabaseError> {
-        db.revalidate_adopted_source_authority(&self.transaction)?;
-        let plan = self.transaction.schema_composition.plan().unwrap();
-        let dirty = plan.touched.iter().any(|(id, touched)| {
-            plan.overlay
-                .schema
-                .tables()
-                .iter()
-                .find(|table| table.id == *id)
-                != Some(&touched.base_table)
-        });
-        if dirty {
-            return db.finalize_adopted_source(&mut self.transaction);
-        }
-        let SchemaCompositionState::AdoptedSourceRefining(adopted) = std::mem::replace(
-            &mut self.transaction.schema_composition,
-            SchemaCompositionState::None,
-        ) else {
-            panic!("adopted")
-        };
-        // No old-digest check may run after this call has mutated physical S1.
-        let rollback = adopted.logical.clone();
-        let result = db.materialize_schema_index_composition(
-            &mut self.transaction,
-            adopted.logical,
-            SchemaIndexMaterialization::Ordinary,
-        );
-        if result.is_err() {
-            self.transaction.require_schema_rollback();
-            let previous = std::mem::replace(
-                &mut self.transaction.schema_composition,
-                SchemaCompositionState::None,
-            );
-            self.transaction.schema_composition = match previous {
-                SchemaCompositionState::SealingAndMaterializingIndex(materialized) => {
-                    SchemaCompositionState::RollbackRequiredMaterializedIndex(materialized)
-                }
-                SchemaCompositionState::None => {
-                    SchemaCompositionState::RollbackRequiredLogical(Box::new(rollback))
-                }
-                other => other,
-            };
-        }
-        result
+        db.finalize_adopted_source(&mut self.transaction)
     }
 }
 
@@ -270,7 +107,7 @@ fn seed(root: &Path) -> Database {
     db
 }
 
-fn adopt(db: &mut Database, schema: &str) -> FinalIndexPhase {
+fn adopt(db: &mut Database, schema: &str) -> FinalIndexFixture {
     let mut transaction = db.begin_transaction().unwrap();
     for sql in [
         "UPDATE users SET legacy = 'updated1' WHERE id = 1",
@@ -282,7 +119,7 @@ fn adopt(db: &mut Database, schema: &str) -> FinalIndexPhase {
     for sql in schema.split(';').filter(|sql| !sql.trim().is_empty()) {
         db.execute_in(&mut transaction, sql).unwrap();
     }
-    FinalIndexPhase::new(transaction)
+    FinalIndexFixture::new(transaction)
 }
 
 const NOOP: &str =
@@ -325,14 +162,14 @@ fn source_digest(db: &mut Database, storage: StorageId) -> [u8; 32] {
     )
     .unwrap()
 }
-fn target(db: &Database, phase: &FinalIndexPhase, name: &str) -> DropIndexTarget {
+fn target(db: &Database, phase: &FinalIndexFixture, name: &str) -> DropIndexTarget {
     db.index_name_bindings(Some(&phase.transaction))
         .into_iter()
         .find(|binding| binding.name.as_str() == name)
         .unwrap()
         .target
 }
-fn create(db: &mut Database, phase: &mut FinalIndexPhase, sql: &str) {
+fn create(db: &mut Database, phase: &mut FinalIndexFixture, sql: &str) {
     let statement = phase.prepare(db, sql);
     assert_eq!(phase.create(db, &statement).unwrap(), DdlOutcome::Created);
 }
@@ -436,6 +273,8 @@ fn hybrid_publication_and_transaction_visible_index_matrix() {
         let floor = db.next_storage_id().unwrap();
         let mut phase = adopt(&mut db, schema);
         let digest = source_digest(&mut db, source);
+        let physical_txn = phase.transaction.physical_transaction_id(source).unwrap();
+        let column_floor = phase.logical_mut().overlay.tables[1].next_column_id;
         let before_prepare = journal(&db);
         let statement = phase.prepare(&db, ddl);
         assert_eq!(journal(&db), before_prepare);
@@ -448,11 +287,20 @@ fn hybrid_publication_and_transaction_visible_index_matrix() {
             reservation.table_version.0,
             base.committed.tables[1].version.0 + u64::from(dirty)
         );
+        assert_eq!(reservation.fingerprint, statement.target.fingerprint);
+        assert_eq!(
+            phase.logical_mut().overlay.tables[1].next_column_id,
+            column_floor
+        );
         assert_eq!(source_digest(&mut db, source), digest);
         assert_eq!(db.next_storage_id(), Some(floor));
         let before = bytes(&root);
         phase.finalize(&mut db).unwrap();
         let peak = bytes(&root);
+        assert_eq!(
+            phase.transaction.physical_transaction_id(source),
+            Some(physical_txn)
+        );
         if dirty {
             let materialized = phase
                 .transaction
@@ -472,6 +320,10 @@ fn hybrid_publication_and_transaction_visible_index_matrix() {
                 .schema_composition
                 .materialized_index()
                 .unwrap();
+            assert_eq!(materialized.source_copy_passes, 0);
+            assert_eq!(materialized.source_rows_copied, 0);
+            assert!(phase.transaction.is_only_participant(source));
+            assert!(phase.transaction.is_only_write_participant(source));
             assert!(materialized.target.is_none());
             assert!(materialized.reference.is_none());
             assert!(materialized.staged.is_empty());
@@ -653,6 +505,7 @@ fn terminal_identity_visibility_noop_and_multiple_indexes() {
                 phase.execute(&mut db, sql),
                 Err(DatabaseError::SchemaMutation(
                     SchemaMutationError::SchemaMutationAfterMaterialization
+                        | SchemaMutationError::MigrationDataAccessAfterRefinement
                 ))
             ));
         }
@@ -788,7 +641,10 @@ fn stale_prepared_create_never_burns_or_rebinds() {
         ))
     ));
     assert_eq!(journal(&db), before);
-    assert!(!phase.terminal);
+    assert!(matches!(
+        phase.transaction.schema_composition,
+        SchemaCompositionState::AdoptedSourceRefining(_)
+    ));
     create(&mut db, &mut phase, CREATE);
     phase.transaction.rollback().unwrap();
     db.close().unwrap();
@@ -1221,7 +1077,7 @@ fn candidate_b_same_fingerprint_clone_cost_and_publication_rejection() {
 }
 
 #[test]
-fn production_native_index_entry_points_stay_closed() {
+fn production_native_index_entry_points_enter_terminal_phase() {
     for (name, schema, sql) in [
         ("create", ADD, "CREATE INDEX marker_idx ON users(marker)"),
         (
@@ -1233,16 +1089,12 @@ fn production_native_index_entry_points_stay_closed() {
         let root = root(name);
         let mut db = seed(&root);
         let mut phase = adopt(&mut db, schema);
-        let before = journal(&db);
+        db.execute_in(&mut phase.transaction, sql).unwrap();
         assert!(matches!(
-            db.execute_in(&mut phase.transaction, sql),
-            Err(DatabaseError::SchemaMutation(
-                SchemaMutationError::TransactionNotPristine
-                    | SchemaMutationError::SchemaMutationAfterMaterialization
-            ))
+            phase.transaction.schema_composition,
+            SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ));
-        assert_eq!(journal(&db), before);
-        phase.transaction.rollback().unwrap();
+        db.commit_transaction(&mut phase.transaction).unwrap();
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1346,7 +1198,7 @@ fn finalization_revalidates_every_captured_source_authority_before_index_mutatio
     let mut db = seed(&root);
     let mut phase = adopt(&mut db, NOOP);
     create(&mut db, &mut phase, CREATE);
-    let SchemaCompositionState::AdoptedSourceRefining(original) =
+    let SchemaCompositionState::AdoptedSourceIndexFinalizing(original) =
         &phase.transaction.schema_composition
     else {
         panic!("adopted")
@@ -1371,12 +1223,13 @@ fn finalization_revalidates_every_captured_source_authority_before_index_mutatio
             _ => candidate.source_index_digest[0] ^= 1,
         }
         phase.transaction.schema_composition =
-            SchemaCompositionState::AdoptedSourceRefining(candidate);
+            SchemaCompositionState::AdoptedSourceIndexFinalizing(candidate);
         assert!(phase.finalize(&mut db).is_err());
         assert_eq!(journal(&db), before);
         assert_eq!(source_digest(&mut db, source), digest);
     }
-    phase.transaction.schema_composition = SchemaCompositionState::AdoptedSourceRefining(original);
+    phase.transaction.schema_composition =
+        SchemaCompositionState::AdoptedSourceIndexFinalizing(original);
     phase.finalize(&mut db).unwrap();
     assert_ne!(source_digest(&mut db, source), digest);
     db.commit_transaction(&mut phase.transaction).unwrap();
@@ -1466,4 +1319,204 @@ fn assert_physical_keys(
         .collect::<Vec<_>>();
     ids.sort_unstable();
     assert_eq!(ids, expected);
+}
+
+#[test]
+fn first_final_index_failures_preserve_overlay_writer_and_allocator_authority() {
+    for failure in [
+        "stale",
+        "stale-if",
+        "duplicate",
+        "column",
+        "indexed-column",
+        "identity-limit",
+        "cross",
+        "actions",
+        "reservations",
+        "undefined-drop",
+    ] {
+        let root = root(failure);
+        let mut db = seed(&root);
+        let mut phase = adopt(&mut db, NOOP);
+        let mut statement = phase.prepare(&db, CREATE);
+        match failure {
+            "stale" | "stale-if" => {
+                statement.target.table_version.0 += 1;
+                statement.if_not_exists = failure == "stale-if";
+                if statement.if_not_exists {
+                    statement.name = IndexName::new("users_email_idx").unwrap();
+                    statement.column_id = ColumnId(3);
+                }
+            }
+            "duplicate" => statement.name = IndexName::new("users_email_idx").unwrap(),
+            "column" => statement.column_id = ColumnId(999),
+            "indexed-column" => statement.column_id = ColumnId(3),
+            "identity-limit" => {
+                phase
+                    .logical_mut()
+                    .touched
+                    .get_mut(&TableId(2))
+                    .unwrap()
+                    .indexes
+                    .next_index_id = IndexId(u64::MAX)
+            }
+            "cross" => statement = phase.prepare(&db, "CREATE INDEX seed_idx ON seed(id)"),
+            "actions" => phase
+                .logical_mut()
+                .action_evidence
+                .resize(MAX_SCHEMA_ACTIONS, [0; 32]),
+            "reservations" => phase.logical_mut().index_reservation_count = MAX_INDEX_RESERVATIONS,
+            _ => {}
+        }
+        let before = journal(&db);
+        let dependency = phase.logical_mut().dependency(TableId(2)).unwrap();
+        let writer = db.schema_writer.get();
+        let result = if failure == "undefined-drop" {
+            phase.drop_index(
+                &mut db,
+                DropIndexTarget {
+                    table_id: TableId(2),
+                    index_id: IndexId(999),
+                },
+            )
+        } else {
+            phase.create(&mut db, &statement)
+        };
+        assert!(result.is_err(), "{failure}");
+        assert_eq!(journal(&db), before);
+        assert_eq!(
+            phase.logical_mut().dependency(TableId(2)).unwrap(),
+            dependency
+        );
+        assert_eq!(db.schema_writer.get(), writer);
+        assert!(matches!(
+            phase.transaction.schema_composition,
+            SchemaCompositionState::AdoptedSourceRefining(_)
+        ));
+        if failure == "identity-limit" {
+            phase
+                .logical_mut()
+                .touched
+                .get_mut(&TableId(2))
+                .unwrap()
+                .indexes
+                .next_index_id = IndexId(2);
+        }
+        if failure == "actions" {
+            phase.logical_mut().action_evidence.truncate(2);
+        }
+        if failure == "reservations" {
+            phase.logical_mut().index_reservation_count = 0;
+        }
+        phase
+            .execute(&mut db, "ALTER TABLE users RENAME COLUMN email TO contact")
+            .unwrap();
+        phase.transaction.rollback().unwrap();
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn first_unchanged_create_seals_without_burn_and_all_terminal_access_is_closed() {
+    let root = root("unchanged-first");
+    let mut db = seed(&root);
+    let mut phase = adopt(&mut db, NOOP);
+    let before = journal(&db);
+    let statement = phase.prepare(
+        &db,
+        "CREATE INDEX IF NOT EXISTS users_email_idx ON users(email)",
+    );
+    assert_eq!(
+        phase.create(&mut db, &statement).unwrap(),
+        DdlOutcome::Unchanged
+    );
+    assert_eq!(journal(&db), before);
+    assert!(phase.transaction.schema_composition.is_started());
+    assert!(phase.transaction.schema_composition.is_sealed());
+    for sql in [
+        ADD,
+        "ALTER TABLE users DROP COLUMN legacy",
+        "ALTER TABLE users RENAME TO people",
+        "ALTER TABLE users RENAME COLUMN email TO contact",
+        "ALTER TABLE users ALTER COLUMN email SET NOT NULL",
+        "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+    ] {
+        assert!(
+            matches!(
+                phase.execute(&mut db, sql),
+                Err(DatabaseError::SchemaMutation(
+                    SchemaMutationError::SchemaMutationAfterMaterialization
+                ))
+            ),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT id FROM users",
+        "INSERT INTO users VALUES (5, 'five', 'five')",
+        "UPDATE users SET legacy = legacy",
+        "DELETE FROM users WHERE id = 1",
+    ] {
+        assert!(
+            matches!(
+                phase.execute(&mut db, sql),
+                Err(DatabaseError::SchemaMutation(
+                    SchemaMutationError::MigrationDataAccessAfterRefinement
+                ))
+            ),
+            "{sql}"
+        );
+    }
+    db.commit_transaction(&mut phase.transaction).unwrap();
+    assert_rows(&mut db, true);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn uncertain_final_index_reservation_requires_recovery_instead_of_refining_retry() {
+    let root = root("uncertain-reservation");
+    let mut db = seed(&root);
+    let mut phase = adopt(&mut db, NOOP);
+    let statement = phase.prepare(&db, CREATE);
+    db.mutation_journal
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .inject_sync_failure();
+    assert!(matches!(
+        phase.create(&mut db, &statement),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::RecoveryRequired
+        ))
+    ));
+    assert!(matches!(
+        phase.transaction.schema_composition,
+        SchemaCompositionState::RollbackRequiredLogical(_)
+    ));
+    assert!(
+        phase
+            .execute(&mut db, "ALTER TABLE users RENAME COLUMN email TO contact")
+            .is_err()
+    );
+    assert!(db.commit_transaction(&mut phase.transaction).is_err());
+    drop(phase);
+    drop(db);
+    for _ in 0..3 {
+        let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_rows(&mut reopened, false);
+        assert_eq!(reopened.indexes(TableId(2)).unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .mutation_journal
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .effective_index(TableId(2), IndexId(2)),
+            Some(IndexId(3))
+        );
+        reopened.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }

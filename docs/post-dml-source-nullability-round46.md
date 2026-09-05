@@ -15,8 +15,8 @@ COMMIT;
 The adopted-source allowlist is nullable ADD COLUMN, unindexed non-primary-key
 DROP COLUMN, RENAME TABLE, RENAME COLUMN, and surviving-base-column SET/DROP
 NOT NULL. Nullability of a column added in the same adopted overlay remains
-unsupported. CREATE/DROP INDEX after adoption and all relational execution
-after the first successful refinement also remain closed.
+unsupported. Relational execution after the first successful refinement remains
+closed.
 
 ## Source identity and validation ordering
 
@@ -85,9 +85,10 @@ overlay resolves the surviving ID and succeeds; no name rebinding exception is
 introduced.
 
 After any successful adopted refinement, SELECT/INSERT/UPDATE/DELETE return
-`MigrationDataAccessAfterRefinement` (`25000` through PostgreSQL). CREATE/DROP
-INDEX also remain transaction-state errors. Rename→SET, SET→rename, nullable
-ADD→surviving SET, and eligible DROP→surviving SET compose into the same one-S2
+`MigrationDataAccessAfterRefinement` (`25000` through PostgreSQL).
+[Round 48](adopted-source-final-index-round48.md) subsequently adds final
+CREATE/DROP INDEX in a terminal phase that permanently closes later ALTER.
+Rename→SET, SET→rename, nullable ADD→surviving SET, and eligible DROP→surviving SET compose into the same one-S2
 final projection.
 
 The `post-dml-not-null-validation-complete` crash boundary lies after first SET
@@ -108,7 +109,7 @@ PartitionCatalog, LSM formats, Protocol v1, PostgreSQL framing v3, Manifest v4,
 SDK Schema Spec v1, and inspection formats are unchanged. Nullability allocates
 no ColumnId or IndexId and adds no journal tag or recovery branch.
 
-Still excluded are new-column SET/DROP NOT NULL, adopted CREATE/DROP INDEX,
+Still excluded are new-column SET/DROP NOT NULL,
 post-refinement DML, defaults, generated expressions, type conversion/USING,
 constraints/CASCADE, cross-table, LSM, partitioned, imported/bootstrap,
 savepoints, online/resumable migration, participant detach, automatic GC, and

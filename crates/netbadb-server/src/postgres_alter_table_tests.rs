@@ -772,8 +772,8 @@ fn pg_round46_surviving_nullability_is_supported_and_round45_boundaries_remain()
 
     for (name, statement) in [
         (
-            "create-index",
-            "CREATE INDEX accounts_marker_idx ON accounts(marker)",
+            "terminal-alter",
+            "ALTER TABLE accounts RENAME COLUMN email TO contact",
         ),
         ("select", "SELECT id, marker FROM accounts"),
         (
@@ -795,6 +795,11 @@ fn pg_round46_surviving_nullability_is_supported_and_round45_boundaries_remain()
             &mut admin,
             &mut db,
             "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        ));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "CREATE INDEX accounts_marker_idx ON accounts(marker)",
         ));
         state(&sql(&mut admin, &mut db, statement), "25000");
         state(
@@ -1845,4 +1850,219 @@ fn pg_alter_permission_errors_unsupported_forms_and_sqlstates_fail_closed() {
     ok(&sql(&mut admin, &mut db, "ROLLBACK"));
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round48_extended_final_create_is_pure_until_execute_and_terminal() {
+    for (case, alters, create) in [
+        (
+            "cnew",
+            vec!["ALTER TABLE projects ADD COLUMN marker TEXT"],
+            "CREATE INDEX marker_idx ON projects(marker)",
+        ),
+        (
+            "index-only",
+            vec![
+                "ALTER TABLE projects RENAME COLUMN name TO tmp",
+                "ALTER TABLE projects RENAME COLUMN tmp TO name",
+            ],
+            "CREATE INDEX name_idx ON projects(name)",
+        ),
+    ] {
+        let (root, mut db) = project(&format!("round48-extended-{case}"));
+        let base_version = db.table_schema_version(TableId(2));
+        let floor = db.next_storage_id();
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET name = 'updated'",
+        ));
+        for alter in alters {
+            ok(&sql(&mut admin, &mut db, alter));
+        }
+        let before = files(&root);
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Parse {
+                    statement: "create".into(),
+                    query: create.into(),
+                    parameter_types: vec![],
+                }
+            ),
+            [BackendMessage::ParseComplete]
+        );
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Bind {
+                    portal: "create".into(),
+                    statement: "create".into(),
+                    parameter_formats: vec![],
+                    parameters: vec![],
+                    result_formats: vec![],
+                }
+            ),
+            [BackendMessage::BindComplete]
+        );
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Describe {
+                    target: DescribeTarget::Statement,
+                    name: "create".into(),
+                }
+            ),
+            [
+                BackendMessage::ParameterDescription(vec![]),
+                BackendMessage::NoData
+            ]
+        );
+        assert_eq!(files(&root), before);
+        assert!(db.indexes(TableId(2)).unwrap().is_empty());
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Execute {
+                    portal: "create".into(),
+                    max_rows: 0,
+                }
+            ),
+            [BackendMessage::CommandComplete("CREATE INDEX".into())]
+        );
+        ok(&admin.handle(&mut db, FrontendMessage::Sync));
+        assert!(db.indexes(TableId(2)).unwrap().is_empty());
+        ok(&sql(&mut admin, &mut db, "COMMIT"));
+        assert_eq!(db.indexes(TableId(2)).unwrap().len(), 1);
+        if case == "index-only" {
+            assert_eq!(db.table_schema_version(TableId(2)), base_version);
+            assert_eq!(db.next_storage_id(), floor);
+        }
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn pg_round48_extended_stale_create_and_exact_old_drop_never_rebind() {
+    for is_drop in [false, true] {
+        let (root, mut db) = project(&format!("round48-prepared-{is_drop}"));
+        if is_drop {
+            db.execute("CREATE INDEX name_idx ON projects(name)")
+                .unwrap();
+        }
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET name = 'updated'",
+        ));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects RENAME COLUMN name TO tmp",
+        ));
+        let query = if is_drop {
+            "DROP INDEX name_idx"
+        } else {
+            "CREATE INDEX IF NOT EXISTS name_idx ON projects(tmp)"
+        };
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Parse {
+                    statement: "old".into(),
+                    query: query.into(),
+                    parameter_types: vec![],
+                }
+            ),
+            [BackendMessage::ParseComplete]
+        );
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Bind {
+                    portal: "old".into(),
+                    statement: "old".into(),
+                    parameter_formats: vec![],
+                    parameters: vec![],
+                    result_formats: vec![],
+                }
+            ),
+            [BackendMessage::BindComplete]
+        );
+        if is_drop {
+            ok(&sql(&mut admin, &mut db, "DROP INDEX name_idx"));
+            ok(&sql(
+                &mut admin,
+                &mut db,
+                "CREATE INDEX name_idx ON projects(tmp)",
+            ));
+        } else {
+            ok(&sql(
+                &mut admin,
+                &mut db,
+                "ALTER TABLE projects RENAME COLUMN tmp TO name",
+            ));
+        }
+        let before = files(&root);
+        state(
+            &admin.handle(
+                &mut db,
+                FrontendMessage::Execute {
+                    portal: "old".into(),
+                    max_rows: 0,
+                },
+            ),
+            if is_drop { "42704" } else { "25000" },
+        );
+        assert_eq!(files(&root), before);
+        ok(&admin.handle(&mut db, FrontendMessage::Sync));
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn pg_round48_terminal_alter_and_relational_errors_fail_the_transaction() {
+    for statement in [
+        "ALTER TABLE projects ADD COLUMN extra TEXT",
+        "ALTER TABLE projects DROP COLUMN name",
+        "ALTER TABLE projects RENAME TO work",
+        "ALTER TABLE projects RENAME COLUMN name TO contact",
+        "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
+        "ALTER TABLE projects ALTER COLUMN name DROP NOT NULL",
+        "SELECT id FROM projects",
+        "INSERT INTO projects VALUES (2, 'two')",
+        "UPDATE projects SET name = name",
+        "DELETE FROM projects WHERE id = 1",
+    ] {
+        let (root, mut db) = project("round48-terminal");
+        let mut admin = session(&db, true);
+        for source in [
+            "BEGIN",
+            "UPDATE projects SET name = 'updated'",
+            "ALTER TABLE projects RENAME COLUMN name TO tmp",
+            "ALTER TABLE projects RENAME COLUMN tmp TO name",
+            "CREATE INDEX name_idx ON projects(name)",
+        ] {
+            ok(&sql(&mut admin, &mut db, source));
+        }
+        state(&sql(&mut admin, &mut db, statement), "25000");
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

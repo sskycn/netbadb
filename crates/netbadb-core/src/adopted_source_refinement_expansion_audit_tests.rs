@@ -828,7 +828,7 @@ fn round46_prepared_drop_and_overlay_dependency_remain_exact() {
 }
 
 #[test]
-fn round46_new_columns_dml_and_index_ddl_remain_closed() {
+fn round46_new_column_nullability_and_dml_remain_closed() {
     for operation in ["SET NOT NULL", "DROP NOT NULL"] {
         let root = root(if operation.starts_with("SET") {
             "cnew-set"
@@ -909,12 +909,11 @@ fn round46_new_columns_dml_and_index_ddl_remain_closed() {
             "CREATE INDEX users_legacy_idx ON users(legacy)",
             "DROP INDEX users_email_idx",
         ] {
-            assert_eq!(
-                db.execute_in(&mut transaction, statement)
-                    .unwrap_err()
-                    .kind(),
-                DatabaseErrorKind::TransactionState
-            );
+            db.execute_in(&mut transaction, statement).unwrap();
+            assert!(matches!(
+                transaction.schema_composition,
+                SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
+            ));
         }
         transaction.rollback().unwrap();
         db.close().unwrap();
@@ -1102,7 +1101,7 @@ fn round46_set_and_drop_rollback_restore_exact_s1() {
 }
 
 #[test]
-fn candidate_b_index_reservation_is_durable_but_table_noop_is_not_a_source_rewrite() {
+fn final_index_reservation_is_durable_and_table_noop_uses_in_place_delta() {
     let root = root("index-reservation");
     let mut db = seed(&root, false, false);
     let table = db.schema().table("users").unwrap().id;
@@ -1124,11 +1123,11 @@ fn candidate_b_index_reservation_is_durable_but_table_noop_is_not_a_source_rewri
         &transaction,
         "CREATE INDEX users_legacy_idx ON users(legacy)",
     );
-    db.audit_apply_adopted_source_create_index(&mut transaction, &statement)
+    db.compose_create_index_in(&mut transaction, &statement)
         .unwrap();
     let (reserved, floor) = {
         let adopted = match &transaction.schema_composition {
-            SchemaCompositionState::AdoptedSourceRefining(adopted) => adopted,
+            SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => adopted,
             _ => panic!("expected adopted state"),
         };
         let touched = &adopted.logical.touched[&table];
@@ -1150,11 +1149,10 @@ fn candidate_b_index_reservation_is_durable_but_table_noop_is_not_a_source_rewri
         );
         (reservation.index, touched.base_indexes.next_index_id)
     };
-    let finalization_error = db.finalize_adopted_source(&mut transaction).unwrap_err();
-    println!("ROUND45_INDEX_ONLY_ERROR {finalization_error:?}");
+    db.finalize_adopted_source(&mut transaction).unwrap();
     assert!(matches!(
-        finalization_error,
-        DatabaseError::SchemaMutation(SchemaMutationError::Corrupt(_))
+        transaction.schema_composition,
+        SchemaCompositionState::MaterializedIndex(_)
     ));
     transaction.rollback().unwrap();
     assert_eq!(
@@ -1204,7 +1202,7 @@ fn candidate_b_new_column_index_is_logically_and_physically_feasible_with_s2() {
         "CREATE INDEX users_marker_idx ON users(marker)",
     );
     assert_eq!(statement.column_id, marker);
-    db.audit_apply_adopted_source_create_index(&mut transaction, &statement)
+    db.compose_create_index_in(&mut transaction, &statement)
         .unwrap();
     db.finalize_adopted_source(&mut transaction).unwrap();
     let materialized = transaction.schema_composition.source_backfill().unwrap();
@@ -1392,13 +1390,11 @@ fn production_round46_nullability_and_round44_round42_stay_positive() {
         .unwrap();
     db.execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN marker TEXT")
         .unwrap();
-    assert!(
-        db.execute_in(
-            &mut transaction,
-            "CREATE INDEX users_marker_idx ON users(marker)"
-        )
-        .is_err()
-    );
+    db.execute_in(
+        &mut transaction,
+        "CREATE INDEX users_marker_idx ON users(marker)",
+    )
+    .unwrap();
     for statement in [
         "SELECT id FROM users",
         "INSERT INTO users VALUES (4, 'four', 'four@example.test', NULL)",
@@ -1506,7 +1502,7 @@ fn observe(name: &str, mode: &str) -> Observation {
                 &transaction,
                 "CREATE INDEX users_marker_idx ON users(marker)",
             );
-            db.audit_apply_adopted_source_create_index(&mut transaction, &statement)
+            db.compose_create_index_in(&mut transaction, &statement)
                 .unwrap();
         }
         _ => panic!("unknown observation mode"),

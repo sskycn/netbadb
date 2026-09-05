@@ -58,8 +58,9 @@ production or build dependencies.
 | ALTER + CREATE/DROP INDEX transaction | yes, bounded | psql, psycopg `prepare=True`, SQLAlchemy `Index.create/drop`, and Alembic Operations |
 | DROP INDEX + DML + compatible ALTER + final index | psql yes, bounded | Round 39 managed Single Heap, one table, DROP-only prelude; Python clients unavailable/unverified |
 | DROP INDEX + DML + nullable ADD/exact DROP + final clone | psql yes, bounded | Round 42 exact Round 39 authority; new-column index/NOT NULL and later DML unsupported |
-| One managed Heap DML + nullable ADD/eligible DROP/rename | psql yes, bounded | Round 44 exact one-S1 adoption; one final S2, no later DML or index DDL |
-| One managed Heap DML + surviving-column SET/DROP NOT NULL | psql yes, bounded | Round 46 transaction-visible SET validation; indexed survivors supported; new-column nullability and later DML/index DDL unsupported |
+| One managed Heap DML + nullable ADD/eligible DROP/rename | psql yes, bounded | Round 44 exact one-S1 adoption; one final S2, no later DML; final index phase added in Round 48 |
+| One managed Heap DML + surviving-column SET/DROP NOT NULL | psql yes, bounded | Round 46 transaction-visible SET validation; indexed survivors supported; new-column nullability and later DML unsupported; final indexes added in Round 48 |
+| Adopted refinement + terminal CREATE/DROP INDEX | psql and Extended Query, bounded | Round 48: one S2 for dirty tables; same S1/P1 for index-only; later ALTER/DML closed |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
@@ -179,3 +180,21 @@ with public `prepare=True`; SQLAlchemy uses its native PostgreSQL dialect and
 `42P01`/`25P02` behavior, and unsupported IF EXISTS/CASCADE forms. The existing
 The standalone Alembic script remains index-only; the Round 29 ALTER fixture
 separately covers mixed schema/index Operations.
+
+Round 48 reproduction from the repository root:
+`python3 scripts/test-adopted-source-final-index-sql.py`. It uses PostgreSQL 17.11 at
+`/opt/local/lib/pgsql` with `/opt/local/lib/icu/lib`, checks Simple Query and
+psql's unnamed Extended Query, and uses that installation's libpq for named
+prepared stale CREATE/exact DROP because psql 17 has no named Parse command.
+Every fixture verifies final schema, index identities and rows across three
+catalog-only reopens. Server tests additionally pin Parse/Bind/Describe byte
+purity and terminal `25000`/`25P02` behavior. The Round 47 script delegates to
+this production suite; retained Round 39/42/44/46 fixtures remain required.
+
+Round 48 also reran the older general client fixtures. Two existing failures
+reproduce on the unmodified starting SHA `1e760f7`: `test-sql-alter-table.py`
+stops at indexed-column nullability during backfill (`0A000`), and
+`test-postgresql-orm.py` stops at DROP of the imported/bootstrap `teams` Heap
+(`0A000`, runtime table mutation supports only a single Heap). They are retained
+and reported rather than weakened; this round's bounded acceptance fixtures,
+CREATE TABLE, controlled backfill, and standalone Alembic index fixture pass.

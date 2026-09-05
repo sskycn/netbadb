@@ -225,11 +225,23 @@ Round 46 extends only this Core route with SET/DROP NOT NULL on a surviving base
 ColumnId, including an indexed survivor. SET scans transaction-visible S1 before
 writer acquisition; a remaining NULL is `23502`, followed by `25P02` under the
 normal PostgreSQL failed-transaction rule. DROP performs no scan. Successful
-refinement still closes later relational and index DDL with `25000`. A late-added
+refinement still closes later relational execution with `25000`. A late-added
 nullable column retains the established boundaries: SET is `25000`, while an
 already-nullable DROP is rejected as an operational `58000`; neither enters the
 adopted nullability path. Simple and Extended Query require no adapter-specific
 state. See [Round 46](post-dml-source-nullability-round46.md).
+
+[Round 48](adopted-source-final-index-round48.md) accepts final single-column
+non-unique CREATE/DROP INDEX only after this adopted-source refinement has
+already begun. The first accepted statement, even unchanged IF NOT EXISTS,
+closes all later ALTER with `25000`. Relational access also remains `25000`,
+followed by `25P02` in a failed explicit transaction. Further same-table index
+DDL can compose. Prepared CREATE validates its original overlay dependency
+before reservation; prepared DROP retains exact T/I and cannot delete a new
+same-name index (`42704` for the absent old identity). Parse/Bind/Describe remain
+pure. Simple and Extended Query retain ordinary authorization and command tags;
+no PostgreSQL production adapter changes or new wire state are involved.
+
 
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections

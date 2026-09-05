@@ -227,8 +227,9 @@ ROLLBACK;
         (
             "index-after",
             "UPDATE projects SET email = email WHERE id = 1;\n"
-            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "ALTER TABLE projects ADD COLUMN marker TEXT;\n"
             "CREATE INDEX projects_marker_idx ON projects(marker);",
+            "ALTER TABLE projects RENAME COLUMN email TO contact;",
             "INDEX_AFTER_STATE",
             "25000",
         ),
@@ -251,8 +252,9 @@ ROLLBACK;
         (
             "create-index",
             "UPDATE projects SET email = email WHERE id = 1;\n"
-            "ALTER TABLE projects ADD COLUMN marker TEXT;",
+            "ALTER TABLE projects ADD COLUMN marker TEXT;\n"
             "CREATE INDEX projects_marker_idx ON projects(marker);",
+            "ALTER TABLE projects RENAME COLUMN email TO contact;",
             "ROUND45_CREATE_INDEX_STATE",
         ),
         (

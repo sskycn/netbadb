@@ -1084,6 +1084,20 @@ adoption; the first accepted index statement permanently closes schema ALTER.
 Production adopted index DDL remains closed in Round 47. Round 42 DROP-first
 migrations keep their distinct SourceIndexFinalizing route.
 
+### Adopted-source terminal final indexes — Round 48
+
+[Round 48](adopted-source-final-index-round48.md) productionizes the selected
+Round 47 architecture. First successful final CREATE/DROP (including unchanged
+IF NOT EXISTS) enters `AdoptedSourceIndexFinalizing`. Exact prepared validation,
+canonical tag24 reservations and shared logical inventory updates precede one
+hybrid finalization. Dirty tables use one S2; index-only changes retain S1/P1
+and V/G/epoch; global no-ops retain accepted ID burns without publication.
+Round 47 tests now call production Core rather than an independent prototype.
+Cnew physical NULL lookup, same-name fresh identity, terminal state errors,
+rollback, single-/two-participant recovery and real PostgreSQL clients are tested.
+Round 49+ still excludes later ALTER/DML, Cnew nullability, index-first adoption,
+UNIQUE/multicolumn, broader migration, savepoints, online operation and GC.
+
 ## Phase 6 — SDK and tooling
 
 ### Phase 6A — Go Protocol v1 client (complete)

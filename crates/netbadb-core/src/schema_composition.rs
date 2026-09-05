@@ -250,6 +250,8 @@ pub(crate) enum SchemaCompositionState {
     None,
     Composing(Box<SchemaTransactionPlan>),
     AdoptedSourceRefining(Box<AdoptedSourceTransaction>),
+    // Final TableDef is frozen; index inventory remains logical until commit.
+    AdoptedSourceIndexFinalizing(Box<AdoptedSourceTransaction>),
     SealingAndMaterializing(Box<MaterializedSchemaTransaction>),
     Materialized(Box<MaterializedSchemaTransaction>),
     BackfillMaterializing(Box<MaterializedSchemaTransaction>),
@@ -276,7 +278,31 @@ pub(crate) enum SchemaCompositionState {
     RollbackRequiredMaterializedIndex(Box<MaterializedSchemaIndexTransaction>),
 }
 
+#[derive(Clone, Copy)]
+enum IndexCompositionContext {
+    Ordinary,
+    AdoptedFinal,
+}
+
 impl SchemaCompositionState {
+    fn adopted_source(&self) -> Option<&AdoptedSourceTransaction> {
+        match self {
+            Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
+                Some(adopted)
+            }
+            _ => None,
+        }
+    }
+
+    fn adopted_source_mut(&mut self) -> Option<&mut AdoptedSourceTransaction> {
+        match self {
+            Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
+                Some(adopted)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
@@ -292,7 +318,8 @@ impl SchemaCompositionState {
     pub(crate) fn is_sealed(&self) -> bool {
         matches!(
             self,
-            Self::SealingAndMaterializing(_)
+            Self::AdoptedSourceIndexFinalizing(_)
+                | Self::SealingAndMaterializing(_)
                 | Self::Materialized(_)
                 | Self::BackfillMaterializing(_)
                 | Self::IndexEvacuating(_)
@@ -320,7 +347,9 @@ impl SchemaCompositionState {
             Self::Composing(plan)
             | Self::SealedNoEffectiveChange(plan)
             | Self::RollbackRequiredLogical(plan) => Some(plan),
-            Self::AdoptedSourceRefining(adopted) => Some(&adopted.logical),
+            Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
+                Some(&adopted.logical)
+            }
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
             | Self::BackfillMaterializing(materialized)
@@ -2782,7 +2811,8 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
         let adopted = match &transaction.schema_composition {
-            SchemaCompositionState::AdoptedSourceRefining(adopted) => adopted,
+            SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => adopted,
             _ => {
                 return Err(
                     SchemaMutationError::Corrupt("adopted source state is not logical").into(),
@@ -2871,7 +2901,8 @@ impl Database {
             SchemaCompositionState::None,
         );
         let adopted = match previous {
-            SchemaCompositionState::AdoptedSourceRefining(adopted) => *adopted,
+            SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => *adopted,
             other => {
                 transaction.schema_composition = other;
                 return Err(
@@ -2880,13 +2911,30 @@ impl Database {
             }
         };
         let rollback_logical = adopted.logical.clone();
-        let result = self.materialize_schema_index_composition(
-            transaction,
-            adopted.logical,
+        // Consume the old source digest proof before an authorized S1 delta.
+        // The materialized state must never revalidate that obsolete digest.
+        let table_dirty = adopted.logical.touched.iter().any(|(id, touched)| {
+            adopted
+                .logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == *id)
+                != Some(&touched.base_table)
+        });
+        let materialization = if table_dirty {
             SchemaIndexMaterialization::AdoptedSourceBackfill {
                 source_storage: adopted.source_storage,
                 source_physical_txn_id: adopted.source_physical_txn_id,
-            },
+            }
+        } else {
+            SchemaIndexMaterialization::Ordinary
+        };
+        let result = self.materialize_schema_index_composition(
+            transaction,
+            adopted.logical,
+            materialization,
         );
         if let Err(error) = result {
             transaction.require_schema_rollback();
@@ -2940,7 +2988,8 @@ impl Database {
                 SchemaCompositionState::Composing(plan) => {
                     SchemaCompositionState::RollbackRequiredLogical(plan)
                 }
-                SchemaCompositionState::AdoptedSourceRefining(adopted) => {
+                SchemaCompositionState::AdoptedSourceRefining(adopted)
+                | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => {
                     SchemaCompositionState::RollbackRequiredLogical(Box::new(adopted.logical))
                 }
                 other => other,
@@ -3554,6 +3603,11 @@ impl Database {
         transaction: &mut Transaction,
         statement: &crate::TypedCreateIndex,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
+        if transaction.schema_composition.adopted_source().is_some() {
+            let result = self.apply_adopted_source_final_create_index(transaction, statement);
+            self.handle_composition_accept_result(transaction, &result);
+            return result;
+        }
         if matches!(
             transaction.schema_composition,
             SchemaCompositionState::SourceRefining(_)
@@ -3862,24 +3916,127 @@ impl Database {
         transaction: &mut Transaction,
         statement: &crate::TypedCreateIndex,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
-        self.apply_composed_create_index_with_options(transaction, statement, false)
+        self.apply_composed_create_index_with_context(
+            transaction,
+            statement,
+            IndexCompositionContext::Ordinary,
+        )
     }
 
-    #[cfg(test)]
-    pub(crate) fn audit_apply_adopted_source_create_index(
+    fn apply_adopted_source_final_create_index(
         &mut self,
         transaction: &mut Transaction,
         statement: &crate::TypedCreateIndex,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
         self.validate_transaction(transaction)?;
-        self.apply_composed_create_index_with_options(transaction, statement, true)
+        let adopted = transaction
+            .schema_composition
+            .adopted_source()
+            .ok_or(SchemaMutationError::SchemaMutationAfterMaterialization)?;
+        Self::validate_adopted_index_table(&adopted.logical, statement.target.table_id)?;
+        // ORIGINAL prepared authority is the current overlay, not the canonical
+        // reservation lineage. In particular stale IF NOT EXISTS cannot succeed.
+        let dependency = adopted.logical.dependency(statement.target.table_id)?;
+        if dependency.table_version != statement.target.table_version
+            || dependency.fingerprint != statement.target.fingerprint
+            || adopted
+                .logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == statement.target.table_id)
+                .and_then(|table| table.column_by_id(statement.column_id))
+                .is_none()
+        {
+            return Err(SchemaMutationError::StaleSchemaDependency.into());
+        }
+        let result = self.apply_composed_create_index_with_context(
+            transaction,
+            statement,
+            IndexCompositionContext::AdoptedFinal,
+        )?;
+        Self::seal_adopted_index_schema(transaction, statement.target.table_id);
+        Ok(result)
     }
 
-    fn apply_composed_create_index_with_options(
+    fn validate_adopted_index_table(
+        plan: &SchemaTransactionPlan,
+        table: TableId,
+    ) -> Result<(), DatabaseError> {
+        if plan.touched.len() != 1 || !plan.touched.contains_key(&table) {
+            return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn canonical_adopted_index_version(
+        plan: &SchemaTransactionPlan,
+        table: TableId,
+    ) -> Result<TableSchemaVersion, DatabaseError> {
+        Self::validate_adopted_index_table(plan, table)?;
+        let touched = &plan.touched[&table];
+        if plan
+            .overlay
+            .schema
+            .tables()
+            .iter()
+            .find(|candidate| candidate.id == table)
+            == Some(&touched.base_table)
+        {
+            Ok(touched.base_lineage.version)
+        } else {
+            touched
+                .base_lineage
+                .version
+                .0
+                .checked_add(1)
+                .map(TableSchemaVersion)
+                .ok_or_else(|| SchemaMutationError::IdentityExhausted("TableSchemaVersion").into())
+        }
+    }
+
+    fn seal_adopted_index_schema(transaction: &mut Transaction, table: TableId) {
+        if let Some(adopted) = transaction.schema_composition.adopted_source_mut() {
+            // Only V is normalized. ColumnId allocator burns remain independent.
+            let touched = &adopted.logical.touched[&table];
+            if adopted
+                .logical
+                .overlay
+                .schema
+                .tables()
+                .iter()
+                .find(|candidate| candidate.id == table)
+                == Some(&touched.base_table)
+            {
+                for lineage in &mut adopted.logical.overlay.tables {
+                    if lineage.table_id == table {
+                        lineage.version = touched.base_lineage.version;
+                    }
+                }
+            }
+        }
+        let previous = std::mem::replace(
+            &mut transaction.schema_composition,
+            SchemaCompositionState::None,
+        );
+        transaction.schema_composition = match previous {
+            SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => {
+                SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted)
+            }
+            other => other,
+        };
+    }
+
+    fn apply_composed_create_index_with_context(
         &mut self,
         transaction: &mut Transaction,
         statement: &crate::TypedCreateIndex,
-        allow_adopted_source: bool,
+        context: IndexCompositionContext,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
         if let Some(binding) = self
             .index_name_bindings(Some(transaction))
@@ -3896,11 +4053,13 @@ impl Database {
             return Err(DatabaseError::DuplicateIndexName(statement.name.clone()));
         }
         let transaction_id = transaction.id();
-        let plan = match &mut transaction.schema_composition {
-            SchemaCompositionState::Composing(plan) => plan,
-            SchemaCompositionState::AdoptedSourceRefining(adopted) if allow_adopted_source => {
-                &mut adopted.logical
-            }
+        let plan = match (&mut transaction.schema_composition, context) {
+            (SchemaCompositionState::Composing(plan), IndexCompositionContext::Ordinary) => plan,
+            (
+                SchemaCompositionState::AdoptedSourceRefining(adopted)
+                | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted),
+                IndexCompositionContext::AdoptedFinal,
+            ) => &mut adopted.logical,
             _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
         };
         if plan.action_count() >= MAX_SCHEMA_ACTIONS {
@@ -4003,10 +4162,17 @@ impl Database {
         if next_index_id.is_none() {
             return Err(SchemaMutationError::IdentityExhausted("IndexId").into());
         }
+        // All acceptance checks precede canonicalization and durable allocation.
+        let reservation_version = match context {
+            IndexCompositionContext::Ordinary => statement.target.table_version,
+            IndexCompositionContext::AdoptedFinal => {
+                Self::canonical_adopted_index_version(plan, statement.target.table_id)?
+            }
+        };
         let reservation = CompositionIndexReservation {
             transaction: transaction_id,
             table: statement.target.table_id,
-            table_version: statement.target.table_version,
+            table_version: reservation_version,
             fingerprint: statement.target.fingerprint,
             index,
             next_index_id,
@@ -4023,6 +4189,9 @@ impl Database {
             };
         }
         crash("composition-index-reservation-durable");
+        if matches!(context, IndexCompositionContext::AdoptedFinal) {
+            crash("adopted-final-index-reservation-durable");
+        }
         touched.indexes.next_index_id =
             next_index_id.ok_or(SchemaMutationError::IdentityExhausted("IndexId"))?;
         touched.indexes.active.push(HeapRewriteIndex {
@@ -4049,6 +4218,11 @@ impl Database {
         transaction: &mut Transaction,
         target: crate::DropIndexTarget,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
+        if transaction.schema_composition.adopted_source().is_some() {
+            let result = self.apply_adopted_source_final_drop_index(transaction, target);
+            self.handle_composition_accept_result(transaction, &result);
+            return result;
+        }
         if matches!(
             transaction.schema_composition,
             SchemaCompositionState::SourceRefining(_)
@@ -4175,6 +4349,31 @@ impl Database {
             SchemaCompositionState::Composing(plan) => plan,
             _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
         };
+        self.apply_index_drop_to_plan(plan, target)
+    }
+
+    fn apply_adopted_source_final_drop_index(
+        &mut self,
+        transaction: &mut Transaction,
+        target: crate::DropIndexTarget,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let adopted = transaction
+            .schema_composition
+            .adopted_source_mut()
+            .ok_or(SchemaMutationError::SchemaMutationAfterMaterialization)?;
+        Self::validate_adopted_index_table(&adopted.logical, target.table_id)?;
+        Self::canonical_adopted_index_version(&adopted.logical, target.table_id)?;
+        let result = self.apply_index_drop_to_plan(&mut adopted.logical, target)?;
+        Self::seal_adopted_index_schema(transaction, target.table_id);
+        Ok(result)
+    }
+
+    fn apply_index_drop_to_plan(
+        &mut self,
+        plan: &mut SchemaTransactionPlan,
+        target: crate::DropIndexTarget,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
         if plan.action_count() >= MAX_SCHEMA_ACTIONS {
             return Err(
                 SchemaMutationError::CompositionLimitExceeded("schema/index actions").into(),
@@ -6617,7 +6816,8 @@ pub(crate) fn cleanup_composition_loser(
         SchemaCompositionState::Composing(plan)
         | SchemaCompositionState::SealedNoEffectiveChange(plan)
         | SchemaCompositionState::RollbackRequiredLogical(plan) => (*plan, None),
-        SchemaCompositionState::AdoptedSourceRefining(adopted) => (adopted.logical, None),
+        SchemaCompositionState::AdoptedSourceRefining(adopted)
+        | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => (adopted.logical, None),
         SchemaCompositionState::SealingAndMaterializing(mut materialized)
         | SchemaCompositionState::Materialized(mut materialized)
         | SchemaCompositionState::BackfillMaterializing(mut materialized)

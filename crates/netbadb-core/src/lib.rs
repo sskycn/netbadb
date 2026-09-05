@@ -2626,6 +2626,7 @@ impl Database {
         if matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ) {
             self.finalize_adopted_source(transaction)?;
         }
@@ -2886,6 +2887,7 @@ impl Database {
                 | schema_composition::SchemaCompositionState::LateCloneMaterializing(_)
                 | schema_composition::SchemaCompositionState::LateCloneReady(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
         {
             return Err(SchemaMutationError::MigrationDataAccessAfterRefinement.into());
