@@ -3,6 +3,7 @@
 mod allocation_transition;
 mod btree;
 mod buffer;
+mod columnar;
 #[cfg(test)]
 mod crash_test;
 mod heap;
@@ -18,6 +19,12 @@ mod wal;
 
 pub use btree::BTree;
 pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
+pub use columnar::{
+    ColumnarBatch, ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics,
+    ColumnarConstraint, ColumnarError, ColumnarProjection, ColumnarProjectionMetadata,
+    ColumnarRowGroupStatistics, ColumnarScanStatistics, ColumnarVector, PreparedColumnarProjection,
+    StorageSnapshotToken,
+};
 pub use heap::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, HistoricalOrphanAdoptionReport,
     IndexMaintenanceReport, IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport,
@@ -523,6 +530,7 @@ pub enum StorageError {
     TxnStatus(TxnStatusError),
     Checkpoint(CheckpointError),
     Lsm(LsmError),
+    Columnar(ColumnarError),
     TableIdMismatch {
         expected: TableId,
         actual: TableId,
@@ -601,6 +609,7 @@ impl fmt::Display for StorageError {
             Self::TxnStatus(error) => write!(formatter, "transaction-status error: {error}"),
             Self::Checkpoint(error) => write!(formatter, "checkpoint error: {error}"),
             Self::Lsm(error) => write!(formatter, "LSM error: {error}"),
+            Self::Columnar(error) => error.fmt(formatter),
             Self::TableIdMismatch { expected, actual } => write!(
                 formatter,
                 "table ID mismatch: expected {}, found {}",
@@ -708,6 +717,7 @@ impl Error for StorageError {
             Self::TxnStatus(error) => Some(error),
             Self::Checkpoint(error) => Some(error),
             Self::Lsm(error) => Some(error),
+            Self::Columnar(error) => Some(error),
             _ => None,
         }
     }
@@ -716,6 +726,12 @@ impl Error for StorageError {
 impl From<std::io::Error> for StorageError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<ColumnarError> for StorageError {
+    fn from(error: ColumnarError) -> Self {
+        Self::Columnar(error)
     }
 }
 

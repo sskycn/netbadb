@@ -34,6 +34,7 @@ fn inspected_hash_keys(plan: &PlanNodeInspection) -> Option<(u32, u32)> {
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => inspected_hash_keys(input),
         PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => None,
         PlanNodeInspection::PartitionedScan { .. } | PlanNodeInspection::OneRow => None,
@@ -54,6 +55,7 @@ fn contains_nested_loop_join(plan: &PlanNodeInspection) -> bool {
         | PlanNodeInspection::Aggregate { input, .. }
         | PlanNodeInspection::Limit { input, .. } => contains_nested_loop_join(input),
         PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => false,
         PlanNodeInspection::PartitionedScan { .. } | PlanNodeInspection::OneRow => false,

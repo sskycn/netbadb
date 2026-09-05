@@ -32,6 +32,14 @@ Run the default quick profile for development confirmation:
 cargo bench -p netbadb-core --bench phase7_baseline
 ```
 
+Columnar Phase 1 also provides a focused warm-process comparison of Heap
+sequential analytics, Heap+BTree point lookup, LSM analytics, and Columnar
+analytics. It prints exact row-group pruning counters for the columnar case:
+
+```sh
+cargo bench -p netbadb-core --bench columnar_phase1
+```
+
 Run the full profile for a manually recorded baseline:
 
 ```sh

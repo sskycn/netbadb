@@ -2092,6 +2092,7 @@ fn plan_contains(plan: &PlanNodeInspection, expected: PlanKind) -> bool {
         | PlanNodeInspection::Limit { input: left, .. } => plan_contains(left, expected),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. }
         | PlanNodeInspection::PartitionedScan { .. } => false,

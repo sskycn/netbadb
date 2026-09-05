@@ -1,5 +1,26 @@
 # NetbaDB roadmap
 
+## Columnar Phase 1 (complete)
+
+- immutable Heap/LSM-derived projections with stable projection, segment, and
+  generation identities plus per-storage equality-only freshness tokens;
+- checksummed version-1 `NBCM` manifests and `NBCS` multi-row-group segments
+  with typed vectors, validity bitmaps, Text offsets, min/max, and NULL counts;
+- crash-safe build/refresh publication, explicit reopen attachment, derived-only
+  drop, stale fallback, and corruption isolation;
+- separate planning snapshots and `ColumnarScan`, preserving BTree point lookup
+  precedence and applying required-column pruning plus safe zone maps;
+- column-vector scan/filter/project/COUNT/SUM/MIN/MAX/GROUP BY execution with
+  explicit result boundaries and exact row-group scan counters;
+- embedded Core/Rust SDK lifecycle and inspection APIs, Heap/LSM end-to-end
+  tests, race/corruption/reopen coverage, and a focused benchmark target.
+
+Phase 2 may add catalog-managed projection locations, persisted cheap LSM
+content epochs, partitioned projections, compression, dictionaries, SIMD,
+spilling, wider columnar operator coverage, and incremental maintenance. It
+must not turn a projection into authoritative storage or introduce a global
+commit sequence.
+
 ## Phase 0 — Rust foundation (complete)
 
 - Cargo workspace and dependency direction;

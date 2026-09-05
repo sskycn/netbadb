@@ -407,6 +407,7 @@ fn physical_uses_index(plan: &PhysicalStatement) -> bool {
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. } => visit(left) || visit(right),
             PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::ColumnarScan { .. }
             | PhysicalPlan::PartitionedScan { .. }
             | PhysicalPlan::OneRow => false,
         }

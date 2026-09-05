@@ -8,7 +8,8 @@ use netbadb_rel::{
     LogicalPlan, LogicalStatement, OutputField, ProjectedExpr, SortKey,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, PartitionId, RelationBindingId, ScalarValue, StorageId, TableId,
+    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, PartitionId,
+    RelationBindingId, ScalarValue, StorageId, TableId,
 };
 
 /// Executable operations advertised by one physical access path.
@@ -80,6 +81,36 @@ pub struct RangeTablePlanningSnapshot {
     pub partitions: Vec<PartitionPlanningSnapshot>,
 }
 
+/// Immutable optimizer metadata for one validated, fresh derived projection.
+/// Core supplies only projections whose table, source storage, schema,
+/// generation, token, and transaction context are eligible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarProjectionPlanningSnapshot {
+    pub projection_id: ColumnarProjectionId,
+    pub generation: ColumnarGeneration,
+    pub table_id: TableId,
+    pub source_storage_id: StorageId,
+    pub projected_columns: Vec<ColumnId>,
+    pub row_count: u64,
+    pub row_group_count: u64,
+    pub segment_bytes: u64,
+    pub row_groups: Vec<ColumnarRowGroupPlanningSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarRowGroupPlanningSnapshot {
+    pub rows: u32,
+    pub columns: Vec<ColumnarZoneMapPlanningSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarZoneMapPlanningSnapshot {
+    pub column_id: ColumnId,
+    pub null_count: u64,
+    pub minimum: Option<ScalarValue>,
+    pub maximum: Option<ScalarValue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionAccessPlan {
     SeqScan,
@@ -110,6 +141,15 @@ pub enum PhysicalPlan {
         table_id: TableId,
         table_name: String,
         columns: Vec<ColumnRef>,
+    },
+    ColumnarScan {
+        binding_id: RelationBindingId,
+        table_id: TableId,
+        table_name: String,
+        columns: Vec<ColumnRef>,
+        projection_id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+        source_storage_id: StorageId,
     },
     IndexScan {
         binding_id: RelationBindingId,
@@ -219,6 +259,7 @@ impl PhysicalPlan {
         match self {
             Self::OneRow => Vec::new(),
             Self::SeqScan { columns, .. }
+            | Self::ColumnarScan { columns, .. }
             | Self::IndexScan { columns, .. }
             | Self::RangeIndexScan { columns, .. }
             | Self::PartitionedScan { columns, .. }
@@ -282,6 +323,357 @@ pub fn plan_with_partition_snapshots(
         .filter_map(|field| field.source_column().map(SourceIdentity::from))
         .collect::<Vec<_>>();
     prune_required_columns(raw, &required)
+}
+
+/// Plans a query with columnar projections kept separate from access paths.
+#[must_use]
+pub fn plan_with_columnar_snapshots(
+    logical: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+) -> PhysicalPlan {
+    let plan = plan_with_partition_snapshots(logical, table_statistics, access_paths, range_tables);
+    select_columnar_scans(plan, table_statistics, projections, true, &[])
+}
+
+#[derive(Debug, Clone)]
+struct ColumnarPlanningConstraint {
+    column_id: ColumnId,
+    lower: Option<(ScalarValue, bool)>,
+    upper: Option<(ScalarValue, bool)>,
+}
+
+fn select_columnar_scans(
+    plan: PhysicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+    eligible_context: bool,
+    constraints: &[ColumnarPlanningConstraint],
+) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+        } if eligible_context => {
+            let required = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
+            let source_work = table_statistics
+                .iter()
+                .find(|entry| entry.table_id == table_id)
+                .and_then(|entry| entry.statistics)
+                .map_or_else(
+                    || {
+                        projections
+                            .iter()
+                            .filter(|projection| projection.table_id == table_id)
+                            .map(|projection| 1_u64.saturating_add(projection.row_count / 32))
+                            .max()
+                            .unwrap_or(1)
+                    },
+                    |statistics| statistics.managed_page_count.max(1),
+                );
+            let selected = projections
+                .iter()
+                .filter(|projection| {
+                    projection.table_id == table_id
+                        && required
+                            .iter()
+                            .all(|column| projection.projected_columns.contains(column))
+                })
+                .min_by_key(|projection| columnar_work_units(projection, &required, constraints));
+            if let Some(projection) = selected {
+                let columnar_work = columnar_work_units(projection, &required, constraints);
+                if columnar_work <= source_work {
+                    return PhysicalPlan::ColumnarScan {
+                        binding_id,
+                        table_id,
+                        table_name,
+                        columns,
+                        projection_id: projection.projection_id,
+                        generation: projection.generation,
+                        source_storage_id: projection.source_storage_id,
+                    };
+                }
+            }
+            PhysicalPlan::SeqScan {
+                binding_id,
+                table_id,
+                table_name,
+                columns,
+            }
+        }
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new({
+                let mut pushed = constraints.to_vec();
+                collect_columnar_constraints(&predicate, &mut pushed);
+                select_columnar_scans(
+                    *input,
+                    table_statistics,
+                    projections,
+                    eligible_context,
+                    &pushed,
+                )
+            }),
+            predicate,
+        },
+        PhysicalPlan::Project { input, columns } => PhysicalPlan::Project {
+            input: Box::new(select_columnar_scans(
+                *input,
+                table_statistics,
+                projections,
+                eligible_context,
+                constraints,
+            )),
+            columns,
+        },
+        PhysicalPlan::ScalarProject { input, expressions } => PhysicalPlan::ScalarProject {
+            input: Box::new(select_columnar_scans(
+                *input,
+                table_statistics,
+                projections,
+                eligible_context,
+                constraints,
+            )),
+            expressions,
+        },
+        PhysicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } => PhysicalPlan::Aggregate {
+            input: Box::new(select_columnar_scans(
+                *input,
+                table_statistics,
+                projections,
+                eligible_context,
+                constraints,
+            )),
+            group_keys,
+            outputs,
+        },
+        PhysicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
+            input: Box::new(select_columnar_scans(
+                *input,
+                table_statistics,
+                projections,
+                eligible_context,
+                constraints,
+            )),
+            limit,
+        },
+        PhysicalPlan::Sort { input, keys } => PhysicalPlan::Sort {
+            input: Box::new(select_columnar_scans(
+                *input,
+                table_statistics,
+                projections,
+                false,
+                &[],
+            )),
+            keys,
+        },
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            kind,
+            predicate,
+            columns,
+        } => PhysicalPlan::NestedLoopJoin {
+            left: Box::new(select_columnar_scans(
+                *left,
+                table_statistics,
+                projections,
+                false,
+                &[],
+            )),
+            right: Box::new(select_columnar_scans(
+                *right,
+                table_statistics,
+                projections,
+                false,
+                &[],
+            )),
+            kind,
+            predicate,
+            columns,
+        },
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+        } => PhysicalPlan::HashJoin {
+            left: Box::new(select_columnar_scans(
+                *left,
+                table_statistics,
+                projections,
+                false,
+                &[],
+            )),
+            right: Box::new(select_columnar_scans(
+                *right,
+                table_statistics,
+                projections,
+                false,
+                &[],
+            )),
+            kind,
+            left_key,
+            right_key,
+            predicate,
+            columns,
+        },
+        PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            right_binding_id,
+            right_table_id,
+            right_table_name,
+            right_columns,
+            kind,
+            left_key,
+            right_key,
+            right_access_path,
+            predicate,
+            columns,
+        } => PhysicalPlan::IndexNestedLoopJoin {
+            left: Box::new(select_columnar_scans(
+                *left,
+                table_statistics,
+                projections,
+                false,
+                &[],
+            )),
+            right_binding_id,
+            right_table_id,
+            right_table_name,
+            right_columns,
+            kind,
+            left_key,
+            right_key,
+            right_access_path,
+            predicate,
+            columns,
+        },
+        other => other,
+    }
+}
+
+fn columnar_work_units(
+    projection: &ColumnarProjectionPlanningSnapshot,
+    required: &[ColumnId],
+    constraints: &[ColumnarPlanningConstraint],
+) -> u64 {
+    let selected = projection
+        .row_groups
+        .iter()
+        .filter(|group| {
+            !constraints
+                .iter()
+                .any(|constraint| planning_group_cannot_match(group, constraint))
+        })
+        .collect::<Vec<_>>();
+    let selected_groups = u64::try_from(selected.len()).unwrap_or(u64::MAX);
+    let selected_rows = selected.iter().fold(0_u64, |total, group| {
+        total.saturating_add(u64::from(group.rows))
+    });
+    let total_columns = u64::try_from(projection.projected_columns.len())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let required_columns = u64::try_from(required.len()).unwrap_or(u64::MAX);
+    let total_groups = projection.row_group_count.max(1);
+    let required_bytes = projection
+        .segment_bytes
+        .saturating_mul(required_columns)
+        .div_ceil(total_columns)
+        .saturating_mul(selected_groups)
+        .div_ceil(total_groups);
+    1_u64
+        .saturating_add(selected_groups)
+        .saturating_add(required_bytes.div_ceil(4096))
+        .saturating_add(selected_rows.div_ceil(256))
+}
+
+fn planning_group_cannot_match(
+    group: &ColumnarRowGroupPlanningSnapshot,
+    constraint: &ColumnarPlanningConstraint,
+) -> bool {
+    let Some(zone) = group
+        .columns
+        .iter()
+        .find(|zone| zone.column_id == constraint.column_id)
+    else {
+        return false;
+    };
+    let (Some(minimum), Some(maximum)) = (&zone.minimum, &zone.maximum) else {
+        return zone.null_count == u64::from(group.rows);
+    };
+    if let Some((lower, inclusive)) = &constraint.lower {
+        let ordering = compare_values(maximum, lower);
+        if ordering == Ordering::Less || (!inclusive && ordering == Ordering::Equal) {
+            return true;
+        }
+    }
+    if let Some((upper, inclusive)) = &constraint.upper {
+        let ordering = compare_values(minimum, upper);
+        if ordering == Ordering::Greater || (!inclusive && ordering == Ordering::Equal) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_columnar_constraints(expression: &Expr, output: &mut Vec<ColumnarPlanningConstraint>) {
+    let ExprKind::Binary {
+        operator,
+        left,
+        right,
+    } = &expression.kind
+    else {
+        return;
+    };
+    if *operator == BinaryOp::And {
+        collect_columnar_constraints(left, output);
+        collect_columnar_constraints(right, output);
+        return;
+    }
+    let (column, value, operator) = match (&left.kind, &right.kind) {
+        (ExprKind::Column(column), ExprKind::Literal(value)) => (column, value, *operator),
+        (ExprKind::Literal(value), ExprKind::Column(column)) => {
+            let reversed = match operator {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                other => *other,
+            };
+            (column, value, reversed)
+        }
+        _ => return,
+    };
+    if matches!(value, ScalarValue::Null) {
+        return;
+    }
+    let (lower, upper) = match operator {
+        BinaryOp::Eq => (Some((value.clone(), true)), Some((value.clone(), true))),
+        BinaryOp::Gt => (Some((value.clone(), false)), None),
+        BinaryOp::GtEq => (Some((value.clone(), true)), None),
+        BinaryOp::Lt => (None, Some((value.clone(), false))),
+        BinaryOp::LtEq => (None, Some((value.clone(), true))),
+        BinaryOp::NotEq | BinaryOp::And | BinaryOp::Or => return,
+    };
+    output.push(ColumnarPlanningConstraint {
+        column_id: column.column_id,
+        lower,
+        upper,
+    });
 }
 
 fn plan_raw_with_statistics(
@@ -551,6 +943,23 @@ fn prune_required_columns(plan: PhysicalPlan, parent_required: &[SourceIdentity]
             table_id,
             table_name,
             columns: prune_columns(columns, parent_required),
+        },
+        PhysicalPlan::ColumnarScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            projection_id,
+            generation,
+            source_storage_id,
+        } => PhysicalPlan::ColumnarScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns: prune_columns(columns, parent_required),
+            projection_id,
+            generation,
+            source_storage_id,
         },
         PhysicalPlan::IndexScan {
             binding_id,
@@ -1836,6 +2245,31 @@ pub fn plan_statement_with_partition_snapshots(
             input: plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
             table_id: *table_id,
         },
+    }
+}
+
+#[must_use]
+pub fn plan_statement_with_columnar_snapshots(
+    logical: &LogicalStatement,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+) -> PhysicalStatement {
+    match logical {
+        LogicalStatement::Query(query) => PhysicalStatement::Query(plan_with_columnar_snapshots(
+            query,
+            table_statistics,
+            access_paths,
+            range_tables,
+            projections,
+        )),
+        _ => plan_statement_with_partition_snapshots(
+            logical,
+            table_statistics,
+            access_paths,
+            range_tables,
+        ),
     }
 }
 
@@ -3518,6 +3952,7 @@ mod tests {
     fn base_columns(plan: &PhysicalPlan) -> &[ColumnRef] {
         match plan {
             PhysicalPlan::SeqScan { columns, .. }
+            | PhysicalPlan::ColumnarScan { columns, .. }
             | PhysicalPlan::IndexScan { columns, .. }
             | PhysicalPlan::RangeIndexScan { columns, .. }
             | PhysicalPlan::PartitionedScan { columns, .. } => columns,

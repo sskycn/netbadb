@@ -12,7 +12,7 @@ use crate::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IsolationLevel,
     LsmIdentityInspection, LsmInspection, LsmReadView, LsmRecoveryInspection, LsmRowHandle,
     LsmStorage, LsmTransaction, PreparedTxnResolution, PresenceCountSummary, ReadView,
-    StorageError, Transaction, TransactionError, TransactionState,
+    StorageError, StorageSnapshotToken, Transaction, TransactionError, TransactionState,
 };
 
 /// Logical index identity copied into a private replacement Heap.
@@ -620,6 +620,35 @@ impl TableStorage {
                 storage.read_view()?,
             )),
         }
+    }
+
+    /// Captures an equality-only committed horizon for this exact storage.
+    pub fn snapshot_token(
+        &self,
+        view: &StorageReadView,
+    ) -> Result<StorageSnapshotToken, StorageError> {
+        let table_id = self.table().id;
+        match self {
+            Self::Heap(storage) => Ok(StorageSnapshotToken::heap(
+                storage.storage_id(),
+                view.heap_view(table_id)?.snapshot().visible_csn.0,
+            )),
+            Self::Lsm(storage) => {
+                let _ = view.lsm_view(table_id)?;
+                let (epoch, sequence) = storage.projection_snapshot_parts()?;
+                Ok(StorageSnapshotToken::lsm(
+                    storage.storage_id(),
+                    epoch,
+                    sequence,
+                ))
+            }
+        }
+    }
+
+    /// Returns the latest committed horizon without creating a cross-storage order.
+    pub fn current_snapshot_token(&self) -> Result<StorageSnapshotToken, StorageError> {
+        let view = self.read_view()?;
+        self.snapshot_token(&view)
     }
 
     pub fn begin_transaction(&mut self) -> Result<StorageTransaction, StorageError> {

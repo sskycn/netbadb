@@ -58,6 +58,7 @@ TableStorage capability boundary
     ↓
 Heap row layout + registered B+Tree access methods
 or LSM MemTable + LSM WAL + Bloom-bearing immutable L0-L3 SSTables
+or a fresh immutable derived Columnar Phase 1 analytical projection
     ↓
 Database coordinator + physical transaction lifecycle + versioned WAL
     ↓
@@ -70,6 +71,11 @@ Page manager / database file
 
 The core does not depend on Go, a network runtime, JSON execution IR, or
 application-specific Rust structs.
+
+[Columnar Phase 1](docs/columnar-phase1.md) adds explicit embedded
+build/refresh/attach/drop APIs, `ColumnarScan`, vector filter/project/aggregate,
+zone-map pruning, corruption-safe fallback, and scan statistics. Heap and LSM
+remain authoritative and committed DML makes a projection stale until refresh.
 
 Round 33 extends controlled backfill with a post-backfill `CREATE INDEX` /
 `DROP INDEX` phase. Index IDs are durably reserved before overlay mutation;
@@ -292,7 +298,7 @@ The current code genuinely supports:
   storage internals and never drives execution;
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
-  current versioned Inspection JSON v5 output (with v1/v2/v3/v4 retained
+  current versioned Inspection JSON v6 output (with v1/v2/v3/v4/v5 retained
   historically);
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 once, compiles full editor buffers without database access, and maps

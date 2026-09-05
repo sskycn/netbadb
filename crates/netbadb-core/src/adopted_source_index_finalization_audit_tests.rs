@@ -1114,7 +1114,7 @@ fn plan_uses_index(node: &netbadb_inspect::PlanNodeInspection) -> bool {
         N::HashJoin { left, right, .. } | N::NestedLoopJoin { left, right, .. } => {
             plan_uses_index(left) || plan_uses_index(right)
         }
-        N::OneRow | N::SeqScan { .. } | N::PartitionedScan { .. } => false,
+        N::OneRow | N::SeqScan { .. } | N::ColumnarScan { .. } | N::PartitionedScan { .. } => false,
     }
 }
 

@@ -1027,6 +1027,7 @@ fn partitioned_scan_partitions(
         | PlanNodeInspection::IndexNestedLoopJoin { .. }
         | PlanNodeInspection::HashJoin { .. }
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => None,
     }
@@ -1208,6 +1209,7 @@ fn selected_partition_count(plan: &PlanNodeInspection) -> Option<usize> {
         PlanNodeInspection::IndexNestedLoopJoin { left, .. } => selected_partition_count(left),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => None,
     }
@@ -5920,6 +5922,7 @@ fn find_hash_join(plan: &PlanNodeInspection) -> Option<&PlanNodeInspection> {
         | PlanNodeInspection::Limit { input, .. } => find_hash_join(input),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. }
         | PlanNodeInspection::PartitionedScan { .. }
@@ -5939,6 +5942,7 @@ fn find_index_nested_loop_join(plan: &PlanNodeInspection) -> Option<&PlanNodeIns
         | PlanNodeInspection::Limit { input, .. } => find_index_nested_loop_join(input),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. }
         | PlanNodeInspection::PartitionedScan { .. }
@@ -5992,6 +5996,7 @@ fn inspect_base_scan_columns(
 fn collect_base_scan_columns(plan: &PlanNodeInspection, scans: &mut Vec<Vec<ColumnId>>) {
     match plan {
         PlanNodeInspection::SeqScan { columns, .. }
+        | PlanNodeInspection::ColumnarScan { columns, .. }
         | PlanNodeInspection::IndexScan { columns, .. }
         | PlanNodeInspection::RangeIndexScan { columns, .. } => {
             scans.push(columns.iter().map(|column| column.column_id).collect());
@@ -6065,6 +6070,7 @@ fn contains_operator(plan: &PlanNodeInspection, target: Operator) -> bool {
             | PlanNodeInspection::Limit { input, .. } => contains_operator(input, target),
             PlanNodeInspection::OneRow
             | PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::ColumnarScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. } => false,
             PlanNodeInspection::PartitionedScan { .. } => false,
@@ -6075,6 +6081,7 @@ const fn operator(plan: &PlanNodeInspection) -> Operator {
     match plan {
         PlanNodeInspection::OneRow => Operator::OneRow,
         PlanNodeInspection::SeqScan { .. } => Operator::SeqScan,
+        PlanNodeInspection::ColumnarScan { .. } => Operator::SeqScan,
         PlanNodeInspection::IndexScan { .. } => Operator::IndexScan,
         PlanNodeInspection::RangeIndexScan { .. } => Operator::RangeIndexScan,
         PlanNodeInspection::PartitionedScan { .. } => Operator::SeqScan,
@@ -6115,6 +6122,7 @@ fn collect_operators(plan: &PlanNodeInspection, operators: &mut Vec<&'static str
         | PlanNodeInspection::Limit { input, .. } => collect_operators(input, operators),
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::IndexScan { .. }
         | PlanNodeInspection::RangeIndexScan { .. } => {}
         PlanNodeInspection::PartitionedScan { .. } => {}

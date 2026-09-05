@@ -14,12 +14,13 @@ use netbadb_rel::{
     ColumnRef, Expr, ExprKind, JoinKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
 };
 use netbadb_storage::{
+    ColumnarBatch, ColumnarConstraint, ColumnarProjection, ColumnarScanStatistics,
     PresenceCountSummary, StorageError, StorageReadView, StorageRowHandle, StorageTransaction,
     TableStorage,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId,
-    TableId,
+    AccessPathId, ColumnId, ColumnarProjectionId, PhysicalType, RelationBindingId, ScalarRef,
+    ScalarValue, StorageId, TableId,
 };
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
@@ -43,6 +44,17 @@ pub struct ExecutionStorage<'a> {
 pub struct ExecutionReadView<'a> {
     pub storage_id: StorageId,
     pub view: &'a StorageReadView,
+}
+
+pub struct ExecutionColumnarProjection<'a> {
+    pub projection_id: ColumnarProjectionId,
+    pub projection: &'a ColumnarProjection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnarExecutionStatistics {
+    pub projection_id: Option<ColumnarProjectionId>,
+    pub scan: ColumnarScanStatistics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +117,8 @@ pub enum ExecutionError {
     MissingTableStorage(TableId),
     MissingPhysicalStorage(StorageId),
     MissingStorageReadView(StorageId),
+    MissingColumnarProjection(ColumnarProjectionId),
+    ColumnarProjectionGenerationMismatch(ColumnarProjectionId),
     StorageIdentityOverflow,
     TableMismatch {
         planned: TableId,
@@ -164,6 +178,16 @@ impl fmt::Display for ExecutionError {
                 formatter,
                 "physical storage {} has no statement read view",
                 storage_id.0
+            ),
+            Self::MissingColumnarProjection(projection_id) => write!(
+                formatter,
+                "missing columnar projection {} required by physical plan",
+                projection_id.0
+            ),
+            Self::ColumnarProjectionGenerationMismatch(projection_id) => write!(
+                formatter,
+                "columnar projection {} generation differs from physical plan",
+                projection_id.0
             ),
             Self::StorageIdentityOverflow => {
                 formatter.write_str("execution storage identity allocation overflowed")
@@ -257,6 +281,31 @@ pub fn execute_with_storage_context(
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
 ) -> Result<QueryResult, ExecutionError> {
+    execute_with_columnar_context(plan, bindings, storages, read_views, &[], None)
+}
+
+pub fn execute_with_columnar_context(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    projections: &[ExecutionColumnarProjection<'_>],
+    columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
+) -> Result<QueryResult, ExecutionError> {
+    if let Some(rows) = execute_columnar_subtree(plan, projections, columnar_statistics)? {
+        return Ok(QueryResult {
+            columns: rows
+                .fields
+                .into_iter()
+                .map(|field| ResultColumn {
+                    name: field.name().to_owned(),
+                    data_type: field.data_type().clone(),
+                    nullable: field.nullable(),
+                })
+                .collect(),
+            rows: rows.rows.into_iter().map(|row| row.values).collect(),
+        });
+    }
     let result = execute_rows_with_views(plan, bindings, storages, read_views)?;
     Ok(QueryResult {
         columns: result
@@ -446,6 +495,415 @@ struct ExecutionRow {
 struct ExecutionRows {
     fields: Vec<OutputField>,
     rows: Vec<ExecutionRow>,
+}
+
+#[derive(Debug)]
+struct VectorBatch {
+    batch: ColumnarBatch,
+    selected: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct VectorRows {
+    fields: Vec<OutputField>,
+    batches: Vec<VectorBatch>,
+}
+
+fn execute_columnar_subtree(
+    plan: &PhysicalPlan,
+    projections: &[ExecutionColumnarProjection<'_>],
+    statistics: Option<&mut ColumnarExecutionStatistics>,
+) -> Result<Option<ExecutionRows>, ExecutionError> {
+    let constraints = collect_zone_constraints(plan);
+    let Some(vectors) = build_vector_rows(plan, projections, &constraints, statistics)? else {
+        return Ok(None);
+    };
+    materialize_vector_rows(vectors).map(Some)
+}
+
+fn build_vector_rows(
+    plan: &PhysicalPlan,
+    projections: &[ExecutionColumnarProjection<'_>],
+    constraints: &[ColumnarConstraint],
+    statistics: Option<&mut ColumnarExecutionStatistics>,
+) -> Result<Option<VectorRows>, ExecutionError> {
+    match plan {
+        PhysicalPlan::ColumnarScan {
+            columns,
+            projection_id,
+            generation,
+            ..
+        } => {
+            let projection = projections
+                .iter()
+                .find(|candidate| candidate.projection_id == *projection_id)
+                .ok_or(ExecutionError::MissingColumnarProjection(*projection_id))?
+                .projection;
+            if projection.metadata().generation != *generation {
+                return Err(ExecutionError::ColumnarProjectionGenerationMismatch(
+                    *projection_id,
+                ));
+            }
+            let column_ids = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
+            let (batches, scan) = projection
+                .scan(&column_ids, constraints)
+                .map_err(StorageError::from)?;
+            if let Some(statistics) = statistics {
+                statistics.projection_id = Some(*projection_id);
+                statistics.scan = scan;
+            }
+            Ok(Some(VectorRows {
+                fields: columns.iter().cloned().map(OutputField::Source).collect(),
+                batches: batches
+                    .into_iter()
+                    .map(|batch| VectorBatch {
+                        selected: (0..batch.row_count).collect(),
+                        batch,
+                    })
+                    .collect(),
+            }))
+        }
+        PhysicalPlan::Filter { input, predicate } => {
+            let Some(mut vectors) = build_vector_rows(input, projections, constraints, statistics)?
+            else {
+                return Ok(None);
+            };
+            for batch in &mut vectors.batches {
+                let mut retained = Vec::with_capacity(batch.selected.len());
+                for row in batch.selected.iter().copied() {
+                    let values = vector_row_values(&batch.batch, row)?;
+                    if matches!(
+                        TruthValue::from_scalar(evaluate(predicate, &values, &vectors.fields)?)?,
+                        TruthValue::True
+                    ) {
+                        retained.push(row);
+                    }
+                }
+                batch.selected = retained;
+            }
+            Ok(Some(vectors))
+        }
+        PhysicalPlan::Project { input, columns } => {
+            let Some(mut vectors) = build_vector_rows(input, projections, constraints, statistics)?
+            else {
+                return Ok(None);
+            };
+            let positions = columns
+                .iter()
+                .map(|column| find_source_position(&vectors.fields, column))
+                .collect::<Result<Vec<_>, _>>()?;
+            for batch in &mut vectors.batches {
+                batch.batch.columns = positions
+                    .iter()
+                    .map(|position| {
+                        batch
+                            .batch
+                            .columns
+                            .get(*position)
+                            .cloned()
+                            .ok_or(ExecutionError::TypeMismatch)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            vectors.fields = columns.iter().cloned().map(OutputField::Source).collect();
+            Ok(Some(vectors))
+        }
+        PhysicalPlan::Limit { input, limit } => {
+            let Some(mut vectors) = build_vector_rows(input, projections, constraints, statistics)?
+            else {
+                return Ok(None);
+            };
+            let mut remaining = usize::try_from(*limit).unwrap_or(usize::MAX);
+            for batch in &mut vectors.batches {
+                if batch.selected.len() > remaining {
+                    batch.selected.truncate(remaining);
+                }
+                remaining = remaining.saturating_sub(batch.selected.len());
+            }
+            Ok(Some(vectors))
+        }
+        PhysicalPlan::Aggregate {
+            input,
+            group_keys,
+            outputs,
+        } => {
+            let Some(vectors) = build_vector_rows(input, projections, constraints, statistics)?
+            else {
+                return Ok(None);
+            };
+            let rows = vector_aggregate(vectors, group_keys, outputs)?;
+            Ok(Some(vector_rows_from_execution(rows)?))
+        }
+        PhysicalPlan::ScalarProject { input, expressions } => {
+            let Some(vectors) = build_vector_rows(input, projections, constraints, statistics)?
+            else {
+                return Ok(None);
+            };
+            let materialized = materialize_vector_rows(vectors)?;
+            let rows = materialized
+                .rows
+                .into_iter()
+                .map(|row| {
+                    expressions
+                        .iter()
+                        .map(|expression| {
+                            evaluate(&expression.expression, &row.values, &materialized.fields)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|values| ExecutionRow {
+                            row_id: None,
+                            values,
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(vector_rows_from_execution(ExecutionRows {
+                fields: expressions
+                    .iter()
+                    .map(|expression| OutputField::Derived(expression.output.clone()))
+                    .collect(),
+                rows,
+            })?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn vector_rows_from_execution(rows: ExecutionRows) -> Result<VectorRows, ExecutionError> {
+    let column_count = rows.fields.len();
+    let row_count = rows.rows.len();
+    let mut columns = Vec::with_capacity(column_count);
+    for position in 0..column_count {
+        let field = rows
+            .fields
+            .get(position)
+            .ok_or(ExecutionError::TypeMismatch)?;
+        let column_id = field.source_column().map_or(
+            ColumnId(u32::try_from(position).unwrap_or(u32::MAX)),
+            |column| column.column_id,
+        );
+        let values = rows
+            .rows
+            .iter()
+            .map(|row| {
+                row.values
+                    .get(position)
+                    .cloned()
+                    .ok_or(ExecutionError::TypeMismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        columns.push(netbadb_storage::ColumnarBatchColumn {
+            column_id,
+            values: values_to_vector(field.data_type().physical, &values)?,
+        });
+    }
+    Ok(VectorRows {
+        fields: rows.fields,
+        batches: vec![VectorBatch {
+            batch: ColumnarBatch { row_count, columns },
+            selected: (0..row_count).collect(),
+        }],
+    })
+}
+
+fn values_to_vector(
+    physical: PhysicalType,
+    values: &[ScalarValue],
+) -> Result<netbadb_storage::ColumnarVector, ExecutionError> {
+    let mut validity = vec![0_u8; values.len().div_ceil(8)];
+    let mut mark = |row: usize| validity[row / 8] |= 1 << (row % 8);
+    match physical {
+        PhysicalType::Bool => {
+            let mut output = Vec::with_capacity(values.len());
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    ScalarValue::Bool(value) => {
+                        mark(row);
+                        output.push(*value);
+                    }
+                    ScalarValue::Null => output.push(false),
+                    _ => return Err(ExecutionError::TypeMismatch),
+                }
+            }
+            Ok(netbadb_storage::ColumnarVector::Bool {
+                values: output,
+                validity,
+            })
+        }
+        PhysicalType::Int64 => {
+            let mut output = Vec::with_capacity(values.len());
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    ScalarValue::Int64(value) => {
+                        mark(row);
+                        output.push(*value);
+                    }
+                    ScalarValue::Null => output.push(0),
+                    _ => return Err(ExecutionError::TypeMismatch),
+                }
+            }
+            Ok(netbadb_storage::ColumnarVector::Int64 {
+                values: output,
+                validity,
+            })
+        }
+        PhysicalType::UInt64 => {
+            let mut output = Vec::with_capacity(values.len());
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    ScalarValue::UInt64(value) => {
+                        mark(row);
+                        output.push(*value);
+                    }
+                    ScalarValue::Null => output.push(0),
+                    _ => return Err(ExecutionError::TypeMismatch),
+                }
+            }
+            Ok(netbadb_storage::ColumnarVector::UInt64 {
+                values: output,
+                validity,
+            })
+        }
+        PhysicalType::Text => {
+            let mut offsets = vec![0_u32];
+            let mut bytes = Vec::new();
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    ScalarValue::Text(value) => {
+                        mark(row);
+                        bytes.extend_from_slice(value.as_bytes());
+                    }
+                    ScalarValue::Null => {}
+                    _ => return Err(ExecutionError::TypeMismatch),
+                }
+                offsets.push(u32::try_from(bytes.len()).map_err(|_| ExecutionError::TypeMismatch)?);
+            }
+            Ok(netbadb_storage::ColumnarVector::Text {
+                offsets,
+                bytes,
+                validity,
+            })
+        }
+    }
+}
+
+fn vector_aggregate(
+    vectors: VectorRows,
+    group_keys: &[ColumnRef],
+    outputs: &[AggregateOutput],
+) -> Result<ExecutionRows, ExecutionError> {
+    let mut accumulator = AggregateAccumulator::new(&vectors.fields, group_keys, outputs)?;
+    for batch in vectors.batches {
+        for row in batch.selected {
+            let values = vector_row_values(&batch.batch, row)?;
+            accumulator.consume_owned_row(ExecutionRow {
+                row_id: None,
+                values,
+            })?;
+        }
+    }
+    accumulator.finish()
+}
+
+fn materialize_vector_rows(vectors: VectorRows) -> Result<ExecutionRows, ExecutionError> {
+    let mut rows = Vec::new();
+    for batch in vectors.batches {
+        for row in batch.selected {
+            rows.push(ExecutionRow {
+                row_id: None,
+                values: vector_row_values(&batch.batch, row)?,
+            });
+        }
+    }
+    Ok(ExecutionRows {
+        fields: vectors.fields,
+        rows,
+    })
+}
+
+fn vector_row_values(
+    batch: &ColumnarBatch,
+    row: usize,
+) -> Result<Vec<ScalarValue>, ExecutionError> {
+    batch
+        .columns
+        .iter()
+        .map(|column| {
+            column
+                .values
+                .value(row)
+                .map_err(StorageError::from)
+                .map_err(ExecutionError::from)
+        })
+        .collect()
+}
+
+fn collect_zone_constraints(plan: &PhysicalPlan) -> Vec<ColumnarConstraint> {
+    let mut output = Vec::new();
+    collect_zone_constraints_into(plan, &mut output);
+    output
+}
+
+fn collect_zone_constraints_into(plan: &PhysicalPlan, output: &mut Vec<ColumnarConstraint>) {
+    match plan {
+        PhysicalPlan::Filter { input, predicate } => {
+            collect_expression_constraints(predicate, output);
+            collect_zone_constraints_into(input, output);
+        }
+        PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::ScalarProject { input, .. }
+        | PhysicalPlan::Aggregate { input, .. }
+        | PhysicalPlan::Limit { input, .. } => collect_zone_constraints_into(input, output),
+        _ => {}
+    }
+}
+
+fn collect_expression_constraints(expression: &Expr, output: &mut Vec<ColumnarConstraint>) {
+    let ExprKind::Binary {
+        operator,
+        left,
+        right,
+    } = &expression.kind
+    else {
+        return;
+    };
+    if *operator == BinaryOp::And {
+        collect_expression_constraints(left, output);
+        collect_expression_constraints(right, output);
+        return;
+    }
+    let (column, value, operator) = match (&left.kind, &right.kind) {
+        (ExprKind::Column(column), ExprKind::Literal(value)) => (column, value, *operator),
+        (ExprKind::Literal(value), ExprKind::Column(column)) => {
+            let reversed = match operator {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                other => *other,
+            };
+            (column, value, reversed)
+        }
+        _ => return,
+    };
+    if matches!(value, ScalarValue::Null) {
+        return;
+    }
+    let (lower, upper) = match operator {
+        BinaryOp::Eq => (Some((value.clone(), true)), Some((value.clone(), true))),
+        BinaryOp::Gt => (Some((value.clone(), false)), None),
+        BinaryOp::GtEq => (Some((value.clone(), true)), None),
+        BinaryOp::Lt => (None, Some((value.clone(), false))),
+        BinaryOp::LtEq => (None, Some((value.clone(), true))),
+        BinaryOp::NotEq | BinaryOp::And | BinaryOp::Or => return,
+    };
+    output.push(ColumnarConstraint {
+        column_id: column.column_id,
+        lower,
+        upper,
+    });
 }
 
 #[cfg(test)]
@@ -1020,7 +1478,8 @@ fn build_batch_pipeline(plan: &PhysicalPlan) -> Result<Option<BatchPipeline<'_>>
             });
             Ok(Some(pipeline))
         }
-        PhysicalPlan::IndexScan { .. }
+        PhysicalPlan::ColumnarScan { .. }
+        | PhysicalPlan::IndexScan { .. }
         | PhysicalPlan::RangeIndexScan { .. }
         | PhysicalPlan::NestedLoopJoin { .. }
         | PhysicalPlan::IndexNestedLoopJoin { .. }
@@ -1388,6 +1847,9 @@ fn execute_rows_legacy_with_filter_mode(
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
             })
+        }
+        PhysicalPlan::ColumnarScan { projection_id, .. } => {
+            Err(ExecutionError::MissingColumnarProjection(*projection_id))
         }
         PhysicalPlan::IndexScan {
             table_id,

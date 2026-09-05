@@ -697,6 +697,33 @@ struct VisibleRow {
 }
 
 impl LsmStorage {
+    /// Equality-only committed-state token for derived projections.
+    ///
+    /// Allocator reservations and manifest generations can advance without a
+    /// logical data change. Phase 1 therefore combines the current WAL
+    /// generation with the exact maximum committed version over the memtable
+    /// and immutable runs. A projection build first flushes the memtable, so
+    /// its WAL generation stays stable across close/reopen. Any later flush
+    /// changes that generation, preventing compaction from making an old token
+    /// equal again after it discards tombstones.
+    pub(crate) fn projection_snapshot_parts(&self) -> Result<(u64, u64), StorageError> {
+        let shared = self.shared.borrow();
+        let mut maximum = shared
+            .memtable
+            .values()
+            .flat_map(|versions| versions.keys())
+            .map(|sequence| sequence.0)
+            .max()
+            .unwrap_or(0);
+        for sstable in &shared.sstables {
+            let mut entries = SstableEntryCursor::new(sstable, &shared.table, None, None)?;
+            while let Some(entry) = entries.next()? {
+                maximum = maximum.max(entry.version.0);
+            }
+        }
+        Ok((shared.manifest.wal_generation, maximum))
+    }
+
     pub fn create(
         root: impl AsRef<Path>,
         table: TableDef,

@@ -31,6 +31,15 @@ pub struct PartitionId(pub u64);
 /// at creation, and is persisted by every physical storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageId(pub u64);
+/// Stable identity of one derived, read-only analytical projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColumnarProjectionId(pub u64);
+/// Stable identity of one immutable columnar segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColumnarSegmentId(pub u64);
+/// Monotonic publication generation within one columnar projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColumnarGeneration(pub u64);
 /// Database-coordinator transaction identity within one opened database.
 ///
 /// Heap WAL transactions retain their independent [`TxnId`] identities.

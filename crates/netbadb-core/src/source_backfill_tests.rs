@@ -192,6 +192,7 @@ fn plan_uses_index(node: &PlanNodeInspection) -> bool {
         }
         PlanNodeInspection::OneRow
         | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::PartitionedScan { .. } => false,
     }
 }

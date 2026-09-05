@@ -697,7 +697,11 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::CreateTablesRollback { .. }
         | DatabaseError::DuplicateIndexName(_)
         | DatabaseError::UndefinedIndex
-        | DatabaseError::UnsupportedDdlCombination => ProtocolErrorCode::Database,
+        | DatabaseError::UnsupportedDdlCombination
+        | DatabaseError::ColumnarProjectionNotFound(_)
+        | DatabaseError::ColumnarProjectionIdExhausted
+        | DatabaseError::ColumnarBuildSourceChanged { .. }
+        | DatabaseError::ColumnarProjectionRequiresSingleStorage(_) => ProtocolErrorCode::Database,
     }
 }
 

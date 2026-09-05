@@ -64,6 +64,7 @@ fn contains_index(plan: &PlanNodeInspection) -> bool {
             contains_index(left) || contains_index(right)
         }
         PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
         | PlanNodeInspection::PartitionedScan { .. }
         | PlanNodeInspection::OneRow => false,
     }

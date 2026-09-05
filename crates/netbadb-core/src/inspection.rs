@@ -253,6 +253,23 @@ fn inspect_plan(plan: &PhysicalPlan) -> PlanNodeInspection {
             table_name: table_name.clone(),
             columns: columns.iter().map(column_reference).collect(),
         },
+        PhysicalPlan::ColumnarScan {
+            binding_id,
+            table_id,
+            table_name,
+            columns,
+            projection_id,
+            generation,
+            source_storage_id,
+        } => PlanNodeInspection::ColumnarScan {
+            binding_id: *binding_id,
+            table_id: *table_id,
+            table_name: table_name.clone(),
+            columns: columns.iter().map(column_reference).collect(),
+            projection_id: *projection_id,
+            generation: *generation,
+            source_storage_id: *source_storage_id,
+        },
         PhysicalPlan::IndexScan {
             binding_id,
             table_id,

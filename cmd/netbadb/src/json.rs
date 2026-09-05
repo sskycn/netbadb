@@ -12,7 +12,8 @@ use netbadb_sdk::{PhysicalType, ScalarValue, SemanticType};
 use serde::Serialize;
 
 const BASE_INSPECTION_JSON_VERSION: u32 = 3;
-pub(crate) const INSPECTION_JSON_VERSION: u32 = 5;
+const INDEX_JOIN_INSPECTION_JSON_VERSION: u32 = 5;
+pub(crate) const INSPECTION_JSON_VERSION: u32 = 6;
 const INSPECTION_JSON_FORMAT: &str = "netbadb-inspection";
 
 pub(crate) fn render_catalog(catalog: &CatalogInspection) -> Result<String, serde_json::Error> {
@@ -47,6 +48,27 @@ pub(crate) fn render_statement(
 }
 
 fn statement_json_version(statement: &StatementInspection) -> u32 {
+    fn plan_has_columnar(plan: &PlanNodeInspection) -> bool {
+        match plan {
+            PlanNodeInspection::ColumnarScan { .. } => true,
+            PlanNodeInspection::NestedLoopJoin { left, right, .. }
+            | PlanNodeInspection::HashJoin { left, right, .. } => {
+                plan_has_columnar(left) || plan_has_columnar(right)
+            }
+            PlanNodeInspection::IndexNestedLoopJoin { left, .. }
+            | PlanNodeInspection::Filter { input: left, .. }
+            | PlanNodeInspection::Sort { input: left, .. }
+            | PlanNodeInspection::Project { input: left, .. }
+            | PlanNodeInspection::ScalarProject { input: left, .. }
+            | PlanNodeInspection::Aggregate { input: left, .. }
+            | PlanNodeInspection::Limit { input: left, .. } => plan_has_columnar(left),
+            PlanNodeInspection::OneRow
+            | PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::IndexScan { .. }
+            | PlanNodeInspection::RangeIndexScan { .. }
+            | PlanNodeInspection::PartitionedScan { .. } => false,
+        }
+    }
     fn plan_has_index_join(plan: &PlanNodeInspection) -> bool {
         match plan {
             PlanNodeInspection::IndexNestedLoopJoin { .. } => true,
@@ -62,6 +84,7 @@ fn statement_json_version(statement: &StatementInspection) -> u32 {
             | PlanNodeInspection::Limit { input, .. } => plan_has_index_join(input),
             PlanNodeInspection::OneRow
             | PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::ColumnarScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. }
             | PlanNodeInspection::PartitionedScan { .. } => false,
@@ -73,8 +96,16 @@ fn statement_json_version(statement: &StatementInspection) -> u32 {
         | StatementPlanInspection::Delete { input, .. } => plan_has_index_join(input),
         StatementPlanInspection::Insert { .. } => false,
     };
-    if has_index_join {
+    let has_columnar = match &statement.plan {
+        StatementPlanInspection::Query { root } => plan_has_columnar(root),
+        StatementPlanInspection::Update { input, .. }
+        | StatementPlanInspection::Delete { input, .. } => plan_has_columnar(input),
+        StatementPlanInspection::Insert { .. } => false,
+    };
+    if has_columnar {
         INSPECTION_JSON_VERSION
+    } else if has_index_join {
+        INDEX_JOIN_INSPECTION_JSON_VERSION
     } else if statement_has_partitions(statement) {
         4
     } else {
@@ -99,6 +130,7 @@ fn statement_has_partitions(statement: &StatementInspection) -> bool {
             | PlanNodeInspection::Limit { input, .. } => plan_has_partitions(input),
             PlanNodeInspection::OneRow
             | PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::ColumnarScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. } => false,
         }
@@ -490,6 +522,15 @@ enum PlanJson<'a> {
         table_name: &'a str,
         columns: Vec<ColumnReferenceJson<'a>>,
     },
+    ColumnarScan {
+        binding_id: u32,
+        table_id: u64,
+        table_name: &'a str,
+        columns: Vec<ColumnReferenceJson<'a>>,
+        projection_id: u64,
+        generation: u64,
+        source_storage_id: u64,
+    },
     IndexScan {
         binding_id: u32,
         table_id: u64,
@@ -605,6 +646,23 @@ impl<'a> From<&'a PlanNodeInspection> for PlanJson<'a> {
                 table_id: table_id.0,
                 table_name,
                 columns: columns.iter().map(ColumnReferenceJson::from).collect(),
+            },
+            PlanNodeInspection::ColumnarScan {
+                binding_id,
+                table_id,
+                table_name,
+                columns,
+                projection_id,
+                generation,
+                source_storage_id,
+            } => Self::ColumnarScan {
+                binding_id: binding_id.0,
+                table_id: table_id.0,
+                table_name,
+                columns: columns.iter().map(ColumnReferenceJson::from).collect(),
+                projection_id: projection_id.0,
+                generation: generation.0,
+                source_storage_id: source_storage_id.0,
             },
             PlanNodeInspection::IndexScan {
                 binding_id,
@@ -1031,8 +1089,9 @@ mod tests {
         TablePlacementInspection, TableStatisticsInspection,
     };
     use netbadb_sdk::{
-        AccessPathId, ColumnId, PartitionId, PhysicalType, RelationBindingId, ScalarValue,
-        SchemaFingerprint, SemanticType, TableId,
+        AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, PartitionId,
+        PhysicalType, RelationBindingId, ScalarValue, SchemaFingerprint, SemanticType, StorageId,
+        TableId,
     };
 
     use super::{render_catalog, render_statement};
@@ -1228,6 +1287,31 @@ mod tests {
             render_statement(&inspection).unwrap(),
             include_str!("../tests/golden/statement-seq-scan-v3.json")
         );
+    }
+
+    #[test]
+    fn columnar_scan_advances_statement_json_to_v6_with_stable_identities() {
+        let id = column(1, "id", PhysicalType::UInt64);
+        let inspection = statement(
+            PlanNodeInspection::ColumnarScan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: vec![id.clone()],
+                projection_id: ColumnarProjectionId(11),
+                generation: ColumnarGeneration(3),
+                source_storage_id: StorageId(7),
+            },
+            vec![result(&id)],
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
+        assert_eq!(json["version"], 6);
+        let root = &json["statement"]["plan"]["root"];
+        assert_eq!(root["operator"], "columnar_scan");
+        assert_eq!(root["projection_id"], 11);
+        assert_eq!(root["generation"], 3);
+        assert_eq!(root["source_storage_id"], 7);
     }
 
     fn join_statement(hash: bool) -> StatementInspection {

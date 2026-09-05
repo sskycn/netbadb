@@ -23,5 +23,9 @@ netbadb-types = { path = "../netbadb-types" }
 name = "phase7_baseline"
 harness = false
 
+[[bench]]
+name = "columnar_phase1"
+harness = false
+
 [lints]
 workspace = true

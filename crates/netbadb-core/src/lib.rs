@@ -1,5 +1,8 @@
 //! Native synchronous embedded API for NetbaDB.
 
+mod columnar;
+#[cfg(test)]
+mod columnar_tests;
 #[cfg(test)]
 mod coordinator_crash;
 mod coordinator_log;
@@ -34,25 +37,28 @@ use netbadb_compiler::{
     compile_statement_with_parameters,
 };
 use netbadb_executor::{
-    ExecutionError, ExecutionReadView, ExecutionStorage, ExecutionStorageBinding, PreparedMutation,
-    execute_with_storage_context, prepare_mutation_with_storage_context,
+    ExecutionColumnarProjection, ExecutionError, ExecutionReadView, ExecutionStorage,
+    ExecutionStorageBinding, PreparedMutation, execute_with_columnar_context,
+    prepare_mutation_with_storage_context,
 };
 use netbadb_inspect::StatementInspection;
 use netbadb_planner::{
-    AccessCostHints, AccessPath, AccessPathCapabilities, PartitionPlanningSnapshot,
+    AccessCostHints, AccessPath, AccessPathCapabilities, ColumnarProjectionPlanningSnapshot,
+    ColumnarRowGroupPlanningSnapshot, ColumnarZoneMapPlanningSnapshot, PartitionPlanningSnapshot,
     PhysicalStatement, RangeTablePlanningSnapshot, TableAccessStatistics,
-    plan_statement_with_partition_snapshots,
+    plan_statement_with_columnar_snapshots, plan_statement_with_partition_snapshots,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
-    HeapRecoveryInspection, PreparedDecision, PreparedTransaction, PreparedTransactionState,
-    PreparedTxnResolution, StorageError, TableStorage,
+    ColumnarProjection, HeapRecoveryInspection, PreparedDecision, PreparedTransaction,
+    PreparedTransactionState, PreparedTxnResolution, StorageError, TableStorage,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, DatabaseTxnId, IndexName, PhysicalType, ScalarValue, StorageId,
-    TableId, TxnId,
+    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, DatabaseTxnId, IndexName,
+    PhysicalType, ScalarValue, StorageId, TableId, TxnId,
 };
 
+use columnar::ProjectionRegistry;
 use coordinator_log::{CoordinatorDecision, CoordinatorLog};
 use partition_catalog::{CatalogTable, PartitionCatalog, canonicalize_partitions, route_partition};
 use registry::{
@@ -61,8 +67,13 @@ use registry::{
 use schema_catalog::CommittedCatalogState;
 use transaction::SharedCoordinatorLog;
 
+pub use columnar::{
+    ColumnarProjectionHealth, ColumnarProjectionInspection, ColumnarProjectionSpec,
+};
 pub use coordinator_log::CoordinatorLogError;
-pub use netbadb_executor::{ExecutionResult, QueryResult, ResultColumn};
+pub use netbadb_executor::{
+    ColumnarExecutionStatistics, ExecutionResult, QueryResult, ResultColumn,
+};
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
@@ -539,6 +550,12 @@ pub enum DatabaseError {
     DuplicateIndexName(IndexName),
     UndefinedIndex,
     UnsupportedDdlCombination,
+    ColumnarProjectionNotFound(ColumnarProjectionId),
+    ColumnarProjectionIdExhausted,
+    ColumnarBuildSourceChanged {
+        storage_id: StorageId,
+    },
+    ColumnarProjectionRequiresSingleStorage(TableId),
     CreateTablesRollback {
         creation: StorageError,
         cleanup_path: PathBuf,
@@ -645,6 +662,9 @@ impl DatabaseError {
             Self::Transaction(_) => DatabaseErrorKind::TransactionState,
             Self::UndefinedIndex => DatabaseErrorKind::UndefinedObject,
             Self::UnsupportedDdlCombination => DatabaseErrorKind::FeatureNotSupported,
+            Self::ColumnarProjectionRequiresSingleStorage(_) => {
+                DatabaseErrorKind::FeatureNotSupported
+            }
             Self::Storage(StorageError::Index(
                 netbadb_index::IndexError::UnknownIndexId(_)
                 | netbadb_index::IndexError::IndexAlreadyRetired(_),
@@ -671,7 +691,11 @@ impl DatabaseError {
             | Self::PreparedParticipantMismatch { .. }
             | Self::InspectionStorageMissing { .. }
             | Self::InspectionIndexColumnMissing { .. }
-            | Self::InspectionRegistrationOrderOverflow { .. } => DatabaseErrorKind::Internal,
+            | Self::InspectionRegistrationOrderOverflow { .. }
+            | Self::ColumnarProjectionIdExhausted => DatabaseErrorKind::Internal,
+            Self::ColumnarProjectionNotFound(_) | Self::ColumnarBuildSourceChanged { .. } => {
+                DatabaseErrorKind::Operational
+            }
         }
     }
 
@@ -756,6 +780,22 @@ impl fmt::Display for DatabaseError {
             Self::UndefinedIndex => formatter.write_str("index does not exist"),
             Self::UnsupportedDdlCombination => formatter
                 .write_str("this schema/index DDL combination is not supported in one transaction"),
+            Self::ColumnarProjectionNotFound(id) => {
+                write!(formatter, "columnar projection {} does not exist", id.0)
+            }
+            Self::ColumnarProjectionIdExhausted => {
+                formatter.write_str("columnar projection identity space is exhausted")
+            }
+            Self::ColumnarBuildSourceChanged { storage_id } => write!(
+                formatter,
+                "source storage {} changed while the columnar projection was built",
+                storage_id.0
+            ),
+            Self::ColumnarProjectionRequiresSingleStorage(table_id) => write!(
+                formatter,
+                "columnar phase 1 requires table {} to have one physical storage",
+                table_id.0
+            ),
             Self::DuplicateIndexName(name) => write!(formatter, "index `{name}` already exists"),
             Self::CreateTablesRollback {
                 creation,
@@ -797,7 +837,11 @@ impl Error for DatabaseError {
             | Self::InspectionRegistrationOrderOverflow { .. } => None,
             Self::DuplicateIndexName(_)
             | Self::UndefinedIndex
-            | Self::UnsupportedDdlCombination => None,
+            | Self::UnsupportedDdlCombination
+            | Self::ColumnarProjectionNotFound(_)
+            | Self::ColumnarProjectionIdExhausted
+            | Self::ColumnarBuildSourceChanged { .. }
+            | Self::ColumnarProjectionRequiresSingleStorage(_) => None,
         }
     }
 }
@@ -823,6 +867,12 @@ impl From<SchemaError> for DatabaseError {
 impl From<StorageError> for DatabaseError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<netbadb_storage::ColumnarError> for DatabaseError {
+    fn from(error: netbadb_storage::ColumnarError) -> Self {
+        Self::Storage(StorageError::from(error))
     }
 }
 
@@ -859,10 +909,18 @@ impl From<PartitionError> for DatabaseError {
     }
 }
 
+struct CapturedColumnarSource {
+    storage_id: StorageId,
+    table: TableDef,
+    token: netbadb_storage::StorageSnapshotToken,
+    rows: Vec<Vec<ScalarValue>>,
+}
+
 pub struct Database {
     committed: schema_catalog::CommittedCatalogState,
     bindings: PhysicalBindings,
     registry: StorageRegistry,
+    projections: ProjectionRegistry,
     transaction_owner: Rc<()>,
     next_transaction_id: DatabaseTxnId,
     coordinator: Option<SharedCoordinatorLog>,
@@ -1415,6 +1473,7 @@ impl Database {
             ),
             bindings,
             registry,
+            projections: ProjectionRegistry::new(),
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
@@ -1439,6 +1498,7 @@ impl Database {
             ),
             bindings,
             registry,
+            projections: ProjectionRegistry::new(),
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
@@ -1480,6 +1540,7 @@ impl Database {
             ),
             bindings,
             registry,
+            projections: ProjectionRegistry::new(),
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
@@ -1544,6 +1605,7 @@ impl Database {
             committed,
             bindings,
             registry,
+            projections: ProjectionRegistry::new(),
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator,
@@ -2060,6 +2122,242 @@ impl Database {
         Ok(())
     }
 
+    /// Builds and publishes an immutable projection from one fixed committed view.
+    pub fn build_columnar_projection(
+        &mut self,
+        spec: ColumnarProjectionSpec,
+    ) -> Result<ColumnarProjectionId, DatabaseError> {
+        self.build_columnar_projection_with(spec, |_| Ok(()))
+    }
+
+    fn build_columnar_projection_with<F>(
+        &mut self,
+        spec: ColumnarProjectionSpec,
+        after_scan: F,
+    ) -> Result<ColumnarProjectionId, DatabaseError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), DatabaseError>,
+    {
+        self.ensure_schema_available(None)?;
+        if spec.directory.join("projection.nbcmanifest").exists() {
+            return Err(
+                StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
+                    "projection directory already contains a manifest",
+                ))
+                .into(),
+            );
+        }
+        let id = self
+            .projections
+            .allocate_id()
+            .ok_or(DatabaseError::ColumnarProjectionIdExhausted)?;
+        let CapturedColumnarSource {
+            storage_id,
+            table,
+            token: source_token,
+            rows,
+        } = self.capture_columnar_source(spec.table_id, &spec.columns)?;
+        let prepared = ColumnarProjection::prepare(
+            &spec.directory,
+            id,
+            ColumnarGeneration(1),
+            &table,
+            storage_id,
+            source_token,
+            &spec.columns,
+            &rows,
+            spec.row_group_rows,
+        )?;
+        after_scan(self)?;
+        let current = self
+            .registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .current_snapshot_token()?;
+        if current != source_token {
+            return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+        }
+        let projection = prepared.publish()?;
+        self.projections.publish(projection);
+        Ok(id)
+    }
+
+    /// Rebuilds the same projection identity and atomically publishes a new generation.
+    pub fn refresh_columnar_projection(
+        &mut self,
+        id: ColumnarProjectionId,
+    ) -> Result<ColumnarGeneration, DatabaseError> {
+        let existing = self
+            .projections
+            .get(id)
+            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?;
+        let metadata = existing.metadata().clone();
+        let directory = existing.root().to_owned();
+        let columns = metadata
+            .columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        let generation = ColumnarGeneration(
+            metadata
+                .generation
+                .0
+                .checked_add(1)
+                .ok_or(DatabaseError::ColumnarProjectionIdExhausted)?,
+        );
+        let CapturedColumnarSource {
+            storage_id,
+            table,
+            token: source_token,
+            rows,
+        } = self.capture_columnar_source(metadata.table_id, &columns)?;
+        let prepared = ColumnarProjection::prepare(
+            directory,
+            id,
+            generation,
+            &table,
+            storage_id,
+            source_token,
+            &columns,
+            &rows,
+            None,
+        )?;
+        let current = self
+            .registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .current_snapshot_token()?;
+        if current != source_token {
+            return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+        }
+        let replacement = prepared.publish()?;
+        let retired = self
+            .projections
+            .remove(id)
+            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?;
+        self.projections.publish(replacement);
+        retired.retire_segment()?;
+        Ok(generation)
+    }
+
+    /// Reattaches an explicitly located projection after reopening a database.
+    pub fn attach_columnar_projection(
+        &mut self,
+        directory: impl AsRef<Path>,
+        table_id: TableId,
+    ) -> Result<ColumnarProjectionId, DatabaseError> {
+        self.ensure_schema_available(None)?;
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == table_id)
+            .cloned()
+            .ok_or(StorageRegistryError::MissingPhysicalBinding { table_id })?;
+        let projection = ColumnarProjection::open(directory, &table)?;
+        let metadata = projection.metadata();
+        let expected_storage = match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(DatabaseError::ColumnarProjectionRequiresSingleStorage(
+                    table_id,
+                ));
+            }
+        };
+        if metadata.source_storage_id != expected_storage {
+            return Err(
+                StorageError::from(netbadb_storage::ColumnarError::IdentityMismatch(
+                    "source storage",
+                ))
+                .into(),
+            );
+        }
+        let id = metadata.id;
+        self.projections.publish(projection);
+        Ok(id)
+    }
+
+    pub fn drop_columnar_projection(
+        &mut self,
+        id: ColumnarProjectionId,
+    ) -> Result<(), DatabaseError> {
+        self.projections
+            .remove(id)
+            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?
+            .drop_files()?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn inspect_columnar_projections(&self) -> Vec<ColumnarProjectionInspection> {
+        self.projections
+            .iter()
+            .map(|entry| {
+                let metadata = entry.projection.metadata();
+                let current = self
+                    .registry
+                    .get(metadata.source_storage_id)
+                    .and_then(|storage| storage.current_snapshot_token().ok());
+                let current_schema_fingerprint = self
+                    .registry
+                    .get(metadata.source_storage_id)
+                    .and_then(|storage| storage.table().fingerprint().ok());
+                columnar::inspection(&entry.projection, current, current_schema_fingerprint)
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn inspect_columnar_projection_path(
+        directory: impl AsRef<Path>,
+        table: &TableDef,
+    ) -> ColumnarProjectionInspection {
+        let directory = directory.as_ref();
+        match ColumnarProjection::open(directory, table) {
+            Ok(projection) => columnar::inspection(&projection, None, table.fingerprint().ok()),
+            Err(error) => columnar::unavailable_inspection(directory, table.id, error.to_string()),
+        }
+    }
+
+    fn capture_columnar_source(
+        &mut self,
+        table_id: TableId,
+        columns: &[ColumnId],
+    ) -> Result<CapturedColumnarSource, DatabaseError> {
+        let storage_id = match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(DatabaseError::ColumnarProjectionRequiresSingleStorage(
+                    table_id,
+                ));
+            }
+        };
+        let storage = self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+        if storage.kind() == StorageKind::Lsm {
+            // Stabilize the WAL-generation token component so a clean
+            // close/reopen preserves freshness for unchanged LSM data.
+            storage.flush()?;
+        }
+        let table = storage.table().clone();
+        let view = storage.read_view()?;
+        let token = storage.snapshot_token(&view)?;
+        let rows = storage
+            .scan_columns_with_view(columns, &view)?
+            .into_iter()
+            .map(|(_, values)| values)
+            .collect();
+        Ok(CapturedColumnarSource {
+            storage_id,
+            table,
+            token,
+            rows,
+        })
+    }
+
     pub fn vacuum(&mut self, table_id: TableId) -> Result<u64, DatabaseError> {
         self.ensure_schema_available(None)?;
         let storage_ids = self
@@ -2097,7 +2395,24 @@ impl Database {
         };
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
-        self.execute_query_plan(&plan, &view, None)
+        self.execute_query_plan(&plan, &view, None, None)
+    }
+
+    /// Executes a query and returns exact columnar row-group scan counters.
+    /// Counters remain zero when planning falls back to authoritative storage.
+    pub fn query_with_columnar_statistics(
+        &mut self,
+        source: &str,
+    ) -> Result<(QueryResult, ColumnarExecutionStatistics), DatabaseError> {
+        let (compiled, physical) = self.compile_and_plan(source)?;
+        let PhysicalStatement::Query(plan) = physical else {
+            return Err(DatabaseError::ExpectedQuery);
+        };
+        let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
+        let view = self.autocommit_read_view(&storage_ids)?;
+        let mut statistics = ColumnarExecutionStatistics::default();
+        let result = self.execute_query_plan(&plan, &view, None, Some(&mut statistics))?;
+        Ok((result, statistics))
     }
 
     /// Compiles SQL and reports its canonical table access without planning,
@@ -2785,7 +3100,7 @@ impl Database {
             let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
             let view = self.autocommit_read_view(&storage_ids)?;
             return self
-                .execute_query_plan(plan, &view, None)
+                .execute_query_plan(plan, &view, None, None)
                 .map(ExecutionResult::Query);
         }
 
@@ -2972,11 +3287,12 @@ impl Database {
     }
 
     fn plan_logical_statement(&self, logical: &netbadb_rel::LogicalStatement) -> PhysicalStatement {
-        plan_statement_with_partition_snapshots(
+        plan_statement_with_columnar_snapshots(
             logical,
             &self.planner_table_statistics(),
             &self.planner_access_paths(),
             &self.planner_range_tables(),
+            &self.planner_columnar_projections(),
         )
     }
 
@@ -3201,6 +3517,60 @@ impl Database {
             .collect()
     }
 
+    fn planner_columnar_projections(&self) -> Vec<ColumnarProjectionPlanningSnapshot> {
+        self.projections
+            .iter()
+            .filter_map(|entry| {
+                let projection = &entry.projection;
+                let metadata = projection.metadata();
+                let placement = self.bindings.placement(metadata.table_id).ok()?;
+                let TablePlacement::Single { storage_id, .. } = placement else {
+                    return None;
+                };
+                if *storage_id != metadata.source_storage_id {
+                    return None;
+                }
+                let storage = self.registry.get(*storage_id)?;
+                if storage.table().fingerprint().ok()? != metadata.schema_fingerprint
+                    || storage.current_snapshot_token().ok()? != metadata.source_token
+                {
+                    return None;
+                }
+                Some(ColumnarProjectionPlanningSnapshot {
+                    projection_id: metadata.id,
+                    generation: metadata.generation,
+                    table_id: metadata.table_id,
+                    source_storage_id: metadata.source_storage_id,
+                    projected_columns: metadata
+                        .columns
+                        .iter()
+                        .map(|column| column.column_id)
+                        .collect(),
+                    row_count: metadata.row_count,
+                    row_group_count: metadata.row_group_count,
+                    segment_bytes: metadata.segment_bytes,
+                    row_groups: projection
+                        .row_group_statistics()
+                        .into_iter()
+                        .map(|group| ColumnarRowGroupPlanningSnapshot {
+                            rows: group.rows,
+                            columns: group
+                                .columns
+                                .into_iter()
+                                .map(|(column_id, statistics)| ColumnarZoneMapPlanningSnapshot {
+                                    column_id,
+                                    null_count: statistics.null_count,
+                                    minimum: statistics.minimum,
+                                    maximum: statistics.maximum,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     fn begin_database_transaction(
         &mut self,
         isolation_level: IsolationLevel,
@@ -3245,6 +3615,7 @@ impl Database {
         plan: &netbadb_planner::PhysicalPlan,
         view: &DatabaseReadView,
         staged: Option<&mut TableStorage>,
+        columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
     ) -> Result<QueryResult, DatabaseError> {
         let staged_table = staged.as_ref().map(|storage| storage.table().id);
         let mut bindings = self
@@ -3283,11 +3654,21 @@ impl Database {
                 storage,
             }))
             .collect::<Vec<_>>();
-        Ok(execute_with_storage_context(
+        let projections = self
+            .projections
+            .iter()
+            .map(|entry| ExecutionColumnarProjection {
+                projection_id: entry.projection.metadata().id,
+                projection: &entry.projection,
+            })
+            .collect::<Vec<_>>();
+        Ok(execute_with_columnar_context(
             plan,
             &bindings,
             &mut storages,
             &read_views,
+            &projections,
+            columnar_statistics,
         )?)
     }
 
@@ -3393,11 +3774,13 @@ impl Database {
                     storage,
                 }),
         );
-        Ok(execute_with_storage_context(
+        Ok(execute_with_columnar_context(
             plan,
             &bindings,
             &mut storages,
             &read_views,
+            &[],
+            None,
         )?)
     }
 
@@ -5156,6 +5539,7 @@ mod tests {
                 planned_index(left).or_else(|| planned_index(right))
             }
             PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::ColumnarScan { .. }
             | PhysicalPlan::RangeIndexScan { .. }
             | PhysicalPlan::PartitionedScan { .. }
             | PhysicalPlan::OneRow => None,
@@ -5294,6 +5678,7 @@ mod tests {
             ),
             bindings,
             registry,
+            projections: crate::columnar::ProjectionRegistry::new(),
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
@@ -5771,6 +6156,7 @@ mod tests {
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_index(input),
             PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::ColumnarScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. }
             | PlanNodeInspection::PartitionedScan { .. }
             | PlanNodeInspection::OneRow => None,
@@ -5794,6 +6180,7 @@ mod tests {
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_range(input),
             PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::ColumnarScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::PartitionedScan { .. }
             | PlanNodeInspection::OneRow => None,
@@ -5812,6 +6199,11 @@ mod tests {
     fn scan_bindings(plan: &PlanNodeInspection, bindings: &mut Vec<(TableId, u32)>) {
         match plan {
             PlanNodeInspection::SeqScan {
+                table_id,
+                binding_id,
+                ..
+            }
+            | PlanNodeInspection::ColumnarScan {
                 table_id,
                 binding_id,
                 ..
@@ -5858,6 +6250,7 @@ mod tests {
     fn inspected_scan_columns(plan: &PlanNodeInspection) -> Option<Vec<ColumnId>> {
         match plan {
             PlanNodeInspection::SeqScan { columns, .. }
+            | PlanNodeInspection::ColumnarScan { columns, .. }
             | PlanNodeInspection::IndexScan { columns, .. }
             | PlanNodeInspection::RangeIndexScan { columns, .. } => {
                 Some(columns.iter().map(|column| column.column_id).collect())
@@ -5894,6 +6287,7 @@ mod tests {
             | PlanNodeInspection::Aggregate { input, .. }
             | PlanNodeInspection::Limit { input, .. } => inspected_filter(input),
             PlanNodeInspection::SeqScan { .. }
+            | PlanNodeInspection::ColumnarScan { .. }
             | PlanNodeInspection::IndexScan { .. }
             | PlanNodeInspection::RangeIndexScan { .. }
             | PlanNodeInspection::PartitionedScan { .. }

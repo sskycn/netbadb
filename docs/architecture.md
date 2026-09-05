@@ -61,7 +61,7 @@ Canonical Schema + source SQL               netbadb-inspect DTOs
         ↓                                           ↓
 netbadb-compiler                             embedded SDK / offline CLI
         ↓                                           ↓
-ToolingDiagnostic                           text / Inspection JSON v5
+ToolingDiagnostic                           text / Inspection JSON v6
         ↓
 netbadb-lsp UTF-16 adapter
 ```
@@ -111,6 +111,15 @@ execution. The explicit text renderer is deterministic human-readable output,
 not SQL, Rust `Debug`, a wire contract, or a versioned JSON API. Statistics are
 last-`ANALYZE` snapshots and may be stale.
 
+Columnar Phase 1 adds a second one-way observation and execution boundary.
+Core owns a derived `ProjectionRegistry` beside the authoritative physical
+bindings. Only exact fresh projection metadata crosses into the planner as a
+separate snapshot; it never becomes an access path. Chosen plans expose a
+stable `ColumnarScan` inspection node. The executor receives immutable
+projection handles separately from mutable `TableStorage` and its read views.
+See [Columnar Phase 1](columnar-phase1.md) for token, format, publication,
+fallback, and vector-execution invariants.
+
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text
@@ -122,15 +131,15 @@ netbadb-sdk embedded Database
           ↓
 netbadb-inspect DTOs
        ↙       ↘
-human text   Inspection JSON v5
+human text   Inspection JSON v6
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
 obtain required table expectation paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
-filesystem access. JSON v5 is the current explicit external CLI contract when
-IndexNestedLoopJoin appears, converted exhaustively from inspection DTOs;
-ordinary plans remain v3, partition plans remain v4, and v1/v2 are historical
+filesystem access. JSON v6 is the current explicit external CLI contract when
+ColumnarScan appears; IndexNestedLoopJoin uses v5, ordinary plans remain v3,
+partition plans remain v4, and v1/v2 are historical
 contracts and the DTOs themselves remain serde-free.
 Future runtime-inspection tooling, including MCP, consumes those DTOs directly
 rather than spawning the CLI. The diagnostics-only LSP does not use this path.

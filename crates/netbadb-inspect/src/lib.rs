@@ -8,8 +8,8 @@ use std::fmt::{self, Write};
 
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
-    AccessPathId, ColumnId, IndexName, ParameterId, PartitionId, RelationBindingId, ScalarValue,
-    SemanticType, TableId,
+    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, IndexName, ParameterId,
+    PartitionId, RelationBindingId, ScalarValue, SemanticType, StorageId, TableId,
 };
 
 /// One declaration-ordered snapshot of the visible canonical catalog.
@@ -223,6 +223,15 @@ pub enum PlanNodeInspection {
         table_id: TableId,
         table_name: String,
         columns: Vec<ColumnReferenceInspection>,
+    },
+    ColumnarScan {
+        binding_id: RelationBindingId,
+        table_id: TableId,
+        table_name: String,
+        columns: Vec<ColumnReferenceInspection>,
+        projection_id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+        source_storage_id: StorageId,
     },
     IndexScan {
         binding_id: RelationBindingId,
@@ -644,6 +653,27 @@ impl Renderer {
                     table_id.0,
                     binding_id.0,
                     columns_text(columns)
+                ),
+            ),
+            PlanNodeInspection::ColumnarScan {
+                binding_id,
+                table_id,
+                table_name,
+                columns,
+                projection_id,
+                generation,
+                source_storage_id,
+            } => self.line(
+                depth,
+                format_args!(
+                    "ColumnarScan table={}#{} binding=#{} columns={} projection=#{} generation={} source-storage=#{}",
+                    escape_text(table_name),
+                    table_id.0,
+                    binding_id.0,
+                    columns_text(columns),
+                    projection_id.0,
+                    generation.0,
+                    source_storage_id.0
                 ),
             ),
             PlanNodeInspection::IndexScan {
