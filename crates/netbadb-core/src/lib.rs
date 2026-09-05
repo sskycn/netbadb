@@ -6,6 +6,7 @@ mod columnar_tests;
 #[cfg(test)]
 mod coordinator_crash;
 mod coordinator_log;
+mod deferred_backfill;
 mod inspection;
 mod partition_catalog;
 mod projection_catalog;
@@ -3048,6 +3049,7 @@ impl Database {
         if matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceBackfilling(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ) {
             self.finalize_adopted_source(transaction)?;
@@ -3253,6 +3255,11 @@ impl Database {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
+        if let Some(affected_rows) =
+            deferred_backfill::try_execute_adopted_update(self, transaction, &logical)?
+        {
+            return Ok(ExecutionResult::AffectedRows(affected_rows));
+        }
         if let Some(composition) = transaction.schema_composition.plan()
             && Self::is_backfill_candidate(composition)
         {
@@ -3309,6 +3316,7 @@ impl Database {
                 | schema_composition::SchemaCompositionState::LateCloneMaterializing(_)
                 | schema_composition::SchemaCompositionState::LateCloneReady(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceBackfilling(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
         {
@@ -7849,7 +7857,7 @@ mod tests {
 #[cfg(test)]
 mod adopted_source_refinement_expansion_audit_tests;
 #[cfg(test)]
-mod deferred_new_column_backfill_audit_tests;
+mod deferred_backfill_tests;
 #[cfg(test)]
 mod indexed_nullability_audit_tests;
 #[cfg(test)]

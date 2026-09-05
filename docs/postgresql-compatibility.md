@@ -242,6 +242,17 @@ same-name index (`42704` for the absent old identity). Parse/Bind/Describe remai
 pure. Simple and Extended Query retain ordinary authorization and command tags;
 no PostgreSQL production adapter changes or new wire state are involved.
 
+[Round 50](deferred-new-column-backfill-round50.md) adds one Core-selected
+exception before that terminal phase. UPDATE may target only durably reserved
+late columns of the same adopted table and may read only surviving base columns
+or Execute-bound deterministic scalars. Simple Query reports exact `UPDATE n`.
+Extended Parse/Bind/Describe remain pure and Execute owns bound values before
+recording the action. A projected late-column SET NOT NULL succeeds only after
+deferred backfill covers every row; a remaining NULL is `23502`, followed by
+`25P02` in an explicit failed transaction. Base/mixed/late-reading UPDATE and
+SELECT/INSERT/DELETE remain `25000`. The adapter still has no migration-state
+branch.
+
 
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections

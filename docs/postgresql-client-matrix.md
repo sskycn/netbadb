@@ -61,6 +61,7 @@ production or build dependencies.
 | One managed Heap DML + nullable ADD/eligible DROP/rename | psql yes, bounded | Round 44 exact one-S1 adoption; one final S2, no later DML; final index phase added in Round 48 |
 | One managed Heap DML + surviving-column SET/DROP NOT NULL | psql yes, bounded | Round 46 transaction-visible SET validation; indexed survivors supported; new-column nullability and later DML unsupported; final indexes added in Round 48 |
 | Adopted refinement + terminal CREATE/DROP INDEX | psql and Extended Query, bounded | Round 48: one S2 for dirty tables; same S1/P1 for index-only; later ALTER/DML closed |
+| Adopted ADD + deferred late-column UPDATE + projected NOT NULL + final index | psql and Extended Query, bounded | Round 50 managed Single Heap only; exact S1/P1 observation, owned bound scalars, one final S2; other relational access closed |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
@@ -198,3 +199,10 @@ stops at indexed-column nullability during backfill (`0A000`), and
 (`0A000`, runtime table mutation supports only a single Heap). They are retained
 and reported rather than weakened; this round's bounded acceptance fixtures,
 CREATE TABLE, controlled backfill, and standalone Alembic index fixture pass.
+
+Round 50 reproduction from the repository root:
+`python3 scripts/test-deferred-new-column-backfill-sql.py`. It uses the same
+PostgreSQL 17.11 psql and ICU paths, exercises Simple Query plus psql's unnamed
+Extended Query bind, checks exact UPDATE/ALTER/CREATE/COMMIT tags and
+`23502`/`25000`/`25P02`, and verifies committed or rolled-back state through
+three catalog-only reopens per fixture. Round 39/42/44/46/48 remain retained.

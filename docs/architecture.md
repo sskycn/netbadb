@@ -386,8 +386,8 @@ helper performs the complete Candidate-B preflight, proves base `ColumnId`
 identity, and validates SET against transaction-visible S1 before acquiring the
 schema writer. DROP does not scan. Indexed survivors keep logical identity;
 effective changes rebuild their final `IndexSpec` on the one S2, while SET/DROP
-round trips keep the original S1 and physical index. New-column nullability
-and post-refinement relational execution remain closed. Round 48 adds the
+round trips keep the original S1 and physical index. At that milestone,
+new-column nullability and post-refinement relational execution remain closed. Round 48 adds the
 bounded terminal final-index phase described below. The
 existing tag35/stage/tag34/NBSC/CORD lifecycle and every persistent/wire format
 are unchanged.
@@ -403,6 +403,18 @@ change, or SealedNoEffectiveChange for global no-op. Only the rewrite branch
 allocates S2 and writes tag35/stage/tag34/NBSC. Index-only publication changes
 runtime revision once and leaves V/G/epoch unchanged; the old digest proof is
 consumed before the authorized physical delta. No persistent decoder changes.
+
+[Round 50](deferred-new-column-backfill-round50.md) inserts one private logical
+phase before Round 48 final indexes. `AdoptedSourceBackfilling` owns an ordered
+typed program whose targets are durably reserved late `ColumnId`s and whose
+reads are surviving base `ColumnId`s or bound literals. Execute streams the
+exact transaction-visible S1, records affected rows plus a result digest, and
+only then appends canonical semantic evidence. Projected late-column SET NOT
+NULL validates `RowProjection + program`; finalization applies that same
+ordered transform before constraints and the single S2 insert. Observation
+verification detects source/program drift. The program is never durable;
+existing tag25/tag35 evidence and CORD recovery remain authoritative after the
+commit decision. Columnar stays derived and outside transaction participants.
 
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;

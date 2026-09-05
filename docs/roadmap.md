@@ -1,6 +1,21 @@
 # NetbaDB roadmap
 
-## Deferred new-column backfill audit (Round 49 complete; production deferred)
+## Deferred new-column backfill (Round 50 complete)
+
+- productionized the Round 49 ordered typed deferred UPDATE program for
+  durably reserved late columns on an adopted managed Single Heap;
+- added `AdoptedSourceBackfilling`, streaming S1 Execute observation, exact
+  affected counts, owned bound parameters, limits, and canonical action
+  evidence;
+- added projected late-column SET NOT NULL with native repair, then reused the
+  Round 48 terminal index phase and one existing S1-to-S2 finalizer;
+- verified Execute/finalization observations, one-S2 cost, source index
+  stability, clone-plan binding, rollback, CORD recovery, PostgreSQL Simple and
+  Extended Query, and Columnar authoritative fallback.
+
+See [`deferred-new-column-backfill-round50.md`](deferred-new-column-backfill-round50.md).
+
+## Deferred new-column backfill audit (Round 49 historical)
 
 - selected ordered deterministic deferred UPDATE programs as the next
   new-column value-population authority;
@@ -16,9 +31,8 @@
   compared persistent DEFAULT, RowId sidecar, early S2, and NOT-NULL-only
   alternatives.
 
-Production post-refinement relational SQL and Cnew NOT NULL remain closed in
-Round 49. The proposed Round 50 slice is documented in
-[`deferred-new-column-backfill-round49.md`](deferred-new-column-backfill-round49.md).
+Round 50 has now productionized the selected bounded program. The Round 49
+document remains the decision and rejected-alternatives record.
 
 ## Columnar Phase 1 (complete)
 
@@ -1136,7 +1150,8 @@ and V/G/epoch; global no-ops retain accepted ID burns without publication.
 Round 47 tests now call production Core rather than an independent prototype.
 Cnew physical NULL lookup, same-name fresh identity, terminal state errors,
 rollback, single-/two-participant recovery and real PostgreSQL clients are tested.
-Round 49+ still excludes later ALTER/DML, Cnew nullability, index-first adoption,
+Round 50 supersedes the blanket DML and Cnew-nullability exclusion with its
+late-column-only deferred UPDATE and projected SET NOT NULL boundary. It still excludes index-first adoption,
 UNIQUE/multicolumn, broader migration, savepoints, online operation and GC.
 
 ## Phase 6 — SDK and tooling

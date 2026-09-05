@@ -196,8 +196,10 @@ WAL/status; IndexCatalog v9; BTree v3; PartitionCatalog/LSM; Protocol v1;
 PG framing v3; Manifest v4; SDK Schema Spec v1 and inspection formats remain intact.
 No tag33, fake tag25 or new persistent tag is introduced.
 
-Round 49+ defers all later ALTER/relational DML, DROP INDEX→DROP COLUMN in this
-adopted phase, Cnew nullability, generic index-first adoption, UNIQUE/multicolumn,
+Round 49 deferred all later ALTER/relational DML. Round 50 now permits its
+bounded late-column-only deferred UPDATE and projected SET NOT NULL before this
+final-index phase; once the first final index action is accepted, UPDATE remains
+closed. DROP INDEX→DROP COLUMN in this adopted phase, generic index-first adoption, UNIQUE/multicolumn,
 constraints/CASCADE, defaults/generated/type conversion/USING, cross-table,
 LSM/partitioned/imported/bootstrap, savepoints, online/resumable migration,
 participant detach, automatic GC and new formats. Round 42 SourceIndexFinalizing

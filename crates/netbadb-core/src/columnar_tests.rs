@@ -712,6 +712,99 @@ fn schema_rewrite_and_drop_table_invalidate_managed_projection_identity() {
 }
 
 #[test]
+fn deferred_backfill_uses_s1_and_stales_the_old_columnar_identity() {
+    let root = path("deferred-backfill");
+    let catalog = root.join("catalog");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![],
+        Some(crate::DatabaseCoordinatorConfig::new(
+            root.join("coordinator"),
+        )),
+    )
+    .expect("create database");
+    database
+        .execute("CREATE TABLE events (id BIGINT NOT NULL, label TEXT)")
+        .expect("create events");
+    for id in 0..256 {
+        database
+            .execute(&format!("INSERT INTO events VALUES ({id}, 'old-{id}')"))
+            .expect("insert event");
+    }
+    let table = database.schema().table("events").unwrap().id;
+    let projection = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            table,
+            root.join("projection"),
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build projection");
+    let analytical = "SELECT COUNT(*), MIN(id), MAX(id) FROM events WHERE id >= 0";
+    assert!(statement_uses_columnar(&database, analytical));
+
+    let mut transaction = database.begin_transaction().expect("begin migration");
+    database
+        .execute_in(
+            &mut transaction,
+            "UPDATE events SET label = 'own-write' WHERE id = 1",
+        )
+        .expect("update S1");
+    database
+        .execute_in(
+            &mut transaction,
+            "ALTER TABLE events ADD COLUMN marker TEXT",
+        )
+        .expect("add marker");
+    assert_eq!(
+        database
+            .execute_in(
+                &mut transaction,
+                "UPDATE events SET marker = label WHERE id = 1",
+            )
+            .expect("observe S1"),
+        ExecutionResult::AffectedRows(1)
+    );
+    database
+        .commit_transaction(&mut transaction)
+        .expect("commit migration");
+    assert_eq!(
+        database
+            .query("SELECT marker FROM events WHERE id = 1")
+            .expect("query marker")
+            .rows,
+        vec![vec![ScalarValue::Text("own-write".into())]]
+    );
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Stale
+    );
+    let (_, stale_stats) = database
+        .query_with_columnar_statistics(analytical)
+        .expect("authoritative fallback");
+    assert_eq!(stale_stats.projection_id, None);
+
+    let (_, marker_stats) = database
+        .query_with_columnar_statistics("SELECT COUNT(*) FROM events WHERE marker IS NOT NULL")
+        .expect("marker query fallback");
+    assert_eq!(marker_stats.projection_id, None);
+    assert_eq!(
+        database.inspect_columnar_projections()[0].projection_id,
+        Some(projection)
+    );
+    assert!(matches!(
+        database.refresh_columnar_projection(projection),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::Corrupt("replacement projection identity changed")
+        ))
+    ));
+    assert!(!statement_uses_columnar(&database, analytical));
+
+    database.close().expect("close database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
 fn catalog_entry_for_partitioned_table_stays_unavailable() {
     let root = path("partitioned-catalog-entry-root");
     let catalog = root.join("catalog");

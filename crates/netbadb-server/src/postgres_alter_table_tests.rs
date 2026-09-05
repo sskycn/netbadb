@@ -2066,3 +2066,159 @@ fn pg_round48_terminal_alter_and_relational_errors_fail_the_transaction() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn pg_round50_simple_deferred_update_not_null_index_and_commit() {
+    let (root, mut db) = layout_project("round50-simple");
+    let mut admin = session(&db, true);
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        (
+            "UPDATE accounts SET legacy = 'updated' WHERE id = 1",
+            "UPDATE 1",
+        ),
+        ("ALTER TABLE accounts ADD COLUMN marker TEXT", "ALTER TABLE"),
+        (
+            "UPDATE accounts SET marker = legacy WHERE legacy IS NOT NULL",
+            "UPDATE 3",
+        ),
+        (
+            "ALTER TABLE accounts ALTER COLUMN marker SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        (
+            "CREATE INDEX accounts_marker_idx ON accounts(marker)",
+            "CREATE INDEX",
+        ),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+            ],
+            "{source}"
+        );
+    }
+    assert_eq!(
+        db.query("SELECT marker FROM accounts ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![ScalarValue::Text("updated".into())],
+            vec![ScalarValue::Text("old-two".into())],
+            vec![ScalarValue::Text("old-three".into())],
+        ]
+    );
+    assert_eq!(
+        db.indexes(TableId(2))
+            .unwrap()
+            .iter()
+            .filter(|index| {
+                index
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.as_str() == "accounts_marker_idx")
+            })
+            .count(),
+        1
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round50_projected_not_null_failure_aborts_explicit_transaction() {
+    let (root, mut db) = layout_project("round50-not-null-failure");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        "UPDATE accounts SET marker = legacy WHERE id = 1",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE accounts ALTER COLUMN marker SET NOT NULL",
+        ),
+        "23502",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    assert!(
+        db.schema()
+            .table("accounts")
+            .unwrap()
+            .column("marker")
+            .is_none()
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round50_extended_bound_update_is_pure_until_execute() {
+    let (root, mut db) = layout_project("round50-extended");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    let before = files(&root);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "backfill".into(),
+                query: "UPDATE accounts SET marker = $1 WHERE id = $2".into(),
+                parameter_types: vec![PostgresOid(25), PostgresOid(20)],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "backfill".into(),
+                statement: "backfill".into(),
+                parameter_formats: vec![],
+                parameters: vec![Some(b"bound".to_vec()), Some(b"2".to_vec())],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(files(&root), before);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "backfill".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("UPDATE 1".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    assert_eq!(
+        db.query("SELECT marker FROM accounts WHERE id = 2")
+            .unwrap()
+            .rows,
+        vec![vec![ScalarValue::Text("bound".into())]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

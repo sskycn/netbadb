@@ -33,6 +33,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round44_probe = std::env::var("NETBADB_ROUND44_PROBE").ok();
     let round45_probe = std::env::var("NETBADB_ROUND45_PROBE").ok();
     let round48_probe = std::env::var("NETBADB_ROUND48_PROBE").ok();
+    let round50_probe = std::env::var("NETBADB_ROUND50_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -59,6 +60,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round45_probe.is_some()
         || round46_probe.is_some()
         || round48_probe.is_some()
+        || round50_probe.is_some()
     {
         let nullability = if round46_email_not_null {
             " NOT NULL"
@@ -120,6 +122,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round45_probe.is_some()
         || round46_probe.is_some()
         || round48_probe.is_some()
+        || round50_probe.is_some()
     {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
@@ -153,6 +156,68 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round50_probe {
+        let winner = matches!(probe.as_str(), "commit" | "commit-bound");
+        if !winner && probe != "rollback" {
+            return Err(format!("unknown Round 50 probe {probe}").into());
+        }
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 50 table absent")?;
+            if winner {
+                if projects
+                    .column("marker")
+                    .is_none_or(|column| column.id != ColumnId(4) || column.nullable)
+                    || reopened.table_schema_version(TableId(2))
+                        != Some(netbadb_types::TableSchemaVersion(base_version.0 + 1))
+                    || reopened.schema_generation().0 != base_generation.0 + 1
+                    || reopened.next_storage_id()
+                        != Some(netbadb_types::StorageId(target_storage.0 + 1))
+                    || reopened
+                        .query("SELECT id, marker FROM projects ORDER BY id")?
+                        .rows
+                        != vec![
+                            vec![
+                                ScalarValue::Int64(1),
+                                ScalarValue::Text(if probe == "commit-bound" {
+                                    "bound-value".into()
+                                } else {
+                                    "updated1".into()
+                                }),
+                            ],
+                            vec![ScalarValue::Int64(3), ScalarValue::Text("old-three".into())],
+                            vec![ScalarValue::Int64(4), ScalarValue::Text("inserted4".into())],
+                        ]
+                    || !reopened.indexes(TableId(2))?.iter().any(|index| {
+                        index
+                            .name
+                            .as_ref()
+                            .is_some_and(|name| name.as_str() == "projects_marker_idx")
+                    })
+                {
+                    return Err("Round 50 winner mismatch".into());
+                }
+            } else if projects.column("marker").is_some()
+                || reopened.table_schema_version(TableId(2)) != Some(base_version)
+                || reopened.schema_generation() != base_generation
+                || reopened.next_storage_id() != Some(target_storage)
+                || reopened.query("SELECT id FROM projects ORDER BY id")?.rows
+                    != vec![
+                        vec![ScalarValue::Int64(1)],
+                        vec![ScalarValue::Int64(2)],
+                        vec![ScalarValue::Int64(3)],
+                    ]
+            {
+                return Err("Round 50 rollback mismatch".into());
+            }
+            reopened.close()?;
+        }
+        println!("REOPEN PASS Round 50 {probe}");
+        return Ok(());
     }
     if let Some(probe) = round48_probe {
         let dirty = matches!(probe.as_str(), "cnew" | "rename");

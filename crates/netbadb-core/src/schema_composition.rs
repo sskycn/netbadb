@@ -268,6 +268,7 @@ enum SourceBackfillRefinementScope {
 enum AlterValidationContext {
     Ordinary,
     AdoptedSource { source_not_null_validated: bool },
+    AdoptedProjectedNewColumn,
 }
 
 #[derive(Debug)]
@@ -275,6 +276,9 @@ pub(crate) enum SchemaCompositionState {
     None,
     Composing(Box<SchemaTransactionPlan>),
     AdoptedSourceRefining(Box<AdoptedSourceTransaction>),
+    // S1 remains the only physical table; ordered deferred UPDATE actions are
+    // observed and retained in the transaction-local logical plan.
+    AdoptedSourceBackfilling(Box<AdoptedSourceTransaction>),
     // Final TableDef is frozen; index inventory remains logical until commit.
     AdoptedSourceIndexFinalizing(Box<AdoptedSourceTransaction>),
     SealingAndMaterializing(Box<MaterializedSchemaTransaction>),
@@ -312,18 +316,18 @@ enum IndexCompositionContext {
 impl SchemaCompositionState {
     pub(crate) fn adopted_source(&self) -> Option<&AdoptedSourceTransaction> {
         match self {
-            Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
-                Some(adopted)
-            }
+            Self::AdoptedSourceRefining(adopted)
+            | Self::AdoptedSourceBackfilling(adopted)
+            | Self::AdoptedSourceIndexFinalizing(adopted) => Some(adopted),
             _ => None,
         }
     }
 
     pub(crate) fn adopted_source_mut(&mut self) -> Option<&mut AdoptedSourceTransaction> {
         match self {
-            Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
-                Some(adopted)
-            }
+            Self::AdoptedSourceRefining(adopted)
+            | Self::AdoptedSourceBackfilling(adopted)
+            | Self::AdoptedSourceIndexFinalizing(adopted) => Some(adopted),
             _ => None,
         }
     }
@@ -372,9 +376,9 @@ impl SchemaCompositionState {
             Self::Composing(plan)
             | Self::SealedNoEffectiveChange(plan)
             | Self::RollbackRequiredLogical(plan) => Some(plan),
-            Self::AdoptedSourceRefining(adopted) | Self::AdoptedSourceIndexFinalizing(adopted) => {
-                Some(&adopted.logical)
-            }
+            Self::AdoptedSourceRefining(adopted)
+            | Self::AdoptedSourceBackfilling(adopted)
+            | Self::AdoptedSourceIndexFinalizing(adopted) => Some(&adopted.logical),
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
             | Self::BackfillMaterializing(materialized)
@@ -559,9 +563,7 @@ pub(crate) struct SchemaTransactionPlan {
     pub(crate) touched: BTreeMap<TableId, ComposedTable>,
     pub(crate) created: BTreeMap<TableId, TransactionCreatedTable>,
     pub(crate) action_evidence: Vec<[u8; 32]>,
-    #[cfg(test)]
-    pub(crate) deferred_backfill:
-        crate::deferred_new_column_backfill_audit_tests::DeferredBackfillProgram,
+    pub(crate) deferred_backfill: crate::deferred_backfill::DeferredBackfillProgram,
     pub(crate) reservation_count: usize,
     pub(crate) index_reservation_count: usize,
     pub(crate) index_actions: usize,
@@ -1307,9 +1309,15 @@ impl Database {
         if self.try_apply_source_backfill_refinement(transaction, &spec)? {
             return Ok(());
         }
-        if let SchemaCompositionState::AdoptedSourceRefining(adopted) =
-            &transaction.schema_composition
-        {
+        if matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::AdoptedSourceRefining(_)
+                | SchemaCompositionState::AdoptedSourceBackfilling(_)
+        ) {
+            let adopted = transaction
+                .schema_composition
+                .adopted_source()
+                .ok_or(SchemaMutationError::Corrupt("adopted source state absent"))?;
             if !Self::is_adopted_source_operation(&spec.operation) {
                 return Err(SchemaMutationError::TransactionNotPristine.into());
             }
@@ -1323,6 +1331,12 @@ impl Database {
             }
             if Self::is_adopted_source_nullability_operation(&spec.operation) {
                 return self.apply_adopted_source_nullability(transaction, spec);
+            }
+            if matches!(
+                transaction.schema_composition,
+                SchemaCompositionState::AdoptedSourceBackfilling(_)
+            ) {
+                return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
             }
             let result = self.apply_composed_alter(transaction, spec);
             self.handle_composition_accept_result(transaction, &result);
@@ -2567,7 +2581,7 @@ impl Database {
             _ => return Err(SchemaMutationError::TransactionNotPristine.into()),
         };
         let first = transaction.schema_composition.is_none();
-        let source_storage = if first {
+        let (source_storage, validation_context) = if first {
             let adopted = self.preflight_post_dml_source_adoption(transaction, &spec)?;
             crash("post-dml-adoption-preflight-complete");
             let touched = adopted
@@ -2589,43 +2603,70 @@ impl Database {
             transaction.schema_composition =
                 SchemaCompositionState::AdoptedSourceRefining(Box::new(adopted));
             crash("post-dml-adopted-source-installed");
-            source_storage
+            (
+                source_storage,
+                AlterValidationContext::AdoptedSource {
+                    source_not_null_validated,
+                },
+            )
         } else {
-            let adopted = match &transaction.schema_composition {
-                SchemaCompositionState::AdoptedSourceRefining(adopted) => adopted,
-                _ => {
-                    return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+            let (source_storage, base_has_column, backfilling) =
+                match &transaction.schema_composition {
+                    SchemaCompositionState::AdoptedSourceRefining(adopted) => {
+                        Self::validate_adopted_source_alter(&adopted.logical, &spec)?;
+                        let touched =
+                            adopted.logical.touched.get(&spec.target.table_id).ok_or(
+                                SchemaMutationError::Corrupt("adopted source table absent"),
+                            )?;
+                        (
+                            adopted.source_storage,
+                            touched.base_table.column_by_id(column_id).is_some(),
+                            false,
+                        )
+                    }
+                    SchemaCompositionState::AdoptedSourceBackfilling(adopted) => {
+                        Self::validate_adopted_source_alter(&adopted.logical, &spec)?;
+                        let touched =
+                            adopted.logical.touched.get(&spec.target.table_id).ok_or(
+                                SchemaMutationError::Corrupt("adopted source table absent"),
+                            )?;
+                        (
+                            adopted.source_storage,
+                            touched.base_table.column_by_id(column_id).is_some(),
+                            true,
+                        )
+                    }
+                    _ => {
+                        return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+                    }
+                };
+            let set_not_null = matches!(spec.operation, AlterTableOperation::SetNotNull { .. });
+            let context = if base_has_column {
+                if set_not_null {
+                    self.validate_source_view_not_null(transaction, source_storage, column_id)?;
                 }
-            };
-            Self::validate_adopted_source_alter(&adopted.logical, &spec)?;
-            let touched = adopted
-                .logical
-                .touched
-                .get(&spec.target.table_id)
-                .ok_or(SchemaMutationError::Corrupt("adopted source table absent"))?;
-            if touched.base_table.column_by_id(column_id).is_none() {
+                AlterValidationContext::AdoptedSource {
+                    source_not_null_validated: set_not_null,
+                }
+            } else if set_not_null && backfilling {
+                crate::deferred_backfill::validate_projected_new_not_null(
+                    self,
+                    transaction,
+                    spec.target.table_id,
+                    column_id,
+                )?;
+                AlterValidationContext::AdoptedProjectedNewColumn
+            } else {
                 return Err(SchemaMutationError::TransactionNotPristine.into());
-            }
-            let source_storage = adopted.source_storage;
-            if matches!(spec.operation, AlterTableOperation::SetNotNull { .. }) {
-                self.validate_source_view_not_null(transaction, source_storage, column_id)?;
-            }
-            source_storage
+            };
+            (source_storage, context)
         };
         debug_assert_eq!(
             transaction.write_participant(),
             Some(source_storage),
             "nullability refinement must retain the exact adopted source"
         );
-        let source_not_null_validated =
-            matches!(spec.operation, AlterTableOperation::SetNotNull { .. });
-        let result = self.apply_composed_alter_with_context(
-            transaction,
-            spec,
-            AlterValidationContext::AdoptedSource {
-                source_not_null_validated,
-            },
-        );
+        let result = self.apply_composed_alter_with_context(transaction, spec, validation_context);
         self.handle_composition_accept_result(transaction, &result);
         if first && result.is_ok() {
             crash("post-dml-first-refinement-accepted");
@@ -2840,6 +2881,7 @@ impl Database {
         self.validate_transaction(transaction)?;
         let adopted = match &transaction.schema_composition {
             SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
             | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => adopted,
             _ => {
                 return Err(
@@ -2930,6 +2972,7 @@ impl Database {
         );
         let adopted = match previous {
             SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
             | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => *adopted,
             other => {
                 transaction.schema_composition = other;
@@ -3017,6 +3060,7 @@ impl Database {
                     SchemaCompositionState::RollbackRequiredLogical(plan)
                 }
                 SchemaCompositionState::AdoptedSourceRefining(adopted)
+                | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
                 | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => {
                     SchemaCompositionState::RollbackRequiredLogical(Box::new(adopted.logical))
                 }
@@ -3080,9 +3124,7 @@ impl Database {
             touched: BTreeMap::new(),
             created: BTreeMap::new(),
             action_evidence: Vec::new(),
-            #[cfg(test)]
-            deferred_backfill:
-                crate::deferred_new_column_backfill_audit_tests::DeferredBackfillProgram::default(),
+            deferred_backfill: crate::deferred_backfill::DeferredBackfillProgram::default(),
             reservation_count: 0,
             index_reservation_count: 0,
             index_actions: 0,
@@ -3351,7 +3393,8 @@ impl Database {
         let transaction_id = transaction.id();
         let plan = match &mut transaction.schema_composition {
             SchemaCompositionState::Composing(plan) => plan,
-            SchemaCompositionState::AdoptedSourceRefining(adopted) => &mut adopted.logical,
+            SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceBackfilling(adopted) => &mut adopted.logical,
             _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
         };
         if plan.action_count() >= MAX_SCHEMA_ACTIONS {
@@ -3569,6 +3612,7 @@ impl Database {
                     )
                     .into());
                 }
+                AlterValidationContext::AdoptedProjectedNewColumn => {}
             }
         }
 
@@ -3621,6 +3665,9 @@ impl Database {
         }
         plan.touched.entry(spec.target.table_id).or_insert(touched);
         let mut evidence = Sha256::new();
+        if matches!(context, AlterValidationContext::AdoptedProjectedNewColumn) {
+            evidence.update(b"NetbaDB deferred projected SET NOT NULL v1\0");
+        }
         evidence.update(spec.target.table_id.0.to_le_bytes());
         evidence.update(target_version.0.to_le_bytes());
         evidence.update(target_fingerprint.as_bytes());
@@ -4056,6 +4103,7 @@ impl Database {
         );
         transaction.schema_composition = match previous {
             SchemaCompositionState::AdoptedSourceRefining(adopted)
+            | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
             | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => {
                 SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted)
             }
@@ -4088,6 +4136,7 @@ impl Database {
             (SchemaCompositionState::Composing(plan), IndexCompositionContext::Ordinary) => plan,
             (
                 SchemaCompositionState::AdoptedSourceRefining(adopted)
+                | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
                 | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted),
                 IndexCompositionContext::AdoptedFinal,
             ) => &mut adopted.logical,
@@ -6098,14 +6147,12 @@ impl Database {
             table_plan.target.committed.tables[0].version,
             &reserved_new_columns,
         )?;
-        #[cfg(test)]
         let deferred_backfill = transaction
             .schema_composition
             .plan()
             .ok_or(SchemaMutationError::Corrupt("composition plan absent"))?
             .deferred_backfill
             .clone();
-        #[cfg(test)]
         let mut deferred_observations = deferred_backfill.begin_finalization();
         let catalog = &transaction
             .schema_composition
@@ -6189,19 +6236,16 @@ impl Database {
                 &old_columns,
                 source_view,
                 |_row, old_values| {
-                    #[cfg(not(test))]
-                    let values = projection.project(&old_values)?;
-                    #[cfg(test)]
-                    let values = {
+                    let values = if deferred_backfill.is_empty() {
+                        projection.project(&old_values)?
+                    } else {
                         let mut values =
                             projection.project_without_target_constraints(&old_values)?;
-                        if !deferred_backfill.is_empty() {
-                            deferred_backfill.apply_row(
-                                &old_values,
-                                &mut values,
-                                &mut deferred_observations,
-                            )?;
-                        }
+                        deferred_backfill.apply_row(
+                            &old_values,
+                            &mut values,
+                            &mut deferred_observations,
+                        )?;
                         projection.validate_target_constraints(&values)?;
                         values
                     };
@@ -6226,7 +6270,6 @@ impl Database {
             )
             .into());
         }
-        #[cfg(test)]
         deferred_backfill.verify_finalization(deferred_observations)?;
         #[cfg(test)]
         if late_clone {
@@ -6874,6 +6917,7 @@ pub(crate) fn cleanup_composition_loser(
         | SchemaCompositionState::SealedNoEffectiveChange(plan)
         | SchemaCompositionState::RollbackRequiredLogical(plan) => (*plan, None),
         SchemaCompositionState::AdoptedSourceRefining(adopted)
+        | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
         | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => (adopted.logical, None),
         SchemaCompositionState::SealingAndMaterializing(mut materialized)
         | SchemaCompositionState::Materialized(mut materialized)

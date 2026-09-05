@@ -84,8 +84,10 @@ overlay changes its dependency. Preparing again against the transaction-visible
 overlay resolves the surviving ID and succeeds; no name rebinding exception is
 introduced.
 
-After any successful adopted refinement, SELECT/INSERT/UPDATE/DELETE return
-`MigrationDataAccessAfterRefinement` (`25000` through PostgreSQL).
+After any successful adopted refinement, SELECT/INSERT/DELETE and ordinary
+UPDATE return `MigrationDataAccessAfterRefinement` (`25000` through PostgreSQL).
+[Round 50](deferred-new-column-backfill-round50.md) later adds the bounded
+late-column-only deferred UPDATE exception and projected Cnew SET NOT NULL.
 [Round 48](adopted-source-final-index-round48.md) subsequently adds final
 CREATE/DROP INDEX in a terminal phase that permanently closes later ALTER.
 Rename→SET, SET→rename, nullable ADD→surviving SET, and eligible DROP→surviving SET compose into the same one-S2
@@ -109,8 +111,9 @@ PartitionCatalog, LSM formats, Protocol v1, PostgreSQL framing v3, Manifest v4,
 SDK Schema Spec v1, and inspection formats are unchanged. Nullability allocates
 no ColumnId or IndexId and adds no journal tag or recovery branch.
 
-Still excluded are new-column SET/DROP NOT NULL,
-post-refinement DML, defaults, generated expressions, type conversion/USING,
+Still excluded here are new-column SET/DROP NOT NULL and post-refinement DML;
+Round 50 supersedes only Cnew SET and its bounded deferred UPDATE prerequisite.
+Defaults, generated expressions, type conversion/USING,
 constraints/CASCADE, cross-table, LSM, partitioned, imported/bootstrap,
 savepoints, online/resumable migration, participant detach, automatic GC, and
 format compaction. The Round 39/42 DROP-first route and ordinary pristine

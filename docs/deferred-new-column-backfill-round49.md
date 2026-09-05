@@ -1,7 +1,8 @@
 # Deferred new-column backfill architecture audit (Round 49)
 
-Round 49 is an architecture audit with an executable Core unit-test prototype.
-It does not add production SQL. The requested historical baseline was
+Round 49 is the historical architecture audit whose selected Candidate A was
+productionized by [Round 50](deferred-new-column-backfill-round50.md). At this
+milestone it did not add production SQL. The requested historical baseline was
 `0b3a71a112b06eaa42a20a8dc3e6111e57e28fb2`; work began on current `main` at
 `84253de8af298efc48bbe426e3dee6492186720d`, whose parent is that baseline and
 whose additional commit is the already integrated Columnar Phase 1 work.
@@ -295,8 +296,9 @@ expression encoding, protocol special case, or PostgreSQL adapter path.
 | Manifest v4 | none |
 | SDK Schema Spec v1 / inspection | none |
 
-Round 49 production behavior stays frozen. Production post-refinement UPDATE and
-Cnew SET NOT NULL retain their exact current errors, followed by PostgreSQL
+Round 50 supersedes this audit's production closure with the exact bounded
+late-column UPDATE and projected Cnew SET NOT NULL design selected above.
+Other post-refinement relational access remains closed, with PostgreSQL
 `25P02` after a failed explicit transaction. Round 48 final-index behavior stays
 positive. The known older `test-sql-alter-table.py` indexed SET NOT NULL blocker
 and `test-postgresql-orm.py` imported/bootstrap DROP blocker are unrelated and

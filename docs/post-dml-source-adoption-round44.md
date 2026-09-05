@@ -54,8 +54,8 @@ the new column. Renames retain TableId/ColumnId, and existing indexes retain
 their IndexId/ColumnId identity.
 
 The first accepted refinement closes SELECT/INSERT/UPDATE/DELETE with
-`MigrationDataAccessAfterRefinement` (`25000`). Round 46 permits SET/DROP NOT
-NULL only for a surviving base ID; new-column nullability remains closed.
+`MigrationDataAccessAfterRefinement` (`25000`) at this milestone. Round 46
+permits SET/DROP NOT NULL only for a surviving base ID.
 [Round 48](adopted-source-final-index-round48.md) adds terminal final CREATE/DROP
 INDEX after adopted refinement; its first accepted statement closes later ALTER. Indexed DROP returns `2BP01` and
 there is no implicit CASCADE. The older Round 39/42 DROP-first route remains
@@ -109,7 +109,7 @@ ordinary adoption used S2=3, one source pass, and three copied rows, with
 248,924 final bytes. This is fixture evidence, not a general performance claim.
 
 Defaults, generated values, type/nominal conversion, USING, constraints,
-CASCADE, post-refinement DML, new-column NOT NULL/indexes, cross-table adoption,
+CASCADE, general post-refinement DML, cross-table adoption,
 savepoints, online/resumable migration,
 participant detach, automatic GC, format compaction, and general Alembic
 support remain out of scope.
@@ -118,3 +118,8 @@ Round 48 supersedes the index-DDL exclusion only after adoption has already
 succeeded. Its index-only and global-no-op branches qualify the table-only
 no-op discussion above: changed active indexes publish a real S1/P1 delta;
 unchanged active indexes retain the direct DML/no-publication theorem.
+
+[Round 50](deferred-new-column-backfill-round50.md) supersedes the blanket
+new-column value/nullability exclusion with a late-column-only deferred UPDATE,
+projected SET NOT NULL, and the existing Round 48 final-index phase. The rest of
+this Round 44 source-adoption and recovery contract remains unchanged.

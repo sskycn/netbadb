@@ -385,6 +385,17 @@ relational execution remain closed. A table-effective migration builds the
 complete final index inventory on one S2. A canonical table no-op applies an
 honest transactional index delta to S1; CREATE→DROP retains only the ID burn.
 
+[Round 50](docs/deferred-new-column-backfill-round50.md) adds one bounded value
+population step between adopted layout refinement and that terminal index
+phase. Same-table UPDATE may write only durably reserved late columns and may
+read only surviving base columns, deterministic literals, or Execute-bound
+scalars. Actions are observed against the exact transaction-visible S1 and
+replayed in order during the single final S1-to-S2 projection. This enables
+ADD nullable → UPDATE → projected SET NOT NULL → CREATE INDEX while keeping
+other relational access, late-column reads, base writes, structural ALTER after
+backfill starts, non-Heap placements, and cross-table migration closed. The
+program is transaction-local; no persistent or wire format changes.
+
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
