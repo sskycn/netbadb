@@ -27,5 +27,9 @@ harness = false
 name = "columnar_phase1"
 harness = false
 
+[[bench]]
+name = "columnar_scale"
+harness = false
+
 [lints]
 workspace = true

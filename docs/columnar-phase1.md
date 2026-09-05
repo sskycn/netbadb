@@ -66,11 +66,14 @@ inconsistent counts, identity mismatches, and checksum failures. Publication
 uses `create_new` temporary files, complete writes, `sync_data`, atomic rename,
 and parent-directory `sync_all` for both the segment and manifest.
 
-`Database::attach_columnar_projection` is the explicit reopen path when no
-durable catalog location exists. It validates table/schema/source identity and
-all segment metadata before registration. A failed or corrupt attachment does
-not affect authoritative recovery or queries. `inspect_columnar_projection_path`
-reports it as `Unavailable` with a diagnostic.
+Managed databases now use the durable NBPC projection catalog described in
+[Columnar Phase 1.5](columnar-phase1-5.md). Reopen automatically discovers its
+registered locations and preserves a monotonic database-scoped identity
+high-water. `Database::attach_columnar_projection` remains an explicit
+adoption/repair path and validates table/schema/source identity and all segment
+metadata. A failed or corrupt projection does not affect authoritative recovery
+or queries. Inspection retains a registered unavailable identity with a
+diagnostic.
 
 ## Planning and execution
 
@@ -115,7 +118,7 @@ projected columns, segment/row-group/row counts, bytes, and any unavailable-file
 diagnostic.
 
 Phase 1 intentionally omits authoritative columnar writes, CDC or incremental
-maintenance, a database-global CSN, catalog-managed projection locations,
+maintenance, a database-global CSN,
 partitioned projections, complex join/sort columnar pipelines, compression,
 dictionary encoding, SIMD, spilling, protocol commands, PostgreSQL syntax, and
 Go APIs.

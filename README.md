@@ -74,8 +74,12 @@ application-specific Rust structs.
 
 [Columnar Phase 1](docs/columnar-phase1.md) adds explicit embedded
 build/refresh/attach/drop APIs, `ColumnarScan`, vector filter/project/aggregate,
-zone-map pruning, corruption-safe fallback, and scan statistics. Heap and LSM
-remain authoritative and committed DML makes a projection stale until refresh.
+zone-map pruning, corruption-safe fallback, and scan statistics. [Phase
+1.5](docs/columnar-phase1-5.md) adds the versioned NBPC projection catalog,
+durable monotonic IDs, automatic reopen discovery, hardened generation
+lifecycle, structural planner costs, and a 10K–10M CSV scale benchmark. Heap and
+LSM remain authoritative and committed DML makes a projection stale until
+refresh.
 
 Round 33 extends controlled backfill with a post-backfill `CREATE INDEX` /
 `DROP INDEX` phase. Index IDs are durably reserved before overlay mutation;

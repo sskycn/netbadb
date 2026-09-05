@@ -97,6 +97,9 @@ pub struct ColumnarColumnStatistics {
     pub null_count: u64,
     pub minimum: Option<ScalarValue>,
     pub maximum: Option<ScalarValue>,
+    /// Encoded validity, offset, and value bytes for this row-group chunk.
+    /// This is derived from the decoded immutable vector, not persisted twice.
+    pub encoded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +231,7 @@ pub struct ColumnarProjectionMetadata {
     pub segment_bytes: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ColumnarProjection {
     root: PathBuf,
     metadata: ColumnarProjectionMetadata,
@@ -648,7 +651,8 @@ fn encode_row_group(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let vector = vector_from_values(column, &values)?;
-        let stats = statistics_for_values(&values)?;
+        let mut stats = statistics_for_values(&values)?;
+        stats.encoded_bytes = vector_encoded_bytes(&vector);
         vectors.push(ColumnarBatchColumn {
             column_id: column.column_id,
             values: vector,
@@ -777,6 +781,7 @@ fn statistics_for_values(
         null_count,
         minimum,
         maximum,
+        encoded_bytes: 0,
     })
 }
 
@@ -1220,12 +1225,14 @@ fn decode_column_chunk(
             "validity bitmap disagrees with null count",
         ));
     }
+    let encoded_bytes = vector_encoded_bytes(&vector);
     Ok((
         vector,
         ColumnarColumnStatistics {
             null_count,
             minimum,
             maximum,
+            encoded_bytes,
         },
     ))
 }
@@ -1728,6 +1735,64 @@ mod tests {
             ScalarValue::Int64(4)
         );
         drop(projection);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn active_reader_keeps_immutable_generation_after_refresh_retires_its_file() {
+        let directory = test_directory("active-reader");
+        let table = table();
+        let generation_one = build_projection!(
+            &directory,
+            ColumnarProjectionId(17),
+            ColumnarGeneration(1),
+            &table,
+            StorageId(9),
+            StorageSnapshotToken::heap(StorageId(9), 1),
+            &[ColumnId(1)],
+            &[vec![ScalarValue::Int64(10)]],
+            None,
+        )
+        .expect("build generation one");
+        let active_reader = generation_one.clone();
+        let generation_two = build_projection!(
+            &directory,
+            ColumnarProjectionId(17),
+            ColumnarGeneration(2),
+            &table,
+            StorageId(9),
+            StorageSnapshotToken::heap(StorageId(9), 2),
+            &[ColumnId(1)],
+            &[vec![ScalarValue::Int64(20)]],
+            None,
+        )
+        .expect("publish generation two");
+        generation_one
+            .retire_segment()
+            .expect("retire generation one file");
+
+        let (old_batches, _) = active_reader
+            .scan(&[ColumnId(1)], &[])
+            .expect("active reader scans retained generation");
+        assert_eq!(
+            old_batches[0].columns[0]
+                .values
+                .value(0)
+                .expect("old value"),
+            ScalarValue::Int64(10)
+        );
+        let (new_batches, _) = generation_two
+            .scan(&[ColumnId(1)], &[])
+            .expect("new reader scans new generation");
+        assert_eq!(
+            new_batches[0].columns[0]
+                .values
+                .value(0)
+                .expect("new value"),
+            ScalarValue::Int64(20)
+        );
+        drop(active_reader);
+        drop(generation_two);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

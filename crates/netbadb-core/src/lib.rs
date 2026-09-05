@@ -8,6 +8,7 @@ mod coordinator_crash;
 mod coordinator_log;
 mod inspection;
 mod partition_catalog;
+mod projection_catalog;
 mod registry;
 mod schema_catalog;
 mod schema_catalog_api;
@@ -58,7 +59,7 @@ use netbadb_types::{
     PhysicalType, ScalarValue, StorageId, TableId, TxnId,
 };
 
-use columnar::ProjectionRegistry;
+use columnar::{ProjectionRegistry, ProjectionRegistryEntry};
 use coordinator_log::{CoordinatorDecision, CoordinatorLog};
 use partition_catalog::{CatalogTable, PartitionCatalog, canonicalize_partitions, route_partition};
 use registry::{
@@ -68,7 +69,8 @@ use schema_catalog::CommittedCatalogState;
 use transaction::SharedCoordinatorLog;
 
 pub use columnar::{
-    ColumnarProjectionHealth, ColumnarProjectionInspection, ColumnarProjectionSpec,
+    ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
+    ColumnarProjectionSpec,
 };
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{
@@ -86,6 +88,7 @@ pub use netbadb_types::{SchemaGeneration, TableSchemaVersion};
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
 };
+pub use projection_catalog::ProjectionCatalogError;
 pub use registry::StorageRegistryError;
 pub use schema_catalog::SchemaCatalogError;
 pub use schema_catalog_api::{CompleteLegacyInventory, LegacyStorageLocation};
@@ -514,6 +517,7 @@ pub enum DatabaseError {
     Bind(BindError),
     Schema(SchemaError),
     SchemaCatalog(SchemaCatalogError),
+    ProjectionCatalog(ProjectionCatalogError),
     SchemaMutation(SchemaMutationError),
     Storage(StorageError),
     Execution(ExecutionError),
@@ -674,6 +678,7 @@ impl DatabaseError {
                 DatabaseErrorKind::DuplicateObject
             }
             Self::SchemaCatalog(_)
+            | Self::ProjectionCatalog(_)
             | Self::Schema(_)
             | Self::Storage(_)
             | Self::Registry(_)
@@ -718,6 +723,7 @@ impl fmt::Display for DatabaseError {
             Self::Bind(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
             Self::SchemaCatalog(error) => error.fmt(formatter),
+            Self::ProjectionCatalog(error) => error.fmt(formatter),
             Self::SchemaMutation(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
@@ -817,6 +823,7 @@ impl Error for DatabaseError {
             Self::Bind(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::SchemaCatalog(error) => Some(error),
+            Self::ProjectionCatalog(error) => Some(error),
             Self::SchemaMutation(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Execution(error) => Some(error),
@@ -861,6 +868,12 @@ impl From<BindError> for DatabaseError {
 impl From<SchemaError> for DatabaseError {
     fn from(error: SchemaError) -> Self {
         Self::Schema(error)
+    }
+}
+
+impl From<ProjectionCatalogError> for DatabaseError {
+    fn from(error: ProjectionCatalogError) -> Self {
+        Self::ProjectionCatalog(error)
     }
 }
 
@@ -931,6 +944,91 @@ pub struct Database {
 }
 
 impl Database {
+    fn configure_managed_projection_catalog(&mut self, incarnation: [u8; 16]) {
+        let Some(schema_catalog_path) = self.catalog_path.as_deref() else {
+            return;
+        };
+        let catalog_path = projection_catalog::catalog_path(schema_catalog_path);
+        let mut catalog = match projection_catalog::ProjectionCatalog::open_or_initialize(
+            schema_catalog_path,
+            incarnation,
+        ) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.projections = ProjectionRegistry::degraded(catalog_path, error.to_string());
+                return;
+            }
+        };
+        let mut entries = Vec::with_capacity(catalog.entries().len());
+        for mut identity in catalog.entries().to_vec() {
+            let directory = catalog.resolve(&identity);
+            let opened = (|| -> Result<ColumnarProjection, String> {
+                let table = self
+                    .committed
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == identity.table_id)
+                    .ok_or_else(|| {
+                        "projection table is absent from the authoritative schema".to_owned()
+                    })?;
+                if table.fingerprint().map_err(|error| error.to_string())?
+                    != identity.schema_fingerprint
+                {
+                    return Err("projection schema fingerprint is stale".to_owned());
+                }
+                let expected_storage = match self
+                    .bindings
+                    .placement(identity.table_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    TablePlacement::Single { storage_id, .. } => *storage_id,
+                    TablePlacement::RangePartitioned { .. } => {
+                        return Err("partitioned projections are unsupported".to_owned());
+                    }
+                };
+                if expected_storage != identity.source_storage_id
+                    || self.registry.get(expected_storage).is_none()
+                {
+                    return Err("projection source storage identity is unavailable".to_owned());
+                }
+                let projection = ColumnarProjection::open(&directory, table)
+                    .map_err(|error| error.to_string())?;
+                let metadata = projection.metadata();
+                if metadata.id != identity.id
+                    || metadata.table_id != identity.table_id
+                    || metadata.source_storage_id != identity.source_storage_id
+                    || metadata.schema_fingerprint != identity.schema_fingerprint
+                {
+                    return Err("projection manifest differs from its catalog identity".to_owned());
+                }
+                if metadata.generation.0 < identity.generation.0 {
+                    return Err("projection manifest generation moved backwards".to_owned());
+                }
+                Ok(projection)
+            })();
+            let (projection, detail) = match opened {
+                Ok(projection) => {
+                    if projection.metadata().generation.0 > identity.generation.0 {
+                        let generation = projection.metadata().generation;
+                        let _ = catalog.update_generation(identity.id, generation);
+                        identity.generation = generation;
+                    }
+                    (Some(projection), None)
+                }
+                Err(detail) => (None, Some(detail)),
+            };
+            entries.push(ProjectionRegistryEntry {
+                identity,
+                directory,
+                projection,
+                detail,
+                managed: true,
+            });
+        }
+        self.projections = ProjectionRegistry::managed(catalog, entries);
+    }
+
     /// Creates an explicit mixed Heap/LSM catalog without a durable database
     /// coordinator. As with the legacy API, at most one storage may be written
     /// by a transaction.
@@ -2132,13 +2230,15 @@ impl Database {
 
     fn build_columnar_projection_with<F>(
         &mut self,
-        spec: ColumnarProjectionSpec,
+        mut spec: ColumnarProjectionSpec,
         after_scan: F,
     ) -> Result<ColumnarProjectionId, DatabaseError>
     where
         F: FnOnce(&mut Self) -> Result<(), DatabaseError>,
     {
         self.ensure_schema_available(None)?;
+        spec.directory = schema_catalog_file::absolute(&spec.directory)?;
+        self.projections.preflight_location(&spec.directory)?;
         if spec.directory.join("projection.nbcmanifest").exists() {
             return Err(
                 StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
@@ -2147,10 +2247,7 @@ impl Database {
                 .into(),
             );
         }
-        let id = self
-            .projections
-            .allocate_id()
-            .ok_or(DatabaseError::ColumnarProjectionIdExhausted)?;
+        let id = self.projections.reserve_id()?;
         let CapturedColumnarSource {
             storage_id,
             table,
@@ -2168,6 +2265,7 @@ impl Database {
             &rows,
             spec.row_group_rows,
         )?;
+        columnar::crash("build-files-synced");
         after_scan(self)?;
         let current = self
             .registry
@@ -2178,7 +2276,8 @@ impl Database {
             return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
         }
         let projection = prepared.publish()?;
-        self.projections.publish(projection);
+        columnar::crash("build-manifest-published");
+        self.projections.publish(projection)?;
         Ok(id)
     }
 
@@ -2222,6 +2321,7 @@ impl Database {
             &rows,
             None,
         )?;
+        columnar::crash("refresh-files-synced");
         let current = self
             .registry
             .get(storage_id)
@@ -2231,12 +2331,10 @@ impl Database {
             return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
         }
         let replacement = prepared.publish()?;
-        let retired = self
-            .projections
-            .remove(id)
-            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?;
-        self.projections.publish(replacement);
+        columnar::crash("refresh-manifest-published");
+        let retired = self.projections.replace(id, replacement)?;
         retired.retire_segment()?;
+        columnar::crash("refresh-old-retired");
         Ok(generation)
     }
 
@@ -2274,7 +2372,7 @@ impl Database {
             );
         }
         let id = metadata.id;
-        self.projections.publish(projection);
+        self.projections.adopt(projection)?;
         Ok(id)
     }
 
@@ -2282,10 +2380,10 @@ impl Database {
         &mut self,
         id: ColumnarProjectionId,
     ) -> Result<(), DatabaseError> {
-        self.projections
-            .remove(id)
-            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?
-            .drop_files()?;
+        if let Some(projection) = self.projections.remove(id)? {
+            projection.drop_files()?;
+        }
+        columnar::crash("drop-physical-cleanup");
         Ok(())
     }
 
@@ -2294,7 +2392,7 @@ impl Database {
         self.projections
             .iter()
             .map(|entry| {
-                let metadata = entry.projection.metadata();
+                let metadata = &entry.identity;
                 let current = self
                     .registry
                     .get(metadata.source_storage_id)
@@ -2303,9 +2401,14 @@ impl Database {
                     .registry
                     .get(metadata.source_storage_id)
                     .and_then(|storage| storage.table().fingerprint().ok());
-                columnar::inspection(&entry.projection, current, current_schema_fingerprint)
+                columnar::inspection(entry, current, current_schema_fingerprint)
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn inspect_columnar_projection_catalog(&self) -> ColumnarProjectionCatalogInspection {
+        self.projections.catalog_inspection()
     }
 
     #[must_use]
@@ -2315,8 +2418,12 @@ impl Database {
     ) -> ColumnarProjectionInspection {
         let directory = directory.as_ref();
         match ColumnarProjection::open(directory, table) {
-            Ok(projection) => columnar::inspection(&projection, None, table.fingerprint().ok()),
-            Err(error) => columnar::unavailable_inspection(directory, table.id, error.to_string()),
+            Ok(projection) => {
+                columnar::unmanaged_projection_inspection(projection, table.fingerprint().ok())
+            }
+            Err(error) => {
+                columnar::unmanaged_path_inspection(directory, table.id, error.to_string())
+            }
         }
     }
 
@@ -3521,7 +3628,7 @@ impl Database {
         self.projections
             .iter()
             .filter_map(|entry| {
-                let projection = &entry.projection;
+                let projection = entry.projection.as_ref()?;
                 let metadata = projection.metadata();
                 let placement = self.bindings.placement(metadata.table_id).ok()?;
                 let TablePlacement::Single { storage_id, .. } = placement else {
@@ -3562,6 +3669,7 @@ impl Database {
                                     null_count: statistics.null_count,
                                     minimum: statistics.minimum,
                                     maximum: statistics.maximum,
+                                    encoded_bytes: statistics.encoded_bytes,
                                 })
                                 .collect(),
                         })
@@ -3657,9 +3765,10 @@ impl Database {
         let projections = self
             .projections
             .iter()
-            .map(|entry| ExecutionColumnarProjection {
-                projection_id: entry.projection.metadata().id,
-                projection: &entry.projection,
+            .filter_map(|entry| entry.projection.as_ref())
+            .map(|projection| ExecutionColumnarProjection {
+                projection_id: projection.metadata().id,
+                projection,
             })
             .collect::<Vec<_>>();
         Ok(execute_with_columnar_context(

@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use netbadb_inspect::{PlanNodeInspection, StatementPlanInspection};
@@ -8,7 +9,7 @@ use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
 use crate::{
     ColumnarProjectionHealth, ColumnarProjectionSpec, Database, DatabaseError, ExecutionResult,
-    TableStorageCreateSpec, cleanup_created_table_files,
+    ProjectionCatalogError, TableStorageCreateSpec, cleanup_created_table_files,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -327,7 +328,7 @@ fn missing_columns_and_explicit_transaction_writes_fall_back_authoritative() {
 }
 
 #[test]
-fn lsm_projection_builds_and_reopens_by_explicit_attachment() {
+fn lsm_projection_is_discovered_automatically_after_reopen() {
     let lsm = path("lsm");
     let projection = path("lsm-projection");
     let _ = fs::remove_dir_all(&lsm);
@@ -354,12 +355,10 @@ fn lsm_projection_builds_and_reopens_by_explicit_attachment() {
     let mut reopened =
         Database::open_storages(vec![crate::TableStorageOpenSpec::lsm(&lsm, table())])
             .expect("reopen LSM database");
-    assert!(!statement_uses_columnar(&reopened, sql));
+    assert_eq!(reopened.inspect_columnar_projections().len(), 1);
     assert_eq!(
-        reopened
-            .attach_columnar_projection(&projection, TableId(1))
-            .expect("attach projection"),
-        id
+        reopened.inspect_columnar_projections()[0].projection_id,
+        Some(id)
     );
     assert_eq!(
         reopened.inspect_columnar_projections()[0].health,
@@ -408,6 +407,551 @@ fn lsm_projection_builds_and_reopens_by_explicit_attachment() {
     reopened.close().expect("close reopened LSM");
     let _ = fs::remove_dir_all(lsm);
     let _ = fs::remove_dir_all(projection);
+}
+
+#[test]
+fn managed_catalog_discovers_projections_and_never_reuses_dropped_ids() {
+    let root = path("managed-identity-root");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    let projection_a = root.join("projection-a");
+    let projection_b = root.join("projection-b");
+    let projection_c = root.join("projection-c");
+    let projection_d = root.join("projection-d");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        None,
+    )
+    .expect("create managed database");
+    insert_rows(&mut database, 512);
+    let build = |database: &mut Database, directory: &PathBuf| {
+        database
+            .build_columnar_projection(
+                ColumnarProjectionSpec::new(
+                    TableId(1),
+                    directory,
+                    vec![ColumnId(1), ColumnId(2), ColumnId(3)],
+                )
+                .with_row_group_rows(64),
+            )
+            .expect("build managed projection")
+    };
+    let a = build(&mut database, &projection_a);
+    assert!(
+        database
+            .build_columnar_projection(ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection_a,
+                vec![ColumnId(1)],
+            ))
+            .is_err(),
+        "one managed location cannot be registered twice"
+    );
+    let b = build(&mut database, &projection_b);
+    assert_eq!((a.0, b.0), (1, 2));
+    database.close().expect("close database");
+
+    let mut reopened = Database::open_catalog(&catalog).expect("reopen managed database");
+    assert_eq!(
+        reopened
+            .inspect_columnar_projections()
+            .iter()
+            .map(|entry| entry.projection_id.expect("managed identity").0)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(statement_uses_columnar(
+        &reopened,
+        "SELECT COUNT(*) FROM events"
+    ));
+    let c = build(&mut reopened, &projection_c);
+    assert_eq!(c.0, 3);
+    reopened
+        .drop_columnar_projection(b)
+        .expect("drop projection B");
+    reopened
+        .drop_columnar_projection(b)
+        .expect("repeat logical drop is idempotent");
+    reopened.close().expect("close reopened database");
+
+    let mut reopened = Database::open_catalog(&catalog).expect("reopen after drop");
+    let d = build(&mut reopened, &projection_d);
+    assert_eq!(d.0, 4);
+    assert_eq!(
+        reopened
+            .inspect_columnar_projection_catalog()
+            .next_projection_id
+            .expect("next identity")
+            .0,
+        5
+    );
+    reopened.close().expect("close final database");
+    fs::remove_dir_all(root).expect("remove managed fixture");
+}
+
+#[test]
+fn missing_projection_segment_is_unavailable_but_inventory_and_database_survive() {
+    let root = path("missing-managed-segment-root");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    let projection = root.join("projection");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        None,
+    )
+    .expect("create database");
+    insert_rows(&mut database, 8);
+    let id = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &projection,
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build projection");
+    database.close().expect("close database");
+    let segment = fs::read_dir(&projection)
+        .expect("read projection directory")
+        .map(|entry| entry.expect("directory entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "nbcs")
+        })
+        .expect("segment path");
+    fs::remove_file(segment).expect("remove segment");
+
+    let mut reopened = Database::open_catalog(&catalog).expect("authoritative reopen");
+    let inventory = reopened.inspect_columnar_projections();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].projection_id, Some(id));
+    assert_eq!(inventory[0].health, ColumnarProjectionHealth::Unavailable);
+    assert!(
+        inventory[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("I/O"))
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT COUNT(*) FROM events")
+            .expect("authoritative query")
+            .rows,
+        vec![vec![ScalarValue::UInt64(8)]]
+    );
+    let replacement = reopened
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("replacement"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build replacement identity");
+    assert_eq!(replacement.0, 2);
+    reopened.close().expect("close database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn corrupt_projection_catalog_degrades_only_the_projection_subsystem() {
+    let root = path("corrupt-managed-catalog-root");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        None,
+    )
+    .expect("create database");
+    insert_rows(&mut database, 4);
+    database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("projection"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build projection");
+    database.close().expect("close database");
+    let projection_catalog = root.join("catalog.projections");
+    let mut bytes = fs::read(&projection_catalog).expect("read projection catalog");
+    bytes[20] ^= 0x40;
+    fs::write(&projection_catalog, bytes).expect("corrupt projection catalog");
+
+    let mut reopened = Database::open_catalog(&catalog).expect("authoritative reopen");
+    let inspection = reopened.inspect_columnar_projection_catalog();
+    assert!(inspection.managed);
+    assert!(!inspection.available);
+    assert!(
+        inspection
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("checksum"))
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT COUNT(*) FROM events")
+            .expect("authoritative query")
+            .rows,
+        vec![vec![ScalarValue::UInt64(4)]]
+    );
+    assert!(matches!(
+        reopened.build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("blocked"),
+            vec![ColumnId(1)],
+        )),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::Unavailable(_)
+        ))
+    ));
+    reopened.close().expect("close database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn missing_projection_catalog_with_durable_marker_degrades_only_projections() {
+    let root = path("missing-managed-catalog-root");
+    let catalog = root.join("catalog");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create database");
+    insert_rows(&mut database, 2);
+    database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("projection"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build projection");
+    database.close().expect("close database");
+    fs::remove_file(root.join("catalog.projections")).expect("remove projection catalog");
+
+    let mut reopened = Database::open_catalog(&catalog).expect("authoritative reopen");
+    let inspection = reopened.inspect_columnar_projection_catalog();
+    assert!(!inspection.available);
+    assert!(
+        inspection
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("catalog is missing"))
+    );
+    assert_eq!(
+        reopened
+            .query("SELECT COUNT(*) FROM events")
+            .expect("authoritative query")
+            .rows,
+        vec![vec![ScalarValue::UInt64(2)]]
+    );
+    reopened.close().expect("close database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn schema_rewrite_and_drop_table_invalidate_managed_projection_identity() {
+    let root = path("schema-invalidation-root");
+    let catalog = root.join("catalog");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![],
+        Some(crate::DatabaseCoordinatorConfig::new(
+            root.join("coordinator"),
+        )),
+    )
+    .expect("create database");
+    database
+        .execute(
+            "CREATE TABLE events (id BIGINT NOT NULL, amount BIGINT, active BOOLEAN NOT NULL, label TEXT NOT NULL)",
+        )
+        .expect("create runtime table");
+    insert_rows(&mut database, 4);
+    let id = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("projection"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build projection");
+    database
+        .execute("ALTER TABLE events ADD COLUMN note TEXT")
+        .expect("rewrite schema");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Stale
+    );
+    assert!(!statement_uses_columnar(
+        &database,
+        "SELECT COUNT(*) FROM events"
+    ));
+    database.close().expect("close rewritten database");
+
+    let mut reopened = Database::open_catalog(&catalog).expect("reopen rewritten database");
+    assert_eq!(
+        reopened.inspect_columnar_projections()[0].projection_id,
+        Some(id)
+    );
+    assert_eq!(
+        reopened.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Unavailable
+    );
+    reopened.execute("DROP TABLE events").expect("drop table");
+    reopened.close().expect("close dropped database");
+    let reopened = Database::open_catalog(&catalog).expect("reopen dropped database");
+    let inventory = reopened.inspect_columnar_projections();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].projection_id, Some(id));
+    assert_eq!(inventory[0].health, ColumnarProjectionHealth::Unavailable);
+    drop(reopened);
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn catalog_entry_for_partitioned_table_stays_unavailable() {
+    let root = path("partitioned-catalog-entry-root");
+    let catalog = root.join("catalog");
+    fs::create_dir_all(&root).expect("create root");
+    let partitions = vec![
+        crate::RangePartitionSpec::new(
+            netbadb_types::PartitionId(1),
+            root.join("low"),
+            None,
+            Some(ScalarValue::Int64(0)),
+        ),
+        crate::RangePartitionSpec::new(
+            netbadb_types::PartitionId(2),
+            root.join("high"),
+            Some(ScalarValue::Int64(0)),
+            None,
+        ),
+    ];
+    Database::create_catalog_with_placements(
+        &catalog,
+        vec![crate::TablePlacementSpec::range_partitioned(
+            table(),
+            ColumnId(1),
+            partitions,
+        )],
+        crate::PartitionCatalogConfig::new(root.join("placements"), root.join("coordinator")),
+    )
+    .expect("create partitioned database")
+    .close()
+    .expect("close partitioned database");
+    let snapshot = crate::schema_catalog_file::load(&catalog).expect("load schema catalog");
+    let mut projection_catalog = crate::projection_catalog::ProjectionCatalog::open_or_initialize(
+        &catalog,
+        snapshot.incarnation,
+    )
+    .expect("open projection catalog");
+    let projection_path = root.join("unsupported-projection");
+    let locator = projection_catalog
+        .locator(&projection_path)
+        .expect("projection locator");
+    projection_catalog
+        .insert(crate::projection_catalog::ProjectionCatalogEntry {
+            id: netbadb_types::ColumnarProjectionId(1),
+            table_id: TableId(1),
+            source_storage_id: netbadb_types::StorageId(1),
+            generation: netbadb_types::ColumnarGeneration(1),
+            schema_fingerprint: table().fingerprint().expect("table fingerprint"),
+            locator,
+        })
+        .expect("publish synthetic unsupported entry");
+    drop(projection_catalog);
+
+    let reopened = Database::open_catalog(&catalog).expect("reopen partitioned database");
+    let inventory = reopened.inspect_columnar_projections();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].health, ColumnarProjectionHealth::Unavailable);
+    assert!(
+        inventory[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("partitioned"))
+    );
+    drop(reopened);
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn projection_lifecycle_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_COLUMNAR_CRASH_ROOT") else {
+        return;
+    };
+    let operation =
+        std::env::var("NETBADB_COLUMNAR_CRASH_OPERATION").expect("crash child operation");
+    let root = PathBuf::from(root);
+    let mut database = Database::open_catalog(root.join("catalog")).expect("child open database");
+    match operation.as_str() {
+        "build" => {
+            database
+                .build_columnar_projection(ColumnarProjectionSpec::new(
+                    TableId(1),
+                    root.join("crashing-projection"),
+                    vec![ColumnId(1), ColumnId(2)],
+                ))
+                .expect("crash point should terminate build");
+        }
+        "refresh" => {
+            database
+                .insert(&[
+                    ScalarValue::Int64(99),
+                    ScalarValue::Int64(198),
+                    ScalarValue::Bool(false),
+                    ScalarValue::Text("refresh".into()),
+                ])
+                .expect("make projection stale");
+            database
+                .refresh_columnar_projection(netbadb_types::ColumnarProjectionId(1))
+                .expect("crash point should terminate refresh");
+        }
+        "drop" => database
+            .drop_columnar_projection(netbadb_types::ColumnarProjectionId(1))
+            .expect("crash point should terminate drop"),
+        _ => panic!("unknown crash child operation"),
+    }
+    panic!("configured crash point was not reached");
+}
+
+fn run_crash_child(root: &PathBuf, operation: &str, point: &str) {
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "columnar_tests::projection_lifecycle_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_COLUMNAR_CRASH_ROOT", root)
+        .env("NETBADB_COLUMNAR_CRASH_OPERATION", operation)
+        .env("NETBADB_PROJECTION_CATALOG_CRASH_POINT", point)
+        .status()
+        .expect("run crash child");
+    assert_eq!(status.code(), Some(88), "crash point {point}");
+}
+
+fn seed_crash_database(root: &PathBuf, projection: bool) {
+    fs::create_dir_all(root).expect("create crash root");
+    let mut database = Database::create_catalog(
+        root.join("catalog"),
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create crash database");
+    insert_rows(&mut database, 8);
+    if projection {
+        assert_eq!(
+            database
+                .build_columnar_projection(ColumnarProjectionSpec::new(
+                    TableId(1),
+                    root.join("projection"),
+                    vec![ColumnId(1), ColumnId(2)],
+                ))
+                .expect("seed projection")
+                .0,
+            1
+        );
+    }
+    database.close().expect("close crash seed");
+}
+
+#[test]
+fn projection_catalog_build_refresh_and_drop_crash_boundaries_reopen_deterministically() {
+    let reservation_points = [
+        ("catalog-mid-write", 1),
+        ("catalog-temp-written", 1),
+        ("catalog-temp-synced", 1),
+        ("catalog-before-rename", 1),
+        ("catalog-after-rename", 2),
+        ("catalog-renamed", 2),
+        ("id-reserved", 2),
+        ("build-files-synced", 2),
+        ("build-manifest-published", 2),
+    ];
+    for (point, expected_next) in reservation_points {
+        let root = path(&format!("crash-build-{point}"));
+        seed_crash_database(&root, false);
+        run_crash_child(&root, "build", point);
+        let mut reopened =
+            Database::open_catalog(root.join("catalog")).expect("reopen build crash");
+        assert!(reopened.inspect_columnar_projections().is_empty());
+        let id = reopened
+            .build_columnar_projection(ColumnarProjectionSpec::new(
+                TableId(1),
+                root.join("after-crash"),
+                vec![ColumnId(1)],
+            ))
+            .expect("build after crash");
+        assert_eq!(id.0, expected_next, "crash point {point}");
+        reopened.close().expect("close build crash database");
+        fs::remove_dir_all(root).expect("remove build crash fixture");
+    }
+
+    let root = path("crash-build-registry-publish");
+    seed_crash_database(&root, false);
+    run_crash_child(&root, "build", "before-registry-publish");
+    let reopened = Database::open_catalog(root.join("catalog")).expect("reopen registry crash");
+    assert_eq!(reopened.inspect_columnar_projections().len(), 1);
+    assert_eq!(
+        reopened.inspect_columnar_projections()[0].projection_id,
+        Some(netbadb_types::ColumnarProjectionId(1))
+    );
+    drop(reopened);
+    fs::remove_dir_all(root).expect("remove registry crash fixture");
+
+    for point in [
+        "refresh-files-synced",
+        "refresh-manifest-published",
+        "refresh-catalog-updated",
+        "refresh-old-retired",
+    ] {
+        let root = path(&format!("crash-refresh-{point}"));
+        seed_crash_database(&root, true);
+        run_crash_child(&root, "refresh", point);
+        let reopened = Database::open_catalog(root.join("catalog")).expect("reopen refresh crash");
+        let inspection = &reopened.inspect_columnar_projections()[0];
+        let expected_generation = if point == "refresh-files-synced" {
+            1
+        } else {
+            2
+        };
+        assert_eq!(
+            inspection.generation,
+            Some(netbadb_types::ColumnarGeneration(expected_generation)),
+            "crash point {point}"
+        );
+        assert_eq!(
+            inspection.health,
+            if expected_generation == 1 {
+                ColumnarProjectionHealth::Stale
+            } else {
+                ColumnarProjectionHealth::Fresh
+            },
+            "crash point {point}"
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove refresh crash fixture");
+    }
+
+    for point in [
+        "drop-catalog-removal",
+        "drop-registry-removal",
+        "drop-physical-cleanup",
+    ] {
+        let root = path(&format!("crash-drop-{point}"));
+        seed_crash_database(&root, true);
+        run_crash_child(&root, "drop", point);
+        let reopened = Database::open_catalog(root.join("catalog")).expect("reopen drop crash");
+        assert!(
+            reopened.inspect_columnar_projections().is_empty(),
+            "crash point {point}"
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove drop crash fixture");
+    }
 }
 
 #[test]

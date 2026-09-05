@@ -588,6 +588,7 @@ fn finish_install(
     path: &Path,
     snapshot: SchemaCatalogSnapshot,
 ) -> Result<Database, DatabaseError> {
+    let incarnation = snapshot.incarnation;
     for storage in database.registry.iter() {
         storage.storage.flush()?;
     }
@@ -606,6 +607,7 @@ fn finish_install(
     // caller's TableDefs. Physical handles have already validated against it.
     database.committed = file::install_initial(path, &snapshot)?.committed;
     database.catalog_path = Some(path.to_owned());
+    database.configure_managed_projection_catalog(incarnation);
     Ok(database)
 }
 
@@ -661,6 +663,7 @@ fn open_authority(
     let path = file::absolute(path)?;
     let journal = crate::schema_mutation::recover(&path)?;
     let snapshot = file::load(&path)?;
+    let incarnation = snapshot.incarnation;
     preflight_paths(&path, &snapshot, false)?;
     if let Some(expectation) = expectation {
         validate_expectation(&snapshot.committed.schema, expectation)?;
@@ -686,6 +689,7 @@ fn open_authority(
     let mut database = recover_physical(&path, &snapshot, overrides)?;
     database.committed = snapshot.committed;
     database.catalog_path = Some(path);
+    database.configure_managed_projection_catalog(incarnation);
     if let Some(journal) = journal {
         if let Some(id) = journal
             .reservations

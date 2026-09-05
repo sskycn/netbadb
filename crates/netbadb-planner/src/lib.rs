@@ -109,6 +109,7 @@ pub struct ColumnarZoneMapPlanningSnapshot {
     pub null_count: u64,
     pub minimum: Option<ScalarValue>,
     pub maximum: Option<ScalarValue>,
+    pub encoded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,34 +572,36 @@ fn columnar_work_units(
     required: &[ColumnId],
     constraints: &[ColumnarPlanningConstraint],
 ) -> u64 {
-    let selected = projection
-        .row_groups
-        .iter()
-        .filter(|group| {
-            !constraints
+    let mut selected_groups = 0_u64;
+    let mut selected_rows = 0_u64;
+    let mut required_bytes = 0_u64;
+    for group in &projection.row_groups {
+        if constraints
+            .iter()
+            .any(|constraint| planning_group_cannot_match(group, constraint))
+        {
+            continue;
+        }
+        selected_groups = selected_groups.saturating_add(1);
+        selected_rows = selected_rows.saturating_add(u64::from(group.rows));
+        required_bytes = required_bytes.saturating_add(
+            group
+                .columns
                 .iter()
-                .any(|constraint| planning_group_cannot_match(group, constraint))
-        })
-        .collect::<Vec<_>>();
-    let selected_groups = u64::try_from(selected.len()).unwrap_or(u64::MAX);
-    let selected_rows = selected.iter().fold(0_u64, |total, group| {
-        total.saturating_add(u64::from(group.rows))
-    });
-    let total_columns = u64::try_from(projection.projected_columns.len())
-        .unwrap_or(u64::MAX)
-        .max(1);
+                .filter(|column| required.contains(&column.column_id))
+                .fold(0_u64, |bytes, column| {
+                    bytes.saturating_add(column.encoded_bytes)
+                }),
+        );
+    }
     let required_columns = u64::try_from(required.len()).unwrap_or(u64::MAX);
-    let total_groups = projection.row_group_count.max(1);
-    let required_bytes = projection
-        .segment_bytes
-        .saturating_mul(required_columns)
-        .div_ceil(total_columns)
-        .saturating_mul(selected_groups)
-        .div_ceil(total_groups);
-    1_u64
+    let decoded_values = selected_rows.saturating_mul(required_columns);
+    // Startup, row-group dispatch, encoded byte pages, and vector value work
+    // all use the same storage-neutral integer work units as managed scans.
+    2_u64
         .saturating_add(selected_groups)
         .saturating_add(required_bytes.div_ceil(4096))
-        .saturating_add(selected_rows.div_ceil(256))
+        .saturating_add(decoded_values.div_ceil(256))
 }
 
 fn planning_group_cannot_match(
@@ -2276,17 +2279,213 @@ pub fn plan_statement_with_columnar_snapshots(
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessCostHints, AccessPath, AccessPathCapabilities, PhysicalPlan, PhysicalStatement,
-        RangeTablePlanningSnapshot, TableAccessStatistics, plan, plan_statement,
-        plan_statement_with_access_paths, plan_statement_with_statistics, plan_with_access_paths,
-        plan_with_partition_snapshots, plan_with_statistics, point_lookup_cost,
+        AccessCostHints, AccessPath, AccessPathCapabilities, ColumnarPlanningConstraint,
+        ColumnarProjectionPlanningSnapshot, ColumnarRowGroupPlanningSnapshot,
+        ColumnarZoneMapPlanningSnapshot, PhysicalPlan, PhysicalStatement,
+        RangeTablePlanningSnapshot, TableAccessStatistics, columnar_work_units, plan,
+        plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
+        plan_with_access_paths, plan_with_columnar_snapshots, plan_with_partition_snapshots,
+        plan_with_statistics, point_lookup_cost,
     };
     use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
     use netbadb_types::{
-        AccessPathId, ColumnId, ExprType, PhysicalType, RelationBindingId, ScalarValue,
-        SemanticType, TableId,
+        AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, ExprType, PhysicalType,
+        RelationBindingId, ScalarValue, SemanticType, StorageId, TableId,
     };
+
+    fn columnar_snapshot(
+        projected_columns: Vec<ColumnId>,
+        groups: Vec<ColumnarRowGroupPlanningSnapshot>,
+    ) -> ColumnarProjectionPlanningSnapshot {
+        ColumnarProjectionPlanningSnapshot {
+            projection_id: ColumnarProjectionId(1),
+            generation: ColumnarGeneration(1),
+            table_id: TableId(1),
+            source_storage_id: StorageId(1),
+            projected_columns,
+            row_count: groups.iter().map(|group| u64::from(group.rows)).sum(),
+            row_group_count: u64::try_from(groups.len()).expect("group count"),
+            segment_bytes: groups
+                .iter()
+                .flat_map(|group| &group.columns)
+                .map(|column| column.encoded_bytes)
+                .sum(),
+            row_groups: groups,
+        }
+    }
+
+    fn planning_group(
+        rows: u32,
+        columns: &[ColumnId],
+        bytes_per_column: u64,
+        minimum: i64,
+        maximum: i64,
+    ) -> ColumnarRowGroupPlanningSnapshot {
+        ColumnarRowGroupPlanningSnapshot {
+            rows,
+            columns: columns
+                .iter()
+                .map(|column_id| ColumnarZoneMapPlanningSnapshot {
+                    column_id: *column_id,
+                    null_count: 0,
+                    minimum: Some(ScalarValue::Int64(minimum)),
+                    maximum: Some(ScalarValue::Int64(maximum)),
+                    encoded_bytes: bytes_per_column,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn columnar_cost_uses_projected_bytes_and_keeps_index_precedence() {
+        let id = test_column(1, "id", false);
+        let payload = test_column(2, "payload", false);
+        let point = LogicalPlan::Project {
+            input: Box::new(filtered_scan(
+                binary(
+                    BinaryOp::Eq,
+                    column_expr(&id),
+                    literal(ScalarValue::Int64(7)),
+                ),
+                vec![id.clone(), payload.clone()],
+            )),
+            columns: vec![payload.clone()],
+        };
+        let projection = columnar_snapshot(
+            vec![ColumnId(1), ColumnId(2)],
+            vec![planning_group(
+                10_000,
+                &[ColumnId(1), ColumnId(2)],
+                80_000,
+                0,
+                9_999,
+            )],
+        );
+        let planned = plan_with_columnar_snapshots(
+            &point,
+            &[analyzed_table(10_000, 1_000)],
+            &[analyzed_path(1, 40, 10_000, 0, 2)],
+            &[],
+            std::slice::from_ref(&projection),
+        );
+        assert!(matches!(
+            base_plan(&planned),
+            PhysicalPlan::IndexScan { .. }
+        ));
+
+        let small_table_scan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(7),
+                table_id: TableId(1),
+                table_name: "users".into(),
+                columns: vec![id.clone(), payload.clone()],
+            }),
+            columns: vec![id, payload],
+        };
+        let costly_projection = columnar_snapshot(
+            vec![ColumnId(1), ColumnId(2)],
+            vec![
+                planning_group(128, &[ColumnId(1), ColumnId(2)], 4_096, 0, 127),
+                planning_group(128, &[ColumnId(1), ColumnId(2)], 4_096, 128, 255),
+            ],
+        );
+        let planned = plan_with_columnar_snapshots(
+            &small_table_scan,
+            &[analyzed_table(256, 4)],
+            &[],
+            &[],
+            &[costly_projection],
+        );
+        assert!(matches!(base_plan(&planned), PhysicalPlan::SeqScan { .. }));
+    }
+
+    #[test]
+    fn wide_projection_with_narrow_required_subset_can_beat_authoritative_scan() {
+        let required = [ColumnId(1), ColumnId(2), ColumnId(3)];
+        let projected = (1..=128).map(ColumnId).collect::<Vec<_>>();
+        let groups = (0..16)
+            .map(|group| planning_group(512, &projected, 4_096, group * 512, group * 512 + 511))
+            .collect();
+        let projection = columnar_snapshot(projected, groups);
+        let columns = required
+            .iter()
+            .enumerate()
+            .map(|(position, id)| test_column(id.0, &format!("c{position}"), false))
+            .collect::<Vec<_>>();
+        let logical = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Scan {
+                binding_id: RelationBindingId(7),
+                table_id: TableId(1),
+                table_name: "wide".into(),
+                columns: columns.clone(),
+            }),
+            columns,
+        };
+        let planned = plan_with_columnar_snapshots(
+            &logical,
+            &[analyzed_table(8_192, 1_000)],
+            &[],
+            &[],
+            &[projection],
+        );
+        assert!(matches!(
+            base_plan(&planned),
+            PhysicalPlan::ColumnarScan { .. }
+        ));
+    }
+
+    #[test]
+    fn zone_map_pruning_reduces_work_independently_of_predicate_selectivity() {
+        let column = ColumnId(1);
+        let projected = vec![column];
+        let friendly = columnar_snapshot(
+            projected.clone(),
+            (0..8)
+                .map(|group| planning_group(100, &projected, 800, group * 100, group * 100 + 99))
+                .collect(),
+        );
+        let hostile = columnar_snapshot(
+            projected,
+            (0..8)
+                .map(|_| planning_group(100, &[column], 800, 0, 799))
+                .collect(),
+        );
+        let constraints = [ColumnarPlanningConstraint {
+            column_id: column,
+            lower: Some((ScalarValue::Int64(100), true)),
+            upper: Some((ScalarValue::Int64(199), true)),
+        }];
+        let friendly_work = columnar_work_units(&friendly, &[column], &constraints);
+        let hostile_work = columnar_work_units(&hostile, &[column], &constraints);
+        assert!(friendly_work < hostile_work);
+        assert_eq!(friendly_work, 5);
+        assert_eq!(hostile_work, 16);
+    }
+
+    #[test]
+    fn projection_missing_a_required_column_is_never_a_candidate() {
+        let id = test_column(1, "id", false);
+        let payload = test_column(2, "payload", false);
+        let logical = LogicalPlan::Scan {
+            binding_id: RelationBindingId(7),
+            table_id: TableId(1),
+            table_name: "users".into(),
+            columns: vec![id, payload],
+        };
+        let projection = columnar_snapshot(
+            vec![ColumnId(1)],
+            vec![planning_group(1_000, &[ColumnId(1)], 8_000, 0, 999)],
+        );
+        let planned = plan_with_columnar_snapshots(
+            &logical,
+            &[analyzed_table(1_000, 10_000)],
+            &[],
+            &[],
+            &[projection],
+        );
+        assert!(matches!(planned, PhysicalPlan::SeqScan { .. }));
+    }
 
     #[test]
     fn creates_a_sequence_scan_physical_plan() {

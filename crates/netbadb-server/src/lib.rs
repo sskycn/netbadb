@@ -680,6 +680,7 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         DatabaseError::Execution(_) => ProtocolErrorCode::Execution,
         DatabaseError::ExpectedQuery
         | DatabaseError::SchemaCatalog(_)
+        | DatabaseError::ProjectionCatalog(_)
         | DatabaseError::SchemaMutation(_)
         | DatabaseError::Registry(_)
         | DatabaseError::Transaction(_)

@@ -2,13 +2,14 @@
 
 #[cfg(feature = "embedded")]
 pub use netbadb_core::{
-    AlterTableOperation, AlterTableSpec, ColumnarExecutionStatistics, ColumnarProjectionHealth,
-    ColumnarProjectionInspection, ColumnarProjectionSpec, CompleteLegacyInventory,
-    CreateColumnSpec, CreateTableSpec, Database, DatabaseCoordinatorConfig, DatabaseError,
-    ExecutionResult, LegacyStorageLocation, PartitionCatalogConfig, QueryResult,
-    RangePartitionSpec, ReplacementRetiredHeap, ResultColumn, SchemaCatalogError, SchemaDependency,
-    SchemaGeneration, SchemaMutationError, TablePlacementSpec, TableSchemaVersion,
-    TableStorageCreateSpec, Transaction, TransactionState,
+    AlterTableOperation, AlterTableSpec, ColumnarExecutionStatistics,
+    ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
+    ColumnarProjectionSpec, CompleteLegacyInventory, CreateColumnSpec, CreateTableSpec, Database,
+    DatabaseCoordinatorConfig, DatabaseError, ExecutionResult, LegacyStorageLocation,
+    PartitionCatalogConfig, ProjectionCatalogError, QueryResult, RangePartitionSpec,
+    ReplacementRetiredHeap, ResultColumn, SchemaCatalogError, SchemaDependency, SchemaGeneration,
+    SchemaMutationError, TablePlacementSpec, TableSchemaVersion, TableStorageCreateSpec,
+    Transaction, TransactionState,
 };
 pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,
