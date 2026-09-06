@@ -8223,6 +8223,8 @@ mod tests {
 #[cfg(test)]
 mod adopted_source_refinement_expansion_audit_tests;
 #[cfg(test)]
+mod change_stream_schema_replacement_audit_tests;
+#[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]
 mod indexed_nullability_audit_tests;

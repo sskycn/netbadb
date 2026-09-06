@@ -1,5 +1,23 @@
 # NetbaDB roadmap
 
+## Active change stream × schema replacement audit (Round 51 complete)
+
+- proved that current S1-to-S2 replacement commits the final ordinary-DML S1
+  NBCL batch but makes it unreachable through the TableId API, publishes S2
+  with its stream Disabled, and later removes the retained S1 log/guard through
+  replacement GC;
+- classified that behavior as unsafe silent abandonment and verified pre-CORD
+  loser, post-CORD winner/finalize repair, same-S1 no-op, index-only, explicit
+  disable/rebaseline/anchor, unavailable-stream, Round 42/46/48/50, and direct
+  Core paths without changing production behavior;
+- selected Round 52 Candidate A2: only a final physical `RewriteHeap` should
+  reject an Enabled or Unavailable source before intent/allocation/mutation;
+  Disabled replacement and same-S1 paths remain unchanged;
+- retained NBCL v1, NBSJ tags, CORD, schema/storage/protocol/SDK/Columnar
+  formats, recovery, GC, and storage-local identity semantics.
+
+See [`change-stream-schema-replacement-round51.md`](change-stream-schema-replacement-round51.md).
+
 ## Deferred new-column backfill (Round 50 complete)
 
 - productionized the Round 49 ordered typed deferred UPDATE program for
