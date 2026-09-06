@@ -94,7 +94,11 @@ managed retention GC. [Phase 2D](docs/columnar-phase2d-lazy-io.md) adds NBCM v3,
 indexed NBCS v3 and NBCD v2 readers: open retains directories, zone maps,
 descriptors, and row references while projected values are fetched and verified
 only for selected groups and columns. Legacy v1/v2/v1 projections remain
-readable through the eager path.
+readable through the eager path. [Phase
+2E](docs/columnar-phase2e-maintenance-controller.md) adds read-only maintenance
+inspection plus one-action, caller-driven synchronous maintenance steps with
+shared structural work/read/write budgets, typed reasons, stable ranking, and a
+runtime-only fairness cursor. It is not background scheduling.
 
 [Round 52](docs/change-stream-schema-replacement-round52.md) requires an
 enabled or unavailable per-storage Change Stream to be explicitly abandoned

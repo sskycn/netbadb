@@ -695,6 +695,24 @@ pub struct LsmInspection {
     pub analyzed_max_clustering: Option<ScalarValue>,
 }
 
+/// Admission estimate for one existing atomic LSM maintenance primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmMaintenanceCostInspection {
+    pub work_units: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+/// Immutable structural state used by higher-level maintenance policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmMaintenanceInspection {
+    pub memtable_entry_count: u64,
+    pub memtable_bytes: u64,
+    pub memtable_flush_threshold_bytes: u64,
+    pub flush_cost: Option<LsmMaintenanceCostInspection>,
+    pub next_compaction_cost: Option<LsmMaintenanceCostInspection>,
+}
+
 #[derive(Debug)]
 struct VisibleRow {
     key: PhysicalKey,
@@ -1089,6 +1107,30 @@ impl LsmStorage {
         }
     }
 
+    pub fn maintenance_inspection(&self) -> Result<LsmMaintenanceInspection, StorageError> {
+        let shared = self.shared.borrow();
+        let memtable_entry_count = shared
+            .memtable
+            .values()
+            .map(|versions| versions.len() as u64)
+            .sum::<u64>();
+        let flush_cost = (memtable_entry_count != 0).then_some(LsmMaintenanceCostInspection {
+            work_units: memtable_entry_count,
+            read_bytes: shared.memtable_bytes,
+            write_bytes: shared.memtable_bytes,
+        });
+        let next_compaction_cost = pick_compaction(&shared)?
+            .map(|plan| compaction_cost_inspection(&shared, &plan))
+            .transpose()?;
+        Ok(LsmMaintenanceInspection {
+            memtable_entry_count,
+            memtable_bytes: shared.memtable_bytes,
+            memtable_flush_threshold_bytes: shared.flush_threshold,
+            flush_cost,
+            next_compaction_cost,
+        })
+    }
+
     pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
         if self.shared.borrow().runtime.recovery_required.get() {
             Err(TransactionError::RecoveryRequired.into())
@@ -1167,6 +1209,12 @@ impl LsmStorage {
 
     pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
         self.shared.borrow().change_stream.inspection()
+    }
+
+    pub(crate) fn change_stream_maintenance_inspection(
+        &self,
+    ) -> crate::ChangeStreamMaintenanceInspection {
+        self.shared.borrow().change_stream.maintenance_inspection()
     }
 
     pub fn begin_transaction(&mut self) -> Result<LsmTransaction, StorageError> {
@@ -1602,6 +1650,21 @@ impl LsmStorage {
             flush_memtable(&mut shared)?;
         }
         compact_sstables(&mut shared)
+    }
+
+    /// Executes at most one already-eligible structural compaction. It never
+    /// folds a MemTable flush into the same action.
+    pub fn compact_one(&self) -> Result<bool, StorageError> {
+        let mut shared = self.shared.borrow_mut();
+        ensure_maintenance_safe(&shared)?;
+        if !shared.memtable.is_empty() {
+            return Ok(false);
+        }
+        let Some(plan) = pick_compaction(&shared)? else {
+            return Ok(false);
+        };
+        execute_compaction(&mut shared, &plan, false)?;
+        Ok(true)
     }
 
     /// Merges every immutable level and discards superseded history. This is
@@ -4278,6 +4341,38 @@ fn compact_full_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
 struct CompactionPlan {
     output_level: u8,
     input_ids: BTreeSet<u64>,
+}
+
+fn compaction_cost_inspection(
+    shared: &LsmShared,
+    plan: &CompactionPlan,
+) -> Result<LsmMaintenanceCostInspection, StorageError> {
+    let mut work_units = 0_u64;
+    let mut input_bytes = 0_u64;
+    for sstable in shared
+        .sstables
+        .iter()
+        .filter(|sstable| plan.input_ids.contains(&sstable.reference.id))
+    {
+        work_units = work_units
+            .checked_add(sstable.reference.entry_count)
+            .ok_or(LsmError::InvalidManifest(
+                "compaction work estimate overflows",
+            ))?;
+        input_bytes = input_bytes
+            .checked_add(sstable.reference.file_bytes)
+            .ok_or(LsmError::InvalidManifest(
+                "compaction byte estimate overflows",
+            ))?;
+    }
+    Ok(LsmMaintenanceCostInspection {
+        work_units,
+        read_bytes: input_bytes,
+        // This is an admission estimate, not an I/O counter. Existing input
+        // bytes are the closest storage-owned structural estimate available
+        // without decoding every SSTable during planning.
+        write_bytes: input_bytes,
+    })
 }
 
 fn pick_compaction(shared: &LsmShared) -> Result<Option<CompactionPlan>, StorageError> {

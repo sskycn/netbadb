@@ -2078,6 +2078,12 @@ impl HeapStorage {
         self.change_stream.borrow().inspection()
     }
 
+    pub(crate) fn change_stream_maintenance_inspection(
+        &self,
+    ) -> crate::ChangeStreamMaintenanceInspection {
+        self.change_stream.borrow().maintenance_inspection()
+    }
+
     pub(crate) fn buffer(&self) -> &BufferPool {
         &self.buffer
     }

@@ -539,6 +539,15 @@ impl TableStorage {
             Self::Lsm(storage) => Some(storage.inspection()),
         }
     }
+
+    pub fn lsm_maintenance_inspection(
+        &self,
+    ) -> Result<Option<crate::LsmMaintenanceInspection>, StorageError> {
+        match self {
+            Self::Heap(_) => Ok(None),
+            Self::Lsm(storage) => storage.maintenance_inspection().map(Some),
+        }
+    }
     pub fn create_heap(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
         HeapStorage::create(path, table)
             .map(Box::new)
@@ -724,6 +733,16 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => storage.change_stream_inspection(),
             Self::Lsm(storage) => storage.change_stream_inspection(),
+        }
+    }
+
+    /// Returns small record metadata for maintenance policy without cloning or
+    /// decoding committed row payloads.
+    #[must_use]
+    pub fn inspect_change_stream_maintenance(&self) -> crate::ChangeStreamMaintenanceInspection {
+        match self {
+            Self::Heap(storage) => storage.change_stream_maintenance_inspection(),
+            Self::Lsm(storage) => storage.change_stream_maintenance_inspection(),
         }
     }
 
@@ -1616,6 +1635,16 @@ impl TableStorage {
                 storage_kind: "Heap",
             }),
             Self::Lsm(storage) => storage.compact(),
+        }
+    }
+
+    pub fn compact_lsm_one(&mut self) -> Result<bool, StorageError> {
+        match self {
+            Self::Heap(_) => Err(StorageError::UnsupportedOperation {
+                operation: "LSM bounded compaction",
+                storage_kind: "Heap",
+            }),
+            Self::Lsm(storage) => storage.compact_one(),
         }
     }
 

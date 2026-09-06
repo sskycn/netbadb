@@ -191,6 +191,28 @@ pub struct ChangeStreamInspection {
     pub last_error: Option<String>,
 }
 
+/// Payload-free metadata used to plan bounded change-stream maintenance.
+///
+/// `change_bytes` is the exact encoded prepared-record length consumed by a
+/// bounded reader. `retained_file_bytes` additionally includes the matching
+/// finalize record and is therefore the exact contribution retained by an
+/// NBCL rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeBatchMaintenanceInspection {
+    pub before: StorageDataVersion,
+    pub after: StorageDataVersion,
+    pub mutation_count: u64,
+    pub change_bytes: u64,
+    pub retained_file_bytes: u64,
+}
+
+/// Immutable, payload-free NBCL state for maintenance planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeStreamMaintenanceInspection {
+    pub stream: ChangeStreamInspection,
+    pub batches: Vec<ChangeBatchMaintenanceInspection>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeStreamGcStorageReport {
     pub storage_id: StorageId,
@@ -406,6 +428,14 @@ struct PreparedRecord {
     batch: ChangeBatch,
     outcome: AuthoritativeOutcome,
     finalized: bool,
+    prepared_file_bytes: u64,
+    retained_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchFileBytes {
+    change_bytes: u64,
+    retained_file_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -418,6 +448,7 @@ enum State {
         file: File,
         file_bytes: u64,
         batches: Vec<ChangeBatch>,
+        batch_file_bytes: Vec<BatchFileBytes>,
         finalize_versions: BTreeMap<TxnId, Option<LsmCommitSeq>>,
         unresolved: BTreeMap<TxnId, PreparedRecord>,
         next_sequence: u64,
@@ -617,6 +648,7 @@ impl ChangeStreamManager {
             file,
             file_bytes,
             batches: Vec::new(),
+            batch_file_bytes: Vec::new(),
             finalize_versions: BTreeMap::new(),
             unresolved: BTreeMap::new(),
             next_sequence: 1,
@@ -720,7 +752,10 @@ impl ChangeStreamManager {
         max_bytes: u64,
     ) -> Result<ChangeReadResult, StorageError> {
         let State::Enabled {
-            header, batches, ..
+            header,
+            batches,
+            batch_file_bytes,
+            ..
         } = &self.state
         else {
             return match &self.state {
@@ -755,7 +790,7 @@ impl ChangeStreamManager {
         let mut expected = cursor.frontier;
         let mut bytes = 0_u64;
         let mut selected = Vec::new();
-        for batch in &batches[start..] {
+        for (batch, record_bytes) in batches[start..].iter().zip(&batch_file_bytes[start..]) {
             if batch.before != expected {
                 return Err(ChangeStreamError::ChangeGap {
                     expected,
@@ -763,7 +798,7 @@ impl ChangeStreamManager {
                 }
                 .into());
             }
-            let encoded_bytes = encode_record(batch)?.len() as u64;
+            let encoded_bytes = record_bytes.change_bytes;
             if selected.len() >= max_batches
                 || bytes
                     .checked_add(encoded_bytes)
@@ -799,6 +834,7 @@ impl ChangeStreamManager {
             file,
             file_bytes,
             batches,
+            batch_file_bytes,
             finalize_versions,
             unresolved,
             next_sequence,
@@ -874,6 +910,7 @@ impl ChangeStreamManager {
             .map(|batch| batch.physical_txn_id)
             .collect::<Vec<_>>();
         batches.drain(..first_retained);
+        batch_file_bytes.drain(..first_retained);
         for txn_id in removed_ids {
             finalize_versions.remove(&txn_id);
         }
@@ -966,6 +1003,29 @@ impl ChangeStreamManager {
             last_error,
         }
     }
+
+    pub(crate) fn maintenance_inspection(&self) -> ChangeStreamMaintenanceInspection {
+        let stream = self.inspection();
+        let batches = match &self.state {
+            State::Enabled {
+                batches,
+                batch_file_bytes,
+                ..
+            } => batches
+                .iter()
+                .zip(batch_file_bytes)
+                .map(|(batch, bytes)| ChangeBatchMaintenanceInspection {
+                    before: batch.before,
+                    after: batch.after,
+                    mutation_count: batch.mutations.len() as u64,
+                    change_bytes: bytes.change_bytes,
+                    retained_file_bytes: bytes.retained_file_bytes,
+                })
+                .collect(),
+            State::Disabled { .. } | State::Unavailable { .. } => Vec::new(),
+        };
+        ChangeStreamMaintenanceInspection { stream, batches }
+    }
 }
 
 fn prepare_enabled(
@@ -1035,6 +1095,8 @@ fn prepare_enabled(
             batch,
             outcome: AuthoritativeOutcome::Unresolved,
             finalized: false,
+            prepared_file_bytes: encoded.len() as u64,
+            retained_file_bytes: encoded.len() as u64,
         },
     );
     Ok(Some(PreparedChange {
@@ -1055,6 +1117,7 @@ fn publish_enabled(
         file,
         file_bytes,
         batches,
+        batch_file_bytes,
         finalize_versions,
         unresolved,
         ..
@@ -1100,8 +1163,16 @@ fn publish_enabled(
     file.write_all(&marker)?;
     file.sync_data()?;
     *file_bytes = following_file_bytes;
+    record.retained_file_bytes = record
+        .retained_file_bytes
+        .checked_add(marker.len() as u64)
+        .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
     unresolved.remove(&txn_id);
     finalize_versions.insert(txn_id, lsm_commit);
+    batch_file_bytes.push(BatchFileBytes {
+        change_bytes: record.prepared_file_bytes,
+        retained_file_bytes: record.retained_file_bytes,
+    });
     batches.push(record.batch);
     Ok(())
 }
@@ -1112,7 +1183,7 @@ fn build_enabled_state(
     mut file_bytes: u64,
     records: Vec<PreparedRecord>,
 ) -> Result<State, ChangeStreamError> {
-    let mut batches = Vec::new();
+    let mut committed = Vec::new();
     let mut finalize_versions = BTreeMap::new();
     let mut unresolved = BTreeMap::new();
     let mut max_sequence = 0;
@@ -1143,9 +1214,17 @@ fn build_enabled_state(
                     file_bytes = file_bytes
                         .checked_add(marker.len() as u64)
                         .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+                    record.retained_file_bytes = record
+                        .retained_file_bytes
+                        .checked_add(marker.len() as u64)
+                        .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
                 }
                 finalize_versions.insert(record.batch.physical_txn_id, commit);
-                batches.push(record.batch);
+                committed.push((
+                    record.batch,
+                    record.prepared_file_bytes,
+                    record.retained_file_bytes,
+                ));
             }
             AuthoritativeOutcome::Aborted => {}
             AuthoritativeOutcome::Unresolved => {
@@ -1153,7 +1232,19 @@ fn build_enabled_state(
             }
         }
     }
-    batches.sort_by_key(|batch| batch.sequence);
+    committed.sort_by_key(|(batch, _, _)| batch.sequence);
+    let (batches, batch_file_bytes): (Vec<_>, Vec<_>) = committed
+        .into_iter()
+        .map(|(batch, change_bytes, retained_file_bytes)| {
+            (
+                batch,
+                BatchFileBytes {
+                    change_bytes,
+                    retained_file_bytes,
+                },
+            )
+        })
+        .unzip();
     validate_committed_chain(header.earliest, &batches)?;
     let effective = effective_current(&header, &batches);
     if batches.is_empty() && header.earliest != header.current {
@@ -1175,6 +1266,7 @@ fn build_enabled_state(
         file,
         file_bytes,
         batches,
+        batch_file_bytes,
         finalize_versions,
         unresolved,
         next_sequence,
@@ -1687,10 +1779,13 @@ where
         match payload.first().copied() {
             Some(PREPARED_TAG) => {
                 let batch = decode_record(&payload, &header, table)?;
+                let record_file_bytes = 8_u64 + u64::from(length);
                 records.push(PreparedRecord {
                     outcome: outcome(batch.physical_txn_id),
                     batch,
                     finalized: false,
+                    prepared_file_bytes: record_file_bytes,
+                    retained_file_bytes: record_file_bytes,
                 });
             }
             Some(FINALIZE_TAG) => {
@@ -1708,6 +1803,10 @@ where
                 }
                 record.finalized = true;
                 record.outcome = AuthoritativeOutcome::Committed(commit);
+                record.retained_file_bytes = record
+                    .retained_file_bytes
+                    .checked_add(8_u64 + u64::from(length))
+                    .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
             }
             _ => return Err(ChangeStreamError::InvalidRecord("unknown record tag")),
         }

@@ -6,10 +6,13 @@ pub use netbadb_core::{
     ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
     ColumnarProjectionSpec, CompleteLegacyInventory, CreateColumnSpec, CreateTableSpec, Database,
     DatabaseCoordinatorConfig, DatabaseError, ExecutionResult, LegacyStorageLocation,
-    PartitionCatalogConfig, ProjectionCatalogError, QueryResult, RangePartitionSpec,
-    ReplacementRetiredHeap, ResultColumn, SchemaCatalogError, SchemaDependency, SchemaGeneration,
-    SchemaMutationError, TablePlacementSpec, TableSchemaVersion, TableStorageCreateSpec,
-    Transaction, TransactionState,
+    LsmMaintenanceReport, MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker,
+    MaintenanceBound, MaintenanceBudget, MaintenanceCandidate, MaintenanceConsumption,
+    MaintenanceDecision, MaintenanceEstimate, MaintenanceInspection, MaintenanceOutcome,
+    MaintenanceReason, MaintenanceStepReport, PartitionCatalogConfig, ProjectionCatalogError,
+    QueryResult, RangePartitionSpec, ReplacementRetiredHeap, ResultColumn, SchemaCatalogError,
+    SchemaDependency, SchemaGeneration, SchemaMutationError, TablePlacementSpec,
+    TableSchemaVersion, TableStorageCreateSpec, Transaction, TransactionState,
 };
 pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,

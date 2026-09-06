@@ -8,6 +8,9 @@ mod coordinator_crash;
 mod coordinator_log;
 mod deferred_backfill;
 mod inspection;
+mod maintenance;
+#[cfg(test)]
+mod maintenance_tests;
 mod partition_catalog;
 mod projection_catalog;
 mod registry;
@@ -75,6 +78,12 @@ pub use columnar::{
     ColumnarProjectionSpec,
 };
 pub use coordinator_log::CoordinatorLogError;
+pub use maintenance::{
+    LsmMaintenanceReport, MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker,
+    MaintenanceBound, MaintenanceBudget, MaintenanceCandidate, MaintenanceConsumption,
+    MaintenanceDecision, MaintenanceEstimate, MaintenanceInspection, MaintenanceOutcome,
+    MaintenanceReason, MaintenanceStepReport,
+};
 pub use netbadb_executor::{
     ColumnarExecutionStatistics, ExecutionResult, QueryResult, ResultColumn,
 };
@@ -990,6 +999,7 @@ pub struct Database {
     catalog_path: Option<PathBuf>,
     mutation_journal: Option<schema_mutation::SharedMutationJournal>,
     schema_writer: schema_mutation::SchemaWriter,
+    maintenance_cursor: Option<maintenance::MaintenanceCursor>,
 }
 
 impl Database {
@@ -1628,6 +1638,7 @@ impl Database {
             catalog_path: None,
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
+            maintenance_cursor: None,
         })
     }
 
@@ -1653,6 +1664,7 @@ impl Database {
             catalog_path: None,
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
+            maintenance_cursor: None,
         })
     }
 
@@ -1695,6 +1707,7 @@ impl Database {
             catalog_path: None,
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
+            maintenance_cursor: None,
         })
     }
 
@@ -1760,6 +1773,7 @@ impl Database {
             catalog_path: None,
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
+            maintenance_cursor: None,
         })
     }
 
@@ -6422,6 +6436,7 @@ mod tests {
             catalog_path: None,
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
+            maintenance_cursor: None,
         };
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")

@@ -212,6 +212,13 @@ fn gc_persists_retained_and_current_frontiers_and_sequence_high_water() {
         .read_changes(origin, 10, 1_000_000)
         .expect("read complete history");
     assert_eq!(all.batches.len(), 3);
+    let maintenance_before = storage.inspect_change_stream_maintenance();
+    assert_eq!(maintenance_before.batches.len(), 3);
+    assert!(
+        maintenance_before.batches.iter().all(|batch| {
+            batch.change_bytes > 0 && batch.retained_file_bytes > batch.change_bytes
+        })
+    );
     let retained = all.batches[1].after;
     let current = all.current_frontier;
 
@@ -228,6 +235,9 @@ fn gc_persists_retained_and_current_frontiers_and_sequence_high_water() {
     assert_eq!(inspection.baseline_data_version, Some(origin.frontier));
     assert_eq!(inspection.earliest_available_frontier, Some(retained));
     assert_eq!(inspection.current_data_version, current);
+    let maintenance_after = storage.inspect_change_stream_maintenance();
+    assert_eq!(maintenance_after.batches.len(), 1);
+    assert_eq!(maintenance_after.batches[0].before, retained);
     let old = netbadb_storage::ChangeStreamCursor {
         frontier: netbadb_types::StorageDataVersion(retained.0 - 1),
         ..origin
@@ -264,6 +274,12 @@ fn gc_persists_retained_and_current_frontiers_and_sequence_high_water() {
     );
     assert_eq!(reopened_inspection.current_data_version, current);
     assert_eq!(reopened_inspection.committed_batch_count, 0);
+    assert!(
+        reopened
+            .inspect_change_stream_maintenance()
+            .batches
+            .is_empty()
+    );
 
     reopened.insert(&row(4, "d")).expect("post-GC insert");
     let post_gc_cursor = netbadb_storage::ChangeStreamCursor {
@@ -277,6 +293,9 @@ fn gc_persists_retained_and_current_frontiers_and_sequence_high_water() {
     assert_eq!(post_gc.batches[0].before, current);
     assert_eq!(post_gc.batches[0].after.0, current.0 + 1);
     assert_eq!(post_gc.batches[0].sequence, 4);
+    let maintenance_reopened = reopened.inspect_change_stream_maintenance();
+    assert_eq!(maintenance_reopened.batches.len(), 1);
+    assert_eq!(maintenance_reopened.batches[0].before, current);
     reopened.close().expect("close reopened heap");
     let change_path = heap_change_log_path(&path);
     let change_file = std::fs::OpenOptions::new()

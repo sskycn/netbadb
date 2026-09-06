@@ -149,11 +149,13 @@ cargo bench -p netbadb-core --bench columnar_lazy_io_phase2d
 Set `NETBADB_COLUMNAR_LAZY_DELTA=0` only when a quick Base-only development run
 is desired; the default formal run includes the fixed 1M/100K Delta case.
 
-## Deferred Phase 2E work
+## Work deferred beyond Phase 2D
 
 Phase 2D deliberately adds no decoded chunk cache, mmap, unsafe zero-copy,
-compression, dictionary encoding, SIMD, async prefetch, background maintenance,
-automatic NBCL GC, aggregate spill, global CSN, `RowEntityId`, or authoritative
-Columnar placement. The matrix shows stable three-block query work and does not
-establish decoded-block reuse as the dominant bottleneck, so a cache is not
-justified here.
+compression, dictionary encoding, SIMD, async prefetch, aggregate spill, global
+CSN, `RowEntityId`, or authoritative Columnar placement. The matrix shows stable
+three-block query work and does not establish decoded-block reuse as the
+dominant bottleneck, so a cache is not justified here. [Phase
+2E](columnar-phase2e-maintenance-controller.md) subsequently adds explicit,
+caller-driven bounded maintenance selection; it does not add a background
+worker or cache.
