@@ -31,9 +31,9 @@ pub use change_stream::{
 pub use columnar::{
     ColumnarBatch, ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics,
     ColumnarConstraint, ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata,
-    ColumnarProjection, ColumnarProjectionMetadata, ColumnarRowGroupStatistics,
-    ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance, PreparedColumnarProjection,
-    StorageSnapshotToken,
+    ColumnarProjection, ColumnarProjectionMetadata, ColumnarRepresentationStatistics,
+    ColumnarRowGroupStatistics, ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance,
+    PreparedColumnarProjection, StorageSnapshotToken,
 };
 pub use heap::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, HistoricalOrphanAdoptionReport,

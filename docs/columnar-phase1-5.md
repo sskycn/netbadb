@@ -207,10 +207,10 @@ default: the best group size depends on pruning granularity and workload.
 At 10K rows with a full scan and three required columns, widths 4/16/64/128 all
 reported exactly 243,750 scanned bytes while total logical bytes rose from
 320,000 to 13,865,055. This proves scan-time column pruning, including that
-unqueried Text payload is not cloned into scan batches. The current Phase 1
-representation still decodes all projected chunks when the immutable segment
-is opened and keeps them resident; lazy on-disk chunk decode is outside this
-format-preserving hardening round.
+unqueried Text payload is not cloned into scan batches. That was the Phase 1.5
+representation: it still decoded all chunks at open. [Columnar Phase
+2D](columnar-phase2d-lazy-io.md) now uses indexed, independently verified lazy
+chunks for new generations while retaining the eager reader for legacy files.
 
 The 10K full-range GROUP BY matrix produced 2/100/10,000 result groups. At the
 two endpoints, Heap measured 1,725/3,098 µs and Columnar measured 1,307/3,722

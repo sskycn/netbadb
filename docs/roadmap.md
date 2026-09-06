@@ -118,8 +118,23 @@ See [Columnar Phase 2B](columnar-phase2b-base-delta.md).
   maintenance benchmarks.
 
 See [Columnar Phase 2C](columnar-phase2c-compaction-retention.md). Background
-maintenance, generic CDC leases, lazy Columnar loading, spill, global CSN,
+maintenance, generic CDC leases, spill, global CSN,
 `RowEntityId`, and hybrid authoritative storage remain deferred.
+
+## Columnar Phase 2D (complete)
+
+- NBCM v3 selects checksummed indexed NBCS v3 Base and NBCD v2 Delta formats;
+- open retains zone maps, directories, descriptors and exact row references,
+  with zero resident Base/Delta value bytes for the indexed representation;
+- scans prune before I/O, read version blocks only for retained groups when
+  suppression exists, and fetch only required Base/Delta column blocks;
+- active-reader generation leases, streaming lazy compaction, block-level
+  corruption quarantine and safe autocommit authoritative retry;
+- physical I/O/decode counters, representation inspection, legacy eager
+  compatibility, and 100K/1M widths 4/16/64/128 benchmark coverage.
+
+See [Columnar Phase 2D](columnar-phase2d-lazy-io.md). A decoded chunk cache,
+mmap, compression, SIMD, prefetch, and automatic maintenance remain deferred.
 
 ## Phase 0 — Rust foundation (complete)
 

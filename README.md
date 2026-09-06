@@ -87,6 +87,15 @@ row-version identities, transaction coalescing, bounded replay, gap detection,
 and coordinator correlation. It remains an embedded storage capability; no
 network CDC or Columnar Delta is implemented.
 
+[Columnar Phase 2B](docs/columnar-phase2b-base-delta.md) adds explicit
+NBCL-to-NBCD incremental advance and Base+Delta merge; [Phase
+2C](docs/columnar-phase2c-compaction-retention.md) adds explicit compaction and
+managed retention GC. [Phase 2D](docs/columnar-phase2d-lazy-io.md) adds NBCM v3,
+indexed NBCS v3 and NBCD v2 readers: open retains directories, zone maps,
+descriptors, and row references while projected values are fetched and verified
+only for selected groups and columns. Legacy v1/v2/v1 projections remain
+readable through the eager path.
+
 [Round 52](docs/change-stream-schema-replacement-round52.md) requires an
 enabled or unavailable per-storage Change Stream to be explicitly abandoned
 before an operation that would replace the authoritative Heap `StorageId`.

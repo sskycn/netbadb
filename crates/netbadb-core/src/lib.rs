@@ -2984,7 +2984,20 @@ impl Database {
         };
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
-        self.execute_query_plan(&plan, &view, None, None)
+        match self.execute_query_plan(&plan, &view, None, None) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let Some((projection_id, detail)) = columnar_read_failure(&error) else {
+                    return Err(error);
+                };
+                self.projections.quarantine(projection_id, detail);
+                let (_, retry) = self.compile_and_plan(source)?;
+                let PhysicalStatement::Query(retry) = retry else {
+                    return Err(DatabaseError::ExpectedQuery);
+                };
+                self.execute_query_plan(&retry, &view, None, None)
+            }
+        }
     }
 
     /// Executes a query and returns exact columnar row-group scan counters.
@@ -3000,8 +3013,22 @@ impl Database {
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
         let mut statistics = ColumnarExecutionStatistics::default();
-        let result = self.execute_query_plan(&plan, &view, None, Some(&mut statistics))?;
-        Ok((result, statistics))
+        match self.execute_query_plan(&plan, &view, None, Some(&mut statistics)) {
+            Ok(result) => Ok((result, statistics)),
+            Err(error) => {
+                let Some((projection_id, detail)) = columnar_read_failure(&error) else {
+                    return Err(error);
+                };
+                self.projections.quarantine(projection_id, detail);
+                let (_, retry) = self.compile_and_plan(source)?;
+                let PhysicalStatement::Query(retry) = retry else {
+                    return Err(DatabaseError::ExpectedQuery);
+                };
+                statistics = ColumnarExecutionStatistics::default();
+                let result = self.execute_query_plan(&retry, &view, None, Some(&mut statistics))?;
+                Ok((result, statistics))
+            }
+        }
     }
 
     /// Compiles SQL and reports its canonical table access without planning,
@@ -5182,6 +5209,20 @@ fn cleanup_created_table_files(paths: &[PathBuf]) -> Option<(PathBuf, std::io::E
         }
     }
     first_error
+}
+
+fn columnar_read_failure(error: &DatabaseError) -> Option<(ColumnarProjectionId, String)> {
+    let DatabaseError::Execution(ExecutionError::ColumnarRead {
+        projection_id,
+        source: StorageError::Columnar(columnar),
+    }) = error
+    else {
+        return None;
+    };
+    if !columnar.invalidates_projection() {
+        return None;
+    }
+    Some((*projection_id, columnar.to_string()))
 }
 
 #[cfg(test)]

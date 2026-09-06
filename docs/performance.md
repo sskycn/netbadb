@@ -40,6 +40,18 @@ analytics. It prints exact row-group pruning counters for the columnar case:
 cargo bench -p netbadb-core --bench columnar_phase1
 ```
 
+Columnar Phase 2D adds a scale-oriented lazy-I/O target. Its default matrix
+covers 100K and 1M rows at 4/16/64/128 columns, plus a fixed 1M Base + 100K
+Delta case at 64 columns. It reports internal resident-byte accounting and
+physical verified-block reads rather than unstable RSS or OS-cache estimates:
+
+```sh
+cargo bench -p netbadb-core --bench columnar_lazy_io_phase2d
+```
+
+The measured matrix and exact counter semantics are recorded in
+[Columnar Phase 2D](columnar-phase2d-lazy-io.md).
+
 Run the full profile for a manually recorded baseline:
 
 ```sh

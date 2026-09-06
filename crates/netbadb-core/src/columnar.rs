@@ -133,6 +133,18 @@ pub struct ColumnarProjectionInspection {
     pub row_group_count: Option<u64>,
     pub segment_count: Option<u64>,
     pub segment_bytes: Option<u64>,
+    pub representation: Option<&'static str>,
+    pub manifest_format_version: Option<u16>,
+    pub base_format_version: Option<u16>,
+    pub delta_format_version: Option<u16>,
+    pub resident_metadata_bytes: Option<u64>,
+    pub resident_payload_bytes: Option<u64>,
+    pub resident_suppressed_version_bytes: Option<u64>,
+    pub resident_delta_row_reference_bytes: Option<u64>,
+    pub base_index_bytes: Option<u64>,
+    pub delta_descriptor_bytes: Option<u64>,
+    pub base_index_entries: Option<u64>,
+    pub delta_descriptor_count: Option<u64>,
     pub mode: Option<&'static str>,
     pub stream_generation: Option<ChangeStreamGeneration>,
     pub base_frontier: Option<StorageDataVersion>,
@@ -400,6 +412,17 @@ impl ProjectionRegistry {
             .and_then(|entry| entry.projection.as_ref())
     }
 
+    pub(crate) fn quarantine(&mut self, id: ColumnarProjectionId, detail: String) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity.id == id)
+        {
+            entry.projection = None;
+            entry.detail = Some(detail);
+        }
+    }
+
     pub(crate) fn remove(
         &mut self,
         id: ColumnarProjectionId,
@@ -503,6 +526,7 @@ pub(crate) fn inspection(
         },
     };
     let incremental = metadata.incremental.as_ref();
+    let representation = projection.representation_statistics();
     ColumnarProjectionInspection {
         managed: entry.managed,
         projection_id: Some(metadata.id),
@@ -521,6 +545,18 @@ pub(crate) fn inspection(
         row_group_count: Some(metadata.row_group_count),
         segment_count: Some(metadata.segment_count),
         segment_bytes: Some(metadata.segment_bytes),
+        representation: Some(representation.representation),
+        manifest_format_version: Some(representation.manifest_format_version),
+        base_format_version: Some(representation.base_format_version),
+        delta_format_version: representation.delta_format_version,
+        resident_metadata_bytes: Some(representation.resident_metadata_bytes),
+        resident_payload_bytes: Some(representation.resident_payload_bytes),
+        resident_suppressed_version_bytes: Some(representation.resident_suppressed_version_bytes),
+        resident_delta_row_reference_bytes: Some(representation.resident_delta_row_reference_bytes),
+        base_index_bytes: Some(representation.base_index_bytes),
+        delta_descriptor_bytes: Some(representation.delta_descriptor_bytes),
+        base_index_entries: Some(representation.indexed_base_chunks),
+        delta_descriptor_count: incremental.map(|value| value.delta_mutation_count),
         mode: Some(if incremental.is_some() {
             "incremental"
         } else {
@@ -560,6 +596,18 @@ pub(crate) fn unavailable_inspection(
         row_group_count: None,
         segment_count: None,
         segment_bytes: None,
+        representation: None,
+        manifest_format_version: None,
+        base_format_version: None,
+        delta_format_version: None,
+        resident_metadata_bytes: None,
+        resident_payload_bytes: None,
+        resident_suppressed_version_bytes: None,
+        resident_delta_row_reference_bytes: None,
+        base_index_bytes: None,
+        delta_descriptor_bytes: None,
+        base_index_entries: None,
+        delta_descriptor_count: None,
         mode: None,
         stream_generation: None,
         base_frontier: None,
@@ -597,6 +645,18 @@ pub(crate) fn unmanaged_path_inspection(
         row_group_count: None,
         segment_count: None,
         segment_bytes: None,
+        representation: None,
+        manifest_format_version: None,
+        base_format_version: None,
+        delta_format_version: None,
+        resident_metadata_bytes: None,
+        resident_payload_bytes: None,
+        resident_suppressed_version_bytes: None,
+        resident_delta_row_reference_bytes: None,
+        base_index_bytes: None,
+        delta_descriptor_bytes: None,
+        base_index_entries: None,
+        delta_descriptor_count: None,
         mode: None,
         stream_generation: None,
         base_frontier: None,

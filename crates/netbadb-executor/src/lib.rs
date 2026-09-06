@@ -101,6 +101,10 @@ pub enum PreparedMutation {
 #[derive(Debug)]
 pub enum ExecutionError {
     Storage(StorageError),
+    ColumnarRead {
+        projection_id: ColumnarProjectionId,
+        source: StorageError,
+    },
     MissingColumn(String),
     ExpectedBoolean,
     TypeMismatch,
@@ -139,6 +143,14 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => error.fmt(formatter),
+            Self::ColumnarRead {
+                projection_id,
+                source,
+            } => write!(
+                formatter,
+                "columnar projection {} read failed: {source}",
+                projection_id.0
+            ),
             Self::MissingColumn(name) => write!(
                 formatter,
                 "execution input does not contain column `{name}`"
@@ -219,6 +231,7 @@ impl Error for ExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
+            Self::ColumnarRead { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -548,9 +561,12 @@ fn build_vector_rows(
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
-            let (batches, scan) = projection
-                .scan(&column_ids, constraints)
-                .map_err(StorageError::from)?;
+            let (batches, scan) = projection.scan(&column_ids, constraints).map_err(|error| {
+                ExecutionError::ColumnarRead {
+                    projection_id: *projection_id,
+                    source: StorageError::from(error),
+                }
+            })?;
             if let Some(statistics) = statistics {
                 statistics.projection_id = Some(*projection_id);
                 statistics.scan = scan;

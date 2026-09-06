@@ -843,6 +843,48 @@ fn heap_columnar_build_executes_vector_filter_projection_and_aggregate() {
 }
 
 #[test]
+fn lazy_block_corruption_is_quarantined_and_same_autocommit_query_retries_authoritative() {
+    let heap = path("lazy-corruption-heap");
+    let projection = path("lazy-corruption-projection");
+    cleanup(&heap, &projection);
+    let mut database = Database::create(&heap, table()).expect("create heap database");
+    insert_rows(&mut database, 512);
+    let id = database
+        .build_columnar_projection(
+            ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection,
+                vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            )
+            .with_row_group_rows(64),
+        )
+        .expect("build lazy projection");
+    let sql = "SELECT COUNT(*), SUM(id) FROM events";
+    assert!(statement_uses_columnar(&database, sql));
+    let expected = authoritative(&mut database, sql);
+    let segment = projection.join(format!("projection-{}-g1.nbcs", id.0));
+    let mut bytes = fs::read(&segment).expect("read lazy segment");
+    bytes[132] ^= 0x80;
+    fs::write(&segment, bytes).expect("corrupt first selected payload block");
+
+    assert_eq!(
+        database.query(sql).expect("safe authoritative retry"),
+        expected
+    );
+    let inspection = &database.inspect_columnar_projections()[0];
+    assert_eq!(inspection.health, ColumnarProjectionHealth::Unavailable);
+    assert!(
+        inspection
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("checksum mismatch"))
+    );
+    assert!(!statement_uses_columnar(&database, sql));
+    assert_eq!(database.query(sql).expect("future fallback"), expected);
+    cleanup(&heap, &projection);
+}
+
+#[test]
 fn point_lookup_keeps_btree_precedence_over_a_fresh_projection() {
     let heap = path("point");
     let projection = path("point-projection");

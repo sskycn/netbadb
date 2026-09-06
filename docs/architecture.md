@@ -120,6 +120,15 @@ projection handles separately from mutable `TableStorage` and its read views.
 See [Columnar Phase 1](columnar-phase1.md) for token, format, publication,
 fallback, and vector-execution invariants.
 
+Columnar Phase 2D keeps the same one-way boundary but changes physical
+ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
+chain. Open validates and retains only checksummed directories, zone maps,
+mutation descriptors, exact suppression keys, and live `DeltaRowRef`s. The
+executor's required-column set drives independent payload reads and checksum
+verification. Generation leases keep old file handles valid across publish and
+defer retirement until the last reader is gone. See [Columnar Phase
+2D](columnar-phase2d-lazy-io.md).
+
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text

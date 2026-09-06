@@ -164,6 +164,7 @@ the database coordinator and never blocks Heap/LSM COMMIT.
 
 Explicit Delta-to-Base compaction and managed-projection-aware NBCL retention
 GC are implemented by [Columnar Phase 2C](columnar-phase2c-compaction-retention.md).
-Automatic scheduling, generic CDC retention leases, lazy on-disk Columnar
-loading, aggregate spill, database-global CSN, `RowEntityId`, and hybrid
+Lazy on-disk Columnar loading is implemented by [Columnar Phase
+2D](columnar-phase2d-lazy-io.md). Automatic scheduling, generic CDC retention
+leases, aggregate spill, database-global CSN, `RowEntityId`, and hybrid
 authoritative Columnar storage remain deferred.

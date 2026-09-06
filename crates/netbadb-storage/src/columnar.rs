@@ -1,18 +1,21 @@
 //! Immutable derived columnar projections.
 //!
-//! `NBCM`/`NBCS` version 1 describe snapshot projections. Version 2 adds the
-//! hidden source-version identities and incremental metadata needed to merge
-//! immutable `NBCD` version 1 delta segments. All integers are little-endian
-//! and every file ends in a CRC32C of the preceding bytes. Heap or LSM data
-//! remains authoritative.
+//! `NBCM`/`NBCS` version 1 describe snapshot projections. Version 2 adds hidden
+//! source-version identities and `NBCD` version 1 Delta. New generations use
+//! indexed `NBCM`/`NBCS` version 3 plus independently checksummed `NBCD`
+//! version 2 blocks. Legacy files remain readable through the eager decoder;
+//! indexed readers retain metadata and fetch values on demand. Heap or LSM
+//! data remains authoritative.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use netbadb_index::compare_values;
 use netbadb_schema::{SchemaFingerprint, TableDef};
@@ -22,19 +25,28 @@ use netbadb_types::{
     StorageId, TableId,
 };
 
-use crate::{ChangeBatch, StorageChange, StorageVersionKey};
+use crate::{ChangeBatch, ChangeStreamCursor, StorageChange, StorageVersionKey};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"NBCM";
 const SEGMENT_MAGIC: &[u8; 4] = b"NBCS";
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const INCREMENTAL_FORMAT_VERSION: u16 = 2;
+const LAZY_FORMAT_VERSION: u16 = 3;
 const DELTA_MAGIC: &[u8; 4] = b"NBCD";
 const DELTA_FORMAT_VERSION: u16 = 1;
+const LAZY_DELTA_FORMAT_VERSION: u16 = 2;
+const SEGMENT_FOOTER_MAGIC: &[u8; 4] = b"NBCF";
+const DELTA_FOOTER_MAGIC: &[u8; 4] = b"NBDF";
+const INDEX_FORMAT_VERSION: u16 = 1;
+const LAZY_SEGMENT_HEADER_BYTES: u64 = 132;
+const LAZY_DELTA_HEADER_BYTES: u64 = 156;
 const MANIFEST_FILE: &str = "projection.nbcmanifest";
 const MAX_FILE_BYTES: u64 = 1 << 34;
 const MAX_COLUMNS: u32 = 1 << 20;
 const MAX_ROW_GROUPS: u32 = 1 << 24;
 const MAX_TEXT_BYTES: u64 = 1 << 32;
+const MAX_LAZY_BLOCK_BYTES: u64 = 1 << 26;
+const MAX_INDEX_BYTES: u64 = 1 << 28;
 const DEFAULT_ROW_GROUP_ROWS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +142,40 @@ pub struct ColumnarScanStatistics {
     pub delta_rows_emitted: u64,
     pub delta_bytes_read: u64,
     pub merged_rows: u64,
+    /// Physical payload blocks fetched for this scan. Header/footer reads made
+    /// while opening the immutable projection are intentionally excluded.
+    pub physical_block_reads: u64,
+    /// Physical payload bytes fetched for this scan.
+    pub physical_bytes_read: u64,
+    /// Column chunks decoded for this scan.
+    pub decoded_column_chunks: u64,
+    /// Hidden source-version blocks decoded for suppression.
+    pub decoded_version_blocks: u64,
+    pub base_data_bytes_read: u64,
+    pub base_version_key_bytes_read: u64,
+    pub delta_data_bytes_read: u64,
+    pub version_key_chunks_read: u64,
+    pub blocks_verified: u64,
+    pub row_groups_pruned_before_data_read: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarRepresentationStatistics {
+    pub representation: &'static str,
+    pub manifest_format_version: u16,
+    pub base_format_version: u16,
+    pub delta_format_version: Option<u16>,
+    pub resident_metadata_bytes: u64,
+    pub resident_payload_bytes: u64,
+    pub indexed_base_chunks: u64,
+    pub indexed_delta_chunks: u64,
+    pub indexed_delta_row_references: u64,
+    pub resident_suppressed_version_bytes: u64,
+    pub resident_delta_row_reference_bytes: u64,
+    pub base_index_bytes: u64,
+    pub delta_descriptor_bytes: u64,
+    pub base_block_count: u64,
+    pub delta_block_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +329,88 @@ struct DeltaOverlay {
     live: HashMap<StorageVersionKey, Vec<ScalarValue>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockRef {
+    offset: u64,
+    length: u64,
+    checksum: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LazyColumnChunk {
+    spec: ColumnarColumnSpec,
+    statistics: ColumnarColumnStatistics,
+    block: BlockRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LazyRowGroup {
+    rows: u32,
+    source_versions: Option<BlockRef>,
+    columns: Vec<LazyColumnChunk>,
+}
+
+#[derive(Debug)]
+struct GenerationFiles {
+    handles: Vec<Option<File>>,
+    paths: Vec<PathBuf>,
+    retired: AtomicBool,
+}
+
+impl Drop for GenerationFiles {
+    fn drop(&mut self) {
+        for handle in &mut self.handles {
+            drop(handle.take());
+        }
+        if self.retired.load(AtomicOrdering::Acquire) {
+            for path in &self.paths {
+                let _ = fs::remove_file(path);
+            }
+            if let Some(root) = self.paths.first().and_then(|path| path.parent()) {
+                let _ = sync_directory(root);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeltaRowRef {
+    segment: u32,
+    row: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeltaDescriptor {
+    old_version: Option<StorageVersionKey>,
+    new_version: Option<StorageVersionKey>,
+    after_row: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LazyDeltaOverlay {
+    suppressed: HashSet<StorageVersionKey>,
+    live: HashMap<StorageVersionKey, DeltaRowRef>,
+}
+
+#[derive(Debug, Clone)]
+struct LazyDeltaSegment {
+    file_index: usize,
+    groups: Vec<LazyRowGroup>,
+}
+
+#[derive(Debug, Clone)]
+struct LazyProjection {
+    base_file_index: usize,
+    base_groups: Vec<LazyRowGroup>,
+    deltas: Vec<LazyDeltaSegment>,
+    overlay: LazyDeltaOverlay,
+    files: Arc<GenerationFiles>,
+    prior_files: Vec<Arc<GenerationFiles>>,
+    resident_metadata_bytes: u64,
+    base_index_bytes: u64,
+    delta_descriptor_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnarProjection {
     root: PathBuf,
@@ -291,6 +419,10 @@ pub struct ColumnarProjection {
     segment_file: String,
     row_groups: Vec<RowGroup>,
     overlay: DeltaOverlay,
+    manifest_format_version: u16,
+    base_format_version: u16,
+    delta_format_version: Option<u16>,
+    lazy: Option<LazyProjection>,
 }
 
 /// Fully written and synced generation that is not yet visible to readers.
@@ -298,10 +430,11 @@ pub struct ColumnarProjection {
 pub struct PreparedColumnarProjection {
     root: PathBuf,
     metadata: ColumnarProjectionMetadata,
+    #[cfg(test)]
     segment_id: ColumnarSegmentId,
     segment_file: String,
+    #[cfg(test)]
     row_groups: Vec<RowGroup>,
-    overlay: DeltaOverlay,
     segment_tmp: PathBuf,
     manifest_tmp: PathBuf,
     published: bool,
@@ -310,7 +443,9 @@ pub struct PreparedColumnarProjection {
 #[derive(Debug)]
 pub struct PreparedColumnarAdvance {
     root: PathBuf,
-    projection: ColumnarProjection,
+    expected_table_id: TableId,
+    expected_fingerprint: SchemaFingerprint,
+    prior_files: Vec<Arc<GenerationFiles>>,
     delta_tmp: PathBuf,
     delta_final: PathBuf,
     manifest_tmp: PathBuf,
@@ -335,14 +470,11 @@ impl PreparedColumnarProjection {
         sync_directory(&self.root)?;
         crash("compact-manifest-directory-synced");
         self.published = true;
-        Ok(ColumnarProjection {
-            root: self.root.clone(),
-            metadata: self.metadata.clone(),
-            segment_id: self.segment_id,
-            segment_file: self.segment_file.clone(),
-            row_groups: self.row_groups.clone(),
-            overlay: self.overlay.clone(),
-        })
+        open_persisted_projection(
+            self.root.clone(),
+            Some(self.metadata.table_id),
+            Some(self.metadata.schema_fingerprint),
+        )
     }
 }
 
@@ -356,7 +488,15 @@ impl PreparedColumnarAdvance {
         crash("delta-manifest-renamed");
         sync_directory(&self.root)?;
         self.published = true;
-        Ok(self.projection.clone())
+        let mut projection = open_persisted_projection(
+            self.root.clone(),
+            Some(self.expected_table_id),
+            Some(self.expected_fingerprint),
+        )?;
+        if let Some(lazy) = &mut projection.lazy {
+            lazy.prior_files = self.prior_files.clone();
+        }
+        Ok(projection)
     }
 }
 
@@ -415,22 +555,6 @@ impl ColumnarProjection {
             .map(|chunk| encode_row_group(&column_specs, chunk))
             .collect::<Result<Vec<_>, _>>()?;
         let fingerprint = table.fingerprint().map_err(ColumnarError::Schema)?;
-        let segment = encode_segment(
-            SegmentIdentity {
-                projection_id: id,
-                generation,
-                segment_id,
-                table_id: table.id,
-                storage_id: source_storage_id,
-                fingerprint,
-            },
-            &column_specs,
-            &row_groups,
-            SNAPSHOT_FORMAT_VERSION,
-        )?;
-        let segment_checksum = stored_checksum(&segment)?;
-        let segment_bytes = u64::try_from(segment.len())
-            .map_err(|_| ColumnarError::InvalidInput("segment length overflow"))?;
         let row_count = u64::try_from(rows.len())
             .map_err(|_| ColumnarError::InvalidInput("row count overflow"))?;
         let metadata = ColumnarProjectionMetadata {
@@ -445,14 +569,40 @@ impl ColumnarProjection {
             row_group_count: u64::try_from(row_groups.len())
                 .map_err(|_| ColumnarError::InvalidInput("row-group count overflow"))?,
             segment_count: 1,
-            segment_bytes,
+            segment_bytes: 0,
             incremental: None,
         };
-        let manifest = encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)?;
         let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
         let segment_tmp = root.join(format!(".{segment_file}.tmp.{suffix}"));
         let manifest_tmp = root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
-        write_new_synced(&segment_tmp, &segment)?;
+        let (segment_bytes, segment_checksum) = write_lazy_segment_synced(
+            &segment_tmp,
+            SegmentIdentity {
+                projection_id: id,
+                generation,
+                segment_id,
+                table_id: table.id,
+                storage_id: source_storage_id,
+                fingerprint,
+            },
+            source_token.kind,
+            &metadata.columns,
+            &row_groups,
+            false,
+            "base-temp-created",
+            "base-written",
+            "base-synced",
+        )?;
+        let mut metadata = metadata;
+        metadata.segment_bytes = segment_bytes;
+        let manifest = match encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
         if let Err(error) = write_new_synced(&manifest_tmp, &manifest) {
             let _ = fs::remove_file(&segment_tmp);
             return Err(error);
@@ -460,17 +610,386 @@ impl ColumnarProjection {
         Ok(PreparedColumnarProjection {
             root,
             metadata,
+            #[cfg(test)]
             segment_id,
             segment_file,
+            #[cfg(test)]
             row_groups,
-            overlay: DeltaOverlay::default(),
             segment_tmp,
             manifest_tmp,
             published: false,
         })
     }
 
-    /// Builds an NBCS/NBCM v2 base bound to one committed change-stream
+    /// Builds a snapshot projection while retaining at most one input row
+    /// group. This is the scale-oriented writer counterpart of [`Self::prepare`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_streaming<I>(
+        root: impl AsRef<Path>,
+        id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+        table: &TableDef,
+        source_storage_id: StorageId,
+        source_token: StorageSnapshotToken,
+        columns: &[ColumnId],
+        rows: I,
+        row_group_rows: Option<usize>,
+    ) -> Result<PreparedColumnarProjection, ColumnarError>
+    where
+        I: IntoIterator<Item = Vec<ScalarValue>>,
+    {
+        if source_token.storage_id() != source_storage_id {
+            return Err(ColumnarError::IdentityMismatch("snapshot storage"));
+        }
+        let column_specs = resolve_columns(table, columns)?;
+        let group_rows = row_group_rows.unwrap_or(DEFAULT_ROW_GROUP_ROWS);
+        if group_rows == 0 || group_rows > u32::MAX as usize {
+            return Err(ColumnarError::InvalidInput("invalid row-group size"));
+        }
+        let root = root.as_ref().to_owned();
+        fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
+        let segment_id = ColumnarSegmentId(generation.0);
+        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let fingerprint = table.fingerprint().map_err(ColumnarError::Schema)?;
+        let identity = SegmentIdentity {
+            projection_id: id,
+            generation,
+            segment_id,
+            table_id: table.id,
+            storage_id: source_storage_id,
+            fingerprint,
+        };
+        let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
+        let segment_tmp = root.join(format!(".{segment_file}.tmp.{suffix}"));
+        let manifest_tmp = root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&segment_tmp)
+                .map_err(ColumnarError::Io)?;
+            file.write_all(&vec![0; LAZY_SEGMENT_HEADER_BYTES as usize])
+                .map_err(ColumnarError::Io)?;
+            let mut directory = Vec::new();
+            let mut pending = Vec::with_capacity(group_rows);
+            let mut row_count = 0_u64;
+            for row in rows {
+                if row.len() != column_specs.len() {
+                    return Err(ColumnarError::InvalidInput(
+                        "row width differs from projection",
+                    ));
+                }
+                row_count = row_count
+                    .checked_add(1)
+                    .ok_or(ColumnarError::InvalidInput("row count overflow"))?;
+                pending.push(row);
+                if pending.len() == group_rows {
+                    let group = encode_row_group(&column_specs, &pending)?;
+                    directory.push(write_lazy_row_group(
+                        &mut file,
+                        identity,
+                        &column_specs,
+                        &group,
+                        false,
+                    )?);
+                    pending.clear();
+                }
+            }
+            if !pending.is_empty() {
+                let group = encode_row_group(&column_specs, &pending)?;
+                directory.push(write_lazy_row_group(
+                    &mut file,
+                    identity,
+                    &column_specs,
+                    &group,
+                    false,
+                )?);
+            }
+            let footer_offset = file.stream_position().map_err(ColumnarError::Io)?;
+            let mut footer = Vec::new();
+            footer.extend_from_slice(SEGMENT_FOOTER_MAGIC);
+            push_u16(&mut footer, INDEX_FORMAT_VERSION);
+            push_u16(&mut footer, 0);
+            push_u64(&mut footer, identity.projection_id.0);
+            push_u64(&mut footer, identity.generation.0);
+            push_u64(&mut footer, identity.segment_id.0);
+            push_u32(&mut footer, column_specs.len() as u32);
+            push_u32(&mut footer, directory.len() as u32);
+            push_u64(&mut footer, row_count);
+            for group in &directory {
+                encode_lazy_group_directory(&mut footer, group)?;
+            }
+            append_checksum(&mut footer);
+            let footer_checksum = stored_checksum(&footer)?;
+            file.write_all(&footer).map_err(ColumnarError::Io)?;
+            let header = encode_lazy_segment_header(
+                identity,
+                source_token.kind,
+                false,
+                column_specs.len(),
+                directory.len(),
+                row_count,
+                BlockRef {
+                    offset: footer_offset,
+                    length: footer.len() as u64,
+                    checksum: footer_checksum,
+                },
+            )?;
+            file.seek(SeekFrom::Start(0)).map_err(ColumnarError::Io)?;
+            file.write_all(&header).map_err(ColumnarError::Io)?;
+            file.sync_data().map_err(ColumnarError::Io)?;
+            let segment_bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+            Ok((
+                row_count,
+                directory.len() as u64,
+                segment_bytes,
+                footer_checksum,
+            ))
+        })();
+        let (row_count, row_group_count, segment_bytes, segment_checksum) = match write_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        let metadata = ColumnarProjectionMetadata {
+            id,
+            generation,
+            table_id: table.id,
+            source_storage_id,
+            source_token,
+            schema_fingerprint: fingerprint,
+            columns: column_specs,
+            row_count,
+            row_group_count,
+            segment_count: 1,
+            segment_bytes,
+            incremental: None,
+        };
+        let manifest = match encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_new_synced(&manifest_tmp, &manifest) {
+            let _ = fs::remove_file(&segment_tmp);
+            return Err(error);
+        }
+        Ok(PreparedColumnarProjection {
+            root,
+            metadata,
+            #[cfg(test)]
+            segment_id,
+            segment_file,
+            #[cfg(test)]
+            row_groups: Vec::new(),
+            segment_tmp,
+            manifest_tmp,
+            published: false,
+        })
+    }
+
+    /// Builds an indexed incremental Base without retaining decoded Base
+    /// values. The writer buffers one row group; the source-version set remains
+    /// resident during the build so duplicate physical identities fail closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_incremental_streaming<I>(
+        root: impl AsRef<Path>,
+        id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+        table: &TableDef,
+        source_storage_id: StorageId,
+        source_token: StorageSnapshotToken,
+        cursor: ChangeStreamCursor,
+        columns: &[ColumnId],
+        rows: I,
+        row_group_rows: Option<usize>,
+    ) -> Result<PreparedColumnarProjection, ColumnarError>
+    where
+        I: IntoIterator<Item = (StorageVersionKey, Vec<ScalarValue>)>,
+    {
+        if source_token.storage_id() != source_storage_id || cursor.storage_id != source_storage_id
+        {
+            return Err(ColumnarError::IdentityMismatch(
+                "incremental snapshot storage",
+            ));
+        }
+        if cursor.generation.0 == 0 {
+            return Err(ColumnarError::InvalidInput("zero change-stream generation"));
+        }
+        let column_specs = resolve_columns(table, columns)?;
+        let group_rows = row_group_rows.unwrap_or(DEFAULT_ROW_GROUP_ROWS);
+        if group_rows == 0 || group_rows > u32::MAX as usize {
+            return Err(ColumnarError::InvalidInput("invalid row-group size"));
+        }
+        let root = root.as_ref().to_owned();
+        fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
+        let segment_id = ColumnarSegmentId(generation.0);
+        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let fingerprint = table.fingerprint().map_err(ColumnarError::Schema)?;
+        let identity = SegmentIdentity {
+            projection_id: id,
+            generation,
+            segment_id,
+            table_id: table.id,
+            storage_id: source_storage_id,
+            fingerprint,
+        };
+        let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
+        let segment_tmp = root.join(format!(".{segment_file}.tmp.{suffix}"));
+        let manifest_tmp = root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&segment_tmp)
+                .map_err(ColumnarError::Io)?;
+            file.write_all(&vec![0; LAZY_SEGMENT_HEADER_BYTES as usize])
+                .map_err(ColumnarError::Io)?;
+            let mut directory = Vec::new();
+            let mut pending = Vec::with_capacity(group_rows);
+            let mut seen = HashSet::new();
+            let mut row_count = 0_u64;
+            for (version, row) in rows {
+                validate_version_key(version, source_storage_id, source_token.kind)?;
+                if !seen.insert(version) {
+                    return Err(ColumnarError::InvalidInput("duplicate base source version"));
+                }
+                if row.len() != column_specs.len() {
+                    return Err(ColumnarError::InvalidInput(
+                        "row width differs from projection",
+                    ));
+                }
+                row_count = row_count
+                    .checked_add(1)
+                    .ok_or(ColumnarError::InvalidInput("row count overflow"))?;
+                pending.push((version, row));
+                if pending.len() == group_rows {
+                    let group = encode_versioned_row_group(&column_specs, &pending)?;
+                    directory.push(write_lazy_row_group(
+                        &mut file,
+                        identity,
+                        &column_specs,
+                        &group,
+                        true,
+                    )?);
+                    pending.clear();
+                }
+            }
+            if !pending.is_empty() {
+                let group = encode_versioned_row_group(&column_specs, &pending)?;
+                directory.push(write_lazy_row_group(
+                    &mut file,
+                    identity,
+                    &column_specs,
+                    &group,
+                    true,
+                )?);
+            }
+            let footer_offset = file.stream_position().map_err(ColumnarError::Io)?;
+            let mut footer = Vec::new();
+            footer.extend_from_slice(SEGMENT_FOOTER_MAGIC);
+            push_u16(&mut footer, INDEX_FORMAT_VERSION);
+            push_u16(&mut footer, 0);
+            push_u64(&mut footer, identity.projection_id.0);
+            push_u64(&mut footer, identity.generation.0);
+            push_u64(&mut footer, identity.segment_id.0);
+            push_u32(&mut footer, column_specs.len() as u32);
+            push_u32(&mut footer, directory.len() as u32);
+            push_u64(&mut footer, row_count);
+            for group in &directory {
+                encode_lazy_group_directory(&mut footer, group)?;
+            }
+            append_checksum(&mut footer);
+            let footer_checksum = stored_checksum(&footer)?;
+            file.write_all(&footer).map_err(ColumnarError::Io)?;
+            let header = encode_lazy_segment_header(
+                identity,
+                source_token.kind,
+                true,
+                column_specs.len(),
+                directory.len(),
+                row_count,
+                BlockRef {
+                    offset: footer_offset,
+                    length: footer.len() as u64,
+                    checksum: footer_checksum,
+                },
+            )?;
+            file.seek(SeekFrom::Start(0)).map_err(ColumnarError::Io)?;
+            file.write_all(&header).map_err(ColumnarError::Io)?;
+            file.sync_data().map_err(ColumnarError::Io)?;
+            let segment_bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+            Ok((
+                row_count,
+                directory.len() as u64,
+                segment_bytes,
+                footer_checksum,
+            ))
+        })();
+        let (row_count, row_group_count, segment_bytes, segment_checksum) = match write_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        let metadata = ColumnarProjectionMetadata {
+            id,
+            generation,
+            table_id: table.id,
+            source_storage_id,
+            source_token,
+            schema_fingerprint: fingerprint,
+            columns: column_specs,
+            row_count,
+            row_group_count,
+            segment_count: 1,
+            segment_bytes,
+            incremental: Some(ColumnarIncrementalMetadata {
+                stream_generation: cursor.generation,
+                base_frontier: cursor.frontier,
+                applied_frontier: cursor.frontier,
+                delta_segments: Vec::new(),
+                delta_mutation_count: 0,
+                delta_live_row_count: 0,
+                suppressed_version_count: 0,
+                delta_bytes: 0,
+            }),
+        };
+        let manifest = match encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_new_synced(&manifest_tmp, &manifest) {
+            let _ = fs::remove_file(&segment_tmp);
+            return Err(error);
+        }
+        Ok(PreparedColumnarProjection {
+            root,
+            metadata,
+            #[cfg(test)]
+            segment_id,
+            segment_file,
+            #[cfg(test)]
+            row_groups: Vec::new(),
+            segment_tmp,
+            manifest_tmp,
+            published: false,
+        })
+    }
+
+    /// Builds an indexed NBCS/NBCM v3 base bound to one committed change-stream
     /// frontier. Source version keys remain hidden from the SQL schema.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_incremental(
@@ -534,7 +1053,12 @@ impl ColumnarProjection {
                 delta_bytes: 0,
             }),
         };
-        let segment = encode_segment(
+        let mut metadata = metadata_seed;
+        let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
+        let segment_tmp = root.join(format!(".{segment_file}.tmp.{suffix}"));
+        let manifest_tmp = root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        let (segment_bytes, segment_checksum) = write_lazy_segment_synced(
+            &segment_tmp,
             SegmentIdentity {
                 projection_id: id,
                 generation,
@@ -543,19 +1067,23 @@ impl ColumnarProjection {
                 storage_id: source_storage_id,
                 fingerprint,
             },
-            &metadata_seed.columns,
+            source_token.kind,
+            &metadata.columns,
             &row_groups,
-            INCREMENTAL_FORMAT_VERSION,
+            true,
+            "base-temp-created",
+            "base-written",
+            "base-synced",
         )?;
-        let segment_checksum = stored_checksum(&segment)?;
-        let mut metadata = metadata_seed;
-        metadata.segment_bytes = u64::try_from(segment.len())
-            .map_err(|_| ColumnarError::InvalidInput("segment length overflow"))?;
-        let manifest = encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)?;
-        let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
-        let segment_tmp = root.join(format!(".{segment_file}.tmp.{suffix}"));
-        let manifest_tmp = root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
-        write_new_synced(&segment_tmp, &segment)?;
+        metadata.segment_bytes = segment_bytes;
+        let manifest = match encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
         if let Err(error) = write_new_synced(&manifest_tmp, &manifest) {
             let _ = fs::remove_file(&segment_tmp);
             return Err(error);
@@ -563,10 +1091,11 @@ impl ColumnarProjection {
         Ok(PreparedColumnarProjection {
             root,
             metadata,
+            #[cfg(test)]
             segment_id,
             segment_file,
+            #[cfg(test)]
             row_groups,
-            overlay: DeltaOverlay::default(),
             segment_tmp,
             manifest_tmp,
             published: false,
@@ -574,86 +1103,109 @@ impl ColumnarProjection {
     }
 
     pub fn open(root: impl AsRef<Path>, table: &TableDef) -> Result<Self, ColumnarError> {
-        let root = root.as_ref().to_owned();
-        let manifest_bytes = read_bounded(&root.join(MANIFEST_FILE))?;
-        let manifest = decode_manifest(&manifest_bytes)?;
-        if manifest.metadata.table_id != table.id {
-            return Err(ColumnarError::IdentityMismatch("table"));
-        }
-        if manifest.metadata.schema_fingerprint
-            != table.fingerprint().map_err(ColumnarError::Schema)?
-        {
-            return Err(ColumnarError::IdentityMismatch("schema fingerprint"));
-        }
-        let segment_path = root.join(&manifest.segment_file);
-        let segment_bytes = read_bounded(&segment_path)?;
-        if u64::try_from(segment_bytes.len())
-            .map_err(|_| ColumnarError::Corrupt("segment length does not fit u64"))?
-            != manifest.metadata.segment_bytes
-        {
-            return Err(ColumnarError::Corrupt(
-                "segment length differs from manifest",
-            ));
-        }
-        if stored_checksum(&segment_bytes)? != manifest.segment_checksum {
-            return Err(ColumnarError::ChecksumMismatch { path: segment_path });
-        }
-        let decoded = decode_segment(&segment_bytes, &manifest.metadata)?;
-        if decoded.segment_id != manifest.segment_id {
-            return Err(ColumnarError::IdentityMismatch("segment"));
-        }
-        let mut overlay = DeltaOverlay::default();
-        if let Some(incremental) = &manifest.metadata.incremental {
-            let mut expected = incremental.base_frontier;
-            for delta in &incremental.delta_segments {
-                if delta.before != expected || delta.after.0 <= delta.before.0 {
-                    return Err(ColumnarError::Corrupt("broken delta frontier chain"));
-                }
-                let path = root.join(&delta.file);
-                let bytes = read_bounded(&path)?;
-                if u64::try_from(bytes.len()).ok() != Some(delta.bytes)
-                    || stored_checksum(&bytes)? != delta.checksum
-                {
-                    return Err(ColumnarError::ChecksumMismatch { path });
-                }
-                let mutations = decode_delta(&bytes, &manifest.metadata, delta)?;
-                apply_overlay(&mut overlay, &mutations)?;
-                expected = delta.after;
+        open_persisted_projection(
+            root.as_ref().to_owned(),
+            Some(table.id),
+            Some(table.fingerprint().map_err(ColumnarError::Schema)?),
+        )
+    }
+
+    #[must_use]
+    pub fn representation_statistics(&self) -> ColumnarRepresentationStatistics {
+        if let Some(lazy) = &self.lazy {
+            ColumnarRepresentationStatistics {
+                representation: "lazy-indexed",
+                manifest_format_version: self.manifest_format_version,
+                base_format_version: self.base_format_version,
+                delta_format_version: self.delta_format_version,
+                resident_metadata_bytes: lazy.resident_metadata_bytes,
+                resident_payload_bytes: 0,
+                indexed_base_chunks: lazy
+                    .base_groups
+                    .iter()
+                    .map(|group| group.columns.len() as u64)
+                    .sum(),
+                indexed_delta_chunks: lazy
+                    .deltas
+                    .iter()
+                    .flat_map(|delta| &delta.groups)
+                    .map(|group| group.columns.len() as u64)
+                    .sum(),
+                indexed_delta_row_references: lazy.overlay.live.len() as u64,
+                resident_suppressed_version_bytes: (lazy.overlay.suppressed.len()
+                    * std::mem::size_of::<StorageVersionKey>())
+                    as u64,
+                resident_delta_row_reference_bytes: (lazy.overlay.live.len()
+                    * (std::mem::size_of::<StorageVersionKey>()
+                        + std::mem::size_of::<DeltaRowRef>()))
+                    as u64,
+                base_index_bytes: lazy.base_index_bytes,
+                delta_descriptor_bytes: lazy.delta_descriptor_bytes,
+                base_block_count: lazy
+                    .base_groups
+                    .iter()
+                    .map(|group| {
+                        group.columns.len() as u64 + u64::from(group.source_versions.is_some())
+                    })
+                    .sum(),
+                delta_block_count: lazy
+                    .deltas
+                    .iter()
+                    .flat_map(|delta| &delta.groups)
+                    .map(|group| group.columns.len() as u64)
+                    .sum(),
             }
-            if expected != incremental.applied_frontier
-                || overlay.live.len() as u64 != incremental.delta_live_row_count
-                || overlay.suppressed.len() as u64 != incremental.suppressed_version_count
-            {
-                return Err(ColumnarError::Corrupt("delta manifest statistics mismatch"));
+        } else {
+            let resident_payload_bytes = self
+                .row_groups
+                .iter()
+                .flat_map(|group| &group.columns)
+                .map(|column| vector_encoded_bytes(&column.values))
+                .sum::<u64>()
+                .saturating_add(
+                    self.overlay
+                        .live
+                        .values()
+                        .flatten()
+                        .map(scalar_resident_bytes)
+                        .sum(),
+                );
+            ColumnarRepresentationStatistics {
+                representation: "legacy-eager",
+                manifest_format_version: self.manifest_format_version,
+                base_format_version: self.base_format_version,
+                delta_format_version: self.delta_format_version,
+                resident_metadata_bytes: 0,
+                resident_payload_bytes,
+                indexed_base_chunks: 0,
+                indexed_delta_chunks: 0,
+                indexed_delta_row_references: 0,
+                resident_suppressed_version_bytes: 0,
+                resident_delta_row_reference_bytes: 0,
+                base_index_bytes: 0,
+                delta_descriptor_bytes: 0,
+                base_block_count: 0,
+                delta_block_count: 0,
             }
         }
-        Ok(Self {
-            root,
-            metadata: manifest.metadata,
-            segment_id: manifest.segment_id,
-            segment_file: manifest.segment_file,
-            row_groups: decoded.row_groups,
-            overlay,
-        })
-    }
-
-    #[must_use]
-    pub fn metadata(&self) -> &ColumnarProjectionMetadata {
-        &self.metadata
-    }
-
-    #[must_use]
-    pub const fn segment_id(&self) -> ColumnarSegmentId {
-        self.segment_id
-    }
-
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     #[must_use]
     pub fn row_group_statistics(&self) -> Vec<ColumnarRowGroupStatistics> {
+        if let Some(lazy) = &self.lazy {
+            return lazy
+                .base_groups
+                .iter()
+                .map(|group| ColumnarRowGroupStatistics {
+                    rows: group.rows,
+                    columns: group
+                        .columns
+                        .iter()
+                        .map(|column| (column.spec.column_id, column.statistics.clone()))
+                        .collect(),
+                })
+                .collect();
+        }
         self.row_groups
             .iter()
             .map(|group| ColumnarRowGroupStatistics {
@@ -671,6 +1223,195 @@ impl ColumnarProjection {
     /// Converts one bounded contiguous NBCL read into a synced immutable NBCD
     /// segment and a synced replacement NBCM. Publication remains explicit.
     pub fn prepare_advance(
+        &self,
+        table: &TableDef,
+        batches: &[ChangeBatch],
+    ) -> Result<PreparedColumnarAdvance, ColumnarError> {
+        self.prepare_advance_inner(table, batches)
+    }
+}
+
+fn scalar_resident_bytes(value: &ScalarValue) -> u64 {
+    match value {
+        ScalarValue::Null => 0,
+        ScalarValue::Bool(_) => 1,
+        ScalarValue::Int64(_) | ScalarValue::UInt64(_) => 8,
+        ScalarValue::Text(value) => value.len() as u64,
+    }
+}
+
+fn open_persisted_projection(
+    root: PathBuf,
+    expected_table_id: Option<TableId>,
+    expected_fingerprint: Option<SchemaFingerprint>,
+) -> Result<ColumnarProjection, ColumnarError> {
+    let manifest_bytes = read_bounded(&root.join(MANIFEST_FILE))?;
+    let manifest = decode_manifest(&manifest_bytes)?;
+    if expected_table_id.is_some_and(|table_id| manifest.metadata.table_id != table_id) {
+        return Err(ColumnarError::IdentityMismatch("table"));
+    }
+    if expected_fingerprint
+        .is_some_and(|fingerprint| manifest.metadata.schema_fingerprint != fingerprint)
+    {
+        return Err(ColumnarError::IdentityMismatch("schema fingerprint"));
+    }
+    let segment_path = root.join(&manifest.segment_file);
+    if manifest.version == LAZY_FORMAT_VERSION {
+        let actual_bytes = fs::metadata(&segment_path)
+            .map_err(ColumnarError::Io)?
+            .len();
+        if actual_bytes != manifest.metadata.segment_bytes {
+            return Err(ColumnarError::Corrupt(
+                "segment length differs from manifest",
+            ));
+        }
+        let (base_file, base_groups, base_metadata_bytes) = open_lazy_segment(
+            &segment_path,
+            &manifest.metadata,
+            manifest.segment_id,
+            manifest.segment_checksum,
+        )?;
+        let mut handles = vec![Some(base_file)];
+        let mut paths = vec![segment_path];
+        let mut deltas = Vec::new();
+        let mut overlay = LazyDeltaOverlay::default();
+        let mut resident_metadata_bytes =
+            (manifest_bytes.len() as u64).saturating_add(base_metadata_bytes);
+        let base_index_bytes = base_metadata_bytes.saturating_sub(LAZY_SEGMENT_HEADER_BYTES);
+        let mut delta_descriptor_bytes = 0_u64;
+        if let Some(incremental) = &manifest.metadata.incremental {
+            let mut expected = incremental.base_frontier;
+            for (ordinal, delta) in incremental.delta_segments.iter().enumerate() {
+                if delta.before != expected || delta.after.0 <= delta.before.0 {
+                    return Err(ColumnarError::Corrupt("broken delta frontier chain"));
+                }
+                let path = root.join(&delta.file);
+                let file_index = handles.len();
+                let (file, indexed, descriptors, metadata_bytes) =
+                    open_lazy_delta(&path, &manifest.metadata, delta, file_index)?;
+                let segment = u32::try_from(ordinal).map_err(|_| ColumnarError::ResourceLimit {
+                    resource: "delta segment count",
+                    value: ordinal as u64,
+                })?;
+                apply_lazy_descriptors(&mut overlay, &descriptors, segment)?;
+                resident_metadata_bytes = resident_metadata_bytes
+                    .saturating_add(metadata_bytes)
+                    .saturating_add(
+                        (descriptors.len() * std::mem::size_of::<DeltaDescriptor>()) as u64,
+                    );
+                delta_descriptor_bytes = delta_descriptor_bytes
+                    .saturating_add(metadata_bytes.saturating_sub(LAZY_DELTA_HEADER_BYTES));
+                handles.push(Some(file));
+                paths.push(path);
+                deltas.push(indexed);
+                expected = delta.after;
+            }
+            if expected != incremental.applied_frontier
+                || overlay.live.len() as u64 != incremental.delta_live_row_count
+                || overlay.suppressed.len() as u64 != incremental.suppressed_version_count
+            {
+                return Err(ColumnarError::Corrupt("delta manifest statistics mismatch"));
+            }
+        }
+        return Ok(ColumnarProjection {
+            root,
+            metadata: manifest.metadata,
+            segment_id: manifest.segment_id,
+            segment_file: manifest.segment_file,
+            row_groups: Vec::new(),
+            overlay: DeltaOverlay::default(),
+            manifest_format_version: manifest.version,
+            base_format_version: manifest.base_format_version,
+            delta_format_version: manifest.delta_format_version,
+            lazy: Some(LazyProjection {
+                base_file_index: 0,
+                base_groups,
+                deltas,
+                overlay,
+                files: Arc::new(GenerationFiles {
+                    handles,
+                    paths,
+                    retired: AtomicBool::new(false),
+                }),
+                prior_files: Vec::new(),
+                resident_metadata_bytes,
+                base_index_bytes,
+                delta_descriptor_bytes,
+            }),
+        });
+    }
+    let segment_bytes = read_bounded(&segment_path)?;
+    if u64::try_from(segment_bytes.len())
+        .map_err(|_| ColumnarError::Corrupt("segment length does not fit u64"))?
+        != manifest.metadata.segment_bytes
+    {
+        return Err(ColumnarError::Corrupt(
+            "segment length differs from manifest",
+        ));
+    }
+    if stored_checksum(&segment_bytes)? != manifest.segment_checksum {
+        return Err(ColumnarError::ChecksumMismatch { path: segment_path });
+    }
+    let decoded = decode_segment(&segment_bytes, &manifest.metadata)?;
+    if decoded.segment_id != manifest.segment_id {
+        return Err(ColumnarError::IdentityMismatch("segment"));
+    }
+    let mut overlay = DeltaOverlay::default();
+    if let Some(incremental) = &manifest.metadata.incremental {
+        let mut expected = incremental.base_frontier;
+        for delta in &incremental.delta_segments {
+            if delta.before != expected || delta.after.0 <= delta.before.0 {
+                return Err(ColumnarError::Corrupt("broken delta frontier chain"));
+            }
+            let path = root.join(&delta.file);
+            let bytes = read_bounded(&path)?;
+            if u64::try_from(bytes.len()).ok() != Some(delta.bytes)
+                || stored_checksum(&bytes)? != delta.checksum
+            {
+                return Err(ColumnarError::ChecksumMismatch { path });
+            }
+            let mutations = decode_delta(&bytes, &manifest.metadata, delta)?;
+            apply_overlay(&mut overlay, &mutations)?;
+            expected = delta.after;
+        }
+        if expected != incremental.applied_frontier
+            || overlay.live.len() as u64 != incremental.delta_live_row_count
+            || overlay.suppressed.len() as u64 != incremental.suppressed_version_count
+        {
+            return Err(ColumnarError::Corrupt("delta manifest statistics mismatch"));
+        }
+    }
+    Ok(ColumnarProjection {
+        root,
+        metadata: manifest.metadata,
+        segment_id: manifest.segment_id,
+        segment_file: manifest.segment_file,
+        row_groups: decoded.row_groups,
+        overlay,
+        manifest_format_version: manifest.version,
+        base_format_version: manifest.base_format_version,
+        delta_format_version: manifest.delta_format_version,
+        lazy: None,
+    })
+}
+
+impl ColumnarProjection {
+    #[must_use]
+    pub fn metadata(&self) -> &ColumnarProjectionMetadata {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub const fn segment_id(&self) -> ColumnarSegmentId {
+        self.segment_id
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn prepare_advance_inner(
         &self,
         table: &TableDef,
         batches: &[ChangeBatch],
@@ -704,20 +1445,64 @@ impl ColumnarProjection {
             "projection-{}-g{}-d{}.nbcd",
             self.metadata.id.0, self.metadata.generation.0, after.0
         );
-        let delta = encode_delta(&self.metadata, batches, &projected)?;
-        let checksum = stored_checksum(&delta)?;
-        let bytes = u64::try_from(delta.len())
-            .map_err(|_| ColumnarError::InvalidInput("delta length overflow"))?;
         let mutation_count = u64::try_from(projected.len())
             .map_err(|_| ColumnarError::InvalidInput("delta mutation count overflow"))?;
         let after_row_count = projected
             .iter()
             .filter(|change| change.after.is_some())
             .count() as u64;
-        let mut replacement = self.clone();
-        apply_overlay(&mut replacement.overlay, &projected)?;
-        let replacement_incremental = replacement
-            .metadata
+        let suffix = format!("{}.{}.{}", std::process::id(), self.metadata.id.0, after.0);
+        let delta_tmp = self.root.join(format!(".{delta_file}.tmp.{suffix}"));
+        let manifest_tmp = self.root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        let (bytes, checksum) = if self.lazy.is_some() {
+            write_lazy_delta_synced(&delta_tmp, &self.metadata, batches, &projected)?
+        } else {
+            let delta = encode_delta(&self.metadata, batches, &projected)?;
+            let checksum = stored_checksum(&delta)?;
+            let bytes = u64::try_from(delta.len())
+                .map_err(|_| ColumnarError::InvalidInput("delta length overflow"))?;
+            write_advance_file_synced(
+                &delta_tmp,
+                &delta,
+                "delta-temp-created",
+                "delta-written",
+                "delta-synced",
+            )?;
+            (bytes, checksum)
+        };
+        let mut replacement_metadata = self.metadata.clone();
+        let (live_rows, suppressed_versions) = if let Some(lazy) = &self.lazy {
+            let mut overlay = lazy.overlay.clone();
+            let descriptors = projected
+                .iter()
+                .scan(0_u64, |row, mutation| {
+                    let after_row = mutation.after.as_ref().map(|_| {
+                        let current = *row;
+                        *row += 1;
+                        current
+                    });
+                    Some(DeltaDescriptor {
+                        old_version: mutation.old_version,
+                        new_version: mutation.new_version,
+                        after_row,
+                    })
+                })
+                .collect::<Vec<_>>();
+            apply_lazy_descriptors(
+                &mut overlay,
+                &descriptors,
+                u32::try_from(lazy.deltas.len()).map_err(|_| ColumnarError::ResourceLimit {
+                    resource: "delta segment count",
+                    value: lazy.deltas.len() as u64,
+                })?,
+            )?;
+            (overlay.live.len() as u64, overlay.suppressed.len() as u64)
+        } else {
+            let mut overlay = self.overlay.clone();
+            apply_overlay(&mut overlay, &projected)?;
+            (overlay.live.len() as u64, overlay.suppressed.len() as u64)
+        };
+        let replacement_incremental = replacement_metadata
             .incremental
             .as_mut()
             .ok_or(ColumnarError::Corrupt("incremental metadata disappeared"))?;
@@ -737,31 +1522,22 @@ impl ColumnarProjection {
             .delta_mutation_count
             .checked_add(mutation_count)
             .ok_or(ColumnarError::InvalidInput("delta mutation total overflow"))?;
-        replacement_incremental.delta_live_row_count = replacement.overlay.live.len() as u64;
-        replacement_incremental.suppressed_version_count =
-            replacement.overlay.suppressed.len() as u64;
+        replacement_incremental.delta_live_row_count = live_rows;
+        replacement_incremental.suppressed_version_count = suppressed_versions;
         replacement_incremental.delta_bytes = replacement_incremental
             .delta_bytes
             .checked_add(bytes)
             .ok_or(ColumnarError::InvalidInput("delta byte total overflow"))?;
-        replacement.metadata.segment_count = 1_u64
+        replacement_metadata.segment_count = 1_u64
             .checked_add(replacement_incremental.delta_segments.len() as u64)
             .ok_or(ColumnarError::InvalidInput("segment count overflow"))?;
-        let manifest = encode_manifest(
-            &replacement.metadata,
-            replacement.segment_id,
-            &replacement.segment_file,
-            stored_checksum(&read_bounded(&self.root.join(&self.segment_file))?)?,
-        )?;
-        let suffix = format!("{}.{}.{}", std::process::id(), self.metadata.id.0, after.0);
-        let delta_tmp = self.root.join(format!(".{delta_file}.tmp.{suffix}"));
-        let manifest_tmp = self.root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
-        write_advance_file_synced(
-            &delta_tmp,
-            &delta,
-            "delta-temp-created",
-            "delta-written",
-            "delta-synced",
+        let current_manifest = decode_manifest(&read_bounded(&self.root.join(MANIFEST_FILE))?)?;
+        let manifest = encode_manifest_version(
+            &replacement_metadata,
+            self.segment_id,
+            &self.segment_file,
+            current_manifest.segment_checksum,
+            self.manifest_format_version,
         )?;
         if let Err(error) = write_advance_file_synced(
             &manifest_tmp,
@@ -776,7 +1552,15 @@ impl ColumnarProjection {
         crash("delta-manifest-synced");
         Ok(PreparedColumnarAdvance {
             root: self.root.clone(),
-            projection: replacement,
+            expected_table_id: self.metadata.table_id,
+            expected_fingerprint: self.metadata.schema_fingerprint,
+            prior_files: self.lazy.as_ref().map_or_else(Vec::new, |lazy| {
+                lazy.prior_files
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(Arc::clone(&lazy.files)))
+                    .collect()
+            }),
             delta_tmp,
             delta_final: self.root.join(delta_file),
             manifest_tmp,
@@ -785,7 +1569,7 @@ impl ColumnarProjection {
     }
 
     /// Folds this incremental generation's immutable Base and Delta overlay
-    /// into one new NBCS v2 Base. This path never consults the authoritative
+    /// into one new indexed NBCS v3 Base. This path never consults the authoritative
     /// source or the change stream; the captured applied frontier is retained.
     pub fn prepare_compaction(
         &self,
@@ -821,6 +1605,9 @@ impl ColumnarProjection {
                 != self.metadata.schema_fingerprint
         {
             return Err(ColumnarError::IdentityMismatch("compaction schema"));
+        }
+        if self.lazy.is_some() {
+            return self.prepare_lazy_compaction(generation);
         }
 
         let group_rows = self
@@ -924,12 +1711,13 @@ impl ColumnarProjection {
             storage_id: metadata.source_storage_id,
             fingerprint: metadata.schema_fingerprint,
         };
-        let (segment_bytes, segment_checksum) = match write_segment_synced(
+        let (segment_bytes, segment_checksum) = match write_lazy_segment_synced(
             &segment_tmp,
             identity,
+            self.metadata.source_token.kind,
             &metadata.columns,
             &row_groups,
-            INCREMENTAL_FORMAT_VERSION,
+            true,
             "compact-base-temp-created",
             "compact-base-written",
             "compact-base-synced",
@@ -962,10 +1750,230 @@ impl ColumnarProjection {
         Ok(PreparedColumnarProjection {
             root: self.root.clone(),
             metadata,
+            #[cfg(test)]
             segment_id,
             segment_file,
+            #[cfg(test)]
             row_groups,
-            overlay: DeltaOverlay::default(),
+            segment_tmp,
+            manifest_tmp,
+            published: false,
+        })
+    }
+
+    fn prepare_lazy_compaction(
+        &self,
+        generation: ColumnarGeneration,
+    ) -> Result<PreparedColumnarProjection, ColumnarError> {
+        let lazy = self.lazy.as_ref().ok_or(ColumnarError::Corrupt(
+            "lazy compaction representation disappeared",
+        ))?;
+        let incremental = self
+            .metadata
+            .incremental
+            .as_ref()
+            .ok_or(ColumnarError::Corrupt("lazy compaction is not incremental"))?;
+        let group_rows = lazy
+            .base_groups
+            .first()
+            .map_or(DEFAULT_ROW_GROUP_ROWS, |group| group.rows as usize);
+        let segment_id = ColumnarSegmentId(generation.0);
+        let segment_file = format!("projection-{}-g{}.nbcs", self.metadata.id.0, generation.0);
+        let suffix = format!(
+            "compact.{}.{}.{}",
+            std::process::id(),
+            self.metadata.id.0,
+            generation.0
+        );
+        let segment_tmp = self.root.join(format!(".{segment_file}.tmp.{suffix}"));
+        let manifest_tmp = self.root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        let identity = SegmentIdentity {
+            projection_id: self.metadata.id,
+            generation,
+            segment_id,
+            table_id: self.metadata.table_id,
+            storage_id: self.metadata.source_storage_id,
+            fingerprint: self.metadata.schema_fingerprint,
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&segment_tmp)
+            .map_err(ColumnarError::Io)?;
+        crash("compact-base-temp-created");
+        file.write_all(&vec![0; LAZY_SEGMENT_HEADER_BYTES as usize])
+            .map_err(ColumnarError::Io)?;
+        let mut directory = Vec::new();
+        let mut pending = Vec::with_capacity(group_rows);
+        let mut seen = HashSet::new();
+        let mut scan_statistics = ColumnarScanStatistics::default();
+        for group in &lazy.base_groups {
+            let keys = read_version_block(
+                lazy,
+                lazy.base_file_index,
+                group.source_versions.ok_or(ColumnarError::Corrupt(
+                    "incremental indexed group has no version block",
+                ))?,
+                group.rows,
+                self.metadata.source_storage_id,
+                self.metadata.source_token.kind,
+                &mut scan_statistics,
+            )?;
+            let vectors = group
+                .columns
+                .iter()
+                .map(|chunk| {
+                    read_column_block(
+                        lazy,
+                        lazy.base_file_index,
+                        chunk,
+                        group.rows,
+                        false,
+                        &mut scan_statistics,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (row, key) in keys.into_iter().enumerate() {
+                if lazy.overlay.suppressed.contains(&key) {
+                    continue;
+                }
+                if !seen.insert(key) {
+                    return Err(ColumnarError::Corrupt(
+                        "duplicate retained source version during compaction",
+                    ));
+                }
+                let values = vectors
+                    .iter()
+                    .map(|vector| vector.value(row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                pending.push((key, values));
+                if pending.len() == group_rows {
+                    flush_lazy_compaction_group(
+                        &mut file,
+                        identity,
+                        &self.metadata.columns,
+                        &mut pending,
+                        &mut directory,
+                    )?;
+                }
+            }
+        }
+        let mut live = lazy.overlay.live.iter().collect::<Vec<_>>();
+        live.sort_by_key(|(key, _)| version_key_sort_key(**key));
+        for (key, reference) in live {
+            if !seen.insert(*key) {
+                return Err(ColumnarError::Corrupt(
+                    "delta version duplicates a retained base version",
+                ));
+            }
+            pending.push((
+                *key,
+                read_lazy_delta_row(self, lazy, *reference, &mut scan_statistics)?,
+            ));
+            if pending.len() == group_rows {
+                flush_lazy_compaction_group(
+                    &mut file,
+                    identity,
+                    &self.metadata.columns,
+                    &mut pending,
+                    &mut directory,
+                )?;
+            }
+        }
+        if !pending.is_empty() {
+            flush_lazy_compaction_group(
+                &mut file,
+                identity,
+                &self.metadata.columns,
+                &mut pending,
+                &mut directory,
+            )?;
+        }
+        let row_count = directory.iter().try_fold(0_u64, |total, group| {
+            total
+                .checked_add(u64::from(group.rows))
+                .ok_or(ColumnarError::InvalidInput("compacted row count overflow"))
+        })?;
+        let footer_offset = file.stream_position().map_err(ColumnarError::Io)?;
+        let mut footer = Vec::new();
+        footer.extend_from_slice(SEGMENT_FOOTER_MAGIC);
+        push_u16(&mut footer, INDEX_FORMAT_VERSION);
+        push_u16(&mut footer, 0);
+        push_u64(&mut footer, identity.projection_id.0);
+        push_u64(&mut footer, identity.generation.0);
+        push_u64(&mut footer, identity.segment_id.0);
+        push_u32(&mut footer, self.metadata.columns.len() as u32);
+        push_u32(&mut footer, directory.len() as u32);
+        push_u64(&mut footer, row_count);
+        for group in &directory {
+            encode_lazy_group_directory(&mut footer, group)?;
+        }
+        append_checksum(&mut footer);
+        let segment_checksum = stored_checksum(&footer)?;
+        file.write_all(&footer).map_err(ColumnarError::Io)?;
+        let header = encode_lazy_segment_header(
+            identity,
+            self.metadata.source_token.kind,
+            true,
+            self.metadata.columns.len(),
+            directory.len(),
+            row_count,
+            BlockRef {
+                offset: footer_offset,
+                length: footer.len() as u64,
+                checksum: segment_checksum,
+            },
+        )?;
+        file.seek(SeekFrom::Start(0)).map_err(ColumnarError::Io)?;
+        file.write_all(&header).map_err(ColumnarError::Io)?;
+        crash("compact-base-written");
+        file.sync_data().map_err(ColumnarError::Io)?;
+        crash("compact-base-synced");
+        let segment_bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+        drop(file);
+        let mut metadata = self.metadata.clone();
+        metadata.generation = generation;
+        metadata.row_count = row_count;
+        metadata.row_group_count = directory.len() as u64;
+        metadata.segment_count = 1;
+        metadata.segment_bytes = segment_bytes;
+        metadata.incremental = Some(ColumnarIncrementalMetadata {
+            stream_generation: incremental.stream_generation,
+            base_frontier: incremental.applied_frontier,
+            applied_frontier: incremental.applied_frontier,
+            delta_segments: Vec::new(),
+            delta_mutation_count: 0,
+            delta_live_row_count: 0,
+            suppressed_version_count: 0,
+            delta_bytes: 0,
+        });
+        let manifest = match encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_advance_file_synced(
+            &manifest_tmp,
+            &manifest,
+            "compact-manifest-temp-created",
+            "compact-manifest-written",
+            "compact-manifest-synced",
+        ) {
+            let _ = fs::remove_file(&segment_tmp);
+            return Err(error);
+        }
+        Ok(PreparedColumnarProjection {
+            root: self.root.clone(),
+            metadata,
+            #[cfg(test)]
+            segment_id,
+            segment_file,
+            #[cfg(test)]
+            row_groups: Vec::new(),
             segment_tmp,
             manifest_tmp,
             published: false,
@@ -986,6 +1994,9 @@ impl ColumnarProjection {
             {
                 return Err(ColumnarError::UnknownColumn(*column));
             }
+        }
+        if let Some(lazy) = &self.lazy {
+            return self.scan_lazy(lazy, columns, constraints);
         }
         let mut statistics = ColumnarScanStatistics {
             row_groups_total: u64::try_from(self.row_groups.len()).unwrap_or(u64::MAX),
@@ -1118,14 +2129,217 @@ impl ColumnarProjection {
         Ok((batches, statistics))
     }
 
+    fn scan_lazy(
+        &self,
+        lazy: &LazyProjection,
+        columns: &[ColumnId],
+        constraints: &[ColumnarConstraint],
+    ) -> Result<(Vec<ColumnarBatch>, ColumnarScanStatistics), ColumnarError> {
+        let mut statistics = ColumnarScanStatistics {
+            row_groups_total: lazy.base_groups.len() as u64,
+            delta_segments: lazy.deltas.len() as u64,
+            delta_mutations: self
+                .metadata
+                .incremental
+                .as_ref()
+                .map_or(0, |value| value.delta_mutation_count),
+            delta_live_rows: lazy.overlay.live.len() as u64,
+            ..ColumnarScanStatistics::default()
+        };
+        let mut batches = Vec::new();
+        for group in &lazy.base_groups {
+            if constraints
+                .iter()
+                .any(|constraint| lazy_group_cannot_match(group, constraint))
+            {
+                statistics.row_groups_pruned = statistics.row_groups_pruned.saturating_add(1);
+                statistics.row_groups_pruned_before_data_read = statistics
+                    .row_groups_pruned_before_data_read
+                    .saturating_add(1);
+                continue;
+            }
+            statistics.row_groups_read = statistics.row_groups_read.saturating_add(1);
+            let retained = if lazy.overlay.suppressed.is_empty() {
+                (0..group.rows as usize).collect::<Vec<_>>()
+            } else {
+                let block = group.source_versions.ok_or(ColumnarError::Corrupt(
+                    "incremental indexed group has no version block",
+                ))?;
+                let keys = read_version_block(
+                    lazy,
+                    lazy.base_file_index,
+                    block,
+                    group.rows,
+                    self.metadata.source_storage_id,
+                    self.metadata.source_token.kind,
+                    &mut statistics,
+                )?;
+                keys.iter()
+                    .enumerate()
+                    .filter_map(|(row, key)| {
+                        if lazy.overlay.suppressed.contains(key) {
+                            statistics.base_rows_suppressed =
+                                statistics.base_rows_suppressed.saturating_add(1);
+                            None
+                        } else {
+                            Some(row)
+                        }
+                    })
+                    .collect()
+            };
+            let selected = columns
+                .iter()
+                .map(|column_id| {
+                    let chunk = group
+                        .columns
+                        .iter()
+                        .find(|chunk| chunk.spec.column_id == *column_id)
+                        .ok_or(ColumnarError::Corrupt(
+                            "indexed row group is missing a projected column",
+                        ))?;
+                    let vector = read_column_block(
+                        lazy,
+                        lazy.base_file_index,
+                        chunk,
+                        group.rows,
+                        false,
+                        &mut statistics,
+                    )?;
+                    Ok(ColumnarBatchColumn {
+                        column_id: *column_id,
+                        values: select_vector_rows(&vector, &retained),
+                    })
+                })
+                .collect::<Result<Vec<_>, ColumnarError>>()?;
+            statistics.rows_read = statistics.rows_read.saturating_add(retained.len() as u64);
+            statistics.bytes_read = statistics.bytes_read.saturating_add(
+                selected
+                    .iter()
+                    .map(|column| vector_encoded_bytes(&column.values))
+                    .sum::<u64>(),
+            );
+            batches.push(ColumnarBatch {
+                row_count: retained.len(),
+                columns: selected,
+            });
+        }
+
+        if !lazy.overlay.live.is_empty() {
+            let mut needed = HashMap::<(u32, u64), Vec<ScalarValue>>::new();
+            for (ordinal, delta) in lazy.deltas.iter().enumerate() {
+                let ordinal = u32::try_from(ordinal)
+                    .map_err(|_| ColumnarError::Corrupt("delta segment ordinal overflow"))?;
+                let rows = lazy
+                    .overlay
+                    .live
+                    .values()
+                    .filter(|reference| reference.segment == ordinal)
+                    .map(|reference| reference.row)
+                    .collect::<HashSet<_>>();
+                if rows.is_empty() {
+                    continue;
+                }
+                let mut group_start = 0_u64;
+                for group in &delta.groups {
+                    let group_end = group_start.saturating_add(u64::from(group.rows));
+                    let local_rows = rows
+                        .iter()
+                        .filter_map(|row| {
+                            (*row >= group_start && *row < group_end)
+                                .then_some((*row - group_start) as usize)
+                        })
+                        .collect::<Vec<_>>();
+                    if local_rows.is_empty() {
+                        group_start = group_end;
+                        continue;
+                    }
+                    let vectors = columns
+                        .iter()
+                        .map(|column_id| {
+                            let chunk = group
+                                .columns
+                                .iter()
+                                .find(|chunk| chunk.spec.column_id == *column_id)
+                                .ok_or(ColumnarError::Corrupt(
+                                    "indexed delta group is missing a projected column",
+                                ))?;
+                            read_column_block(
+                                lazy,
+                                delta.file_index,
+                                chunk,
+                                group.rows,
+                                true,
+                                &mut statistics,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for local in local_rows {
+                        let values = vectors
+                            .iter()
+                            .map(|vector| vector.value(local))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        needed.insert((ordinal, group_start + local as u64), values);
+                    }
+                    group_start = group_end;
+                }
+            }
+            let mut live = lazy.overlay.live.iter().collect::<Vec<_>>();
+            live.sort_by_key(|(key, _)| version_key_sort_key(**key));
+            let rows = live
+                .into_iter()
+                .map(|(_, reference)| {
+                    needed.remove(&(reference.segment, reference.row)).ok_or(
+                        ColumnarError::Corrupt("live delta row reference is unresolved"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let specs = columns
+                .iter()
+                .map(|column| {
+                    self.metadata
+                        .columns
+                        .iter()
+                        .find(|candidate| candidate.column_id == *column)
+                        .cloned()
+                        .ok_or(ColumnarError::UnknownColumn(*column))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let delta_group = encode_row_group(&specs, &rows)?;
+            statistics.delta_rows_emitted = rows.len() as u64;
+            statistics.rows_read = statistics.rows_read.saturating_add(rows.len() as u64);
+            statistics.bytes_read = statistics.bytes_read.saturating_add(
+                delta_group
+                    .columns
+                    .iter()
+                    .map(|column| vector_encoded_bytes(&column.values))
+                    .sum::<u64>(),
+            );
+            batches.push(ColumnarBatch {
+                row_count: rows.len(),
+                columns: delta_group.columns,
+            });
+        }
+        statistics.merged_rows = statistics.rows_read;
+        Ok((batches, statistics))
+    }
+
     pub fn drop_files(self) -> Result<(), ColumnarError> {
         let manifest = self.root.join(MANIFEST_FILE);
-        let segment = self.root.join(&self.segment_file);
         match fs::remove_file(&manifest) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(ColumnarError::Io(error)),
         }
+        if let Some(lazy) = &self.lazy {
+            lazy.files.retired.store(true, AtomicOrdering::Release);
+            for files in &lazy.prior_files {
+                files.retired.store(true, AtomicOrdering::Release);
+            }
+            let root = self.root.clone();
+            drop(self);
+            return sync_directory(&root);
+        }
+        let segment = self.root.join(&self.segment_file);
         match fs::remove_file(segment) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1145,6 +2359,13 @@ impl ColumnarProjection {
 
     /// Removes only this immutable generation after a newer manifest is durable.
     pub fn retire_segment(self) -> Result<(), ColumnarError> {
+        if let Some(lazy) = &self.lazy {
+            lazy.files.retired.store(true, AtomicOrdering::Release);
+            for files in &lazy.prior_files {
+                files.retired.store(true, AtomicOrdering::Release);
+            }
+            return Ok(());
+        }
         match fs::remove_file(self.root.join(&self.segment_file)) {
             Ok(()) => {
                 if let Some(incremental) = &self.metadata.incremental {
@@ -1209,6 +2430,60 @@ fn select_vector_rows(vector: &ColumnarVector, rows: &[usize]) -> ColumnarVector
     }
 }
 
+fn flush_lazy_compaction_group(
+    file: &mut File,
+    identity: SegmentIdentity,
+    columns: &[ColumnarColumnSpec],
+    pending: &mut Vec<(StorageVersionKey, Vec<ScalarValue>)>,
+    directory: &mut Vec<LazyRowGroup>,
+) -> Result<(), ColumnarError> {
+    let group = encode_versioned_row_group(columns, pending)?;
+    directory.push(write_lazy_row_group(file, identity, columns, &group, true)?);
+    pending.clear();
+    Ok(())
+}
+
+fn read_lazy_delta_row(
+    projection: &ColumnarProjection,
+    lazy: &LazyProjection,
+    reference: DeltaRowRef,
+    statistics: &mut ColumnarScanStatistics,
+) -> Result<Vec<ScalarValue>, ColumnarError> {
+    let delta = lazy
+        .deltas
+        .get(reference.segment as usize)
+        .ok_or(ColumnarError::Corrupt(
+            "delta row references an unknown segment",
+        ))?;
+    let mut start = 0_u64;
+    for group in &delta.groups {
+        let end = start.saturating_add(u64::from(group.rows));
+        if reference.row < end {
+            if reference.row < start {
+                return Err(ColumnarError::Corrupt("delta row reference is unordered"));
+            }
+            let local = usize::try_from(reference.row - start)
+                .map_err(|_| ColumnarError::Corrupt("delta row index overflow"))?;
+            return group
+                .columns
+                .iter()
+                .map(|chunk| {
+                    read_column_block(lazy, delta.file_index, chunk, group.rows, true, statistics)?
+                        .value(local)
+                })
+                .collect();
+        }
+        start = end;
+    }
+    Err(ColumnarError::Corrupt(
+        if projection.metadata.incremental.is_some() {
+            "delta row reference is out of bounds"
+        } else {
+            "delta row reference exists on snapshot projection"
+        },
+    ))
+}
+
 fn version_key_sort_key(key: StorageVersionKey) -> (u8, u64, u64, u64) {
     match key {
         StorageVersionKey::Heap { row_id, .. } => (
@@ -1257,6 +2532,25 @@ pub enum ColumnarError {
     UnknownColumn(ColumnId),
     TypeMismatch(ColumnId),
     ResourceLimit { resource: &'static str, value: u64 },
+}
+
+impl ColumnarError {
+    /// Whether a read failed because the immutable projection can no longer be
+    /// trusted or accessed. Core may quarantine derived state and retry the
+    /// same autocommit query against authoritative storage.
+    #[must_use]
+    pub const fn invalidates_projection(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(_)
+                | Self::InvalidFormat(_)
+                | Self::Corrupt(_)
+                | Self::UnsupportedVersion(_)
+                | Self::ChecksumMismatch { .. }
+                | Self::IdentityMismatch(_)
+                | Self::ResourceLimit { .. }
+        )
+    }
 }
 
 impl fmt::Display for ColumnarError {
@@ -1524,6 +2818,152 @@ fn group_cannot_match(group: &RowGroup, constraint: &ColumnarConstraint) -> bool
         }
     }
     false
+}
+
+fn lazy_group_cannot_match(group: &LazyRowGroup, constraint: &ColumnarConstraint) -> bool {
+    let Some(stats) = group
+        .columns
+        .iter()
+        .find(|column| column.spec.column_id == constraint.column_id)
+        .map(|column| &column.statistics)
+    else {
+        return false;
+    };
+    let Some(minimum) = stats.minimum.as_ref() else {
+        return true;
+    };
+    let Some(maximum) = stats.maximum.as_ref() else {
+        return true;
+    };
+    if let Some((lower, inclusive)) = &constraint.lower {
+        let ordering = compare_values(maximum, lower);
+        if ordering == Ordering::Less || (!inclusive && ordering == Ordering::Equal) {
+            return true;
+        }
+    }
+    if let Some((upper, inclusive)) = &constraint.upper {
+        let ordering = compare_values(minimum, upper);
+        if ordering == Ordering::Greater || (!inclusive && ordering == Ordering::Equal) {
+            return true;
+        }
+    }
+    false
+}
+
+fn lazy_file(lazy: &LazyProjection, file_index: usize) -> Result<&File, ColumnarError> {
+    lazy.files
+        .handles
+        .get(file_index)
+        .and_then(Option::as_ref)
+        .ok_or(ColumnarError::Corrupt(
+            "indexed payload file handle is unavailable",
+        ))
+}
+
+#[derive(Clone, Copy)]
+enum PayloadKind {
+    BaseData,
+    BaseVersion,
+    DeltaData,
+}
+
+fn read_checked_block(
+    lazy: &LazyProjection,
+    file_index: usize,
+    block: BlockRef,
+    kind: PayloadKind,
+    statistics: &mut ColumnarScanStatistics,
+) -> Result<Vec<u8>, ColumnarError> {
+    let bytes = read_exact_range(lazy_file(lazy, file_index)?, block.offset, block.length)?;
+    if crc32c::crc32c(&bytes) != block.checksum {
+        let path = lazy
+            .files
+            .paths
+            .get(file_index)
+            .cloned()
+            .unwrap_or_default();
+        return Err(ColumnarError::ChecksumMismatch { path });
+    }
+    statistics.physical_block_reads = statistics.physical_block_reads.saturating_add(1);
+    statistics.physical_bytes_read = statistics.physical_bytes_read.saturating_add(block.length);
+    statistics.blocks_verified = statistics.blocks_verified.saturating_add(1);
+    match kind {
+        PayloadKind::BaseData => {
+            statistics.base_data_bytes_read =
+                statistics.base_data_bytes_read.saturating_add(block.length);
+        }
+        PayloadKind::BaseVersion => {
+            statistics.base_version_key_bytes_read = statistics
+                .base_version_key_bytes_read
+                .saturating_add(block.length);
+        }
+        PayloadKind::DeltaData => {
+            statistics.delta_data_bytes_read = statistics
+                .delta_data_bytes_read
+                .saturating_add(block.length);
+            statistics.delta_bytes_read = statistics.delta_bytes_read.saturating_add(block.length);
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_column_block(
+    lazy: &LazyProjection,
+    file_index: usize,
+    chunk: &LazyColumnChunk,
+    rows: u32,
+    delta: bool,
+    statistics: &mut ColumnarScanStatistics,
+) -> Result<ColumnarVector, ColumnarError> {
+    let bytes = read_checked_block(
+        lazy,
+        file_index,
+        chunk.block,
+        if delta {
+            PayloadKind::DeltaData
+        } else {
+            PayloadKind::BaseData
+        },
+        statistics,
+    )?;
+    let mut reader = Reader::new(&bytes);
+    let (vector, decoded_statistics) = decode_column_chunk(&mut reader, &chunk.spec, rows)?;
+    reader.finish()?;
+    if decoded_statistics != chunk.statistics {
+        return Err(ColumnarError::Corrupt(
+            "column payload disagrees with indexed metadata",
+        ));
+    }
+    statistics.column_chunks_read = statistics.column_chunks_read.saturating_add(1);
+    statistics.decoded_column_chunks = statistics.decoded_column_chunks.saturating_add(1);
+    Ok(vector)
+}
+
+fn read_version_block(
+    lazy: &LazyProjection,
+    file_index: usize,
+    block: BlockRef,
+    rows: u32,
+    storage_id: StorageId,
+    kind: SnapshotKind,
+    statistics: &mut ColumnarScanStatistics,
+) -> Result<Vec<StorageVersionKey>, ColumnarError> {
+    let bytes = read_checked_block(
+        lazy,
+        file_index,
+        block,
+        PayloadKind::BaseVersion,
+        statistics,
+    )?;
+    let mut reader = Reader::new(&bytes);
+    let mut keys = Vec::with_capacity(rows as usize);
+    for _ in 0..rows {
+        keys.push(decode_version_key(&mut reader, storage_id, kind)?);
+    }
+    reader.finish()?;
+    statistics.decoded_version_blocks = statistics.decoded_version_blocks.saturating_add(1);
+    statistics.version_key_chunks_read = statistics.version_key_chunks_read.saturating_add(1);
+    Ok(keys)
 }
 
 fn validate_versioned_rows(
@@ -2010,6 +3450,930 @@ fn decode_delta(
     Ok(mutations)
 }
 
+fn encode_block_ref(output: &mut Vec<u8>, block: BlockRef) {
+    push_u64(output, block.offset);
+    push_u64(output, block.length);
+    push_u32(output, block.checksum);
+    push_u32(output, 0);
+}
+
+fn decode_block_ref(reader: &mut Reader<'_>) -> Result<BlockRef, ColumnarError> {
+    let block = BlockRef {
+        offset: reader.u64()?,
+        length: reader.u64()?,
+        checksum: reader.u32()?,
+    };
+    if reader.u32()? != 0 || block.length == 0 || block.length > MAX_LAZY_BLOCK_BYTES {
+        return Err(ColumnarError::Corrupt("invalid payload block reference"));
+    }
+    Ok(block)
+}
+
+fn encode_lazy_group_directory(
+    output: &mut Vec<u8>,
+    group: &LazyRowGroup,
+) -> Result<(), ColumnarError> {
+    push_u32(output, group.rows);
+    output.push(u8::from(group.source_versions.is_some()));
+    output.extend_from_slice(&[0; 3]);
+    if let Some(block) = group.source_versions {
+        encode_block_ref(output, block);
+    }
+    push_u32(
+        output,
+        u32::try_from(group.columns.len())
+            .map_err(|_| ColumnarError::InvalidInput("column count overflow"))?,
+    );
+    for column in &group.columns {
+        push_u32(output, column.spec.column_id.0);
+        output.push(type_tag(column.spec.physical_type));
+        output.push(u8::from(column.spec.nullable));
+        push_u16(output, 0);
+        push_u64(output, column.statistics.null_count);
+        encode_optional_scalar(
+            output,
+            column.statistics.minimum.as_ref(),
+            column.spec.physical_type,
+        )?;
+        encode_optional_scalar(
+            output,
+            column.statistics.maximum.as_ref(),
+            column.spec.physical_type,
+        )?;
+        push_u64(output, column.statistics.encoded_bytes);
+        encode_block_ref(output, column.block);
+    }
+    Ok(())
+}
+
+fn decode_lazy_group_directory(
+    reader: &mut Reader<'_>,
+    columns: &[ColumnarColumnSpec],
+    require_versions: bool,
+) -> Result<LazyRowGroup, ColumnarError> {
+    let rows = reader.u32()?;
+    if rows == 0 {
+        return Err(ColumnarError::Corrupt("empty indexed row group"));
+    }
+    let has_versions = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(ColumnarError::Corrupt("invalid version-block flag")),
+    };
+    if reader.take(3)?.iter().any(|byte| *byte != 0) || has_versions != require_versions {
+        return Err(ColumnarError::Corrupt("invalid indexed row-group mode"));
+    }
+    let source_versions = has_versions.then(|| decode_block_ref(reader)).transpose()?;
+    let count = reader.u32()?;
+    if usize::try_from(count).ok() != Some(columns.len()) {
+        return Err(ColumnarError::Corrupt("indexed column count mismatch"));
+    }
+    let mut chunks = Vec::with_capacity(columns.len());
+    for expected in columns {
+        let spec = ColumnarColumnSpec {
+            column_id: ColumnId(reader.u32()?),
+            physical_type: decode_type_tag(reader.u8()?)?,
+            nullable: match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ColumnarError::Corrupt("invalid indexed nullable flag")),
+            },
+        };
+        if reader.u16()? != 0 || &spec != expected {
+            return Err(ColumnarError::IdentityMismatch(
+                "indexed column specification",
+            ));
+        }
+        let null_count = reader.u64()?;
+        let minimum = decode_optional_scalar(reader, spec.physical_type)?;
+        let maximum = decode_optional_scalar(reader, spec.physical_type)?;
+        if null_count > u64::from(rows) || minimum.is_some() != maximum.is_some() {
+            return Err(ColumnarError::Corrupt("invalid indexed zone map"));
+        }
+        let encoded_bytes = reader.u64()?;
+        chunks.push(LazyColumnChunk {
+            spec,
+            statistics: ColumnarColumnStatistics {
+                null_count,
+                minimum,
+                maximum,
+                encoded_bytes,
+            },
+            block: decode_block_ref(reader)?,
+        });
+    }
+    Ok(LazyRowGroup {
+        rows,
+        source_versions,
+        columns: chunks,
+    })
+}
+
+fn write_payload_block(file: &mut File, payload: &[u8]) -> Result<BlockRef, ColumnarError> {
+    if payload.len() as u64 > MAX_LAZY_BLOCK_BYTES {
+        return Err(ColumnarError::ResourceLimit {
+            resource: "payload block bytes",
+            value: payload.len() as u64,
+        });
+    }
+    let offset = file.stream_position().map_err(ColumnarError::Io)?;
+    file.write_all(payload).map_err(ColumnarError::Io)?;
+    Ok(BlockRef {
+        offset,
+        length: u64::try_from(payload.len())
+            .map_err(|_| ColumnarError::InvalidInput("payload block length overflow"))?,
+        checksum: crc32c::crc32c(payload),
+    })
+}
+
+fn write_lazy_row_group(
+    file: &mut File,
+    identity: SegmentIdentity,
+    columns: &[ColumnarColumnSpec],
+    group: &RowGroup,
+    require_versions: bool,
+) -> Result<LazyRowGroup, ColumnarError> {
+    let source_versions = if require_versions {
+        let keys = group
+            .source_versions
+            .as_ref()
+            .ok_or(ColumnarError::InvalidInput(
+                "incremental row group is missing source identities",
+            ))?;
+        if keys.len() != group.rows as usize {
+            return Err(ColumnarError::InvalidInput(
+                "source identity count differs from row count",
+            ));
+        }
+        let mut payload = Vec::with_capacity(keys.len().saturating_mul(24));
+        for key in keys {
+            encode_version_key(&mut payload, *key, identity.storage_id)?;
+        }
+        Some(write_payload_block(file, &payload)?)
+    } else {
+        if group.source_versions.is_some() {
+            return Err(ColumnarError::InvalidInput(
+                "snapshot row group unexpectedly has source identities",
+            ));
+        }
+        None
+    };
+    let mut chunks = Vec::with_capacity(columns.len());
+    for (spec, batch) in columns.iter().zip(&group.columns) {
+        let statistics = group
+            .statistics
+            .iter()
+            .find(|(id, _)| *id == spec.column_id)
+            .map(|(_, statistics)| statistics.clone())
+            .ok_or(ColumnarError::InvalidInput("row-group statistics missing"))?;
+        let mut payload = Vec::new();
+        encode_column_chunk(&mut payload, spec, &batch.values, &statistics)?;
+        chunks.push(LazyColumnChunk {
+            spec: spec.clone(),
+            statistics,
+            block: write_payload_block(file, &payload)?,
+        });
+    }
+    Ok(LazyRowGroup {
+        rows: group.rows,
+        source_versions,
+        columns: chunks,
+    })
+}
+
+fn encode_lazy_segment_header(
+    identity: SegmentIdentity,
+    kind: SnapshotKind,
+    incremental: bool,
+    columns: usize,
+    groups: usize,
+    rows: u64,
+    footer: BlockRef,
+) -> Result<Vec<u8>, ColumnarError> {
+    let mut output = Vec::with_capacity(LAZY_SEGMENT_HEADER_BYTES as usize);
+    output.extend_from_slice(SEGMENT_MAGIC);
+    push_u16(&mut output, LAZY_FORMAT_VERSION);
+    push_u16(&mut output, u16::from(incremental));
+    push_u64(&mut output, identity.projection_id.0);
+    push_u64(&mut output, identity.generation.0);
+    push_u64(&mut output, identity.segment_id.0);
+    push_u64(&mut output, identity.table_id.0);
+    push_u64(&mut output, identity.storage_id.0);
+    output.extend_from_slice(identity.fingerprint.as_bytes());
+    output.push(snapshot_tag(kind));
+    output.extend_from_slice(&[0; 7]);
+    push_u32(
+        &mut output,
+        u32::try_from(columns).map_err(|_| ColumnarError::InvalidInput("column count overflow"))?,
+    );
+    push_u32(
+        &mut output,
+        u32::try_from(groups)
+            .map_err(|_| ColumnarError::InvalidInput("row-group count overflow"))?,
+    );
+    push_u64(&mut output, rows);
+    push_u64(&mut output, footer.offset);
+    push_u64(&mut output, footer.length);
+    push_u32(&mut output, footer.checksum);
+    push_u32(&mut output, 0);
+    append_checksum(&mut output);
+    if output.len() as u64 != LAZY_SEGMENT_HEADER_BYTES {
+        return Err(ColumnarError::Corrupt("lazy segment header size mismatch"));
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_lazy_segment_synced(
+    path: &Path,
+    identity: SegmentIdentity,
+    kind: SnapshotKind,
+    columns: &[ColumnarColumnSpec],
+    groups: &[RowGroup],
+    incremental: bool,
+    created_point: &str,
+    written_point: &str,
+    synced_point: &str,
+) -> Result<(u64, u32), ColumnarError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(ColumnarError::Io)?;
+    crash(created_point);
+    file.write_all(&vec![0; LAZY_SEGMENT_HEADER_BYTES as usize])
+        .map_err(ColumnarError::Io)?;
+    let mut directory = Vec::with_capacity(groups.len());
+    let mut rows = 0_u64;
+    for group in groups {
+        rows = rows
+            .checked_add(u64::from(group.rows))
+            .ok_or(ColumnarError::InvalidInput("segment row count overflow"))?;
+        directory.push(write_lazy_row_group(
+            &mut file,
+            identity,
+            columns,
+            group,
+            incremental,
+        )?);
+    }
+    let footer_offset = file.stream_position().map_err(ColumnarError::Io)?;
+    let mut footer = Vec::new();
+    footer.extend_from_slice(SEGMENT_FOOTER_MAGIC);
+    push_u16(&mut footer, INDEX_FORMAT_VERSION);
+    push_u16(&mut footer, 0);
+    push_u64(&mut footer, identity.projection_id.0);
+    push_u64(&mut footer, identity.generation.0);
+    push_u64(&mut footer, identity.segment_id.0);
+    push_u32(&mut footer, columns.len() as u32);
+    push_u32(&mut footer, directory.len() as u32);
+    push_u64(&mut footer, rows);
+    for group in &directory {
+        encode_lazy_group_directory(&mut footer, group)?;
+    }
+    append_checksum(&mut footer);
+    let footer_checksum = stored_checksum(&footer)?;
+    file.write_all(&footer).map_err(ColumnarError::Io)?;
+    let header = encode_lazy_segment_header(
+        identity,
+        kind,
+        incremental,
+        columns.len(),
+        directory.len(),
+        rows,
+        BlockRef {
+            offset: footer_offset,
+            length: footer.len() as u64,
+            checksum: footer_checksum,
+        },
+    )?;
+    file.seek(SeekFrom::Start(0)).map_err(ColumnarError::Io)?;
+    file.write_all(&header).map_err(ColumnarError::Io)?;
+    crash(written_point);
+    file.sync_data().map_err(ColumnarError::Io)?;
+    crash(synced_point);
+    let bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+    Ok((bytes, footer_checksum))
+}
+
+fn read_exact_range(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, ColumnarError> {
+    let capacity = usize::try_from(length).map_err(|_| ColumnarError::ResourceLimit {
+        resource: "payload block bytes",
+        value: length,
+    })?;
+    let mut handle = file.try_clone().map_err(ColumnarError::Io)?;
+    handle
+        .seek(SeekFrom::Start(offset))
+        .map_err(ColumnarError::Io)?;
+    let mut bytes = vec![0; capacity];
+    handle.read_exact(&mut bytes).map_err(ColumnarError::Io)?;
+    Ok(bytes)
+}
+
+fn validate_block_ranges(
+    groups: &[LazyRowGroup],
+    data_start: u64,
+    data_end: u64,
+) -> Result<(), ColumnarError> {
+    let mut ranges = Vec::new();
+    for group in groups {
+        if let Some(block) = group.source_versions {
+            ranges.push(block);
+        }
+        ranges.extend(group.columns.iter().map(|column| column.block));
+    }
+    for block in &ranges {
+        let end = block
+            .offset
+            .checked_add(block.length)
+            .ok_or(ColumnarError::Corrupt("payload block range overflow"))?;
+        if block.offset < data_start || end > data_end {
+            return Err(ColumnarError::Corrupt("payload block is outside data area"));
+        }
+    }
+    ranges.sort_by_key(|block| block.offset);
+    if ranges
+        .windows(2)
+        .any(|pair| pair[0].offset.saturating_add(pair[0].length) > pair[1].offset)
+    {
+        return Err(ColumnarError::Corrupt("payload blocks overlap"));
+    }
+    Ok(())
+}
+
+fn open_lazy_segment(
+    path: &Path,
+    metadata: &ColumnarProjectionMetadata,
+    expected_segment_id: ColumnarSegmentId,
+    expected_footer_checksum: u32,
+) -> Result<(File, Vec<LazyRowGroup>, u64), ColumnarError> {
+    let file = File::open(path).map_err(ColumnarError::Io)?;
+    let file_bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+    if !(LAZY_SEGMENT_HEADER_BYTES..=MAX_FILE_BYTES).contains(&file_bytes) {
+        return Err(ColumnarError::ResourceLimit {
+            resource: "segment bytes",
+            value: file_bytes,
+        });
+    }
+    let header = read_exact_range(&file, 0, LAZY_SEGMENT_HEADER_BYTES)?;
+    validate_checksum(&header)?;
+    let mut reader = Reader::new(&header[..header.len() - 4]);
+    reader.expect(SEGMENT_MAGIC)?;
+    let format_version = reader.u16()?;
+    if format_version != LAZY_FORMAT_VERSION {
+        return Err(ColumnarError::UnsupportedVersion(format_version));
+    }
+    let incremental = match reader.u16()? {
+        0 => false,
+        1 => true,
+        _ => return Err(ColumnarError::Corrupt("invalid lazy segment flags")),
+    };
+    if incremental != metadata.incremental.is_some()
+        || ColumnarProjectionId(reader.u64()?) != metadata.id
+        || ColumnarGeneration(reader.u64()?) != metadata.generation
+        || ColumnarSegmentId(reader.u64()?) != expected_segment_id
+        || TableId(reader.u64()?) != metadata.table_id
+        || StorageId(reader.u64()?) != metadata.source_storage_id
+        || SchemaFingerprint::from_bytes(reader.array()?) != metadata.schema_fingerprint
+        || decode_snapshot_tag(reader.u8()?)? != metadata.source_token.kind
+        || reader.take(7)?.iter().any(|byte| *byte != 0)
+    {
+        return Err(ColumnarError::IdentityMismatch("lazy segment context"));
+    }
+    let column_count = reader.u32()?;
+    let group_count = reader.u32()?;
+    let row_count = reader.u64()?;
+    let footer_offset = reader.u64()?;
+    let footer_length = reader.u64()?;
+    let footer_checksum = reader.u32()?;
+    if reader.u32()? != 0 || footer_checksum != expected_footer_checksum {
+        return Err(ColumnarError::Corrupt(
+            "lazy segment footer checksum header mismatch",
+        ));
+    }
+    reader.finish()?;
+    if usize::try_from(column_count).ok() != Some(metadata.columns.len())
+        || u64::from(group_count) != metadata.row_group_count
+        || row_count != metadata.row_count
+        || footer_offset < LAZY_SEGMENT_HEADER_BYTES
+        || footer_length > MAX_INDEX_BYTES
+        || footer_offset.checked_add(footer_length) != Some(file_bytes)
+    {
+        return Err(ColumnarError::Corrupt(
+            "lazy segment header counts or footer range mismatch",
+        ));
+    }
+    let footer = read_exact_range(&file, footer_offset, footer_length)?;
+    validate_checksum(&footer)?;
+    if stored_checksum(&footer)? != expected_footer_checksum {
+        return Err(ColumnarError::ChecksumMismatch {
+            path: path.to_owned(),
+        });
+    }
+    let mut reader = Reader::new(&footer[..footer.len() - 4]);
+    reader.expect(SEGMENT_FOOTER_MAGIC)?;
+    if reader.u16()? != INDEX_FORMAT_VERSION
+        || reader.u16()? != 0
+        || ColumnarProjectionId(reader.u64()?) != metadata.id
+        || ColumnarGeneration(reader.u64()?) != metadata.generation
+        || ColumnarSegmentId(reader.u64()?) != expected_segment_id
+        || reader.u32()? != column_count
+        || reader.u32()? != group_count
+        || reader.u64()? != row_count
+    {
+        return Err(ColumnarError::IdentityMismatch(
+            "lazy segment footer context",
+        ));
+    }
+    let mut groups = Vec::with_capacity(group_count as usize);
+    let mut decoded_rows = 0_u64;
+    for _ in 0..group_count {
+        let group = decode_lazy_group_directory(
+            &mut reader,
+            &metadata.columns,
+            metadata.incremental.is_some(),
+        )?;
+        decoded_rows = decoded_rows
+            .checked_add(u64::from(group.rows))
+            .ok_or(ColumnarError::Corrupt("indexed row count overflow"))?;
+        groups.push(group);
+    }
+    reader.finish()?;
+    if decoded_rows != row_count {
+        return Err(ColumnarError::Corrupt("indexed row count mismatch"));
+    }
+    validate_block_ranges(&groups, LAZY_SEGMENT_HEADER_BYTES, footer_offset)?;
+    Ok((
+        file,
+        groups,
+        footer_length.saturating_add(LAZY_SEGMENT_HEADER_BYTES),
+    ))
+}
+
+fn encode_lazy_delta_header(
+    metadata: &ColumnarProjectionMetadata,
+    before: StorageDataVersion,
+    after: StorageDataVersion,
+    batch_count: usize,
+    mutation_count: usize,
+    after_count: usize,
+    footer: BlockRef,
+) -> Result<Vec<u8>, ColumnarError> {
+    let incremental = metadata
+        .incremental
+        .as_ref()
+        .ok_or(ColumnarError::InvalidInput(
+            "snapshot projection cannot encode delta",
+        ))?;
+    let mut output = Vec::with_capacity(LAZY_DELTA_HEADER_BYTES as usize);
+    output.extend_from_slice(DELTA_MAGIC);
+    push_u16(&mut output, LAZY_DELTA_FORMAT_VERSION);
+    push_u16(&mut output, 0);
+    push_u64(&mut output, metadata.id.0);
+    push_u64(&mut output, metadata.generation.0);
+    push_u64(&mut output, metadata.table_id.0);
+    push_u64(&mut output, metadata.source_storage_id.0);
+    output.extend_from_slice(metadata.schema_fingerprint.as_bytes());
+    output.push(snapshot_tag(metadata.source_token.kind));
+    output.extend_from_slice(&[0; 7]);
+    push_u64(&mut output, incremental.stream_generation.0);
+    push_u64(&mut output, before.0);
+    push_u64(&mut output, after.0);
+    push_u32(
+        &mut output,
+        u32::try_from(batch_count)
+            .map_err(|_| ColumnarError::InvalidInput("batch count overflow"))?,
+    );
+    push_u32(&mut output, metadata.columns.len() as u32);
+    push_u64(&mut output, mutation_count as u64);
+    push_u64(&mut output, after_count as u64);
+    push_u64(&mut output, footer.offset);
+    push_u64(&mut output, footer.length);
+    push_u32(&mut output, footer.checksum);
+    push_u32(&mut output, 0);
+    append_checksum(&mut output);
+    if output.len() as u64 != LAZY_DELTA_HEADER_BYTES {
+        return Err(ColumnarError::Corrupt("lazy delta header size mismatch"));
+    }
+    Ok(output)
+}
+
+fn encode_delta_descriptors(
+    output: &mut Vec<u8>,
+    metadata: &ColumnarProjectionMetadata,
+    batches: &[ChangeBatch],
+    mutations: &[ProjectedDeltaMutation],
+) -> Result<(), ColumnarError> {
+    let mut mutation_position = 0_usize;
+    let mut after_index = 0_u64;
+    for batch in batches {
+        push_u64(output, batch.before.0);
+        push_u64(output, batch.after.0);
+        push_u32(output, batch.mutations.len() as u32);
+        for _ in &batch.mutations {
+            let mutation = mutations
+                .get(mutation_position)
+                .ok_or(ColumnarError::InvalidInput("delta mutation count mismatch"))?;
+            mutation_position += 1;
+            match (
+                mutation.old_version,
+                mutation.new_version,
+                mutation.after.as_ref(),
+            ) {
+                (None, Some(new), Some(_)) => {
+                    output.push(1);
+                    encode_version_key(output, new, metadata.source_storage_id)?;
+                    push_u64(output, after_index);
+                    after_index += 1;
+                }
+                (Some(old), Some(new), Some(_)) => {
+                    output.push(2);
+                    encode_version_key(output, old, metadata.source_storage_id)?;
+                    encode_version_key(output, new, metadata.source_storage_id)?;
+                    push_u64(output, after_index);
+                    after_index += 1;
+                }
+                (Some(old), None, None) => {
+                    output.push(3);
+                    encode_version_key(output, old, metadata.source_storage_id)?;
+                }
+                _ => return Err(ColumnarError::InvalidInput("invalid projected mutation")),
+            }
+        }
+    }
+    if mutation_position != mutations.len() {
+        return Err(ColumnarError::InvalidInput("delta mutation count mismatch"));
+    }
+    Ok(())
+}
+
+fn write_lazy_delta_synced(
+    path: &Path,
+    metadata: &ColumnarProjectionMetadata,
+    batches: &[ChangeBatch],
+    mutations: &[ProjectedDeltaMutation],
+) -> Result<(u64, u32), ColumnarError> {
+    let before = batches
+        .first()
+        .ok_or(ColumnarError::InvalidInput("empty delta"))?
+        .before;
+    let after = batches
+        .last()
+        .ok_or(ColumnarError::InvalidInput("empty delta"))?
+        .after;
+    let after_count = mutations
+        .iter()
+        .filter(|mutation| mutation.after.is_some())
+        .count();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(ColumnarError::Io)?;
+    crash("delta-temp-created");
+    file.write_all(&vec![0; LAZY_DELTA_HEADER_BYTES as usize])
+        .map_err(ColumnarError::Io)?;
+    let identity = SegmentIdentity {
+        projection_id: metadata.id,
+        generation: metadata.generation,
+        segment_id: ColumnarSegmentId(after.0),
+        table_id: metadata.table_id,
+        storage_id: metadata.source_storage_id,
+        fingerprint: metadata.schema_fingerprint,
+    };
+    let mut groups = Vec::new();
+    let mut pending = Vec::with_capacity(DEFAULT_ROW_GROUP_ROWS);
+    for mutation in mutations {
+        if let Some(row) = &mutation.after {
+            pending.push(row.clone());
+            if pending.len() == DEFAULT_ROW_GROUP_ROWS {
+                let group = encode_row_group(&metadata.columns, &pending)?;
+                groups.push(write_lazy_row_group(
+                    &mut file,
+                    identity,
+                    &metadata.columns,
+                    &group,
+                    false,
+                )?);
+                pending.clear();
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let group = encode_row_group(&metadata.columns, &pending)?;
+        groups.push(write_lazy_row_group(
+            &mut file,
+            identity,
+            &metadata.columns,
+            &group,
+            false,
+        )?);
+    }
+    let footer_offset = file.stream_position().map_err(ColumnarError::Io)?;
+    let mut footer = Vec::new();
+    footer.extend_from_slice(DELTA_FOOTER_MAGIC);
+    push_u16(&mut footer, INDEX_FORMAT_VERSION);
+    push_u16(&mut footer, 0);
+    push_u64(&mut footer, metadata.id.0);
+    push_u64(&mut footer, metadata.generation.0);
+    push_u64(&mut footer, metadata.table_id.0);
+    push_u64(&mut footer, metadata.source_storage_id.0);
+    footer.extend_from_slice(metadata.schema_fingerprint.as_bytes());
+    let incremental = metadata
+        .incremental
+        .as_ref()
+        .ok_or(ColumnarError::InvalidInput(
+            "snapshot projection cannot encode delta",
+        ))?;
+    push_u64(&mut footer, incremental.stream_generation.0);
+    push_u64(&mut footer, before.0);
+    push_u64(&mut footer, after.0);
+    push_u32(&mut footer, batches.len() as u32);
+    push_u64(&mut footer, mutations.len() as u64);
+    push_u64(&mut footer, after_count as u64);
+    push_u32(&mut footer, metadata.columns.len() as u32);
+    push_u32(&mut footer, groups.len() as u32);
+    encode_delta_descriptors(&mut footer, metadata, batches, mutations)?;
+    for group in &groups {
+        encode_lazy_group_directory(&mut footer, group)?;
+    }
+    append_checksum(&mut footer);
+    let footer_checksum = stored_checksum(&footer)?;
+    file.write_all(&footer).map_err(ColumnarError::Io)?;
+    let header = encode_lazy_delta_header(
+        metadata,
+        before,
+        after,
+        batches.len(),
+        mutations.len(),
+        after_count,
+        BlockRef {
+            offset: footer_offset,
+            length: footer.len() as u64,
+            checksum: footer_checksum,
+        },
+    )?;
+    file.seek(SeekFrom::Start(0)).map_err(ColumnarError::Io)?;
+    file.write_all(&header).map_err(ColumnarError::Io)?;
+    crash("delta-written");
+    file.sync_data().map_err(ColumnarError::Io)?;
+    crash("delta-synced");
+    Ok((
+        file.metadata().map_err(ColumnarError::Io)?.len(),
+        footer_checksum,
+    ))
+}
+
+fn decode_lazy_delta_descriptors(
+    reader: &mut Reader<'_>,
+    metadata: &ColumnarProjectionMetadata,
+    before: StorageDataVersion,
+    after: StorageDataVersion,
+    batch_count: u32,
+    mutation_count: u64,
+    after_count: u64,
+) -> Result<Vec<DeltaDescriptor>, ColumnarError> {
+    let mut descriptors = Vec::with_capacity(mutation_count as usize);
+    let mut frontier = before;
+    let mut used = HashSet::new();
+    for _ in 0..batch_count {
+        let batch_before = StorageDataVersion(reader.u64()?);
+        let batch_after = StorageDataVersion(reader.u64()?);
+        let count = reader.u32()?;
+        if batch_before != frontier || batch_after.0 <= batch_before.0 {
+            return Err(ColumnarError::Corrupt("broken lazy delta batch frontier"));
+        }
+        frontier = batch_after;
+        for _ in 0..count {
+            let descriptor = match reader.u8()? {
+                1 => DeltaDescriptor {
+                    old_version: None,
+                    new_version: Some(decode_version_key(
+                        reader,
+                        metadata.source_storage_id,
+                        metadata.source_token.kind,
+                    )?),
+                    after_row: Some(reader.u64()?),
+                },
+                2 => {
+                    let old = decode_version_key(
+                        reader,
+                        metadata.source_storage_id,
+                        metadata.source_token.kind,
+                    )?;
+                    let new = decode_version_key(
+                        reader,
+                        metadata.source_storage_id,
+                        metadata.source_token.kind,
+                    )?;
+                    if old == new {
+                        return Err(ColumnarError::Corrupt("update preserves version identity"));
+                    }
+                    DeltaDescriptor {
+                        old_version: Some(old),
+                        new_version: Some(new),
+                        after_row: Some(reader.u64()?),
+                    }
+                }
+                3 => DeltaDescriptor {
+                    old_version: Some(decode_version_key(
+                        reader,
+                        metadata.source_storage_id,
+                        metadata.source_token.kind,
+                    )?),
+                    new_version: None,
+                    after_row: None,
+                },
+                _ => return Err(ColumnarError::Corrupt("unknown lazy delta mutation tag")),
+            };
+            if let Some(row) = descriptor.after_row
+                && (row >= after_count || !used.insert(row))
+            {
+                return Err(ColumnarError::Corrupt(
+                    "invalid lazy delta after-row reference",
+                ));
+            }
+            descriptors.push(descriptor);
+        }
+    }
+    if frontier != after
+        || descriptors.len() as u64 != mutation_count
+        || used.len() as u64 != after_count
+    {
+        return Err(ColumnarError::Corrupt(
+            "lazy delta descriptor totals mismatch",
+        ));
+    }
+    Ok(descriptors)
+}
+
+fn open_lazy_delta(
+    path: &Path,
+    metadata: &ColumnarProjectionMetadata,
+    expected: &ColumnarDeltaSegmentMetadata,
+    file_index: usize,
+) -> Result<(File, LazyDeltaSegment, Vec<DeltaDescriptor>, u64), ColumnarError> {
+    let file = File::open(path).map_err(ColumnarError::Io)?;
+    let file_bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+    if file_bytes != expected.bytes || file_bytes < LAZY_DELTA_HEADER_BYTES {
+        return Err(ColumnarError::Corrupt(
+            "lazy delta length differs from manifest",
+        ));
+    }
+    let header = read_exact_range(&file, 0, LAZY_DELTA_HEADER_BYTES)?;
+    validate_checksum(&header)?;
+    let mut reader = Reader::new(&header[..header.len() - 4]);
+    reader.expect(DELTA_MAGIC)?;
+    let format_version = reader.u16()?;
+    if format_version != LAZY_DELTA_FORMAT_VERSION {
+        return Err(ColumnarError::UnsupportedVersion(format_version));
+    }
+    if reader.u16()? != 0 {
+        return Err(ColumnarError::Corrupt("invalid lazy delta flags"));
+    }
+    if ColumnarProjectionId(reader.u64()?) != metadata.id
+        || ColumnarGeneration(reader.u64()?) != metadata.generation
+        || TableId(reader.u64()?) != metadata.table_id
+        || StorageId(reader.u64()?) != metadata.source_storage_id
+        || SchemaFingerprint::from_bytes(reader.array()?) != metadata.schema_fingerprint
+        || decode_snapshot_tag(reader.u8()?)? != metadata.source_token.kind
+        || reader.take(7)?.iter().any(|byte| *byte != 0)
+    {
+        return Err(ColumnarError::IdentityMismatch("lazy delta context"));
+    }
+    let incremental = metadata
+        .incremental
+        .as_ref()
+        .ok_or(ColumnarError::Corrupt("lazy delta on snapshot projection"))?;
+    let stream_generation = ChangeStreamGeneration(reader.u64()?);
+    let before = StorageDataVersion(reader.u64()?);
+    let after = StorageDataVersion(reader.u64()?);
+    let batch_count = reader.u32()?;
+    let column_count = reader.u32()?;
+    let mutation_count = reader.u64()?;
+    let after_count = reader.u64()?;
+    let footer_offset = reader.u64()?;
+    let footer_length = reader.u64()?;
+    let footer_checksum = reader.u32()?;
+    if reader.u32()? != 0 || footer_checksum != expected.checksum {
+        return Err(ColumnarError::Corrupt(
+            "lazy delta footer checksum header mismatch",
+        ));
+    }
+    reader.finish()?;
+    if stream_generation != incremental.stream_generation
+        || before != expected.before
+        || after != expected.after
+        || mutation_count != expected.mutation_count
+        || after_count != expected.after_row_count
+        || usize::try_from(column_count).ok() != Some(metadata.columns.len())
+        || batch_count == 0
+        || footer_offset < LAZY_DELTA_HEADER_BYTES
+        || footer_length > MAX_INDEX_BYTES
+        || footer_offset.checked_add(footer_length) != Some(file_bytes)
+    {
+        return Err(ColumnarError::Corrupt("lazy delta header mismatch"));
+    }
+    let footer = read_exact_range(&file, footer_offset, footer_length)?;
+    validate_checksum(&footer)?;
+    if stored_checksum(&footer)? != expected.checksum {
+        return Err(ColumnarError::ChecksumMismatch {
+            path: path.to_owned(),
+        });
+    }
+    let mut reader = Reader::new(&footer[..footer.len() - 4]);
+    reader.expect(DELTA_FOOTER_MAGIC)?;
+    if reader.u16()? != INDEX_FORMAT_VERSION
+        || reader.u16()? != 0
+        || ColumnarProjectionId(reader.u64()?) != metadata.id
+        || ColumnarGeneration(reader.u64()?) != metadata.generation
+        || TableId(reader.u64()?) != metadata.table_id
+        || StorageId(reader.u64()?) != metadata.source_storage_id
+        || SchemaFingerprint::from_bytes(reader.array()?) != metadata.schema_fingerprint
+        || ChangeStreamGeneration(reader.u64()?) != stream_generation
+        || StorageDataVersion(reader.u64()?) != before
+        || StorageDataVersion(reader.u64()?) != after
+        || reader.u32()? != batch_count
+        || reader.u64()? != mutation_count
+        || reader.u64()? != after_count
+        || reader.u32()? != column_count
+    {
+        return Err(ColumnarError::IdentityMismatch("lazy delta footer context"));
+    }
+    let group_count = reader.u32()?;
+    if group_count > MAX_ROW_GROUPS {
+        return Err(ColumnarError::ResourceLimit {
+            resource: "delta row groups",
+            value: u64::from(group_count),
+        });
+    }
+    let descriptors = decode_lazy_delta_descriptors(
+        &mut reader,
+        metadata,
+        before,
+        after,
+        batch_count,
+        mutation_count,
+        after_count,
+    )?;
+    let mut groups = Vec::with_capacity(group_count as usize);
+    let mut rows = 0_u64;
+    for _ in 0..group_count {
+        let group = decode_lazy_group_directory(&mut reader, &metadata.columns, false)?;
+        rows = rows
+            .checked_add(u64::from(group.rows))
+            .ok_or(ColumnarError::Corrupt("delta indexed row count overflow"))?;
+        groups.push(group);
+    }
+    reader.finish()?;
+    if rows != after_count {
+        return Err(ColumnarError::Corrupt("delta indexed row count mismatch"));
+    }
+    validate_block_ranges(&groups, LAZY_DELTA_HEADER_BYTES, footer_offset)?;
+    Ok((
+        file,
+        LazyDeltaSegment { file_index, groups },
+        descriptors,
+        footer_length.saturating_add(LAZY_DELTA_HEADER_BYTES),
+    ))
+}
+
+fn apply_lazy_descriptors(
+    overlay: &mut LazyDeltaOverlay,
+    descriptors: &[DeltaDescriptor],
+    segment: u32,
+) -> Result<(), ColumnarError> {
+    for descriptor in descriptors {
+        if let Some(old) = descriptor.old_version {
+            if !overlay.suppressed.insert(old) {
+                return Err(ColumnarError::Corrupt(
+                    "one version has multiple durable delta transitions",
+                ));
+            }
+            overlay.live.remove(&old);
+        }
+        match (descriptor.new_version, descriptor.after_row) {
+            (Some(new), Some(row)) => {
+                if overlay.suppressed.contains(&new)
+                    || overlay
+                        .live
+                        .insert(new, DeltaRowRef { segment, row })
+                        .is_some()
+                {
+                    return Err(ColumnarError::Corrupt(
+                        "duplicate or suppressed new delta version",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(ColumnarError::Corrupt("invalid lazy delta mutation image")),
+        }
+    }
+    Ok(())
+}
+
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), ColumnarError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -2038,42 +4402,6 @@ fn write_advance_file_synced(
     file.sync_data().map_err(ColumnarError::Io)?;
     crash(synced_point);
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_segment_synced(
-    path: &Path,
-    identity: SegmentIdentity,
-    columns: &[ColumnarColumnSpec],
-    groups: &[RowGroup],
-    version: u16,
-    created_point: &str,
-    written_point: &str,
-    synced_point: &str,
-) -> Result<(u64, u32), ColumnarError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(ColumnarError::Io)?;
-    crash(created_point);
-    let checksum = {
-        let mut writer = crc32c::Crc32cWriter::new(&mut file);
-        let header = encode_segment_header(identity, columns, groups, version)?;
-        writer.write_all(&header).map_err(ColumnarError::Io)?;
-        for group in groups {
-            let encoded = encode_segment_row_group(identity, columns, group, version)?;
-            writer.write_all(&encoded).map_err(ColumnarError::Io)?;
-        }
-        writer.crc32c()
-    };
-    file.write_all(&checksum.to_le_bytes())
-        .map_err(ColumnarError::Io)?;
-    crash(written_point);
-    file.sync_data().map_err(ColumnarError::Io)?;
-    crash(synced_point);
-    let bytes = file.metadata().map_err(ColumnarError::Io)?.len();
-    Ok((bytes, checksum))
 }
 
 fn sync_directory(path: &Path) -> Result<(), ColumnarError> {
@@ -2106,13 +4434,24 @@ fn encode_manifest(
     segment_file: &str,
     segment_checksum: u32,
 ) -> Result<Vec<u8>, ColumnarError> {
+    encode_manifest_version(
+        metadata,
+        segment_id,
+        segment_file,
+        segment_checksum,
+        LAZY_FORMAT_VERSION,
+    )
+}
+
+fn encode_manifest_version(
+    metadata: &ColumnarProjectionMetadata,
+    segment_id: ColumnarSegmentId,
+    segment_file: &str,
+    segment_checksum: u32,
+    version: u16,
+) -> Result<Vec<u8>, ColumnarError> {
     let mut output = Vec::new();
     output.extend_from_slice(MANIFEST_MAGIC);
-    let version = if metadata.incremental.is_some() {
-        INCREMENTAL_FORMAT_VERSION
-    } else {
-        SNAPSHOT_FORMAT_VERSION
-    };
     push_u16(&mut output, version);
     push_u16(&mut output, 0);
     push_u64(&mut output, metadata.id.0);
@@ -2142,6 +4481,19 @@ fn encode_manifest(
     push_u64(&mut output, segment_id.0);
     push_string(&mut output, segment_file)?;
     push_u32(&mut output, segment_checksum);
+    if version == LAZY_FORMAT_VERSION {
+        push_u16(&mut output, LAZY_FORMAT_VERSION);
+        push_u16(
+            &mut output,
+            if metadata.incremental.is_some() {
+                LAZY_DELTA_FORMAT_VERSION
+            } else {
+                0
+            },
+        );
+        output.push(1); // independently checksummed header, footer, and payload blocks
+        output.extend_from_slice(&[0; 3]);
+    }
     if let Some(incremental) = &metadata.incremental {
         push_u64(&mut output, incremental.stream_generation.0);
         push_u64(&mut output, incremental.base_frontier.0);
@@ -2174,6 +4526,9 @@ struct Manifest {
     segment_id: ColumnarSegmentId,
     segment_file: String,
     segment_checksum: u32,
+    version: u16,
+    base_format_version: u16,
+    delta_format_version: Option<u16>,
 }
 
 fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
@@ -2184,7 +4539,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
     let mut reader = Reader::new(payload);
     reader.expect(MANIFEST_MAGIC)?;
     let version = reader.u16()?;
-    if version != SNAPSHOT_FORMAT_VERSION && version != INCREMENTAL_FORMAT_VERSION {
+    if version != SNAPSHOT_FORMAT_VERSION
+        && version != INCREMENTAL_FORMAT_VERSION
+        && version != LAZY_FORMAT_VERSION
+    {
         return Err(ColumnarError::UnsupportedVersion(version));
     }
     if reader.u16()? != 0 {
@@ -2260,7 +4618,28 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
         return Err(ColumnarError::Corrupt("invalid segment file name"));
     }
     let segment_checksum = reader.u32()?;
-    let incremental = if version == INCREMENTAL_FORMAT_VERSION {
+    let (base_format_version, delta_format_version) = if version == LAZY_FORMAT_VERSION {
+        let base = reader.u16()?;
+        let delta = reader.u16()?;
+        if base != LAZY_FORMAT_VERSION
+            || (delta != 0 && delta != LAZY_DELTA_FORMAT_VERSION)
+            || reader.u8()? != 1
+            || reader.take(3)?.iter().any(|byte| *byte != 0)
+        {
+            return Err(ColumnarError::Corrupt(
+                "invalid lazy manifest format or integrity scheme",
+            ));
+        }
+        (base, (delta != 0).then_some(delta))
+    } else {
+        (
+            version,
+            (version == INCREMENTAL_FORMAT_VERSION).then_some(DELTA_FORMAT_VERSION),
+        )
+    };
+    let incremental = if version == INCREMENTAL_FORMAT_VERSION
+        || (version == LAZY_FORMAT_VERSION && delta_format_version.is_some())
+    {
         let stream_generation = ChangeStreamGeneration(reader.u64()?);
         let base_frontier = StorageDataVersion(reader.u64()?);
         let applied_frontier = StorageDataVersion(reader.u64()?);
@@ -2296,7 +4675,16 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
             let after_row_count = reader.u64()?;
             let bytes = reader.u64()?;
             let checksum = reader.u32()?;
-            if before != expected || after.0 <= before.0 || mutation_count == 0 {
+            if before != expected
+                || after.0 <= before.0
+                || mutation_count == 0
+                || mutation_count > u64::from(crate::CHANGE_LOG_MAX_MUTATIONS)
+                || after_row_count > mutation_count
+                || file == segment_file
+                || delta_segments
+                    .iter()
+                    .any(|existing: &ColumnarDeltaSegmentMetadata| existing.file == file)
+            {
                 return Err(ColumnarError::Corrupt("broken delta frontier chain"));
             }
             expected = after;
@@ -2335,6 +4723,11 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
     } else {
         None
     };
+    if incremental.is_none() && segment_count != 1 {
+        return Err(ColumnarError::Corrupt(
+            "snapshot manifest must contain one segment",
+        ));
+    }
     reader.finish()?;
     Ok(Manifest {
         metadata: ColumnarProjectionMetadata {
@@ -2354,6 +4747,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
         segment_id,
         segment_file,
         segment_checksum,
+        version,
+        base_format_version,
+        delta_format_version,
     })
 }
 
@@ -2367,6 +4763,7 @@ struct SegmentIdentity {
     fingerprint: SchemaFingerprint,
 }
 
+#[cfg(test)]
 fn encode_segment(
     identity: SegmentIdentity,
     columns: &[ColumnarColumnSpec],
@@ -2383,6 +4780,7 @@ fn encode_segment(
     Ok(output)
 }
 
+#[cfg(test)]
 fn encode_segment_header(
     identity: SegmentIdentity,
     columns: &[ColumnarColumnSpec],
@@ -2412,6 +4810,7 @@ fn encode_segment_header(
     Ok(output)
 }
 
+#[cfg(test)]
 fn encode_segment_row_group(
     identity: SegmentIdentity,
     columns: &[ColumnarColumnSpec],
@@ -3213,6 +5612,31 @@ mod tests {
         assert_eq!(values, vec![ScalarValue::Int64(9), ScalarValue::Int64(100)]);
         assert_eq!(statistics.base_rows_suppressed, 2);
         assert_eq!(statistics.delta_rows_emitted, 1);
+        assert_eq!(statistics.version_key_chunks_read, 2);
+        assert_eq!(statistics.decoded_version_blocks, 2);
+        assert_eq!(statistics.decoded_column_chunks, 6);
+        assert!(statistics.base_version_key_bytes_read > 0);
+        assert!(statistics.base_data_bytes_read > 0);
+        assert!(statistics.delta_data_bytes_read > 0);
+        assert_eq!(statistics.blocks_verified, 8);
+        let representation = reopened.representation_statistics();
+        assert_eq!(representation.representation, "lazy-indexed");
+        assert_eq!(representation.resident_payload_bytes, 0);
+        assert_eq!(representation.delta_format_version, Some(2));
+        assert_eq!(representation.indexed_delta_row_references, 1);
+        let (_, pruned_statistics) = reopened
+            .scan(
+                &[ColumnId(1)],
+                &[ColumnarConstraint {
+                    column_id: ColumnId(1),
+                    lower: Some((ScalarValue::Int64(9), true)),
+                    upper: None,
+                }],
+            )
+            .expect("prune before suppression I/O");
+        assert_eq!(pruned_statistics.row_groups_pruned_before_data_read, 1);
+        assert_eq!(pruned_statistics.version_key_chunks_read, 1);
+        assert!(pruned_statistics.base_data_bytes_read > 0);
         let newest_version = heap_key(storage_id, 3, 0);
         let second = ChangeBatch {
             sequence: 2,
@@ -3419,14 +5843,6 @@ mod tests {
         )
         .expect("prepare Heap NBCS v2");
         assert_eq!(prepared.row_groups.len(), 2);
-        let segment = fs::read(&prepared.segment_tmp).expect("read NBCS v2");
-        assert_eq!(
-            super::decode_segment(&segment, &prepared.metadata)
-                .expect("decode NBCS v2")
-                .row_groups,
-            prepared.row_groups
-        );
-
         let identity = super::SegmentIdentity {
             projection_id: prepared.metadata.id,
             generation: prepared.metadata.generation,
@@ -3435,6 +5851,20 @@ mod tests {
             storage_id: prepared.metadata.source_storage_id,
             fingerprint: prepared.metadata.schema_fingerprint,
         };
+        let segment = super::encode_segment(
+            identity,
+            &prepared.metadata.columns,
+            &prepared.row_groups,
+            super::INCREMENTAL_FORMAT_VERSION,
+        )
+        .expect("encode legacy NBCS v2");
+        assert_eq!(
+            super::decode_segment(&segment, &prepared.metadata)
+                .expect("decode NBCS v2")
+                .row_groups,
+            prepared.row_groups
+        );
+
         let mut missing = prepared.row_groups.clone();
         missing[0].source_versions = None;
         assert!(matches!(
@@ -3604,6 +6034,218 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_snapshot_and_v2_base_v1_delta_remain_openable_and_compactable() {
+        let table = table();
+        let column_ids = [ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)];
+        let columns = super::resolve_columns(&table, &column_ids).expect("legacy columns");
+        let snapshot_directory = test_directory("legacy-v1-open");
+        fs::create_dir_all(&snapshot_directory).expect("create legacy snapshot directory");
+        let snapshot_groups = rows()
+            .chunks(2)
+            .map(|rows| super::encode_row_group(&columns, rows))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("legacy snapshot groups");
+        let mut snapshot_metadata = super::ColumnarProjectionMetadata {
+            id: ColumnarProjectionId(41),
+            generation: ColumnarGeneration(1),
+            table_id: table.id,
+            source_storage_id: StorageId(41),
+            source_token: StorageSnapshotToken::heap(StorageId(41), 1),
+            schema_fingerprint: table.fingerprint().expect("fingerprint"),
+            columns: columns.clone(),
+            row_count: 3,
+            row_group_count: 2,
+            segment_count: 1,
+            segment_bytes: 0,
+            incremental: None,
+        };
+        let snapshot_segment = super::encode_segment(
+            super::SegmentIdentity {
+                projection_id: snapshot_metadata.id,
+                generation: snapshot_metadata.generation,
+                segment_id: netbadb_types::ColumnarSegmentId(1),
+                table_id: table.id,
+                storage_id: snapshot_metadata.source_storage_id,
+                fingerprint: snapshot_metadata.schema_fingerprint,
+            },
+            &columns,
+            &snapshot_groups,
+            super::SNAPSHOT_FORMAT_VERSION,
+        )
+        .expect("legacy snapshot segment");
+        snapshot_metadata.segment_bytes = snapshot_segment.len() as u64;
+        let snapshot_file = "projection-41-g1.nbcs";
+        let snapshot_manifest = super::encode_manifest_version(
+            &snapshot_metadata,
+            netbadb_types::ColumnarSegmentId(1),
+            snapshot_file,
+            super::stored_checksum(&snapshot_segment).expect("snapshot checksum"),
+            super::SNAPSHOT_FORMAT_VERSION,
+        )
+        .expect("legacy snapshot manifest");
+        fs::write(snapshot_directory.join(snapshot_file), snapshot_segment)
+            .expect("write legacy snapshot segment");
+        fs::write(
+            snapshot_directory.join(super::MANIFEST_FILE),
+            snapshot_manifest,
+        )
+        .expect("write legacy snapshot manifest");
+        let snapshot =
+            ColumnarProjection::open(&snapshot_directory, &table).expect("open legacy snapshot");
+        assert_eq!(
+            snapshot.representation_statistics().representation,
+            "legacy-eager"
+        );
+        assert_eq!(
+            batch_rows(&snapshot.scan(&[ColumnId(1)], &[]).expect("legacy scan").0),
+            vec![
+                vec![ScalarValue::Int64(-3)],
+                vec![ScalarValue::Int64(4)],
+                vec![ScalarValue::Int64(9)],
+            ]
+        );
+        drop(snapshot);
+        fs::remove_dir_all(snapshot_directory).expect("remove legacy snapshot fixture");
+
+        let directory = test_directory("legacy-v2-v1-delta-open");
+        fs::create_dir_all(&directory).expect("create legacy incremental directory");
+        let storage_id = StorageId(42);
+        let versioned = rows()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, row)| (heap_key(storage_id, 1, slot as u16), row))
+            .collect::<Vec<_>>();
+        let base_groups = versioned
+            .chunks(2)
+            .map(|rows| super::encode_versioned_row_group(&columns, rows))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("legacy incremental groups");
+        let mut metadata = super::ColumnarProjectionMetadata {
+            id: ColumnarProjectionId(42),
+            generation: ColumnarGeneration(1),
+            table_id: table.id,
+            source_storage_id: storage_id,
+            source_token: StorageSnapshotToken::heap(storage_id, 2),
+            schema_fingerprint: table.fingerprint().expect("fingerprint"),
+            columns: columns.clone(),
+            row_count: 3,
+            row_group_count: 2,
+            segment_count: 1,
+            segment_bytes: 0,
+            incremental: Some(super::ColumnarIncrementalMetadata {
+                stream_generation: ChangeStreamGeneration(7),
+                base_frontier: StorageDataVersion(10),
+                applied_frontier: StorageDataVersion(10),
+                delta_segments: Vec::new(),
+                delta_mutation_count: 0,
+                delta_live_row_count: 0,
+                suppressed_version_count: 0,
+                delta_bytes: 0,
+            }),
+        };
+        let segment = super::encode_segment(
+            super::SegmentIdentity {
+                projection_id: metadata.id,
+                generation: metadata.generation,
+                segment_id: netbadb_types::ColumnarSegmentId(1),
+                table_id: table.id,
+                storage_id,
+                fingerprint: metadata.schema_fingerprint,
+            },
+            &columns,
+            &base_groups,
+            super::INCREMENTAL_FORMAT_VERSION,
+        )
+        .expect("legacy incremental segment");
+        metadata.segment_bytes = segment.len() as u64;
+        let next = heap_key(storage_id, 2, 0);
+        let batch = ChangeBatch {
+            sequence: 1,
+            physical_txn_id: TxnId(1),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: metadata.schema_fingerprint,
+            before: StorageDataVersion(10),
+            after: StorageDataVersion(11),
+            mutations: vec![StorageChange::Update {
+                old_version: versioned[0].0,
+                new_version: next,
+                after: vec![
+                    ScalarValue::Int64(100),
+                    ScalarValue::UInt64(100),
+                    ScalarValue::Null,
+                    ScalarValue::Text("legacy-delta".into()),
+                ],
+            }],
+        };
+        let projected =
+            super::project_change_batches(&table, &metadata, std::slice::from_ref(&batch))
+                .expect("project legacy delta");
+        let delta =
+            super::encode_delta(&metadata, &[batch], &projected).expect("legacy delta segment");
+        let delta_metadata = super::ColumnarDeltaSegmentMetadata {
+            file: "projection-42-g1-d11.nbcd".into(),
+            before: StorageDataVersion(10),
+            after: StorageDataVersion(11),
+            mutation_count: 1,
+            after_row_count: 1,
+            bytes: delta.len() as u64,
+            checksum: super::stored_checksum(&delta).expect("delta checksum"),
+        };
+        let incremental = metadata.incremental.as_mut().expect("incremental metadata");
+        incremental.applied_frontier = StorageDataVersion(11);
+        incremental.delta_segments.push(delta_metadata.clone());
+        incremental.delta_mutation_count = 1;
+        incremental.delta_live_row_count = 1;
+        incremental.suppressed_version_count = 1;
+        incremental.delta_bytes = delta.len() as u64;
+        metadata.segment_count = 2;
+        let segment_file = "projection-42-g1.nbcs";
+        let manifest = super::encode_manifest_version(
+            &metadata,
+            netbadb_types::ColumnarSegmentId(1),
+            segment_file,
+            super::stored_checksum(&segment).expect("base checksum"),
+            super::INCREMENTAL_FORMAT_VERSION,
+        )
+        .expect("legacy incremental manifest");
+        fs::write(directory.join(segment_file), segment).expect("write legacy base");
+        fs::write(directory.join(&delta_metadata.file), delta).expect("write legacy delta");
+        fs::write(directory.join(super::MANIFEST_FILE), manifest).expect("write legacy manifest");
+        let legacy =
+            ColumnarProjection::open(&directory, &table).expect("open legacy incremental chain");
+        assert_eq!(
+            legacy.representation_statistics().representation,
+            "legacy-eager"
+        );
+        assert_eq!(
+            batch_rows(
+                &legacy
+                    .scan(&[ColumnId(1)], &[])
+                    .expect("legacy delta scan")
+                    .0
+            ),
+            vec![
+                vec![ScalarValue::Int64(4)],
+                vec![ScalarValue::Int64(9)],
+                vec![ScalarValue::Int64(100)],
+            ]
+        );
+        let compacted = legacy
+            .prepare_compaction(&table, ColumnarGeneration(2))
+            .and_then(|prepared| prepared.publish())
+            .expect("compact legacy chain into indexed generation");
+        assert_eq!(
+            compacted.representation_statistics().representation,
+            "lazy-indexed"
+        );
+        legacy.retire_segment().expect("retire legacy files");
+        drop(compacted);
+        fs::remove_dir_all(directory).expect("remove legacy incremental fixture");
+    }
+
+    #[test]
     fn nbcd_v1_decoder_rejects_malformed_identity_counts_frontiers_and_references() {
         let directory = test_directory("nbcd-v1-boundaries");
         let table = table();
@@ -3699,19 +6341,23 @@ mod tests {
                 ],
             },
         ];
-        let prepared = base
-            .prepare_advance(&table, &batches)
-            .expect("prepare valid NBCD");
-        let bytes = fs::read(&prepared.delta_tmp).expect("read NBCD");
-        let metadata = prepared.projection.metadata().clone();
-        let expected = metadata
-            .incremental
-            .as_ref()
-            .expect("incremental")
-            .delta_segments
-            .last()
-            .expect("delta metadata")
-            .clone();
+        let metadata = base.metadata().clone();
+        let projected = super::project_change_batches(&table, &metadata, &batches)
+            .expect("project legacy delta");
+        let bytes =
+            super::encode_delta(&metadata, &batches, &projected).expect("encode legacy NBCD v1");
+        let expected = super::ColumnarDeltaSegmentMetadata {
+            file: "legacy.nbcd".into(),
+            before: StorageDataVersion(20),
+            after: StorageDataVersion(22),
+            mutation_count: projected.len() as u64,
+            after_row_count: projected
+                .iter()
+                .filter(|mutation| mutation.after.is_some())
+                .count() as u64,
+            bytes: bytes.len() as u64,
+            checksum: super::stored_checksum(&bytes).expect("legacy delta checksum"),
+        };
         assert_eq!(
             super::decode_delta(&bytes, &metadata, &expected)
                 .expect("decode multiple batches")
@@ -3779,7 +6425,6 @@ mod tests {
         oversized_expected.after_row_count = u64::MAX;
         assert_rejected(&oversized_rows, &oversized_expected);
 
-        drop(prepared);
         let duplicate = ChangeBatch {
             sequence: 3,
             physical_txn_id: TxnId(3),
@@ -3859,6 +6504,42 @@ mod tests {
                 .any(|window| window == sentinel.as_bytes()),
             "NBCD must persist only projected after-image columns"
         );
+        let manifest = super::decode_manifest(
+            &fs::read(&prepared.manifest_tmp).expect("read replacement manifest"),
+        )
+        .expect("decode replacement manifest");
+        let mut malformed_expected = manifest
+            .metadata
+            .incremental
+            .as_ref()
+            .expect("incremental metadata")
+            .delta_segments
+            .last()
+            .expect("delta metadata")
+            .clone();
+        let mut malformed = bytes.clone();
+        let footer_offset =
+            u64::from_le_bytes(malformed[128..136].try_into().expect("footer offset")) as usize;
+        let footer_length =
+            u64::from_le_bytes(malformed[136..144].try_into().expect("footer length")) as usize;
+        let after_row_offset = footer_offset + 193;
+        malformed[after_row_offset..after_row_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let footer_checksum_offset = footer_offset + footer_length - 4;
+        let footer_checksum = crc32c::crc32c(&malformed[footer_offset..footer_checksum_offset]);
+        malformed[footer_checksum_offset..footer_checksum_offset + 4]
+            .copy_from_slice(&footer_checksum.to_le_bytes());
+        malformed[144..148].copy_from_slice(&footer_checksum.to_le_bytes());
+        let header_checksum = crc32c::crc32c(&malformed[..152]);
+        malformed[152..156].copy_from_slice(&header_checksum.to_le_bytes());
+        malformed_expected.checksum = footer_checksum;
+        fs::write(&prepared.delta_tmp, &malformed).expect("write malformed NBCD v2");
+        assert!(matches!(
+            super::open_lazy_delta(&prepared.delta_tmp, lsm.metadata(), &malformed_expected, 1,),
+            Err(ColumnarError::Corrupt(
+                "invalid lazy delta after-row reference"
+            ))
+        ));
+        fs::write(&prepared.delta_tmp, &bytes).expect("restore valid NBCD v2");
         let advanced = prepared.publish().expect("publish LSM NBCD");
         drop(advanced);
         let values = ColumnarProjection::open(&lsm_directory, &table)
@@ -4503,5 +7184,233 @@ mod tests {
         );
         drop(reopened);
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    fn wide_table(width: u32) -> TableDef {
+        TableDef::new(
+            TableId(91),
+            "wide_events",
+            (1..=width)
+                .map(|id| {
+                    ColumnDef::new(
+                        ColumnId(id),
+                        format!("c{id}"),
+                        TypeSpec::Physical(if id <= 4 {
+                            PhysicalType::UInt64
+                        } else {
+                            PhysicalType::Text
+                        }),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn lazy_wide_projection_reads_only_selected_chunks_after_zone_pruning() {
+        let directory = test_directory("lazy-wide-pruning");
+        let table = wide_table(128);
+        let columns = (1..=128).map(ColumnId).collect::<Vec<_>>();
+        let rows = (0..20_u64)
+            .map(|row| {
+                (1..=128_u32)
+                    .map(|column| {
+                        if column <= 4 {
+                            ScalarValue::UInt64(row + u64::from(column))
+                        } else {
+                            ScalarValue::Text(format!("text-{column}-{row}"))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let projection = build_projection!(
+            &directory,
+            ColumnarProjectionId(91),
+            ColumnarGeneration(1),
+            &table,
+            StorageId(91),
+            StorageSnapshotToken::heap(StorageId(91), 1),
+            &columns,
+            &rows,
+            Some(2),
+        )
+        .expect("build wide lazy projection");
+        let representation = projection.representation_statistics();
+        assert_eq!(representation.representation, "lazy-indexed");
+        assert_eq!(representation.resident_payload_bytes, 0);
+        assert_eq!(representation.indexed_base_chunks, 1_280);
+        assert!(representation.resident_metadata_bytes < projection.metadata().segment_bytes);
+        let (_, statistics) = projection
+            .scan(
+                &[ColumnId(2), ColumnId(3), ColumnId(4)],
+                &[ColumnarConstraint {
+                    column_id: ColumnId(1),
+                    lower: Some((ScalarValue::UInt64(9), true)),
+                    upper: Some((ScalarValue::UInt64(10), true)),
+                }],
+            )
+            .expect("scan three numeric columns");
+        assert_eq!(statistics.row_groups_total, 10);
+        assert_eq!(statistics.row_groups_read, 1);
+        assert_eq!(statistics.row_groups_pruned_before_data_read, 9);
+        assert_eq!(statistics.column_chunks_read, 3);
+        assert_eq!(statistics.decoded_column_chunks, 3);
+        assert_eq!(statistics.physical_block_reads, 3);
+        assert_eq!(statistics.version_key_chunks_read, 0);
+        assert_eq!(statistics.delta_data_bytes_read, 0);
+        assert!(statistics.physical_bytes_read < projection.metadata().segment_bytes / 20);
+        drop(projection);
+        fs::remove_dir_all(directory).expect("remove wide lazy fixture");
+    }
+
+    #[test]
+    fn streaming_incremental_base_reopens_without_resident_values() {
+        let directory = test_directory("lazy-streaming-incremental");
+        let table = table();
+        let storage_id = StorageId(95);
+        let projection = ColumnarProjection::prepare_incremental_streaming(
+            &directory,
+            ColumnarProjectionId(95),
+            ColumnarGeneration(1),
+            &table,
+            storage_id,
+            StorageSnapshotToken::heap(storage_id, 4),
+            crate::ChangeStreamCursor {
+                storage_id,
+                generation: ChangeStreamGeneration(2),
+                frontier: StorageDataVersion(4),
+            },
+            &[ColumnId(1), ColumnId(2)],
+            (0..3).map(|row| {
+                (
+                    heap_key(storage_id, 1, row),
+                    vec![
+                        ScalarValue::Int64(i64::from(row)),
+                        ScalarValue::UInt64(u64::from(row)),
+                    ],
+                )
+            }),
+            Some(2),
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish streaming incremental base");
+        assert_eq!(
+            projection
+                .representation_statistics()
+                .resident_payload_bytes,
+            0
+        );
+        let values = projection
+            .scan(&[ColumnId(1)], &[])
+            .expect("scan base")
+            .0
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.row_count)
+                    .map(|row| batch.columns[0].values.value(row).expect("base value"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                ScalarValue::Int64(0),
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(2),
+            ]
+        );
+        projection.drop_files().expect("drop streaming fixture");
+        fs::remove_dir_all(directory).expect("remove streaming fixture directory");
+    }
+
+    #[test]
+    fn lazy_selected_block_corruption_never_returns_values() {
+        let directory = test_directory("lazy-block-corruption");
+        let table = table();
+        let projection = build_projection!(
+            &directory,
+            ColumnarProjectionId(92),
+            ColumnarGeneration(1),
+            &table,
+            StorageId(92),
+            StorageSnapshotToken::heap(StorageId(92), 1),
+            &[ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            &rows(),
+            Some(3),
+        )
+        .expect("build corruption fixture");
+        let lazy = projection.lazy.as_ref().expect("lazy representation");
+        let block = lazy.base_groups[0].columns[0].block;
+        let segment_path = lazy.files.paths[0].clone();
+        let mut segment = fs::read(&segment_path).expect("read segment");
+        segment[block.offset as usize] ^= 0x80;
+        fs::write(&segment_path, segment).expect("corrupt selected block");
+        projection
+            .scan(&[ColumnId(2)], &[])
+            .expect("unselected corrupt block is not read");
+        assert!(matches!(
+            projection.scan(&[ColumnId(1)], &[]),
+            Err(ColumnarError::ChecksumMismatch { .. })
+        ));
+        drop(projection);
+        fs::remove_dir_all(directory).expect("remove corruption fixture");
+    }
+
+    #[test]
+    fn lazy_directory_rejects_out_of_bounds_and_overlapping_blocks() {
+        for overlap in [false, true] {
+            let directory = test_directory(if overlap {
+                "lazy-overlap"
+            } else {
+                "lazy-out-of-bounds"
+            });
+            let table = table();
+            let projection = build_projection!(
+                &directory,
+                ColumnarProjectionId(if overlap { 94 } else { 93 }),
+                ColumnarGeneration(1),
+                &table,
+                StorageId(93),
+                StorageSnapshotToken::heap(StorageId(93), 1),
+                &[ColumnId(1), ColumnId(2)],
+                &[vec![ScalarValue::Int64(1), ScalarValue::UInt64(2)]],
+                Some(1),
+            )
+            .expect("build malformed-directory fixture");
+            let lazy = projection.lazy.as_ref().expect("lazy representation");
+            let first = lazy.base_groups[0].columns[0].block;
+            let second = lazy.base_groups[0].columns[1].block;
+            let path = lazy.files.paths[0].clone();
+            let metadata = projection.metadata().clone();
+            let segment_id = projection.segment_id();
+            drop(projection);
+            let mut bytes = fs::read(&path).expect("read indexed segment");
+            let footer_offset =
+                u64::from_le_bytes(bytes[104..112].try_into().expect("footer offset bytes"));
+            let footer_length =
+                u64::from_le_bytes(bytes[112..120].try_into().expect("footer length bytes"));
+            let old = second.offset.to_le_bytes();
+            let footer_start = footer_offset as usize;
+            let footer_end = (footer_offset + footer_length) as usize;
+            let position = bytes[footer_start..footer_end]
+                .windows(old.len())
+                .position(|window| window == old)
+                .map(|position| footer_start + position)
+                .expect("second block offset in directory");
+            let replacement = if overlap { first.offset } else { footer_offset };
+            bytes[position..position + 8].copy_from_slice(&replacement.to_le_bytes());
+            let checksum_position = footer_end - 4;
+            let checksum = crc32c::crc32c(&bytes[footer_start..checksum_position]);
+            bytes[checksum_position..footer_end].copy_from_slice(&checksum.to_le_bytes());
+            bytes[120..124].copy_from_slice(&checksum.to_le_bytes());
+            let header_checksum = crc32c::crc32c(&bytes[..128]);
+            bytes[128..132].copy_from_slice(&header_checksum.to_le_bytes());
+            fs::write(&path, &bytes).expect("write malformed directory");
+            assert!(matches!(
+                super::open_lazy_segment(&path, &metadata, segment_id, checksum),
+                Err(ColumnarError::Corrupt(_))
+            ));
+            fs::remove_dir_all(directory).expect("remove malformed-directory fixture");
+        }
     }
 }

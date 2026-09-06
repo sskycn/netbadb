@@ -194,6 +194,7 @@ the next commit chain. Timings are observations, never assertions.
   projection.
 - `DatabaseTxnId` is not a global commit order.
 - `StorageVersionKey` is not `RowEntityId`.
-- Automatic/background catch-up, compaction, retention GC, generic CDC leases,
-  lazy NBCS/NBCD loading, aggregate spill, global CSN, RowEntityId, and hybrid
-  authoritative storage remain deferred to a later design.
+- Lazy NBCS/NBCD loading is implemented by [Columnar Phase
+  2D](columnar-phase2d-lazy-io.md). Automatic/background catch-up, compaction,
+  retention GC, generic CDC leases, aggregate spill, global CSN, RowEntityId,
+  and hybrid authoritative storage remain deferred to a later design.
