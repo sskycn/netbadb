@@ -30,16 +30,16 @@ type EvaluatedAssignments = Vec<(ColumnId, usize, ScalarValue)>;
 #[derive(Debug, Clone)]
 struct EvaluationLayout {
     fields: Vec<OutputField>,
-    source_positions: Vec<usize>,
+    target_positions: Vec<usize>,
 }
 
 impl EvaluationLayout {
-    fn values(&self, source_values: &[ScalarValue]) -> Result<Vec<ScalarValue>, DatabaseError> {
-        self.source_positions
+    fn values(&self, target_values: &[ScalarValue]) -> Result<Vec<ScalarValue>, DatabaseError> {
+        self.target_positions
             .iter()
             .map(|position| {
-                source_values.get(*position).cloned().ok_or_else(|| {
-                    SchemaMutationError::Corrupt("deferred backfill source ordinal out of bounds")
+                target_values.get(*position).cloned().ok_or_else(|| {
+                    SchemaMutationError::Corrupt("deferred backfill target ordinal out of bounds")
                         .into()
                 })
             })
@@ -117,9 +117,9 @@ struct DeferredBackfillAction {
 impl DeferredBackfillAction {
     fn evaluate(
         &self,
-        source_values: &[ScalarValue],
+        target_values: &[ScalarValue],
     ) -> Result<Option<EvaluatedAssignments>, DatabaseError> {
-        let values = self.layout.values(source_values)?;
+        let values = self.layout.values(target_values)?;
         if let Some(predicate) = &self.predicate
             && !typed_row_predicate_matches(predicate, &self.layout.fields, &values)?
         {
@@ -176,7 +176,10 @@ impl DeferredBackfillProgram {
             .into());
         }
         for (action, observation) in self.actions.iter().zip(observations) {
-            if let Some(assignments) = action.evaluate(source_values)? {
+            // WHERE and every RHS observe one immutable pre-statement row. The
+            // assignments are applied only after all expressions have been
+            // evaluated, preserving SQL's simultaneous assignment semantics.
+            if let Some(assignments) = action.evaluate(target_values)? {
                 let digest_values = assignments
                     .iter()
                     .map(|(column, _, value)| (*column, value.clone()))
@@ -240,6 +243,30 @@ impl DeferredBackfillProgram {
             action.expected.result_digest[0] ^= 0xff;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn resident_metadata_bytes_estimate(&self) -> usize {
+        use std::mem::size_of;
+
+        size_of::<Self>()
+            + self.actions.capacity() * size_of::<DeferredBackfillAction>()
+            + self
+                .actions
+                .iter()
+                .map(|action| {
+                    action.layout.fields.capacity() * size_of::<OutputField>()
+                        + action.layout.target_positions.capacity() * size_of::<usize>()
+                        + action.assignments.capacity() * size_of::<DeferredAssignment>()
+                })
+                .sum::<usize>()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadAuthority {
+    SurvivingBase,
+    #[cfg(test)]
+    VirtualProjected,
 }
 
 fn put_u32(hash: &mut Sha256, value: usize) -> Result<(), DatabaseError> {
@@ -430,6 +457,7 @@ fn build_action(
     base: &TableDef,
     target: &TableDef,
     reserved: &BTreeSet<ColumnId>,
+    read_authority: ReadAuthority,
 ) -> Result<Option<DeferredBackfillAction>, DatabaseError> {
     let LogicalStatement::Update {
         input,
@@ -457,32 +485,38 @@ fn build_action(
         .filter(|column| base.column_by_id(column.id).is_some())
         .map(|column| column.id)
         .collect::<BTreeSet<_>>();
-    let source_positions = scan_columns
+    let readable = match read_authority {
+        ReadAuthority::SurvivingBase => surviving.clone(),
+        #[cfg(test)]
+        ReadAuthority::VirtualProjected => surviving.union(reserved).copied().collect(),
+    };
+    let target_positions = scan_columns
         .iter()
-        .filter(|column| column.table_id == *table_id && surviving.contains(&column.column_id))
+        .filter(|column| column.table_id == *table_id && readable.contains(&column.column_id))
         .map(|column| {
-            base.columns
+            target
+                .columns
                 .iter()
-                .position(|base_column| base_column.id == column.column_id)
+                .position(|target_column| target_column.id == column.column_id)
                 .map(|position| (OutputField::Source(column.clone()), position))
                 .ok_or(SchemaMutationError::Corrupt(
-                    "deferred surviving source column disappeared",
+                    "deferred readable target column disappeared",
                 ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let layout = EvaluationLayout {
-        fields: source_positions
+        fields: target_positions
             .iter()
             .map(|(field, _)| field.clone())
             .collect(),
-        source_positions: source_positions
+        target_positions: target_positions
             .iter()
             .map(|(_, position)| *position)
             .collect(),
     };
     let mut node_count = 0;
     if let Some(expression) = predicate
-        && !expression_is_eligible(expression, *table_id, &surviving, 1, &mut node_count)?
+        && !expression_is_eligible(expression, *table_id, &readable, 1, &mut node_count)?
     {
         return Ok(None);
     }
@@ -497,7 +531,7 @@ fn build_action(
         {
             return Ok(None);
         }
-        if !expression_is_eligible(value, *table_id, &surviving, 1, &mut node_count)? {
+        if !expression_is_eligible(value, *table_id, &readable, 1, &mut node_count)? {
             return Ok(None);
         }
         let target_position = target
@@ -603,6 +637,28 @@ pub(crate) fn try_execute_adopted_update(
     transaction: &mut Transaction,
     statement: &LogicalStatement,
 ) -> Result<Option<u64>, DatabaseError> {
+    try_execute_adopted_update_with_authority(
+        database,
+        transaction,
+        statement,
+        ReadAuthority::SurvivingBase,
+    )
+    .map(|accepted| accepted.map(|accepted| accepted.affected_rows))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedAction {
+    affected_rows: u64,
+    source_rows: u64,
+    prior_action_evaluations: u64,
+}
+
+fn try_execute_adopted_update_with_authority(
+    database: &mut Database,
+    transaction: &mut Transaction,
+    statement: &LogicalStatement,
+    read_authority: ReadAuthority,
+) -> Result<Option<AcceptedAction>, DatabaseError> {
     if !matches!(
         transaction.schema_composition,
         SchemaCompositionState::AdoptedSourceRefining(_)
@@ -611,7 +667,13 @@ pub(crate) fn try_execute_adopted_update(
         return Ok(None);
     }
     let parts = adopted_parts(transaction)?;
-    let Some(mut action) = build_action(statement, &parts.base, &parts.target, &parts.reserved)?
+    let Some(mut action) = build_action(
+        statement,
+        &parts.base,
+        &parts.target,
+        &parts.reserved,
+        read_authority,
+    )?
     else {
         return Ok(None);
     };
@@ -627,6 +689,8 @@ pub(crate) fn try_execute_adopted_update(
         );
     }
 
+    let prefix = plan.deferred_backfill.clone();
+    let prefix_len = prefix.actions.len();
     let view = transaction.begin_read_view(&[parts.storage], &mut database.registry)?;
     let source_view = view
         .iter()
@@ -641,6 +705,8 @@ pub(crate) fn try_execute_adopted_update(
         .map(|column| column.id)
         .collect::<Vec<_>>();
     let mut observation = ActionAccumulator::new();
+    let mut prefix_observations = prefix.begin_finalization();
+    let mut source_rows = 0_u64;
     let flow = database
         .registry
         .get_mut(parts.storage)
@@ -649,7 +715,23 @@ pub(crate) fn try_execute_adopted_update(
             &columns,
             source_view,
             |_row, source_values| {
-                if let Some(assignments) = action.evaluate(&source_values)? {
+                source_rows = source_rows
+                    .checked_add(1)
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "deferred source row count overflow",
+                    ))?;
+                let mut virtual_values = parts
+                    .projection
+                    .project_without_target_constraints(&source_values)?;
+                prefix.apply_row(
+                    &source_values,
+                    &mut virtual_values,
+                    &mut prefix_observations,
+                )?;
+                parts
+                    .projection
+                    .validate_target_constraints(&virtual_values)?;
+                if let Some(assignments) = action.evaluate(&virtual_values)? {
                     let digest_values = assignments
                         .into_iter()
                         .map(|(column, _, value)| (column, value))
@@ -665,6 +747,7 @@ pub(crate) fn try_execute_adopted_update(
         )
         .into());
     }
+    prefix.verify_finalization(prefix_observations)?;
     action.expected = observation.finish();
     let affected_rows = action.expected.affected_rows;
     let semantic_digest = action.semantic_digest;
@@ -696,7 +779,106 @@ pub(crate) fn try_execute_adopted_update(
         }
     };
     schema_mutation::crash("deferred-backfill-accepted");
-    Ok(Some(affected_rows))
+    let prior_action_evaluations = source_rows
+        .checked_mul(
+            u64::try_from(prefix_len)
+                .map_err(|_| SchemaMutationError::Corrupt("deferred prefix length overflow"))?,
+        )
+        .ok_or(SchemaMutationError::Corrupt(
+            "deferred prefix evaluation count overflow",
+        ))?;
+    Ok(Some(AcceptedAction {
+        affected_rows,
+        source_rows,
+        prior_action_evaluations,
+    }))
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VirtualAuditExecution {
+    pub(crate) affected_rows: u64,
+    pub(crate) source_scans: u64,
+    pub(crate) source_rows: u64,
+    pub(crate) prior_action_evaluations: u64,
+}
+
+/// Round 53 audit-only entrance. Production dispatch never calls this path.
+#[cfg(test)]
+pub(crate) fn audit_execute_virtual_adopted_update(
+    database: &mut Database,
+    transaction: &mut Transaction,
+    statement: &LogicalStatement,
+) -> Result<Option<VirtualAuditExecution>, DatabaseError> {
+    try_execute_adopted_update_with_authority(
+        database,
+        transaction,
+        statement,
+        ReadAuthority::VirtualProjected,
+    )
+    .map(|accepted| {
+        accepted.map(|accepted| VirtualAuditExecution {
+            affected_rows: accepted.affected_rows,
+            source_scans: 1,
+            source_rows: accepted.source_rows,
+            prior_action_evaluations: accepted.prior_action_evaluations,
+        })
+    })
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VirtualAuditReplayCost {
+    pub(crate) rows: usize,
+    pub(crate) actions: usize,
+    pub(crate) action_evaluations: u64,
+    pub(crate) resident_metadata_bytes_estimate: usize,
+}
+
+/// Deterministic in-memory replay probe used by the Round 53 cost audit.
+#[cfg(test)]
+pub(crate) fn audit_replay_virtual_rows(
+    transaction: &Transaction,
+    source_values: &[ScalarValue],
+    rows: usize,
+    actions: usize,
+) -> Result<VirtualAuditReplayCost, DatabaseError> {
+    let parts = adopted_parts(transaction)?;
+    let mut program = transaction
+        .schema_composition
+        .plan()
+        .ok_or(SchemaMutationError::Corrupt("deferred plan absent"))?
+        .deferred_backfill
+        .clone();
+    if actions > program.actions.len() {
+        return Err(
+            SchemaMutationError::Corrupt("virtual replay action count exceeds program").into(),
+        );
+    }
+    program.actions.truncate(actions);
+    program.actions.shrink_to_fit();
+    let mut observations = program.begin_finalization();
+    for _ in 0..rows {
+        let mut virtual_values = parts
+            .projection
+            .project_without_target_constraints(source_values)?;
+        program.apply_row(source_values, &mut virtual_values, &mut observations)?;
+    }
+    Ok(VirtualAuditReplayCost {
+        rows,
+        actions,
+        action_evaluations: u64::try_from(rows)
+            .ok()
+            .and_then(|rows| {
+                u64::try_from(actions)
+                    .ok()
+                    .and_then(|actions| rows.checked_mul(actions))
+            })
+            .ok_or(SchemaMutationError::Corrupt(
+                "virtual replay evaluation count overflow",
+            ))?,
+        resident_metadata_bytes_estimate: program.resident_metadata_bytes_estimate(),
+    })
 }
 
 pub(crate) fn validate_projected_new_not_null(

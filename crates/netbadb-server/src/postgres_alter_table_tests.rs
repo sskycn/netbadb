@@ -2222,3 +2222,30 @@ fn pg_round50_extended_bound_update_is_pure_until_execute() {
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn pg_round53_late_rhs_and_where_remain_closed_and_abort_the_transaction() {
+    for statement in [
+        "UPDATE accounts SET normalized = marker",
+        "UPDATE accounts SET normalized = 'x' WHERE marker IS NULL",
+    ] {
+        let (root, mut db) = layout_project("round53-late-read-negative");
+        let mut admin = session(&db, true);
+        for source in [
+            "BEGIN",
+            "UPDATE accounts SET legacy = legacy WHERE id = 1",
+            "ALTER TABLE accounts ADD COLUMN marker TEXT",
+            "ALTER TABLE accounts ADD COLUMN normalized TEXT",
+        ] {
+            ok(&sql(&mut admin, &mut db, source));
+        }
+        state(&sql(&mut admin, &mut db, statement), "25000");
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

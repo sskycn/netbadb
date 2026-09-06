@@ -1,5 +1,21 @@
 # NetbaDB roadmap
 
+## Virtual projected row / late-column read audit (Round 53 complete)
+
+- selected Candidate A for Round 54: reconstruct each pre-statement VirtualRow
+  from transaction-visible S1, exact-ID RowProjection, synthesized NULL late
+  columns, and the ordered accepted-action prefix;
+- proved test-only late WHERE/RHS reads, first-action NULL semantics,
+  simultaneous assignment and swaps, later-wins repair/copy, prepared reuse,
+  exact affected rows, observation/digest binding, one S2/index, and CORD
+  recovery without program replay;
+- measured bounded prefix replay through 100K rows and 32 actions and recommends
+  retaining the existing 32-action cap;
+- kept production late reads closed and preserved the Round 52 stream guard,
+  Columnar Phase 2B/C/D derived authority, and every persistent/wire format.
+
+See [`deferred-virtual-row-round53.md`](deferred-virtual-row-round53.md).
+
 ## Explicit Change Stream rebaseline guard (Round 52 complete)
 
 - productionized Candidate A2 across every managed-Heap replacement producer:

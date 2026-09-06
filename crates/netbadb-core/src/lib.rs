@@ -8480,6 +8480,8 @@ mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]
+mod deferred_virtual_row_audit_tests;
+#[cfg(test)]
 mod indexed_nullability_audit_tests;
 #[cfg(test)]
 mod late_clone_layout_audit_tests;
