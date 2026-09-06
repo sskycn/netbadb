@@ -6,6 +6,10 @@ wire contract. The selected Round 52 target is **Candidate A2: require an
 explicit disable before a final physical replacement, followed by an explicit
 S2 enable and committed-read anchor**.
 
+Round 52 has now productionized that selection. The historical observations
+below remain the decision evidence; current behavior is documented in
+[change-stream-schema-replacement-round52](change-stream-schema-replacement-round52.md).
+
 ## Baselines and scope
 
 The requested historical baselines are Round 50 `7fb849b8e79c357a032d2883a3de6b97bc88d891`

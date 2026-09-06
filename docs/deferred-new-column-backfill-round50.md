@@ -141,6 +141,13 @@ current refresh API rejects that old table identity even when its selected
 columns survive; Round 50 does not weaken projection identity or automatically
 rebuild a projection, and Columnar never becomes a CORD participant.
 
+Round 52 now gates this final S1-to-S2 step when the S1 Change Stream is
+`Enabled` or `Unavailable`. The deferred UPDATE/nullability/index program
+remains rollbackable, but no S2 `StorageId`, rewrite intent, tag 35, stage,
+target, or committed S1 change batch is produced. After explicit rollback and
+S1 stream disable, the unchanged Round 50 finalizer proceeds; its complete S2
+baseline represents the intentionally disabled migration window.
+
 ## Compatibility and exclusions
 
 Canonical schema, NBSC/NBSM, NBSJ v1 tags 1--35, CORD v2, Heap/Page, WAL,

@@ -205,6 +205,12 @@ LSM/partitioned/imported/bootstrap, savepoints, online/resumable migration,
 participant detach, automatic GC and new formats. Round 42 SourceIndexFinalizing
 remains a distinct DROP-first lifecycle.
 
+Round 52 preserves the classification split: an enabled or unavailable S1
+blocks table-dirty `RewriteHeap` finalization, while same-S1
+`InPlaceIndexDelta` and global no-op outcomes remain legal and publish no row
+change for index metadata. Disabled and never-enabled sources retain the Round
+48 replacement behavior unchanged.
+
 ## Pre-merge design answers
 
 - First stale CREATE can burn I or failed first CREATE can terminalize: **no**.

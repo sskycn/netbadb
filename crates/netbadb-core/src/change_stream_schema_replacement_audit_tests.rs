@@ -1,14 +1,12 @@
 use super::*;
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_storage::{
-    ChangeStreamError, ChangeStreamStatus, StorageChange, StorageError, TableStorage,
-};
-use netbadb_types::{ColumnId, PhysicalType, StorageDataVersion, StorageId, TableId};
+use netbadb_storage::{ChangeStreamError, ChangeStreamStatus, StorageChange, StorageError};
+use netbadb_types::{ColumnId, PhysicalType, StorageId, TableId};
 use std::path::{Path, PathBuf};
 
 fn root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "netbadb-round51-{name}-{}-{:?}",
+        "netbadb-round52-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -58,9 +56,97 @@ fn assert_disabled(error: DatabaseError) {
     ));
 }
 
-fn execute_round50_replacement(database: &mut Database) -> (DatabaseTxnId, StorageId) {
-    let table = users(database);
-    let source = database.bindings.resolve_single(table).unwrap();
+fn assert_replacement_blocked(
+    error: DatabaseError,
+    table_id: TableId,
+    storage_id: StorageId,
+    status: ChangeStreamStatus,
+) {
+    assert_eq!(error.kind(), DatabaseErrorKind::FeatureNotSupported);
+    let message = error.to_string();
+    assert!(message.contains("authoritative storage replacement"));
+    assert!(message.contains("explicitly disabling the source change stream"));
+    assert!(message.contains(&format!("table {}", table_id.0)));
+    assert!(message.contains(&format!("storage {}", storage_id.0)));
+    assert!(message.contains(&format!("{status:?}")));
+    assert!(matches!(
+        error,
+        DatabaseError::SchemaMutation(
+            SchemaMutationError::ActiveChangeStreamBlocksReplacement {
+                table_id: actual_table,
+                storage_id: actual_storage,
+                status: actual_status,
+            }
+        ) if actual_table == table_id
+            && actual_storage == storage_id
+            && actual_status == status
+    ));
+}
+
+fn assert_no_replacement_artifacts(
+    root: &Path,
+    incarnation: [u8; 16],
+    transaction_id: DatabaseTxnId,
+    target_storage: StorageId,
+) {
+    let catalog = root.join("catalog");
+    let stage = schema_catalog_file::resolve(
+        &catalog,
+        &schema_mutation_journal::stage_locator(
+            &catalog,
+            incarnation,
+            transaction_id,
+            target_storage,
+        )
+        .unwrap(),
+    );
+    let final_heap = schema_catalog_file::resolve(
+        &catalog,
+        &schema_mutation_journal::final_locator(&catalog, incarnation, target_storage).unwrap(),
+    );
+    let prepared = schema_catalog_file::resolve(
+        &catalog,
+        &schema_mutation_journal::prepared_locator(&catalog, incarnation, transaction_id).unwrap(),
+    );
+    for path in [
+        stage.clone(),
+        schema_catalog_file::suffix(&stage, ".owner"),
+        netbadb_storage::txn_status_path(&stage),
+        netbadb_storage::heap_change_log_path(&stage),
+        netbadb_storage::change_stream_guard_path(netbadb_storage::heap_change_log_path(&stage)),
+        final_heap.clone(),
+        schema_catalog_file::suffix(&final_heap, ".owner"),
+        netbadb_storage::txn_status_path(&final_heap),
+        netbadb_storage::heap_change_log_path(&final_heap),
+        netbadb_storage::change_stream_guard_path(netbadb_storage::heap_change_log_path(
+            &final_heap,
+        )),
+        prepared,
+    ] {
+        assert!(
+            !path.exists(),
+            "unexpected replacement artifact: {}",
+            path.display()
+        );
+    }
+    assert!(
+        !stage.parent().is_some_and(Path::exists),
+        "replacement staging directory was created"
+    );
+}
+
+#[test]
+fn round50_replacement_is_blocked_before_storage_allocation_and_remains_rollbackable() {
+    let root = root("round50-blocked");
+    let mut database = seed(&root);
+    let table = users(&database);
+    let cursor = database.enable_change_stream(table).unwrap();
+    let source = cursor.storage_id;
+    let storage_floor = database.next_storage_id();
+    let target_storage = storage_floor.unwrap();
+    let incarnation = schema_catalog_file::load(&root.join("catalog"))
+        .unwrap()
+        .incarnation;
     let mut transaction = database.begin_transaction().unwrap();
     for statement in [
         "UPDATE users SET legacy = 'updated' WHERE id = 1",
@@ -74,117 +160,62 @@ fn execute_round50_replacement(database: &mut Database) -> (DatabaseTxnId, Stora
         database.execute_in(&mut transaction, statement).unwrap();
     }
     let transaction_id = transaction.id();
-    database.commit_transaction(&mut transaction).unwrap();
+    let error = database.commit_transaction(&mut transaction).unwrap_err();
+    assert_replacement_blocked(error, table, source, ChangeStreamStatus::Enabled);
+    assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+    assert!(transaction.schema_composition.plan().is_some());
+    assert_eq!(database.next_storage_id(), storage_floor);
+    assert_eq!(database.bindings.resolve_single(table), Ok(source));
+    let inspection = database.inspect_change_stream(table).unwrap();
+    assert_eq!(inspection.status, ChangeStreamStatus::Enabled);
+    assert_eq!(inspection.generation, Some(cursor.generation));
+    assert_eq!(inspection.current_data_version, cursor.frontier);
+    let journal = database.mutation_journal.as_ref().unwrap().borrow();
+    assert!(
+        !journal
+            .source_backfill_intents
+            .contains_key(&transaction_id)
+    );
+    assert!(!journal.stage_intents.contains_key(&transaction_id));
+    let record = &journal.compositions[&transaction_id];
+    assert!(record.index_intent.is_none());
+    assert!(record.table_intent.is_none());
+    drop(journal);
+    assert_no_replacement_artifacts(&root, incarnation, transaction_id, target_storage);
+    transaction.rollback().unwrap();
+    assert_eq!(transaction.state(), TransactionState::RolledBack);
     drop(transaction);
-    assert_ne!(database.bindings.resolve_single(table).unwrap(), source);
-    (transaction_id, source)
-}
-
-#[test]
-fn current_round50_replacement_commits_an_unreachable_final_s1_batch_then_gc_removes_it() {
-    let root = root("current-silent-abandonment");
-    let mut database = seed(&root);
-    let table = users(&database);
-    let old_table = database.schema().table("users").unwrap().clone();
-    let old_fingerprint = old_table.fingerprint().unwrap();
-    let old_cursor = database.enable_change_stream(table).unwrap();
-    let (database_txn_id, source) = execute_round50_replacement(&mut database);
-    let target = database.bindings.resolve_single(table).unwrap();
-
-    assert_eq!(source, old_cursor.storage_id);
-    assert_ne!(target, source);
-    let target_stream = database.inspect_change_stream(table).unwrap();
-    assert_eq!(target_stream.storage_id, target);
-    assert_eq!(target_stream.status, ChangeStreamStatus::Disabled);
-    assert_disabled(
-        database
-            .read_changes(table, old_cursor, 16, 1_000_000)
-            .unwrap_err(),
-    );
-
-    let retired = database
-        .inspect_replacement_retired_heaps()
-        .into_iter()
-        .find(|resource| resource.old_storage_id == source)
-        .unwrap();
-    let inspection = database
-        .inspect_replacement_retired_heap_gc(&retired)
-        .unwrap();
-    assert!(inspection.eligible(), "{:?}", inspection.blockers);
-    for kind in [
-        RetiredHeapGcComponentKind::ChangeLog,
-        RetiredHeapGcComponentKind::ChangeStreamGuard,
-    ] {
-        assert!(
-            inspection
-                .components
-                .iter()
-                .any(|component| component.kind == kind && component.present),
-            "missing retained {kind:?}"
-        );
-    }
-    let old_heap = inspection
-        .components
-        .iter()
-        .find(|component| component.kind == RetiredHeapGcComponentKind::Main)
-        .unwrap()
-        .path
-        .clone();
-    let retained_paths = inspection
-        .components
-        .iter()
-        .filter(|component| {
-            matches!(
-                component.kind,
-                RetiredHeapGcComponentKind::ChangeLog
-                    | RetiredHeapGcComponentKind::ChangeStreamGuard
-            )
-        })
-        .map(|component| component.path.clone())
-        .collect::<Vec<_>>();
-
-    let old_storage = TableStorage::open_heap(&old_heap, old_table).unwrap();
-    let changes = old_storage.read_changes(old_cursor, 16, 1_000_000).unwrap();
-    assert_eq!(changes.batches.len(), 1);
-    let batch = &changes.batches[0];
-    assert_eq!(batch.database_txn_id, Some(database_txn_id));
-    assert_eq!(batch.storage_id, source);
-    assert_eq!(batch.schema_fingerprint, old_fingerprint);
-    assert_eq!(batch.before, old_cursor.frontier);
-    assert_eq!(batch.after, StorageDataVersion(old_cursor.frontier.0 + 1));
-    assert_eq!(changes.current_frontier, batch.after);
-    assert_eq!(batch.mutations.len(), 3);
-    for mutation in &batch.mutations {
-        match mutation {
-            StorageChange::Insert { new_version, after } => {
-                assert_eq!(new_version.storage_id(), source);
-                assert_eq!(after.len(), 3);
-            }
-            StorageChange::Update {
-                old_version,
-                new_version,
-                after,
-            } => {
-                assert_eq!(old_version.storage_id(), source);
-                assert_eq!(new_version.storage_id(), source);
-                assert_eq!(after.len(), 3);
-            }
-            StorageChange::Delete { old_version } => {
-                assert_eq!(old_version.storage_id(), source);
-            }
-        }
-    }
-    old_storage.close().unwrap();
-
-    database.gc_replacement_retired_heap(&retired).unwrap();
-    assert!(retained_paths.iter().all(|path| !path.exists()));
+    let journal = database.mutation_journal.as_ref().unwrap().borrow();
+    let record = &journal.compositions[&transaction_id];
+    assert_eq!(record.reservations.len(), 1, "ColumnId burn must remain");
     assert_eq!(
-        database
-            .inspect_replacement_retired_heap_gc(&retired)
-            .unwrap()
-            .state,
-        RetiredHeapGcState::Deleted
+        record.index_reservations.len() + record.migration_index_reservations.len(),
+        1,
+        "IndexId burn must remain"
     );
+    assert_eq!(
+        record.resolution,
+        Some(schema_mutation_journal::CompositionResolution::Loser)
+    );
+    drop(journal);
+    assert_eq!(database.next_storage_id(), storage_floor);
+    assert_eq!(database.bindings.resolve_single(table), Ok(source));
+    assert!(
+        database
+            .read_changes(table, cursor, 16, 1_000_000)
+            .unwrap()
+            .batches
+            .is_empty()
+    );
+    assert!(
+        database
+            .schema()
+            .table("users")
+            .unwrap()
+            .column("marker")
+            .is_none()
+    );
+    assert!(database.inspect_replacement_retired_heaps().is_empty());
     database.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -198,20 +229,39 @@ fn explicit_disable_replacement_enable_anchor_starts_a_distinct_s2_history() {
     database
         .execute("UPDATE users SET legacy = 'before-disable' WHERE id = 1")
         .unwrap();
+    let old_changes = database
+        .read_changes(table, old_cursor, 16, 1_000_000)
+        .unwrap();
+    assert_eq!(old_changes.batches.len(), 1);
+    assert_eq!(old_changes.batches[0].mutations.len(), 1);
     database.disable_change_stream(table).unwrap();
     assert_eq!(
         database.inspect_change_stream(table).unwrap().status,
         ChangeStreamStatus::Disabled
     );
 
-    database
-        .execute("ALTER TABLE users ADD COLUMN marker TEXT")
-        .unwrap();
+    let mut migration = database.begin_transaction().unwrap();
+    for statement in [
+        "UPDATE users SET legacy = 'migration-window' WHERE id = 1",
+        "ALTER TABLE users ADD COLUMN marker TEXT",
+        "UPDATE users SET marker = legacy",
+        "ALTER TABLE users ALTER COLUMN marker SET NOT NULL",
+        "CREATE INDEX users_marker_idx ON users(marker)",
+    ] {
+        database.execute_in(&mut migration, statement).unwrap();
+    }
+    database.commit_transaction(&mut migration).unwrap();
+    drop(migration);
     let replacement = database.bindings.resolve_single(table).unwrap();
     assert_ne!(replacement, old_cursor.storage_id);
     assert_eq!(
         database.inspect_change_stream(table).unwrap().status,
         ChangeStreamStatus::Disabled
+    );
+    assert_disabled(
+        database
+            .read_changes(table, old_cursor, 16, 1_000_000)
+            .unwrap_err(),
     );
     let new_cursor = database.enable_change_stream(table).unwrap();
     let anchor = database.committed_read_anchor(table).unwrap();
@@ -231,7 +281,7 @@ fn explicit_disable_replacement_enable_anchor_starts_a_distinct_s2_history() {
         ))
     ));
     database
-        .execute("UPDATE users SET marker = legacy WHERE id = 1")
+        .execute("UPDATE users SET marker = 'after-anchor' WHERE id = 1")
         .unwrap();
     let changes = database
         .read_changes(table, anchor.cursor, 16, 1_000_000)
@@ -362,7 +412,7 @@ fn enabled_stream_survives_same_s1_index_only_and_global_noop_paths() {
 }
 
 #[test]
-fn active_stream_is_currently_abandoned_by_each_effective_schema_rewrite_shape() {
+fn enabled_stream_blocks_each_effective_schema_rewrite_shape_without_a_storage_burn() {
     for (name, statement) in [
         ("add", "ALTER TABLE users ADD COLUMN note TEXT"),
         (
@@ -373,35 +423,41 @@ fn active_stream_is_currently_abandoned_by_each_effective_schema_rewrite_shape()
             "set-not-null",
             "ALTER TABLE users ALTER COLUMN legacy SET NOT NULL",
         ),
+        (
+            "drop-not-null",
+            "ALTER TABLE users ALTER COLUMN id DROP NOT NULL",
+        ),
         ("drop", "ALTER TABLE users DROP COLUMN flag"),
     ] {
         let root = root(name);
         let mut database = seed(&root);
         let table = users(&database);
         let cursor = database.enable_change_stream(table).unwrap();
-        database.execute(statement).unwrap();
-        assert_ne!(
+        let storage_floor = database.next_storage_id();
+        let mut transaction = database.begin_transaction().unwrap();
+        database.execute_in(&mut transaction, statement).unwrap();
+        let error = database.commit_transaction(&mut transaction).unwrap_err();
+        assert_replacement_blocked(error, table, cursor.storage_id, ChangeStreamStatus::Enabled);
+        assert_eq!(
             database.bindings.resolve_single(table).unwrap(),
             cursor.storage_id,
             "{name}"
         );
-        assert_eq!(
-            database.inspect_change_stream(table).unwrap().status,
-            ChangeStreamStatus::Disabled,
-            "{name}"
-        );
-        assert_disabled(
-            database
-                .read_changes(table, cursor, 16, 1_000_000)
-                .unwrap_err(),
-        );
+        assert_eq!(database.next_storage_id(), storage_floor, "{name}");
+        let stream = database.inspect_change_stream(table).unwrap();
+        assert_eq!(stream.status, ChangeStreamStatus::Enabled, "{name}");
+        assert_eq!(stream.generation, Some(cursor.generation), "{name}");
+        assert_eq!(stream.current_data_version, cursor.frontier, "{name}");
+        assert!(database.inspect_replacement_retired_heaps().is_empty());
+        transaction.rollback().unwrap();
+        drop(transaction);
         database.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
 
 #[test]
-fn drop_first_and_direct_core_rewrite_paths_have_the_same_current_abandonment() {
+fn drop_first_and_direct_core_rewrite_paths_use_the_same_production_guard() {
     let drop_first_root = root("drop-first");
     let mut database = seed(&drop_first_root);
     let table = users(&database);
@@ -419,28 +475,44 @@ fn drop_first_and_direct_core_rewrite_paths_have_the_same_current_abandonment() 
         database.execute_in(&mut transaction, statement).unwrap();
     }
     assert!(transaction.schema_composition.source_backfill().is_some());
-    database.commit_transaction(&mut transaction).unwrap();
+    let storage_floor = database.next_storage_id();
+    let error = database.commit_transaction(&mut transaction).unwrap_err();
+    assert_replacement_blocked(error, table, cursor.storage_id, ChangeStreamStatus::Enabled);
+    assert_eq!(database.next_storage_id(), storage_floor);
+    assert_eq!(
+        database.bindings.resolve_single(table),
+        Ok(cursor.storage_id)
+    );
+    let journal = database.mutation_journal.as_ref().unwrap().borrow();
+    assert!(
+        !journal
+            .source_backfill_intents
+            .contains_key(&transaction.id())
+    );
+    assert!(!journal.stage_intents.contains_key(&transaction.id()));
+    let prelude = journal.compositions[&transaction.id()]
+        .index_intent
+        .as_ref()
+        .unwrap();
+    assert!(prelude.tables.iter().all(|plan| !matches!(
+        plan,
+        crate::schema_mutation_journal::SchemaIndexTablePlan::RewriteHeap { .. }
+    )));
+    drop(journal);
+    transaction.rollback().unwrap();
     drop(transaction);
-    assert_ne!(
-        database.bindings.resolve_single(table).unwrap(),
-        cursor.storage_id
-    );
-    assert_disabled(
-        database
-            .read_changes(table, cursor, 16, 1_000_000)
-            .unwrap_err(),
-    );
     database.close().unwrap();
     std::fs::remove_dir_all(drop_first_root).unwrap();
 
-    let direct_root = root("direct-core");
+    let direct_root = root("direct-core-production");
     let mut database = seed(&direct_root);
     let table = users(&database);
     let cursor = database.enable_change_stream(table).unwrap();
+    let storage_floor = database.next_storage_id();
     let target = database.resolve_alter_table("users").unwrap();
     let mut transaction = database.begin_transaction().unwrap();
     database
-        .rewrite_heap_table_schema_legacy_in(
+        .rewrite_heap_table_schema_in(
             &mut transaction,
             AlterTableSpec::new(
                 target,
@@ -451,115 +523,53 @@ fn drop_first_and_direct_core_rewrite_paths_have_the_same_current_abandonment() 
             ),
         )
         .unwrap();
-    database.commit_transaction(&mut transaction).unwrap();
+    let error = database.commit_transaction(&mut transaction).unwrap_err();
+    assert_replacement_blocked(error, table, cursor.storage_id, ChangeStreamStatus::Enabled);
+    assert_eq!(transaction.state(), TransactionState::RollbackRequired);
+    assert_eq!(database.next_storage_id(), storage_floor);
+    assert_eq!(
+        database.bindings.resolve_single(table),
+        Ok(cursor.storage_id)
+    );
+    transaction.rollback().unwrap();
     drop(transaction);
-    assert_ne!(
-        database.bindings.resolve_single(table).unwrap(),
-        cursor.storage_id
-    );
-    assert_disabled(
-        database
-            .read_changes(table, cursor, 16, 1_000_000)
-            .unwrap_err(),
-    );
     database.close().unwrap();
     std::fs::remove_dir_all(direct_root).unwrap();
+
+    let legacy_root = root("direct-core-legacy");
+    let mut database = seed(&legacy_root);
+    let table = users(&database);
+    let cursor = database.enable_change_stream(table).unwrap();
+    let storage_floor = database.next_storage_id();
+    let target = database.resolve_alter_table("users").unwrap();
+    let mut transaction = database.begin_transaction().unwrap();
+    let error = database
+        .rewrite_heap_table_schema_legacy_in(
+            &mut transaction,
+            AlterTableSpec::new(
+                target,
+                AlterTableOperation::AddNullableColumn {
+                    name: "note".into(),
+                    data_type: netbadb_types::SemanticType::physical(PhysicalType::Text),
+                },
+            ),
+        )
+        .unwrap_err();
+    assert_replacement_blocked(error, table, cursor.storage_id, ChangeStreamStatus::Enabled);
+    assert_eq!(transaction.state(), TransactionState::Active);
+    assert_eq!(database.next_storage_id(), storage_floor);
+    assert_eq!(
+        database.bindings.resolve_single(table),
+        Ok(cursor.storage_id)
+    );
+    transaction.rollback().unwrap();
+    drop(transaction);
+    database.close().unwrap();
+    std::fs::remove_dir_all(legacy_root).unwrap();
 }
 
 #[test]
-fn round51_crash_child() {
-    let Ok(root) = std::env::var("NETBADB_ROUND51_CRASH_ROOT") else {
-        return;
-    };
-    let mut database = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
-    execute_round50_replacement(&mut database);
-    panic!("configured Round 51 crash hook was not reached");
-}
-
-#[test]
-fn active_s1_stream_recovery_hides_pre_cord_batch_and_repairs_post_cord_winner() {
-    for (point, winner) in [
-        ("after-all-prepares", false),
-        ("after-durable-decision", true),
-    ] {
-        let root = root(&format!("crash-{point}"));
-        let mut database = seed(&root);
-        let table = users(&database);
-        let old_table = database.schema().table("users").unwrap().clone();
-        let source = database.bindings.resolve_single(table).unwrap();
-        let cursor = database.enable_change_stream(table).unwrap();
-        database.close().unwrap();
-
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "change_stream_schema_replacement_audit_tests::round51_crash_child",
-                "--nocapture",
-            ])
-            .env("NETBADB_ROUND51_CRASH_ROOT", &root);
-        crate::coordinator_crash::configure_child(&mut command, point, &root, point);
-        let output = command.output().unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(crate::coordinator_crash::EXIT_CODE),
-            "{point}: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let database = Database::open_catalog(root.join("catalog")).unwrap();
-        if winner {
-            assert_ne!(database.bindings.resolve_single(table).unwrap(), source);
-            assert_eq!(
-                database.inspect_change_stream(table).unwrap().status,
-                ChangeStreamStatus::Disabled
-            );
-            assert_disabled(
-                database
-                    .read_changes(table, cursor, 16, 1_000_000)
-                    .unwrap_err(),
-            );
-            let retired = database
-                .inspect_replacement_retired_heaps()
-                .into_iter()
-                .find(|resource| resource.old_storage_id == source)
-                .unwrap();
-            let inspection = database
-                .inspect_replacement_retired_heap_gc(&retired)
-                .unwrap();
-            let old_heap = inspection
-                .components
-                .iter()
-                .find(|component| component.kind == RetiredHeapGcComponentKind::Main)
-                .unwrap()
-                .path
-                .clone();
-            database.close().unwrap();
-            let old_storage = TableStorage::open_heap(old_heap, old_table).unwrap();
-            let changes = old_storage.read_changes(cursor, 16, 1_000_000).unwrap();
-            assert_eq!(changes.batches.len(), 1);
-            assert!(changes.batches[0].database_txn_id.is_some());
-            assert_eq!(changes.batches[0].mutations.len(), 3);
-            old_storage.close().unwrap();
-        } else {
-            assert_eq!(database.bindings.resolve_single(table), Ok(source));
-            assert_eq!(
-                database.inspect_change_stream(table).unwrap().status,
-                ChangeStreamStatus::Enabled
-            );
-            let changes = database.read_changes(table, cursor, 16, 1_000_000).unwrap();
-            assert!(changes.batches.is_empty());
-            assert_eq!(changes.current_frontier, cursor.frontier);
-            assert!(database.inspect_replacement_retired_heaps().is_empty());
-            database.close().unwrap();
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-#[test]
-fn unavailable_source_stream_is_currently_abandoned_by_schema_only_replacement() {
+fn unavailable_source_stream_blocks_replacement_and_can_be_explicitly_abandoned() {
     let root = root("unavailable");
     let mut database = seed(&root);
     let table = users(&database);
@@ -583,13 +593,226 @@ fn unavailable_source_stream_is_currently_abandoned_by_schema_only_replacement()
         database.inspect_change_stream(table).unwrap().status,
         ChangeStreamStatus::Unavailable
     );
+    let storage_floor = database.next_storage_id();
+    let mut transaction = database.begin_transaction().unwrap();
+    database
+        .execute_in(&mut transaction, "ALTER TABLE users ADD COLUMN note TEXT")
+        .unwrap();
+    let error = database.commit_transaction(&mut transaction).unwrap_err();
+    assert_replacement_blocked(error, table, source, ChangeStreamStatus::Unavailable);
+    assert_eq!(database.next_storage_id(), storage_floor);
+    assert_eq!(database.bindings.resolve_single(table), Ok(source));
+    transaction.rollback().unwrap();
+    drop(transaction);
+    database.disable_change_stream(table).unwrap();
+    assert_eq!(
+        database.inspect_change_stream(table).unwrap().status,
+        ChangeStreamStatus::Disabled
+    );
     database
         .execute("ALTER TABLE users ADD COLUMN note TEXT")
         .unwrap();
     assert_ne!(database.bindings.resolve_single(table).unwrap(), source);
+    database.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn disabled_and_never_enabled_sources_replace_while_create_and_drop_remain_unaffected() {
+    for (name, enable_then_disable) in [("never-enabled", false), ("disabled", true)] {
+        let root = root(name);
+        let mut database = seed(&root);
+        let table = users(&database);
+        let source = database.bindings.resolve_single(table).unwrap();
+        if enable_then_disable {
+            database.enable_change_stream(table).unwrap();
+            database.disable_change_stream(table).unwrap();
+        }
+        database
+            .execute("ALTER TABLE users ADD COLUMN note TEXT")
+            .unwrap();
+        assert_ne!(database.bindings.resolve_single(table).unwrap(), source);
+        assert_eq!(
+            database.inspect_change_stream(table).unwrap().status,
+            ChangeStreamStatus::Disabled
+        );
+        database.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    let root = root("create-drop");
+    let mut database = seed(&root);
+    let users = users(&database);
+    database.enable_change_stream(users).unwrap();
+    database
+        .execute("CREATE TABLE transient (id BIGINT NOT NULL)")
+        .unwrap();
+    let transient = database.schema().table("transient").unwrap().id;
+    database.enable_change_stream(transient).unwrap();
+    database.execute("DROP TABLE transient").unwrap();
+    assert!(database.schema().table("transient").is_none());
+    let retired = database
+        .inspect_retired_table_resources()
+        .into_iter()
+        .find(|resource| resource.table_id == transient)
+        .unwrap();
+    let inspection = database.inspect_retired_heap_gc(&retired).unwrap();
+    for kind in [
+        RetiredHeapGcComponentKind::ChangeLog,
+        RetiredHeapGcComponentKind::ChangeStreamGuard,
+    ] {
+        assert!(
+            inspection
+                .components
+                .iter()
+                .any(|component| component.kind == kind && component.present)
+        );
+    }
+    database.gc_retired_heap(&retired).unwrap();
     assert_eq!(
-        database.inspect_change_stream(table).unwrap().status,
-        ChangeStreamStatus::Disabled
+        database.inspect_retired_heap_gc(&retired).unwrap().state,
+        RetiredHeapGcState::Deleted
+    );
+    assert_eq!(
+        database.inspect_change_stream(users).unwrap().status,
+        ChangeStreamStatus::Enabled
+    );
+    database.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn incremental_projection_stays_on_s1_when_blocked_and_rebaselines_explicitly_on_s2() {
+    let root = root("incremental-rebaseline");
+    let mut database = seed(&root);
+    let table = users(&database);
+    let source = database.bindings.resolve_single(table).unwrap();
+    let cursor = database.enable_change_stream(table).unwrap();
+    let source_columns = database
+        .schema()
+        .table("users")
+        .unwrap()
+        .columns
+        .iter()
+        .map(|column| column.id)
+        .collect::<Vec<_>>();
+    let old_projection = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            table,
+            root.join("projection-s1"),
+            source_columns,
+        ))
+        .unwrap();
+    let inspection = database.inspect_columnar_projections();
+    let old = inspection
+        .iter()
+        .find(|projection| projection.projection_id == Some(old_projection))
+        .unwrap();
+    assert_eq!(old.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(old.source_storage_id, Some(source));
+    assert_eq!(old.stream_generation, Some(cursor.generation));
+
+    let mut blocked = database.begin_transaction().unwrap();
+    database
+        .execute_in(&mut blocked, "ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    let error = database.commit_transaction(&mut blocked).unwrap_err();
+    assert_replacement_blocked(error, table, source, ChangeStreamStatus::Enabled);
+    blocked.rollback().unwrap();
+    drop(blocked);
+    let old = database
+        .inspect_columnar_projections()
+        .into_iter()
+        .find(|projection| projection.projection_id == Some(old_projection))
+        .unwrap();
+    assert_eq!(old.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(old.source_storage_id, Some(source));
+    assert_eq!(old.stream_generation, Some(cursor.generation));
+
+    database.disable_change_stream(table).unwrap();
+    assert_eq!(
+        database
+            .inspect_columnar_projections()
+            .into_iter()
+            .find(|projection| projection.projection_id == Some(old_projection))
+            .unwrap()
+            .health,
+        ColumnarProjectionHealth::RebuildRequired
+    );
+    database
+        .execute("ALTER TABLE users ADD COLUMN marker TEXT")
+        .unwrap();
+    let replacement = database.bindings.resolve_single(table).unwrap();
+    assert_ne!(replacement, source);
+    let old_after_replacement = database
+        .inspect_columnar_projections()
+        .into_iter()
+        .find(|projection| projection.projection_id == Some(old_projection))
+        .unwrap();
+    assert_ne!(
+        old_after_replacement.health,
+        ColumnarProjectionHealth::Fresh
+    );
+    assert_eq!(old_after_replacement.source_storage_id, Some(source));
+
+    let new_cursor = database.enable_change_stream(table).unwrap();
+    assert_eq!(new_cursor.storage_id, replacement);
+    let replacement_columns = database
+        .schema()
+        .table("users")
+        .unwrap()
+        .columns
+        .iter()
+        .map(|column| column.id)
+        .collect::<Vec<_>>();
+    let new_projection = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            table,
+            root.join("projection-s2"),
+            replacement_columns,
+        ))
+        .unwrap();
+    let new = database
+        .inspect_columnar_projections()
+        .into_iter()
+        .find(|projection| projection.projection_id == Some(new_projection))
+        .unwrap();
+    assert_eq!(new.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(new.source_storage_id, Some(replacement));
+    assert_eq!(new.stream_generation, Some(new_cursor.generation));
+
+    database
+        .execute("UPDATE users SET marker = 'delta' WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        database
+            .inspect_columnar_projections()
+            .into_iter()
+            .find(|projection| projection.projection_id == Some(new_projection))
+            .unwrap()
+            .health,
+        ColumnarProjectionHealth::Lagging
+    );
+    let report = database
+        .advance_columnar_projection(new_projection, ColumnarAdvanceBudget::new(16, 1_000_000))
+        .unwrap();
+    assert!(report.caught_up);
+    assert_eq!(report.batches_applied, 1);
+    assert_eq!(
+        database
+            .inspect_columnar_projections()
+            .into_iter()
+            .find(|projection| projection.projection_id == Some(new_projection))
+            .unwrap()
+            .health,
+        ColumnarProjectionHealth::Fresh
+    );
+    assert_eq!(
+        database
+            .query("SELECT marker FROM users WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![ScalarValue::Text("delta".into())]]
     );
     database.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();

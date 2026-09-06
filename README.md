@@ -87,6 +87,13 @@ row-version identities, transaction coalescing, bounded replay, gap detection,
 and coordinator correlation. It remains an embedded storage capability; no
 network CDC or Columnar Delta is implemented.
 
+[Round 52](docs/change-stream-schema-replacement-round52.md) requires an
+enabled or unavailable per-storage Change Stream to be explicitly abandoned
+before an operation that would replace the authoritative Heap `StorageId`.
+Same-storage no-ops and in-place index changes retain the stream. After a
+replacement, callers explicitly enable a new stream and take a new committed
+read anchor; its frontier is a new storage-local baseline, not a continuation.
+
 Round 33 extends controlled backfill with a post-backfill `CREATE INDEX` /
 `DROP INDEX` phase. Index IDs are durably reserved before overlay mutation;
 finalization retargets the same staged Heap first and then builds only the

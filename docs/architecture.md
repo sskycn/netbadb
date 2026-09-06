@@ -273,6 +273,15 @@ One prepared NBSC and one CORD decision publish every surviving object. NBSJ v1
 tags 26--30 record TableId reservation, the typed table-object aggregate,
 predecessor retirement, and exact-resource GC without changing older tag bytes.
 
+Round 52 adds final-physical-truth admission to every managed-Heap replacement
+producer. A surviving touched table whose final `TableDef` differs from its
+base would emit `RewriteHeap`; before any replacement `StorageId`, intent,
+stage, target, source-backfill target, or CORD participant exists, Core inspects
+the exact source Change Stream. `Enabled` and `Unavailable` reject with a typed
+feature-not-supported error; `Disabled` proceeds. CreateHeap, DropHeap,
+canonical no-op, and InPlaceIndexDelta bypass the guard. See
+[change-stream-schema-replacement-round52](change-stream-schema-replacement-round52.md).
+
 [Round 31](migration-backfill-round31.md) audits the still-sealed migration-
 backfill boundary without enabling it. Direct transaction-view tests prove that
 ordinary DML reads and writes the private materialized Heap, and a test-only scan

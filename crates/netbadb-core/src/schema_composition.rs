@@ -713,6 +713,27 @@ impl MaterializedSchemaTransaction {
 }
 
 impl Database {
+    /// Returns only surviving touched tables whose final canonical schema
+    /// differs from their base. These are exactly the old authoritative Heap
+    /// sources that a composition will replace; creates, drops and canonical
+    /// no-ops are deliberately absent.
+    fn replacement_sources(logical: &SchemaTransactionPlan) -> Vec<(TableId, StorageId)> {
+        logical
+            .touched
+            .iter()
+            .filter_map(|(table_id, touched)| {
+                logical
+                    .overlay
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == *table_id)
+                    .filter(|table| *table != &touched.base_table)
+                    .map(|_| (*table_id, touched.old_storage))
+            })
+            .collect()
+    }
+
     fn source_backfill_candidate_is_eligible(
         &self,
         transaction: &Transaction,
@@ -1170,6 +1191,14 @@ impl Database {
         &mut self,
         transaction: &mut Transaction,
     ) -> Result<(), DatabaseError> {
+        let replacements = match &transaction.schema_composition {
+            SchemaCompositionState::SourceRefining(materialized)
+            | SchemaCompositionState::SourceIndexFinalizing(materialized) => {
+                Self::replacement_sources(&materialized.logical)
+            }
+            _ => Vec::new(),
+        };
+        self.ensure_heap_replacement_change_stream_safe(replacements)?;
         let previous = std::mem::replace(
             &mut transaction.schema_composition,
             SchemaCompositionState::None,
@@ -4757,6 +4786,7 @@ impl Database {
                 SchemaMutationError::CompositionLimitExceeded("schema-created StorageIds").into(),
             );
         }
+        self.ensure_heap_replacement_change_stream_safe(Self::replacement_sources(&logical))?;
         self.catalog_generation
             .checked_add(1)
             .ok_or(SchemaMutationError::IdentityExhausted(
@@ -5157,6 +5187,7 @@ impl Database {
                 SchemaIndexMaterialization::Ordinary,
             );
         }
+        self.ensure_heap_replacement_change_stream_safe(Self::replacement_sources(&logical))?;
         self.catalog_generation
             .checked_add(1)
             .ok_or(SchemaMutationError::IdentityExhausted(
@@ -5592,6 +5623,7 @@ impl Database {
         if effective.len() > MAX_TOUCHED_TABLES {
             return Err(SchemaMutationError::CompositionLimitExceeded("touched tables").into());
         }
+        self.ensure_heap_replacement_change_stream_safe(Self::replacement_sources(&logical))?;
         self.catalog_generation
             .checked_add(1)
             .ok_or(SchemaMutationError::IdentityExhausted(

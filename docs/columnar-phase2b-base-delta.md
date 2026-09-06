@@ -125,6 +125,13 @@ becomes `RebuildRequired` and cannot advance. LSM flush, compaction, and WAL
 rotation without logical DML do not change `StorageDataVersion` and therefore
 do not stale a caught-up incremental projection.
 
+Round 52 prevents an enabled projection source Heap from being silently
+replaced. A blocked rewrite leaves the exact S1 projection identity unchanged.
+Explicit S1 disable makes the old projection `RebuildRequired`; an S2 winner
+does not retarget or refresh it. After explicit S2 stream enablement, callers
+build a new S2 incremental projection and advance only from S2 NBCL. See
+[change-stream-schema-replacement-round52](change-stream-schema-replacement-round52.md).
+
 The planner still considers Columnar only after B+Tree/LSM access selection, so
 point indexes retain precedence and explicit transactions retain authoritative
 read-your-writes semantics. Columnar structural work adds Delta segment

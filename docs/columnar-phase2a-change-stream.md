@@ -73,6 +73,14 @@ the change log retains its value identity.
 replacement or layout migration. Phase 2A deliberately does not introduce a
 cross-layout logical row identity.
 
+Round 52 enforces that boundary: authoritative Heap replacement is rejected
+while its stream is `Enabled` or `Unavailable`. The administrator explicitly
+disables S1, performs the migration, enables S2, and takes a new committed-read
+anchor. S2's generation/frontier is a new baseline, never a continuation of
+S1. The disabled migration window is represented by the complete S2 baseline,
+not fabricated cross-storage events. See
+[change-stream-schema-replacement-round52](change-stream-schema-replacement-round52.md).
+
 The public mutation model is:
 
 ```text

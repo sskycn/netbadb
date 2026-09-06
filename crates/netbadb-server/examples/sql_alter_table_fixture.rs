@@ -34,6 +34,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round45_probe = std::env::var("NETBADB_ROUND45_PROBE").ok();
     let round48_probe = std::env::var("NETBADB_ROUND48_PROBE").ok();
     let round50_probe = std::env::var("NETBADB_ROUND50_PROBE").ok();
+    let round52_probe = std::env::var("NETBADB_ROUND52_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -61,6 +62,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round46_probe.is_some()
         || round48_probe.is_some()
         || round50_probe.is_some()
+        || round52_probe.is_some()
     {
         let nullability = if round46_email_not_null {
             " NOT NULL"
@@ -98,6 +100,17 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("projects version missing")?;
     let base_generation = db.schema_generation();
     let target_storage = db.next_storage_id().ok_or("StorageId floor missing")?;
+    let round52_cursor = if let Some(probe) = &round52_probe {
+        let cursor = db.enable_change_stream(TableId(2))?;
+        if probe == "disabled" {
+            db.disable_change_stream(TableId(2))?;
+        } else if probe != "blocked" {
+            return Err(format!("unknown Round 52 probe {probe}").into());
+        }
+        Some(cursor)
+    } else {
+        None
+    };
     db.close()?;
 
     let runtime_directory = std::fs::read_dir(root)?
@@ -123,6 +136,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round46_probe.is_some()
         || round48_probe.is_some()
         || round50_probe.is_some()
+        || round52_probe.is_some()
     {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
@@ -156,6 +170,47 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round52_probe {
+        let cursor = round52_cursor.ok_or("Round 52 cursor absent")?;
+        for _ in 0..3 {
+            let reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 52 table absent")?;
+            let stream = reopened.inspect_change_stream(TableId(2))?;
+            if probe == "blocked" {
+                if projects.column("marker").is_some()
+                    || reopened.next_storage_id() != Some(target_storage)
+                    || stream.storage_id != cursor.storage_id
+                    || stream.status != netbadb_storage::ChangeStreamStatus::Enabled
+                    || stream.generation != Some(cursor.generation)
+                    || stream.current_data_version != cursor.frontier
+                {
+                    return Err("Round 52 blocked replacement mismatch".into());
+                }
+            } else if projects.column("marker").is_none()
+                || reopened.next_storage_id()
+                    != Some(netbadb_types::StorageId(target_storage.0 + 1))
+                || stream.storage_id != target_storage
+                || stream.status != netbadb_storage::ChangeStreamStatus::Disabled
+            {
+                return Err("Round 52 disabled-stream winner mismatch".into());
+            }
+            reopened.close()?;
+        }
+        if probe == "disabled" {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let new_cursor = reopened.enable_change_stream(TableId(2))?;
+            let anchor = reopened.committed_read_anchor(TableId(2))?;
+            if new_cursor.storage_id != target_storage || anchor.cursor != new_cursor {
+                return Err("Round 52 S2 rebaseline mismatch".into());
+            }
+            reopened.close()?;
+        }
+        println!("REOPEN PASS Round 52 {probe}");
+        return Ok(());
     }
     if let Some(probe) = round50_probe {
         let winner = matches!(probe.as_str(), "commit" | "commit-bound");

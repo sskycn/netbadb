@@ -645,7 +645,8 @@ impl DatabaseError {
                 | SchemaMutationError::UnsupportedPlacement
                 | SchemaMutationError::MultipleCreatesUnsupported
                 | SchemaMutationError::UnsupportedSchemaEvolution
-                | SchemaMutationError::UnsupportedBackfillRefinement(_),
+                | SchemaMutationError::UnsupportedBackfillRefinement(_)
+                | SchemaMutationError::ActiveChangeStreamBlocksReplacement { .. },
             ) => DatabaseErrorKind::FeatureNotSupported,
             Self::SchemaMutation(
                 SchemaMutationError::TableNotFound(_) | SchemaMutationError::UndefinedTable(_),

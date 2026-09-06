@@ -13,7 +13,9 @@ use std::rc::Rc;
 #[cfg(test)]
 use netbadb_schema::Schema;
 use netbadb_schema::{ColumnDef, DropTableTarget, SchemaFingerprint, TableDef, TypeSpec};
-use netbadb_storage::{HeapRewriteIndexes, PreparedTransactionState, TableStorage};
+use netbadb_storage::{
+    ChangeStreamStatus, HeapRewriteIndexes, PreparedTransactionState, TableStorage,
+};
 #[cfg(test)]
 use netbadb_types::ScalarValue;
 use netbadb_types::{
@@ -390,6 +392,11 @@ pub enum SchemaMutationError {
     UnsupportedConstraint,
     UnsupportedPlacement,
     UnsupportedSchemaEvolution,
+    ActiveChangeStreamBlocksReplacement {
+        table_id: TableId,
+        storage_id: StorageId,
+        status: ChangeStreamStatus,
+    },
     InvalidSchemaEvolution(&'static str),
     TableNotFound(TableId),
     ColumnNotFound(ColumnId),
@@ -445,6 +452,15 @@ impl fmt::Display for SchemaMutationError {
             Self::UnsupportedSchemaEvolution => {
                 f.write_str("requested schema evolution is not supported")
             }
+            Self::ActiveChangeStreamBlocksReplacement {
+                table_id,
+                storage_id,
+                status,
+            } => write!(
+                f,
+                "authoritative storage replacement for table {} storage {} requires explicitly disabling the source change stream (status: {status:?})",
+                table_id.0, storage_id.0
+            ),
             Self::InvalidSchemaEvolution(reason) => write!(f, "invalid schema evolution: {reason}"),
             Self::TableNotFound(table) => {
                 write!(f, "table identity {} is not active", table.0)
@@ -718,6 +734,32 @@ pub(crate) fn build_alter_target(
 }
 
 impl Database {
+    /// Rejects authoritative Heap replacement while any source stream still
+    /// represents live or unresolved storage-local history. This probe is
+    /// intentionally read-only and must run before replacement allocation or
+    /// journaling.
+    pub(crate) fn ensure_heap_replacement_change_stream_safe(
+        &self,
+        replacements: impl IntoIterator<Item = (TableId, StorageId)>,
+    ) -> Result<(), DatabaseError> {
+        for (table_id, storage_id) in replacements {
+            let source = self
+                .registry
+                .get(storage_id)
+                .ok_or(SchemaMutationError::Corrupt("active Heap storage absent"))?;
+            let status = source.inspect_change_stream().status;
+            if status != ChangeStreamStatus::Disabled {
+                return Err(SchemaMutationError::ActiveChangeStreamBlocksReplacement {
+                    table_id,
+                    storage_id,
+                    status,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves a convenience name to the exact durable identity required by
     /// [`Database::drop_table_in`]. This method has no persistent side effects.
     pub fn resolve_drop_table(&self, name: &str) -> Result<DropTableTarget, DatabaseError> {
@@ -928,14 +970,6 @@ impl Database {
             .ok_or(SchemaMutationError::IdentityExhausted(
                 "runtime catalog revision",
             ))?;
-        let new_storage_id = self
-            .next_storage_id()
-            .ok_or(SchemaMutationError::IdentityExhausted("StorageId"))?;
-        let next_storage_floor = new_storage_id
-            .0
-            .checked_add(1)
-            .map(StorageId)
-            .ok_or(SchemaMutationError::IdentityExhausted("StorageId"))?;
         let column_floor =
             self.mutation_journal
                 .as_ref()
@@ -973,6 +1007,15 @@ impl Database {
                 return Err(SchemaMutationError::UnsupportedSchemaEvolution.into());
             }
         }
+        self.ensure_heap_replacement_change_stream_safe([(spec.target.table_id, old_storage_id)])?;
+        let new_storage_id = self
+            .next_storage_id()
+            .ok_or(SchemaMutationError::IdentityExhausted("StorageId"))?;
+        let next_storage_floor = new_storage_id
+            .0
+            .checked_add(1)
+            .map(StorageId)
+            .ok_or(SchemaMutationError::IdentityExhausted("StorageId"))?;
         let coordinator_locator = base
             .coordinator
             .clone()

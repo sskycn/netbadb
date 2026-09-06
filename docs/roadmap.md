@@ -1,6 +1,21 @@
 # NetbaDB roadmap
 
-## Active change stream × schema replacement audit (Round 51 complete)
+## Explicit Change Stream rebaseline guard (Round 52 complete)
+
+- productionized Candidate A2 across every managed-Heap replacement producer:
+  final `RewriteHeap` rejects `Enabled` and `Unavailable` source streams before
+  replacement allocation, intent, stage, target, tag 35, or CORD participation;
+- added the typed table/storage/status error, transport-neutral
+  `FeatureNotSupported` classification, and existing PostgreSQL `0A000` mapping;
+- retained same-S1 no-op/index behavior, explicit DROP TABLE destruction,
+  disabled/never-enabled replacement, rollback, and allocator-burn invariants;
+- proved explicit S1 disable → S2 migration → S2 enable/anchor, old-cursor
+  behavior, and exact Phase 2B projection identity/rebuild/recreate lifecycle;
+- changed no persistent, recovery, protocol, SDK, or cursor format.
+
+See [`change-stream-schema-replacement-round52.md`](change-stream-schema-replacement-round52.md).
+
+## Active change stream × schema replacement audit (Round 51 historical)
 
 - proved that current S1-to-S2 replacement commits the final ordinary-DML S1
   NBCL batch but makes it unreachable through the TableId API, publishes S2
