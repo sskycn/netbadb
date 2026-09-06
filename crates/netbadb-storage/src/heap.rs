@@ -2066,6 +2066,14 @@ impl HeapStorage {
             .read(cursor, max_batches, max_bytes)
     }
 
+    pub(crate) fn gc_change_stream(
+        &mut self,
+        frontier: netbadb_types::StorageDataVersion,
+    ) -> Result<crate::ChangeStreamGcStorageReport, StorageError> {
+        self.transactions.ensure_checkpoint_safe()?;
+        self.change_stream.borrow_mut().gc_through(frontier)
+    }
+
     pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
         self.change_stream.borrow().inspection()
     }

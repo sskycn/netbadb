@@ -70,8 +70,9 @@ use schema_catalog::CommittedCatalogState;
 use transaction::SharedCoordinatorLog;
 
 pub use columnar::{
-    ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarProjectionCatalogInspection,
-    ColumnarProjectionHealth, ColumnarProjectionInspection, ColumnarProjectionSpec,
+    ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
+    ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
+    ColumnarProjectionSpec,
 };
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{
@@ -561,6 +562,12 @@ pub enum DatabaseError {
     UnsupportedDdlCombination,
     ColumnarProjectionNotFound(ColumnarProjectionId),
     ColumnarProjectionNotIncremental(ColumnarProjectionId),
+    ColumnarProjectionRebuildRequired(ColumnarProjectionId),
+    ChangeStreamGcNoRetentionConsumer(StorageId),
+    ChangeStreamGcUnsafe {
+        storage_id: StorageId,
+        reason: String,
+    },
     ColumnarProjectionIdExhausted,
     ColumnarBuildSourceChanged {
         storage_id: StorageId,
@@ -706,6 +713,9 @@ impl DatabaseError {
             | Self::ColumnarProjectionIdExhausted => DatabaseErrorKind::Internal,
             Self::ColumnarProjectionNotFound(_)
             | Self::ColumnarProjectionNotIncremental(_)
+            | Self::ColumnarProjectionRebuildRequired(_)
+            | Self::ChangeStreamGcNoRetentionConsumer(_)
+            | Self::ChangeStreamGcUnsafe { .. }
             | Self::ColumnarBuildSourceChanged { .. } => DatabaseErrorKind::Operational,
         }
     }
@@ -800,6 +810,21 @@ impl fmt::Display for DatabaseError {
                 "columnar projection {} is a snapshot projection and cannot advance",
                 id.0
             ),
+            Self::ColumnarProjectionRebuildRequired(id) => write!(
+                formatter,
+                "columnar projection {} no longer matches the active change stream and must be rebuilt",
+                id.0
+            ),
+            Self::ChangeStreamGcNoRetentionConsumer(storage_id) => write!(
+                formatter,
+                "change stream for storage {} has no managed incremental retention consumer",
+                storage_id.0
+            ),
+            Self::ChangeStreamGcUnsafe { storage_id, reason } => write!(
+                formatter,
+                "change-stream retention for storage {} is unsafe: {reason}",
+                storage_id.0
+            ),
             Self::ColumnarProjectionIdExhausted => {
                 formatter.write_str("columnar projection identity space is exhausted")
             }
@@ -858,6 +883,9 @@ impl Error for DatabaseError {
             | Self::UnsupportedDdlCombination
             | Self::ColumnarProjectionNotFound(_)
             | Self::ColumnarProjectionNotIncremental(_)
+            | Self::ColumnarProjectionRebuildRequired(_)
+            | Self::ChangeStreamGcNoRetentionConsumer(_)
+            | Self::ChangeStreamGcUnsafe { .. }
             | Self::ColumnarProjectionIdExhausted
             | Self::ColumnarBuildSourceChanged { .. }
             | Self::ColumnarProjectionRequiresSingleStorage(_) => None,
@@ -2439,6 +2467,90 @@ impl Database {
         })
     }
 
+    /// Rewrites one incremental projection's already-applied Base+Delta state
+    /// as a new immutable Base generation. It neither reads the source nor
+    /// advances the projection's change-stream acknowledgement.
+    pub fn compact_columnar_projection(
+        &mut self,
+        id: ColumnarProjectionId,
+    ) -> Result<ColumnarCompactionReport, DatabaseError> {
+        let projection = self
+            .projections
+            .get(id)
+            .cloned()
+            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?;
+        let metadata = projection.metadata().clone();
+        let incremental = metadata
+            .incremental
+            .as_ref()
+            .ok_or(DatabaseError::ColumnarProjectionNotIncremental(id))?;
+        let bytes_before = metadata
+            .segment_bytes
+            .saturating_add(incremental.delta_bytes);
+        if incremental.delta_segments.is_empty() {
+            return Ok(ColumnarCompactionReport {
+                projection_id: id,
+                old_generation: metadata.generation,
+                new_generation: metadata.generation,
+                compacted_frontier: incremental.applied_frontier,
+                base_rows_before: metadata.row_count,
+                base_rows_after: metadata.row_count,
+                delta_segments_consumed: 0,
+                delta_mutations_consumed: 0,
+                suppressed_versions_removed: 0,
+                live_delta_rows_folded: 0,
+                bytes_before,
+                bytes_after: bytes_before,
+                bytes_reclaimed: 0,
+                compacted: false,
+            });
+        }
+        let storage = self.registry.get(metadata.source_storage_id).ok_or(
+            StorageRegistryError::UnknownStorageId {
+                storage_id: metadata.source_storage_id,
+            },
+        )?;
+        let stream = storage.inspect_change_stream();
+        if stream.status != netbadb_storage::ChangeStreamStatus::Enabled
+            || stream.generation != Some(incremental.stream_generation)
+            || storage.table().fingerprint()? != metadata.schema_fingerprint
+        {
+            return Err(DatabaseError::ColumnarProjectionRebuildRequired(id));
+        }
+        let table = storage.table().clone();
+        let generation = ColumnarGeneration(
+            metadata
+                .generation
+                .0
+                .checked_add(1)
+                .ok_or(DatabaseError::ColumnarProjectionIdExhausted)?,
+        );
+        let prepared = projection.prepare_compaction(&table, generation)?;
+        let replacement = prepared.publish()?;
+        columnar::crash("compact-manifest-published");
+        let bytes_after = replacement.metadata().segment_bytes;
+        let base_rows_after = replacement.metadata().row_count;
+        let retired = self.projections.replace(id, replacement)?;
+        retired.retire_segment()?;
+        columnar::crash("compact-old-retired");
+        Ok(ColumnarCompactionReport {
+            projection_id: id,
+            old_generation: metadata.generation,
+            new_generation: generation,
+            compacted_frontier: incremental.applied_frontier,
+            base_rows_before: metadata.row_count,
+            base_rows_after,
+            delta_segments_consumed: incremental.delta_segments.len() as u64,
+            delta_mutations_consumed: incremental.delta_mutation_count,
+            suppressed_versions_removed: incremental.suppressed_version_count,
+            live_delta_rows_folded: incremental.delta_live_row_count,
+            bytes_before,
+            bytes_after,
+            bytes_reclaimed: bytes_before.saturating_sub(bytes_after),
+            compacted: true,
+        })
+    }
+
     /// Rebuilds the same projection identity and atomically publishes a new generation.
     pub fn refresh_columnar_projection(
         &mut self,
@@ -2621,6 +2733,105 @@ impl Database {
             .get(storage_id)
             .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
             .inspect_change_stream())
+    }
+
+    /// Reclaims committed NBCL history acknowledged by every managed
+    /// incremental projection that depends on the active stream incarnation.
+    pub fn gc_change_stream(
+        &mut self,
+        table_id: TableId,
+    ) -> Result<ChangeStreamGcReport, DatabaseError> {
+        self.projections.ensure_retention_catalog_available()?;
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        let stream = self
+            .registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .inspect_change_stream();
+        let generation = stream
+            .generation
+            .ok_or_else(|| DatabaseError::ChangeStreamGcUnsafe {
+                storage_id,
+                reason: "active stream generation is unavailable".into(),
+            })?;
+        if stream.status != netbadb_storage::ChangeStreamStatus::Enabled {
+            return Err(DatabaseError::ChangeStreamGcUnsafe {
+                storage_id,
+                reason: format!("change stream status is {:?}", stream.status),
+            });
+        }
+        let mut consumers = Vec::new();
+        for entry in self
+            .projections
+            .iter()
+            .filter(|entry| entry.identity.source_storage_id == storage_id)
+        {
+            let Some(projection) = &entry.projection else {
+                if entry.managed {
+                    return Err(DatabaseError::ChangeStreamGcUnsafe {
+                        storage_id,
+                        reason: format!(
+                            "managed projection {} metadata is unavailable",
+                            entry.identity.id.0
+                        ),
+                    });
+                }
+                continue;
+            };
+            let Some(incremental) = &projection.metadata().incremental else {
+                continue;
+            };
+            if !entry.managed {
+                return Err(DatabaseError::ChangeStreamGcUnsafe {
+                    storage_id,
+                    reason: format!(
+                        "unmanaged incremental projection {} may require retained history",
+                        entry.identity.id.0
+                    ),
+                });
+            }
+            if incremental.stream_generation != generation {
+                continue;
+            }
+            if incremental.applied_frontier.0 > stream.current_data_version.0 {
+                return Err(DatabaseError::ChangeStreamGcUnsafe {
+                    storage_id,
+                    reason: format!(
+                        "projection {} applied frontier is ahead of the source",
+                        entry.identity.id.0
+                    ),
+                });
+            }
+            consumers.push((entry.identity.id, incremental.applied_frontier));
+        }
+        let safe_frontier = consumers
+            .iter()
+            .map(|(_, frontier)| *frontier)
+            .min_by_key(|frontier| frontier.0)
+            .ok_or(DatabaseError::ChangeStreamGcNoRetentionConsumer(storage_id))?;
+        let mut limiting_projection_ids = consumers
+            .iter()
+            .filter_map(|(id, frontier)| (*frontier == safe_frontier).then_some(*id))
+            .collect::<Vec<_>>();
+        limiting_projection_ids.sort_by_key(|id| id.0);
+        let reclaimed = self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .gc_change_stream(safe_frontier)?;
+        Ok(ChangeStreamGcReport {
+            storage_id: reclaimed.storage_id,
+            generation: reclaimed.generation,
+            previous_earliest_frontier: reclaimed.previous_earliest_frontier,
+            new_earliest_frontier: reclaimed.new_earliest_frontier,
+            current_frontier: reclaimed.current_frontier,
+            limiting_projection_ids,
+            batches_removed: reclaimed.batches_removed,
+            mutations_removed: reclaimed.mutations_removed,
+            bytes_before: reclaimed.bytes_before,
+            bytes_after: reclaimed.bytes_after,
+            bytes_reclaimed: reclaimed.bytes_reclaimed,
+        })
     }
 
     #[must_use]

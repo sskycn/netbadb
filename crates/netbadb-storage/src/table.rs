@@ -709,6 +709,16 @@ impl TableStorage {
         }
     }
 
+    pub fn gc_change_stream(
+        &mut self,
+        frontier: netbadb_types::StorageDataVersion,
+    ) -> Result<crate::ChangeStreamGcStorageReport, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.gc_change_stream(frontier),
+            Self::Lsm(storage) => storage.gc_change_stream(frontier),
+        }
+    }
+
     #[must_use]
     pub fn inspect_change_stream(&self) -> crate::ChangeStreamInspection {
         match self {

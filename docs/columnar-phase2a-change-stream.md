@@ -172,8 +172,9 @@ old stream never attaches to a replacement storage or same-name table.
 
 Reads return committed batches, the current frontier, and `has_more`. They
 reject a wrong storage, wrong incarnation, unavailable history, and a broken
-frontier chain. History is append-only in Phase 2A. There is no retention GC,
-consumer acknowledgement, or overwrite-at-limit policy.
+frontier chain. History is append-only in Phase 2A. Phase 2C adds explicit,
+projection-aware retention GC while preserving v1 read compatibility; see
+[Columnar Phase 2C](columnar-phase2c-compaction-retention.md).
 
 Inspection reports status, identities, fingerprint, baseline/current/earliest
 frontier, committed batch and mutation counts, file bytes, unresolved prepared

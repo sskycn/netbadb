@@ -153,9 +153,10 @@ but establishes no cross-storage snapshot order.
 Columnar Delta **IS NOT an authoritative commit participant**. It never enters
 the database coordinator and never blocks Heap/LSM COMMIT.
 
-## Deferred Phase 2C work
+## Phase 2C continuation
 
-This phase deliberately omits automatic Delta compaction into a new Base,
-automatic catch-up scheduling, change-stream acknowledgement/retention GC,
-lazy on-disk Columnar chunk loading, aggregate spill, database-global CSN,
-`RowEntityId`, and hybrid authoritative Columnar storage.
+Explicit Delta-to-Base compaction and managed-projection-aware NBCL retention
+GC are implemented by [Columnar Phase 2C](columnar-phase2c-compaction-retention.md).
+Automatic scheduling, generic CDC retention leases, lazy on-disk Columnar
+loading, aggregate spill, database-global CSN, `RowEntityId`, and hybrid
+authoritative Columnar storage remain deferred.

@@ -2542,6 +2542,12 @@ mod tests {
             matches!(base_plan(&planned), PhysicalPlan::SeqScan { .. }),
             "large delta state must be able to make the authoritative scan cheaper"
         );
+        let compacted =
+            plan_with_columnar_snapshots(&logical, &[analyzed_table(1_000, 10)], &[], &[], &[base]);
+        assert!(
+            matches!(base_plan(&compacted), PhysicalPlan::ColumnarScan { .. }),
+            "resetting structural Delta work after compaction must naturally restore eligibility"
+        );
     }
 
     #[test]

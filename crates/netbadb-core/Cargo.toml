@@ -39,5 +39,13 @@ harness = false
 name = "columnar_delta_phase2b"
 harness = false
 
+[[bench]]
+name = "columnar_compaction_phase2c"
+harness = false
+
+[[bench]]
+name = "change_stream_gc_phase2c"
+harness = false
+
 [lints]
 workspace = true

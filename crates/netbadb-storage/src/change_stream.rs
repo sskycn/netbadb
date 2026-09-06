@@ -18,12 +18,13 @@ use crate::row_codec::{decode_row, encode_row};
 pub(crate) type SharedChangeStream = Rc<RefCell<ChangeStreamManager>>;
 
 pub const CHANGE_LOG_MAGIC: &[u8; 4] = b"NBCL";
-pub const CHANGE_LOG_FORMAT_VERSION: u16 = 1;
+pub const CHANGE_LOG_FORMAT_VERSION: u16 = 2;
 pub const CHANGE_LOG_MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
 pub const CHANGE_LOG_MAX_MUTATIONS: u32 = 1_000_000;
 pub const CHANGE_LOG_MAX_ROW_BYTES: u32 = 16 * 1024 * 1024;
 
-const HEADER_SIZE: usize = 80;
+const V1_HEADER_SIZE: usize = 80;
+const V2_HEADER_SIZE: usize = 104;
 const PREPARED_TAG: u8 = 1;
 const FINALIZE_TAG: u8 = 2;
 const HEAP_TAG: u8 = 1;
@@ -177,6 +178,9 @@ pub struct ChangeStreamInspection {
     pub status: ChangeStreamStatus,
     pub generation: Option<ChangeStreamGeneration>,
     pub schema_fingerprint: SchemaFingerprint,
+    /// Frontier at which this stream incarnation was enabled.
+    pub stream_origin_frontier: Option<StorageDataVersion>,
+    /// Compatibility alias for `stream_origin_frontier`.
     pub baseline_data_version: Option<StorageDataVersion>,
     pub current_data_version: StorageDataVersion,
     pub earliest_available_frontier: Option<StorageDataVersion>,
@@ -185,6 +189,20 @@ pub struct ChangeStreamInspection {
     pub file_bytes: u64,
     pub prepared_unresolved_count: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeStreamGcStorageReport {
+    pub storage_id: StorageId,
+    pub generation: ChangeStreamGeneration,
+    pub previous_earliest_frontier: StorageDataVersion,
+    pub new_earliest_frontier: StorageDataVersion,
+    pub current_frontier: StorageDataVersion,
+    pub batches_removed: u64,
+    pub mutations_removed: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub bytes_reclaimed: u64,
 }
 
 #[derive(Debug)]
@@ -211,6 +229,7 @@ pub enum ChangeStreamError {
         actual: StorageDataVersion,
     },
     Disabled,
+    Busy,
     Unavailable(String),
     VersionExhausted,
 }
@@ -243,6 +262,7 @@ impl fmt::Display for ChangeStreamError {
                 expected.0, actual.0
             ),
             Self::Disabled => f.write_str("change stream is disabled"),
+            Self::Busy => f.write_str("change stream has unresolved prepared changes"),
             Self::Unavailable(reason) => write!(f, "change stream is unavailable: {reason}"),
             Self::VersionExhausted => f.write_str("change-stream version space is exhausted"),
         }
@@ -362,15 +382,23 @@ pub(crate) struct PreparedChange {
     after: StorageDataVersion,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Header {
+    version: u16,
     active: bool,
     kind: ChangeStorageKind,
     storage_id: StorageId,
     table_id: TableId,
     fingerprint: SchemaFingerprint,
     generation: ChangeStreamGeneration,
-    baseline: StorageDataVersion,
+    origin: StorageDataVersion,
+    earliest: StorageDataVersion,
+    /// Durable high-water at the last rewrite. Appended committed records may
+    /// advance beyond this checkpoint without rewriting the header.
+    current: StorageDataVersion,
+    /// Durable sequence floor at the last rewrite. Appended records may
+    /// advance the in-memory value beyond it.
+    next_sequence: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -390,6 +418,7 @@ enum State {
         file: File,
         file_bytes: u64,
         batches: Vec<ChangeBatch>,
+        finalize_versions: BTreeMap<TxnId, Option<LsmCommitSeq>>,
         unresolved: BTreeMap<TxnId, PreparedRecord>,
         next_sequence: u64,
     },
@@ -478,7 +507,20 @@ impl ChangeStreamManager {
                     }
                 } else {
                     let generation = header.generation;
-                    match write_guard(&guard_path, &header) {
+                    let guard_valid = if guard_path.exists() {
+                        read_guard(&guard_path).and_then(|guard| {
+                            if guard_identity_matches(&guard, &header) {
+                                Ok(())
+                            } else {
+                                Err(ChangeStreamError::InvalidHeader(
+                                    "active guard identity mismatch",
+                                ))
+                            }
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    match guard_valid.and_then(|()| write_guard(&guard_path, &header)) {
                         Ok(()) => match build_enabled_state(header, file, file_bytes, records) {
                             Ok(state) => state,
                             Err(error) => State::Unavailable {
@@ -530,10 +572,7 @@ impl ChangeStreamManager {
             State::Enabled {
                 header, batches, ..
             } => {
-                return Ok(cursor_for(
-                    header,
-                    batches.last().map_or(header.baseline, |batch| batch.after),
-                ));
+                return Ok(cursor_for(header, effective_current(header, batches)));
             }
             State::Unavailable { generation, .. } => generation.map_or(0, |value| value.0),
         };
@@ -543,13 +582,17 @@ impl ChangeStreamManager {
                 .ok_or(ChangeStreamError::VersionExhausted)?,
         );
         let header = Header {
+            version: CHANGE_LOG_FORMAT_VERSION,
             active: true,
             kind: self.kind,
             storage_id: self.storage_id,
             table_id: self.table_id,
             fingerprint: self.fingerprint,
             generation,
-            baseline,
+            origin: baseline,
+            earliest: baseline,
+            current: baseline,
+            next_sequence: 1,
         };
         let (file, file_bytes) = match rewrite_header(&self.path, &header) {
             Ok(value) => value,
@@ -574,6 +617,7 @@ impl ChangeStreamManager {
             file,
             file_bytes,
             batches: Vec::new(),
+            finalize_versions: BTreeMap::new(),
             unresolved: BTreeMap::new(),
             next_sequence: 1,
         };
@@ -589,13 +633,17 @@ impl ChangeStreamManager {
             }
         };
         let header = Header {
+            version: CHANGE_LOG_FORMAT_VERSION,
             active: false,
             kind: self.kind,
             storage_id: self.storage_id,
             table_id: self.table_id,
             fingerprint: self.fingerprint,
             generation,
-            baseline: StorageDataVersion(0),
+            origin: StorageDataVersion(0),
+            earliest: StorageDataVersion(0),
+            current: StorageDataVersion(0),
+            next_sequence: 1,
         };
         let _ = rewrite_header(&self.path, &header)?;
         self.state = State::Disabled { generation };
@@ -657,10 +705,7 @@ impl ChangeStreamManager {
         match &self.state {
             State::Enabled {
                 header, batches, ..
-            } => Ok(cursor_for(
-                header,
-                batches.last().map_or(header.baseline, |batch| batch.after),
-            )),
+            } => Ok(cursor_for(header, effective_current(header, batches))),
             State::Disabled { .. } => Err(ChangeStreamError::Disabled.into()),
             State::Unavailable { reason, .. } => {
                 Err(ChangeStreamError::Unavailable(reason.clone()).into())
@@ -692,8 +737,8 @@ impl ChangeStreamManager {
         if cursor.generation != header.generation {
             return Err(ChangeStreamError::StreamIdentityMismatch.into());
         }
-        let current = batches.last().map_or(header.baseline, |batch| batch.after);
-        if cursor.frontier.0 < header.baseline.0 || cursor.frontier.0 > current.0 {
+        let current = effective_current(header, batches);
+        if cursor.frontier.0 < header.earliest.0 || cursor.frontier.0 > current.0 {
             return Err(ChangeStreamError::HistoryUnavailable.into());
         }
         if cursor.frontier == current {
@@ -737,56 +782,180 @@ impl ChangeStreamManager {
         })
     }
 
+    pub(crate) fn gc_through(
+        &mut self,
+        frontier: StorageDataVersion,
+    ) -> Result<ChangeStreamGcStorageReport, StorageError> {
+        let path = self.path.clone();
+        match &self.state {
+            State::Disabled { .. } => return Err(ChangeStreamError::Disabled.into()),
+            State::Unavailable { reason, .. } => {
+                return Err(ChangeStreamError::Unavailable(reason.clone()).into());
+            }
+            State::Enabled { .. } => {}
+        }
+        let State::Enabled {
+            header,
+            file,
+            file_bytes,
+            batches,
+            finalize_versions,
+            unresolved,
+            next_sequence,
+        } = &mut self.state
+        else {
+            return Err(ChangeStreamError::Unavailable(
+                "change stream state changed during synchronous GC".into(),
+            )
+            .into());
+        };
+        if !unresolved.is_empty() {
+            return Err(ChangeStreamError::Busy.into());
+        }
+        let current = effective_current(header, batches);
+        if frontier.0 < header.earliest.0 || frontier.0 > current.0 {
+            return Err(ChangeStreamError::HistoryUnavailable.into());
+        }
+        let first_retained = batches
+            .iter()
+            .position(|batch| batch.after.0 > frontier.0)
+            .unwrap_or(batches.len());
+        if first_retained < batches.len() && batches[first_retained].before != frontier {
+            return Err(ChangeStreamError::HistoryUnavailable.into());
+        }
+        if first_retained == batches.len() && frontier != current {
+            return Err(ChangeStreamError::HistoryUnavailable.into());
+        }
+        let previous_earliest = header.earliest;
+        let bytes_before = *file_bytes;
+        if frontier == previous_earliest && header.version == CHANGE_LOG_FORMAT_VERSION {
+            return Ok(ChangeStreamGcStorageReport {
+                storage_id: header.storage_id,
+                generation: header.generation,
+                previous_earliest_frontier: previous_earliest,
+                new_earliest_frontier: previous_earliest,
+                current_frontier: current,
+                batches_removed: 0,
+                mutations_removed: 0,
+                bytes_before,
+                bytes_after: bytes_before,
+                bytes_reclaimed: 0,
+            });
+        }
+        let batches_removed = first_retained as u64;
+        let mutations_removed = batches[..first_retained]
+            .iter()
+            .map(|batch| batch.mutations.len() as u64)
+            .sum();
+        let replacement_header = Header {
+            version: CHANGE_LOG_FORMAT_VERSION,
+            active: true,
+            kind: header.kind,
+            storage_id: header.storage_id,
+            table_id: header.table_id,
+            fingerprint: header.fingerprint,
+            generation: header.generation,
+            origin: header.origin,
+            earliest: frontier,
+            current,
+            next_sequence: *next_sequence,
+        };
+        let (replacement_file, replacement_bytes) = rewrite_retained(
+            &path,
+            &replacement_header,
+            &batches[first_retained..],
+            finalize_versions,
+        )?;
+        gc_crash("gc-log-published");
+        write_guard(&change_stream_guard_path(&path), &replacement_header)?;
+        gc_crash("gc-guard-published");
+        let removed_ids = batches[..first_retained]
+            .iter()
+            .map(|batch| batch.physical_txn_id)
+            .collect::<Vec<_>>();
+        batches.drain(..first_retained);
+        for txn_id in removed_ids {
+            finalize_versions.remove(&txn_id);
+        }
+        *header = replacement_header;
+        *file = replacement_file;
+        *file_bytes = replacement_bytes;
+        Ok(ChangeStreamGcStorageReport {
+            storage_id: header.storage_id,
+            generation: header.generation,
+            previous_earliest_frontier: previous_earliest,
+            new_earliest_frontier: frontier,
+            current_frontier: current,
+            batches_removed,
+            mutations_removed,
+            bytes_before,
+            bytes_after: replacement_bytes,
+            bytes_reclaimed: bytes_before.saturating_sub(replacement_bytes),
+        })
+    }
+
     pub(crate) fn inspection(&self) -> ChangeStreamInspection {
-        let (status, generation, baseline, batches, file_bytes, unresolved, last_error) =
-            match &self.state {
-                State::Disabled { generation } => (
-                    ChangeStreamStatus::Disabled,
-                    Some(*generation),
-                    None,
-                    &[][..],
-                    fs::metadata(&self.path).map_or(0, |metadata| metadata.len()),
-                    0,
-                    None,
-                ),
-                State::Enabled {
-                    header,
-                    batches,
-                    file_bytes,
-                    unresolved,
-                    ..
-                } => (
-                    ChangeStreamStatus::Enabled,
-                    Some(header.generation),
-                    Some(header.baseline),
-                    batches.as_slice(),
-                    *file_bytes,
-                    unresolved.len() as u64,
-                    None,
-                ),
-                State::Unavailable { generation, reason } => (
-                    ChangeStreamStatus::Unavailable,
-                    *generation,
-                    None,
-                    &[][..],
-                    fs::metadata(&self.path).map_or(0, |metadata| metadata.len()),
-                    0,
-                    Some(reason.clone()),
-                ),
-            };
+        let (
+            status,
+            generation,
+            origin,
+            earliest,
+            current,
+            batches,
+            file_bytes,
+            unresolved,
+            last_error,
+        ) = match &self.state {
+            State::Disabled { generation } => (
+                ChangeStreamStatus::Disabled,
+                Some(*generation),
+                None,
+                None,
+                StorageDataVersion(0),
+                &[][..],
+                fs::metadata(&self.path).map_or(0, |metadata| metadata.len()),
+                0,
+                None,
+            ),
+            State::Enabled {
+                header,
+                batches,
+                file_bytes,
+                unresolved,
+                ..
+            } => (
+                ChangeStreamStatus::Enabled,
+                Some(header.generation),
+                Some(header.origin),
+                Some(header.earliest),
+                effective_current(header, batches),
+                batches.as_slice(),
+                *file_bytes,
+                unresolved.len() as u64,
+                None,
+            ),
+            State::Unavailable { generation, reason } => (
+                ChangeStreamStatus::Unavailable,
+                *generation,
+                None,
+                None,
+                StorageDataVersion(0),
+                &[][..],
+                fs::metadata(&self.path).map_or(0, |metadata| metadata.len()),
+                0,
+                Some(reason.clone()),
+            ),
+        };
         ChangeStreamInspection {
             storage_id: self.storage_id,
             table_id: self.table_id,
             status,
             generation,
             schema_fingerprint: self.fingerprint,
-            baseline_data_version: baseline,
-            current_data_version: batches
-                .last()
-                .map_or(baseline.unwrap_or(StorageDataVersion(0)), |batch| {
-                    batch.after
-                }),
-            earliest_available_frontier: baseline,
+            stream_origin_frontier: origin,
+            baseline_data_version: origin,
+            current_data_version: current,
+            earliest_available_frontier: earliest,
             committed_batch_count: batches.len() as u64,
             committed_mutation_count: batches
                 .iter()
@@ -815,6 +984,7 @@ fn prepare_enabled(
         batches,
         unresolved,
         next_sequence,
+        ..
     } = state
     else {
         return match state {
@@ -828,7 +998,7 @@ fn prepare_enabled(
     if let Some(record) = unresolved.get(&txn_id) {
         return Ok(Some(prepared_identity(&record.batch)));
     }
-    let before = batches.last().map_or(header.baseline, |batch| batch.after);
+    let before = effective_current(header, batches);
     let after = StorageDataVersion(
         before
             .0
@@ -885,6 +1055,7 @@ fn publish_enabled(
         file,
         file_bytes,
         batches,
+        finalize_versions,
         unresolved,
         ..
     } = state
@@ -914,7 +1085,7 @@ fn publish_enabled(
         resolve_lsm_versions(&mut record.batch, commit);
     }
     validate_committed_versions(&record.batch, header.kind)?;
-    let expected = batches.last().map_or(header.baseline, |batch| batch.after);
+    let expected = effective_current(header, batches);
     if record.batch.before != expected {
         return Err(ChangeStreamError::ChangeGap {
             expected,
@@ -930,6 +1101,7 @@ fn publish_enabled(
     file.sync_data()?;
     *file_bytes = following_file_bytes;
     unresolved.remove(&txn_id);
+    finalize_versions.insert(txn_id, lsm_commit);
     batches.push(record.batch);
     Ok(())
 }
@@ -941,6 +1113,7 @@ fn build_enabled_state(
     records: Vec<PreparedRecord>,
 ) -> Result<State, ChangeStreamError> {
     let mut batches = Vec::new();
+    let mut finalize_versions = BTreeMap::new();
     let mut unresolved = BTreeMap::new();
     let mut max_sequence = 0;
     let mut seen = HashSet::new();
@@ -971,6 +1144,7 @@ fn build_enabled_state(
                         .checked_add(marker.len() as u64)
                         .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
                 }
+                finalize_versions.insert(record.batch.physical_txn_id, commit);
                 batches.push(record.batch);
             }
             AuthoritativeOutcome::Aborted => {}
@@ -980,15 +1154,28 @@ fn build_enabled_state(
         }
     }
     batches.sort_by_key(|batch| batch.sequence);
-    validate_committed_chain(header.baseline, &batches)?;
-    let next_sequence = max_sequence
+    validate_committed_chain(header.earliest, &batches)?;
+    let effective = effective_current(&header, &batches);
+    if batches.is_empty() && header.earliest != header.current {
+        return Err(ChangeStreamError::InvalidHeader(
+            "empty retained log has unequal earliest and current frontiers",
+        ));
+    }
+    if effective.0 < header.current.0 {
+        return Err(ChangeStreamError::InvalidHeader(
+            "retained history ends before the durable current frontier",
+        ));
+    }
+    let following_max = max_sequence
         .checked_add(1)
         .ok_or(ChangeStreamError::VersionExhausted)?;
+    let next_sequence = header.next_sequence.max(following_max);
     Ok(State::Enabled {
         header,
         file,
         file_bytes,
         batches,
+        finalize_versions,
         unresolved,
         next_sequence,
     })
@@ -1008,6 +1195,10 @@ fn cursor_for(header: &Header, frontier: StorageDataVersion) -> ChangeStreamCurs
         generation: header.generation,
         frontier,
     }
+}
+
+fn effective_current(header: &Header, batches: &[ChangeBatch]) -> StorageDataVersion {
+    batches.last().map_or(header.current, |batch| batch.after)
 }
 
 fn resolve_lsm_versions(batch: &mut ChangeBatch, commit: LsmCommitSeq) {
@@ -1073,6 +1264,62 @@ fn rewrite_header(path: &Path, header: &Header) -> Result<(File, u64), ChangeStr
     Ok((file, bytes.len() as u64))
 }
 
+fn rewrite_retained(
+    path: &Path,
+    header: &Header,
+    batches: &[ChangeBatch],
+    finalize_versions: &BTreeMap<TxnId, Option<LsmCommitSeq>>,
+) -> Result<(File, u64), ChangeStreamError> {
+    let temporary = path.with_extension(format!(
+        "change.gc.{}.{}.tmp",
+        std::process::id(),
+        header.earliest.0
+    ));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        let encoded_header = encode_header(header);
+        output.write_all(&encoded_header)?;
+        gc_crash("gc-header-written");
+        let mut bytes = encoded_header.len() as u64;
+        for batch in batches {
+            let prepared = encode_record(batch)?;
+            output.write_all(&prepared)?;
+            bytes = bytes
+                .checked_add(prepared.len() as u64)
+                .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+            let commit = finalize_versions
+                .get(&batch.physical_txn_id)
+                .copied()
+                .ok_or(ChangeStreamError::InvalidRecord(
+                    "committed batch has no finalize identity",
+                ))?;
+            let finalize = encode_finalize(batch.physical_txn_id, commit)?;
+            output.write_all(&finalize)?;
+            bytes = bytes
+                .checked_add(finalize.len() as u64)
+                .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+        }
+        gc_crash("gc-records-written");
+        output.sync_all()?;
+        gc_crash("gc-file-synced");
+        fs::rename(&temporary, path)?;
+        gc_crash("gc-file-renamed");
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        gc_crash("gc-directory-synced");
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Ok((file, bytes))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn write_guard(path: &Path, header: &Header) -> Result<(), ChangeStreamError> {
     let temporary = path.with_extension("active.tmp");
     {
@@ -1095,6 +1342,16 @@ fn read_guard(path: &Path) -> Result<Header, ChangeStreamError> {
     decode_header(&fs::read(path)?)
 }
 
+fn guard_identity_matches(left: &Header, right: &Header) -> bool {
+    left.active
+        && right.active
+        && left.kind == right.kind
+        && left.storage_id == right.storage_id
+        && left.table_id == right.table_id
+        && left.fingerprint == right.fingerprint
+        && left.generation == right.generation
+}
+
 fn remove_guard(path: &Path) -> Result<(), ChangeStreamError> {
     match fs::remove_file(path) {
         Ok(()) => {
@@ -1108,24 +1365,47 @@ fn remove_guard(path: &Path) -> Result<(), ChangeStreamError> {
     }
 }
 
-fn encode_header(header: &Header) -> [u8; HEADER_SIZE] {
-    let mut bytes = [0_u8; HEADER_SIZE];
+fn encode_header(header: &Header) -> Vec<u8> {
+    if header.version == 1 {
+        return encode_v1_header(header);
+    }
+    debug_assert_eq!(header.version, CHANGE_LOG_FORMAT_VERSION);
+    let mut bytes = vec![0_u8; V2_HEADER_SIZE];
     bytes[0..4].copy_from_slice(CHANGE_LOG_MAGIC);
-    bytes[4..6].copy_from_slice(&CHANGE_LOG_FORMAT_VERSION.to_le_bytes());
+    bytes[4..6].copy_from_slice(&header.version.to_le_bytes());
     bytes[6] = u8::from(header.active);
     bytes[7] = header.kind.tag();
     bytes[8..16].copy_from_slice(&header.storage_id.0.to_le_bytes());
     bytes[16..24].copy_from_slice(&header.table_id.0.to_le_bytes());
     bytes[24..56].copy_from_slice(header.fingerprint.as_bytes());
     bytes[56..64].copy_from_slice(&header.generation.0.to_le_bytes());
-    bytes[64..72].copy_from_slice(&header.baseline.0.to_le_bytes());
+    bytes[64..72].copy_from_slice(&header.origin.0.to_le_bytes());
+    bytes[72..80].copy_from_slice(&header.earliest.0.to_le_bytes());
+    bytes[80..88].copy_from_slice(&header.current.0.to_le_bytes());
+    bytes[88..96].copy_from_slice(&header.next_sequence.to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes[..100]);
+    bytes[100..104].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+fn encode_v1_header(header: &Header) -> Vec<u8> {
+    let mut bytes = vec![0_u8; V1_HEADER_SIZE];
+    bytes[0..4].copy_from_slice(CHANGE_LOG_MAGIC);
+    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[6] = u8::from(header.active);
+    bytes[7] = header.kind.tag();
+    bytes[8..16].copy_from_slice(&header.storage_id.0.to_le_bytes());
+    bytes[16..24].copy_from_slice(&header.table_id.0.to_le_bytes());
+    bytes[24..56].copy_from_slice(header.fingerprint.as_bytes());
+    bytes[56..64].copy_from_slice(&header.generation.0.to_le_bytes());
+    bytes[64..72].copy_from_slice(&header.origin.0.to_le_bytes());
     let checksum = crc32c::crc32c(&bytes[..76]);
     bytes[76..80].copy_from_slice(&checksum.to_le_bytes());
     bytes
 }
 
 fn decode_header(bytes: &[u8]) -> Result<Header, ChangeStreamError> {
-    if bytes.len() != HEADER_SIZE {
+    if bytes.len() < 6 {
         return Err(ChangeStreamError::Truncated {
             offset: bytes.len() as u64,
         });
@@ -1134,19 +1414,33 @@ fn decode_header(bytes: &[u8]) -> Result<Header, ChangeStreamError> {
         return Err(ChangeStreamError::InvalidMagic);
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != CHANGE_LOG_FORMAT_VERSION {
-        return Err(ChangeStreamError::UnsupportedVersion(version));
+    let expected = match version {
+        1 => V1_HEADER_SIZE,
+        CHANGE_LOG_FORMAT_VERSION => V2_HEADER_SIZE,
+        _ => return Err(ChangeStreamError::UnsupportedVersion(version)),
+    };
+    if bytes.len() != expected {
+        return Err(ChangeStreamError::Truncated {
+            offset: bytes.len() as u64,
+        });
     }
-    if bytes[6] > 1 || bytes[72..76] != [0; 4] {
+    let (reserved, checksum_offset) = if version == 1 {
+        (&bytes[72..76], 76)
+    } else {
+        (&bytes[96..100], 100)
+    };
+    if bytes[6] > 1 || reserved != [0; 4] {
         return Err(ChangeStreamError::InvalidHeader(
             "invalid flags or reserved bytes",
         ));
     }
-    if crc32c::crc32c(&bytes[..76])
+    if crc32c::crc32c(&bytes[..checksum_offset])
         != u32::from_le_bytes(
-            bytes[76..80]
+            bytes[checksum_offset..checksum_offset + 4]
                 .try_into()
-                .map_err(|_| ChangeStreamError::Truncated { offset: 76 })?,
+                .map_err(|_| ChangeStreamError::Truncated {
+                    offset: checksum_offset as u64,
+                })?,
         )
     {
         return Err(ChangeStreamError::ChecksumMismatch { offset: 0 });
@@ -1157,7 +1451,26 @@ fn decode_header(bytes: &[u8]) -> Result<Header, ChangeStreamError> {
     if storage_id.0 == 0 || table_id.0 == 0 || generation.0 == 0 {
         return Err(ChangeStreamError::InvalidHeader("zero identity"));
     }
+    let origin = StorageDataVersion(read_u64(bytes, 64)?);
+    let (earliest, current, next_sequence) = if version == 1 {
+        (origin, origin, 1)
+    } else {
+        (
+            StorageDataVersion(read_u64(bytes, 72)?),
+            StorageDataVersion(read_u64(bytes, 80)?),
+            read_u64(bytes, 88)?,
+        )
+    };
+    if origin.0 > earliest.0 || earliest.0 > current.0 {
+        return Err(ChangeStreamError::InvalidHeader(
+            "origin, earliest, and current frontiers are out of order",
+        ));
+    }
+    if next_sequence == 0 {
+        return Err(ChangeStreamError::InvalidHeader("zero next sequence"));
+    }
     Ok(Header {
+        version,
         active: bytes[6] == 1,
         kind: ChangeStorageKind::decode(bytes[7])?,
         storage_id,
@@ -1168,7 +1481,10 @@ fn decode_header(bytes: &[u8]) -> Result<Header, ChangeStreamError> {
                 .map_err(|_| ChangeStreamError::Truncated { offset: 24 })?,
         ),
         generation,
-        baseline: StorageDataVersion(read_u64(bytes, 64)?),
+        origin,
+        earliest,
+        current,
+        next_sequence,
     })
 }
 
@@ -1308,7 +1624,20 @@ where
 {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let mut file_bytes = file.metadata()?.len();
-    let mut header_bytes = [0_u8; HEADER_SIZE];
+    let mut prefix = [0_u8; 6];
+    file.read_exact(&mut prefix)
+        .map_err(|error| map_truncated(error, 0))?;
+    if &prefix[..4] != CHANGE_LOG_MAGIC {
+        return Err(ChangeStreamError::InvalidMagic);
+    }
+    let version = u16::from_le_bytes([prefix[4], prefix[5]]);
+    let header_size = match version {
+        1 => V1_HEADER_SIZE,
+        CHANGE_LOG_FORMAT_VERSION => V2_HEADER_SIZE,
+        _ => return Err(ChangeStreamError::UnsupportedVersion(version)),
+    };
+    file.seek(SeekFrom::Start(0))?;
+    let mut header_bytes = vec![0_u8; header_size];
     file.read_exact(&mut header_bytes)
         .map_err(|error| map_truncated(error, 0))?;
     let header = decode_header(&header_bytes)?;
@@ -1316,7 +1645,7 @@ where
         return Ok((header, file, file_bytes, Vec::new()));
     }
     let mut records = Vec::<PreparedRecord>::new();
-    let mut offset = HEADER_SIZE as u64;
+    let mut offset = header_size as u64;
     while offset < file_bytes {
         let mut length_bytes = [0_u8; 4];
         if let Err(error) = file.read_exact(&mut length_bytes) {
@@ -1665,6 +1994,16 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ChangeStreamError> {
     ))
 }
 
+#[cfg(test)]
+fn gc_crash(point: &str) {
+    if std::env::var("NETBADB_CHANGE_STREAM_GC_CRASH_POINT").as_deref() == Ok(point) {
+        std::process::exit(89);
+    }
+}
+
+#[cfg(not(test))]
+fn gc_crash(_: &str) {}
+
 #[must_use]
 pub fn heap_change_log_path(path: impl AsRef<Path>) -> PathBuf {
     let mut value = path.as_ref().as_os_str().to_owned();
@@ -1730,13 +2069,17 @@ mod tests {
     fn header() -> Header {
         let table = table();
         Header {
+            version: CHANGE_LOG_FORMAT_VERSION,
             active: true,
             kind: ChangeStorageKind::Heap,
             storage_id: StorageId(8),
             table_id: table.id,
             fingerprint: table.fingerprint().unwrap(),
             generation: ChangeStreamGeneration(3),
-            baseline: StorageDataVersion(11),
+            origin: StorageDataVersion(11),
+            earliest: StorageDataVersion(11),
+            current: StorageDataVersion(11),
+            next_sequence: 1,
         }
     }
 
@@ -1749,7 +2092,7 @@ mod tests {
             table_id: header.table_id,
             storage_id: header.storage_id,
             schema_fingerprint: header.fingerprint,
-            before: header.baseline,
+            before: header.current,
             after: StorageDataVersion(12),
             mutations: vec![StorageChange::Insert {
                 new_version: StorageVersionKey::Heap {
@@ -1771,19 +2114,51 @@ mod tests {
         let cases = [
             (0, b'X'),
             (4, 99),
-            (72, 1),
+            (96, 1),
             (8, 0),
             (16, 0),
             (24, valid[24] ^ 1),
         ];
         for (offset, value) in cases {
-            let mut bytes = valid;
+            let mut bytes = valid.clone();
             bytes[offset] = value;
             assert!(decode_header(&bytes).is_err(), "offset {offset}");
         }
         assert!(matches!(
             decode_header(&valid[..20]),
             Err(ChangeStreamError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn v1_header_remains_readable_and_v2_frontiers_are_validated() {
+        let expected = header();
+        let decoded = decode_header(&encode_v1_header(&expected)).expect("decode NBCL v1");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.origin, expected.origin);
+        assert_eq!(decoded.earliest, expected.origin);
+        assert_eq!(decoded.current, expected.origin);
+        assert_eq!(decoded.next_sequence, 1);
+
+        let mut invalid_order = encode_header(&expected);
+        invalid_order[72..80].copy_from_slice(&StorageDataVersion(12).0.to_le_bytes());
+        invalid_order[80..88].copy_from_slice(&StorageDataVersion(11).0.to_le_bytes());
+        let checksum = crc32c::crc32c(&invalid_order[..100]);
+        invalid_order[100..104].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            decode_header(&invalid_order),
+            Err(ChangeStreamError::InvalidHeader(
+                "origin, earliest, and current frontiers are out of order"
+            ))
+        ));
+
+        let mut zero_sequence = encode_header(&expected);
+        zero_sequence[88..96].fill(0);
+        let checksum = crc32c::crc32c(&zero_sequence[..100]);
+        zero_sequence[100..104].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            decode_header(&zero_sequence),
+            Err(ChangeStreamError::InvalidHeader("zero next sequence"))
         ));
     }
 
@@ -1875,7 +2250,7 @@ mod tests {
             Err(ChangeStreamError::Truncated { .. })
         ));
         let mut corrupt = bytes.clone();
-        corrupt[HEADER_SIZE + 10] ^= 1;
+        corrupt[V2_HEADER_SIZE + 10] ^= 1;
         fs::write(&path, corrupt).unwrap();
         assert!(matches!(
             validate_change_log_file(&path, &table()),
@@ -1947,5 +2322,172 @@ mod tests {
         let debug = format!("{batch:?}");
         assert!(debug.contains("mutation_count: 1"));
         assert!(!debug.contains("Int64(42)"));
+    }
+
+    fn write_committed_fixture(path: &Path, version: u16, batches: &[ChangeBatch]) {
+        let mut fixture_header = header();
+        fixture_header.version = version;
+        let mut bytes = if version == 1 {
+            encode_v1_header(&fixture_header)
+        } else {
+            encode_header(&fixture_header)
+        };
+        for batch in batches {
+            bytes.extend_from_slice(&encode_record(batch).expect("encode fixture batch"));
+            bytes.extend_from_slice(
+                &encode_finalize(batch.physical_txn_id, None).expect("encode fixture finalize"),
+            );
+        }
+        fs::write(path, bytes).expect("write committed fixture");
+    }
+
+    #[test]
+    fn v1_gc_migrates_to_v2_and_future_sequence_stays_monotonic() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-change-v1-gc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let first = batch();
+        write_committed_fixture(&path, 1, std::slice::from_ref(&first));
+        let table = table();
+        let mut manager = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table,
+            |_| AuthoritativeOutcome::Unresolved,
+        )
+        .expect("open v1 stream");
+        manager
+            .gc_through(first.after)
+            .expect("migrate v1 through current");
+        let bytes = fs::read(&path).expect("read migrated stream");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 2);
+        drop(manager);
+
+        let mut reopened = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table,
+            |_| AuthoritativeOutcome::Unresolved,
+        )
+        .expect("reopen migrated stream");
+        let change = StorageChange::Insert {
+            new_version: StorageVersionKey::Heap {
+                storage_id: StorageId(8),
+                row_id: RowId {
+                    page: PageId(3),
+                    slot: 0,
+                    generation: 1,
+                },
+            },
+            after: vec![ScalarValue::Int64(99)],
+        };
+        let prepared = reopened
+            .prepare(TxnId(5), None, &[change])
+            .expect("prepare post-GC")
+            .expect("prepared identity");
+        reopened
+            .publish(TxnId(5), prepared, None)
+            .expect("publish post-GC");
+        let cursor = ChangeStreamCursor {
+            storage_id: StorageId(8),
+            generation: ChangeStreamGeneration(3),
+            frontier: first.after,
+        };
+        let result = reopened.read(cursor, 1, 1_000_000).expect("read post-GC");
+        assert_eq!(result.batches[0].sequence, 2);
+        assert_eq!(result.batches[0].before, first.after);
+        let _ = fs::remove_file(change_stream_guard_path(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gc_publication_crash_child() {
+        if std::env::var("NETBADB_CHANGE_STREAM_GC_CRASH_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        let path = PathBuf::from(
+            std::env::var("NETBADB_CHANGE_STREAM_GC_CRASH_PATH").expect("GC crash path"),
+        );
+        let table = table();
+        let mut manager =
+            ChangeStreamManager::open(path, ChangeStorageKind::Heap, StorageId(8), &table, |_| {
+                AuthoritativeOutcome::Unresolved
+            })
+            .expect("open GC crash fixture");
+        manager
+            .gc_through(StorageDataVersion(12))
+            .expect("GC must reach crash point");
+        panic!("configured GC crash point did not terminate child");
+    }
+
+    #[test]
+    fn gc_crash_matrix_reopens_complete_old_or_new_history() {
+        let mut second = batch();
+        second.sequence = 2;
+        second.physical_txn_id = TxnId(6);
+        second.before = StorageDataVersion(12);
+        second.after = StorageDataVersion(13);
+        let points = [
+            "gc-header-written",
+            "gc-records-written",
+            "gc-file-synced",
+            "gc-file-renamed",
+            "gc-directory-synced",
+            "gc-log-published",
+            "gc-guard-published",
+        ];
+        for point in points {
+            let path = std::env::temp_dir().join(format!(
+                "netbadb-change-gc-crash-{point}-{}",
+                std::process::id()
+            ));
+            write_committed_fixture(&path, CHANGE_LOG_FORMAT_VERSION, &[batch(), second.clone()]);
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .arg("change_stream::tests::gc_publication_crash_child")
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env("NETBADB_CHANGE_STREAM_GC_CRASH_CHILD", "1")
+                    .env("NETBADB_CHANGE_STREAM_GC_CRASH_PATH", &path)
+                    .env("NETBADB_CHANGE_STREAM_GC_CRASH_POINT", point)
+                    .status()
+                    .expect("run GC crash child");
+            assert_eq!(status.code(), Some(89), "crash point {point}");
+            let manager = ChangeStreamManager::open(
+                path.clone(),
+                ChangeStorageKind::Heap,
+                StorageId(8),
+                &table(),
+                |_| AuthoritativeOutcome::Unresolved,
+            )
+            .unwrap_or_else(|error| panic!("reopen after {point}: {error}"));
+            let earliest = manager
+                .inspection()
+                .earliest_available_frontier
+                .expect("earliest frontier");
+            let expected = if matches!(
+                point,
+                "gc-file-renamed"
+                    | "gc-directory-synced"
+                    | "gc-log-published"
+                    | "gc-guard-published"
+            ) {
+                StorageDataVersion(12)
+            } else {
+                StorageDataVersion(11)
+            };
+            assert_eq!(earliest, expected, "crash point {point}");
+            assert_eq!(
+                manager.inspection().current_data_version,
+                StorageDataVersion(13)
+            );
+            drop(manager);
+            let _ = fs::remove_file(change_stream_guard_path(&path));
+            let _ = fs::remove_file(path);
+        }
     }
 }

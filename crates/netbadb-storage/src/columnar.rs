@@ -321,15 +321,19 @@ impl PreparedColumnarProjection {
     pub fn publish(mut self) -> Result<ColumnarProjection, ColumnarError> {
         let segment_final = self.root.join(&self.segment_file);
         fs::rename(&self.segment_tmp, &segment_final).map_err(ColumnarError::Io)?;
+        crash("compact-base-renamed");
         if let Err(error) = sync_directory(&self.root) {
             let _ = fs::remove_file(&segment_final);
             return Err(error);
         }
+        crash("compact-base-directory-synced");
         if let Err(error) = fs::rename(&self.manifest_tmp, self.root.join(MANIFEST_FILE)) {
             let _ = fs::remove_file(&segment_final);
             return Err(ColumnarError::Io(error));
         }
+        crash("compact-manifest-renamed");
         sync_directory(&self.root)?;
+        crash("compact-manifest-directory-synced");
         self.published = true;
         Ok(ColumnarProjection {
             root: self.root.clone(),
@@ -775,6 +779,194 @@ impl ColumnarProjection {
             projection: replacement,
             delta_tmp,
             delta_final: self.root.join(delta_file),
+            manifest_tmp,
+            published: false,
+        })
+    }
+
+    /// Folds this incremental generation's immutable Base and Delta overlay
+    /// into one new NBCS v2 Base. This path never consults the authoritative
+    /// source or the change stream; the captured applied frontier is retained.
+    pub fn prepare_compaction(
+        &self,
+        table: &TableDef,
+        generation: ColumnarGeneration,
+    ) -> Result<PreparedColumnarProjection, ColumnarError> {
+        let incremental = self
+            .metadata
+            .incremental
+            .as_ref()
+            .ok_or(ColumnarError::InvalidInput(
+                "snapshot projection cannot compact",
+            ))?;
+        if incremental.delta_segments.is_empty() {
+            return Err(ColumnarError::InvalidInput(
+                "incremental projection has no delta to compact",
+            ));
+        }
+        if generation.0
+            != self
+                .metadata
+                .generation
+                .0
+                .checked_add(1)
+                .ok_or(ColumnarError::InvalidInput(
+                    "columnar generation space is exhausted",
+                ))?
+        {
+            return Err(ColumnarError::IdentityMismatch("compaction generation"));
+        }
+        if table.id != self.metadata.table_id
+            || table.fingerprint().map_err(ColumnarError::Schema)?
+                != self.metadata.schema_fingerprint
+        {
+            return Err(ColumnarError::IdentityMismatch("compaction schema"));
+        }
+
+        let group_rows = self
+            .row_groups
+            .first()
+            .map_or(DEFAULT_ROW_GROUP_ROWS, |group| group.rows as usize);
+        let mut row_groups = Vec::new();
+        let mut pending = Vec::with_capacity(group_rows);
+        let mut seen = HashSet::new();
+        for group in &self.row_groups {
+            let keys = group
+                .source_versions
+                .as_ref()
+                .ok_or(ColumnarError::Corrupt(
+                    "incremental base row group has no version keys",
+                ))?;
+            for (row, key) in keys.iter().copied().enumerate() {
+                if self.overlay.suppressed.contains(&key) {
+                    continue;
+                }
+                if !seen.insert(key) {
+                    return Err(ColumnarError::Corrupt(
+                        "duplicate retained source version during compaction",
+                    ));
+                }
+                let values = group
+                    .columns
+                    .iter()
+                    .map(|column| column.values.value(row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                pending.push((key, values));
+                if pending.len() == group_rows {
+                    row_groups.push(encode_versioned_row_group(
+                        &self.metadata.columns,
+                        &pending,
+                    )?);
+                    pending.clear();
+                }
+            }
+        }
+        let mut live = self.overlay.live.iter().collect::<Vec<_>>();
+        live.sort_by_key(|(key, _)| version_key_sort_key(**key));
+        for (key, values) in live {
+            if !seen.insert(*key) {
+                return Err(ColumnarError::Corrupt(
+                    "delta version duplicates a retained base version",
+                ));
+            }
+            pending.push((*key, values.clone()));
+            if pending.len() == group_rows {
+                row_groups.push(encode_versioned_row_group(
+                    &self.metadata.columns,
+                    &pending,
+                )?);
+                pending.clear();
+            }
+        }
+        if !pending.is_empty() {
+            row_groups.push(encode_versioned_row_group(
+                &self.metadata.columns,
+                &pending,
+            )?);
+        }
+
+        let row_count = row_groups.iter().try_fold(0_u64, |total, group| {
+            total
+                .checked_add(u64::from(group.rows))
+                .ok_or(ColumnarError::InvalidInput("compacted row count overflow"))
+        })?;
+        let segment_id = ColumnarSegmentId(generation.0);
+        let segment_file = format!("projection-{}-g{}.nbcs", self.metadata.id.0, generation.0);
+        let mut metadata = self.metadata.clone();
+        metadata.generation = generation;
+        metadata.row_count = row_count;
+        metadata.row_group_count = row_groups.len() as u64;
+        metadata.segment_count = 1;
+        metadata.segment_bytes = 0;
+        metadata.incremental = Some(ColumnarIncrementalMetadata {
+            stream_generation: incremental.stream_generation,
+            base_frontier: incremental.applied_frontier,
+            applied_frontier: incremental.applied_frontier,
+            delta_segments: Vec::new(),
+            delta_mutation_count: 0,
+            delta_live_row_count: 0,
+            suppressed_version_count: 0,
+            delta_bytes: 0,
+        });
+        let suffix = format!(
+            "compact.{}.{}.{}",
+            std::process::id(),
+            metadata.id.0,
+            generation.0
+        );
+        let segment_tmp = self.root.join(format!(".{segment_file}.tmp.{suffix}"));
+        let manifest_tmp = self.root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        let identity = SegmentIdentity {
+            projection_id: metadata.id,
+            generation,
+            segment_id,
+            table_id: metadata.table_id,
+            storage_id: metadata.source_storage_id,
+            fingerprint: metadata.schema_fingerprint,
+        };
+        let (segment_bytes, segment_checksum) = match write_segment_synced(
+            &segment_tmp,
+            identity,
+            &metadata.columns,
+            &row_groups,
+            INCREMENTAL_FORMAT_VERSION,
+            "compact-base-temp-created",
+            "compact-base-written",
+            "compact-base-synced",
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        metadata.segment_bytes = segment_bytes;
+        let manifest = match encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_file(&segment_tmp);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_advance_file_synced(
+            &manifest_tmp,
+            &manifest,
+            "compact-manifest-temp-created",
+            "compact-manifest-written",
+            "compact-manifest-synced",
+        ) {
+            let _ = fs::remove_file(&segment_tmp);
+            return Err(error);
+        }
+        Ok(PreparedColumnarProjection {
+            root: self.root.clone(),
+            metadata,
+            segment_id,
+            segment_file,
+            row_groups,
+            overlay: DeltaOverlay::default(),
+            segment_tmp,
             manifest_tmp,
             published: false,
         })
@@ -1848,6 +2040,42 @@ fn write_advance_file_synced(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_segment_synced(
+    path: &Path,
+    identity: SegmentIdentity,
+    columns: &[ColumnarColumnSpec],
+    groups: &[RowGroup],
+    version: u16,
+    created_point: &str,
+    written_point: &str,
+    synced_point: &str,
+) -> Result<(u64, u32), ColumnarError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(ColumnarError::Io)?;
+    crash(created_point);
+    let checksum = {
+        let mut writer = crc32c::Crc32cWriter::new(&mut file);
+        let header = encode_segment_header(identity, columns, groups, version)?;
+        writer.write_all(&header).map_err(ColumnarError::Io)?;
+        for group in groups {
+            let encoded = encode_segment_row_group(identity, columns, group, version)?;
+            writer.write_all(&encoded).map_err(ColumnarError::Io)?;
+        }
+        writer.crc32c()
+    };
+    file.write_all(&checksum.to_le_bytes())
+        .map_err(ColumnarError::Io)?;
+    crash(written_point);
+    file.sync_data().map_err(ColumnarError::Io)?;
+    crash(synced_point);
+    let bytes = file.metadata().map_err(ColumnarError::Io)?.len();
+    Ok((bytes, checksum))
+}
+
 fn sync_directory(path: &Path) -> Result<(), ColumnarError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -2145,7 +2373,23 @@ fn encode_segment(
     groups: &[RowGroup],
     version: u16,
 ) -> Result<Vec<u8>, ColumnarError> {
-    let mut output = Vec::new();
+    let mut output = encode_segment_header(identity, columns, groups, version)?;
+    for group in groups {
+        output.extend_from_slice(&encode_segment_row_group(
+            identity, columns, group, version,
+        )?);
+    }
+    append_checksum(&mut output);
+    Ok(output)
+}
+
+fn encode_segment_header(
+    identity: SegmentIdentity,
+    columns: &[ColumnarColumnSpec],
+    groups: &[RowGroup],
+    version: u16,
+) -> Result<Vec<u8>, ColumnarError> {
+    let mut output = Vec::with_capacity(80);
     output.extend_from_slice(SEGMENT_MAGIC);
     push_u16(&mut output, version);
     push_u16(&mut output, 0);
@@ -2165,35 +2409,42 @@ fn encode_segment(
         u32::try_from(groups.len())
             .map_err(|_| ColumnarError::InvalidInput("row-group count overflow"))?,
     );
-    for group in groups {
-        push_u32(&mut output, group.rows);
-        if version == INCREMENTAL_FORMAT_VERSION {
-            let keys = group
-                .source_versions
-                .as_ref()
-                .ok_or(ColumnarError::InvalidInput(
-                    "incremental row group is missing source identities",
-                ))?;
-            if keys.len() != group.rows as usize {
-                return Err(ColumnarError::InvalidInput(
-                    "source identity count differs from row count",
-                ));
-            }
-            for key in keys {
-                encode_version_key(&mut output, *key, identity.storage_id)?;
-            }
+    Ok(output)
+}
+
+fn encode_segment_row_group(
+    identity: SegmentIdentity,
+    columns: &[ColumnarColumnSpec],
+    group: &RowGroup,
+    version: u16,
+) -> Result<Vec<u8>, ColumnarError> {
+    let mut output = Vec::new();
+    push_u32(&mut output, group.rows);
+    if version == INCREMENTAL_FORMAT_VERSION {
+        let keys = group
+            .source_versions
+            .as_ref()
+            .ok_or(ColumnarError::InvalidInput(
+                "incremental row group is missing source identities",
+            ))?;
+        if keys.len() != group.rows as usize {
+            return Err(ColumnarError::InvalidInput(
+                "source identity count differs from row count",
+            ));
         }
-        for (column, batch) in columns.iter().zip(&group.columns) {
-            let stats = group
-                .statistics
-                .iter()
-                .find(|(id, _)| *id == column.column_id)
-                .map(|(_, stats)| stats)
-                .ok_or(ColumnarError::InvalidInput("row-group statistics missing"))?;
-            encode_column_chunk(&mut output, column, &batch.values, stats)?;
+        for key in keys {
+            encode_version_key(&mut output, *key, identity.storage_id)?;
         }
     }
-    append_checksum(&mut output);
+    for (column, batch) in columns.iter().zip(&group.columns) {
+        let stats = group
+            .statistics
+            .iter()
+            .find(|(id, _)| *id == column.column_id)
+            .map(|(_, stats)| stats)
+            .ok_or(ColumnarError::InvalidInput("row-group statistics missing"))?;
+        encode_column_chunk(&mut output, column, &batch.values, stats)?;
+    }
     Ok(output)
 }
 
@@ -2845,6 +3096,21 @@ mod tests {
         ]
     }
 
+    fn batch_rows(batches: &[super::ColumnarBatch]) -> Vec<Vec<ScalarValue>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.row_count).map(|row| {
+                    batch
+                        .columns
+                        .iter()
+                        .map(|column| column.values.value(row).expect("batch value"))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
     fn heap_key(storage_id: StorageId, page: u64, slot: u16) -> StorageVersionKey {
         StorageVersionKey::Heap {
             storage_id,
@@ -3002,6 +3268,127 @@ mod tests {
             Err(ColumnarError::ChecksumMismatch { .. }) | Err(ColumnarError::Corrupt(_))
         ));
         fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn compaction_folds_exact_versions_rebuilds_statistics_and_keeps_old_reader_owned() {
+        let directory = test_directory("phase2c-compaction");
+        let table = table();
+        let storage_id = StorageId(71);
+        let base_rows = rows()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, row)| (heap_key(storage_id, 1, slot as u16), row))
+            .collect::<Vec<_>>();
+        let base = ColumnarProjection::prepare_incremental(
+            &directory,
+            ColumnarProjectionId(71),
+            ColumnarGeneration(1),
+            &table,
+            storage_id,
+            StorageSnapshotToken::heap(storage_id, 1),
+            crate::ChangeStreamCursor {
+                storage_id,
+                generation: ChangeStreamGeneration(4),
+                frontier: StorageDataVersion(10),
+            },
+            &[ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            &base_rows,
+            Some(2),
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish base");
+        let updated_key = heap_key(storage_id, 2, 0);
+        let inserted_key = heap_key(storage_id, 2, 1);
+        let delta = ChangeBatch {
+            sequence: 1,
+            physical_txn_id: TxnId(9),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: table.fingerprint().expect("fingerprint"),
+            before: StorageDataVersion(10),
+            after: StorageDataVersion(11),
+            mutations: vec![
+                StorageChange::Update {
+                    old_version: base_rows[0].0,
+                    new_version: updated_key,
+                    after: vec![
+                        ScalarValue::Int64(100),
+                        ScalarValue::UInt64(100),
+                        ScalarValue::Null,
+                        ScalarValue::Text("updated".into()),
+                    ],
+                },
+                StorageChange::Delete {
+                    old_version: base_rows[1].0,
+                },
+                StorageChange::Insert {
+                    new_version: inserted_key,
+                    after: vec![
+                        ScalarValue::Int64(200),
+                        ScalarValue::UInt64(200),
+                        ScalarValue::Bool(true),
+                        ScalarValue::Null,
+                    ],
+                },
+            ],
+        };
+        let advanced = base
+            .prepare_advance(&table, &[delta])
+            .and_then(|prepared| prepared.publish())
+            .expect("publish delta");
+        let expected = advanced
+            .scan(&[ColumnId(1), ColumnId(3), ColumnId(4)], &[])
+            .expect("scan before compaction")
+            .0;
+        let expected = batch_rows(&expected);
+        let reader = advanced.clone();
+        let compacted = advanced
+            .prepare_compaction(&table, ColumnarGeneration(2))
+            .and_then(|prepared| prepared.publish())
+            .expect("publish compacted generation");
+        let incremental = compacted
+            .metadata()
+            .incremental
+            .as_ref()
+            .expect("incremental metadata");
+        assert_eq!(compacted.metadata().generation, ColumnarGeneration(2));
+        assert_eq!(incremental.base_frontier, StorageDataVersion(11));
+        assert_eq!(incremental.applied_frontier, StorageDataVersion(11));
+        assert!(incremental.delta_segments.is_empty());
+        assert_eq!(incremental.delta_mutation_count, 0);
+        assert_eq!(incremental.suppressed_version_count, 0);
+        assert_eq!(incremental.delta_live_row_count, 0);
+        assert_eq!(compacted.metadata().row_count, 3);
+        assert_eq!(
+            batch_rows(
+                &compacted
+                    .scan(&[ColumnId(1), ColumnId(3), ColumnId(4)], &[])
+                    .expect("scan compacted")
+                    .0
+            ),
+            expected
+        );
+        advanced.retire_segment().expect("retire old files");
+        assert_eq!(
+            batch_rows(
+                &reader
+                    .scan(&[ColumnId(1), ColumnId(3), ColumnId(4)], &[])
+                    .expect("scan owned old reader")
+                    .0
+            ),
+            expected
+        );
+        let reopened = ColumnarProjection::open(&directory, &table).expect("reopen compacted");
+        assert_eq!(reopened.metadata().generation, ColumnarGeneration(2));
+        let zone_maps = reopened.row_group_statistics();
+        assert!(zone_maps.iter().any(|group| {
+            group.columns.iter().any(|(column, statistics)| {
+                *column == ColumnId(1) && statistics.maximum == Some(ScalarValue::Int64(200))
+            })
+        }));
+        fs::remove_dir_all(directory).expect("remove compacted fixture");
     }
 
     #[test]
@@ -3679,6 +4066,84 @@ mod tests {
             };
             assert_eq!(frontier, expected, "crash point {point}");
             fs::remove_dir_all(directory).expect("remove delta crash fixture");
+        }
+    }
+
+    #[test]
+    fn compaction_publication_crash_child() {
+        if std::env::var("NETBADB_COLUMNAR_COMPACTION_CRASH_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        let directory = PathBuf::from(
+            std::env::var("NETBADB_COLUMNAR_COMPACTION_CRASH_DIRECTORY")
+                .expect("compaction crash directory"),
+        );
+        let table = table();
+        let projection = ColumnarProjection::open(&directory, &table).expect("open delta base");
+        projection
+            .prepare_compaction(&table, ColumnarGeneration(2))
+            .and_then(|prepared| prepared.publish())
+            .expect("compaction must reach configured crash point");
+        panic!("configured compaction crash point did not terminate the child");
+    }
+
+    #[test]
+    fn compaction_crash_matrix_reopens_complete_old_or_new_generation() {
+        let points = [
+            "compact-base-temp-created",
+            "compact-base-written",
+            "compact-base-synced",
+            "compact-manifest-temp-created",
+            "compact-manifest-written",
+            "compact-manifest-synced",
+            "compact-base-renamed",
+            "compact-base-directory-synced",
+            "compact-manifest-renamed",
+        ];
+        for point in points {
+            let directory = test_directory(point);
+            seed_delta_crash_projection(&directory);
+            let table = table();
+            let advanced = ColumnarProjection::open(&directory, &table)
+                .expect("open base")
+                .prepare_advance(&table, &[crash_delta_batch(&table, StorageId(61))])
+                .and_then(|prepared| prepared.publish())
+                .expect("seed delta");
+            drop(advanced);
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("columnar::tests::compaction_publication_crash_child")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("NETBADB_COLUMNAR_COMPACTION_CRASH_CHILD", "1")
+                .env("NETBADB_COLUMNAR_COMPACTION_CRASH_DIRECTORY", &directory)
+                .env("NETBADB_COLUMNAR_DELTA_CRASH_POINT", point)
+                .status()
+                .expect("run compaction crash child");
+            assert_eq!(status.code(), Some(89), "crash point {point}");
+            let reopened = ColumnarProjection::open(&directory, &table)
+                .unwrap_or_else(|error| panic!("reopen after {point}: {error}"));
+            let expected_generation = if point == "compact-manifest-renamed" {
+                ColumnarGeneration(2)
+            } else {
+                ColumnarGeneration(1)
+            };
+            assert_eq!(
+                reopened.metadata().generation,
+                expected_generation,
+                "crash point {point}"
+            );
+            if expected_generation == ColumnarGeneration(2) {
+                assert!(
+                    reopened
+                        .metadata()
+                        .incremental
+                        .as_ref()
+                        .expect("incremental")
+                        .delta_segments
+                        .is_empty()
+                );
+            }
+            fs::remove_dir_all(directory).expect("remove compaction crash fixture");
         }
     }
 

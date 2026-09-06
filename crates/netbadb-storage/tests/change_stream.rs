@@ -199,6 +199,106 @@ fn heap_change_chain_coalesces_rollbacks_reopens_and_rejects_old_incarnation() {
 }
 
 #[test]
+fn gc_persists_retained_and_current_frontiers_and_sequence_high_water() {
+    let path = path("gc-frontiers").with_extension("db");
+    cleanup_heap(&path);
+    let mut storage = TableStorage::create_heap_with_storage_id(&path, table(), StorageId(44))
+        .expect("create heap");
+    let origin = storage.enable_change_stream().expect("enable stream");
+    storage.insert(&row(1, "a")).expect("insert one");
+    storage.insert(&row(2, "b")).expect("insert two");
+    storage.insert(&row(3, "c")).expect("insert three");
+    let all = storage
+        .read_changes(origin, 10, 1_000_000)
+        .expect("read complete history");
+    assert_eq!(all.batches.len(), 3);
+    let retained = all.batches[1].after;
+    let current = all.current_frontier;
+
+    let report = storage
+        .gc_change_stream(retained)
+        .expect("retain final batch");
+    assert_eq!(report.previous_earliest_frontier, origin.frontier);
+    assert_eq!(report.new_earliest_frontier, retained);
+    assert_eq!(report.current_frontier, current);
+    assert_eq!(report.batches_removed, 2);
+    assert!(report.bytes_after < report.bytes_before);
+    let inspection = storage.inspect_change_stream();
+    assert_eq!(inspection.stream_origin_frontier, Some(origin.frontier));
+    assert_eq!(inspection.baseline_data_version, Some(origin.frontier));
+    assert_eq!(inspection.earliest_available_frontier, Some(retained));
+    assert_eq!(inspection.current_data_version, current);
+    let old = netbadb_storage::ChangeStreamCursor {
+        frontier: netbadb_types::StorageDataVersion(retained.0 - 1),
+        ..origin
+    };
+    assert!(matches!(
+        storage.read_changes(old, 10, 1_000_000),
+        Err(StorageError::ChangeStream(
+            ChangeStreamError::HistoryUnavailable
+        ))
+    ));
+    let retained_cursor = netbadb_storage::ChangeStreamCursor {
+        frontier: retained,
+        ..origin
+    };
+    let tail = storage
+        .read_changes(retained_cursor, 10, 1_000_000)
+        .expect("read retained history");
+    assert_eq!(tail.batches.len(), 1);
+    assert_eq!(tail.batches[0].sequence, 3);
+
+    storage
+        .gc_change_stream(current)
+        .expect("remove every committed batch");
+    storage.close().expect("close after GC");
+    let mut reopened = TableStorage::open_heap(&path, table()).expect("reopen empty retained log");
+    let reopened_inspection = reopened.inspect_change_stream();
+    assert_eq!(
+        reopened_inspection.stream_origin_frontier,
+        Some(origin.frontier)
+    );
+    assert_eq!(
+        reopened_inspection.earliest_available_frontier,
+        Some(current)
+    );
+    assert_eq!(reopened_inspection.current_data_version, current);
+    assert_eq!(reopened_inspection.committed_batch_count, 0);
+
+    reopened.insert(&row(4, "d")).expect("post-GC insert");
+    let post_gc_cursor = netbadb_storage::ChangeStreamCursor {
+        frontier: current,
+        ..origin
+    };
+    let post_gc = reopened
+        .read_changes(post_gc_cursor, 10, 1_000_000)
+        .expect("read post-GC batch");
+    assert_eq!(post_gc.batches.len(), 1);
+    assert_eq!(post_gc.batches[0].before, current);
+    assert_eq!(post_gc.batches[0].after.0, current.0 + 1);
+    assert_eq!(post_gc.batches[0].sequence, 4);
+    reopened.close().expect("close reopened heap");
+    let change_path = heap_change_log_path(&path);
+    let change_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&change_path)
+        .expect("open post-GC log");
+    let length = change_file.metadata().expect("post-GC metadata").len();
+    change_file
+        .set_len(length - 1)
+        .expect("truncate post-GC finalize tail");
+    drop(change_file);
+    let recovered = TableStorage::open_heap(&path, table()).expect("recover post-GC finalize");
+    let recovered_batch = recovered
+        .read_changes(post_gc_cursor, 10, 1_000_000)
+        .expect("read recovered post-GC batch");
+    assert_eq!(recovered_batch.batches.len(), 1);
+    assert_eq!(recovered_batch.batches[0].sequence, 4);
+    recovered.close().expect("close recovered heap");
+    cleanup_heap(&path);
+}
+
+#[test]
 fn lsm_stream_preserves_logical_updates_across_flush_compaction_and_reopen() {
     let root = path("lsm");
     let _ = std::fs::remove_dir_all(&root);

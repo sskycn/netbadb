@@ -701,6 +701,9 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::UnsupportedDdlCombination
         | DatabaseError::ColumnarProjectionNotFound(_)
         | DatabaseError::ColumnarProjectionNotIncremental(_)
+        | DatabaseError::ColumnarProjectionRebuildRequired(_)
+        | DatabaseError::ChangeStreamGcNoRetentionConsumer(_)
+        | DatabaseError::ChangeStreamGcUnsafe { .. }
         | DatabaseError::ColumnarProjectionIdExhausted
         | DatabaseError::ColumnarBuildSourceChanged { .. }
         | DatabaseError::ColumnarProjectionRequiresSingleStorage(_) => ProtocolErrorCode::Database,

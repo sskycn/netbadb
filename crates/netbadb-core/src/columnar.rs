@@ -77,6 +77,39 @@ pub struct ColumnarAdvanceReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarCompactionReport {
+    pub projection_id: ColumnarProjectionId,
+    pub old_generation: ColumnarGeneration,
+    pub new_generation: ColumnarGeneration,
+    pub compacted_frontier: StorageDataVersion,
+    pub base_rows_before: u64,
+    pub base_rows_after: u64,
+    pub delta_segments_consumed: u64,
+    pub delta_mutations_consumed: u64,
+    pub suppressed_versions_removed: u64,
+    pub live_delta_rows_folded: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub bytes_reclaimed: u64,
+    pub compacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeStreamGcReport {
+    pub storage_id: StorageId,
+    pub generation: ChangeStreamGeneration,
+    pub previous_earliest_frontier: StorageDataVersion,
+    pub new_earliest_frontier: StorageDataVersion,
+    pub current_frontier: StorageDataVersion,
+    pub limiting_projection_ids: Vec<ColumnarProjectionId>,
+    pub batches_removed: u64,
+    pub mutations_removed: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub bytes_reclaimed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnarProjectionCatalogInspection {
     pub managed: bool,
     pub available: bool,
@@ -106,10 +139,12 @@ pub struct ColumnarProjectionInspection {
     pub applied_frontier: Option<StorageDataVersion>,
     pub current_source_frontier: Option<StorageDataVersion>,
     pub lag: Option<u64>,
+    pub delta_segment_count: Option<u64>,
     pub delta_mutations: Option<u64>,
     pub delta_live_rows: Option<u64>,
     pub suppressed_versions: Option<u64>,
     pub delta_bytes: Option<u64>,
+    pub compaction_possible: Option<bool>,
     pub health: ColumnarProjectionHealth,
     pub detail: Option<String>,
     pub directory: PathBuf,
@@ -343,6 +378,7 @@ impl ProjectionRegistry {
         {
             catalog.update_generation(id, metadata.generation)?;
         }
+        crash("compact-catalog-updated-before-registry");
         let old = self.entries[position]
             .projection
             .replace(replacement)
@@ -352,6 +388,7 @@ impl ProjectionRegistry {
         self.entries[position].identity.generation = metadata.generation;
         self.entries[position].identity.schema_fingerprint = metadata.schema_fingerprint;
         self.entries[position].detail = None;
+        crash("compact-registry-swapped");
         crash("refresh-catalog-updated");
         Ok(old)
     }
@@ -389,6 +426,10 @@ impl ProjectionRegistry {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &ProjectionRegistryEntry> {
         self.entries.iter()
+    }
+
+    pub(crate) fn ensure_retention_catalog_available(&self) -> Result<(), ProjectionCatalogError> {
+        self.ensure_catalog_available()
     }
 
     pub(crate) fn catalog_inspection(&self) -> ColumnarProjectionCatalogInspection {
@@ -490,10 +531,12 @@ pub(crate) fn inspection(
         applied_frontier: incremental.map(|value| value.applied_frontier),
         current_source_frontier,
         lag,
+        delta_segment_count: incremental.map(|value| value.delta_segments.len() as u64),
         delta_mutations: incremental.map(|value| value.delta_mutation_count),
         delta_live_rows: incremental.map(|value| value.delta_live_row_count),
         suppressed_versions: incremental.map(|value| value.suppressed_version_count),
         delta_bytes: incremental.map(|value| value.delta_bytes),
+        compaction_possible: incremental.map(|value| !value.delta_segments.is_empty()),
         health,
         detail: entry.detail.clone(),
         directory: projection.root().to_owned(),
@@ -523,10 +566,12 @@ pub(crate) fn unavailable_inspection(
         applied_frontier: None,
         current_source_frontier: None,
         lag: None,
+        delta_segment_count: None,
         delta_mutations: None,
         delta_live_rows: None,
         suppressed_versions: None,
         delta_bytes: None,
+        compaction_possible: None,
         health: ColumnarProjectionHealth::Unavailable,
         detail: entry.detail.clone(),
         directory: entry.directory.clone(),
@@ -558,10 +603,12 @@ pub(crate) fn unmanaged_path_inspection(
         applied_frontier: None,
         current_source_frontier: None,
         lag: None,
+        delta_segment_count: None,
         delta_mutations: None,
         delta_live_rows: None,
         suppressed_versions: None,
         delta_bytes: None,
+        compaction_possible: None,
         health: ColumnarProjectionHealth::Unavailable,
         detail: Some(detail),
         directory: directory.to_owned(),

@@ -80,8 +80,31 @@ document remains the decision and rejected-alternatives record.
   inspection, corruption tests, and write-overhead benchmarks.
 
 See [Columnar Phase 2A](columnar-phase2a-change-stream.md). Columnar Delta,
-Base+Delta merge, incremental projection maintenance, retention/acknowledgement
-GC, global CSN, `RowEntityId`, and network CDC remain deferred.
+Base+Delta merge, and incremental projection maintenance were completed by
+Phase 2B.
+
+## Columnar Phase 2B (complete)
+
+- NBCS/NBCM v2 incremental Base metadata and immutable NBCD v1 segments;
+- explicit bounded advance from per-storage NBCL, exact version suppression,
+  live Delta merge, NULL-safe vector execution, and structural planner cost;
+- Fresh/Lagging/RebuildRequired lifecycle with no DML Columnar writes.
+
+See [Columnar Phase 2B](columnar-phase2b-base-delta.md).
+
+## Columnar Phase 2C (complete)
+
+- explicit Base+Delta compaction into a new NBCS generation without rescanning
+  Heap/LSM or advancing the applied frontier;
+- NBCL v2 origin/retained/current checkpoints and durable diagnostic sequence
+  high-water with lazy v1-to-v2 GC migration;
+- fail-closed minimum-frontier retention across managed incremental
+  projections, non-retaining cursors, crash-safe rewrite, inspection, and
+  maintenance benchmarks.
+
+See [Columnar Phase 2C](columnar-phase2c-compaction-retention.md). Background
+maintenance, generic CDC leases, lazy Columnar loading, spill, global CSN,
+`RowEntityId`, and hybrid authoritative storage remain deferred.
 
 ## Phase 0 — Rust foundation (complete)
 

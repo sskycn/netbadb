@@ -280,6 +280,230 @@ fn incremental_heap_merge_is_predicate_safe_and_reopens() {
 }
 
 #[test]
+fn compaction_rebaselines_only_applied_state_and_lagging_projection_catches_up() {
+    let root = path("phase2c-compaction");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    let projection = root.join("projection");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        None,
+    )
+    .expect("create database");
+    insert_rows(&mut database, 100);
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream");
+    let id = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &projection,
+            vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+        ))
+        .expect("build projection");
+    database
+        .execute("UPDATE events SET amount = 1000 WHERE id = 1")
+        .expect("update into predicate");
+    database
+        .execute("UPDATE events SET amount = 0 WHERE id = 30")
+        .expect("update out of predicate");
+    database
+        .execute("DELETE FROM events WHERE id = 2")
+        .expect("delete base row");
+    database
+        .execute("INSERT INTO events (id, amount, active, label) VALUES (900, 700, TRUE, 'delta')")
+        .expect("insert live row");
+    for amount in [7, 8, 9] {
+        database
+            .execute(&format!("UPDATE events SET amount = {amount} WHERE id = 3"))
+            .expect("extend version chain");
+    }
+    database
+        .execute("INSERT INTO events (id, amount, active, label) VALUES (901, NULL, TRUE, 'gone')")
+        .expect("insert transient row");
+    database
+        .execute("DELETE FROM events WHERE id = 901")
+        .expect("delete transient row");
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(100, 64 * 1024 * 1024))
+        .expect("advance mixed delta");
+    let equivalence_queries = [
+        "SELECT id FROM events WHERE amount > 50",
+        "SELECT id FROM events WHERE amount IS NULL",
+        "SELECT id FROM events WHERE amount IS NOT NULL",
+        "SELECT COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM events",
+        "SELECT active, COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM events GROUP BY active",
+    ];
+    for sql in equivalence_queries {
+        let expected = authoritative(&mut database, sql);
+        assert_eq!(
+            database.query(sql).expect("query before compaction"),
+            expected
+        );
+    }
+    let first_compaction = database
+        .compact_columnar_projection(id)
+        .expect("compact mixed delta");
+    assert!(first_compaction.compacted);
+    assert!(first_compaction.delta_mutations_consumed >= 9);
+    for sql in equivalence_queries {
+        let expected = authoritative(&mut database, sql);
+        assert_eq!(
+            database.query(sql).expect("query after compaction"),
+            expected
+        );
+    }
+
+    database
+        .execute("UPDATE events SET amount = 2000 WHERE id = 4")
+        .expect("first source advance beyond compacted frontier");
+    database
+        .execute("UPDATE events SET amount = 3000 WHERE id = 6")
+        .expect("second source advance beyond compacted frontier");
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(1, 64 * 1024 * 1024))
+        .expect("advance one batch and remain lagging");
+    let lagging_before = database.inspect_columnar_projections()[0].clone();
+    assert_eq!(lagging_before.health, ColumnarProjectionHealth::Lagging);
+    let applied = lagging_before.applied_frontier.expect("applied frontier");
+    let source_current = lagging_before
+        .current_source_frontier
+        .expect("source frontier");
+    let report = database
+        .compact_columnar_projection(id)
+        .expect("compact lagging projection");
+    assert!(report.compacted);
+    assert_eq!(report.old_generation.0 + 1, report.new_generation.0);
+    assert_eq!(report.compacted_frontier, applied);
+    assert!(report.delta_segments_consumed > 0);
+    let lagging_after = &database.inspect_columnar_projections()[0];
+    assert_eq!(lagging_after.health, ColumnarProjectionHealth::Lagging);
+    assert_eq!(lagging_after.base_frontier, Some(applied));
+    assert_eq!(lagging_after.applied_frontier, Some(applied));
+    assert_eq!(lagging_after.current_source_frontier, Some(source_current));
+    assert_eq!(lagging_after.delta_segment_count, Some(0));
+    assert_eq!(lagging_after.delta_mutations, Some(0));
+    assert_eq!(lagging_after.suppressed_versions, Some(0));
+    assert_eq!(lagging_after.delta_live_rows, Some(0));
+    assert_eq!(lagging_after.compaction_possible, Some(false));
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(10, 64 * 1024 * 1024))
+        .expect("catch up after compaction");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh
+    );
+    let sql = "SELECT id FROM events WHERE amount > 500";
+    let expected = authoritative(&mut database, sql);
+    assert_eq!(database.query(sql).expect("query after catch-up"), expected);
+    let no_op = database
+        .compact_columnar_projection(id)
+        .expect("compact new delta");
+    assert!(no_op.compacted);
+    let second_no_op = database
+        .compact_columnar_projection(id)
+        .expect("base-only no-op");
+    assert!(!second_no_op.compacted);
+    database.close().expect("close database");
+    let reopened = Database::open_catalog(&catalog).expect("reopen compacted database");
+    let inspection = &reopened.inspect_columnar_projections()[0];
+    assert_eq!(inspection.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(inspection.delta_segment_count, Some(0));
+    reopened.close().expect("close reopened database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn managed_projection_minimum_frontier_controls_change_stream_gc() {
+    let root = path("phase2c-retention");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    let projection_one = root.join("projection-one");
+    let projection_two = root.join("projection-two");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        None,
+    )
+    .expect("create database");
+    insert_rows(&mut database, 20);
+    let origin = database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream");
+    assert!(matches!(
+        database.gc_change_stream(TableId(1)),
+        Err(DatabaseError::ChangeStreamGcNoRetentionConsumer(_))
+    ));
+    let first = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &projection_one,
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build first projection");
+    let second = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &projection_two,
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build second projection");
+    database
+        .execute("UPDATE events SET amount = 101 WHERE id = 1")
+        .expect("first update");
+    database
+        .execute("UPDATE events SET amount = 202 WHERE id = 2")
+        .expect("second update");
+    database
+        .advance_columnar_projection(first, ColumnarAdvanceBudget::new(10, 64 * 1024 * 1024))
+        .expect("advance first fully");
+    database
+        .advance_columnar_projection(second, ColumnarAdvanceBudget::new(1, 64 * 1024 * 1024))
+        .expect("advance second once");
+    let inspections = database.inspect_columnar_projections();
+    let second_frontier = inspections
+        .iter()
+        .find(|inspection| inspection.projection_id == Some(second))
+        .and_then(|inspection| inspection.applied_frontier)
+        .expect("second frontier");
+    let report = database
+        .gc_change_stream(TableId(1))
+        .expect("GC to limiting projection");
+    assert_eq!(report.new_earliest_frontier, second_frontier);
+    assert_eq!(report.limiting_projection_ids, vec![second]);
+    assert_eq!(report.batches_removed, 1);
+    assert!(matches!(
+        database.read_changes(TableId(1), origin, 10, 1_000_000),
+        Err(DatabaseError::Storage(crate::StorageError::ChangeStream(
+            crate::ChangeStreamError::HistoryUnavailable
+        )))
+    ));
+    database
+        .advance_columnar_projection(second, ColumnarAdvanceBudget::new(10, 64 * 1024 * 1024))
+        .expect("advance limiter fully");
+    let report = database
+        .gc_change_stream(TableId(1))
+        .expect("GC through current frontier");
+    assert_eq!(report.current_frontier, report.new_earliest_frontier);
+    assert_eq!(report.limiting_projection_ids, vec![first, second]);
+    database.close().expect("close database");
+
+    fs::remove_file(projection_two.join("projection.nbcmanifest"))
+        .expect("remove managed manifest");
+    let mut reopened =
+        Database::open_catalog(&catalog).expect("reopen with unavailable projection");
+    assert!(matches!(
+        reopened.gc_change_stream(TableId(1)),
+        Err(DatabaseError::ChangeStreamGcUnsafe { .. })
+    ));
+    reopened.close().expect("close reopened database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
 fn incremental_heap_null_chains_and_duplicate_values_merge_by_version_identity() {
     let heap = path("incremental-identity-heap");
     let projection = path("incremental-identity-projection");
@@ -484,8 +708,18 @@ fn incremental_lsm_key_move_and_maintenance_preserve_freshness() {
     let expected = authoritative(&mut database, sql);
     assert!(statement_uses_columnar(&database, sql));
     assert_eq!(database.query(sql).expect("merged LSM query"), expected);
+    let compacted = database
+        .compact_columnar_projection(id)
+        .expect("compact LSM key-move delta");
+    assert!(compacted.compacted);
+    assert_eq!(compacted.new_generation.0, compacted.old_generation.0 + 1);
+    assert_eq!(database.query(sql).expect("compacted LSM query"), expected);
     database.flush().expect("flush LSM");
     database.compact_full(TableId(1)).expect("compact LSM");
+    let gc = database
+        .gc_change_stream(TableId(1))
+        .expect("GC LSM history after physical maintenance");
+    assert_eq!(gc.new_earliest_frontier, gc.current_frontier);
     assert_eq!(
         database.inspect_columnar_projections()[0].health,
         ColumnarProjectionHealth::Fresh,
@@ -502,7 +736,7 @@ fn incremental_lsm_key_move_and_maintenance_preserve_freshness() {
     let generation = reopened
         .refresh_columnar_projection(id)
         .expect("rebaseline incremental projection");
-    assert_eq!(generation, netbadb_types::ColumnarGeneration(2));
+    assert_eq!(generation, netbadb_types::ColumnarGeneration(3));
     let refreshed = &reopened.inspect_columnar_projections()[0];
     assert_eq!(refreshed.health, ColumnarProjectionHealth::Fresh);
     assert_eq!(refreshed.delta_mutations, Some(0));
@@ -1295,6 +1529,11 @@ fn projection_lifecycle_crash_child() {
                 .refresh_columnar_projection(netbadb_types::ColumnarProjectionId(1))
                 .expect("crash point should terminate refresh");
         }
+        "compact" => {
+            database
+                .compact_columnar_projection(netbadb_types::ColumnarProjectionId(1))
+                .expect("crash point should terminate compaction");
+        }
         "drop" => database
             .drop_columnar_projection(netbadb_types::ColumnarProjectionId(1))
             .expect("crash point should terminate drop"),
@@ -1341,6 +1580,68 @@ fn seed_crash_database(root: &PathBuf, projection: bool) {
         );
     }
     database.close().expect("close crash seed");
+}
+
+fn seed_compaction_crash_database(root: &PathBuf) {
+    fs::create_dir_all(root).expect("create compaction crash root");
+    let mut database = Database::create_catalog(
+        root.join("catalog"),
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create compaction crash database");
+    insert_rows(&mut database, 8);
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable compaction crash stream");
+    let id = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("projection"),
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build compaction crash projection");
+    database
+        .execute("UPDATE events SET amount = 999 WHERE id = 1")
+        .expect("create compaction crash delta");
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(10, 1 << 20))
+        .expect("publish compaction crash delta");
+    database.close().expect("close compaction crash seed");
+}
+
+#[test]
+fn compaction_catalog_registry_and_retirement_crashes_reopen_published_generation() {
+    for point in [
+        "compact-manifest-published",
+        "compact-catalog-updated-before-registry",
+        "compact-registry-swapped",
+        "compact-old-retired",
+    ] {
+        let root = path(&format!("crash-compact-{point}"));
+        seed_compaction_crash_database(&root);
+        run_crash_child(&root, "compact", point);
+        let mut reopened =
+            Database::open_catalog(root.join("catalog")).expect("reopen compaction crash");
+        let inspection = &reopened.inspect_columnar_projections()[0];
+        assert_eq!(
+            inspection.generation,
+            Some(netbadb_types::ColumnarGeneration(2)),
+            "crash point {point}"
+        );
+        assert_eq!(inspection.delta_segment_count, Some(0));
+        assert_eq!(inspection.health, ColumnarProjectionHealth::Fresh);
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM events WHERE amount > 500")
+                .expect("query compacted generation")
+                .rows,
+            vec![vec![ScalarValue::Int64(1)]],
+            "crash point {point}"
+        );
+        reopened.close().expect("close compaction crash database");
+        fs::remove_dir_all(root).expect("remove compaction crash fixture");
+    }
 }
 
 #[test]

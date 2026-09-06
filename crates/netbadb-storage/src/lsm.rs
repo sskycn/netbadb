@@ -1149,6 +1149,22 @@ impl LsmStorage {
             .read(cursor, max_batches, max_bytes)
     }
 
+    pub(crate) fn gc_change_stream(
+        &mut self,
+        frontier: netbadb_types::StorageDataVersion,
+    ) -> Result<crate::ChangeStreamGcStorageReport, StorageError> {
+        let mut shared = self.shared.borrow_mut();
+        if shared.runtime.outstanding_transactions.get() != 0
+            || shared.runtime.writer.get().is_some()
+        {
+            return Err(TransactionError::OutstandingTransactions {
+                count: shared.runtime.outstanding_transactions.get(),
+            }
+            .into());
+        }
+        shared.change_stream.gc_through(frontier)
+    }
+
     pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
         self.shared.borrow().change_stream.inspection()
     }
