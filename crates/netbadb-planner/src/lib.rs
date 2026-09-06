@@ -94,6 +94,11 @@ pub struct ColumnarProjectionPlanningSnapshot {
     pub row_count: u64,
     pub row_group_count: u64,
     pub segment_bytes: u64,
+    pub delta_segment_count: u64,
+    pub delta_bytes: u64,
+    pub delta_mutation_count: u64,
+    pub delta_live_row_count: u64,
+    pub suppressed_version_count: u64,
     pub row_groups: Vec<ColumnarRowGroupPlanningSnapshot>,
 }
 
@@ -602,6 +607,15 @@ fn columnar_work_units(
         .saturating_add(selected_groups)
         .saturating_add(required_bytes.div_ceil(4096))
         .saturating_add(decoded_values.div_ceil(256))
+        .saturating_add(projection.delta_segment_count)
+        .saturating_add(projection.delta_bytes.div_ceil(4096))
+        .saturating_add(projection.delta_mutation_count.div_ceil(256))
+        .saturating_add(
+            projection
+                .delta_live_row_count
+                .saturating_add(projection.suppressed_version_count)
+                .div_ceil(256),
+        )
 }
 
 fn planning_group_cannot_match(
@@ -2311,6 +2325,11 @@ mod tests {
                 .flat_map(|group| &group.columns)
                 .map(|column| column.encoded_bytes)
                 .sum(),
+            delta_segment_count: 0,
+            delta_bytes: 0,
+            delta_mutation_count: 0,
+            delta_live_row_count: 0,
+            suppressed_version_count: 0,
             row_groups: groups,
         }
     }
@@ -2461,6 +2480,68 @@ mod tests {
         assert!(friendly_work < hostile_work);
         assert_eq!(friendly_work, 5);
         assert_eq!(hostile_work, 16);
+    }
+
+    #[test]
+    fn delta_cost_is_structural_and_never_receives_base_zone_map_credit() {
+        let column = ColumnId(1);
+        let mut small = columnar_snapshot(
+            vec![column],
+            vec![planning_group(1_000, &[column], 8_000, 0, 999)],
+        );
+        small.delta_segment_count = 1;
+        small.delta_bytes = 4_096;
+        small.delta_mutation_count = 64;
+        small.delta_live_row_count = 32;
+        small.suppressed_version_count = 32;
+        let mut large = small.clone();
+        large.delta_segment_count = 128;
+        large.delta_bytes = 64 * 1024 * 1024;
+        large.delta_mutation_count = 500_000;
+        large.delta_live_row_count = 250_000;
+        large.suppressed_version_count = 250_000;
+        let impossible = [ColumnarPlanningConstraint {
+            column_id: column,
+            lower: Some((ScalarValue::Int64(2_000), true)),
+            upper: None,
+        }];
+        let base = columnar_snapshot(
+            vec![column],
+            vec![planning_group(1_000, &[column], 8_000, 0, 999)],
+        );
+        let base_pruned = columnar_work_units(&base, &[column], &impossible);
+        let small_pruned = columnar_work_units(&small, &[column], &impossible);
+        let large_pruned = columnar_work_units(&large, &[column], &impossible);
+        assert!(small_pruned > base_pruned);
+        assert!(large_pruned > small_pruned);
+        assert_eq!(
+            small_pruned.saturating_sub(base_pruned),
+            columnar_work_units(&small, &[], &impossible).saturating_sub(columnar_work_units(
+                &base,
+                &[],
+                &impossible
+            )),
+            "base pruning cannot discount delta work"
+        );
+
+        let source = test_column(1, "value", false);
+        let logical = LogicalPlan::Scan {
+            binding_id: RelationBindingId(7),
+            table_id: TableId(1),
+            table_name: "values".into(),
+            columns: vec![source],
+        };
+        let planned = plan_with_columnar_snapshots(
+            &logical,
+            &[analyzed_table(1_000, 10)],
+            &[],
+            &[],
+            &[large],
+        );
+        assert!(
+            matches!(base_plan(&planned), PhysicalPlan::SeqScan { .. }),
+            "large delta state must be able to make the authoritative scan cheaper"
+        );
     }
 
     #[test]

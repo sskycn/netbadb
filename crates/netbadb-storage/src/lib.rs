@@ -29,8 +29,9 @@ pub use change_stream::{
 };
 pub use columnar::{
     ColumnarBatch, ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics,
-    ColumnarConstraint, ColumnarError, ColumnarProjection, ColumnarProjectionMetadata,
-    ColumnarRowGroupStatistics, ColumnarScanStatistics, ColumnarVector, PreparedColumnarProjection,
+    ColumnarConstraint, ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata,
+    ColumnarProjection, ColumnarProjectionMetadata, ColumnarRowGroupStatistics,
+    ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance, PreparedColumnarProjection,
     StorageSnapshotToken,
 };
 pub use heap::{

@@ -1,12 +1,13 @@
 //! Immutable derived columnar projections.
 //!
-//! The `NBCM` manifest and `NBCS` segment formats are experimental version 1
-//! formats. All integers are little-endian and every file ends in a CRC32C of
-//! the preceding bytes. A projection is published by syncing an immutable
-//! segment, atomically replacing the manifest, and syncing the parent
-//! directory. Heap or LSM data remains authoritative.
+//! `NBCM`/`NBCS` version 1 describe snapshot projections. Version 2 adds the
+//! hidden source-version identities and incremental metadata needed to merge
+//! immutable `NBCD` version 1 delta segments. All integers are little-endian
+//! and every file ends in a CRC32C of the preceding bytes. Heap or LSM data
+//! remains authoritative.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -16,13 +17,19 @@ use std::path::{Path, PathBuf};
 use netbadb_index::compare_values;
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{
-    ColumnId, ColumnarGeneration, ColumnarProjectionId, ColumnarSegmentId, PhysicalType,
-    ScalarValue, StorageId, TableId,
+    ChangeStreamGeneration, ColumnId, ColumnarGeneration, ColumnarProjectionId, ColumnarSegmentId,
+    LsmCommitSeq, LsmRowId, PageId, PhysicalType, RowId, ScalarValue, StorageDataVersion,
+    StorageId, TableId,
 };
+
+use crate::{ChangeBatch, StorageChange, StorageVersionKey};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"NBCM";
 const SEGMENT_MAGIC: &[u8; 4] = b"NBCS";
-const FORMAT_VERSION: u16 = 1;
+const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const INCREMENTAL_FORMAT_VERSION: u16 = 2;
+const DELTA_MAGIC: &[u8; 4] = b"NBCD";
+const DELTA_FORMAT_VERSION: u16 = 1;
 const MANIFEST_FILE: &str = "projection.nbcmanifest";
 const MAX_FILE_BYTES: u64 = 1 << 34;
 const MAX_COLUMNS: u32 = 1 << 20;
@@ -116,6 +123,13 @@ pub struct ColumnarScanStatistics {
     pub rows_read: u64,
     pub column_chunks_read: u64,
     pub bytes_read: u64,
+    pub base_rows_suppressed: u64,
+    pub delta_segments: u64,
+    pub delta_mutations: u64,
+    pub delta_live_rows: u64,
+    pub delta_rows_emitted: u64,
+    pub delta_bytes_read: u64,
+    pub merged_rows: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +226,7 @@ pub struct ColumnarBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowGroup {
     rows: u32,
+    source_versions: Option<Vec<StorageVersionKey>>,
     columns: Vec<ColumnarBatchColumn>,
     statistics: Vec<(ColumnId, ColumnarColumnStatistics)>,
 }
@@ -229,6 +244,43 @@ pub struct ColumnarProjectionMetadata {
     pub row_group_count: u64,
     pub segment_count: u64,
     pub segment_bytes: u64,
+    pub incremental: Option<ColumnarIncrementalMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarIncrementalMetadata {
+    pub stream_generation: ChangeStreamGeneration,
+    pub base_frontier: StorageDataVersion,
+    pub applied_frontier: StorageDataVersion,
+    pub delta_segments: Vec<ColumnarDeltaSegmentMetadata>,
+    pub delta_mutation_count: u64,
+    pub delta_live_row_count: u64,
+    pub suppressed_version_count: u64,
+    pub delta_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarDeltaSegmentMetadata {
+    pub file: String,
+    pub before: StorageDataVersion,
+    pub after: StorageDataVersion,
+    pub mutation_count: u64,
+    pub after_row_count: u64,
+    pub bytes: u64,
+    pub checksum: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectedDeltaMutation {
+    old_version: Option<StorageVersionKey>,
+    new_version: Option<StorageVersionKey>,
+    after: Option<Vec<ScalarValue>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeltaOverlay {
+    suppressed: HashSet<StorageVersionKey>,
+    live: HashMap<StorageVersionKey, Vec<ScalarValue>>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +290,7 @@ pub struct ColumnarProjection {
     segment_id: ColumnarSegmentId,
     segment_file: String,
     row_groups: Vec<RowGroup>,
+    overlay: DeltaOverlay,
 }
 
 /// Fully written and synced generation that is not yet visible to readers.
@@ -248,7 +301,18 @@ pub struct PreparedColumnarProjection {
     segment_id: ColumnarSegmentId,
     segment_file: String,
     row_groups: Vec<RowGroup>,
+    overlay: DeltaOverlay,
     segment_tmp: PathBuf,
+    manifest_tmp: PathBuf,
+    published: bool,
+}
+
+#[derive(Debug)]
+pub struct PreparedColumnarAdvance {
+    root: PathBuf,
+    projection: ColumnarProjection,
+    delta_tmp: PathBuf,
+    delta_final: PathBuf,
     manifest_tmp: PathBuf,
     published: bool,
 }
@@ -273,7 +337,31 @@ impl PreparedColumnarProjection {
             segment_id: self.segment_id,
             segment_file: self.segment_file.clone(),
             row_groups: self.row_groups.clone(),
+            overlay: self.overlay.clone(),
         })
+    }
+}
+
+impl PreparedColumnarAdvance {
+    pub fn publish(mut self) -> Result<ColumnarProjection, ColumnarError> {
+        fs::rename(&self.delta_tmp, &self.delta_final).map_err(ColumnarError::Io)?;
+        crash("delta-renamed");
+        sync_directory(&self.root)?;
+        crash("delta-directory-synced");
+        fs::rename(&self.manifest_tmp, self.root.join(MANIFEST_FILE)).map_err(ColumnarError::Io)?;
+        crash("delta-manifest-renamed");
+        sync_directory(&self.root)?;
+        self.published = true;
+        Ok(self.projection.clone())
+    }
+}
+
+impl Drop for PreparedColumnarAdvance {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.delta_tmp);
+            let _ = fs::remove_file(&self.manifest_tmp);
+        }
     }
 }
 
@@ -334,6 +422,7 @@ impl ColumnarProjection {
             },
             &column_specs,
             &row_groups,
+            SNAPSHOT_FORMAT_VERSION,
         )?;
         let segment_checksum = stored_checksum(&segment)?;
         let segment_bytes = u64::try_from(segment.len())
@@ -353,6 +442,7 @@ impl ColumnarProjection {
                 .map_err(|_| ColumnarError::InvalidInput("row-group count overflow"))?,
             segment_count: 1,
             segment_bytes,
+            incremental: None,
         };
         let manifest = encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)?;
         let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
@@ -369,6 +459,110 @@ impl ColumnarProjection {
             segment_id,
             segment_file,
             row_groups,
+            overlay: DeltaOverlay::default(),
+            segment_tmp,
+            manifest_tmp,
+            published: false,
+        })
+    }
+
+    /// Builds an NBCS/NBCM v2 base bound to one committed change-stream
+    /// frontier. Source version keys remain hidden from the SQL schema.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_incremental(
+        root: impl AsRef<Path>,
+        id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+        table: &TableDef,
+        source_storage_id: StorageId,
+        source_token: StorageSnapshotToken,
+        cursor: crate::ChangeStreamCursor,
+        columns: &[ColumnId],
+        rows: &[(StorageVersionKey, Vec<ScalarValue>)],
+        row_group_rows: Option<usize>,
+    ) -> Result<PreparedColumnarProjection, ColumnarError> {
+        if source_token.storage_id() != source_storage_id || cursor.storage_id != source_storage_id
+        {
+            return Err(ColumnarError::IdentityMismatch(
+                "incremental source storage",
+            ));
+        }
+        if cursor.generation.0 == 0 {
+            return Err(ColumnarError::InvalidInput("zero change-stream generation"));
+        }
+        let column_specs = resolve_columns(table, columns)?;
+        validate_versioned_rows(source_storage_id, source_token.kind, &column_specs, rows)?;
+        let group_rows = row_group_rows.unwrap_or(DEFAULT_ROW_GROUP_ROWS);
+        if group_rows == 0 || group_rows > u32::MAX as usize {
+            return Err(ColumnarError::InvalidInput("invalid row-group size"));
+        }
+        let root = root.as_ref().to_owned();
+        fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
+        let segment_id = ColumnarSegmentId(generation.0);
+        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let row_groups = rows
+            .chunks(group_rows)
+            .map(|chunk| encode_versioned_row_group(&column_specs, chunk))
+            .collect::<Result<Vec<_>, _>>()?;
+        let fingerprint = table.fingerprint().map_err(ColumnarError::Schema)?;
+        let metadata_seed = ColumnarProjectionMetadata {
+            id,
+            generation,
+            table_id: table.id,
+            source_storage_id,
+            source_token,
+            schema_fingerprint: fingerprint,
+            columns: column_specs,
+            row_count: u64::try_from(rows.len())
+                .map_err(|_| ColumnarError::InvalidInput("row count overflow"))?,
+            row_group_count: u64::try_from(row_groups.len())
+                .map_err(|_| ColumnarError::InvalidInput("row-group count overflow"))?,
+            segment_count: 1,
+            segment_bytes: 0,
+            incremental: Some(ColumnarIncrementalMetadata {
+                stream_generation: cursor.generation,
+                base_frontier: cursor.frontier,
+                applied_frontier: cursor.frontier,
+                delta_segments: Vec::new(),
+                delta_mutation_count: 0,
+                delta_live_row_count: 0,
+                suppressed_version_count: 0,
+                delta_bytes: 0,
+            }),
+        };
+        let segment = encode_segment(
+            SegmentIdentity {
+                projection_id: id,
+                generation,
+                segment_id,
+                table_id: table.id,
+                storage_id: source_storage_id,
+                fingerprint,
+            },
+            &metadata_seed.columns,
+            &row_groups,
+            INCREMENTAL_FORMAT_VERSION,
+        )?;
+        let segment_checksum = stored_checksum(&segment)?;
+        let mut metadata = metadata_seed;
+        metadata.segment_bytes = u64::try_from(segment.len())
+            .map_err(|_| ColumnarError::InvalidInput("segment length overflow"))?;
+        let manifest = encode_manifest(&metadata, segment_id, &segment_file, segment_checksum)?;
+        let suffix = format!("{}.{}.{}", std::process::id(), id.0, generation.0);
+        let segment_tmp = root.join(format!(".{segment_file}.tmp.{suffix}"));
+        let manifest_tmp = root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        write_new_synced(&segment_tmp, &segment)?;
+        if let Err(error) = write_new_synced(&manifest_tmp, &manifest) {
+            let _ = fs::remove_file(&segment_tmp);
+            return Err(error);
+        }
+        Ok(PreparedColumnarProjection {
+            root,
+            metadata,
+            segment_id,
+            segment_file,
+            row_groups,
+            overlay: DeltaOverlay::default(),
             segment_tmp,
             manifest_tmp,
             published: false,
@@ -404,12 +598,38 @@ impl ColumnarProjection {
         if decoded.segment_id != manifest.segment_id {
             return Err(ColumnarError::IdentityMismatch("segment"));
         }
+        let mut overlay = DeltaOverlay::default();
+        if let Some(incremental) = &manifest.metadata.incremental {
+            let mut expected = incremental.base_frontier;
+            for delta in &incremental.delta_segments {
+                if delta.before != expected || delta.after.0 <= delta.before.0 {
+                    return Err(ColumnarError::Corrupt("broken delta frontier chain"));
+                }
+                let path = root.join(&delta.file);
+                let bytes = read_bounded(&path)?;
+                if u64::try_from(bytes.len()).ok() != Some(delta.bytes)
+                    || stored_checksum(&bytes)? != delta.checksum
+                {
+                    return Err(ColumnarError::ChecksumMismatch { path });
+                }
+                let mutations = decode_delta(&bytes, &manifest.metadata, delta)?;
+                apply_overlay(&mut overlay, &mutations)?;
+                expected = delta.after;
+            }
+            if expected != incremental.applied_frontier
+                || overlay.live.len() as u64 != incremental.delta_live_row_count
+                || overlay.suppressed.len() as u64 != incremental.suppressed_version_count
+            {
+                return Err(ColumnarError::Corrupt("delta manifest statistics mismatch"));
+            }
+        }
         Ok(Self {
             root,
             metadata: manifest.metadata,
             segment_id: manifest.segment_id,
             segment_file: manifest.segment_file,
             row_groups: decoded.row_groups,
+            overlay,
         })
     }
 
@@ -439,6 +659,127 @@ impl ColumnarProjection {
             .collect()
     }
 
+    #[must_use]
+    pub fn is_incremental(&self) -> bool {
+        self.metadata.incremental.is_some()
+    }
+
+    /// Converts one bounded contiguous NBCL read into a synced immutable NBCD
+    /// segment and a synced replacement NBCM. Publication remains explicit.
+    pub fn prepare_advance(
+        &self,
+        table: &TableDef,
+        batches: &[ChangeBatch],
+    ) -> Result<PreparedColumnarAdvance, ColumnarError> {
+        let incremental = self
+            .metadata
+            .incremental
+            .as_ref()
+            .ok_or(ColumnarError::InvalidInput(
+                "snapshot projection cannot advance",
+            ))?;
+        if batches.is_empty() {
+            return Err(ColumnarError::InvalidInput("advance contains no batches"));
+        }
+        if table.id != self.metadata.table_id
+            || table.fingerprint().map_err(ColumnarError::Schema)?
+                != self.metadata.schema_fingerprint
+        {
+            return Err(ColumnarError::IdentityMismatch("advance schema"));
+        }
+        let projected = project_change_batches(table, &self.metadata, batches)?;
+        let before = batches[0].before;
+        let after = batches
+            .last()
+            .map(|batch| batch.after)
+            .ok_or(ColumnarError::InvalidInput("advance contains no batches"))?;
+        if before != incremental.applied_frontier {
+            return Err(ColumnarError::IdentityMismatch("advance frontier"));
+        }
+        let delta_file = format!(
+            "projection-{}-g{}-d{}.nbcd",
+            self.metadata.id.0, self.metadata.generation.0, after.0
+        );
+        let delta = encode_delta(&self.metadata, batches, &projected)?;
+        let checksum = stored_checksum(&delta)?;
+        let bytes = u64::try_from(delta.len())
+            .map_err(|_| ColumnarError::InvalidInput("delta length overflow"))?;
+        let mutation_count = u64::try_from(projected.len())
+            .map_err(|_| ColumnarError::InvalidInput("delta mutation count overflow"))?;
+        let after_row_count = projected
+            .iter()
+            .filter(|change| change.after.is_some())
+            .count() as u64;
+        let mut replacement = self.clone();
+        apply_overlay(&mut replacement.overlay, &projected)?;
+        let replacement_incremental = replacement
+            .metadata
+            .incremental
+            .as_mut()
+            .ok_or(ColumnarError::Corrupt("incremental metadata disappeared"))?;
+        replacement_incremental
+            .delta_segments
+            .push(ColumnarDeltaSegmentMetadata {
+                file: delta_file.clone(),
+                before,
+                after,
+                mutation_count,
+                after_row_count,
+                bytes,
+                checksum,
+            });
+        replacement_incremental.applied_frontier = after;
+        replacement_incremental.delta_mutation_count = replacement_incremental
+            .delta_mutation_count
+            .checked_add(mutation_count)
+            .ok_or(ColumnarError::InvalidInput("delta mutation total overflow"))?;
+        replacement_incremental.delta_live_row_count = replacement.overlay.live.len() as u64;
+        replacement_incremental.suppressed_version_count =
+            replacement.overlay.suppressed.len() as u64;
+        replacement_incremental.delta_bytes = replacement_incremental
+            .delta_bytes
+            .checked_add(bytes)
+            .ok_or(ColumnarError::InvalidInput("delta byte total overflow"))?;
+        replacement.metadata.segment_count = 1_u64
+            .checked_add(replacement_incremental.delta_segments.len() as u64)
+            .ok_or(ColumnarError::InvalidInput("segment count overflow"))?;
+        let manifest = encode_manifest(
+            &replacement.metadata,
+            replacement.segment_id,
+            &replacement.segment_file,
+            stored_checksum(&read_bounded(&self.root.join(&self.segment_file))?)?,
+        )?;
+        let suffix = format!("{}.{}.{}", std::process::id(), self.metadata.id.0, after.0);
+        let delta_tmp = self.root.join(format!(".{delta_file}.tmp.{suffix}"));
+        let manifest_tmp = self.root.join(format!(".{MANIFEST_FILE}.tmp.{suffix}"));
+        write_advance_file_synced(
+            &delta_tmp,
+            &delta,
+            "delta-temp-created",
+            "delta-written",
+            "delta-synced",
+        )?;
+        if let Err(error) = write_advance_file_synced(
+            &manifest_tmp,
+            &manifest,
+            "delta-manifest-temp-created",
+            "delta-manifest-written",
+            "delta-manifest-synced",
+        ) {
+            let _ = fs::remove_file(&delta_tmp);
+            return Err(error);
+        }
+        crash("delta-manifest-synced");
+        Ok(PreparedColumnarAdvance {
+            root: self.root.clone(),
+            projection: replacement,
+            delta_tmp,
+            delta_final: self.root.join(delta_file),
+            manifest_tmp,
+            published: false,
+        })
+    }
+
     pub fn scan(
         &self,
         columns: &[ColumnId],
@@ -456,6 +797,22 @@ impl ColumnarProjection {
         }
         let mut statistics = ColumnarScanStatistics {
             row_groups_total: u64::try_from(self.row_groups.len()).unwrap_or(u64::MAX),
+            delta_segments: self
+                .metadata
+                .incremental
+                .as_ref()
+                .map_or(0, |value| value.delta_segments.len() as u64),
+            delta_mutations: self
+                .metadata
+                .incremental
+                .as_ref()
+                .map_or(0, |value| value.delta_mutation_count),
+            delta_live_rows: self.overlay.live.len() as u64,
+            delta_bytes_read: self
+                .metadata
+                .incremental
+                .as_ref()
+                .map_or(0, |value| value.delta_bytes),
             ..ColumnarScanStatistics::default()
         };
         let mut batches = Vec::new();
@@ -468,7 +825,23 @@ impl ColumnarProjection {
                 continue;
             }
             statistics.row_groups_read += 1;
-            statistics.rows_read = statistics.rows_read.saturating_add(u64::from(group.rows));
+            let retained = match &group.source_versions {
+                Some(keys) => keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, key)| {
+                        if self.overlay.suppressed.contains(key) {
+                            statistics.base_rows_suppressed =
+                                statistics.base_rows_suppressed.saturating_add(1);
+                            None
+                        } else {
+                            Some(row)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                None => (0..group.rows as usize).collect(),
+            };
+            statistics.rows_read = statistics.rows_read.saturating_add(retained.len() as u64);
             let selected = columns
                 .iter()
                 .map(|column| {
@@ -476,7 +849,10 @@ impl ColumnarProjection {
                         .columns
                         .iter()
                         .find(|candidate| candidate.column_id == *column)
-                        .cloned()
+                        .map(|candidate| ColumnarBatchColumn {
+                            column_id: candidate.column_id,
+                            values: select_vector_rows(&candidate.values, &retained),
+                        })
                         .ok_or(ColumnarError::Corrupt(
                             "row group is missing a projected column",
                         ))
@@ -491,11 +867,62 @@ impl ColumnarProjection {
                     .saturating_add(vector_encoded_bytes(&column.values));
             }
             batches.push(ColumnarBatch {
-                row_count: usize::try_from(group.rows)
-                    .map_err(|_| ColumnarError::Corrupt("row-group row count overflow"))?,
+                row_count: retained.len(),
                 columns: selected,
             });
         }
+        if !self.overlay.live.is_empty() {
+            let mut live = self.overlay.live.iter().collect::<Vec<_>>();
+            live.sort_by_key(|(key, _)| version_key_sort_key(**key));
+            let positions = columns
+                .iter()
+                .map(|column| {
+                    self.metadata
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.column_id == *column)
+                        .ok_or(ColumnarError::UnknownColumn(*column))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let rows = live
+                .into_iter()
+                .map(|(_, row)| {
+                    positions
+                        .iter()
+                        .map(|position| row[*position].clone())
+                        .collect()
+                })
+                .collect::<Vec<Vec<ScalarValue>>>();
+            let specs = columns
+                .iter()
+                .map(|column| {
+                    self.metadata
+                        .columns
+                        .iter()
+                        .find(|candidate| candidate.column_id == *column)
+                        .cloned()
+                        .ok_or(ColumnarError::UnknownColumn(*column))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let delta_group = encode_row_group(&specs, &rows)?;
+            statistics.delta_rows_emitted = rows.len() as u64;
+            statistics.rows_read = statistics.rows_read.saturating_add(rows.len() as u64);
+            statistics.column_chunks_read = statistics
+                .column_chunks_read
+                .saturating_add(delta_group.columns.len() as u64);
+            statistics.bytes_read = statistics.bytes_read.saturating_add(
+                delta_group
+                    .columns
+                    .iter()
+                    .map(|column| vector_encoded_bytes(&column.values))
+                    .sum::<u64>(),
+            );
+            batches.push(ColumnarBatch {
+                row_count: rows.len(),
+                columns: delta_group.columns,
+            });
+        }
+        statistics.merged_rows = statistics.rows_read;
         Ok((batches, statistics))
     }
 
@@ -512,16 +939,95 @@ impl ColumnarProjection {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(ColumnarError::Io(error)),
         }
+        if let Some(incremental) = &self.metadata.incremental {
+            for delta in &incremental.delta_segments {
+                match fs::remove_file(self.root.join(&delta.file)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ColumnarError::Io(error)),
+                }
+            }
+        }
         sync_directory(&self.root)
     }
 
     /// Removes only this immutable generation after a newer manifest is durable.
     pub fn retire_segment(self) -> Result<(), ColumnarError> {
         match fs::remove_file(self.root.join(&self.segment_file)) {
-            Ok(()) => sync_directory(&self.root),
+            Ok(()) => {
+                if let Some(incremental) = &self.metadata.incremental {
+                    for delta in &incremental.delta_segments {
+                        match fs::remove_file(self.root.join(&delta.file)) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(ColumnarError::Io(error)),
+                        }
+                    }
+                }
+                sync_directory(&self.root)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(ColumnarError::Io(error)),
         }
+    }
+}
+
+fn select_vector_rows(vector: &ColumnarVector, rows: &[usize]) -> ColumnarVector {
+    let mut validity = vec![0_u8; rows.len().div_ceil(8)];
+    for (output, input) in rows.iter().copied().enumerate() {
+        let source = match vector {
+            ColumnarVector::Bool { validity, .. }
+            | ColumnarVector::Int64 { validity, .. }
+            | ColumnarVector::UInt64 { validity, .. }
+            | ColumnarVector::Text { validity, .. } => validity,
+        };
+        if valid_at(source, input) {
+            set_valid(&mut validity, output);
+        }
+    }
+    match vector {
+        ColumnarVector::Bool { values, .. } => ColumnarVector::Bool {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::Int64 { values, .. } => ColumnarVector::Int64 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::UInt64 { values, .. } => ColumnarVector::UInt64 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::Text { offsets, bytes, .. } => {
+            let mut selected_offsets = Vec::with_capacity(rows.len() + 1);
+            let mut selected_bytes = Vec::new();
+            selected_offsets.push(0);
+            for row in rows {
+                let start = offsets[*row] as usize;
+                let end = offsets[*row + 1] as usize;
+                selected_bytes.extend_from_slice(&bytes[start..end]);
+                selected_offsets.push(u32::try_from(selected_bytes.len()).unwrap_or(u32::MAX));
+            }
+            ColumnarVector::Text {
+                offsets: selected_offsets,
+                bytes: selected_bytes,
+                validity,
+            }
+        }
+    }
+}
+
+fn version_key_sort_key(key: StorageVersionKey) -> (u8, u64, u64, u64) {
+    match key {
+        StorageVersionKey::Heap { row_id, .. } => (
+            1,
+            row_id.page.0,
+            u64::from(row_id.slot),
+            u64::from(row_id.generation),
+        ),
+        StorageVersionKey::Lsm {
+            row_id, version, ..
+        } => (2, row_id.0, version.0, 0),
     }
 }
 
@@ -662,9 +1168,23 @@ fn encode_row_group(
     Ok(RowGroup {
         rows: u32::try_from(rows.len())
             .map_err(|_| ColumnarError::InvalidInput("row-group row count overflow"))?,
+        source_versions: None,
         columns: vectors,
         statistics,
     })
+}
+
+fn encode_versioned_row_group(
+    columns: &[ColumnarColumnSpec],
+    rows: &[(StorageVersionKey, Vec<ScalarValue>)],
+) -> Result<RowGroup, ColumnarError> {
+    let values = rows
+        .iter()
+        .map(|(_, values)| values.clone())
+        .collect::<Vec<_>>();
+    let mut group = encode_row_group(columns, &values)?;
+    group.source_versions = Some(rows.iter().map(|(key, _)| *key).collect());
+    Ok(group)
 }
 
 fn vector_from_values(
@@ -814,6 +1334,490 @@ fn group_cannot_match(group: &RowGroup, constraint: &ColumnarConstraint) -> bool
     false
 }
 
+fn validate_versioned_rows(
+    storage_id: StorageId,
+    kind: SnapshotKind,
+    columns: &[ColumnarColumnSpec],
+    rows: &[(StorageVersionKey, Vec<ScalarValue>)],
+) -> Result<(), ColumnarError> {
+    let mut seen = HashSet::with_capacity(rows.len());
+    for (key, values) in rows {
+        validate_version_key(*key, storage_id, kind)?;
+        if !seen.insert(*key) {
+            return Err(ColumnarError::InvalidInput("duplicate base source version"));
+        }
+        if values.len() != columns.len() {
+            return Err(ColumnarError::InvalidInput(
+                "row width differs from projection",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_version_key(
+    key: StorageVersionKey,
+    storage_id: StorageId,
+    kind: SnapshotKind,
+) -> Result<(), ColumnarError> {
+    if storage_id.0 == 0 || key.storage_id() != storage_id {
+        return Err(ColumnarError::IdentityMismatch("version storage"));
+    }
+    match (kind, key) {
+        (SnapshotKind::Heap, StorageVersionKey::Heap { row_id, .. })
+            if row_id.page.0 != 0 && row_id.generation != 0 =>
+        {
+            Ok(())
+        }
+        (
+            SnapshotKind::Lsm,
+            StorageVersionKey::Lsm {
+                row_id, version, ..
+            },
+        ) if row_id.0 != 0 && version.0 != 0 => Ok(()),
+        (SnapshotKind::Heap, StorageVersionKey::Heap { .. }) => {
+            Err(ColumnarError::Corrupt("invalid Heap version identity"))
+        }
+        (SnapshotKind::Lsm, StorageVersionKey::Lsm { .. }) => {
+            Err(ColumnarError::Corrupt("invalid LSM version identity"))
+        }
+        _ => Err(ColumnarError::IdentityMismatch("version engine kind")),
+    }
+}
+
+fn encode_version_key(
+    output: &mut Vec<u8>,
+    key: StorageVersionKey,
+    storage_id: StorageId,
+) -> Result<(), ColumnarError> {
+    let kind = match key {
+        StorageVersionKey::Heap { .. } => SnapshotKind::Heap,
+        StorageVersionKey::Lsm { .. } => SnapshotKind::Lsm,
+    };
+    validate_version_key(key, storage_id, kind)?;
+    match key {
+        StorageVersionKey::Heap { row_id, .. } => {
+            output.push(1);
+            output.extend_from_slice(&[0; 7]);
+            push_u64(output, row_id.page.0);
+            push_u16(output, row_id.slot);
+            push_u32(output, row_id.generation);
+            push_u16(output, 0);
+        }
+        StorageVersionKey::Lsm {
+            row_id, version, ..
+        } => {
+            output.push(2);
+            output.extend_from_slice(&[0; 7]);
+            push_u64(output, row_id.0);
+            push_u64(output, version.0);
+        }
+    }
+    Ok(())
+}
+
+fn decode_version_key(
+    reader: &mut Reader<'_>,
+    storage_id: StorageId,
+    expected_kind: SnapshotKind,
+) -> Result<StorageVersionKey, ColumnarError> {
+    let tag = reader.u8()?;
+    if reader.take(7)?.iter().any(|byte| *byte != 0) {
+        return Err(ColumnarError::Corrupt(
+            "version key reserved bytes are nonzero",
+        ));
+    }
+    let key = match tag {
+        1 => {
+            let page = PageId(reader.u64()?);
+            let slot = reader.u16()?;
+            let generation = reader.u32()?;
+            if reader.u16()? != 0 {
+                return Err(ColumnarError::Corrupt(
+                    "Heap key reserved bytes are nonzero",
+                ));
+            }
+            StorageVersionKey::Heap {
+                storage_id,
+                row_id: RowId {
+                    page,
+                    slot,
+                    generation,
+                },
+            }
+        }
+        2 => StorageVersionKey::Lsm {
+            storage_id,
+            row_id: LsmRowId(reader.u64()?),
+            version: LsmCommitSeq(reader.u64()?),
+        },
+        _ => return Err(ColumnarError::Corrupt("unknown version key tag")),
+    };
+    validate_version_key(key, storage_id, expected_kind)?;
+    Ok(key)
+}
+
+fn project_change_batches(
+    table: &TableDef,
+    metadata: &ColumnarProjectionMetadata,
+    batches: &[ChangeBatch],
+) -> Result<Vec<ProjectedDeltaMutation>, ColumnarError> {
+    let incremental = metadata
+        .incremental
+        .as_ref()
+        .ok_or(ColumnarError::InvalidInput(
+            "snapshot projection cannot consume changes",
+        ))?;
+    let positions = metadata
+        .columns
+        .iter()
+        .map(|column| {
+            table
+                .columns
+                .iter()
+                .position(|candidate| candidate.id == column.column_id)
+                .ok_or(ColumnarError::UnknownColumn(column.column_id))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = incremental.applied_frontier;
+    let mut projected = Vec::new();
+    for batch in batches {
+        if batch.table_id != metadata.table_id
+            || batch.storage_id != metadata.source_storage_id
+            || batch.schema_fingerprint != metadata.schema_fingerprint
+            || batch.before != expected
+            || batch.after.0 <= batch.before.0
+        {
+            return Err(ColumnarError::IdentityMismatch(
+                "change batch context or frontier",
+            ));
+        }
+        expected = batch.after;
+        for mutation in &batch.mutations {
+            let value = match mutation {
+                StorageChange::Insert { new_version, after } => ProjectedDeltaMutation {
+                    old_version: None,
+                    new_version: Some(*new_version),
+                    after: Some(project_after(after, &positions)?),
+                },
+                StorageChange::Update {
+                    old_version,
+                    new_version,
+                    after,
+                } => {
+                    if old_version == new_version {
+                        return Err(ColumnarError::Corrupt("update preserves version identity"));
+                    }
+                    ProjectedDeltaMutation {
+                        old_version: Some(*old_version),
+                        new_version: Some(*new_version),
+                        after: Some(project_after(after, &positions)?),
+                    }
+                }
+                StorageChange::Delete { old_version } => ProjectedDeltaMutation {
+                    old_version: Some(*old_version),
+                    new_version: None,
+                    after: None,
+                },
+            };
+            if let Some(key) = value.old_version {
+                validate_version_key(key, metadata.source_storage_id, metadata.source_token.kind)?;
+            }
+            if let Some(key) = value.new_version {
+                validate_version_key(key, metadata.source_storage_id, metadata.source_token.kind)?;
+            }
+            projected.push(value);
+        }
+    }
+    Ok(projected)
+}
+
+fn project_after(
+    after: &[ScalarValue],
+    positions: &[usize],
+) -> Result<Vec<ScalarValue>, ColumnarError> {
+    positions
+        .iter()
+        .map(|position| {
+            after
+                .get(*position)
+                .cloned()
+                .ok_or(ColumnarError::Corrupt("change after-image is too short"))
+        })
+        .collect()
+}
+
+fn apply_overlay(
+    overlay: &mut DeltaOverlay,
+    mutations: &[ProjectedDeltaMutation],
+) -> Result<(), ColumnarError> {
+    for mutation in mutations {
+        if let Some(old) = mutation.old_version {
+            if !overlay.suppressed.insert(old) {
+                return Err(ColumnarError::Corrupt(
+                    "one version has multiple durable delta transitions",
+                ));
+            }
+            overlay.live.remove(&old);
+        }
+        match (mutation.new_version, mutation.after.as_ref()) {
+            (Some(new), Some(after)) => {
+                if overlay.suppressed.contains(&new)
+                    || overlay.live.insert(new, after.clone()).is_some()
+                {
+                    return Err(ColumnarError::Corrupt(
+                        "duplicate or suppressed new delta version",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(ColumnarError::Corrupt("invalid delta mutation image")),
+        }
+    }
+    Ok(())
+}
+
+fn encode_delta(
+    metadata: &ColumnarProjectionMetadata,
+    batches: &[ChangeBatch],
+    mutations: &[ProjectedDeltaMutation],
+) -> Result<Vec<u8>, ColumnarError> {
+    let incremental = metadata
+        .incremental
+        .as_ref()
+        .ok_or(ColumnarError::InvalidInput(
+            "snapshot projection cannot encode delta",
+        ))?;
+    let before = batches[0].before;
+    let after = batches
+        .last()
+        .ok_or(ColumnarError::InvalidInput("empty delta"))?
+        .after;
+    let after_rows = mutations
+        .iter()
+        .filter_map(|mutation| mutation.after.clone())
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    output.extend_from_slice(DELTA_MAGIC);
+    push_u16(&mut output, DELTA_FORMAT_VERSION);
+    push_u16(&mut output, 0);
+    push_u64(&mut output, metadata.id.0);
+    push_u64(&mut output, metadata.generation.0);
+    push_u64(&mut output, metadata.table_id.0);
+    push_u64(&mut output, metadata.source_storage_id.0);
+    output.extend_from_slice(metadata.schema_fingerprint.as_bytes());
+    output.push(snapshot_tag(metadata.source_token.kind));
+    output.extend_from_slice(&[0; 7]);
+    push_u64(&mut output, incremental.stream_generation.0);
+    push_u64(&mut output, before.0);
+    push_u64(&mut output, after.0);
+    push_u32(
+        &mut output,
+        u32::try_from(batches.len())
+            .map_err(|_| ColumnarError::InvalidInput("batch count overflow"))?,
+    );
+    push_u64(&mut output, mutations.len() as u64);
+    push_u64(&mut output, after_rows.len() as u64);
+    push_u32(&mut output, metadata.columns.len() as u32);
+    let mut mutation_position = 0_usize;
+    let mut after_index = 0_u64;
+    for batch in batches {
+        push_u64(&mut output, batch.before.0);
+        push_u64(&mut output, batch.after.0);
+        push_u32(&mut output, batch.mutations.len() as u32);
+        for _ in &batch.mutations {
+            let mutation = &mutations[mutation_position];
+            mutation_position += 1;
+            match (
+                mutation.old_version,
+                mutation.new_version,
+                mutation.after.as_ref(),
+            ) {
+                (None, Some(new), Some(_)) => {
+                    output.push(1);
+                    encode_version_key(&mut output, new, metadata.source_storage_id)?;
+                    push_u64(&mut output, after_index);
+                    after_index += 1;
+                }
+                (Some(old), Some(new), Some(_)) => {
+                    output.push(2);
+                    encode_version_key(&mut output, old, metadata.source_storage_id)?;
+                    encode_version_key(&mut output, new, metadata.source_storage_id)?;
+                    push_u64(&mut output, after_index);
+                    after_index += 1;
+                }
+                (Some(old), None, None) => {
+                    output.push(3);
+                    encode_version_key(&mut output, old, metadata.source_storage_id)?;
+                }
+                _ => return Err(ColumnarError::InvalidInput("invalid projected mutation")),
+            }
+        }
+    }
+    let group = encode_row_group(&metadata.columns, &after_rows)?;
+    for (column, batch) in metadata.columns.iter().zip(&group.columns) {
+        let stats = group
+            .statistics
+            .iter()
+            .find(|(id, _)| *id == column.column_id)
+            .map(|(_, stats)| stats)
+            .ok_or(ColumnarError::InvalidInput(
+                "delta column statistics missing",
+            ))?;
+        encode_column_chunk(&mut output, column, &batch.values, stats)?;
+    }
+    append_checksum(&mut output);
+    Ok(output)
+}
+
+fn decode_delta(
+    bytes: &[u8],
+    metadata: &ColumnarProjectionMetadata,
+    expected_segment: &ColumnarDeltaSegmentMetadata,
+) -> Result<Vec<ProjectedDeltaMutation>, ColumnarError> {
+    validate_checksum(bytes)?;
+    let payload = bytes
+        .get(..bytes.len().saturating_sub(4))
+        .ok_or(ColumnarError::InvalidFormat("delta is truncated"))?;
+    let mut reader = Reader::new(payload);
+    reader.expect(DELTA_MAGIC)?;
+    let version = reader.u16()?;
+    if version != DELTA_FORMAT_VERSION {
+        return Err(ColumnarError::UnsupportedVersion(version));
+    }
+    if reader.u16()? != 0 {
+        return Err(ColumnarError::Corrupt("delta reserved field is nonzero"));
+    }
+    if ColumnarProjectionId(reader.u64()?) != metadata.id
+        || ColumnarGeneration(reader.u64()?) != metadata.generation
+        || TableId(reader.u64()?) != metadata.table_id
+        || StorageId(reader.u64()?) != metadata.source_storage_id
+        || SchemaFingerprint::from_bytes(reader.array()?) != metadata.schema_fingerprint
+    {
+        return Err(ColumnarError::IdentityMismatch("delta projection context"));
+    }
+    let kind = decode_snapshot_tag(reader.u8()?)?;
+    if kind != metadata.source_token.kind || reader.take(7)?.iter().any(|byte| *byte != 0) {
+        return Err(ColumnarError::IdentityMismatch("delta engine kind"));
+    }
+    let incremental = metadata
+        .incremental
+        .as_ref()
+        .ok_or(ColumnarError::Corrupt("delta on snapshot projection"))?;
+    if ChangeStreamGeneration(reader.u64()?) != incremental.stream_generation {
+        return Err(ColumnarError::IdentityMismatch("delta stream generation"));
+    }
+    let before = StorageDataVersion(reader.u64()?);
+    let after = StorageDataVersion(reader.u64()?);
+    if before != expected_segment.before || after != expected_segment.after {
+        return Err(ColumnarError::IdentityMismatch("delta frontier"));
+    }
+    let batch_count = reader.u32()?;
+    if batch_count == 0 || batch_count > crate::CHANGE_LOG_MAX_MUTATIONS {
+        return Err(ColumnarError::ResourceLimit {
+            resource: "delta batch count",
+            value: u64::from(batch_count),
+        });
+    }
+    let mutation_count = reader.u64()?;
+    let after_count = reader.u64()?;
+    if mutation_count != expected_segment.mutation_count
+        || after_count != expected_segment.after_row_count
+        || mutation_count > u64::from(crate::CHANGE_LOG_MAX_MUTATIONS)
+    {
+        return Err(ColumnarError::Corrupt("delta counts mismatch"));
+    }
+    if reader.u32()? as usize != metadata.columns.len() {
+        return Err(ColumnarError::Corrupt("delta column count mismatch"));
+    }
+    let mut descriptors = Vec::with_capacity(mutation_count as usize);
+    let mut frontier = before;
+    for _ in 0..batch_count {
+        let batch_before = StorageDataVersion(reader.u64()?);
+        let batch_after = StorageDataVersion(reader.u64()?);
+        let count = reader.u32()?;
+        if batch_before != frontier || batch_after.0 <= batch_before.0 {
+            return Err(ColumnarError::Corrupt("broken delta batch frontier"));
+        }
+        frontier = batch_after;
+        for _ in 0..count {
+            let descriptor = match reader.u8()? {
+                1 => (
+                    None,
+                    Some(decode_version_key(
+                        &mut reader,
+                        metadata.source_storage_id,
+                        kind,
+                    )?),
+                    Some(reader.u64()?),
+                ),
+                2 => {
+                    let old = decode_version_key(&mut reader, metadata.source_storage_id, kind)?;
+                    let new = decode_version_key(&mut reader, metadata.source_storage_id, kind)?;
+                    if old == new {
+                        return Err(ColumnarError::Corrupt("update preserves version identity"));
+                    }
+                    (Some(old), Some(new), Some(reader.u64()?))
+                }
+                3 => (
+                    Some(decode_version_key(
+                        &mut reader,
+                        metadata.source_storage_id,
+                        kind,
+                    )?),
+                    None,
+                    None,
+                ),
+                _ => return Err(ColumnarError::Corrupt("unknown delta mutation tag")),
+            };
+            descriptors.push(descriptor);
+        }
+    }
+    if frontier != after || descriptors.len() as u64 != mutation_count {
+        return Err(ColumnarError::Corrupt(
+            "delta chain or mutation count mismatch",
+        ));
+    }
+    let rows_u32 = u32::try_from(after_count).map_err(|_| ColumnarError::ResourceLimit {
+        resource: "delta after rows",
+        value: after_count,
+    })?;
+    let mut vectors = Vec::with_capacity(metadata.columns.len());
+    for column in &metadata.columns {
+        vectors.push(decode_column_chunk(&mut reader, column, rows_u32)?.0);
+    }
+    reader.finish()?;
+    let mut mutations = Vec::with_capacity(descriptors.len());
+    let mut used = HashSet::new();
+    for (old_version, new_version, index) in descriptors {
+        let after_row = match index {
+            Some(index) => {
+                if index >= after_count || !used.insert(index) {
+                    return Err(ColumnarError::Corrupt("invalid delta after-row reference"));
+                }
+                let row = usize::try_from(index)
+                    .map_err(|_| ColumnarError::Corrupt("after-row index overflow"))?;
+                Some(
+                    vectors
+                        .iter()
+                        .map(|vector| vector.value(row))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            None => None,
+        };
+        mutations.push(ProjectedDeltaMutation {
+            old_version,
+            new_version,
+            after: after_row,
+        });
+    }
+    if used.len() as u64 != after_count {
+        return Err(ColumnarError::Corrupt("unreferenced delta after row"));
+    }
+    Ok(mutations)
+}
+
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), ColumnarError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -822,6 +1826,26 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), ColumnarError> {
         .map_err(ColumnarError::Io)?;
     file.write_all(bytes).map_err(ColumnarError::Io)?;
     file.sync_data().map_err(ColumnarError::Io)
+}
+
+fn write_advance_file_synced(
+    path: &Path,
+    bytes: &[u8],
+    created_point: &str,
+    written_point: &str,
+    synced_point: &str,
+) -> Result<(), ColumnarError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(ColumnarError::Io)?;
+    crash(created_point);
+    file.write_all(bytes).map_err(ColumnarError::Io)?;
+    crash(written_point);
+    file.sync_data().map_err(ColumnarError::Io)?;
+    crash(synced_point);
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), ColumnarError> {
@@ -856,7 +1880,12 @@ fn encode_manifest(
 ) -> Result<Vec<u8>, ColumnarError> {
     let mut output = Vec::new();
     output.extend_from_slice(MANIFEST_MAGIC);
-    push_u16(&mut output, FORMAT_VERSION);
+    let version = if metadata.incremental.is_some() {
+        INCREMENTAL_FORMAT_VERSION
+    } else {
+        SNAPSHOT_FORMAT_VERSION
+    };
+    push_u16(&mut output, version);
     push_u16(&mut output, 0);
     push_u64(&mut output, metadata.id.0);
     push_u64(&mut output, metadata.generation.0);
@@ -885,6 +1914,29 @@ fn encode_manifest(
     push_u64(&mut output, segment_id.0);
     push_string(&mut output, segment_file)?;
     push_u32(&mut output, segment_checksum);
+    if let Some(incremental) = &metadata.incremental {
+        push_u64(&mut output, incremental.stream_generation.0);
+        push_u64(&mut output, incremental.base_frontier.0);
+        push_u64(&mut output, incremental.applied_frontier.0);
+        push_u64(&mut output, incremental.delta_mutation_count);
+        push_u64(&mut output, incremental.delta_live_row_count);
+        push_u64(&mut output, incremental.suppressed_version_count);
+        push_u64(&mut output, incremental.delta_bytes);
+        push_u32(
+            &mut output,
+            u32::try_from(incremental.delta_segments.len())
+                .map_err(|_| ColumnarError::InvalidInput("delta segment count overflow"))?,
+        );
+        for delta in &incremental.delta_segments {
+            push_string(&mut output, &delta.file)?;
+            push_u64(&mut output, delta.before.0);
+            push_u64(&mut output, delta.after.0);
+            push_u64(&mut output, delta.mutation_count);
+            push_u64(&mut output, delta.after_row_count);
+            push_u64(&mut output, delta.bytes);
+            push_u32(&mut output, delta.checksum);
+        }
+    }
     append_checksum(&mut output);
     Ok(output)
 }
@@ -904,7 +1956,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
     let mut reader = Reader::new(payload);
     reader.expect(MANIFEST_MAGIC)?;
     let version = reader.u16()?;
-    if version != FORMAT_VERSION {
+    if version != SNAPSHOT_FORMAT_VERSION && version != INCREMENTAL_FORMAT_VERSION {
         return Err(ColumnarError::UnsupportedVersion(version));
     }
     if reader.u16()? != 0 {
@@ -932,7 +1984,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
     let row_count = reader.u64()?;
     let row_group_count = reader.u64()?;
     let segment_count = reader.u64()?;
-    if segment_count != 1 {
+    if version == SNAPSHOT_FORMAT_VERSION && segment_count != 1 {
         return Err(ColumnarError::Corrupt(
             "phase 1 manifest must contain one segment",
         ));
@@ -980,6 +2032,81 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
         return Err(ColumnarError::Corrupt("invalid segment file name"));
     }
     let segment_checksum = reader.u32()?;
+    let incremental = if version == INCREMENTAL_FORMAT_VERSION {
+        let stream_generation = ChangeStreamGeneration(reader.u64()?);
+        let base_frontier = StorageDataVersion(reader.u64()?);
+        let applied_frontier = StorageDataVersion(reader.u64()?);
+        let delta_mutation_count = reader.u64()?;
+        let delta_live_row_count = reader.u64()?;
+        let suppressed_version_count = reader.u64()?;
+        let delta_bytes = reader.u64()?;
+        let delta_count = reader.u32()?;
+        if delta_count > MAX_ROW_GROUPS {
+            return Err(ColumnarError::ResourceLimit {
+                resource: "delta segment count",
+                value: u64::from(delta_count),
+            });
+        }
+        if segment_count != u64::from(delta_count).saturating_add(1) {
+            return Err(ColumnarError::Corrupt("manifest segment count mismatch"));
+        }
+        if stream_generation.0 == 0 || applied_frontier.0 < base_frontier.0 {
+            return Err(ColumnarError::Corrupt("invalid incremental frontier"));
+        }
+        let mut delta_segments = Vec::with_capacity(delta_count as usize);
+        let mut expected = base_frontier;
+        let mut accumulated_bytes = 0_u64;
+        let mut accumulated_mutations = 0_u64;
+        for _ in 0..delta_count {
+            let file = reader.string()?;
+            if file.is_empty() || Path::new(&file).components().count() != 1 {
+                return Err(ColumnarError::Corrupt("invalid delta file name"));
+            }
+            let before = StorageDataVersion(reader.u64()?);
+            let after = StorageDataVersion(reader.u64()?);
+            let mutation_count = reader.u64()?;
+            let after_row_count = reader.u64()?;
+            let bytes = reader.u64()?;
+            let checksum = reader.u32()?;
+            if before != expected || after.0 <= before.0 || mutation_count == 0 {
+                return Err(ColumnarError::Corrupt("broken delta frontier chain"));
+            }
+            expected = after;
+            accumulated_bytes = accumulated_bytes
+                .checked_add(bytes)
+                .ok_or(ColumnarError::Corrupt("delta byte count overflow"))?;
+            accumulated_mutations = accumulated_mutations
+                .checked_add(mutation_count)
+                .ok_or(ColumnarError::Corrupt("delta mutation count overflow"))?;
+            delta_segments.push(ColumnarDeltaSegmentMetadata {
+                file,
+                before,
+                after,
+                mutation_count,
+                after_row_count,
+                bytes,
+                checksum,
+            });
+        }
+        if expected != applied_frontier
+            || accumulated_bytes != delta_bytes
+            || accumulated_mutations != delta_mutation_count
+        {
+            return Err(ColumnarError::Corrupt("delta inventory totals mismatch"));
+        }
+        Some(ColumnarIncrementalMetadata {
+            stream_generation,
+            base_frontier,
+            applied_frontier,
+            delta_segments,
+            delta_mutation_count,
+            delta_live_row_count,
+            suppressed_version_count,
+            delta_bytes,
+        })
+    } else {
+        None
+    };
     reader.finish()?;
     Ok(Manifest {
         metadata: ColumnarProjectionMetadata {
@@ -994,6 +2121,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
             row_group_count,
             segment_count,
             segment_bytes,
+            incremental,
         },
         segment_id,
         segment_file,
@@ -1015,10 +2143,11 @@ fn encode_segment(
     identity: SegmentIdentity,
     columns: &[ColumnarColumnSpec],
     groups: &[RowGroup],
+    version: u16,
 ) -> Result<Vec<u8>, ColumnarError> {
     let mut output = Vec::new();
     output.extend_from_slice(SEGMENT_MAGIC);
-    push_u16(&mut output, FORMAT_VERSION);
+    push_u16(&mut output, version);
     push_u16(&mut output, 0);
     push_u64(&mut output, identity.projection_id.0);
     push_u64(&mut output, identity.generation.0);
@@ -1038,6 +2167,22 @@ fn encode_segment(
     );
     for group in groups {
         push_u32(&mut output, group.rows);
+        if version == INCREMENTAL_FORMAT_VERSION {
+            let keys = group
+                .source_versions
+                .as_ref()
+                .ok_or(ColumnarError::InvalidInput(
+                    "incremental row group is missing source identities",
+                ))?;
+            if keys.len() != group.rows as usize {
+                return Err(ColumnarError::InvalidInput(
+                    "source identity count differs from row count",
+                ));
+            }
+            for key in keys {
+                encode_version_key(&mut output, *key, identity.storage_id)?;
+            }
+        }
         for (column, batch) in columns.iter().zip(&group.columns) {
             let stats = group
                 .statistics
@@ -1068,8 +2213,11 @@ fn decode_segment(
     let mut reader = Reader::new(payload);
     reader.expect(SEGMENT_MAGIC)?;
     let version = reader.u16()?;
-    if version != FORMAT_VERSION {
+    if version != SNAPSHOT_FORMAT_VERSION && version != INCREMENTAL_FORMAT_VERSION {
         return Err(ColumnarError::UnsupportedVersion(version));
+    }
+    if (version == INCREMENTAL_FORMAT_VERSION) != metadata.incremental.is_some() {
+        return Err(ColumnarError::IdentityMismatch("segment mode"));
     }
     if reader.u16()? != 0 {
         return Err(ColumnarError::Corrupt("segment reserved field is nonzero"));
@@ -1107,6 +2255,19 @@ fn decode_segment(
         decoded_rows = decoded_rows
             .checked_add(u64::from(rows))
             .ok_or(ColumnarError::Corrupt("segment row count overflow"))?;
+        let source_versions = if version == INCREMENTAL_FORMAT_VERSION {
+            let mut keys = Vec::with_capacity(rows as usize);
+            for _ in 0..rows {
+                keys.push(decode_version_key(
+                    &mut reader,
+                    metadata.source_storage_id,
+                    metadata.source_token.kind,
+                )?);
+            }
+            Some(keys)
+        } else {
+            None
+        };
         let mut chunks = Vec::with_capacity(metadata.columns.len());
         let mut statistics = Vec::with_capacity(metadata.columns.len());
         for column in &metadata.columns {
@@ -1119,6 +2280,7 @@ fn decode_segment(
         }
         row_groups.push(RowGroup {
             rows,
+            source_versions,
             columns: chunks,
             statistics,
         });
@@ -1569,15 +2731,28 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(test)]
+fn crash(point: &str) {
+    if std::env::var("NETBADB_COLUMNAR_DELTA_CRASH_POINT").as_deref() == Ok(point) {
+        std::process::exit(89);
+    }
+}
+
+#[cfg(not(test))]
+fn crash(_: &str) {}
+
+#[cfg(test)]
 mod tests {
     use super::{ColumnarConstraint, ColumnarError, ColumnarProjection, StorageSnapshotToken};
+    use crate::{ChangeBatch, StorageChange, StorageVersionKey};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{
-        ColumnId, ColumnarGeneration, ColumnarProjectionId, PhysicalType, ScalarValue, StorageId,
-        TableId,
+        ChangeStreamGeneration, ColumnId, ColumnarGeneration, ColumnarProjectionId, LsmCommitSeq,
+        LsmRowId, PageId, PhysicalType, RowId, ScalarValue, StorageDataVersion, StorageId, TableId,
+        TxnId,
     };
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     macro_rules! build_projection {
@@ -1601,6 +2776,16 @@ mod tests {
         let payload_length = bytes.len() - 4;
         let checksum = crc32c::crc32c(&bytes[..payload_length]);
         bytes[payload_length..].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn replace_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        rewrite_checksum(bytes);
+    }
+
+    fn replace_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        rewrite_checksum(bytes);
     }
 
     fn test_directory(name: &str) -> PathBuf {
@@ -1658,6 +2843,843 @@ mod tests {
                 ScalarValue::Text("omega".into()),
             ],
         ]
+    }
+
+    fn heap_key(storage_id: StorageId, page: u64, slot: u16) -> StorageVersionKey {
+        StorageVersionKey::Heap {
+            storage_id,
+            row_id: RowId {
+                page: PageId(page),
+                slot,
+                generation: 1,
+            },
+        }
+    }
+
+    fn lsm_key(storage_id: StorageId, row: u64, version: u64) -> StorageVersionKey {
+        StorageVersionKey::Lsm {
+            storage_id,
+            row_id: LsmRowId(row),
+            version: LsmCommitSeq(version),
+        }
+    }
+
+    #[test]
+    fn incremental_v2_delta_round_trip_suppresses_exact_versions() {
+        let directory = test_directory("incremental-round-trip");
+        let table = table();
+        let storage_id = StorageId(3);
+        let base_rows = rows()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, row)| (heap_key(storage_id, 1, slot as u16), row))
+            .collect::<Vec<_>>();
+        let base = ColumnarProjection::prepare_incremental(
+            &directory,
+            ColumnarProjectionId(21),
+            ColumnarGeneration(1),
+            &table,
+            storage_id,
+            StorageSnapshotToken::heap(storage_id, 19),
+            crate::ChangeStreamCursor {
+                storage_id,
+                generation: ChangeStreamGeneration(2),
+                frontier: StorageDataVersion(10),
+            },
+            &[ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            &base_rows,
+            Some(2),
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish incremental base");
+        assert!(base.is_incremental());
+        let new_version = heap_key(storage_id, 2, 0);
+        let fingerprint = table.fingerprint().expect("table fingerprint");
+        let batch = ChangeBatch {
+            sequence: 1,
+            physical_txn_id: TxnId(1),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: fingerprint,
+            before: StorageDataVersion(10),
+            after: StorageDataVersion(11),
+            mutations: vec![
+                StorageChange::Update {
+                    old_version: base_rows[0].0,
+                    new_version,
+                    after: vec![
+                        ScalarValue::Int64(100),
+                        ScalarValue::UInt64(10),
+                        ScalarValue::Null,
+                        ScalarValue::Text("delta".into()),
+                    ],
+                },
+                StorageChange::Delete {
+                    old_version: base_rows[1].0,
+                },
+            ],
+        };
+        let advanced = base
+            .prepare_advance(&table, &[batch])
+            .and_then(|prepared| prepared.publish())
+            .expect("publish delta");
+        drop(advanced);
+        let reopened = ColumnarProjection::open(&directory, &table).expect("reopen v2 chain");
+        let incremental = reopened
+            .metadata()
+            .incremental
+            .as_ref()
+            .expect("incremental metadata");
+        assert_eq!(incremental.base_frontier, StorageDataVersion(10));
+        assert_eq!(incremental.applied_frontier, StorageDataVersion(11));
+        assert_eq!(incremental.delta_live_row_count, 1);
+        assert_eq!(incremental.suppressed_version_count, 2);
+        let (batches, statistics) = reopened
+            .scan(&[ColumnId(1), ColumnId(4)], &[])
+            .expect("scan merged projection");
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.row_count).map(|row| batch.columns[0].values.value(row).expect("value"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![ScalarValue::Int64(9), ScalarValue::Int64(100)]);
+        assert_eq!(statistics.base_rows_suppressed, 2);
+        assert_eq!(statistics.delta_rows_emitted, 1);
+        let newest_version = heap_key(storage_id, 3, 0);
+        let second = ChangeBatch {
+            sequence: 2,
+            physical_txn_id: TxnId(2),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: fingerprint,
+            before: StorageDataVersion(11),
+            after: StorageDataVersion(12),
+            mutations: vec![StorageChange::Update {
+                old_version: new_version,
+                new_version: newest_version,
+                after: vec![
+                    ScalarValue::Int64(200),
+                    ScalarValue::UInt64(20),
+                    ScalarValue::Bool(true),
+                    ScalarValue::Null,
+                ],
+            }],
+        };
+        let advanced = reopened
+            .prepare_advance(&table, &[second])
+            .and_then(|prepared| prepared.publish())
+            .expect("publish second delta segment");
+        drop(advanced);
+        let reopened = ColumnarProjection::open(&directory, &table).expect("reopen delta chain");
+        let incremental = reopened
+            .metadata()
+            .incremental
+            .as_ref()
+            .expect("incremental metadata");
+        assert_eq!(incremental.applied_frontier, StorageDataVersion(12));
+        assert_eq!(incremental.delta_segments.len(), 2);
+        assert_eq!(incremental.suppressed_version_count, 3);
+        let values = reopened
+            .scan(&[ColumnId(1)], &[])
+            .expect("scan second merge")
+            .0
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.row_count).map(|row| batch.columns[0].values.value(row).expect("value"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![ScalarValue::Int64(9), ScalarValue::Int64(200)]);
+        let delta_file = incremental.delta_segments[1].file.clone();
+        let delta_path = directory.join(delta_file);
+        let mut corrupt = fs::read(&delta_path).expect("read delta");
+        corrupt[32] ^= 0x20;
+        fs::write(&delta_path, corrupt).expect("corrupt delta");
+        assert!(matches!(
+            ColumnarProjection::open(&directory, &table),
+            Err(ColumnarError::ChecksumMismatch { .. }) | Err(ColumnarError::Corrupt(_))
+        ));
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn nbcs_v2_round_trips_both_key_kinds_and_rejects_identity_corruption() {
+        let table = table();
+        let heap_directory = test_directory("nbcs-v2-heap-boundaries");
+        let heap_storage = StorageId(31);
+        let heap_rows = rows()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| (heap_key(heap_storage, 7, slot as u16), values))
+            .collect::<Vec<_>>();
+        let prepared = ColumnarProjection::prepare_incremental(
+            &heap_directory,
+            ColumnarProjectionId(31),
+            ColumnarGeneration(1),
+            &table,
+            heap_storage,
+            StorageSnapshotToken::heap(heap_storage, 3),
+            crate::ChangeStreamCursor {
+                storage_id: heap_storage,
+                generation: ChangeStreamGeneration(1),
+                frontier: StorageDataVersion(3),
+            },
+            &[ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            &heap_rows,
+            Some(2),
+        )
+        .expect("prepare Heap NBCS v2");
+        assert_eq!(prepared.row_groups.len(), 2);
+        let segment = fs::read(&prepared.segment_tmp).expect("read NBCS v2");
+        assert_eq!(
+            super::decode_segment(&segment, &prepared.metadata)
+                .expect("decode NBCS v2")
+                .row_groups,
+            prepared.row_groups
+        );
+
+        let identity = super::SegmentIdentity {
+            projection_id: prepared.metadata.id,
+            generation: prepared.metadata.generation,
+            segment_id: prepared.segment_id,
+            table_id: prepared.metadata.table_id,
+            storage_id: prepared.metadata.source_storage_id,
+            fingerprint: prepared.metadata.schema_fingerprint,
+        };
+        let mut missing = prepared.row_groups.clone();
+        missing[0].source_versions = None;
+        assert!(matches!(
+            super::encode_segment(
+                identity,
+                &prepared.metadata.columns,
+                &missing,
+                super::INCREMENTAL_FORMAT_VERSION
+            ),
+            Err(ColumnarError::InvalidInput(
+                "incremental row group is missing source identities"
+            ))
+        ));
+        let mut short = prepared.row_groups.clone();
+        short[0].source_versions.as_mut().expect("identities").pop();
+        assert!(matches!(
+            super::encode_segment(
+                identity,
+                &prepared.metadata.columns,
+                &short,
+                super::INCREMENTAL_FORMAT_VERSION
+            ),
+            Err(ColumnarError::InvalidInput(
+                "source identity count differs from row count"
+            ))
+        ));
+
+        let mut wrong_storage = segment.clone();
+        replace_u64(&mut wrong_storage, 40, 999);
+        assert!(matches!(
+            super::decode_segment(&wrong_storage, &prepared.metadata),
+            Err(ColumnarError::IdentityMismatch("segment source storage"))
+        ));
+        let mut wrong_engine = segment.clone();
+        wrong_engine[92] = 2;
+        rewrite_checksum(&mut wrong_engine);
+        assert!(matches!(
+            super::decode_segment(&wrong_engine, &prepared.metadata),
+            Err(ColumnarError::IdentityMismatch("version engine kind"))
+        ));
+        let mut zero_generation = segment.clone();
+        zero_generation[110..114].copy_from_slice(&0_u32.to_le_bytes());
+        rewrite_checksum(&mut zero_generation);
+        assert!(matches!(
+            super::decode_segment(&zero_generation, &prepared.metadata),
+            Err(ColumnarError::Corrupt("invalid Heap version identity"))
+        ));
+        let mut checksum = segment;
+        checksum[32] ^= 1;
+        assert!(matches!(
+            super::decode_segment(&checksum, &prepared.metadata),
+            Err(ColumnarError::Corrupt("file checksum mismatch"))
+        ));
+        drop(prepared);
+        fs::remove_dir_all(&heap_directory).expect("remove Heap NBCS fixture");
+
+        let lsm_directory = test_directory("nbcs-v2-lsm-boundaries");
+        let lsm_storage = StorageId(32);
+        let lsm_rows = [
+            (lsm_key(lsm_storage, 1, 9), rows()[0].clone()),
+            (lsm_key(lsm_storage, 2, 10), rows()[1].clone()),
+        ];
+        let lsm = ColumnarProjection::prepare_incremental(
+            &lsm_directory,
+            ColumnarProjectionId(32),
+            ColumnarGeneration(1),
+            &table,
+            lsm_storage,
+            StorageSnapshotToken::lsm(lsm_storage, 5, 10),
+            crate::ChangeStreamCursor {
+                storage_id: lsm_storage,
+                generation: ChangeStreamGeneration(2),
+                frontier: StorageDataVersion(8),
+            },
+            &[ColumnId(1), ColumnId(4)],
+            &lsm_rows
+                .iter()
+                .map(|(key, values)| (*key, vec![values[0].clone(), values[3].clone()]))
+                .collect::<Vec<_>>(),
+            Some(1),
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish LSM NBCS v2");
+        drop(lsm);
+        assert!(
+            ColumnarProjection::open(&lsm_directory, &table)
+                .expect("open LSM NBCS v2")
+                .is_incremental()
+        );
+        fs::remove_dir_all(&lsm_directory).expect("remove LSM NBCS fixture");
+
+        for (name, key, token) in [
+            (
+                "wrong-kind",
+                lsm_key(heap_storage, 1, 1),
+                StorageSnapshotToken::heap(heap_storage, 1),
+            ),
+            (
+                "zero-heap-generation",
+                StorageVersionKey::Heap {
+                    storage_id: heap_storage,
+                    row_id: RowId {
+                        page: PageId(1),
+                        slot: 0,
+                        generation: 0,
+                    },
+                },
+                StorageSnapshotToken::heap(heap_storage, 1),
+            ),
+            (
+                "zero-lsm-sequence",
+                lsm_key(heap_storage, 1, 0),
+                StorageSnapshotToken::lsm(heap_storage, 1, 1),
+            ),
+        ] {
+            let directory = test_directory(name);
+            assert!(
+                ColumnarProjection::prepare_incremental(
+                    &directory,
+                    ColumnarProjectionId(40),
+                    ColumnarGeneration(1),
+                    &table,
+                    heap_storage,
+                    token,
+                    crate::ChangeStreamCursor {
+                        storage_id: heap_storage,
+                        generation: ChangeStreamGeneration(1),
+                        frontier: StorageDataVersion(1),
+                    },
+                    &[ColumnId(1)],
+                    &[(key, vec![ScalarValue::Int64(1)])],
+                    None,
+                )
+                .is_err()
+            );
+            let _ = fs::remove_dir_all(directory);
+        }
+
+        let empty_directory = test_directory("nbcs-v2-empty");
+        let empty = ColumnarProjection::prepare_incremental(
+            &empty_directory,
+            ColumnarProjectionId(41),
+            ColumnarGeneration(1),
+            &table,
+            heap_storage,
+            StorageSnapshotToken::heap(heap_storage, 1),
+            crate::ChangeStreamCursor {
+                storage_id: heap_storage,
+                generation: ChangeStreamGeneration(1),
+                frontier: StorageDataVersion(1),
+            },
+            &[ColumnId(1)],
+            &[],
+            None,
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish empty NBCS v2");
+        assert!(
+            empty
+                .scan(&[ColumnId(1)], &[])
+                .expect("scan empty")
+                .0
+                .is_empty()
+        );
+        drop(empty);
+        fs::remove_dir_all(empty_directory).expect("remove empty NBCS fixture");
+    }
+
+    #[test]
+    fn nbcd_v1_decoder_rejects_malformed_identity_counts_frontiers_and_references() {
+        let directory = test_directory("nbcd-v1-boundaries");
+        let table = table();
+        let storage_id = StorageId(51);
+        let base_keys = [heap_key(storage_id, 1, 0), heap_key(storage_id, 1, 1)];
+        let base_rows = vec![
+            (
+                base_keys[0],
+                vec![ScalarValue::Int64(10), ScalarValue::Null],
+            ),
+            (
+                base_keys[1],
+                vec![ScalarValue::Int64(20), ScalarValue::Text("base".into())],
+            ),
+        ];
+        let base = ColumnarProjection::prepare_incremental(
+            &directory,
+            ColumnarProjectionId(51),
+            ColumnarGeneration(2),
+            &table,
+            storage_id,
+            StorageSnapshotToken::heap(storage_id, 20),
+            crate::ChangeStreamCursor {
+                storage_id,
+                generation: ChangeStreamGeneration(7),
+                frontier: StorageDataVersion(20),
+            },
+            &[ColumnId(1), ColumnId(4)],
+            &base_rows,
+            None,
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish NBCD base");
+        let fingerprint = table.fingerprint().expect("fingerprint");
+        let updated = heap_key(storage_id, 2, 0);
+        let inserted = heap_key(storage_id, 2, 1);
+        let final_version = heap_key(storage_id, 3, 0);
+        let batches = vec![
+            ChangeBatch {
+                sequence: 1,
+                physical_txn_id: TxnId(1),
+                database_txn_id: None,
+                table_id: table.id,
+                storage_id,
+                schema_fingerprint: fingerprint,
+                before: StorageDataVersion(20),
+                after: StorageDataVersion(21),
+                mutations: vec![
+                    StorageChange::Update {
+                        old_version: base_keys[0],
+                        new_version: updated,
+                        after: vec![
+                            ScalarValue::Int64(11),
+                            ScalarValue::UInt64(1),
+                            ScalarValue::Null,
+                            ScalarValue::Text("delta-text".into()),
+                        ],
+                    },
+                    StorageChange::Insert {
+                        new_version: inserted,
+                        after: vec![
+                            ScalarValue::Int64(30),
+                            ScalarValue::UInt64(2),
+                            ScalarValue::Bool(true),
+                            ScalarValue::Null,
+                        ],
+                    },
+                ],
+            },
+            ChangeBatch {
+                sequence: 2,
+                physical_txn_id: TxnId(2),
+                database_txn_id: None,
+                table_id: table.id,
+                storage_id,
+                schema_fingerprint: fingerprint,
+                before: StorageDataVersion(21),
+                after: StorageDataVersion(22),
+                mutations: vec![
+                    StorageChange::Delete {
+                        old_version: updated,
+                    },
+                    StorageChange::Update {
+                        old_version: base_keys[1],
+                        new_version: final_version,
+                        after: vec![
+                            ScalarValue::Int64(21),
+                            ScalarValue::UInt64(3),
+                            ScalarValue::Bool(false),
+                            ScalarValue::Text("final".into()),
+                        ],
+                    },
+                ],
+            },
+        ];
+        let prepared = base
+            .prepare_advance(&table, &batches)
+            .expect("prepare valid NBCD");
+        let bytes = fs::read(&prepared.delta_tmp).expect("read NBCD");
+        let metadata = prepared.projection.metadata().clone();
+        let expected = metadata
+            .incremental
+            .as_ref()
+            .expect("incremental")
+            .delta_segments
+            .last()
+            .expect("delta metadata")
+            .clone();
+        assert_eq!(
+            super::decode_delta(&bytes, &metadata, &expected)
+                .expect("decode multiple batches")
+                .len(),
+            4
+        );
+
+        let assert_rejected = |candidate: &[u8], expected: &super::ColumnarDeltaSegmentMetadata| {
+            assert!(
+                super::decode_delta(candidate, &metadata, expected).is_err(),
+                "malformed NBCD unexpectedly decoded"
+            );
+        };
+        let mut malformed = bytes.clone();
+        malformed[0] = b'X';
+        rewrite_checksum(&mut malformed);
+        assert_rejected(&malformed, &expected);
+        let mut malformed = bytes.clone();
+        replace_u16(&mut malformed, 4, 99);
+        assert_rejected(&malformed, &expected);
+        let mut malformed = bytes.clone();
+        malformed[12] ^= 1;
+        assert_rejected(&malformed, &expected);
+        assert_rejected(&bytes[..bytes.len() - 9], &expected);
+        let mut malformed = bytes[..bytes.len() - 4].to_vec();
+        malformed.push(0xff);
+        super::append_checksum(&mut malformed);
+        assert_rejected(&malformed, &expected);
+
+        for (offset, value) in [
+            (8, 999_u64),
+            (16, 999),
+            (24, 999),
+            (32, 999),
+            (40, 999),
+            (80, 999),
+        ] {
+            let mut malformed = bytes.clone();
+            replace_u64(&mut malformed, offset, value);
+            assert_rejected(&malformed, &expected);
+        }
+        let mut malformed = bytes.clone();
+        replace_u64(&mut malformed, 136, 20);
+        assert_rejected(&malformed, &expected);
+        let mut malformed = bytes.clone();
+        malformed[149] = 2;
+        rewrite_checksum(&mut malformed);
+        assert_rejected(&malformed, &expected);
+        let mut malformed = bytes.clone();
+        replace_u64(&mut malformed, 197, 3);
+        assert_rejected(&malformed, &expected);
+
+        let mut oversized_mutations = bytes.clone();
+        replace_u64(
+            &mut oversized_mutations,
+            108,
+            u64::from(crate::CHANGE_LOG_MAX_MUTATIONS) + 1,
+        );
+        let mut oversized_expected = expected.clone();
+        oversized_expected.mutation_count = u64::from(crate::CHANGE_LOG_MAX_MUTATIONS) + 1;
+        assert_rejected(&oversized_mutations, &oversized_expected);
+        let mut oversized_rows = bytes.clone();
+        replace_u64(&mut oversized_rows, 116, u64::MAX);
+        let mut oversized_expected = expected.clone();
+        oversized_expected.after_row_count = u64::MAX;
+        assert_rejected(&oversized_rows, &oversized_expected);
+
+        drop(prepared);
+        let duplicate = ChangeBatch {
+            sequence: 3,
+            physical_txn_id: TxnId(3),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: fingerprint,
+            before: StorageDataVersion(20),
+            after: StorageDataVersion(21),
+            mutations: vec![
+                StorageChange::Delete {
+                    old_version: base_keys[0],
+                },
+                StorageChange::Delete {
+                    old_version: base_keys[0],
+                },
+            ],
+        };
+        assert!(matches!(
+            base.prepare_advance(&table, &[duplicate]),
+            Err(ColumnarError::Corrupt(
+                "one version has multiple durable delta transitions"
+            ))
+        ));
+        drop(base);
+        fs::remove_dir_all(directory).expect("remove NBCD fixture");
+
+        let lsm_directory = test_directory("nbcd-v1-lsm-projected-only");
+        let lsm_storage = StorageId(52);
+        let old = lsm_key(lsm_storage, 8, 10);
+        let lsm = ColumnarProjection::prepare_incremental(
+            &lsm_directory,
+            ColumnarProjectionId(52),
+            ColumnarGeneration(1),
+            &table,
+            lsm_storage,
+            StorageSnapshotToken::lsm(lsm_storage, 2, 10),
+            crate::ChangeStreamCursor {
+                storage_id: lsm_storage,
+                generation: ChangeStreamGeneration(3),
+                frontier: StorageDataVersion(5),
+            },
+            &[ColumnId(1)],
+            &[(old, vec![ScalarValue::Int64(1)])],
+            None,
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish LSM base");
+        let sentinel = "unprojected-text-must-not-be-persisted";
+        let lsm_batch = ChangeBatch {
+            sequence: 1,
+            physical_txn_id: TxnId(4),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id: lsm_storage,
+            schema_fingerprint: fingerprint,
+            before: StorageDataVersion(5),
+            after: StorageDataVersion(6),
+            mutations: vec![StorageChange::Update {
+                old_version: old,
+                new_version: lsm_key(lsm_storage, 8, 11),
+                after: vec![
+                    ScalarValue::Int64(2),
+                    ScalarValue::UInt64(9),
+                    ScalarValue::Null,
+                    ScalarValue::Text(sentinel.into()),
+                ],
+            }],
+        };
+        let prepared = lsm
+            .prepare_advance(&table, &[lsm_batch])
+            .expect("prepare LSM NBCD");
+        let bytes = fs::read(&prepared.delta_tmp).expect("read LSM NBCD");
+        assert!(
+            !bytes
+                .windows(sentinel.len())
+                .any(|window| window == sentinel.as_bytes()),
+            "NBCD must persist only projected after-image columns"
+        );
+        let advanced = prepared.publish().expect("publish LSM NBCD");
+        drop(advanced);
+        let values = ColumnarProjection::open(&lsm_directory, &table)
+            .expect("open LSM NBCD")
+            .scan(&[ColumnId(1)], &[])
+            .expect("scan LSM merge")
+            .0
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.row_count)
+                    .map(|row| batch.columns[0].values.value(row).expect("LSM delta value"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![ScalarValue::Int64(2)]);
+        fs::remove_dir_all(lsm_directory).expect("remove LSM NBCD fixture");
+    }
+
+    #[test]
+    fn delta_publication_reopens_at_only_old_or_new_frontier() {
+        let directory = test_directory("incremental-publication");
+        let table = table();
+        let storage_id = StorageId(3);
+        let base_rows = vec![(heap_key(storage_id, 1, 0), rows()[0].clone())];
+        let base = ColumnarProjection::prepare_incremental(
+            &directory,
+            ColumnarProjectionId(22),
+            ColumnarGeneration(1),
+            &table,
+            storage_id,
+            StorageSnapshotToken::heap(storage_id, 1),
+            crate::ChangeStreamCursor {
+                storage_id,
+                generation: ChangeStreamGeneration(1),
+                frontier: StorageDataVersion(4),
+            },
+            &[ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            &base_rows,
+            None,
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("publish base");
+        let batch = ChangeBatch {
+            sequence: 1,
+            physical_txn_id: TxnId(1),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: table.fingerprint().expect("fingerprint"),
+            before: StorageDataVersion(4),
+            after: StorageDataVersion(5),
+            mutations: vec![StorageChange::Delete {
+                old_version: base_rows[0].0,
+            }],
+        };
+
+        let prepared = base
+            .prepare_advance(&table, std::slice::from_ref(&batch))
+            .expect("prepare delta");
+        fs::rename(&prepared.delta_tmp, &prepared.delta_final).expect("install orphan delta");
+        super::sync_directory(&directory).expect("sync orphan delta");
+        drop(prepared);
+        let old = ColumnarProjection::open(&directory, &table).expect("open old authority");
+        assert_eq!(
+            old.metadata()
+                .incremental
+                .as_ref()
+                .expect("incremental")
+                .applied_frontier,
+            StorageDataVersion(4)
+        );
+
+        let prepared = old
+            .prepare_advance(&table, &[batch])
+            .expect("prepare retry");
+        fs::rename(&prepared.delta_tmp, &prepared.delta_final).expect("install delta");
+        super::sync_directory(&directory).expect("sync delta");
+        fs::rename(&prepared.manifest_tmp, directory.join(super::MANIFEST_FILE))
+            .expect("install manifest");
+        super::sync_directory(&directory).expect("sync manifest");
+        drop(prepared);
+        let new = ColumnarProjection::open(&directory, &table).expect("open new authority");
+        assert_eq!(
+            new.metadata()
+                .incremental
+                .as_ref()
+                .expect("incremental")
+                .applied_frontier,
+            StorageDataVersion(5)
+        );
+        assert_eq!(
+            new.scan(&[ColumnId(1)], &[]).expect("scan").0[0].row_count,
+            0
+        );
+        assert_eq!(
+            base.scan(&[ColumnId(1)], &[]).expect("old reader scan").0[0].row_count,
+            1,
+            "an active immutable reader retains its pre-advance overlay"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    fn crash_delta_batch(table: &TableDef, storage_id: StorageId) -> ChangeBatch {
+        ChangeBatch {
+            sequence: 1,
+            physical_txn_id: TxnId(1),
+            database_txn_id: None,
+            table_id: table.id,
+            storage_id,
+            schema_fingerprint: table.fingerprint().expect("fingerprint"),
+            before: StorageDataVersion(4),
+            after: StorageDataVersion(5),
+            mutations: vec![StorageChange::Update {
+                old_version: heap_key(storage_id, 1, 0),
+                new_version: heap_key(storage_id, 2, 0),
+                after: vec![
+                    ScalarValue::Int64(2),
+                    ScalarValue::UInt64(2),
+                    ScalarValue::Null,
+                    ScalarValue::Text("new".into()),
+                ],
+            }],
+        }
+    }
+
+    fn seed_delta_crash_projection(directory: &PathBuf) {
+        let table = table();
+        let storage_id = StorageId(61);
+        let projection = ColumnarProjection::prepare_incremental(
+            directory,
+            ColumnarProjectionId(61),
+            ColumnarGeneration(1),
+            &table,
+            storage_id,
+            StorageSnapshotToken::heap(storage_id, 4),
+            crate::ChangeStreamCursor {
+                storage_id,
+                generation: ChangeStreamGeneration(1),
+                frontier: StorageDataVersion(4),
+            },
+            &[ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            &[(heap_key(storage_id, 1, 0), rows()[0].clone())],
+            None,
+        )
+        .and_then(|prepared| prepared.publish())
+        .expect("seed delta crash projection");
+        drop(projection);
+    }
+
+    #[test]
+    fn delta_publication_crash_child() {
+        if std::env::var("NETBADB_COLUMNAR_DELTA_CRASH_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        let directory = PathBuf::from(
+            std::env::var("NETBADB_COLUMNAR_DELTA_CRASH_DIRECTORY").expect("crash directory"),
+        );
+        let table = table();
+        let storage_id = StorageId(61);
+        let projection = ColumnarProjection::open(&directory, &table).expect("open crash base");
+        projection
+            .prepare_advance(&table, &[crash_delta_batch(&table, storage_id)])
+            .and_then(|prepared| prepared.publish())
+            .expect("advance must reach configured crash point");
+        panic!("configured delta crash point did not terminate the child");
+    }
+
+    #[test]
+    fn delta_publication_crash_matrix_reopens_at_old_or_new_authority() {
+        let points = [
+            "delta-temp-created",
+            "delta-written",
+            "delta-synced",
+            "delta-manifest-temp-created",
+            "delta-manifest-written",
+            "delta-manifest-synced",
+            "delta-renamed",
+            "delta-directory-synced",
+            "delta-manifest-renamed",
+        ];
+        for point in points {
+            let directory = test_directory(point);
+            seed_delta_crash_projection(&directory);
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("columnar::tests::delta_publication_crash_child")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("NETBADB_COLUMNAR_DELTA_CRASH_CHILD", "1")
+                .env("NETBADB_COLUMNAR_DELTA_CRASH_DIRECTORY", &directory)
+                .env("NETBADB_COLUMNAR_DELTA_CRASH_POINT", point)
+                .status()
+                .expect("run delta crash child");
+            assert_eq!(status.code(), Some(89), "crash point {point}");
+            let reopened = ColumnarProjection::open(&directory, &table())
+                .unwrap_or_else(|error| panic!("reopen after {point}: {error}"));
+            let frontier = reopened
+                .metadata()
+                .incremental
+                .as_ref()
+                .expect("incremental")
+                .applied_frontier;
+            let expected = if point == "delta-manifest-renamed" {
+                StorageDataVersion(5)
+            } else {
+                StorageDataVersion(4)
+            };
+            assert_eq!(frontier, expected, "crash point {point}");
+            fs::remove_dir_all(directory).expect("remove delta crash fixture");
+        }
     }
 
     #[test]

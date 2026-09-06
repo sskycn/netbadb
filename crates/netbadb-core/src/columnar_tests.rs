@@ -8,8 +8,9 @@ use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
 use crate::{
-    ColumnarProjectionHealth, ColumnarProjectionSpec, Database, DatabaseError, ExecutionResult,
-    ProjectionCatalogError, TableStorageCreateSpec, cleanup_created_table_files,
+    ColumnarAdvanceBudget, ColumnarProjectionHealth, ColumnarProjectionSpec, Database,
+    DatabaseError, ExecutionResult, ProjectionCatalogError, TableStorageCreateSpec,
+    cleanup_created_table_files,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -116,6 +117,397 @@ fn plan_contains_index(plan: &PlanNodeInspection) -> bool {
 fn cleanup(heap: &PathBuf, projection: &PathBuf) {
     cleanup_created_table_files(std::slice::from_ref(heap));
     let _ = fs::remove_dir_all(projection);
+}
+
+fn authoritative(database: &mut Database, sql: &str) -> crate::QueryResult {
+    let mut transaction = database
+        .begin_transaction_with_isolation(crate::IsolationLevel::RepeatableRead)
+        .expect("begin authoritative transaction");
+    let ExecutionResult::Query(result) = database
+        .execute_in(&mut transaction, sql)
+        .expect("authoritative query")
+    else {
+        panic!("query result expected");
+    };
+    transaction.rollback().expect("rollback read transaction");
+    result
+}
+
+#[test]
+fn incremental_heap_merge_is_predicate_safe_and_reopens() {
+    let root = path("incremental-heap-root");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    let projection = root.join("projection");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        None,
+    )
+    .expect("create managed database");
+    insert_rows(&mut database, 512);
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream explicitly");
+    let id = database
+        .build_incremental_columnar_projection(
+            ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection,
+                vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            )
+            .with_row_group_rows(256),
+        )
+        .expect("build incremental projection");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh
+    );
+    let manifest_before_dml = fs::read(projection.join("projection.nbcmanifest"))
+        .expect("read incremental manifest before DML");
+    let files_before_dml = fs::read_dir(&projection)
+        .expect("read projection directory")
+        .map(|entry| entry.expect("projection entry").file_name())
+        .collect::<Vec<_>>();
+
+    database
+        .execute("UPDATE events SET amount = 0 WHERE id = 100")
+        .expect("update out of predicate");
+    database
+        .execute("UPDATE events SET amount = 1000 WHERE id = 1")
+        .expect("update into predicate");
+    database
+        .execute("DELETE FROM events WHERE id = 2")
+        .expect("delete base row");
+    database
+        .execute("INSERT INTO events (id, amount, active, label) VALUES (900, 700, TRUE, 'delta')")
+        .expect("insert delta row");
+    for amount in [7, 8, 9] {
+        database
+            .execute(&format!("UPDATE events SET amount = {amount} WHERE id = 3"))
+            .expect("advance update chain");
+    }
+    database
+        .execute("INSERT INTO events (id, amount, active, label) VALUES (901, 800, TRUE, 'gone')")
+        .expect("insert transient row");
+    database
+        .execute("DELETE FROM events WHERE id = 901")
+        .expect("delete transient row");
+    assert_eq!(
+        fs::read(projection.join("projection.nbcmanifest")).expect("read manifest after DML"),
+        manifest_before_dml,
+        "authoritative commit must not synchronously update NBCM"
+    );
+    assert_eq!(
+        fs::read_dir(&projection)
+            .expect("read projection directory after DML")
+            .map(|entry| entry.expect("projection entry").file_name())
+            .collect::<Vec<_>>(),
+        files_before_dml,
+        "authoritative commit must not create NBCD files"
+    );
+
+    let lagging = &database.inspect_columnar_projections()[0];
+    assert_eq!(lagging.health, ColumnarProjectionHealth::Lagging);
+    assert!(!statement_uses_columnar(
+        &database,
+        "SELECT id FROM events WHERE amount > 50"
+    ));
+    let report = database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(100, 64 * 1024 * 1024))
+        .expect("advance delta");
+    assert!(report.caught_up);
+    assert_eq!(report.batches_applied, 9);
+    assert!(report.delta_segment_created);
+    let fresh = &database.inspect_columnar_projections()[0];
+    assert_eq!(fresh.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(fresh.delta_live_rows, Some(4));
+    assert!(fresh.suppressed_versions.is_some_and(|count| count >= 7));
+
+    for sql in [
+        "SELECT id FROM events WHERE amount > 50",
+        "SELECT id FROM events WHERE amount IS NULL",
+        "SELECT COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM events",
+        "SELECT active, COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM events GROUP BY active",
+    ] {
+        let expected = authoritative(&mut database, sql);
+        assert!(statement_uses_columnar(&database, sql), "{sql}");
+        let (actual, statistics) = database
+            .query_with_columnar_statistics(sql)
+            .expect("merged columnar query");
+        assert_eq!(actual, expected, "{sql}");
+        assert_eq!(statistics.scan.delta_live_rows, 4);
+    }
+
+    database.close().expect("close database");
+    let mut reopened = Database::open_catalog(&catalog).expect("reopen managed database");
+    assert_eq!(
+        reopened.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh
+    );
+    let sql = "SELECT id FROM events WHERE amount > 50";
+    assert!(statement_uses_columnar(&reopened, sql));
+    let expected = authoritative(&mut reopened, sql);
+    assert_eq!(
+        reopened.query(sql).expect("reopened merged query"),
+        expected
+    );
+    reopened.close().expect("close reopened database");
+    let delta = fs::read_dir(&projection)
+        .expect("read projection directory")
+        .map(|entry| entry.expect("projection entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "nbcd")
+        })
+        .expect("delta segment");
+    fs::remove_file(delta).expect("remove delta segment");
+    let mut degraded = Database::open_catalog(&catalog).expect("authoritative reopen");
+    assert_eq!(
+        degraded.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Unavailable
+    );
+    assert_eq!(
+        degraded
+            .query("SELECT COUNT(*) FROM events")
+            .expect("authoritative fallback")
+            .rows,
+        vec![vec![ScalarValue::UInt64(512)]]
+    );
+    degraded.close().expect("close degraded database");
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn incremental_heap_null_chains_and_duplicate_values_merge_by_version_identity() {
+    let heap = path("incremental-identity-heap");
+    let projection = path("incremental-identity-projection");
+    cleanup(&heap, &projection);
+    let mut database = Database::create(&heap, table()).expect("create heap database");
+    insert_rows(&mut database, 512);
+    for values in [
+        "(1001, NULL, TRUE, 'null-to-value')",
+        "(1002, 20, FALSE, 'value-to-null')",
+        "(1003, NULL, TRUE, 'deleted-null')",
+        "(1009, 10, TRUE, 'duplicate-a')",
+        "(1009, 10, TRUE, 'duplicate-b')",
+    ] {
+        database
+            .execute(&format!(
+                "INSERT INTO events (id, amount, active, label) VALUES {values}"
+            ))
+            .expect("insert identity fixture");
+    }
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream");
+    let id = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &projection,
+            vec![ColumnId(1), ColumnId(2), ColumnId(3)],
+        ))
+        .expect("build incremental projection");
+
+    database
+        .execute("UPDATE events SET amount = 42 WHERE id = 1001")
+        .expect("NULL to value");
+    database
+        .execute("UPDATE events SET amount = NULL WHERE id = 1002")
+        .expect("value to NULL");
+    database
+        .execute("DELETE FROM events WHERE id = 1003")
+        .expect("delete NULL base row");
+    database.vacuum(TableId(1)).expect("vacuum deleted slot");
+    database
+        .execute(
+            "INSERT INTO events (id, amount, active, label) VALUES (1004, NULL, FALSE, 'reused-slot')",
+        )
+        .expect("insert after slot retirement");
+    database
+        .execute(
+            "INSERT INTO events (id, amount, active, label) VALUES (1005, NULL, TRUE, 'delta-chain')",
+        )
+        .expect("insert delta chain");
+    database
+        .execute("UPDATE events SET amount = 5 WHERE id = 1005")
+        .expect("first delta update");
+    database
+        .execute("UPDATE events SET amount = NULL WHERE id = 1005")
+        .expect("second delta update");
+    database
+        .execute(
+            "INSERT INTO events (id, amount, active, label) VALUES (1006, NULL, TRUE, 'transient')",
+        )
+        .expect("insert transient NULL");
+    database
+        .execute("DELETE FROM events WHERE id = 1006")
+        .expect("delete transient NULL");
+    database
+        .execute("UPDATE events SET amount = 11 WHERE label = 'duplicate-a'")
+        .expect("update one duplicate-valued version");
+    database
+        .execute("DELETE FROM events WHERE label = 'duplicate-b'")
+        .expect("delete the other duplicate-valued version");
+
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(100, 64 * 1024 * 1024))
+        .expect("advance identity delta");
+    for sql in [
+        "SELECT id, amount, active FROM events WHERE id >= 1000",
+        "SELECT id FROM events WHERE id >= 1000 AND amount IS NULL",
+        "SELECT id FROM events WHERE id >= 1000 AND amount IS NOT NULL",
+        "SELECT COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM events WHERE id >= 1000",
+        "SELECT active, COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM events WHERE id >= 1000 GROUP BY active",
+    ] {
+        let expected = authoritative(&mut database, sql);
+        assert!(statement_uses_columnar(&database, sql), "{sql}");
+        assert_eq!(
+            database.query(sql).expect("columnar query"),
+            expected,
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        database
+            .query("SELECT id, amount FROM events WHERE id = 1009")
+            .expect("query surviving duplicate")
+            .rows,
+        vec![vec![ScalarValue::Int64(1009), ScalarValue::Int64(11)]],
+        "equal business values must not cause cross-row suppression"
+    );
+    database.close().expect("close database");
+    cleanup(&heap, &projection);
+}
+
+#[test]
+fn incremental_build_accepts_concurrent_commits_and_requires_same_stream() {
+    let heap = path("incremental-race-heap");
+    let projection = path("incremental-race-projection");
+    cleanup(&heap, &projection);
+    let mut database = Database::create(&heap, table()).expect("create heap database");
+    insert_rows(&mut database, 512);
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream");
+    let id = database
+        .build_incremental_columnar_projection_with(
+            ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection,
+                vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            ),
+            |database| {
+                database.execute("INSERT INTO events (id, amount, active, label) VALUES (700, 70, TRUE, 'race-a')")?;
+                database.execute("INSERT INTO events (id, amount, active, label) VALUES (701, 71, TRUE, 'race-b')")?;
+                Ok(())
+            },
+        )
+        .expect("build survives commits after anchor");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Lagging
+    );
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(1, 64 * 1024 * 1024))
+        .expect("partial advance");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Lagging
+    );
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(10, 64 * 1024 * 1024))
+        .expect("catch up");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh
+    );
+
+    database
+        .disable_change_stream(TableId(1))
+        .expect("disable stream");
+    database
+        .enable_change_stream(TableId(1))
+        .expect("re-enable stream");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::RebuildRequired
+    );
+    assert!(
+        database
+            .advance_columnar_projection(id, ColumnarAdvanceBudget::new(10, 64 * 1024 * 1024))
+            .is_err()
+    );
+    assert!(!statement_uses_columnar(
+        &database,
+        "SELECT COUNT(*) FROM events"
+    ));
+    database.close().expect("close database");
+    cleanup(&heap, &projection);
+}
+
+#[test]
+fn incremental_lsm_key_move_and_maintenance_preserve_freshness() {
+    let root = path("incremental-lsm-root");
+    let catalog = root.join("catalog");
+    let lsm = root.join("lsm");
+    let projection = root.join("projection");
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::lsm(&lsm, table(), ColumnId(1))],
+        None,
+    )
+    .expect("create managed LSM database");
+    insert_rows(&mut database, 512);
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream");
+    let id = database
+        .build_incremental_columnar_projection(
+            ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection,
+                vec![ColumnId(1), ColumnId(2), ColumnId(3), ColumnId(4)],
+            )
+            .with_row_group_rows(256),
+        )
+        .expect("build incremental LSM projection");
+    database
+        .execute("UPDATE events SET id = 700, amount = 777 WHERE id = 100")
+        .expect("move LSM clustering key");
+    database
+        .advance_columnar_projection(id, ColumnarAdvanceBudget::new(10, 64 * 1024 * 1024))
+        .expect("advance LSM delta");
+    let sql = "SELECT id, amount, active, label FROM events WHERE id >= 695";
+    let expected = authoritative(&mut database, sql);
+    assert!(statement_uses_columnar(&database, sql));
+    assert_eq!(database.query(sql).expect("merged LSM query"), expected);
+    database.flush().expect("flush LSM");
+    database.compact_full(TableId(1)).expect("compact LSM");
+    assert_eq!(
+        database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh,
+        "physical LSM maintenance must not alter logical data frontier"
+    );
+    database.close().expect("close LSM database");
+    let mut reopened = Database::open_catalog(&catalog).expect("reopen LSM database");
+    assert_eq!(
+        reopened.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh
+    );
+    assert!(statement_uses_columnar(&reopened, sql));
+    assert_eq!(reopened.query(sql).expect("reopened LSM query"), expected);
+    let generation = reopened
+        .refresh_columnar_projection(id)
+        .expect("rebaseline incremental projection");
+    assert_eq!(generation, netbadb_types::ColumnarGeneration(2));
+    let refreshed = &reopened.inspect_columnar_projections()[0];
+    assert_eq!(refreshed.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(refreshed.delta_mutations, Some(0));
+    reopened.close().expect("close refreshed database");
+    fs::remove_dir_all(root).expect("remove fixture");
 }
 
 #[test]

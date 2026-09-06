@@ -35,5 +35,9 @@ harness = false
 name = "change_stream_phase2a"
 harness = false
 
+[[bench]]
+name = "columnar_delta_phase2b"
+harness = false
+
 [lints]
 workspace = true

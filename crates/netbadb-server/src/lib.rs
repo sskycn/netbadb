@@ -700,6 +700,7 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::UndefinedIndex
         | DatabaseError::UnsupportedDdlCombination
         | DatabaseError::ColumnarProjectionNotFound(_)
+        | DatabaseError::ColumnarProjectionNotIncremental(_)
         | DatabaseError::ColumnarProjectionIdExhausted
         | DatabaseError::ColumnarBuildSourceChanged { .. }
         | DatabaseError::ColumnarProjectionRequiresSingleStorage(_) => ProtocolErrorCode::Database,

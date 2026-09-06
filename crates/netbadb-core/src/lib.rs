@@ -70,8 +70,8 @@ use schema_catalog::CommittedCatalogState;
 use transaction::SharedCoordinatorLog;
 
 pub use columnar::{
-    ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
-    ColumnarProjectionSpec,
+    ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarProjectionCatalogInspection,
+    ColumnarProjectionHealth, ColumnarProjectionInspection, ColumnarProjectionSpec,
 };
 pub use coordinator_log::CoordinatorLogError;
 pub use netbadb_executor::{
@@ -560,6 +560,7 @@ pub enum DatabaseError {
     UndefinedIndex,
     UnsupportedDdlCombination,
     ColumnarProjectionNotFound(ColumnarProjectionId),
+    ColumnarProjectionNotIncremental(ColumnarProjectionId),
     ColumnarProjectionIdExhausted,
     ColumnarBuildSourceChanged {
         storage_id: StorageId,
@@ -703,9 +704,9 @@ impl DatabaseError {
             | Self::InspectionIndexColumnMissing { .. }
             | Self::InspectionRegistrationOrderOverflow { .. }
             | Self::ColumnarProjectionIdExhausted => DatabaseErrorKind::Internal,
-            Self::ColumnarProjectionNotFound(_) | Self::ColumnarBuildSourceChanged { .. } => {
-                DatabaseErrorKind::Operational
-            }
+            Self::ColumnarProjectionNotFound(_)
+            | Self::ColumnarProjectionNotIncremental(_)
+            | Self::ColumnarBuildSourceChanged { .. } => DatabaseErrorKind::Operational,
         }
     }
 
@@ -794,6 +795,11 @@ impl fmt::Display for DatabaseError {
             Self::ColumnarProjectionNotFound(id) => {
                 write!(formatter, "columnar projection {} does not exist", id.0)
             }
+            Self::ColumnarProjectionNotIncremental(id) => write!(
+                formatter,
+                "columnar projection {} is a snapshot projection and cannot advance",
+                id.0
+            ),
             Self::ColumnarProjectionIdExhausted => {
                 formatter.write_str("columnar projection identity space is exhausted")
             }
@@ -851,6 +857,7 @@ impl Error for DatabaseError {
             | Self::UndefinedIndex
             | Self::UnsupportedDdlCombination
             | Self::ColumnarProjectionNotFound(_)
+            | Self::ColumnarProjectionNotIncremental(_)
             | Self::ColumnarProjectionIdExhausted
             | Self::ColumnarBuildSourceChanged { .. }
             | Self::ColumnarProjectionRequiresSingleStorage(_) => None,
@@ -932,6 +939,14 @@ struct CapturedColumnarSource {
     table: TableDef,
     token: netbadb_storage::StorageSnapshotToken,
     rows: Vec<Vec<ScalarValue>>,
+}
+
+struct CapturedIncrementalColumnarSource {
+    storage_id: StorageId,
+    table: TableDef,
+    token: netbadb_storage::StorageSnapshotToken,
+    cursor: ChangeStreamCursor,
+    rows: Vec<(StorageVersionKey, Vec<ScalarValue>)>,
 }
 
 pub struct Database {
@@ -2233,6 +2248,56 @@ impl Database {
         self.build_columnar_projection_with(spec, |_| Ok(()))
     }
 
+    /// Builds a versioned NBCS v2 base at an atomic committed-read anchor.
+    /// The source change stream must already be explicitly enabled.
+    pub fn build_incremental_columnar_projection(
+        &mut self,
+        spec: ColumnarProjectionSpec,
+    ) -> Result<ColumnarProjectionId, DatabaseError> {
+        self.build_incremental_columnar_projection_with(spec, |_| Ok(()))
+    }
+
+    fn build_incremental_columnar_projection_with<F>(
+        &mut self,
+        mut spec: ColumnarProjectionSpec,
+        after_scan: F,
+    ) -> Result<ColumnarProjectionId, DatabaseError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), DatabaseError>,
+    {
+        self.ensure_schema_available(None)?;
+        spec.directory = schema_catalog_file::absolute(&spec.directory)?;
+        self.projections.preflight_location(&spec.directory)?;
+        if spec.directory.join("projection.nbcmanifest").exists() {
+            return Err(
+                StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
+                    "projection directory already contains a manifest",
+                ))
+                .into(),
+            );
+        }
+        let id = self.projections.reserve_id()?;
+        let captured = self.capture_incremental_columnar_source(spec.table_id, &spec.columns)?;
+        let prepared = ColumnarProjection::prepare_incremental(
+            &spec.directory,
+            id,
+            ColumnarGeneration(1),
+            &captured.table,
+            captured.storage_id,
+            captured.token,
+            captured.cursor,
+            &spec.columns,
+            &captured.rows,
+            spec.row_group_rows,
+        )?;
+        columnar::crash("incremental-build-files-synced");
+        after_scan(self)?;
+        let projection = prepared.publish()?;
+        columnar::crash("incremental-build-manifest-published");
+        self.projections.publish(projection)?;
+        Ok(id)
+    }
+
     fn build_columnar_projection_with<F>(
         &mut self,
         mut spec: ColumnarProjectionSpec,
@@ -2286,6 +2351,94 @@ impl Database {
         Ok(id)
     }
 
+    /// Applies one bounded contiguous NBCL range and publishes at most one
+    /// immutable NBCD segment. DML never invokes this path.
+    pub fn advance_columnar_projection(
+        &mut self,
+        id: ColumnarProjectionId,
+        budget: ColumnarAdvanceBudget,
+    ) -> Result<ColumnarAdvanceReport, DatabaseError> {
+        if budget.max_batches == 0 || budget.max_change_bytes == 0 {
+            return Err(
+                StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
+                    "columnar advance budget must be nonzero",
+                ))
+                .into(),
+            );
+        }
+        let projection = self
+            .projections
+            .get(id)
+            .cloned()
+            .ok_or(DatabaseError::ColumnarProjectionNotFound(id))?;
+        let metadata = projection.metadata().clone();
+        let incremental = metadata
+            .incremental
+            .as_ref()
+            .ok_or(DatabaseError::ColumnarProjectionNotIncremental(id))?;
+        let storage = self.registry.get(metadata.source_storage_id).ok_or(
+            StorageRegistryError::UnknownStorageId {
+                storage_id: metadata.source_storage_id,
+            },
+        )?;
+        if storage.table().fingerprint()? != metadata.schema_fingerprint {
+            return Err(
+                StorageError::from(netbadb_storage::ColumnarError::IdentityMismatch(
+                    "incremental projection schema",
+                ))
+                .into(),
+            );
+        }
+        let cursor = ChangeStreamCursor {
+            storage_id: metadata.source_storage_id,
+            generation: incremental.stream_generation,
+            frontier: incremental.applied_frontier,
+        };
+        let changes = storage.read_changes(cursor, budget.max_batches, budget.max_change_bytes)?;
+        let before = incremental.applied_frontier;
+        if changes.batches.is_empty() {
+            return Ok(ColumnarAdvanceReport {
+                before_frontier: before,
+                after_frontier: before,
+                source_current_frontier: changes.current_frontier,
+                batches_applied: 0,
+                mutations_applied: 0,
+                delta_segment_created: false,
+                bytes_written: 0,
+                caught_up: before == changes.current_frontier,
+            });
+        }
+        let table = storage.table().clone();
+        let mutations_applied = changes
+            .batches
+            .iter()
+            .map(|batch| batch.mutations.len() as u64)
+            .sum();
+        let batches_applied = changes.batches.len() as u64;
+        let prepared = projection.prepare_advance(&table, &changes.batches)?;
+        let replacement = prepared.publish()?;
+        let replacement_incremental = replacement
+            .metadata()
+            .incremental
+            .as_ref()
+            .ok_or(DatabaseError::ColumnarProjectionNotIncremental(id))?;
+        let after = replacement_incremental.applied_frontier;
+        let bytes_written = replacement_incremental
+            .delta_bytes
+            .saturating_sub(incremental.delta_bytes);
+        let _old = self.projections.replace(id, replacement)?;
+        Ok(ColumnarAdvanceReport {
+            before_frontier: before,
+            after_frontier: after,
+            source_current_frontier: changes.current_frontier,
+            batches_applied,
+            mutations_applied,
+            delta_segment_created: true,
+            bytes_written,
+            caught_up: after == changes.current_frontier,
+        })
+    }
+
     /// Rebuilds the same projection identity and atomically publishes a new generation.
     pub fn refresh_columnar_projection(
         &mut self,
@@ -2309,31 +2462,47 @@ impl Database {
                 .checked_add(1)
                 .ok_or(DatabaseError::ColumnarProjectionIdExhausted)?,
         );
-        let CapturedColumnarSource {
-            storage_id,
-            table,
-            token: source_token,
-            rows,
-        } = self.capture_columnar_source(metadata.table_id, &columns)?;
-        let prepared = ColumnarProjection::prepare(
-            directory,
-            id,
-            generation,
-            &table,
-            storage_id,
-            source_token,
-            &columns,
-            &rows,
-            None,
-        )?;
+        let incremental_mode = metadata.incremental.is_some();
+        let (prepared, storage_id, source_token) = if incremental_mode {
+            let captured = self.capture_incremental_columnar_source(metadata.table_id, &columns)?;
+            let prepared = ColumnarProjection::prepare_incremental(
+                directory,
+                id,
+                generation,
+                &captured.table,
+                captured.storage_id,
+                captured.token,
+                captured.cursor,
+                &columns,
+                &captured.rows,
+                None,
+            )?;
+            (prepared, captured.storage_id, captured.token)
+        } else {
+            let captured = self.capture_columnar_source(metadata.table_id, &columns)?;
+            let prepared = ColumnarProjection::prepare(
+                directory,
+                id,
+                generation,
+                &captured.table,
+                captured.storage_id,
+                captured.token,
+                &columns,
+                &captured.rows,
+                None,
+            )?;
+            (prepared, captured.storage_id, captured.token)
+        };
         columnar::crash("refresh-files-synced");
-        let current = self
-            .registry
-            .get(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-            .current_snapshot_token()?;
-        if current != source_token {
-            return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+        if !incremental_mode {
+            let current = self
+                .registry
+                .get(storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+                .current_snapshot_token()?;
+            if current != source_token {
+                return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+            }
         }
         let replacement = prepared.publish()?;
         columnar::crash("refresh-manifest-published");
@@ -2468,7 +2637,11 @@ impl Database {
                     .registry
                     .get(metadata.source_storage_id)
                     .and_then(|storage| storage.table().fingerprint().ok());
-                columnar::inspection(entry, current, current_schema_fingerprint)
+                let current_stream = self
+                    .registry
+                    .get(metadata.source_storage_id)
+                    .map(TableStorage::inspect_change_stream);
+                columnar::inspection(entry, current, current_stream, current_schema_fingerprint)
             })
             .collect()
     }
@@ -2528,6 +2701,36 @@ impl Database {
             storage_id,
             table,
             token,
+            rows,
+        })
+    }
+
+    fn capture_incremental_columnar_source(
+        &mut self,
+        table_id: TableId,
+        columns: &[ColumnId],
+    ) -> Result<CapturedIncrementalColumnarSource, DatabaseError> {
+        let storage_id = match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(DatabaseError::ColumnarProjectionRequiresSingleStorage(
+                    table_id,
+                ));
+            }
+        };
+        let storage = self
+            .registry
+            .get_mut(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+        let table = storage.table().clone();
+        let anchor = storage.committed_read_anchor()?;
+        let token = storage.snapshot_token(&anchor.read_view)?;
+        let rows = storage.scan_versioned_columns_with_view(columns, &anchor.read_view)?;
+        Ok(CapturedIncrementalColumnarSource {
+            storage_id,
+            table,
+            token,
+            cursor: anchor.cursor,
             rows,
         })
     }
@@ -3712,11 +3915,39 @@ impl Database {
                     return None;
                 }
                 let storage = self.registry.get(*storage_id)?;
-                if storage.table().fingerprint().ok()? != metadata.schema_fingerprint
-                    || storage.current_snapshot_token().ok()? != metadata.source_token
-                {
+                if storage.table().fingerprint().ok()? != metadata.schema_fingerprint {
                     return None;
                 }
+                let (
+                    delta_segment_count,
+                    delta_bytes,
+                    delta_mutation_count,
+                    delta_live_row_count,
+                    suppressed_version_count,
+                ) = match &metadata.incremental {
+                    Some(incremental) => {
+                        let stream = storage.inspect_change_stream();
+                        if stream.status != netbadb_storage::ChangeStreamStatus::Enabled
+                            || stream.generation != Some(incremental.stream_generation)
+                            || stream.current_data_version != incremental.applied_frontier
+                        {
+                            return None;
+                        }
+                        (
+                            incremental.delta_segments.len() as u64,
+                            incremental.delta_bytes,
+                            incremental.delta_mutation_count,
+                            incremental.delta_live_row_count,
+                            incremental.suppressed_version_count,
+                        )
+                    }
+                    None => {
+                        if storage.current_snapshot_token().ok()? != metadata.source_token {
+                            return None;
+                        }
+                        (0, 0, 0, 0, 0)
+                    }
+                };
                 Some(ColumnarProjectionPlanningSnapshot {
                     projection_id: metadata.id,
                     generation: metadata.generation,
@@ -3730,6 +3961,11 @@ impl Database {
                     row_count: metadata.row_count,
                     row_group_count: metadata.row_group_count,
                     segment_bytes: metadata.segment_bytes,
+                    delta_segment_count,
+                    delta_bytes,
+                    delta_mutation_count,
+                    delta_live_row_count,
+                    suppressed_version_count,
                     row_groups: projection
                         .row_group_statistics()
                         .into_iter()

@@ -215,6 +215,35 @@ impl StorageRowHandle {
     pub const fn storage_id(self) -> StorageId {
         self.storage_id
     }
+
+    /// Converts an opaque handle observed through a committed read view into
+    /// the exact storage-local version identity used by change streams.
+    pub fn committed_version_key(self) -> Result<crate::StorageVersionKey, StorageError> {
+        match self.inner {
+            StorageRowHandleKind::Heap(row_id) => Ok(crate::StorageVersionKey::Heap {
+                storage_id: self.storage_id,
+                row_id,
+            }),
+            StorageRowHandleKind::Lsm(row) => match row.observed {
+                crate::lsm::LsmObservedVersion::Committed(version) if version.0 != 0 => {
+                    Ok(crate::StorageVersionKey::Lsm {
+                        storage_id: self.storage_id,
+                        row_id: row.row_id,
+                        version,
+                    })
+                }
+                crate::lsm::LsmObservedVersion::Committed(_) => Err(StorageError::InvalidFormat(
+                    "committed LSM row has zero commit sequence".into(),
+                )),
+                crate::lsm::LsmObservedVersion::Pending(_) => {
+                    Err(StorageError::UnsupportedOperation {
+                        operation: "version identity for an uncommitted LSM row",
+                        storage_kind: "LSM",
+                    })
+                }
+            },
+        }
+    }
 }
 
 /// Table-scoped read context passed through executor storage capabilities.
@@ -928,6 +957,19 @@ impl TableStorage {
                     .collect())
             }
         }
+    }
+
+    /// Scans projected values together with their exact committed physical
+    /// version identity. The identity is storage metadata, not a SQL column.
+    pub fn scan_versioned_columns_with_view(
+        &mut self,
+        columns: &[ColumnId],
+        view: &StorageReadView,
+    ) -> Result<Vec<(crate::StorageVersionKey, Vec<ScalarValue>)>, StorageError> {
+        self.scan_columns_with_view(columns, view)?
+            .into_iter()
+            .map(|(handle, values)| Ok((handle.committed_version_key()?, values)))
+            .collect()
     }
 
     /// Produces validated visible rows synchronously until the consumer breaks.
