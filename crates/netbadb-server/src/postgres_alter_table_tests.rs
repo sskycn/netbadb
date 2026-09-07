@@ -2224,12 +2224,207 @@ fn pg_round50_extended_bound_update_is_pure_until_execute() {
 }
 
 #[test]
-fn pg_round53_late_rhs_and_where_remain_closed_and_abort_the_transaction() {
-    for statement in [
-        "UPDATE accounts SET normalized = marker",
-        "UPDATE accounts SET normalized = 'x' WHERE marker IS NULL",
+fn pg_round54_simple_virtual_row_repair_copy_index_and_reopen() {
+    let (root, mut db) = layout_project("round54-simple");
+    let mut admin = session(&db, true);
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        (
+            "UPDATE accounts SET legacy = 'updated1' WHERE id = 1",
+            "UPDATE 1",
+        ),
+        (
+            "INSERT INTO accounts VALUES (4, 'inserted4', NULL)",
+            "INSERT 0 1",
+        ),
+        ("DELETE FROM accounts WHERE id = 2", "DELETE 1"),
+        ("UPDATE accounts SET legacy = NULL WHERE id = 3", "UPDATE 1"),
+        ("ALTER TABLE accounts ADD COLUMN marker TEXT", "ALTER TABLE"),
+        (
+            "ALTER TABLE accounts ADD COLUMN normalized TEXT",
+            "ALTER TABLE",
+        ),
+        (
+            "UPDATE accounts SET marker = legacy WHERE marker IS NULL AND legacy IS NOT NULL",
+            "UPDATE 2",
+        ),
+        (
+            "UPDATE accounts SET marker = 'missing' WHERE marker IS NULL",
+            "UPDATE 1",
+        ),
+        (
+            "UPDATE accounts SET normalized = marker WHERE marker IS NOT NULL",
+            "UPDATE 3",
+        ),
+        (
+            "ALTER TABLE accounts ALTER COLUMN marker SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        (
+            "ALTER TABLE accounts ALTER COLUMN normalized SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        (
+            "CREATE INDEX accounts_normalized_idx ON accounts(normalized)",
+            "CREATE INDEX",
+        ),
+        ("COMMIT", "COMMIT"),
     ] {
-        let (root, mut db) = layout_project("round53-late-read-negative");
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+            ],
+            "{source}"
+        );
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            db.query("SELECT id, marker, normalized FROM accounts ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("updated1".into()),
+                    ScalarValue::Text("updated1".into()),
+                ],
+                vec![
+                    ScalarValue::Int64(3),
+                    ScalarValue::Text("missing".into()),
+                    ScalarValue::Text("missing".into()),
+                ],
+                vec![
+                    ScalarValue::Int64(4),
+                    ScalarValue::Text("inserted4".into()),
+                    ScalarValue::Text("inserted4".into()),
+                ],
+            ]
+        );
+        db.close().unwrap();
+        db = Database::open_catalog(root.join("catalog")).unwrap();
+    }
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round54_extended_prepared_consumer_reads_current_prefix_and_bound_values() {
+    let (root, mut db) = layout_project("round54-extended");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        "ALTER TABLE accounts ADD COLUMN normalized TEXT",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "consumer".into(),
+                query: "UPDATE accounts SET normalized = marker WHERE marker IS NOT NULL".into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET marker = legacy WHERE marker IS NULL AND legacy IS NOT NULL"
+        ),
+        [
+            BackendMessage::CommandComplete("UPDATE 3".into()),
+            BackendMessage::ReadyForQuery(b'T'),
+        ]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "consumer".into(),
+                statement: "consumer".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "consumer".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("UPDATE 3".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "repair".into(),
+                query: "UPDATE accounts SET marker = $1 WHERE marker IS NULL AND legacy = $2"
+                    .into(),
+                parameter_types: vec![PostgresOid(25), PostgresOid(25)],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "repair".into(),
+                statement: "repair".into(),
+                parameter_formats: vec![],
+                parameters: vec![Some(b"bound".to_vec()), Some(b"never".to_vec())],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "repair".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("UPDATE 0".into())]
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+    ok(&sql(&mut admin, &mut db, "COMMIT"));
+    assert_eq!(
+        db.query("SELECT normalized FROM accounts WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![ScalarValue::Text("old-one".into())]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round54_true_unsupported_access_still_aborts_the_transaction() {
+    for statement in [
+        "UPDATE accounts SET legacy = marker",
+        "UPDATE accounts SET legacy = marker, normalized = marker",
+        "SELECT marker FROM accounts",
+        "INSERT INTO accounts (id, marker) VALUES (9, 'x')",
+        "DELETE FROM accounts WHERE marker IS NULL",
+    ] {
+        let (root, mut db) = layout_project("round54-unsupported");
         let mut admin = session(&db, true);
         for source in [
             "BEGIN",
@@ -2248,4 +2443,73 @@ fn pg_round53_late_rhs_and_where_remain_closed_and_abort_the_transaction() {
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn pg_round54_terminal_index_phase_closes_late_read_updates() {
+    let (root, mut db) = layout_project("round54-terminal");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        "ALTER TABLE accounts ADD COLUMN normalized TEXT",
+        "UPDATE accounts SET marker = legacy WHERE marker IS NULL",
+        "CREATE INDEX accounts_marker_round54_idx ON accounts(marker)",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET normalized = marker WHERE marker IS NOT NULL",
+        ),
+        "25000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round54_enabled_stream_accepts_updates_but_blocks_commit() {
+    let (root, mut db) = layout_project("round54-enabled-stream");
+    let table = db.schema().table("accounts").unwrap().id;
+    let frontier = db.enable_change_stream(table).unwrap().frontier;
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN marker TEXT",
+        "ALTER TABLE accounts ADD COLUMN normalized TEXT",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    assert_eq!(
+        sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET marker = legacy WHERE marker IS NULL AND legacy IS NOT NULL"
+        ),
+        [
+            BackendMessage::CommandComplete("UPDATE 3".into()),
+            BackendMessage::ReadyForQuery(b'T'),
+        ]
+    );
+    state(&sql(&mut admin, &mut db, "COMMIT"), "0A000");
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+        "25000",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    let stream = db.inspect_change_stream(table).unwrap();
+    assert_eq!(stream.current_data_version, frontier);
+    assert_eq!(stream.committed_batch_count, 0);
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

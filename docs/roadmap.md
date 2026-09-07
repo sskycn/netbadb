@@ -1,5 +1,22 @@
 # NetbaDB roadmap
 
+## Production VirtualRow late-column reads (Round 54 complete)
+
+- removed the test-only read-authority split and productionized Candidate A
+  through real `execute_in`, prepared Execute, and PostgreSQL paths;
+- defined readable late identities as reserved, visible in the current target,
+  absent from the captured base, and owned by the same adopted TableId;
+- implemented initial NULL, ordered-prefix, simultaneous assignment, swap,
+  repair, late-to-late RHS, exact affected-row and prepared-before-producer
+  semantics through the shared production row primitive;
+- retained one authoritative S1 scan per Execute, one final S2/pass, v1 action
+  semantics, tag25/tag35 binding, CORD recovery without program replay, and the
+  32-action limit;
+- kept Round 52 Enabled/Unavailable replacement blocking, Columnar derived
+  authority, every persistent/wire format, and unsupported relational scope.
+
+See [`deferred-virtual-row-round54.md`](deferred-virtual-row-round54.md).
+
 ## Virtual projected row / late-column read audit (Round 53 complete)
 
 - selected Candidate A for Round 54: reconstruct each pre-statement VirtualRow
@@ -11,8 +28,9 @@
   recovery without program replay;
 - measured bounded prefix replay through 100K rows and 32 actions and recommends
   retaining the existing 32-action cap;
-- kept production late reads closed and preserved the Round 52 stream guard,
-  Columnar Phase 2B/C/D derived authority, and every persistent/wire format.
+- kept production late reads closed at that audit milestone; Round 54 now
+  productionizes the selected semantics without changing the Round 52 stream
+  guard, Columnar Phase 2B/C/D derived authority, or persistent/wire formats.
 
 See [`deferred-virtual-row-round53.md`](deferred-virtual-row-round53.md).
 

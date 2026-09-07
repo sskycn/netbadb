@@ -61,7 +61,7 @@ production or build dependencies.
 | One managed Heap DML + nullable ADD/eligible DROP/rename | psql yes, bounded | Round 44 exact one-S1 adoption; one final S2, no later DML; final index phase added in Round 48 |
 | One managed Heap DML + surviving-column SET/DROP NOT NULL | psql yes, bounded | Round 46 transaction-visible SET validation; indexed survivors supported; new-column nullability and later DML unsupported; final indexes added in Round 48 |
 | Adopted refinement + terminal CREATE/DROP INDEX | psql and Extended Query, bounded | Round 48: one S2 for dirty tables; same S1/P1 for index-only; later ALTER/DML closed |
-| Adopted ADD + deferred late-column UPDATE + projected NOT NULL + final index | psql and Extended Query, bounded | Round 50 managed Single Heap only; exact S1/P1 observation, owned bound scalars, one final S2; other relational access closed |
+| Adopted ADD + deferred late-column UPDATE + projected NOT NULL + final index | psql and Extended Query, bounded | Round 54 managed Single Heap: reads surviving base plus visible reserved late columns from one pre-statement VirtualRow; simultaneous assignments, owned bound scalars, exact S1/P1 observation, one final S2; other relational access closed |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
@@ -206,3 +206,11 @@ PostgreSQL 17.11 psql and ICU paths, exercises Simple Query plus psql's unnamed
 Extended Query bind, checks exact UPDATE/ALTER/CREATE/COMMIT tags and
 `23502`/`25000`/`25P02`, and verifies committed or rolled-back state through
 three catalog-only reopens per fixture. Round 39/42/44/46/48 remain retained.
+
+Round 54 production coverage is part of the same retained Core and PostgreSQL
+ALTER suites. It adds Simple Query repair/copy/index tags, Extended prepared
+consumer-before-producer and bound-late-predicate cases, true unsupported
+`25000`/`25P02` cases, and Enabled-stream UPDATE-success/COMMIT-`0A000`
+behavior. Run `python3 scripts/test-deferred-virtual-row-sql.py` from the
+repository root with the documented PostgreSQL and ICU installation. See
+[`deferred-virtual-row-round54.md`](deferred-virtual-row-round54.md).

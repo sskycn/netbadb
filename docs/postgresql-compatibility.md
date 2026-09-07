@@ -253,6 +253,16 @@ deferred backfill covers every row; a remaining NULL is `23502`, followed by
 SELECT/INSERT/DELETE remain `25000`. The adapter still has no migration-state
 branch.
 
+[Round 54](deferred-virtual-row-round54.md) permits those same deferred UPDATEs
+to read visible reserved late columns through the current logical VirtualRow.
+WHERE and every RHS share one immutable pre-statement row, assignments are
+simultaneous, and later statements observe earlier results. Late-read UPDATE is
+therefore no longer a `25000` case; base/mixed writes and SELECT/INSERT/DELETE
+remain so. Extended prepared consumers reconstruct the prefix at Execute
+without a program-generation dependency. An Enabled/Unavailable Change Stream
+still makes final replacement `0A000`; the accepted logical action emits no
+NBCL mutation.
+
 
 Retirement clears only that index's statistics. ANALYZE and vacuum ignore retired
 definitions. Inspection JSON is unchanged and active-only. Existing connections

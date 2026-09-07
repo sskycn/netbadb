@@ -349,7 +349,6 @@ fn ineligible_relational_access_falls_through_without_changing_program() {
     let mut transaction = adopt(&mut database);
     for statement in [
         "UPDATE users SET legacy = 'base write'",
-        "UPDATE users SET marker = marker",
         "SELECT marker FROM users",
         "DELETE FROM users WHERE id = 1",
     ] {
@@ -908,21 +907,19 @@ fn empty_table_allows_projected_not_null_and_simultaneous_assignments_keep_sql_o
 }
 
 #[test]
-fn mixed_targets_and_late_predicates_stay_on_the_existing_closed_gate() {
+fn mixed_base_and_late_targets_stay_on_the_existing_closed_gate() {
     let root = root("error-matrix");
     let mut database = seed(&root);
     let mut transaction = adopt(&mut database);
-    for statement in [
-        "UPDATE users SET legacy = 'base', marker = 'late'",
-        "UPDATE users SET marker = 'late' WHERE marker IS NULL",
-    ] {
-        assert!(matches!(
-            database.execute_in(&mut transaction, statement),
-            Err(DatabaseError::SchemaMutation(
-                SchemaMutationError::MigrationDataAccessAfterRefinement
-            ))
-        ));
-    }
+    assert!(matches!(
+        database.execute_in(
+            &mut transaction,
+            "UPDATE users SET legacy = 'base', marker = 'late'",
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::MigrationDataAccessAfterRefinement
+        ))
+    ));
     assert!(
         transaction
             .schema_composition

@@ -12,12 +12,16 @@ WHERE deterministic_typed_predicate;
 
 Every assignment target must be a current column absent from the captured base
 `TableDef` and backed by the transaction's durable tag-16 `ColumnId`
-reservation. Every column read by the predicate or right-hand side must be a
-surviving base `ColumnId` from the same adopted table. Literals, `NULL`, bound
+reservation. At this milestone every column read by the predicate or
+right-hand side had to be a surviving base `ColumnId` from the same adopted
+table. Literals, `NULL`, bound
 scalar parameters, supported casts, comparisons, Boolean operations, and
 `IS [NOT] NULL` reuse the existing typed executor evaluator. Functions,
 arithmetic outside the existing language, subqueries, joins, aggregates,
-late-column reads, base-column writes, and cross-table access remain closed.
+late-column reads, base-column writes, and cross-table access remained closed.
+Round 54 now adds the bounded late-read extension described in
+[`deferred-virtual-row-round54.md`](deferred-virtual-row-round54.md), without
+changing this Round 50 base-only semantic domain or golden digest.
 
 This is bounded deferred migration UPDATE support. It is not general
 post-refinement DML.

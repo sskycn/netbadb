@@ -7,6 +7,11 @@ columns; a late-column RHS or WHERE expression falls through to
 `MigrationDataAccessAfterRefinement` (`25000` over PostgreSQL, then `25P02` in
 an explicit failed transaction).
 
+Round 54 subsequently productionized this selected Candidate A and removed the
+test-only correctness entrance. See
+[`deferred-virtual-row-round54.md`](deferred-virtual-row-round54.md). The text
+below remains the historical audit and decision record.
+
 The audit started from `5adfa29c866ac32909834dbb78745a417d48b03e`, preserving
 the Round 52 guard at `358b06d89c72cb35c299300546f33a54ac0a00fc` and
 Columnar Phase 2D at `5adfa29c866ac32909834dbb78745a417d48b03e`.

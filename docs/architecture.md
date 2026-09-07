@@ -434,6 +434,17 @@ verification detects source/program drift. The program is never durable;
 existing tag25/tag35 evidence and CORD recovery remain authoritative after the
 commit decision. Columnar stays derived and outside transaction participants.
 
+[Round 54](deferred-virtual-row-round54.md) makes the same projected row the
+sole production deferred-read model. Readable identities are surviving base
+columns plus current-target, durably reserved late columns. Execute projects
+the transaction-visible S1 row, synthesizes late NULLs, applies the accepted
+prefix through the same `DeferredBackfillProgram::apply_row` used by
+finalization, and evaluates WHERE plus every RHS against one immutable
+pre-statement row. Assignments are then applied together. Program growth does
+not stale prepared statements, while normal T/V/F changes do. S1 remains the
+only pre-final physical authority; one final S2, tag25/tag35 evidence, Round 52
+replacement admission and CORD recovery are unchanged.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

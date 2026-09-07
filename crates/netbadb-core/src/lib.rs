@@ -8495,7 +8495,7 @@ mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]
-mod deferred_virtual_row_audit_tests;
+mod deferred_virtual_row_tests;
 #[cfg(test)]
 mod indexed_nullability_audit_tests;
 #[cfg(test)]

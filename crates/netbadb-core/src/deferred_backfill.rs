@@ -262,13 +262,6 @@ impl DeferredBackfillProgram {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadAuthority {
-    SurvivingBase,
-    #[cfg(test)]
-    VirtualProjected,
-}
-
 fn put_u32(hash: &mut Sha256, value: usize) -> Result<(), DatabaseError> {
     hash.update(
         u32::try_from(value)
@@ -457,7 +450,6 @@ fn build_action(
     base: &TableDef,
     target: &TableDef,
     reserved: &BTreeSet<ColumnId>,
-    read_authority: ReadAuthority,
 ) -> Result<Option<DeferredBackfillAction>, DatabaseError> {
     let LogicalStatement::Update {
         input,
@@ -485,11 +477,21 @@ fn build_action(
         .filter(|column| base.column_by_id(column.id).is_some())
         .map(|column| column.id)
         .collect::<BTreeSet<_>>();
-    let readable = match read_authority {
-        ReadAuthority::SurvivingBase => surviving.clone(),
-        #[cfg(test)]
-        ReadAuthority::VirtualProjected => surviving.union(reserved).copied().collect(),
-    };
+    // A durable reservation is allocation history, not schema visibility.
+    // Only reserved identities that are still present in the current target
+    // and absent from the captured base become synthesized/readable late
+    // columns. A previously added-then-dropped identity remains burned but
+    // cannot re-enter the VirtualRow authority.
+    let visible_reserved_late = target
+        .columns
+        .iter()
+        .filter(|column| base.column_by_id(column.id).is_none() && reserved.contains(&column.id))
+        .map(|column| column.id)
+        .collect::<BTreeSet<_>>();
+    let readable = surviving
+        .union(&visible_reserved_late)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let target_positions = scan_columns
         .iter()
         .filter(|column| column.table_id == *table_id && readable.contains(&column.column_id))
@@ -637,27 +639,19 @@ pub(crate) fn try_execute_adopted_update(
     transaction: &mut Transaction,
     statement: &LogicalStatement,
 ) -> Result<Option<u64>, DatabaseError> {
-    try_execute_adopted_update_with_authority(
-        database,
-        transaction,
-        statement,
-        ReadAuthority::SurvivingBase,
-    )
-    .map(|accepted| accepted.map(|accepted| accepted.affected_rows))
+    try_execute_adopted_update_inner(database, transaction, statement)
+        .map(|accepted| accepted.map(|accepted| accepted.affected_rows))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AcceptedAction {
     affected_rows: u64,
-    source_rows: u64,
-    prior_action_evaluations: u64,
 }
 
-fn try_execute_adopted_update_with_authority(
+fn try_execute_adopted_update_inner(
     database: &mut Database,
     transaction: &mut Transaction,
     statement: &LogicalStatement,
-    read_authority: ReadAuthority,
 ) -> Result<Option<AcceptedAction>, DatabaseError> {
     if !matches!(
         transaction.schema_composition,
@@ -667,13 +661,7 @@ fn try_execute_adopted_update_with_authority(
         return Ok(None);
     }
     let parts = adopted_parts(transaction)?;
-    let Some(mut action) = build_action(
-        statement,
-        &parts.base,
-        &parts.target,
-        &parts.reserved,
-        read_authority,
-    )?
+    let Some(mut action) = build_action(statement, &parts.base, &parts.target, &parts.reserved)?
     else {
         return Ok(None);
     };
@@ -690,7 +678,6 @@ fn try_execute_adopted_update_with_authority(
     }
 
     let prefix = plan.deferred_backfill.clone();
-    let prefix_len = prefix.actions.len();
     let view = transaction.begin_read_view(&[parts.storage], &mut database.registry)?;
     let source_view = view
         .iter()
@@ -706,7 +693,6 @@ fn try_execute_adopted_update_with_authority(
         .collect::<Vec<_>>();
     let mut observation = ActionAccumulator::new();
     let mut prefix_observations = prefix.begin_finalization();
-    let mut source_rows = 0_u64;
     let flow = database
         .registry
         .get_mut(parts.storage)
@@ -715,11 +701,6 @@ fn try_execute_adopted_update_with_authority(
             &columns,
             source_view,
             |_row, source_values| {
-                source_rows = source_rows
-                    .checked_add(1)
-                    .ok_or(SchemaMutationError::Corrupt(
-                        "deferred source row count overflow",
-                    ))?;
                 let mut virtual_values = parts
                     .projection
                     .project_without_target_constraints(&source_values)?;
@@ -779,51 +760,7 @@ fn try_execute_adopted_update_with_authority(
         }
     };
     schema_mutation::crash("deferred-backfill-accepted");
-    let prior_action_evaluations = source_rows
-        .checked_mul(
-            u64::try_from(prefix_len)
-                .map_err(|_| SchemaMutationError::Corrupt("deferred prefix length overflow"))?,
-        )
-        .ok_or(SchemaMutationError::Corrupt(
-            "deferred prefix evaluation count overflow",
-        ))?;
-    Ok(Some(AcceptedAction {
-        affected_rows,
-        source_rows,
-        prior_action_evaluations,
-    }))
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VirtualAuditExecution {
-    pub(crate) affected_rows: u64,
-    pub(crate) source_scans: u64,
-    pub(crate) source_rows: u64,
-    pub(crate) prior_action_evaluations: u64,
-}
-
-/// Round 53 audit-only entrance. Production dispatch never calls this path.
-#[cfg(test)]
-pub(crate) fn audit_execute_virtual_adopted_update(
-    database: &mut Database,
-    transaction: &mut Transaction,
-    statement: &LogicalStatement,
-) -> Result<Option<VirtualAuditExecution>, DatabaseError> {
-    try_execute_adopted_update_with_authority(
-        database,
-        transaction,
-        statement,
-        ReadAuthority::VirtualProjected,
-    )
-    .map(|accepted| {
-        accepted.map(|accepted| VirtualAuditExecution {
-            affected_rows: accepted.affected_rows,
-            source_scans: 1,
-            source_rows: accepted.source_rows,
-            prior_action_evaluations: accepted.prior_action_evaluations,
-        })
-    })
+    Ok(Some(AcceptedAction { affected_rows }))
 }
 
 #[cfg(test)]
@@ -835,7 +772,7 @@ pub(crate) struct VirtualAuditReplayCost {
     pub(crate) resident_metadata_bytes_estimate: usize,
 }
 
-/// Deterministic in-memory replay probe used by the Round 53 cost audit.
+/// Deterministic in-memory replay probe retained for the bounded cost test.
 #[cfg(test)]
 pub(crate) fn audit_replay_virtual_rows(
     transaction: &Transaction,

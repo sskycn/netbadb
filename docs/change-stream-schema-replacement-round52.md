@@ -52,6 +52,11 @@ same-S1 index prelude/tag-25 intent may also exist; the guard does not erase or
 replace it. It prevents the later rewrite aggregate and target. Explicit
 rollback resolves that prelude through its normal loser path.
 
+Round 54 late-column reads do not weaken this admission point. Deferred
+VirtualRow UPDATEs may be accepted while S1 is Enabled or Unavailable because
+they do not mutate S1 or append NBCL; final RewriteHeap still fails before S2
+allocation, and rollback leaves the stream frontier unchanged.
+
 The guard covers all current managed-Heap replacement producers:
 
 - ordinary schema composition (`CompositionTablePlan`);

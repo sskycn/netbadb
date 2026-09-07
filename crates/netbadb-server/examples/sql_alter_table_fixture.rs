@@ -35,6 +35,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round48_probe = std::env::var("NETBADB_ROUND48_PROBE").ok();
     let round50_probe = std::env::var("NETBADB_ROUND50_PROBE").ok();
     let round52_probe = std::env::var("NETBADB_ROUND52_PROBE").ok();
+    let round54_probe = std::env::var("NETBADB_ROUND54_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -63,6 +64,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round48_probe.is_some()
         || round50_probe.is_some()
         || round52_probe.is_some()
+        || round54_probe.is_some()
     {
         let nullability = if round46_email_not_null {
             " NOT NULL"
@@ -99,6 +101,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .table_schema_version(TableId(2))
         .ok_or("projects version missing")?;
     let base_generation = db.schema_generation();
+    let source_storage = db.inspect_change_stream(TableId(2))?.storage_id;
     let target_storage = db.next_storage_id().ok_or("StorageId floor missing")?;
     let round52_cursor = if let Some(probe) = &round52_probe {
         let cursor = db.enable_change_stream(TableId(2))?;
@@ -108,6 +111,11 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
             return Err(format!("unknown Round 52 probe {probe}").into());
         }
         Some(cursor)
+    } else {
+        None
+    };
+    let round54_cursor = if round54_probe.as_deref() == Some("enabled") {
+        Some(db.enable_change_stream(TableId(2))?)
     } else {
         None
     };
@@ -137,6 +145,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         || round48_probe.is_some()
         || round50_probe.is_some()
         || round52_probe.is_some()
+        || round54_probe.is_some()
     {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
@@ -210,6 +219,76 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
             reopened.close()?;
         }
         println!("REOPEN PASS Round 52 {probe}");
+        return Ok(());
+    }
+    if let Some(probe) = round54_probe {
+        let winner = probe == "commit";
+        if !winner && !matches!(probe.as_str(), "rollback" | "enabled") {
+            return Err(format!("unknown Round 54 probe {probe}").into());
+        }
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 54 table absent")?;
+            if winner {
+                if projects
+                    .column("marker")
+                    .is_none_or(|column| column.id != ColumnId(4) || column.nullable)
+                    || projects
+                        .column("normalized")
+                        .is_none_or(|column| column.id != ColumnId(5) || column.nullable)
+                    || reopened.next_storage_id()
+                        != Some(netbadb_types::StorageId(target_storage.0 + 1))
+                    || reopened.indexes(TableId(2))?.iter().all(|index| {
+                        index
+                            .name
+                            .as_ref()
+                            .is_none_or(|name| name.as_str() != "projects_normalized_idx")
+                    })
+                    || reopened
+                        .query("SELECT id, marker, normalized FROM projects ORDER BY id")?
+                        .rows
+                        != vec![
+                            vec![
+                                ScalarValue::Int64(1),
+                                ScalarValue::Text("updated1".into()),
+                                ScalarValue::Text("updated1".into()),
+                            ],
+                            vec![
+                                ScalarValue::Int64(3),
+                                ScalarValue::Text("missing".into()),
+                                ScalarValue::Text("missing".into()),
+                            ],
+                            vec![
+                                ScalarValue::Int64(4),
+                                ScalarValue::Text("inserted4".into()),
+                                ScalarValue::Text("inserted4".into()),
+                            ],
+                        ]
+                {
+                    return Err("Round 54 committed VirtualRow result mismatch".into());
+                }
+            } else if projects.column("marker").is_some()
+                || reopened.inspect_change_stream(TableId(2))?.storage_id
+                    != round54_cursor.map_or(source_storage, |cursor| cursor.storage_id)
+                || reopened.next_storage_id() != Some(target_storage)
+            {
+                return Err("Round 54 rollback/blocked result mismatch".into());
+            }
+            if let Some(cursor) = round54_cursor {
+                let stream = reopened.inspect_change_stream(TableId(2))?;
+                if stream.status != netbadb_storage::ChangeStreamStatus::Enabled
+                    || stream.current_data_version != cursor.frontier
+                    || stream.committed_batch_count != 0
+                {
+                    return Err("Round 54 enabled-stream loser emitted a change batch".into());
+                }
+            }
+            reopened.close()?;
+        }
+        println!("REOPEN PASS Round 54 {probe}");
         return Ok(());
     }
     if let Some(probe) = round50_probe {
