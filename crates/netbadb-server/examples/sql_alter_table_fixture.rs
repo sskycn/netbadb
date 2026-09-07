@@ -37,6 +37,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round52_probe = std::env::var("NETBADB_ROUND52_PROBE").ok();
     let round54_probe = std::env::var("NETBADB_ROUND54_PROBE").ok();
     let round56_probe = std::env::var("NETBADB_ROUND56_PROBE").ok();
+    let round58_probe = std::env::var("NETBADB_ROUND58_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -58,9 +59,11 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    if round56_probe.is_some() {
+    if round56_probe.is_some() || round58_probe.is_some() {
         db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, flag BOOLEAN)")?;
-        if round56_probe.as_deref() == Some("indexed-drop") {
+        if round56_probe.as_deref() == Some("indexed-drop")
+            || round58_probe.as_deref() == Some("indexed-swap")
+        {
             db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
         }
         db.execute("INSERT INTO projects VALUES (1, 'old1', true)")?;
@@ -150,7 +153,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("runtime storage path is not UTF-8")?;
 
     let manifest = root.join("server.json");
-    let project_columns = if round56_probe.is_some() {
+    let project_columns = if round56_probe.is_some() || round58_probe.is_some() {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
             {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
@@ -197,6 +200,46 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round58_probe {
+        if probe != "indexed-swap" {
+            return Err(format!("unknown Round 58 probe {probe}").into());
+        }
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 58 final table absent")?;
+            let indexes = reopened.indexes(TableId(2))?;
+            if projects.columns.len() != 3
+                || projects
+                    .column("legacy")
+                    .is_none_or(|column| column.id != ColumnId(4) || column.nullable)
+                || projects.column_by_id(ColumnId(2)).is_some()
+                || reopened.next_storage_id()
+                    != Some(netbadb_types::StorageId(target_storage.0 + 1))
+                || indexes.len() != 1
+                || indexes[0].id != netbadb_types::IndexId(2)
+                || indexes[0].column_id != ColumnId(4)
+                || indexes[0].name.as_ref().map(|name| name.as_str()) != Some("projects_legacy_idx")
+                || reopened
+                    .query("SELECT id, legacy FROM projects ORDER BY id")?
+                    .rows
+                    != vec![
+                        vec![ScalarValue::Int64(1), ScalarValue::Text("updated1".into())],
+                        vec![ScalarValue::Int64(3), ScalarValue::Text("missing".into())],
+                        vec![ScalarValue::Int64(4), ScalarValue::Text("inserted4".into())],
+                    ]
+            {
+                return Err("Round 58 committed indexed shadow swap mismatch".into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: indexed-swap Round 58 result survived three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round56_probe {
         let winner = matches!(probe.as_str(), "commit" | "rename-table");

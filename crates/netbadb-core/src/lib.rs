@@ -9703,7 +9703,7 @@ mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]
-mod deferred_index_evacuation_audit_tests;
+mod deferred_index_evacuation_tests;
 #[cfg(test)]
 mod deferred_terminal_structural_tests;
 #[cfg(test)]

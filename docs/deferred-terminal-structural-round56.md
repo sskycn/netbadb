@@ -6,8 +6,10 @@ managed Single-Heap migration may finish its deferred value program and then
 compose terminal same-table `DROP COLUMN`, `RENAME COLUMN`, and `RENAME TABLE`
 operations before its one final Heap replacement.
 
-This enables an atomic unindexed shadow-column replacement. It is not general
-online ALTER, indexed shadow swap, or type conversion.
+This round enabled an atomic unindexed shadow-column replacement. The later
+[Round 58](deferred-index-evacuation-round58.md) extends the same terminal phase
+with bounded logical evacuation for an indexed source; neither round implements
+general online ALTER or type conversion.
 
 ## Production state and routing
 

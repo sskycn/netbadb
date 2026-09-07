@@ -6,6 +6,11 @@ proof ancestors are `5ac08a8` and `e460a17`. This round is an architecture
 audit with a test-only executable carrier. It does **not** enable indexed
 shadow-column swaps in production.
 
+The selected design was subsequently productionized by
+[Round 58](deferred-index-evacuation-round58.md). The test-only routing and
+negative PostgreSQL endpoint described below remain the historical Round 57
+baseline, not current production behavior.
+
 ## Current blocker and selected design
 
 Production currently routes every adopted-source `DROP INDEX` through
@@ -203,6 +208,7 @@ Partition/LSM, Protocol/PostgreSQL framing, deployment manifest, SDK Schema
 Spec, generated code or public inspection format. It adds no persistent
 evacuation phase, journal tag, early S2, S3, async work or new decoder target.
 
-The real PostgreSQL negative acceptance remains deliberate: DROP INDEX
-succeeds, DROP COLUMN returns `25000`, the next command returns `25P02`, and
-ROLLBACK restores I1/C2. Production enablement is reserved for Round 58.
+At the Round 57 audit commit, the real PostgreSQL negative acceptance remained
+deliberate: DROP INDEX succeeded, DROP COLUMN returned `25000`, the next command
+returned `25P02`, and ROLLBACK restored I1/C2. Round 58 replaces that historical
+endpoint with the bounded positive production flow.

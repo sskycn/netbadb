@@ -450,8 +450,16 @@ private final schema before the one final Heap replacement. This enables atomic
 unindexed shadow-column replacement without physically mutating S1 or exposing
 an intermediate schema. Dropped source and late-intermediate ColumnIds may
 remain evaluation-only dependencies in frozen E, but are absent from final F
-and S2. ADD, type conversion, post-terminal nullability, indexed shadow swap,
-and general post-refinement DML remain unsupported.
+and S2.
+
+[Round 58](docs/deferred-index-evacuation-round58.md) productionizes bounded
+terminal logical index evacuation. After frozen E, an effective same-table DROP
+INDEX removes only the transaction-private binding, enters FinalRefining, and
+leaves the committed and physical S1 index unchanged. Terminal DROP/RENAME may
+then replace C2 with C4 and a same-name CREATE reserves a fresh I2 before one
+atomic S2 materialization. Table-noop/index-effective composition reuses the
+same-S1 index-delta path. ADD, type conversion, post-terminal nullability and
+general post-refinement DML remain unsupported.
 
 
 Offline catalog and statement inspection is documented in

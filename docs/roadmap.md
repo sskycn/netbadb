@@ -1,6 +1,23 @@
 # NetbaDB roadmap
 
-## Indexed shadow-column swap audit (Round 57 complete; production deferred)
+## Production terminal index evacuation (Round 58 complete)
+
+- productionized the Round 57 Candidate A routing through ordinary native,
+  prepared and PostgreSQL execution and removed the audit-only execution seam;
+- an effective same-table DROP INDEX in Backfilling enters FinalRefining, while
+  further drops remain there and unchanged/failed drops do not seal the program;
+- keeps physical/public S1 I1/C2 and its captured digest unchanged while the
+  private inventory drops I1, then assigns same-name replacement I2 to C4;
+- reuses the existing one-S2 rewrite or same-S1 `InPlaceIndexDelta`, preserving
+  Round 52 stream admission, rollback/burn rules, CORD recovery and one-G
+  structural publication with no pending Complete;
+- adds production crash/reopen and PostgreSQL acceptance without changing a
+  persistent, wire, SDK or inspection format.
+
+See
+[`deferred-index-evacuation-round58.md`](deferred-index-evacuation-round58.md).
+
+## Indexed shadow-column swap audit (Round 57 complete)
 
 - selected terminal logical index evacuation: an effective same-table DROP in
   Backfilling should seal the deferred program and enter FinalRefining, while
@@ -15,9 +32,8 @@
 - covered pre/post-CORD recovery, three reopens, Phase 3A one-G structural
   publication, Phase 3B prior-pending-Complete ordering, rollback and allocator
   burns without adding a format or recovery replay;
-- retained the production blocker: DROP INDEX still seals IndexFinalizing, so
-  the following structural ALTER remains `25000`. Round 58 owns the bounded
-  production routing change.
+- recorded the former production blocker and selected the bounded routing now
+  implemented by Round 58.
 
 See
 [`deferred-index-evacuation-round57.md`](deferred-index-evacuation-round57.md).
