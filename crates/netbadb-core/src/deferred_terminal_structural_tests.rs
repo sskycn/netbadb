@@ -1293,3 +1293,65 @@ fn terminal_structural_crash_matrix_converges_without_replaying_e() {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+#[test]
+fn global_terminal_swap_crashes_publish_only_the_reserved_final_snapshot() {
+    for (point, winner) in [
+        ("before-first-prepare", false),
+        ("after-durable-decision", true),
+        ("after-durable-complete-before-publication", true),
+    ] {
+        let path = root(&format!("global-crash-{point}"));
+        let database = seed_global(&path);
+        let before = database.current_database_snapshot().unwrap().unwrap();
+        let source = database.bindings.resolve_single(TableId(2)).unwrap();
+        database.close().unwrap();
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "deferred_terminal_structural_tests::round56_crash_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_ROUND56_CRASH_ROOT", &path);
+        crate::coordinator_crash::configure_child(&mut command, point, &path, point);
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(87),
+            "{point}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(path.join("catalog")).unwrap();
+            let published = reopened.current_database_snapshot().unwrap().unwrap();
+            if winner {
+                let target = reopened.bindings.resolve_single(TableId(2)).unwrap();
+                assert_ne!(target, source);
+                assert_eq!(published.commit_seq().0, before.commit_seq().0 + 1);
+                assert!(published.boundary(source).is_none());
+                assert!(published.boundary(target).is_some());
+                let table = reopened.schema().table("users").unwrap();
+                assert_eq!(table.column("legacy").unwrap().id, ColumnId(4));
+                assert!(table.column_by_id(ColumnId(2)).is_none());
+                assert_eq!(
+                    reopened.indexes(TableId(2)).unwrap()[0].column_id,
+                    ColumnId(4)
+                );
+                assert_physical_index_key(&mut reopened, target, ColumnId(4), "missing", 3);
+            } else {
+                assert_eq!(published, before);
+                assert_eq!(reopened.bindings.resolve_single(TableId(2)), Ok(source));
+                let table = reopened.schema().table("users").unwrap();
+                assert_eq!(table.column("legacy").unwrap().id, ColumnId(2));
+                assert!(table.column_by_id(ColumnId(4)).is_none());
+            }
+            reopened.close().unwrap();
+        }
+        assert_no_stage(&path);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}

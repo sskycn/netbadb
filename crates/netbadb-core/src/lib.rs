@@ -3919,6 +3919,8 @@ impl Database {
         let (Some(published), Some(commit_seq)) = (&self.published_visibility, commit_seq) else {
             return Ok(());
         };
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("after-durable-complete-before-publication");
         let snapshot =
             DatabaseSnapshot::new(commit_seq, current_visibility_boundaries(&self.registry)?)?;
         published
