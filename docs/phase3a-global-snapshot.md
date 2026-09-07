@@ -1,5 +1,10 @@
 # Phase 3A: global commit sequence and snapshot publication
 
+> Historical baseline: Phase 3A introduced the two-sync protocol documented
+> below. [Phase 3B](phase3b-global-commit-pipeline.md) now pipelines Complete
+> synchronization for pure data transactions while retaining this conservative
+> protocol for structural transactions.
+
 Phase 3A adds an opt-in database-wide committed visibility order without
 replacing either storage engine's MVCC domain. The database-global sequence is
 publication metadata; Heap and LSM continue to own their physical histories.
@@ -40,7 +45,7 @@ coordinator resolves every prepared decision before a `Database` is returned,
 finishes missing Completes in sequence order, then reconstructs the latest
 visibility vector from the current authoritative storage inventory.
 
-## Commit and publication protocol
+## Historical Phase 3A commit and publication protocol
 
 Every authoritative writer in global mode, including a single Heap or LSM
 writer and a no-op writer already enlisted as a write participant, follows:
@@ -55,17 +60,18 @@ writer and a no-op writer already enlisted as a write participant, follows:
 5. Publish one in-memory `DatabaseSnapshot` containing G and the updated,
    sorted storage boundary vector.
 
-Complete is the durable publication point. The synchronous database worker
-does not serve another statement between durable Complete and in-memory vector
-publication. A crash in that window reconstructs the vector during recovery.
-Decision and Complete retries are idempotent: an uncertain sync retries the
-same transaction and G. A later G cannot Complete while an earlier sequenced
-decision is incomplete.
+In the Phase 3A baseline, Complete is the durable publication point. The
+synchronous database worker does not serve another statement between durable
+Complete and in-memory vector publication. A crash in that window reconstructs
+the vector during recovery. Decision and Complete retries are idempotent: an
+uncertain sync retries the same transaction and G. A later G cannot Complete
+while an earlier sequenced decision is incomplete.
 
-Read-only transactions allocate no G. Global mode intentionally pays the
-coordinator decision and synchronization cost for a single writer; bypassing
-the sequence would permit a reader to observe a state that no published
-database snapshot names. Group commit and asynchronous batching are deferred.
+Read-only transactions allocate no G. The Phase 3A baseline intentionally pays
+the coordinator decision and synchronization cost for a single writer;
+bypassing the sequence would permit a reader to observe a state that no
+published database snapshot names. Group commit and asynchronous batching are
+deferred.
 
 ## Storage visibility boundaries
 
@@ -111,8 +117,10 @@ of the published vector query-visible.
 ## Inspection and scope
 
 `Database::inspect_global_visibility()` reports mode, published G, next G, and
-the sorted storage boundary diagnostics. `current_database_snapshot()` exposes
-the typed snapshot for embedded coordination and tests.
+the sorted storage boundary diagnostics. Phase 3B extends that inspection with
+the appended/synced Complete frontier, pending count, checkpoint error, bytes,
+and runtime sync counters. `current_database_snapshot()` exposes the typed
+snapshot for embedded coordination and tests.
 
 This phase does not add `AS OF`, persistent historical G-to-vector lookup,
 historical schema snapshots, Serializable isolation, group commit, async commit

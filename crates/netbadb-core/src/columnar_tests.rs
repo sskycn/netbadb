@@ -1916,7 +1916,7 @@ fn attach_rejects_projection_from_a_different_physical_storage() {
 }
 
 #[test]
-fn global_snapshot_blocks_ahead_projection_and_old_rr_uses_authoritative_history() {
+fn global_snapshot_with_pending_complete_keeps_old_rr_on_authoritative_history() {
     let root = path("global-snapshot-eligibility");
     let catalog = root.join("catalog");
     let heap = root.join("heap");
@@ -1978,15 +1978,14 @@ fn global_snapshot_blocks_ahead_projection_and_old_rr_uses_authoritative_history
         .expect("coordinator")
         .borrow_mut()
         .inject_complete_sync_failure();
-    assert!(writer.commit().is_err(), "Complete sync is uncertain");
-    assert!(matches!(
-        database.refresh_columnar_projection(projection_id),
-        Err(DatabaseError::ColumnarBuildSourceChanged { .. })
-    ));
-    writer.commit().expect("retry Complete and publish G2");
+    writer
+        .commit()
+        .expect("publish G2 before its Complete checkpoint sync");
     database
         .refresh_columnar_projection(projection_id)
         .expect("refresh at published G2");
+    assert!(database.flush().is_err(), "Complete checkpoint sync fails");
+    database.flush().expect("retry Complete checkpoint sync");
 
     let (latest, statistics) = database
         .query_with_columnar_statistics("SELECT id FROM events WHERE id >= 0")

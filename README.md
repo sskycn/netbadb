@@ -91,6 +91,15 @@ lifecycle, structural planner costs, and a 10K–10M CSV scale benchmark. Heap a
 LSM remain authoritative and committed DML makes a projection stale until
 refresh.
 
+[Phase 3B](docs/phase3b-global-commit-pipeline.md) pipelines coordinator
+synchronization for pure global data commits. `Decision(G)` is still synced
+before any participant commit, every participant commit is durable before G is
+published, and `Complete(G)` becomes a deferred recovery checkpoint combined
+with the next Decision sync or flushed by checkpoint/close. Structural schema,
+index, backfill, replacement, and catalog commits retain the conservative
+two-sync path. This is synchronous single-writer pipelining, not async or group
+commit, and CORD v3 is unchanged.
+
 [Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
 durable per-storage committed change stream for Heap and LSM, with exact
 row-version identities, transaction coalescing, bounded replay, gap detection,

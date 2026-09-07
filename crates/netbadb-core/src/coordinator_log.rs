@@ -58,6 +58,13 @@ pub(crate) struct CoordinatorLog {
     file: File,
     decisions: BTreeMap<DatabaseTxnId, CoordinatorDecision>,
     global_visibility: bool,
+    pending_complete_checkpoints: BTreeSet<DatabaseCommitSeq>,
+    last_appended_complete: DatabaseCommitSeq,
+    last_synced_complete: DatabaseCommitSeq,
+    last_checkpoint_error: Option<String>,
+    decision_sync_count: u64,
+    checkpoint_sync_count: u64,
+    combined_pipeline_sync_count: u64,
     #[cfg(test)]
     fail_next_decision_append: bool,
     #[cfg(test)]
@@ -83,6 +90,13 @@ impl CoordinatorLog {
             file,
             decisions: BTreeMap::new(),
             global_visibility: false,
+            pending_complete_checkpoints: BTreeSet::new(),
+            last_appended_complete: DatabaseCommitSeq(0),
+            last_synced_complete: DatabaseCommitSeq(0),
+            last_checkpoint_error: None,
+            decision_sync_count: 0,
+            checkpoint_sync_count: 0,
+            combined_pipeline_sync_count: 0,
             #[cfg(test)]
             fail_next_decision_append: false,
             #[cfg(test)]
@@ -100,12 +114,29 @@ impl CoordinatorLog {
         let scan = scan_file(&mut file, true)?;
         if scan.incomplete_tail {
             file.set_len(scan.valid_end)?;
-            file.sync_data()?;
         }
+        // Establish one durable baseline for inspection even when an
+        // unsynchronized but complete final checkpoint survived a process
+        // crash. Startup synchronization is not a foreground commit counter.
+        file.sync_data()?;
+        let last_complete = scan
+            .decisions
+            .values()
+            .filter(|decision| decision.complete)
+            .filter_map(|decision| decision.commit_seq)
+            .max()
+            .unwrap_or(DatabaseCommitSeq(0));
         Ok(Self {
             file,
             decisions: scan.decisions,
             global_visibility: scan.global_visibility,
+            pending_complete_checkpoints: BTreeSet::new(),
+            last_appended_complete: last_complete,
+            last_synced_complete: last_complete,
+            last_checkpoint_error: None,
+            decision_sync_count: 0,
+            checkpoint_sync_count: 0,
+            combined_pipeline_sync_count: 0,
             #[cfg(test)]
             fail_next_decision_append: false,
             #[cfg(test)]
@@ -147,6 +178,46 @@ impl CoordinatorLog {
             .ok_or(CoordinatorLogError::CommitSequenceExhausted)
     }
 
+    pub(crate) fn last_sequenced_decision(&self) -> DatabaseCommitSeq {
+        self.decisions
+            .values()
+            .filter_map(|decision| decision.commit_seq)
+            .max()
+            .unwrap_or(DatabaseCommitSeq(0))
+    }
+
+    pub(crate) const fn last_appended_complete(&self) -> DatabaseCommitSeq {
+        self.last_appended_complete
+    }
+
+    pub(crate) const fn last_synced_complete(&self) -> DatabaseCommitSeq {
+        self.last_synced_complete
+    }
+
+    pub(crate) fn pending_complete_count(&self) -> usize {
+        self.pending_complete_checkpoints.len()
+    }
+
+    pub(crate) fn last_checkpoint_error(&self) -> Option<&str> {
+        self.last_checkpoint_error.as_deref()
+    }
+
+    pub(crate) const fn decision_sync_count(&self) -> u64 {
+        self.decision_sync_count
+    }
+
+    pub(crate) const fn checkpoint_sync_count(&self) -> u64 {
+        self.checkpoint_sync_count
+    }
+
+    pub(crate) const fn combined_pipeline_sync_count(&self) -> u64 {
+        self.combined_pipeline_sync_count
+    }
+
+    pub(crate) fn byte_len(&self) -> Result<u64, CoordinatorLogError> {
+        Ok(self.file.metadata()?.len())
+    }
+
     /// Durably and irreversibly enables database-global snapshot publication.
     pub(crate) fn enable_global_visibility(&mut self) -> Result<(), CoordinatorLogError> {
         if self.global_visibility {
@@ -173,6 +244,8 @@ impl CoordinatorLog {
             return Err(CoordinatorLogError::GlobalVisibilityNotEnabled);
         }
         let participants = canonical_participants(database_txn_id, participants, schema.is_some())?;
+        let combined_checkpoint = !self.pending_complete_checkpoints.is_empty();
+        self.append_missing_pending_completes()?;
         if let Some(existing) = self.decisions.get(&database_txn_id) {
             if existing.participants != participants || existing.schema.as_ref() != schema {
                 return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
@@ -180,7 +253,7 @@ impl CoordinatorLog {
             let sequence = existing
                 .commit_seq
                 .ok_or(CoordinatorLogError::ConflictingDecision { database_txn_id })?;
-            self.file.sync_data()?;
+            self.sync_decision(combined_checkpoint)?;
             return Ok(sequence);
         }
         let commit_seq = self.next_commit_seq()?;
@@ -218,12 +291,100 @@ impl CoordinatorLog {
         if std::mem::take(&mut self.fail_next_decision_sync) {
             return Err(injected_io_error("sequenced decision sync").into());
         }
-        self.file.sync_data()?;
+        self.sync_decision(combined_checkpoint)?;
         Ok(commit_seq)
+    }
+
+    /// Appends a data transaction's recovery checkpoint without synchronizing
+    /// it. The already durable decision and participant commits remain the
+    /// commit proof; a later Decision sync or explicit checkpoint makes this
+    /// Complete durable.
+    pub(crate) fn defer_complete_sequenced(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorLogError> {
+        self.validate_sequenced_complete(database_txn_id, commit_seq)?;
+        self.pending_complete_checkpoints.insert(commit_seq);
+        if self
+            .decisions
+            .get(&database_txn_id)
+            .is_some_and(|decision| decision.complete)
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.append_sequenced_complete(database_txn_id, commit_seq) {
+            self.last_checkpoint_error = Some(error.to_string());
+            return Ok(());
+        }
+        self.last_checkpoint_error = None;
+        Ok(())
     }
 
     pub(crate) fn complete_sequenced(
         &mut self,
+        database_txn_id: DatabaseTxnId,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorLogError> {
+        self.validate_sequenced_complete(database_txn_id, commit_seq)?;
+        if self
+            .decisions
+            .get(&database_txn_id)
+            .is_some_and(|decision| decision.complete)
+        {
+            if let Err(error) = self.file.sync_data() {
+                let error = CoordinatorLogError::from(error);
+                self.last_checkpoint_error = Some(error.to_string());
+                return Err(error);
+            }
+            self.checkpoint_sync_count = self.checkpoint_sync_count.saturating_add(1);
+            self.mark_pending_completes_synced();
+            self.last_checkpoint_error = None;
+            return Ok(());
+        }
+        self.append_sequenced_complete(database_txn_id, commit_seq)?;
+        self.pending_complete_checkpoints.insert(commit_seq);
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_complete_sync) {
+            let error: CoordinatorLogError = injected_io_error("sequenced Complete sync").into();
+            self.last_checkpoint_error = Some(error.to_string());
+            return Err(error);
+        }
+        if let Err(error) = self.file.sync_data() {
+            let error = CoordinatorLogError::from(error);
+            self.last_checkpoint_error = Some(error.to_string());
+            return Err(error);
+        }
+        self.checkpoint_sync_count = self.checkpoint_sync_count.saturating_add(1);
+        self.mark_pending_completes_synced();
+        self.last_checkpoint_error = None;
+        Ok(())
+    }
+
+    pub(crate) fn flush_complete_checkpoints(&mut self) -> Result<(), CoordinatorLogError> {
+        if self.pending_complete_checkpoints.is_empty() {
+            return Ok(());
+        }
+        self.append_missing_pending_completes()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_complete_sync) {
+            let error: CoordinatorLogError = injected_io_error("sequenced Complete sync").into();
+            self.last_checkpoint_error = Some(error.to_string());
+            return Err(error);
+        }
+        if let Err(error) = self.file.sync_data() {
+            let error = CoordinatorLogError::from(error);
+            self.last_checkpoint_error = Some(error.to_string());
+            return Err(error);
+        }
+        self.checkpoint_sync_count = self.checkpoint_sync_count.saturating_add(1);
+        self.mark_pending_completes_synced();
+        self.last_checkpoint_error = None;
+        Ok(())
+    }
+
+    fn validate_sequenced_complete(
+        &self,
         database_txn_id: DatabaseTxnId,
         commit_seq: DatabaseCommitSeq,
     ) -> Result<(), CoordinatorLogError> {
@@ -238,19 +399,24 @@ impl CoordinatorLog {
                 actual: commit_seq,
             });
         }
-        if decision.complete {
-            self.file.sync_data()?;
-            return Ok(());
-        }
-        let preceding_incomplete = self.decisions.values().any(|other| {
-            other
-                .commit_seq
-                .is_some_and(|sequence| sequence < commit_seq)
-                && !other.complete
-        });
-        if preceding_incomplete {
+        if !decision.complete
+            && self.decisions.values().any(|other| {
+                other
+                    .commit_seq
+                    .is_some_and(|sequence| sequence < commit_seq)
+                    && !other.complete
+            })
+        {
             return Err(CoordinatorLogError::CommitSequenceGap { commit_seq });
         }
+        Ok(())
+    }
+
+    fn append_sequenced_complete(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorLogError> {
         let bytes = encode_record(
             database_txn_id,
             CoordinatorRecord::SequencedComplete(commit_seq),
@@ -272,12 +438,57 @@ impl CoordinatorLog {
             .get_mut(&database_txn_id)
             .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?
             .complete = true;
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_complete_sync) {
-            return Err(injected_io_error("sequenced Complete sync").into());
-        }
-        self.file.sync_data()?;
+        self.last_appended_complete = self.last_appended_complete.max(commit_seq);
         Ok(())
+    }
+
+    fn append_missing_pending_completes(&mut self) -> Result<(), CoordinatorLogError> {
+        let missing = self
+            .pending_complete_checkpoints
+            .iter()
+            .filter_map(|commit_seq| {
+                self.decisions
+                    .values()
+                    .find(|decision| decision.commit_seq == Some(*commit_seq) && !decision.complete)
+                    .map(|decision| (decision.database_txn_id, *commit_seq))
+            })
+            .collect::<Vec<_>>();
+        for (database_txn_id, commit_seq) in missing {
+            if let Err(error) = self.append_sequenced_complete(database_txn_id, commit_seq) {
+                self.last_checkpoint_error = Some(error.to_string());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_decision(&mut self, combined_checkpoint: bool) -> Result<(), CoordinatorLogError> {
+        if let Err(error) = self.file.sync_data() {
+            let error = CoordinatorLogError::from(error);
+            if combined_checkpoint {
+                self.last_checkpoint_error = Some(error.to_string());
+            }
+            return Err(error);
+        }
+        self.decision_sync_count = self.decision_sync_count.saturating_add(1);
+        if combined_checkpoint {
+            self.combined_pipeline_sync_count = self.combined_pipeline_sync_count.saturating_add(1);
+            self.mark_pending_completes_synced();
+        }
+        self.last_checkpoint_error = None;
+        Ok(())
+    }
+
+    fn mark_pending_completes_synced(&mut self) {
+        if let Some(last) = self
+            .pending_complete_checkpoints
+            .iter()
+            .next_back()
+            .copied()
+        {
+            self.last_synced_complete = self.last_synced_complete.max(last);
+        }
+        self.pending_complete_checkpoints.clear();
     }
 
     /// Appends and synchronizes the canonical database commit decision.
@@ -1571,6 +1782,77 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read global log");
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 1);
         drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deferred_complete_is_combined_with_the_next_decision_sync() {
+        let path = path("deferred-complete-pipeline");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).expect("create pipeline log");
+        log.enable_global_visibility().expect("enable global mode");
+
+        let first = log
+            .sequenced_commit_decision(DatabaseTxnId(30), &participants(), None)
+            .expect("write G1 decision");
+        log.defer_complete_sequenced(DatabaseTxnId(30), first)
+            .expect("append deferred G1 Complete");
+        assert_eq!(log.decision_sync_count(), 1);
+        assert_eq!(log.checkpoint_sync_count(), 0);
+        assert_eq!(log.combined_pipeline_sync_count(), 0);
+        assert_eq!(log.pending_complete_count(), 1);
+        assert_eq!(log.last_appended_complete(), DatabaseCommitSeq(1));
+        assert_eq!(log.last_synced_complete(), DatabaseCommitSeq(0));
+
+        let second = log
+            .sequenced_commit_decision(DatabaseTxnId(31), &participants(), None)
+            .expect("combine G1 Complete with G2 decision");
+        assert_eq!(second, DatabaseCommitSeq(2));
+        assert_eq!(log.decision_sync_count(), 2);
+        assert_eq!(log.combined_pipeline_sync_count(), 1);
+        assert_eq!(log.pending_complete_count(), 0);
+        assert_eq!(log.last_synced_complete(), DatabaseCommitSeq(1));
+
+        log.defer_complete_sequenced(DatabaseTxnId(31), second)
+            .expect("append deferred G2 Complete");
+        log.flush_complete_checkpoints()
+            .expect("explicitly checkpoint G2");
+        assert_eq!(log.checkpoint_sync_count(), 1);
+        assert_eq!(log.pending_complete_count(), 0);
+        assert_eq!(log.last_synced_complete(), DatabaseCommitSeq(2));
+        drop(log);
+
+        let reopened = CoordinatorLog::open(&path).expect("reopen checkpointed pipeline");
+        assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(2));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_deferred_complete_append_is_repaired_before_the_next_decision() {
+        let path = path("deferred-complete-repair");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).expect("create repair log");
+        log.enable_global_visibility().expect("enable global mode");
+        let first = log
+            .sequenced_commit_decision(DatabaseTxnId(40), &participants(), None)
+            .expect("write G1 decision");
+
+        log.inject_complete_append_failure();
+        log.defer_complete_sequenced(DatabaseTxnId(40), first)
+            .expect("committed data does not fail on checkpoint append");
+        assert_eq!(log.pending_complete_count(), 1);
+        assert_eq!(log.last_appended_complete(), DatabaseCommitSeq(0));
+        assert!(log.last_checkpoint_error().is_some());
+
+        let second = log
+            .sequenced_commit_decision(DatabaseTxnId(41), &participants(), None)
+            .expect("repair G1 Complete before syncing G2 decision");
+        assert_eq!(second, DatabaseCommitSeq(2));
+        assert_eq!(log.last_appended_complete(), DatabaseCommitSeq(1));
+        assert_eq!(log.last_synced_complete(), DatabaseCommitSeq(1));
+        assert_eq!(log.pending_complete_count(), 0);
+        assert!(log.last_checkpoint_error().is_none());
+        assert_eq!(log.combined_pipeline_sync_count(), 1);
         let _ = std::fs::remove_file(path);
     }
 }

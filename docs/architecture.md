@@ -455,6 +455,15 @@ written to S2. The existing ColumnId-only E-to-F projection, one source pass,
 one S2, tag25/tag35 evidence, CORD recovery, Round 52 replacement guard, and
 Phase 3A single-snapshot publication remain authoritative.
 
+[Phase 3B](phase3b-global-commit-pipeline.md) preserves that one-G publication
+model while moving only a pure data transaction's Complete sync out of its
+foreground path. Decision sync remains the irreversible commit point;
+participants commit durably before publication. The next Decision sync drains
+prior Complete checkpoints, and flush/checkpoint/close drain the final one.
+Structural transactions keep immediate Complete synchronization. No persistent
+format, async runtime, background worker, group commit, or multi-writer model is
+introduced.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

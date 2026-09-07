@@ -730,13 +730,22 @@ impl DatabaseTransaction {
             return Ok(());
         }
         if let Some(commit_seq) = self.pending_commit_seq {
-            self.coordinator
+            let structural = self.has_pending_schema_mutations();
+            let mut coordinator = self
+                .coordinator
                 .as_ref()
                 .ok_or(CoordinatorError::DurableCoordinatorRequired)?
                 .try_borrow_mut()
-                .map_err(|_| CoordinatorError::CoordinatorBusy)?
-                .complete_sequenced(self.id, commit_seq)?;
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?;
+            if structural {
+                coordinator.complete_sequenced(self.id, commit_seq)?;
+            } else {
+                coordinator.defer_complete_sequenced(self.id, commit_seq)?;
+            }
+            drop(coordinator);
             self.publish_committed_boundaries(commit_seq)?;
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash("after-publication-before-complete-sync");
         } else {
             self.coordinator
                 .as_ref()
@@ -748,7 +757,11 @@ impl DatabaseTransaction {
         self.state = TransactionState::Committed;
         self.release_visibility_pins();
         #[cfg(test)]
-        crate::coordinator_crash::maybe_crash("after-durable-complete");
+        if self.pending_commit_seq.is_some() {
+            crate::coordinator_crash::maybe_crash("after-deferred-complete-publication");
+        } else {
+            crate::coordinator_crash::maybe_crash("after-durable-complete");
+        }
         Ok(())
     }
 
@@ -1104,7 +1117,7 @@ impl DatabaseTransaction {
         commit_seq: DatabaseCommitSeq,
     ) -> Result<(), CoordinatorError> {
         #[cfg(test)]
-        crate::coordinator_crash::maybe_crash("after-durable-complete-before-publication");
+        crate::coordinator_crash::maybe_crash("after-deferred-complete-before-publication");
         let updates = self
             .write_participants
             .iter()

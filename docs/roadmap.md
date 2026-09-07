@@ -1,5 +1,24 @@
 # NetbaDB roadmap
 
+## Global commit sync pipeline (Phase 3B complete)
+
+- pure global Heap/LSM data commits retain a synced sequenced Decision as the
+  irreversible commit point and durable participant commits before publication;
+- sequenced Complete is now a deferred recovery checkpoint, appended before
+  publication and synchronized by the next Decision or explicit
+  flush/checkpoint/close;
+- missing Complete append is recorded without falsely rolling back committed
+  data, repaired before a future Decision, and exposed with appended/synced
+  frontiers, pending count, checkpoint error, bytes, and sync counters;
+- schema, composition, backfill, replacement, index, and catalog commits keep
+  the conservative two-sync Phase 3A path;
+- CORD v3 and every wire/storage format remain unchanged; no async commit,
+  group commit, background thread, timer, or concurrent coordinator writer was
+  added.
+
+See
+[`phase3b-global-commit-pipeline.md`](phase3b-global-commit-pipeline.md).
+
 ## Production terminal structural refinement (Round 56 complete)
 
 - added production `AdoptedSourceFinalRefining` entered only by the first

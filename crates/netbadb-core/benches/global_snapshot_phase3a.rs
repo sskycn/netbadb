@@ -96,6 +96,7 @@ fn run_single(kind: &str, global: bool, rows: i64) -> Result<(), Box<dyn Error>>
         transaction.commit()?;
     }
     let elapsed = started.elapsed().as_nanos();
+    let sync_count = database.inspect_global_visibility()?.decision_sync_count;
     database.flush()?;
     let sequence = database
         .current_database_snapshot()?
@@ -106,7 +107,6 @@ fn run_single(kind: &str, global: bool, rows: i64) -> Result<(), Box<dyn Error>>
     } else {
         lsm_wal_bytes(&lsm)
     };
-    let sync_count = if global { 2 } else { 0 };
     println!(
         "single,{kind},{},{rows},{elapsed},{coordinator_bytes},{sync_count},{wal_bytes},0,{sequence}",
         if global { "global" } else { "local" }
@@ -145,6 +145,7 @@ fn run_cross_storage() -> Result<(), Box<dyn Error>> {
     }
     transaction.commit()?;
     let commit_elapsed = started.elapsed().as_nanos();
+    let sync_count = database.inspect_global_visibility()?.decision_sync_count;
     let read_started = Instant::now();
     let rows = database
         .query("SELECT h.id FROM heap_items h JOIN lsm_items l ON h.id = l.id")?
@@ -158,7 +159,7 @@ fn run_cross_storage() -> Result<(), Box<dyn Error>> {
         .commit_seq()
         .0;
     println!(
-        "cross,heap+lsm,global,200,{commit_elapsed},{},2,{},0,{sequence};join_rows={rows};join_ns={read_elapsed}",
+        "cross,heap+lsm,global,200,{commit_elapsed},{},{sync_count},{},0,{sequence};join_rows={rows};join_ns={read_elapsed}",
         file_bytes(&coordinator),
         file_bytes(&netbadb_storage::wal_path(&heap)) + lsm_wal_bytes(&lsm)
     );

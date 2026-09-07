@@ -180,6 +180,15 @@ pub struct DatabaseVisibilityInspection {
     pub mode: DatabaseVisibilityMode,
     pub published_commit_seq: Option<DatabaseCommitSeq>,
     pub next_commit_seq: Option<DatabaseCommitSeq>,
+    pub last_sequenced_decision: Option<DatabaseCommitSeq>,
+    pub last_appended_complete: Option<DatabaseCommitSeq>,
+    pub last_synced_complete: Option<DatabaseCommitSeq>,
+    pub pending_complete_count: usize,
+    pub last_checkpoint_error: Option<String>,
+    pub decision_sync_count: u64,
+    pub checkpoint_sync_count: u64,
+    pub combined_pipeline_sync_count: u64,
+    pub coordinator_bytes: u64,
     pub boundaries: Vec<VisibilityBoundaryInspection>,
 }
 
@@ -1087,20 +1096,38 @@ impl Database {
                 mode: DatabaseVisibilityMode::LegacyLocal,
                 published_commit_seq: None,
                 next_commit_seq: None,
+                last_sequenced_decision: None,
+                last_appended_complete: None,
+                last_synced_complete: None,
+                pending_complete_count: 0,
+                last_checkpoint_error: None,
+                decision_sync_count: 0,
+                checkpoint_sync_count: 0,
+                combined_pipeline_sync_count: 0,
+                coordinator_bytes: 0,
                 boundaries: Vec::new(),
             });
         };
-        let next_commit_seq = self
+        let coordinator = self
             .coordinator
             .as_ref()
             .ok_or(CoordinatorError::DurableCoordinatorRequired)?
             .try_borrow()
-            .map_err(|_| CoordinatorError::CoordinatorBusy)?
-            .next_commit_seq()?;
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?;
+        let next_commit_seq = coordinator.next_commit_seq()?;
         Ok(DatabaseVisibilityInspection {
             mode: DatabaseVisibilityMode::Global,
             published_commit_seq: Some(snapshot.commit_seq()),
             next_commit_seq: Some(next_commit_seq),
+            last_sequenced_decision: Some(coordinator.last_sequenced_decision()),
+            last_appended_complete: Some(coordinator.last_appended_complete()),
+            last_synced_complete: Some(coordinator.last_synced_complete()),
+            pending_complete_count: coordinator.pending_complete_count(),
+            last_checkpoint_error: coordinator.last_checkpoint_error().map(str::to_owned),
+            decision_sync_count: coordinator.decision_sync_count(),
+            checkpoint_sync_count: coordinator.checkpoint_sync_count(),
+            combined_pipeline_sync_count: coordinator.combined_pipeline_sync_count(),
+            coordinator_bytes: coordinator.byte_len()?,
             boundaries: snapshot
                 .boundaries()
                 .iter()
@@ -2080,6 +2107,12 @@ impl Database {
         for entry in self.registry.iter() {
             entry.storage.flush()?;
         }
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .flush_complete_checkpoints()?;
+        }
         Ok(())
     }
 
@@ -2088,6 +2121,12 @@ impl Database {
         self.ensure_schema_available(None)?;
         for entry in self.registry.iter_mut() {
             entry.storage.checkpoint()?;
+        }
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .flush_complete_checkpoints()?;
         }
         Ok(())
     }
@@ -3259,7 +3298,7 @@ impl Database {
 
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
-        self.ensure_schema_available(None)?;
+        self.flush()?;
         for entry in self.registry.into_entries() {
             entry.storage.close()?;
         }
@@ -6147,8 +6186,9 @@ mod tests {
             ("after-all-commits", true),
             ("during-complete-append", true),
             ("after-complete-append", true),
-            ("after-durable-complete-before-publication", true),
-            ("after-durable-complete", true),
+            ("after-deferred-complete-before-publication", true),
+            ("after-publication-before-complete-sync", true),
+            ("after-deferred-complete-publication", true),
         ];
         for reverse in [false, true] {
             for (case, committed) in cases {
@@ -6213,7 +6253,7 @@ mod tests {
             for point in [
                 "after-durable-decision",
                 "after-commit-1",
-                "after-durable-complete-before-publication",
+                "after-deferred-complete-before-publication",
             ] {
                 let root = std::env::temp_dir().join(format!(
                     "netbadb-global-single-{engine}-{point}-{}",
@@ -9270,7 +9310,7 @@ mod tests {
     }
 
     #[test]
-    fn global_complete_sync_failure_keeps_cross_storage_readers_on_old_snapshot() {
+    fn global_complete_checkpoint_sync_failure_does_not_unpublish_committed_data() {
         let root = std::env::temp_dir().join(format!(
             "netbadb-phase3a-publication-gate-{}-{:?}",
             std::process::id(),
@@ -9306,53 +9346,285 @@ mod tests {
         database
             .execute_in(&mut writer, "UPDATE lsm_items SET id = 2 WHERE id = 1")
             .expect("update LSM");
+        writer
+            .commit()
+            .expect("publish G2 before its Complete sync");
+        assert_eq!(writer.state(), TransactionState::Committed);
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("snapshot while Complete is pending")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(2)
+        );
+        let pending = database
+            .inspect_global_visibility()
+            .expect("inspect pending G2 checkpoint");
+        assert_eq!(pending.last_synced_complete, Some(DatabaseCommitSeq(1)));
+        assert_eq!(pending.last_appended_complete, Some(DatabaseCommitSeq(2)));
+        assert_eq!(pending.pending_complete_count, 1);
+        assert_eq!(pending.decision_sync_count, 2);
+        assert_eq!(pending.combined_pipeline_sync_count, 1);
+        assert_eq!(pending.checkpoint_sync_count, 0);
+
+        let new_join = database
+            .query(
+                "SELECT users.id, lsm_items.id FROM users JOIN lsm_items ON users.id = lsm_items.id",
+            )
+            .expect("join while G2 Complete is not synced");
+        assert_eq!(
+            new_join.rows,
+            vec![vec![ScalarValue::Int64(2), ScalarValue::Int64(2)]]
+        );
+
         database
             .coordinator
             .as_ref()
             .expect("coordinator")
             .borrow_mut()
             .inject_complete_sync_failure();
-        assert!(writer.commit().is_err());
-        assert_eq!(writer.state(), TransactionState::FinalizePending);
+        assert!(database.flush().is_err());
+        let failed = database
+            .inspect_global_visibility()
+            .expect("inspect failed checkpoint");
+        assert_eq!(failed.published_commit_seq, Some(DatabaseCommitSeq(2)));
+        assert_eq!(failed.pending_complete_count, 1);
+        assert!(failed.last_checkpoint_error.is_some());
+        database.flush().expect("retry explicit checkpoint");
+        let checkpointed = database
+            .inspect_global_visibility()
+            .expect("inspect checkpointed G2");
+        assert_eq!(checkpointed.pending_complete_count, 0);
         assert_eq!(
-            database
-                .current_database_snapshot()
-                .expect("snapshot while Complete is uncertain")
-                .expect("global snapshot")
-                .commit_seq(),
-            DatabaseCommitSeq(1)
+            checkpointed.last_synced_complete,
+            Some(DatabaseCommitSeq(2))
         );
-
-        let old_join = database
-            .query(
-                "SELECT users.id, lsm_items.id FROM users JOIN lsm_items ON users.id = lsm_items.id",
-            )
-            .expect("join while G2 is not published");
-        assert_eq!(
-            old_join.rows,
-            vec![vec![ScalarValue::Int64(1), ScalarValue::Int64(1)]]
-        );
-
-        writer.commit().expect("retry Complete and publish G2");
-        assert_eq!(
-            database
-                .current_database_snapshot()
-                .expect("snapshot after Complete retry")
-                .expect("global snapshot")
-                .commit_seq(),
-            DatabaseCommitSeq(2)
-        );
-        let new_join = database
-            .query(
-                "SELECT users.id, lsm_items.id FROM users JOIN lsm_items ON users.id = lsm_items.id",
-            )
-            .expect("join after G2 publication");
-        assert_eq!(
-            new_join.rows,
-            vec![vec![ScalarValue::Int64(2), ScalarValue::Int64(2)]]
-        );
+        assert_eq!(checkpointed.checkpoint_sync_count, 1);
 
         database.close().expect("close publication-gate database");
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn failed_complete_append_is_published_and_repaired_by_the_next_decision() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3b-complete-repair-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let mut database = Database::create_storages_with_coordinator(
+            mixed_create_specs(&root),
+            DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility(),
+        )
+        .expect("create repair database");
+
+        let mut first = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin Heap writer");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut first,
+                &[ScalarValue::Int64(1), ScalarValue::Text("heap".into())],
+            )
+            .expect("write Heap");
+        database
+            .coordinator
+            .as_ref()
+            .expect("coordinator")
+            .borrow_mut()
+            .inject_complete_append_failure();
+        first
+            .commit()
+            .expect("checkpoint append failure cannot roll back committed G1");
+        let failed = database
+            .inspect_global_visibility()
+            .expect("inspect missing G1 Complete");
+        assert_eq!(failed.published_commit_seq, Some(DatabaseCommitSeq(1)));
+        assert_eq!(failed.last_appended_complete, Some(DatabaseCommitSeq(0)));
+        assert_eq!(failed.last_synced_complete, Some(DatabaseCommitSeq(0)));
+        assert_eq!(failed.pending_complete_count, 1);
+        assert!(failed.last_checkpoint_error.is_some());
+
+        let mut second = database
+            .begin_transaction_for(TableId(2))
+            .expect("begin LSM writer");
+        database
+            .insert_into_in(TableId(2), &mut second, &[ScalarValue::Int64(2)])
+            .expect("write LSM");
+        second
+            .commit()
+            .expect("repair G1 Complete while syncing G2 Decision");
+        let repaired = database
+            .inspect_global_visibility()
+            .expect("inspect repaired checkpoint");
+        assert_eq!(repaired.published_commit_seq, Some(DatabaseCommitSeq(2)));
+        assert_eq!(repaired.last_synced_complete, Some(DatabaseCommitSeq(1)));
+        assert_eq!(repaired.last_appended_complete, Some(DatabaseCommitSeq(2)));
+        assert_eq!(repaired.pending_complete_count, 1);
+        assert_eq!(repaired.combined_pipeline_sync_count, 1);
+        assert!(repaired.last_checkpoint_error.is_none());
+
+        database.close().expect("checkpoint G2 on close");
+        let mut reopened = Database::open_storages_with_coordinator(
+            mixed_open_specs(&root),
+            DatabaseCoordinatorConfig::new(&coordinator_path),
+        )
+        .expect("reopen repaired database");
+        assert_eq!(
+            reopened.query("SELECT id FROM users").unwrap().rows,
+            vec![vec![ScalarValue::Int64(1)]]
+        );
+        assert_eq!(
+            reopened.query("SELECT id FROM lsm_items").unwrap().rows,
+            vec![vec![ScalarValue::Int64(2)]]
+        );
+        reopened.close().expect("close reopened database");
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn one_hundred_data_commits_use_one_foreground_coordinator_sync_each() {
+        for (engine, table_id) in [("heap", TableId(1)), ("lsm", TableId(2))] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-phase3b-sequential-{engine}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            cleanup_mixed_crash_fixture(&root);
+            let (_, _, coordinator_path) = mixed_crash_paths(&root);
+            let mut database = Database::create_storages_with_coordinator(
+                mixed_create_specs(&root),
+                DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility(),
+            )
+            .expect("create sequential database");
+            for id in 0..100_i64 {
+                let values = if engine == "heap" {
+                    vec![ScalarValue::Int64(id), ScalarValue::Text("v".into())]
+                } else {
+                    vec![ScalarValue::Int64(id)]
+                };
+                database
+                    .insert_into(table_id, &values)
+                    .expect("commit one row");
+            }
+            let foreground = database
+                .inspect_global_visibility()
+                .expect("inspect sequential pipeline");
+            assert_eq!(
+                foreground.published_commit_seq,
+                Some(DatabaseCommitSeq(100))
+            );
+            assert_eq!(foreground.decision_sync_count, 100);
+            assert_eq!(foreground.combined_pipeline_sync_count, 99);
+            assert_eq!(foreground.checkpoint_sync_count, 0);
+            assert_eq!(foreground.pending_complete_count, 1);
+            database.flush().expect("flush final Complete checkpoint");
+            let checkpointed = database
+                .inspect_global_visibility()
+                .expect("inspect explicit checkpoint");
+            assert_eq!(checkpointed.checkpoint_sync_count, 1);
+            assert_eq!(checkpointed.pending_complete_count, 0);
+            database.close().expect("close sequential database");
+
+            let mut reopened = Database::open_storages_with_coordinator(
+                mixed_open_specs(&root),
+                DatabaseCoordinatorConfig::new(&coordinator_path),
+            )
+            .expect("reopen sequential database");
+            let query = if engine == "heap" {
+                "SELECT id FROM users"
+            } else {
+                "SELECT id FROM lsm_items"
+            };
+            assert_eq!(reopened.query(query).unwrap().rows.len(), 100);
+            reopened.close().expect("close reopened database");
+            cleanup_mixed_crash_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn three_participant_data_commit_has_no_immediate_complete_sync() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3b-three-participants-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let mut database = Database::create_tables_with_coordinator(
+            tables,
+            DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility(),
+        )
+        .expect("create three-participant database");
+        let mut transaction = database.begin_transaction().expect("begin writer");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("u".into())],
+            )
+            .unwrap();
+        database
+            .insert_into_in(TableId(2), &mut transaction, &[ScalarValue::Int64(2)])
+            .unwrap();
+        database
+            .insert_into_in(TableId(3), &mut transaction, &[ScalarValue::Int64(3)])
+            .unwrap();
+        transaction.commit().expect("publish three participants");
+        let inspection = database.inspect_global_visibility().unwrap();
+        assert_eq!(inspection.decision_sync_count, 1);
+        assert_eq!(inspection.checkpoint_sync_count, 0);
+        assert_eq!(inspection.pending_complete_count, 1);
+        assert_eq!(inspection.published_commit_seq, Some(DatabaseCommitSeq(1)));
+        database.close().expect("checkpoint on close");
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn clean_close_reports_a_final_complete_checkpoint_sync_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3b-close-failure-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let mut database = Database::create_storages_with_coordinator(
+            mixed_create_specs(&root),
+            DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility(),
+        )
+        .expect("create close-failure database");
+        database
+            .insert_into(
+                TableId(1),
+                &[ScalarValue::Int64(1), ScalarValue::Text("v".into())],
+            )
+            .expect("publish G1");
+        database
+            .coordinator
+            .as_ref()
+            .expect("coordinator")
+            .borrow_mut()
+            .inject_complete_sync_failure();
+        assert!(
+            database.close().is_err(),
+            "close must expose checkpoint failure"
+        );
+
+        let mut reopened = Database::open_storages_with_coordinator(
+            mixed_open_specs(&root),
+            DatabaseCoordinatorConfig::new(&coordinator_path),
+        )
+        .expect("reopen after failed close");
+        assert_eq!(
+            reopened.query("SELECT id FROM users").unwrap().rows,
+            vec![vec![ScalarValue::Int64(1)]]
+        );
+        reopened.close().expect("close recovered database");
         cleanup_mixed_crash_fixture(&root);
     }
 
@@ -9386,6 +9658,12 @@ mod tests {
         database
             .execute("CREATE TABLE extras (id BIGINT NOT NULL)")
             .expect("publish create table");
+        let schema_syncs = database
+            .inspect_global_visibility()
+            .expect("inspect conservative schema commit");
+        assert_eq!(schema_syncs.decision_sync_count, 1);
+        assert_eq!(schema_syncs.checkpoint_sync_count, 1);
+        assert_eq!(schema_syncs.pending_complete_count, 0);
         let created = database.current_database_snapshot().unwrap().unwrap();
         assert_eq!(created.commit_seq(), DatabaseCommitSeq(1));
         assert_eq!(created.boundaries().len(), 2);

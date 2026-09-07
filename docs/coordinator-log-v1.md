@@ -134,7 +134,23 @@ transaction and sequence of an earlier decision.
 
 Sequenced decisions are consecutive beginning at G1. Complete records are
 gap-free: G(n+1) cannot Complete while an earlier G remains incomplete.
-Successful Complete synchronization is the durable database-snapshot
-publication point. Startup finishes incomplete decided transactions in G order
-and reconstructs the current storage visibility vector before admitting reads.
-See [Phase 3A global snapshots](phase3a-global-snapshot.md).
+Phase 3A used successful Complete synchronization as the durable
+database-snapshot publication point. Startup finishes incomplete decided
+transactions in G order and reconstructs the current storage visibility vector
+before admitting reads. See
+[Phase 3A global snapshots](phase3a-global-snapshot.md).
+
+## Phase 3B synchronization semantics (same CORD v3 bytes)
+
+Phase 3B changes no record layout or decoder rule. For pure authoritative data
+transactions, the synced sequenced Decision remains the irreversible commit
+point and participant commits remain durable before publication. The sequenced
+Complete is appended without an immediate sync and serves as a recovery
+checkpoint. The next Decision sync also makes earlier appended Completes
+durable; flush, checkpoint, and clean close synchronize the final pending
+Complete. Missing final Completes and valid partial final records are repaired
+during recovery. Fully present checksum-invalid records remain hard errors.
+
+Schema, composition, backfill, replacement, index, and catalog transactions
+retain immediate Complete synchronization before structural publication. See
+[Phase 3B global commit sync pipeline](phase3b-global-commit-pipeline.md).
