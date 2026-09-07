@@ -62,6 +62,8 @@ or a fresh immutable derived Columnar Phase 1 analytical projection
     ↓
 Database coordinator + physical transaction lifecycle + versioned WAL
     ↓
+optional DatabaseCommitSeq → published storage visibility vector
+    ↓
 Buffer pool (guards, pinning, dirty writeback)
     ↓
 Slotted pages
@@ -71,6 +73,14 @@ Page manager / database file
 
 The core does not depend on Go, a network runtime, JSON execution IR, or
 application-specific Rust structs.
+
+[Phase 3A](docs/phase3a-global-snapshot.md) adds an explicit, durable one-way
+global visibility mode. Every authoritative writer—including a single Heap or
+LSM writer—publishes through a gap-free `DatabaseCommitSeq` and one sorted
+Heap/LSM visibility vector. Read Committed captures one vector per statement;
+Repeatable Read pins the first vector across lazy storage access. Legacy local
+mode and NBCO v1 remain readable, while Columnar remains derived and is never
+used for an old Repeatable Read snapshot.
 
 [Columnar Phase 1](docs/columnar-phase1.md) adds explicit embedded
 build/refresh/attach/drop APIs, `ColumnarScan`, vector filter/project/aggregate,

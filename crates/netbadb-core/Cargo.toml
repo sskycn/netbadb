@@ -55,5 +55,9 @@ harness = false
 name = "maintenance_phase2e"
 harness = false
 
+[[bench]]
+name = "global_snapshot_phase3a"
+harness = false
+
 [lints]
 workspace = true

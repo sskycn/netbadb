@@ -9,8 +9,8 @@ use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
 use crate::{
     ColumnarAdvanceBudget, ColumnarProjectionHealth, ColumnarProjectionSpec, Database,
-    DatabaseError, ExecutionResult, ProjectionCatalogError, TableStorageCreateSpec,
-    cleanup_created_table_files,
+    DatabaseCoordinatorConfig, DatabaseError, ExecutionResult, IsolationLevel,
+    ProjectionCatalogError, TableStorageCreateSpec, cleanup_created_table_files,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -1913,4 +1913,94 @@ fn attach_rejects_projection_from_a_different_physical_storage() {
 
     cleanup(&source_heap, &projection);
     cleanup_created_table_files(&[first_target_heap, second_target_heap]);
+}
+
+#[test]
+fn global_snapshot_blocks_ahead_projection_and_old_rr_uses_authoritative_history() {
+    let root = path("global-snapshot-eligibility");
+    let catalog = root.join("catalog");
+    let heap = root.join("heap");
+    let coordinator = root.join("coordinator");
+    let projection = root.join("projection");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create root");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(&heap, table())],
+        Some(DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility()),
+    )
+    .expect("create global columnar database");
+    let mut seed = database.begin_transaction().expect("begin seed");
+    for id in 0..512_i64 {
+        database
+            .insert_in(
+                &mut seed,
+                &[
+                    ScalarValue::Int64(id),
+                    ScalarValue::Int64(id),
+                    ScalarValue::Bool(id % 2 == 0),
+                    ScalarValue::Text(format!("row-{id}")),
+                ],
+            )
+            .expect("seed row");
+    }
+    seed.commit().expect("publish seed G1");
+    let projection_id = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &projection,
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build G1 projection");
+
+    let mut old = database
+        .begin_transaction_with_isolation(IsolationLevel::RepeatableRead)
+        .expect("begin old RR");
+    database
+        .execute_in(&mut old, "SELECT id FROM events WHERE id = 0")
+        .expect("pin RR at G1");
+
+    let mut writer = database.begin_transaction().expect("begin G2 writer");
+    database
+        .insert_in(
+            &mut writer,
+            &[
+                ScalarValue::Int64(999),
+                ScalarValue::Int64(999),
+                ScalarValue::Bool(true),
+                ScalarValue::Text("new".into()),
+            ],
+        )
+        .expect("write G2 row");
+    database
+        .coordinator
+        .as_ref()
+        .expect("coordinator")
+        .borrow_mut()
+        .inject_complete_sync_failure();
+    assert!(writer.commit().is_err(), "Complete sync is uncertain");
+    assert!(matches!(
+        database.refresh_columnar_projection(projection_id),
+        Err(DatabaseError::ColumnarBuildSourceChanged { .. })
+    ));
+    writer.commit().expect("retry Complete and publish G2");
+    database
+        .refresh_columnar_projection(projection_id)
+        .expect("refresh at published G2");
+
+    let (latest, statistics) = database
+        .query_with_columnar_statistics("SELECT id FROM events WHERE id >= 0")
+        .expect("latest columnar query");
+    assert_eq!(latest.rows.len(), 513);
+    assert_eq!(statistics.projection_id, Some(projection_id));
+    let ExecutionResult::Query(old_result) = database
+        .execute_in(&mut old, "SELECT id FROM events WHERE id >= 0")
+        .expect("old RR authoritative query")
+    else {
+        panic!("query result expected");
+    };
+    assert_eq!(old_result.rows.len(), 512);
+    old.rollback().expect("finish old RR");
+    database.close().expect("close global columnar database");
+    let _ = fs::remove_dir_all(root);
 }

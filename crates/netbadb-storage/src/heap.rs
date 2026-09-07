@@ -802,6 +802,15 @@ impl HeapStorage {
             .map(|plan| plan.definition)
     }
 
+    pub(crate) fn create_index_in(
+        &mut self,
+        transaction: &mut Transaction,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        self.build_index_in(transaction, None, column_id)
+            .map(|plan| plan.definition)
+    }
+
     pub(crate) fn create_named_index_with_reserved_id_in(
         &mut self,
         transaction: &mut Transaction,
@@ -2020,11 +2029,31 @@ impl HeapStorage {
     /// Pins a committed statement snapshot for a read that is not associated
     /// with an explicit transaction.
     pub fn read_view(&self) -> Result<ReadView, StorageError> {
-        let visible_csn = self
+        let visible_csn = self.current_commit_seq();
+        self.read_view_at(visible_csn)
+    }
+
+    #[must_use]
+    pub(crate) fn current_commit_seq(&self) -> netbadb_types::CommitSeq {
+        self.statuses.borrow().maximum_commit_seq()
+    }
+
+    pub(crate) fn read_view_at(
+        &self,
+        visible_csn: netbadb_types::CommitSeq,
+    ) -> Result<ReadView, StorageError> {
+        let current = self
             .statuses
             .try_borrow()
             .map_err(|_| TransactionError::StatusBusy)?
             .maximum_commit_seq();
+        if visible_csn > current {
+            return Err(StorageError::FutureVisibilityBoundary {
+                storage_id: self.storage_id(),
+                requested: visible_csn.0.saturating_add(1),
+                current: current.0.saturating_add(1),
+            });
+        }
         ReadView::new(
             Snapshot {
                 visible_csn,

@@ -6,10 +6,10 @@ use std::rc::Rc;
 
 use netbadb_storage::{
     IndexDefinition, IsolationLevel, StorageError, StorageReadView, StorageTransaction,
-    TransactionState as StorageTransactionState,
+    StorageVisibilityBoundary, StorageVisibilityPin, TransactionState as StorageTransactionState,
 };
 use netbadb_types::{ColumnId, IndexName};
-use netbadb_types::{DatabaseTxnId, StorageId};
+use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId};
 
 use crate::coordinator_log::{CoordinatorLog, CoordinatorLogError, CoordinatorParticipant};
 use crate::registry::{StorageRegistry, StorageRegistryError};
@@ -17,6 +17,82 @@ use crate::schema_composition::SchemaCompositionState;
 use crate::schema_mutation::{SchemaMutation, SchemaMutationError};
 
 pub(crate) type SharedCoordinatorLog = Rc<RefCell<CoordinatorLog>>;
+pub(crate) type SharedPublishedVisibility = Rc<RefCell<PublishedVisibility>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseVisibilityMode {
+    LegacyLocal,
+    Global,
+}
+
+/// One immutable, database-wide published state vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseSnapshot {
+    commit_seq: DatabaseCommitSeq,
+    boundaries: Vec<StorageVisibilityBoundary>,
+}
+
+impl DatabaseSnapshot {
+    pub(crate) fn new(
+        commit_seq: DatabaseCommitSeq,
+        mut boundaries: Vec<StorageVisibilityBoundary>,
+    ) -> Result<Self, CoordinatorError> {
+        boundaries.sort_unstable_by_key(|boundary| boundary.storage_id());
+        for pair in boundaries.windows(2) {
+            if pair[0].storage_id() == pair[1].storage_id() {
+                return Err(CoordinatorError::DuplicateSnapshotStorage {
+                    storage_id: pair[0].storage_id(),
+                });
+            }
+        }
+        Ok(Self {
+            commit_seq,
+            boundaries,
+        })
+    }
+
+    #[must_use]
+    pub const fn commit_seq(&self) -> DatabaseCommitSeq {
+        self.commit_seq
+    }
+
+    #[must_use]
+    pub fn boundaries(&self) -> &[StorageVisibilityBoundary] {
+        &self.boundaries
+    }
+
+    #[must_use]
+    pub fn boundary(&self, storage_id: StorageId) -> Option<StorageVisibilityBoundary> {
+        self.boundaries
+            .binary_search_by_key(&storage_id, |boundary| boundary.storage_id())
+            .ok()
+            .map(|position| self.boundaries[position])
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PublishedVisibility {
+    pub(crate) snapshot: DatabaseSnapshot,
+}
+
+impl PublishedVisibility {
+    fn publish_boundaries(
+        &mut self,
+        commit_seq: DatabaseCommitSeq,
+        updates: impl IntoIterator<Item = StorageVisibilityBoundary>,
+    ) -> Result<(), CoordinatorError> {
+        let mut boundaries = self.snapshot.boundaries.clone();
+        for update in updates {
+            match boundaries.binary_search_by_key(&update.storage_id(), |entry| entry.storage_id())
+            {
+                Ok(position) => boundaries[position] = update,
+                Err(position) => boundaries.insert(position, update),
+            }
+        }
+        self.snapshot = DatabaseSnapshot::new(commit_seq, boundaries)?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -47,14 +123,13 @@ struct StorageParticipant {
 
 /// One statement's database-owned collection of engine read views.
 ///
-/// NetbaDB has no database-global commit sequence yet. This object provides
-/// database-level ownership and isolation intent while each entry remains the
-/// engine adapter for its physical storage's existing MVCC domain.
+/// In global mode every entry is opened at the exact boundary in `snapshot`.
 #[derive(Debug)]
 pub struct DatabaseReadView {
     transaction_id: Option<DatabaseTxnId>,
     isolation_level: IsolationLevel,
     views: Vec<(StorageId, StorageReadView)>,
+    snapshot: Option<DatabaseSnapshot>,
 }
 
 impl DatabaseReadView {
@@ -66,6 +141,21 @@ impl DatabaseReadView {
             transaction_id: None,
             isolation_level,
             views,
+            snapshot: None,
+        }
+    }
+
+    pub(crate) fn global(
+        transaction_id: Option<DatabaseTxnId>,
+        isolation_level: IsolationLevel,
+        snapshot: DatabaseSnapshot,
+        views: Vec<(StorageId, StorageReadView)>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            isolation_level,
+            views,
+            snapshot: Some(snapshot),
         }
     }
 
@@ -77,6 +167,11 @@ impl DatabaseReadView {
     #[must_use]
     pub fn isolation_level(&self) -> IsolationLevel {
         self.isolation_level
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Option<&DatabaseSnapshot> {
+        self.snapshot.as_ref()
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (StorageId, &StorageReadView)> {
@@ -98,6 +193,10 @@ pub struct DatabaseTransaction {
     participants: BTreeMap<StorageId, StorageParticipant>,
     write_participants: BTreeSet<StorageId>,
     coordinator: Option<SharedCoordinatorLog>,
+    published_visibility: Option<SharedPublishedVisibility>,
+    repeatable_snapshot: Option<DatabaseSnapshot>,
+    visibility_pins: Vec<StorageVisibilityPin>,
+    pending_commit_seq: Option<DatabaseCommitSeq>,
     pub(crate) schema_mutation: Option<SchemaMutation>,
     pub(crate) schema_composition: SchemaCompositionState,
     pub(crate) preparation_scope: Rc<()>,
@@ -111,6 +210,7 @@ impl DatabaseTransaction {
         id: DatabaseTxnId,
         isolation_level: IsolationLevel,
         coordinator: Option<SharedCoordinatorLog>,
+        published_visibility: Option<SharedPublishedVisibility>,
     ) -> Self {
         Self {
             owner,
@@ -120,6 +220,10 @@ impl DatabaseTransaction {
             participants: BTreeMap::new(),
             write_participants: BTreeSet::new(),
             coordinator,
+            published_visibility,
+            repeatable_snapshot: None,
+            visibility_pins: Vec::new(),
+            pending_commit_seq: None,
             schema_mutation: None,
             schema_composition: SchemaCompositionState::None,
             preparation_scope: Rc::new(()),
@@ -218,6 +322,40 @@ impl DatabaseTransaction {
         registry: &mut StorageRegistry,
     ) -> Result<DatabaseReadView, CoordinatorError> {
         self.ensure_active()?;
+        let snapshot = if let Some(published) = &self.published_visibility {
+            match self.isolation_level {
+                IsolationLevel::ReadCommitted => Some(
+                    published
+                        .try_borrow()
+                        .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+                        .snapshot
+                        .clone(),
+                ),
+                IsolationLevel::RepeatableRead => {
+                    if self.repeatable_snapshot.is_none() {
+                        let snapshot = published
+                            .try_borrow()
+                            .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+                            .snapshot
+                            .clone();
+                        let mut pins = Vec::with_capacity(snapshot.boundaries().len());
+                        for boundary in snapshot.boundaries() {
+                            let storage = registry.get(boundary.storage_id()).ok_or(
+                                CoordinatorError::UnknownStorageId {
+                                    storage_id: boundary.storage_id(),
+                                },
+                            )?;
+                            pins.push(storage.pin_visibility_boundary(*boundary)?);
+                        }
+                        self.visibility_pins = pins;
+                        self.repeatable_snapshot = Some(snapshot);
+                    }
+                    self.repeatable_snapshot.clone()
+                }
+            }
+        } else {
+            None
+        };
         let mut unique = BTreeSet::new();
         for storage_id in storage_ids {
             if unique.insert(*storage_id) {
@@ -233,12 +371,30 @@ impl DatabaseTransaction {
                     reason: "registered read participant is missing",
                 },
             )?;
-            views.push((storage_id, participant.context.begin_statement()?));
+            let view = match &snapshot {
+                Some(snapshot) => match snapshot.boundary(storage_id) {
+                    Some(boundary) => participant.context.begin_statement_at(boundary)?,
+                    None if participant.mode == ParticipantMode::Write => {
+                        participant.context.begin_statement()?
+                    }
+                    None => {
+                        return Err(CoordinatorError::SnapshotMissingStorage { storage_id });
+                    }
+                },
+                None => participant.context.begin_statement()?,
+            };
+            views.push((storage_id, view));
         }
-        Ok(DatabaseReadView {
-            transaction_id: Some(self.id),
-            isolation_level: self.isolation_level,
-            views,
+        Ok(match snapshot {
+            Some(snapshot) => {
+                DatabaseReadView::global(Some(self.id), self.isolation_level, snapshot, views)
+            }
+            None => DatabaseReadView {
+                transaction_id: Some(self.id),
+                isolation_level: self.isolation_level,
+                views,
+                snapshot: None,
+            },
         })
     }
 
@@ -278,7 +434,8 @@ impl DatabaseTransaction {
     }
 
     pub(crate) fn commit_with_schema_mutations(&mut self) -> Result<(), CoordinatorError> {
-        if self.write_participants.len() > 1
+        if (!self.write_participants.is_empty() && self.published_visibility.is_some())
+            || self.write_participants.len() > 1
             || self.schema_mutation.is_some()
             || self.schema_composition.materialized().is_some()
             || self.schema_composition.backfill().is_some()
@@ -317,6 +474,7 @@ impl DatabaseTransaction {
             commit_participant(storage_id, participant)?;
         }
         self.state = TransactionState::Committed;
+        self.release_visibility_pins();
         Ok(())
     }
 
@@ -484,30 +642,33 @@ impl DatabaseTransaction {
                 .ok_or(CoordinatorError::DurableCoordinatorRequired)?
                 .try_borrow_mut()
                 .map_err(|_| CoordinatorError::CoordinatorBusy)?;
-            if let Some(mutation) = &self.schema_mutation {
-                log.commit_schema_decision(
+            let schema_reference = self
+                .schema_mutation
+                .as_ref()
+                .map(|mutation| &mutation.reference)
+                .or_else(|| {
+                    self.schema_composition
+                        .backfill()
+                        .map(|composition| &composition.reference)
+                })
+                .or_else(|| {
+                    self.schema_composition
+                        .materialized()
+                        .map(|composition| &composition.reference)
+                })
+                .or_else(|| {
+                    self.schema_composition
+                        .materialized_index()
+                        .and_then(|composition| composition.reference.as_ref())
+                });
+            if self.published_visibility.is_some() {
+                self.pending_commit_seq = Some(log.sequenced_commit_decision(
                     self.id,
                     &decision_participants,
-                    Some(&mutation.reference),
-                )?;
-            } else if let Some(composition) = self.schema_composition.backfill() {
-                log.commit_schema_decision(
-                    self.id,
-                    &decision_participants,
-                    Some(&composition.reference),
-                )?;
-            } else if let Some(composition) = self.schema_composition.materialized() {
-                log.commit_schema_decision(
-                    self.id,
-                    &decision_participants,
-                    Some(&composition.reference),
-                )?;
-            } else if let Some(composition) = self.schema_composition.materialized_index() {
-                log.commit_schema_decision(
-                    self.id,
-                    &decision_participants,
-                    composition.reference.as_ref(),
-                )?;
+                    schema_reference,
+                )?);
+            } else if schema_reference.is_some() {
+                log.commit_schema_decision(self.id, &decision_participants, schema_reference)?;
             } else {
                 log.commit_decision(self.id, &decision_participants)?;
             }
@@ -568,13 +729,24 @@ impl DatabaseTransaction {
         {
             return Ok(());
         }
-        self.coordinator
-            .as_ref()
-            .ok_or(CoordinatorError::DurableCoordinatorRequired)?
-            .try_borrow_mut()
-            .map_err(|_| CoordinatorError::CoordinatorBusy)?
-            .complete(self.id)?;
+        if let Some(commit_seq) = self.pending_commit_seq {
+            self.coordinator
+                .as_ref()
+                .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .complete_sequenced(self.id, commit_seq)?;
+            self.publish_committed_boundaries(commit_seq)?;
+        } else {
+            self.coordinator
+                .as_ref()
+                .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .complete(self.id)?;
+        }
         self.state = TransactionState::Committed;
+        self.release_visibility_pins();
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-durable-complete");
         Ok(())
@@ -905,18 +1077,61 @@ impl DatabaseTransaction {
         self.write_participants.remove(&id);
     }
     pub(crate) fn finish_schema_decision(&mut self) -> Result<(), CoordinatorError> {
-        self.coordinator
-            .as_ref()
-            .ok_or(CoordinatorError::DurableCoordinatorRequired)?
-            .try_borrow_mut()
-            .map_err(|_| CoordinatorError::CoordinatorBusy)?
-            .complete(self.id)?;
+        if let Some(commit_seq) = self.pending_commit_seq {
+            self.coordinator
+                .as_ref()
+                .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .complete_sequenced(self.id, commit_seq)?;
+        } else {
+            self.coordinator
+                .as_ref()
+                .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .complete(self.id)?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn database_commit_seq(&self) -> Option<DatabaseCommitSeq> {
+        self.pending_commit_seq
+    }
+
+    fn publish_committed_boundaries(
+        &self,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorError> {
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("after-durable-complete-before-publication");
+        let updates = self
+            .write_participants
+            .iter()
+            .map(|storage_id| {
+                self.participants
+                    .get(storage_id)
+                    .ok_or(CoordinatorError::ParticipantStateViolation {
+                        storage_id: *storage_id,
+                        reason: "committed participant identity has no context",
+                    })?
+                    .context
+                    .current_visibility_boundary()
+                    .map_err(CoordinatorError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.published_visibility
+            .as_ref()
+            .ok_or(CoordinatorError::GlobalVisibilityNotEnabled)?
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+            .publish_boundaries(commit_seq, updates)
     }
     pub(crate) fn complete_schema_publication(&mut self) {
         self.schema_mutation = None;
         self.schema_composition = SchemaCompositionState::None;
         self.state = TransactionState::Committed;
+        self.release_visibility_pins();
     }
     pub(crate) fn with_write_storage<T>(
         &mut self,
@@ -1021,6 +1236,7 @@ impl DatabaseTransaction {
         }
         self.schema_mutation = None;
         self.state = TransactionState::RolledBack;
+        self.release_visibility_pins();
         Ok(())
     }
 
@@ -1044,6 +1260,11 @@ impl DatabaseTransaction {
             },
         );
         Ok(())
+    }
+
+    fn release_visibility_pins(&mut self) {
+        self.visibility_pins.clear();
+        self.repeatable_snapshot = None;
     }
 }
 
@@ -1174,6 +1395,17 @@ pub enum CoordinatorError {
     },
     DurableCoordinatorRequired,
     CoordinatorBusy,
+    PublishedVisibilityBusy,
+    GlobalVisibilityNotEnabled,
+    GlobalEnableRequiresQuiescence {
+        outstanding: usize,
+    },
+    SnapshotMissingStorage {
+        storage_id: StorageId,
+    },
+    DuplicateSnapshotStorage {
+        storage_id: StorageId,
+    },
     PrepareFailed {
         storage_id: StorageId,
         source: Box<CoordinatorError>,
@@ -1226,6 +1458,26 @@ impl fmt::Display for CoordinatorError {
             Self::CoordinatorBusy => {
                 formatter.write_str("database coordinator log is already borrowed")
             }
+            Self::PublishedVisibilityBusy => {
+                formatter.write_str("database published visibility state is already borrowed")
+            }
+            Self::GlobalVisibilityNotEnabled => {
+                formatter.write_str("database-global visibility is not enabled")
+            }
+            Self::GlobalEnableRequiresQuiescence { outstanding } => write!(
+                formatter,
+                "database-global visibility requires quiescence but {outstanding} database transaction handle(s) are outstanding"
+            ),
+            Self::SnapshotMissingStorage { storage_id } => write!(
+                formatter,
+                "database snapshot has no boundary for physical storage {}",
+                storage_id.0
+            ),
+            Self::DuplicateSnapshotStorage { storage_id } => write!(
+                formatter,
+                "database snapshot repeats physical storage {}",
+                storage_id.0
+            ),
             Self::PrepareFailed { storage_id, source } => write!(
                 formatter,
                 "physical storage {} failed to prepare and the database transaction was aborted: {source}",
@@ -1275,6 +1527,11 @@ impl Error for CoordinatorError {
             | Self::MultipleWriteParticipantsUnsupported { .. }
             | Self::DurableCoordinatorRequired
             | Self::CoordinatorBusy
+            | Self::PublishedVisibilityBusy
+            | Self::GlobalVisibilityNotEnabled
+            | Self::GlobalEnableRequiresQuiescence { .. }
+            | Self::SnapshotMissingStorage { .. }
+            | Self::DuplicateSnapshotStorage { .. }
             | Self::CommitAlreadyDecided { .. }
             | Self::ParticipantStateViolation { .. }
             | Self::NotActive { .. }

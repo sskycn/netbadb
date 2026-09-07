@@ -5,14 +5,15 @@ pub use netbadb_core::{
     AlterTableOperation, AlterTableSpec, ColumnarExecutionStatistics,
     ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
     ColumnarProjectionSpec, CompleteLegacyInventory, CreateColumnSpec, CreateTableSpec, Database,
-    DatabaseCoordinatorConfig, DatabaseError, ExecutionResult, LegacyStorageLocation,
-    LsmMaintenanceReport, MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker,
-    MaintenanceBound, MaintenanceBudget, MaintenanceCandidate, MaintenanceConsumption,
-    MaintenanceDecision, MaintenanceEstimate, MaintenanceInspection, MaintenanceOutcome,
-    MaintenanceReason, MaintenanceStepReport, PartitionCatalogConfig, ProjectionCatalogError,
-    QueryResult, RangePartitionSpec, ReplacementRetiredHeap, ResultColumn, SchemaCatalogError,
-    SchemaDependency, SchemaGeneration, SchemaMutationError, TablePlacementSpec,
-    TableSchemaVersion, TableStorageCreateSpec, Transaction, TransactionState,
+    DatabaseCoordinatorConfig, DatabaseError, DatabaseSnapshot, DatabaseVisibilityInspection,
+    DatabaseVisibilityMode, ExecutionResult, LegacyStorageLocation, LsmMaintenanceReport,
+    MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker, MaintenanceBound,
+    MaintenanceBudget, MaintenanceCandidate, MaintenanceConsumption, MaintenanceDecision,
+    MaintenanceEstimate, MaintenanceInspection, MaintenanceOutcome, MaintenanceReason,
+    MaintenanceStepReport, PartitionCatalogConfig, ProjectionCatalogError, QueryResult,
+    RangePartitionSpec, ReplacementRetiredHeap, ResultColumn, SchemaCatalogError, SchemaDependency,
+    SchemaGeneration, SchemaMutationError, TablePlacementSpec, TableSchemaVersion,
+    TableStorageCreateSpec, Transaction, TransactionState, VisibilityBoundaryInspection,
 };
 pub use netbadb_schema::{
     CANONICAL_TABLE_SCHEMA_VERSION, ColumnDef, Schema, SchemaError, SchemaFingerprint, TableDef,
@@ -20,7 +21,8 @@ pub use netbadb_schema::{
 };
 pub use netbadb_types::{
     AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, ColumnarSegmentId,
-    PartitionId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, StorageId, TableId,
+    DatabaseCommitSeq, PartitionId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
+    StorageId, TableId,
 };
 
 /// Stable embedded catalog and physical-plan inspection values and renderers.

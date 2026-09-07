@@ -133,10 +133,100 @@ pub struct StorageAccessPath {
     pub cost_hints: Option<StorageAccessCostHints>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StorageKind {
     Heap,
     Lsm,
+}
+
+/// Opaque committed visibility boundary for one physical storage.
+///
+/// The numeric value is meaningful only with both the storage identity and
+/// engine kind. Value zero is reserved; an empty engine's local horizon zero
+/// is encoded as boundary value one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StorageVisibilityBoundary {
+    storage_id: StorageId,
+    storage_kind: StorageKind,
+    value: u64,
+}
+
+impl StorageVisibilityBoundary {
+    pub fn new(
+        storage_id: StorageId,
+        storage_kind: StorageKind,
+        value: u64,
+    ) -> Result<Self, StorageError> {
+        if storage_id.0 == 0 || value == 0 {
+            return Err(StorageError::InvalidVisibilityBoundary { storage_id, value });
+        }
+        Ok(Self {
+            storage_id,
+            storage_kind,
+            value,
+        })
+    }
+
+    #[must_use]
+    pub const fn storage_id(self) -> StorageId {
+        self.storage_id
+    }
+
+    #[must_use]
+    pub const fn storage_kind(self) -> StorageKind {
+        self.storage_kind
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+
+    fn from_local_horizon(
+        storage_id: StorageId,
+        storage_kind: StorageKind,
+        horizon: u64,
+    ) -> Result<Self, StorageError> {
+        let value = horizon
+            .checked_add(1)
+            .ok_or(StorageError::VisibilityBoundaryExhausted { storage_id })?;
+        Self::new(storage_id, storage_kind, value)
+    }
+
+    fn local_horizon(self) -> u64 {
+        self.value - 1
+    }
+}
+
+fn validate_visibility_boundary(
+    expected_storage_id: StorageId,
+    expected_kind: StorageKind,
+    current_horizon: u64,
+    boundary: StorageVisibilityBoundary,
+) -> Result<(), StorageError> {
+    if boundary.storage_id != expected_storage_id || boundary.storage_kind != expected_kind {
+        return Err(StorageError::VisibilityBoundaryContextMismatch {
+            expected_storage_id,
+            actual_storage_id: boundary.storage_id,
+            expected_kind,
+            actual_kind: boundary.storage_kind,
+        });
+    }
+    let current_value =
+        current_horizon
+            .checked_add(1)
+            .ok_or(StorageError::VisibilityBoundaryExhausted {
+                storage_id: expected_storage_id,
+            })?;
+    let requested_horizon = boundary.local_horizon();
+    if requested_horizon > current_horizon {
+        return Err(StorageError::FutureVisibilityBoundary {
+            storage_id: expected_storage_id,
+            requested: boundary.value,
+            current: current_value,
+        });
+    }
+    Ok(())
 }
 
 /// Opaque executor identity for a physical row version.
@@ -253,6 +343,21 @@ pub struct StorageReadView {
     inner: StorageReadViewKind,
 }
 
+/// An ownership-only pin that keeps the storage history needed by a database
+/// snapshot alive without materializing row data.
+#[derive(Debug)]
+pub struct StorageVisibilityPin {
+    boundary: StorageVisibilityBoundary,
+    _view: StorageReadView,
+}
+
+impl StorageVisibilityPin {
+    #[must_use]
+    pub const fn boundary(&self) -> StorageVisibilityBoundary {
+        self.boundary
+    }
+}
+
 /// An atomic committed read view and matching storage-local change frontier.
 #[derive(Debug)]
 pub struct CommittedReadAnchor {
@@ -319,6 +424,7 @@ impl StorageReadView {
 #[derive(Debug)]
 pub struct StorageTransaction {
     table_id: TableId,
+    storage_id: StorageId,
     inner: StorageTransactionKind,
 }
 
@@ -329,9 +435,10 @@ enum StorageTransactionKind {
 }
 
 impl StorageTransaction {
-    fn heap(table_id: TableId, transaction: Transaction) -> Self {
+    fn heap(table_id: TableId, storage_id: StorageId, transaction: Transaction) -> Self {
         Self {
             table_id,
+            storage_id,
             inner: StorageTransactionKind::Heap(transaction),
         }
     }
@@ -369,9 +476,10 @@ impl StorageTransaction {
         }
     }
 
-    fn lsm(table_id: TableId, transaction: LsmTransaction) -> Self {
+    fn lsm(table_id: TableId, storage_id: StorageId, transaction: LsmTransaction) -> Self {
         Self {
             table_id,
+            storage_id,
             inner: StorageTransactionKind::Lsm(transaction),
         }
     }
@@ -454,6 +562,59 @@ impl StorageTransaction {
                 table_id,
                 transaction.begin_statement()?,
             )),
+        }
+    }
+
+    pub fn begin_statement_at(
+        &mut self,
+        boundary: StorageVisibilityBoundary,
+    ) -> Result<StorageReadView, StorageError> {
+        self.validate_visibility_boundary(boundary)?;
+        let table_id = self.table_id;
+        let horizon = boundary.local_horizon();
+        match &mut self.inner {
+            StorageTransactionKind::Heap(transaction) => Ok(StorageReadView::heap(
+                table_id,
+                transaction.begin_statement_at(netbadb_types::CommitSeq(horizon))?,
+            )),
+            StorageTransactionKind::Lsm(transaction) => Ok(StorageReadView::lsm(
+                table_id,
+                transaction.begin_statement_at(netbadb_types::LsmCommitSeq(horizon))?,
+            )),
+        }
+    }
+
+    fn validate_visibility_boundary(
+        &self,
+        boundary: StorageVisibilityBoundary,
+    ) -> Result<(), StorageError> {
+        let (kind, current) = match &self.inner {
+            StorageTransactionKind::Heap(transaction) => {
+                (StorageKind::Heap, transaction.current_commit_seq().0)
+            }
+            StorageTransactionKind::Lsm(transaction) => {
+                (StorageKind::Lsm, transaction.current_commit_seq().0)
+            }
+        };
+        validate_visibility_boundary(self.storage_id, kind, current, boundary)
+    }
+
+    pub fn current_visibility_boundary(&self) -> Result<StorageVisibilityBoundary, StorageError> {
+        match &self.inner {
+            StorageTransactionKind::Heap(transaction) => {
+                StorageVisibilityBoundary::from_local_horizon(
+                    self.storage_id,
+                    StorageKind::Heap,
+                    transaction.current_commit_seq().0,
+                )
+            }
+            StorageTransactionKind::Lsm(transaction) => {
+                StorageVisibilityBoundary::from_local_horizon(
+                    self.storage_id,
+                    StorageKind::Lsm,
+                    transaction.current_commit_seq().0,
+                )
+            }
         }
     }
 
@@ -679,6 +840,57 @@ impl TableStorage {
         }
     }
 
+    /// Captures the latest committed boundary for this exact storage.
+    pub fn current_visibility_boundary(&self) -> Result<StorageVisibilityBoundary, StorageError> {
+        match self {
+            Self::Heap(storage) => StorageVisibilityBoundary::from_local_horizon(
+                storage.storage_id(),
+                StorageKind::Heap,
+                storage.current_commit_seq().0,
+            ),
+            Self::Lsm(storage) => StorageVisibilityBoundary::from_local_horizon(
+                storage.storage_id(),
+                StorageKind::Lsm,
+                storage.current_commit_seq().0,
+            ),
+        }
+    }
+
+    /// Opens a committed read view at a previously captured local boundary.
+    pub fn read_view_at(
+        &self,
+        boundary: StorageVisibilityBoundary,
+    ) -> Result<StorageReadView, StorageError> {
+        let current = self.current_visibility_boundary()?;
+        validate_visibility_boundary(
+            current.storage_id,
+            current.storage_kind,
+            current.local_horizon(),
+            boundary,
+        )?;
+        match self {
+            Self::Heap(storage) => Ok(StorageReadView::heap(
+                storage.table().id,
+                storage.read_view_at(netbadb_types::CommitSeq(boundary.local_horizon()))?,
+            )),
+            Self::Lsm(storage) => Ok(StorageReadView::lsm(
+                storage.table().id,
+                storage.read_view_at(netbadb_types::LsmCommitSeq(boundary.local_horizon()))?,
+            )),
+        }
+    }
+
+    /// Pins history at `boundary` without caching or decoding row payloads.
+    pub fn pin_visibility_boundary(
+        &self,
+        boundary: StorageVisibilityBoundary,
+    ) -> Result<StorageVisibilityPin, StorageError> {
+        Ok(StorageVisibilityPin {
+            boundary,
+            _view: self.read_view_at(boundary)?,
+        })
+    }
+
     pub fn enable_change_stream(&mut self) -> Result<crate::ChangeStreamCursor, StorageError> {
         match self {
             Self::Heap(storage) => storage.enable_change_stream(),
@@ -787,12 +999,17 @@ impl TableStorage {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
                 let transaction = storage.begin_transaction_with_isolation(isolation_level)?;
-                Ok(StorageTransaction::heap(table_id, transaction))
+                Ok(StorageTransaction::heap(
+                    table_id,
+                    storage.storage_id(),
+                    transaction,
+                ))
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
                 Ok(StorageTransaction::lsm(
                     table_id,
+                    storage.storage_id(),
                     storage.begin_transaction_with_isolation(isolation_level)?,
                 ))
             }
@@ -1387,6 +1604,23 @@ impl TableStorage {
         }
     }
 
+    pub fn create_index_in(
+        &mut self,
+        transaction: &mut StorageTransaction,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, StorageError> {
+        match self {
+            Self::Heap(storage) => {
+                let table_id = storage.table().id;
+                storage.create_index_in(transaction.heap_transaction_mut(table_id)?, column_id)
+            }
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "create B+Tree access method",
+                storage_kind: "LSM",
+            }),
+        }
+    }
+
     pub fn create_named_index_with_reserved_id_in(
         &mut self,
         transaction: &mut StorageTransaction,
@@ -1692,9 +1926,9 @@ mod tests {
 
     use netbadb_index::{IndexBound, IndexRange};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+    use netbadb_types::{ColumnId, PhysicalType, ScalarValue, StorageId, TableId};
 
-    use super::TableStorage;
+    use super::{StorageKind, StorageVisibilityBoundary, TableStorage};
     use crate::{
         StorageError, TransactionError, TransactionState, txn_status_path, wal_alternate_path,
         wal_path,
@@ -1945,5 +2179,172 @@ mod tests {
         second.close().expect("close second storage");
         cleanup(&first_path);
         cleanup(&second_path);
+    }
+
+    #[test]
+    fn heap_and_lsm_boundaries_reopen_exact_history_and_reject_wrong_context() {
+        let heap_path = path("visibility-boundary-heap");
+        let lsm_path = path("visibility-boundary-lsm");
+        cleanup(&heap_path);
+        let _ = std::fs::remove_dir_all(&lsm_path);
+        let heap = TableStorage::create_heap_with_storage_id(&heap_path, table(91), StorageId(91))
+            .expect("create Heap");
+        let lsm = TableStorage::create_lsm_with_storage_id(
+            &lsm_path,
+            table(92),
+            ColumnId(1),
+            StorageId(92),
+        )
+        .expect("create LSM");
+
+        for mut storage in [heap, lsm] {
+            let kind = storage.kind();
+            let storage_id = storage.storage_id();
+            let baseline = storage
+                .current_visibility_boundary()
+                .expect("capture baseline");
+            assert_eq!(baseline.value(), 1);
+            assert!(matches!(
+                StorageVisibilityBoundary::new(storage_id, kind, 0),
+                Err(StorageError::InvalidVisibilityBoundary { .. })
+            ));
+            let row = storage
+                .insert(&[ScalarValue::Int64(1), ScalarValue::Text("new".into())])
+                .expect("commit row");
+            let inserted = storage
+                .current_visibility_boundary()
+                .expect("capture inserted boundary");
+            assert!(inserted.value() > baseline.value());
+            let old = storage.read_view_at(baseline).expect("read old boundary");
+            assert!(
+                storage
+                    .scan_columns_with_view(&[ColumnId(1)], &old)
+                    .expect("scan old")
+                    .is_empty()
+            );
+            drop(old);
+            if storage.kind() == StorageKind::Lsm {
+                let before_flush = storage
+                    .current_visibility_boundary()
+                    .expect("boundary before flush");
+                storage.flush().expect("flush before pinning history");
+                assert_eq!(
+                    storage
+                        .current_visibility_boundary()
+                        .expect("boundary after flush"),
+                    before_flush
+                );
+            }
+            let pinned = storage
+                .read_view_at(inserted)
+                .expect("pin inserted boundary");
+            storage
+                .update(
+                    row,
+                    &[ScalarValue::Int64(1), ScalarValue::Text("updated".into())],
+                )
+                .expect("commit update");
+            match storage.kind() {
+                StorageKind::Heap => {
+                    let _ = storage.vacuum().expect("vacuum with old pin");
+                }
+                StorageKind::Lsm => {
+                    assert!(
+                        storage.compact().is_err(),
+                        "LSM must not reclaim pinned history"
+                    );
+                }
+            }
+            assert_eq!(
+                storage
+                    .scan_columns_with_view(&[ColumnId(2)], &pinned)
+                    .expect("read pinned history"),
+                vec![(row, vec![ScalarValue::Text("new".into())])]
+            );
+            drop(pinned);
+            let current = storage
+                .current_visibility_boundary()
+                .expect("capture current boundary");
+            let now = storage
+                .read_view_at(current)
+                .expect("read current boundary");
+            let current_rows = storage
+                .scan_columns_with_view(&[ColumnId(2)], &now)
+                .expect("scan current");
+            assert_eq!(current_rows.len(), 1);
+            assert_eq!(current_rows[0].1, vec![ScalarValue::Text("updated".into())]);
+            drop(now);
+
+            let wrong_kind = match storage.kind() {
+                StorageKind::Heap => StorageKind::Lsm,
+                StorageKind::Lsm => StorageKind::Heap,
+            };
+            let wrong =
+                StorageVisibilityBoundary::new(storage.storage_id(), wrong_kind, current.value())
+                    .expect("construct wrong-kind boundary");
+            assert!(matches!(
+                storage.read_view_at(wrong),
+                Err(StorageError::VisibilityBoundaryContextMismatch { .. })
+            ));
+            let wrong_storage = StorageVisibilityBoundary::new(
+                StorageId(storage.storage_id().0 + 1),
+                storage.kind(),
+                current.value(),
+            )
+            .expect("construct wrong-storage boundary");
+            assert!(matches!(
+                storage.read_view_at(wrong_storage),
+                Err(StorageError::VisibilityBoundaryContextMismatch { .. })
+            ));
+            let future = StorageVisibilityBoundary::new(
+                storage.storage_id(),
+                storage.kind(),
+                current.value() + 1,
+            )
+            .expect("construct future boundary");
+            assert!(matches!(
+                storage.read_view_at(future),
+                Err(StorageError::FutureVisibilityBoundary { .. })
+            ));
+            let before_checkpoint = storage
+                .current_visibility_boundary()
+                .expect("boundary before checkpoint");
+            storage.checkpoint().expect("checkpoint storage");
+            assert_eq!(
+                storage
+                    .current_visibility_boundary()
+                    .expect("boundary after checkpoint"),
+                before_checkpoint
+            );
+            storage.close().expect("close storage");
+
+            let mut reopened = match kind {
+                StorageKind::Heap => {
+                    TableStorage::open_heap(&heap_path, table(storage_id.0)).expect("reopen Heap")
+                }
+                StorageKind::Lsm => {
+                    TableStorage::open_lsm(&lsm_path, table(storage_id.0)).expect("reopen LSM")
+                }
+            };
+            assert_eq!(
+                reopened
+                    .current_visibility_boundary()
+                    .expect("reopened current boundary"),
+                current
+            );
+            let reopened_old = reopened
+                .read_view_at(inserted)
+                .expect("reopen old boundary");
+            assert_eq!(
+                reopened
+                    .scan_columns_with_view(&[ColumnId(2)], &reopened_old)
+                    .expect("scan reopened old boundary"),
+                vec![(row, vec![ScalarValue::Text("new".into())])]
+            );
+            drop(reopened_old);
+            reopened.close().expect("close reopened storage");
+        }
+        cleanup(&heap_path);
+        let _ = std::fs::remove_dir_all(lsm_path);
     }
 }

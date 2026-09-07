@@ -62,7 +62,8 @@ pub use recovery::{
 pub use table::{
     AccessPathCapabilities, CommittedReadAnchor, HeapResourceComponent, HeapResourceComponentKind,
     HeapRewriteIndex, HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath, StorageKind,
-    StorageReadView, StorageRowHandle, StorageTransaction, TableStorage, heap_resource_components,
+    StorageReadView, StorageRowHandle, StorageTransaction, StorageVisibilityBoundary,
+    StorageVisibilityPin, TableStorage, heap_resource_components,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
@@ -589,6 +590,24 @@ pub enum StorageError {
         expected: TableId,
         actual: TableId,
     },
+    InvalidVisibilityBoundary {
+        storage_id: netbadb_types::StorageId,
+        value: u64,
+    },
+    VisibilityBoundaryExhausted {
+        storage_id: netbadb_types::StorageId,
+    },
+    VisibilityBoundaryContextMismatch {
+        expected_storage_id: netbadb_types::StorageId,
+        actual_storage_id: netbadb_types::StorageId,
+        expected_kind: crate::StorageKind,
+        actual_kind: crate::StorageKind,
+    },
+    FutureVisibilityBoundary {
+        storage_id: netbadb_types::StorageId,
+        requested: u64,
+        current: u64,
+    },
     UnknownAccessPath {
         table_id: TableId,
         access_path: AccessPathId,
@@ -688,6 +707,35 @@ impl fmt::Display for StorageError {
                 formatter,
                 "storage context belongs to table {}, expected table {}",
                 actual.0, expected.0
+            ),
+            Self::InvalidVisibilityBoundary { storage_id, value } => write!(
+                formatter,
+                "storage {} has invalid visibility boundary value {value}",
+                storage_id.0
+            ),
+            Self::VisibilityBoundaryExhausted { storage_id } => write!(
+                formatter,
+                "storage {} visibility boundary space is exhausted",
+                storage_id.0
+            ),
+            Self::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            } => write!(
+                formatter,
+                "visibility boundary belongs to storage {} ({actual_kind:?}), expected storage {} ({expected_kind:?})",
+                actual_storage_id.0, expected_storage_id.0
+            ),
+            Self::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            } => write!(
+                formatter,
+                "storage {} visibility boundary {requested} is newer than current boundary {current}",
+                storage_id.0
             ),
             Self::UnknownAccessPath {
                 table_id,

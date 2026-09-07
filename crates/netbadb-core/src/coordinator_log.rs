@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use netbadb_types::{DatabaseTxnId, StorageId, TxnId};
+use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId, TxnId};
 
 const LOG_MAGIC: &[u8; 4] = b"NBCO";
 const LOG_VERSION: u16 = 1;
@@ -17,11 +17,18 @@ const RECORD_CHECKSUM_OFFSET: usize = 12;
 const COMMIT_DECISION_TAG: u8 = 1;
 const COMPLETE_TAG: u8 = 2;
 const SCHEMA_COMMIT_TAG: u8 = 3;
+const GLOBAL_ENABLE_TAG: u8 = 4;
+const SEQUENCED_COMMIT_TAG: u8 = 5;
+const SEQUENCED_SCHEMA_COMMIT_TAG: u8 = 6;
+const SEQUENCED_COMPLETE_TAG: u8 = 7;
+const SEQUENCED_PREFIX_SIZE: usize = 8;
 const SCHEMA_REFERENCE_SIZE: usize = 56;
 pub(crate) const MAX_COORDINATOR_PARTICIPANTS: usize = 1_024;
 const PARTICIPANT_SIZE: usize = 16;
-const MAX_RECORD_SIZE: usize =
-    RECORD_HEADER_SIZE + MAX_COORDINATOR_PARTICIPANTS * PARTICIPANT_SIZE + SCHEMA_REFERENCE_SIZE;
+const MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE
+    + SEQUENCED_PREFIX_SIZE
+    + MAX_COORDINATOR_PARTICIPANTS * PARTICIPANT_SIZE
+    + SCHEMA_REFERENCE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CoordinatorParticipant {
@@ -40,6 +47,7 @@ pub(crate) struct SchemaParticipantReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoordinatorDecision {
     pub(crate) database_txn_id: DatabaseTxnId,
+    pub(crate) commit_seq: Option<DatabaseCommitSeq>,
     pub(crate) participants: Vec<CoordinatorParticipant>,
     pub(crate) complete: bool,
     pub(crate) schema: Option<SchemaParticipantReference>,
@@ -49,6 +57,7 @@ pub(crate) struct CoordinatorDecision {
 pub(crate) struct CoordinatorLog {
     file: File,
     decisions: BTreeMap<DatabaseTxnId, CoordinatorDecision>,
+    global_visibility: bool,
     #[cfg(test)]
     fail_next_decision_append: bool,
     #[cfg(test)]
@@ -73,6 +82,7 @@ impl CoordinatorLog {
         Ok(Self {
             file,
             decisions: BTreeMap::new(),
+            global_visibility: false,
             #[cfg(test)]
             fail_next_decision_append: false,
             #[cfg(test)]
@@ -95,6 +105,7 @@ impl CoordinatorLog {
         Ok(Self {
             file,
             decisions: scan.decisions,
+            global_visibility: scan.global_visibility,
             #[cfg(test)]
             fail_next_decision_append: false,
             #[cfg(test)]
@@ -108,6 +119,165 @@ impl CoordinatorLog {
 
     pub(crate) fn decisions(&self) -> impl Iterator<Item = &CoordinatorDecision> {
         self.decisions.values()
+    }
+
+    pub(crate) const fn global_visibility_enabled(&self) -> bool {
+        self.global_visibility
+    }
+
+    pub(crate) fn published_commit_seq(&self) -> DatabaseCommitSeq {
+        self.decisions
+            .values()
+            .filter(|decision| decision.complete)
+            .filter_map(|decision| decision.commit_seq)
+            .max()
+            .unwrap_or(DatabaseCommitSeq(0))
+    }
+
+    pub(crate) fn next_commit_seq(&self) -> Result<DatabaseCommitSeq, CoordinatorLogError> {
+        let last = self
+            .decisions
+            .values()
+            .filter_map(|decision| decision.commit_seq)
+            .max()
+            .unwrap_or(DatabaseCommitSeq(0));
+        last.0
+            .checked_add(1)
+            .map(DatabaseCommitSeq)
+            .ok_or(CoordinatorLogError::CommitSequenceExhausted)
+    }
+
+    /// Durably and irreversibly enables database-global snapshot publication.
+    pub(crate) fn enable_global_visibility(&mut self) -> Result<(), CoordinatorLogError> {
+        if self.global_visibility {
+            self.file.sync_data()?;
+            return Ok(());
+        }
+        if self.decisions.values().any(|decision| !decision.complete) {
+            return Err(CoordinatorLogError::GlobalEnableWithIncompleteDecision);
+        }
+        let bytes = encode_record(DatabaseTxnId(0), CoordinatorRecord::GlobalEnable)?;
+        append_record(&mut self.file, &bytes)?;
+        self.file.sync_data()?;
+        self.global_visibility = true;
+        Ok(())
+    }
+
+    pub(crate) fn sequenced_commit_decision(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        participants: &[CoordinatorParticipant],
+        schema: Option<&SchemaParticipantReference>,
+    ) -> Result<DatabaseCommitSeq, CoordinatorLogError> {
+        if !self.global_visibility {
+            return Err(CoordinatorLogError::GlobalVisibilityNotEnabled);
+        }
+        let participants = canonical_participants(database_txn_id, participants, schema.is_some())?;
+        if let Some(existing) = self.decisions.get(&database_txn_id) {
+            if existing.participants != participants || existing.schema.as_ref() != schema {
+                return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
+            }
+            let sequence = existing
+                .commit_seq
+                .ok_or(CoordinatorLogError::ConflictingDecision { database_txn_id })?;
+            self.file.sync_data()?;
+            return Ok(sequence);
+        }
+        let commit_seq = self.next_commit_seq()?;
+        let record = match schema {
+            Some(reference) => {
+                CoordinatorRecord::SequencedSchemaCommit(commit_seq, &participants, reference)
+            }
+            None => CoordinatorRecord::SequencedCommit(commit_seq, &participants),
+        };
+        let bytes = encode_record(database_txn_id, record)?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_decision_append) {
+            inject_partial_append_failure(&mut self.file, &bytes)?;
+        }
+        #[cfg(test)]
+        if crate::coordinator_crash::enabled("during-decision-append") {
+            self.file.seek(SeekFrom::End(0))?;
+            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            crate::coordinator_crash::maybe_crash("during-decision-append");
+        }
+        append_record(&mut self.file, &bytes)?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("after-decision-append");
+        self.decisions.insert(
+            database_txn_id,
+            CoordinatorDecision {
+                database_txn_id,
+                commit_seq: Some(commit_seq),
+                participants,
+                complete: false,
+                schema: schema.cloned(),
+            },
+        );
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_decision_sync) {
+            return Err(injected_io_error("sequenced decision sync").into());
+        }
+        self.file.sync_data()?;
+        Ok(commit_seq)
+    }
+
+    pub(crate) fn complete_sequenced(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorLogError> {
+        let decision = self
+            .decisions
+            .get(&database_txn_id)
+            .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?;
+        if decision.commit_seq != Some(commit_seq) {
+            return Err(CoordinatorLogError::CompleteSequenceMismatch {
+                database_txn_id,
+                expected: decision.commit_seq,
+                actual: commit_seq,
+            });
+        }
+        if decision.complete {
+            self.file.sync_data()?;
+            return Ok(());
+        }
+        let preceding_incomplete = self.decisions.values().any(|other| {
+            other
+                .commit_seq
+                .is_some_and(|sequence| sequence < commit_seq)
+                && !other.complete
+        });
+        if preceding_incomplete {
+            return Err(CoordinatorLogError::CommitSequenceGap { commit_seq });
+        }
+        let bytes = encode_record(
+            database_txn_id,
+            CoordinatorRecord::SequencedComplete(commit_seq),
+        )?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_complete_append) {
+            inject_partial_append_failure(&mut self.file, &bytes)?;
+        }
+        #[cfg(test)]
+        if crate::coordinator_crash::enabled("during-complete-append") {
+            self.file.seek(SeekFrom::End(0))?;
+            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            crate::coordinator_crash::maybe_crash("during-complete-append");
+        }
+        append_record(&mut self.file, &bytes)?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("after-complete-append");
+        self.decisions
+            .get_mut(&database_txn_id)
+            .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?
+            .complete = true;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_complete_sync) {
+            return Err(injected_io_error("sequenced Complete sync").into());
+        }
+        self.file.sync_data()?;
+        Ok(())
     }
 
     /// Appends and synchronizes the canonical database commit decision.
@@ -158,6 +328,7 @@ impl CoordinatorLog {
             database_txn_id,
             CoordinatorDecision {
                 database_txn_id,
+                commit_seq: None,
                 participants,
                 complete: false,
                 schema: schema.cloned(),
@@ -236,11 +407,20 @@ enum CoordinatorRecord<'a> {
     CommitDecision(&'a [CoordinatorParticipant]),
     SchemaCommit(&'a [CoordinatorParticipant], &'a SchemaParticipantReference),
     Complete,
+    GlobalEnable,
+    SequencedCommit(DatabaseCommitSeq, &'a [CoordinatorParticipant]),
+    SequencedSchemaCommit(
+        DatabaseCommitSeq,
+        &'a [CoordinatorParticipant],
+        &'a SchemaParticipantReference,
+    ),
+    SequencedComplete(DatabaseCommitSeq),
 }
 
 #[derive(Debug)]
 struct CoordinatorScan {
     decisions: BTreeMap<DatabaseTxnId, CoordinatorDecision>,
+    global_visibility: bool,
     valid_end: u64,
     incomplete_tail: bool,
 }
@@ -260,6 +440,7 @@ fn scan_file(
 
     let mut offset = LOG_HEADER_SIZE as u64;
     let mut decisions = BTreeMap::new();
+    let mut global_visibility = false;
     while offset < length {
         let remaining = length - offset;
         if remaining < RECORD_HEADER_SIZE as u64 {
@@ -273,6 +454,7 @@ fn scan_file(
             if allow_incomplete_tail {
                 return Ok(CoordinatorScan {
                     decisions,
+                    global_visibility,
                     valid_end: offset,
                     incomplete_tail: true,
                 });
@@ -287,6 +469,7 @@ fn scan_file(
             if allow_incomplete_tail {
                 return Ok(CoordinatorScan {
                     decisions,
+                    global_visibility,
                     valid_end: offset,
                     incomplete_tail: true,
                 });
@@ -301,13 +484,14 @@ fn scan_file(
         bytes[..RECORD_HEADER_SIZE].copy_from_slice(&record_header);
         file.read_exact(&mut bytes[RECORD_HEADER_SIZE..])?;
         verify_record_checksum(&bytes, offset)?;
-        apply_decoded_record(&bytes, offset, &mut decisions)?;
+        apply_decoded_record(&bytes, offset, &mut decisions, &mut global_visibility)?;
         offset = offset
             .checked_add(u64::from(total_len))
             .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
     }
     Ok(CoordinatorScan {
         decisions,
+        global_visibility,
         valid_end: offset,
         incomplete_tail: false,
     })
@@ -317,9 +501,11 @@ fn apply_decoded_record(
     bytes: &[u8],
     offset: u64,
     decisions: &mut BTreeMap<DatabaseTxnId, CoordinatorDecision>,
+    global_visibility: &mut bool,
 ) -> Result<(), CoordinatorLogError> {
     let database_txn_id = DatabaseTxnId(read_u64(bytes, 16));
-    if database_txn_id.0 == 0 {
+    let tag = bytes[6];
+    if database_txn_id.0 == 0 && tag != GLOBAL_ENABLE_TAG {
         return Err(CoordinatorLogError::InvalidTransactionId { offset });
     }
     let participant_count = usize::try_from(read_u32(bytes, 24))
@@ -327,9 +513,24 @@ fn apply_decoded_record(
     if bytes[28..32] != [0; 4] {
         return Err(CoordinatorLogError::InvalidReservedBytes { offset });
     }
-    match bytes[6] {
-        COMMIT_DECISION_TAG | SCHEMA_COMMIT_TAG => {
-            if (participant_count == 0 && bytes[6] != SCHEMA_COMMIT_TAG)
+    match tag {
+        GLOBAL_ENABLE_TAG => {
+            if database_txn_id.0 != 0 || participant_count != 0 || bytes.len() != RECORD_HEADER_SIZE
+            {
+                return Err(CoordinatorLogError::InvalidGlobalEnable { offset });
+            }
+            *global_visibility = true;
+        }
+        COMMIT_DECISION_TAG
+        | SCHEMA_COMMIT_TAG
+        | SEQUENCED_COMMIT_TAG
+        | SEQUENCED_SCHEMA_COMMIT_TAG => {
+            let sequenced = matches!(tag, SEQUENCED_COMMIT_TAG | SEQUENCED_SCHEMA_COMMIT_TAG);
+            let schema_record = matches!(tag, SCHEMA_COMMIT_TAG | SEQUENCED_SCHEMA_COMMIT_TAG);
+            if sequenced && !*global_visibility {
+                return Err(CoordinatorLogError::SequencedRecordBeforeGlobalEnable { offset });
+            }
+            if (participant_count == 0 && !schema_record)
                 || participant_count > MAX_COORDINATOR_PARTICIPANTS
             {
                 return Err(CoordinatorLogError::InvalidParticipantCount {
@@ -339,7 +540,7 @@ fn apply_decoded_record(
             }
             let mut participants = Vec::with_capacity(participant_count);
             for position in 0..participant_count {
-                let base = RECORD_HEADER_SIZE
+                let base = (RECORD_HEADER_SIZE + if sequenced { SEQUENCED_PREFIX_SIZE } else { 0 })
                     .checked_add(
                         position
                             .checked_mul(PARTICIPANT_SIZE)
@@ -353,13 +554,36 @@ fn apply_decoded_record(
                     physical_txn_id,
                 });
             }
-            let participants = canonical_participants(
-                database_txn_id,
-                &participants,
-                bytes[6] == SCHEMA_COMMIT_TAG,
-            )?;
-            let schema = if bytes[6] == SCHEMA_COMMIT_TAG {
-                let base = RECORD_HEADER_SIZE + participant_count * PARTICIPANT_SIZE;
+            let participants =
+                canonical_participants(database_txn_id, &participants, schema_record)?;
+            let commit_seq = if sequenced {
+                let sequence = DatabaseCommitSeq(read_u64(bytes, RECORD_HEADER_SIZE));
+                if sequence.0 == 0 {
+                    return Err(CoordinatorLogError::InvalidCommitSequence { offset });
+                }
+                let expected = decisions
+                    .values()
+                    .filter_map(|decision| decision.commit_seq)
+                    .max()
+                    .unwrap_or(DatabaseCommitSeq(0))
+                    .0
+                    .checked_add(1)
+                    .ok_or(CoordinatorLogError::CommitSequenceExhausted)?;
+                if sequence.0 != expected {
+                    return Err(CoordinatorLogError::NonConsecutiveCommitSequence {
+                        offset,
+                        expected: DatabaseCommitSeq(expected),
+                        actual: sequence,
+                    });
+                }
+                Some(sequence)
+            } else {
+                None
+            };
+            let schema = if schema_record {
+                let base = RECORD_HEADER_SIZE
+                    + if sequenced { SEQUENCED_PREFIX_SIZE } else { 0 }
+                    + participant_count * PARTICIPANT_SIZE;
                 let mut incarnation = [0; 16];
                 incarnation.copy_from_slice(&bytes[base..base + 16]);
                 let target_epoch = read_u64(bytes, base + 16);
@@ -377,7 +601,10 @@ fn apply_decoded_record(
                 None
             };
             if let Some(existing) = decisions.get(&database_txn_id) {
-                if existing.participants != participants || existing.schema != schema {
+                if existing.participants != participants
+                    || existing.schema != schema
+                    || existing.commit_seq != commit_seq
+                {
                     return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
                 }
             } else {
@@ -385,6 +612,7 @@ fn apply_decoded_record(
                     database_txn_id,
                     CoordinatorDecision {
                         database_txn_id,
+                        commit_seq,
                         participants,
                         complete: false,
                         schema,
@@ -400,6 +628,37 @@ fn apply_decoded_record(
                 .get_mut(&database_txn_id)
                 .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?;
             decision.complete = true;
+        }
+        SEQUENCED_COMPLETE_TAG => {
+            if !*global_visibility
+                || participant_count != 0
+                || bytes.len() != RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE
+            {
+                return Err(CoordinatorLogError::InvalidCompleteLength { offset });
+            }
+            let commit_seq = DatabaseCommitSeq(read_u64(bytes, RECORD_HEADER_SIZE));
+            let decision = decisions
+                .get_mut(&database_txn_id)
+                .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?;
+            if decision.commit_seq != Some(commit_seq) {
+                return Err(CoordinatorLogError::CompleteSequenceMismatch {
+                    database_txn_id,
+                    expected: decision.commit_seq,
+                    actual: commit_seq,
+                });
+            }
+            if decisions.values().any(|other| {
+                other
+                    .commit_seq
+                    .is_some_and(|sequence| sequence < commit_seq)
+                    && !other.complete
+            }) {
+                return Err(CoordinatorLogError::CommitSequenceGap { commit_seq });
+            }
+            decisions
+                .get_mut(&database_txn_id)
+                .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?
+                .complete = true;
         }
         tag => return Err(CoordinatorLogError::UnknownRecordTag { offset, tag }),
     }
@@ -483,7 +742,14 @@ fn encode_record(
     record: CoordinatorRecord<'_>,
 ) -> Result<Vec<u8>, CoordinatorLogError> {
     let schema = match &record {
-        CoordinatorRecord::SchemaCommit(_, reference) => Some(*reference),
+        CoordinatorRecord::SchemaCommit(_, reference)
+        | CoordinatorRecord::SequencedSchemaCommit(_, _, reference) => Some(*reference),
+        _ => None,
+    };
+    let sequence = match &record {
+        CoordinatorRecord::SequencedCommit(sequence, _)
+        | CoordinatorRecord::SequencedSchemaCommit(sequence, _, _)
+        | CoordinatorRecord::SequencedComplete(sequence) => Some(*sequence),
         _ => None,
     };
     let (tag, participants) = match record {
@@ -501,8 +767,28 @@ fn encode_record(
             )
         }
         CoordinatorRecord::Complete => (COMPLETE_TAG, Vec::new()),
+        CoordinatorRecord::GlobalEnable => (GLOBAL_ENABLE_TAG, Vec::new()),
+        CoordinatorRecord::SequencedCommit(_, participants) => (
+            SEQUENCED_COMMIT_TAG,
+            canonical_participants(database_txn_id, participants, false)?,
+        ),
+        CoordinatorRecord::SequencedSchemaCommit(_, participants, reference) => {
+            if reference.incarnation == [0; 16] || reference.target_epoch == 0 {
+                return Err(CoordinatorLogError::InvalidReservedBytes { offset: 0 });
+            }
+            (
+                SEQUENCED_SCHEMA_COMMIT_TAG,
+                canonical_participants(database_txn_id, participants, true)?,
+            )
+        }
+        CoordinatorRecord::SequencedComplete(_) => (SEQUENCED_COMPLETE_TAG, Vec::new()),
     };
     let total_len = (RECORD_HEADER_SIZE
+        + if sequence.is_some() {
+            SEQUENCED_PREFIX_SIZE
+        } else {
+            0
+        }
         + if schema.is_some() {
             SCHEMA_REFERENCE_SIZE
         } else {
@@ -522,7 +808,9 @@ fn encode_record(
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(RECORD_MAGIC);
     bytes.extend_from_slice(
-        &(if schema.is_some() {
+        &(if sequence.is_some() || tag == GLOBAL_ENABLE_TAG {
+            3_u16
+        } else if schema.is_some() {
             2_u16
         } else {
             RECORD_VERSION
@@ -536,6 +824,12 @@ fn encode_record(
     bytes.extend_from_slice(&database_txn_id.0.to_le_bytes());
     bytes.extend_from_slice(&participant_count.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
+    if let Some(sequence) = sequence {
+        if sequence.0 == 0 {
+            return Err(CoordinatorLogError::InvalidCommitSequence { offset: 0 });
+        }
+        bytes.extend_from_slice(&sequence.0.to_le_bytes());
+    }
     for participant in participants {
         bytes.extend_from_slice(&participant.storage_id.0.to_le_bytes());
         bytes.extend_from_slice(&participant.physical_txn_id.0.to_le_bytes());
@@ -556,7 +850,7 @@ fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorL
     if bytes[..magic_len] != RECORD_MAGIC[..magic_len] {
         return Err(CoordinatorLogError::InvalidRecordMagic { offset });
     }
-    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1 | 2) {
+    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1..=3) {
         return Err(CoordinatorLogError::UnsupportedRecordVersion {
             offset,
             version: read_u16(bytes, 4),
@@ -565,7 +859,15 @@ fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorL
     if bytes.len() >= 7
         && !matches!(
             (read_u16(bytes, 4), bytes[6]),
-            (1, COMMIT_DECISION_TAG | COMPLETE_TAG) | (2, SCHEMA_COMMIT_TAG)
+            (1, COMMIT_DECISION_TAG | COMPLETE_TAG)
+                | (2, SCHEMA_COMMIT_TAG)
+                | (
+                    3,
+                    GLOBAL_ENABLE_TAG
+                        | SEQUENCED_COMMIT_TAG
+                        | SEQUENCED_SCHEMA_COMMIT_TAG
+                        | SEQUENCED_COMPLETE_TAG
+                )
         )
     {
         return Err(CoordinatorLogError::UnknownRecordTag {
@@ -600,8 +902,16 @@ fn validate_record_header(
         return Err(CoordinatorLogError::InvalidParticipantCount { offset, count });
     }
     let expected = match tag {
-        COMMIT_DECISION_TAG | SCHEMA_COMMIT_TAG => (RECORD_HEADER_SIZE
-            + if tag == SCHEMA_COMMIT_TAG {
+        COMMIT_DECISION_TAG
+        | SCHEMA_COMMIT_TAG
+        | SEQUENCED_COMMIT_TAG
+        | SEQUENCED_SCHEMA_COMMIT_TAG => (RECORD_HEADER_SIZE
+            + if matches!(tag, SEQUENCED_COMMIT_TAG | SEQUENCED_SCHEMA_COMMIT_TAG) {
+                SEQUENCED_PREFIX_SIZE
+            } else {
+                0
+            }
+            + if matches!(tag, SCHEMA_COMMIT_TAG | SEQUENCED_SCHEMA_COMMIT_TAG) {
                 SCHEMA_REFERENCE_SIZE
             } else {
                 0
@@ -611,7 +921,8 @@ fn validate_record_header(
                 .checked_mul(PARTICIPANT_SIZE)
                 .ok_or(CoordinatorLogError::RecordSizeOverflow)?,
         ),
-        COMPLETE_TAG => Some(RECORD_HEADER_SIZE),
+        COMPLETE_TAG | GLOBAL_ENABLE_TAG => Some(RECORD_HEADER_SIZE),
+        SEQUENCED_COMPLETE_TAG => Some(RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE),
         _ => None,
     }
     .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
@@ -735,6 +1046,31 @@ pub enum CoordinatorLogError {
         offset: u64,
     },
     TransactionIdExhausted,
+    CommitSequenceExhausted,
+    InvalidCommitSequence {
+        offset: u64,
+    },
+    NonConsecutiveCommitSequence {
+        offset: u64,
+        expected: DatabaseCommitSeq,
+        actual: DatabaseCommitSeq,
+    },
+    CompleteSequenceMismatch {
+        database_txn_id: DatabaseTxnId,
+        expected: Option<DatabaseCommitSeq>,
+        actual: DatabaseCommitSeq,
+    },
+    CommitSequenceGap {
+        commit_seq: DatabaseCommitSeq,
+    },
+    GlobalVisibilityNotEnabled,
+    GlobalEnableWithIncompleteDecision,
+    InvalidGlobalEnable {
+        offset: u64,
+    },
+    SequencedRecordBeforeGlobalEnable {
+        offset: u64,
+    },
     ParticipantCountOverflow {
         offset: u64,
     },
@@ -820,6 +1156,52 @@ impl fmt::Display for CoordinatorLogError {
             Self::TransactionIdExhausted => {
                 formatter.write_str("database transaction identity space is exhausted")
             }
+            Self::CommitSequenceExhausted => {
+                formatter.write_str("database commit sequence space is exhausted")
+            }
+            Self::InvalidCommitSequence { offset } => write!(
+                formatter,
+                "coordinator record at {offset} has database commit sequence zero"
+            ),
+            Self::NonConsecutiveCommitSequence {
+                offset,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "coordinator record at {offset} has database commit sequence {}, expected {}",
+                actual.0, expected.0
+            ),
+            Self::CompleteSequenceMismatch {
+                database_txn_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "database transaction {} completes sequence {}, expected {:?}",
+                database_txn_id.0,
+                actual.0,
+                expected.map(|sequence| sequence.0)
+            ),
+            Self::CommitSequenceGap { commit_seq } => write!(
+                formatter,
+                "database commit sequence {} cannot publish before an earlier decision",
+                commit_seq.0
+            ),
+            Self::GlobalVisibilityNotEnabled => {
+                formatter.write_str("database-global visibility is not enabled")
+            }
+            Self::GlobalEnableWithIncompleteDecision => formatter.write_str(
+                "database-global visibility cannot be enabled with an incomplete decision",
+            ),
+            Self::InvalidGlobalEnable { offset } => write!(
+                formatter,
+                "coordinator global-enable record at {offset} has an invalid payload"
+            ),
+            Self::SequencedRecordBeforeGlobalEnable { offset } => write!(
+                formatter,
+                "coordinator sequenced record at {offset} precedes global-enable"
+            ),
             Self::ParticipantCountOverflow { offset } => write!(
                 formatter,
                 "coordinator participant count at {offset} does not fit memory size"
@@ -888,7 +1270,7 @@ mod tests {
         LOG_HEADER_SIZE, MAX_COORDINATOR_PARTICIPANTS, RECORD_CHECKSUM_OFFSET, RECORD_HEADER_SIZE,
         encode_record,
     };
-    use netbadb_types::{DatabaseTxnId, StorageId, TxnId};
+    use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId, TxnId};
 
     fn path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1150,6 +1532,44 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].database_txn_id, DatabaseTxnId(17));
         assert!(decisions[0].complete);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn global_mode_and_gap_free_sequences_round_trip_without_rewriting_v1() {
+        let path = path("global-sequences");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).expect("create global log");
+        assert!(!log.global_visibility_enabled());
+        log.enable_global_visibility().expect("enable global mode");
+        let first = log
+            .sequenced_commit_decision(DatabaseTxnId(20), &participants(), None)
+            .expect("first sequence");
+        let second = log
+            .sequenced_commit_decision(DatabaseTxnId(19), &participants(), None)
+            .expect("second sequence");
+        assert_eq!(first, DatabaseCommitSeq(1));
+        assert_eq!(second, DatabaseCommitSeq(2));
+        assert!(matches!(
+            log.complete_sequenced(DatabaseTxnId(19), second),
+            Err(CoordinatorLogError::CommitSequenceGap { .. })
+        ));
+        log.complete_sequenced(DatabaseTxnId(20), first)
+            .expect("publish G1");
+        log.complete_sequenced(DatabaseTxnId(19), second)
+            .expect("publish G2");
+        drop(log);
+
+        let reopened = CoordinatorLog::open(&path).expect("reopen global log");
+        assert!(reopened.global_visibility_enabled());
+        assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(2));
+        assert_eq!(
+            reopened.next_commit_seq().expect("next"),
+            DatabaseCommitSeq(3)
+        );
+        let bytes = std::fs::read(&path).expect("read global log");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 1);
         drop(reopened);
         let _ = std::fs::remove_file(path);
     }

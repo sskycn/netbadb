@@ -56,11 +56,11 @@ use netbadb_planner::{
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
     ColumnarProjection, HeapRecoveryInspection, PreparedDecision, PreparedTransaction,
-    PreparedTransactionState, PreparedTxnResolution, TableStorage,
+    PreparedTransactionState, PreparedTxnResolution, StorageVisibilityBoundary, TableStorage,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, DatabaseTxnId, IndexName,
-    PhysicalType, ScalarValue, StorageId, TableId, TxnId,
+    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, DatabaseCommitSeq,
+    DatabaseTxnId, IndexName, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
 };
 
 use columnar::{ProjectionRegistry, ProjectionRegistryEntry};
@@ -70,7 +70,7 @@ use registry::{
     PhysicalBindings, RangePartitionBinding, StorageRegistry, StorageRegistryEntry, TablePlacement,
 };
 use schema_catalog::CommittedCatalogState;
-use transaction::SharedCoordinatorLog;
+use transaction::{PublishedVisibility, SharedCoordinatorLog, SharedPublishedVisibility};
 
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
@@ -141,7 +141,8 @@ pub fn fuzz_schema_mutation_bytes(bytes: &[u8]) {
 }
 
 pub use transaction::{
-    CoordinatorError, DatabaseReadView, DatabaseTransaction, ParticipantMode, TransactionState,
+    CoordinatorError, DatabaseReadView, DatabaseSnapshot, DatabaseTransaction,
+    DatabaseVisibilityMode, ParticipantMode, TransactionState,
 };
 pub type Transaction = DatabaseTransaction;
 
@@ -164,6 +165,22 @@ pub fn fuzz_partition_catalog_bytes(bytes: &[u8]) {
 pub struct DatabaseCoordinatorConfig {
     log_path: PathBuf,
     retired_storage_ids: Vec<StorageId>,
+    global_visibility: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityBoundaryInspection {
+    pub storage_id: StorageId,
+    pub storage_kind: netbadb_storage::StorageKind,
+    pub boundary: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseVisibilityInspection {
+    pub mode: DatabaseVisibilityMode,
+    pub published_commit_seq: Option<DatabaseCommitSeq>,
+    pub next_commit_seq: Option<DatabaseCommitSeq>,
+    pub boundaries: Vec<VisibilityBoundaryInspection>,
 }
 
 impl DatabaseCoordinatorConfig {
@@ -172,12 +189,21 @@ impl DatabaseCoordinatorConfig {
         Self {
             log_path: log_path.into(),
             retired_storage_ids: Vec::new(),
+            global_visibility: false,
         }
     }
 
     #[must_use]
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// Requests durable database-global snapshot publication for a newly
+    /// created coordinator. Open always follows the mode persisted in NBCO.
+    #[must_use]
+    pub fn with_global_visibility(mut self) -> Self {
+        self.global_visibility = true;
+        self
     }
 
     pub(crate) fn with_retired_storage_ids(mut self, ids: Vec<StorageId>) -> Self {
@@ -995,6 +1021,7 @@ pub struct Database {
     transaction_owner: Rc<()>,
     next_transaction_id: DatabaseTxnId,
     coordinator: Option<SharedCoordinatorLog>,
+    published_visibility: Option<SharedPublishedVisibility>,
     catalog_generation: u64,
     catalog_path: Option<PathBuf>,
     mutation_journal: Option<schema_mutation::SharedMutationJournal>,
@@ -1002,7 +1029,115 @@ pub struct Database {
     maintenance_cursor: Option<maintenance::MaintenanceCursor>,
 }
 
+fn current_visibility_boundaries(
+    registry: &StorageRegistry,
+) -> Result<Vec<StorageVisibilityBoundary>, DatabaseError> {
+    registry
+        .iter()
+        .map(|entry| {
+            entry
+                .storage
+                .current_visibility_boundary()
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn initial_published_visibility(
+    coordinator: &CoordinatorLog,
+    registry: &StorageRegistry,
+) -> Result<Option<SharedPublishedVisibility>, DatabaseError> {
+    if !coordinator.global_visibility_enabled() {
+        return Ok(None);
+    }
+    let snapshot = DatabaseSnapshot::new(
+        coordinator.published_commit_seq(),
+        current_visibility_boundaries(registry)?,
+    )?;
+    Ok(Some(Rc::new(RefCell::new(PublishedVisibility {
+        snapshot,
+    }))))
+}
+
 impl Database {
+    #[must_use]
+    pub fn visibility_mode(&self) -> DatabaseVisibilityMode {
+        if self.published_visibility.is_some() {
+            DatabaseVisibilityMode::Global
+        } else {
+            DatabaseVisibilityMode::LegacyLocal
+        }
+    }
+
+    pub fn current_database_snapshot(&self) -> Result<Option<DatabaseSnapshot>, DatabaseError> {
+        self.published_visibility
+            .as_ref()
+            .map(|published| {
+                published
+                    .try_borrow()
+                    .map(|state| state.snapshot.clone())
+                    .map_err(|_| CoordinatorError::PublishedVisibilityBusy.into())
+            })
+            .transpose()
+    }
+
+    pub fn inspect_global_visibility(&self) -> Result<DatabaseVisibilityInspection, DatabaseError> {
+        let Some(snapshot) = self.current_database_snapshot()? else {
+            return Ok(DatabaseVisibilityInspection {
+                mode: DatabaseVisibilityMode::LegacyLocal,
+                published_commit_seq: None,
+                next_commit_seq: None,
+                boundaries: Vec::new(),
+            });
+        };
+        let next_commit_seq = self
+            .coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+            .try_borrow()
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?
+            .next_commit_seq()?;
+        Ok(DatabaseVisibilityInspection {
+            mode: DatabaseVisibilityMode::Global,
+            published_commit_seq: Some(snapshot.commit_seq()),
+            next_commit_seq: Some(next_commit_seq),
+            boundaries: snapshot
+                .boundaries()
+                .iter()
+                .map(|boundary| VisibilityBoundaryInspection {
+                    storage_id: boundary.storage_id(),
+                    storage_kind: boundary.storage_kind(),
+                    boundary: boundary.value(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Irreversibly enables durable database-global snapshot publication.
+    /// The transition requires no outstanding database transaction handles.
+    pub fn enable_global_visibility(&mut self) -> Result<(), DatabaseError> {
+        if self.published_visibility.is_some() {
+            return Ok(());
+        }
+        let outstanding = Rc::strong_count(&self.transaction_owner).saturating_sub(1);
+        if outstanding != 0 {
+            return Err(CoordinatorError::GlobalEnableRequiresQuiescence { outstanding }.into());
+        }
+        let boundaries = current_visibility_boundaries(&self.registry)?;
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::DurableCoordinatorRequired)?;
+        coordinator
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?
+            .enable_global_visibility()?;
+        self.published_visibility = Some(Rc::new(RefCell::new(PublishedVisibility {
+            snapshot: DatabaseSnapshot::new(DatabaseCommitSeq(0), boundaries)?,
+        })));
+        Ok(())
+    }
+
     fn configure_managed_projection_catalog(&mut self, incarnation: [u8; 16]) {
         let Some(schema_catalog_path) = self.catalog_path.as_deref() else {
             return;
@@ -1105,7 +1240,7 @@ impl Database {
         validate_explicit_coordinator_path_create(&specs, &config)?;
         let cleanup_specs = specs.clone();
         let (schema, storages) = create_explicit_storages(specs)?;
-        let coordinator = match CoordinatorLog::create(config.log_path()) {
+        let mut coordinator = match CoordinatorLog::create(config.log_path()) {
             Ok(coordinator) => coordinator,
             Err(error) => {
                 drop(storages);
@@ -1113,6 +1248,9 @@ impl Database {
                 return Err(error.into());
             }
         };
+        if config.global_visibility {
+            coordinator.enable_global_visibility()?;
+        }
         Self::compose_with_coordinator(schema, storages, coordinator, DatabaseTxnId(1))
     }
 
@@ -1151,7 +1289,12 @@ impl Database {
             ));
         }
         let mut coordinator = CoordinatorLog::open(config.log_path())?;
-        let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        decisions.sort_by_key(|decision| {
+            decision
+                .commit_seq
+                .map_or((0_u8, 0_u64), |sequence| (1, sequence.0))
+        });
         let mut inspected = Vec::with_capacity(specs.len());
         for spec in &specs {
             let recovery = match spec {
@@ -1205,7 +1348,11 @@ impl Database {
         }
         for decision in &decisions {
             if !decision.complete && decision.schema.is_none() {
-                coordinator.complete(decision.database_txn_id)?;
+                if let Some(commit_seq) = decision.commit_seq {
+                    coordinator.complete_sequenced(decision.database_txn_id, commit_seq)?;
+                } else {
+                    coordinator.complete(decision.database_txn_id)?;
+                }
             }
         }
         let next_transaction_id = DatabaseTxnId(
@@ -1289,7 +1436,7 @@ impl Database {
                 }
             }
         }
-        let coordinator = match CoordinatorLog::create(config.log_path()) {
+        let mut coordinator = match CoordinatorLog::create(config.log_path()) {
             Ok(coordinator) => coordinator,
             Err(error) => {
                 drop(storages);
@@ -1297,6 +1444,9 @@ impl Database {
                 return Err(error.into());
             }
         };
+        if config.global_visibility {
+            coordinator.enable_global_visibility()?;
+        }
         Self::compose_with_coordinator(schema, storages, coordinator, DatabaseTxnId(1))
     }
 
@@ -1323,7 +1473,12 @@ impl Database {
         validate_catalog_paths(&tables)?;
         validate_coordinator_path(&tables, &config)?;
         let mut coordinator = CoordinatorLog::open(config.log_path())?;
-        let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        decisions.sort_by_key(|decision| {
+            decision
+                .commit_seq
+                .map_or((0_u8, 0_u64), |sequence| (1, sequence.0))
+        });
         let mut inspected = Vec::with_capacity(tables.len());
         for (path, table) in &tables {
             inspected.push(InspectedStorage {
@@ -1384,7 +1539,11 @@ impl Database {
         }
         for decision in &decisions {
             if !decision.complete && decision.schema.is_none() {
-                coordinator.complete(decision.database_txn_id)?;
+                if let Some(commit_seq) = decision.commit_seq {
+                    coordinator.complete_sequenced(decision.database_txn_id, commit_seq)?;
+                } else {
+                    coordinator.complete(decision.database_txn_id)?;
+                }
             }
         }
         let next_transaction_id = DatabaseTxnId(
@@ -1528,7 +1687,12 @@ impl Database {
         let catalog = PartitionCatalog::open(config.catalog_path())?;
         validate_catalog_schemas(&catalog, &tables)?;
         let mut coordinator = CoordinatorLog::open(config.coordinator_log_path())?;
-        let decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        decisions.sort_by_key(|decision| {
+            decision
+                .commit_seq
+                .map_or((0_u8, 0_u64), |sequence| (1, sequence.0))
+        });
 
         let mut inspected = Vec::with_capacity(storage_paths.len());
         for path in storage_paths {
@@ -1605,7 +1769,11 @@ impl Database {
         }
         for decision in &decisions {
             if !decision.complete && decision.schema.is_none() {
-                coordinator.complete(decision.database_txn_id)?;
+                if let Some(commit_seq) = decision.commit_seq {
+                    coordinator.complete_sequenced(decision.database_txn_id, commit_seq)?;
+                } else {
+                    coordinator.complete(decision.database_txn_id)?;
+                }
             }
         }
         let next_transaction_id = DatabaseTxnId(
@@ -1634,6 +1802,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
+            published_visibility: None,
             catalog_generation: 0,
             catalog_path: None,
             mutation_journal: None,
@@ -1649,6 +1818,7 @@ impl Database {
         next_transaction_id: DatabaseTxnId,
     ) -> Result<Self, DatabaseError> {
         let (registry, bindings) = StorageRegistry::from_catalog_order(storages)?;
+        let published_visibility = initial_published_visibility(&coordinator, &registry)?;
         Ok(Self {
             committed: crate::schema_catalog::CommittedCatalogState::initial(
                 schema,
@@ -1660,6 +1830,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
+            published_visibility,
             catalog_generation: 0,
             catalog_path: None,
             mutation_journal: None,
@@ -1692,6 +1863,7 @@ impl Database {
                 .collect(),
             &registry,
         )?;
+        let published_visibility = initial_published_visibility(&coordinator, &registry)?;
         Ok(Self {
             committed: crate::schema_catalog::CommittedCatalogState::initial(
                 schema,
@@ -1703,6 +1875,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator: Some(Rc::new(RefCell::new(coordinator))),
+            published_visibility,
             catalog_generation: 0,
             catalog_path: None,
             mutation_journal: None,
@@ -1757,9 +1930,12 @@ impl Database {
                 }
             }
         }
-        let (coordinator, next_transaction_id) = match coordinator {
-            Some((log, next)) => (Some(Rc::new(RefCell::new(log))), next),
-            None => (None, DatabaseTxnId(1)),
+        let (coordinator, published_visibility, next_transaction_id) = match coordinator {
+            Some((log, next)) => {
+                let visibility = initial_published_visibility(&log, &registry)?;
+                (Some(Rc::new(RefCell::new(log))), visibility, next)
+            }
+            None => (None, None, DatabaseTxnId(1)),
         };
         Ok(Self {
             committed,
@@ -1769,6 +1945,7 @@ impl Database {
             transaction_owner: Rc::new(()),
             next_transaction_id,
             coordinator,
+            published_visibility,
             catalog_generation: 0,
             catalog_path: None,
             mutation_journal: None,
@@ -1778,6 +1955,12 @@ impl Database {
     }
 
     pub fn insert(&mut self, values: &[ScalarValue]) -> Result<(), DatabaseError> {
+        if self.published_visibility.is_some() {
+            let mut transaction = self.begin_transaction()?;
+            self.insert_in(&mut transaction, values)?;
+            self.commit_transaction(&mut transaction)?;
+            return Ok(());
+        }
         self.ensure_schema_available(None)?;
         let storage_id = self.primary_storage_id()?;
         let table_id = self
@@ -1859,6 +2042,12 @@ impl Database {
         table_id: TableId,
         values: &[ScalarValue],
     ) -> Result<(), DatabaseError> {
+        if self.published_visibility.is_some() {
+            let mut transaction = self.begin_transaction_for(table_id)?;
+            self.insert_into_in(table_id, &mut transaction, values)?;
+            self.commit_transaction(&mut transaction)?;
+            return Ok(());
+        }
         self.ensure_schema_available(None)?;
         let storage_id = self.route_storage_for_values(table_id, values)?;
         self.registry
@@ -2089,6 +2278,9 @@ impl Database {
         table_id: TableId,
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
+        if self.published_visibility.is_some() {
+            return self.create_index_globally(None, table_id, column_id);
+        }
         self.ensure_schema_available(None)?;
         match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => {
@@ -2113,6 +2305,9 @@ impl Database {
         table_id: TableId,
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
+        if self.published_visibility.is_some() {
+            return self.create_index_globally(Some(name), table_id, column_id);
+        }
         self.ensure_schema_available(None)?;
         if self.registry.iter().any(|entry| {
             entry
@@ -2137,6 +2332,49 @@ impl Database {
             }
         };
         self.catalog_generation = self.catalog_generation.saturating_add(1);
+        Ok(definition)
+    }
+
+    fn create_index_globally(
+        &mut self,
+        name: Option<IndexName>,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<IndexDefinition, DatabaseError> {
+        self.ensure_schema_available(None)?;
+        if let Some(name) = &name
+            && self.registry.iter().any(|entry| {
+                entry
+                    .storage
+                    .indexes()
+                    .iter()
+                    .any(|definition| definition.name.as_ref() == Some(name))
+            })
+        {
+            return Err(DatabaseError::DuplicateIndexName(name.clone()));
+        }
+        let storage_id = match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into());
+            }
+        };
+        let floor = self.index_allocation_floor(table_id, storage_id)?;
+        let mut transaction = self.begin_transaction_for(table_id)?;
+        let context = transaction.write_context(storage_id, &mut self.registry)?;
+        let definition = {
+            let storage = self
+                .registry
+                .get_mut(storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+            storage.advance_index_id_floor_in(context, floor)?;
+            match name {
+                Some(name) => storage.create_named_index_in(context, name, column_id)?,
+                None => storage.create_index_in(context, column_id)?,
+            }
+        };
+        transaction.stage_index(storage_id, definition.clone());
+        self.commit_transaction(&mut transaction)?;
         Ok(definition)
     }
 
@@ -2168,6 +2406,12 @@ impl Database {
         table_id: TableId,
         id: netbadb_types::IndexId,
     ) -> Result<(), DatabaseError> {
+        if self.published_visibility.is_some() {
+            let mut transaction = self.begin_transaction_for(table_id)?;
+            self.drop_index_in(&mut transaction, table_id, id)?;
+            self.commit_transaction(&mut transaction)?;
+            return Ok(());
+        }
         let storage_id = self.index_ddl_storage(table_id)?;
         self.registry
             .get_mut(storage_id)
@@ -2915,8 +3159,28 @@ impl Database {
             // close/reopen preserves freshness for unchanged LSM data.
             storage.flush()?;
         }
+        let global_boundary = self
+            .published_visibility
+            .as_ref()
+            .map(|published| {
+                published
+                    .try_borrow()
+                    .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+                    .snapshot
+                    .boundary(storage_id)
+                    .ok_or(CoordinatorError::SnapshotMissingStorage { storage_id })
+            })
+            .transpose()?;
+        if let Some(boundary) = global_boundary
+            && storage.current_visibility_boundary()? != boundary
+        {
+            return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+        }
         let table = storage.table().clone();
-        let view = storage.read_view()?;
+        let view = match global_boundary {
+            Some(boundary) => storage.read_view_at(boundary)?,
+            None => storage.read_view()?,
+        };
         let token = storage.snapshot_token(&view)?;
         let rows = storage
             .scan_columns_with_view(columns, &view)?
@@ -2948,6 +3212,17 @@ impl Database {
             .registry
             .get_mut(storage_id)
             .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?;
+        if let Some(published) = &self.published_visibility {
+            let boundary = published
+                .try_borrow()
+                .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+                .snapshot
+                .boundary(storage_id)
+                .ok_or(CoordinatorError::SnapshotMissingStorage { storage_id })?;
+            if storage.current_visibility_boundary()? != boundary {
+                return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+            }
+        }
         let table = storage.table().clone();
         let anchor = storage.committed_read_anchor()?;
         let token = storage.snapshot_token(&anchor.read_view)?;
@@ -3595,20 +3870,26 @@ impl Database {
         );
         transaction.commit_with_schema_mutations()?;
         if transaction.schema_composition.materialized().is_some() {
-            return self.finish_composition_commit(transaction);
+            self.finish_composition_commit(transaction)?;
+            self.reconcile_global_snapshot(transaction.database_commit_seq())?;
+            return Ok(());
         }
         if transaction
             .schema_composition
             .materialized_index()
             .is_some()
         {
-            return self.finish_schema_index_composition_commit(transaction);
+            self.finish_schema_index_composition_commit(transaction)?;
+            self.reconcile_global_snapshot(transaction.database_commit_seq())?;
+            return Ok(());
         }
         if no_effective {
             self.finish_no_effective_composition(transaction)?;
         }
         if transaction.schema_mutation.is_some() {
-            return self.finish_schema_commit(transaction);
+            self.finish_schema_commit(transaction)?;
+            self.reconcile_global_snapshot(transaction.database_commit_seq())?;
+            return Ok(());
         }
         let pending = transaction.take_pending_indexes();
         let drops = transaction.take_pending_index_drops();
@@ -3627,6 +3908,22 @@ impl Database {
             }
             self.catalog_generation = self.catalog_generation.saturating_add(1);
         }
+        Ok(())
+    }
+
+    fn reconcile_global_snapshot(
+        &mut self,
+        commit_seq: Option<DatabaseCommitSeq>,
+    ) -> Result<(), DatabaseError> {
+        let (Some(published), Some(commit_seq)) = (&self.published_visibility, commit_seq) else {
+            return Ok(());
+        };
+        let snapshot =
+            DatabaseSnapshot::new(commit_seq, current_visibility_boundaries(&self.registry)?)?;
+        published
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+            .snapshot = snapshot;
         Ok(())
     }
 
@@ -4257,6 +4554,7 @@ impl Database {
             id,
             isolation_level,
             self.coordinator.as_ref().map(Rc::clone),
+            self.published_visibility.as_ref().map(Rc::clone),
         ))
     }
 
@@ -4265,6 +4563,16 @@ impl Database {
         storage_ids: &[StorageId],
     ) -> Result<DatabaseReadView, DatabaseError> {
         self.ensure_schema_available(None)?;
+        let snapshot = self
+            .published_visibility
+            .as_ref()
+            .map(|published| {
+                published
+                    .try_borrow()
+                    .map(|state| state.snapshot.clone())
+                    .map_err(|_| CoordinatorError::PublishedVisibilityBusy)
+            })
+            .transpose()?;
         let mut views = Vec::with_capacity(storage_ids.len());
         for storage_id in storage_ids {
             let storage =
@@ -4273,12 +4581,22 @@ impl Database {
                     .ok_or(StorageRegistryError::UnknownStorageId {
                         storage_id: *storage_id,
                     })?;
-            views.push((*storage_id, storage.read_view()?));
+            let view = match &snapshot {
+                Some(snapshot) => storage.read_view_at(snapshot.boundary(*storage_id).ok_or(
+                    CoordinatorError::SnapshotMissingStorage {
+                        storage_id: *storage_id,
+                    },
+                )?)?,
+                None => storage.read_view()?,
+            };
+            views.push((*storage_id, view));
         }
-        Ok(DatabaseReadView::autocommit(
-            IsolationLevel::ReadCommitted,
-            views,
-        ))
+        Ok(match snapshot {
+            Some(snapshot) => {
+                DatabaseReadView::global(None, IsolationLevel::ReadCommitted, snapshot, views)
+            }
+            None => DatabaseReadView::autocommit(IsolationLevel::ReadCommitted, views),
+        })
     }
 
     fn execute_query_plan(
@@ -5263,8 +5581,8 @@ mod tests {
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
     use netbadb_storage::{HeapStorage, TableStorage};
     use netbadb_types::{
-        AccessPathId, ColumnId, DatabaseTxnId, PartitionId, PhysicalType, ScalarValue, StorageId,
-        TableId,
+        AccessPathId, ColumnId, DatabaseCommitSeq, DatabaseTxnId, PartitionId, PhysicalType,
+        ScalarValue, StorageId, TableId,
     };
 
     fn table() -> TableDef {
@@ -5372,6 +5690,14 @@ mod tests {
         if case.starts_with("mixed:") {
             mixed_crash_child(&root);
             panic!("mixed crash child returned without reaching its crash point");
+        }
+        if case.starts_with("global-single-heap:") {
+            global_single_crash_child(&root, TableId(1));
+            panic!("global single-Heap crash child returned without reaching its crash point");
+        }
+        if case.starts_with("global-single-lsm:") {
+            global_single_crash_child(&root, TableId(2));
+            panic!("global single-LSM crash child returned without reaching its crash point");
         }
         if let Some(operation) = case.strip_prefix("partition-") {
             partition_crash_child(&root, operation);
@@ -5495,6 +5821,34 @@ mod tests {
         transaction
             .commit()
             .expect("commit until mixed crash point");
+    }
+
+    fn global_single_crash_child(root: &std::path::Path, table_id: TableId) {
+        let (_, _, coordinator) = mixed_crash_paths(root);
+        let mut database = Database::open_storages_with_coordinator(
+            mixed_open_specs(root),
+            DatabaseCoordinatorConfig::new(coordinator),
+        )
+        .expect("open global single-writer crash child database");
+        let mut transaction = database
+            .begin_transaction_for(table_id)
+            .expect("begin global single-writer crash transaction");
+        match table_id {
+            TableId(1) => database
+                .insert_into_in(
+                    TableId(1),
+                    &mut transaction,
+                    &[ScalarValue::Int64(1), ScalarValue::Text("heap".into())],
+                )
+                .expect("write single Heap participant"),
+            TableId(2) => database
+                .insert_into_in(TableId(2), &mut transaction, &[ScalarValue::Int64(2)])
+                .expect("write single LSM participant"),
+            _ => panic!("unexpected single-writer table"),
+        }
+        transaction
+            .commit()
+            .expect("commit until global single-writer crash point");
     }
 
     fn assert_mixed_crash_outcome(root: &std::path::Path, committed: bool) {
@@ -5771,6 +6125,149 @@ mod tests {
             );
             assert_crash_outcome(&root, committed);
             cleanup_coordinator_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn subprocess_global_snapshot_crash_windows_recover_before_serving_reads() {
+        let cases = [
+            ("before-first-prepare", false),
+            ("after-prepare-1", false),
+            ("after-prepare-2", false),
+            ("after-all-prepares", false),
+            ("during-decision-append", false),
+            ("after-decision-append", true),
+            ("after-durable-decision", true),
+            ("after-commit-1", true),
+            ("after-commit-2", true),
+            ("after-all-commits", true),
+            ("during-complete-append", true),
+            ("after-complete-append", true),
+            ("after-durable-complete-before-publication", true),
+            ("after-durable-complete", true),
+        ];
+        for reverse in [false, true] {
+            for (case, committed) in cases {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-global-coordinator-crash-{reverse}-{case}-{}",
+                    std::process::id()
+                ));
+                cleanup_coordinator_fixture(&root);
+                let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+                Database::create_tables_with_coordinator(
+                    tables,
+                    DatabaseCoordinatorConfig::new(coordinator_path).with_global_visibility(),
+                )
+                .expect("create global crash fixture")
+                .close()
+                .expect("close global crash fixture");
+
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("current core test executable"),
+                );
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                if reverse {
+                    command.env("NETBADB_REVERSE_PARTICIPANT_COMMIT", "1");
+                }
+                crate::coordinator_crash::configure_child(&mut command, case, &root, case);
+                let status = command.status().expect("start global crash child");
+                assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+                assert_crash_outcome(&root, committed);
+                let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+                let recovered = Database::open_tables_with_coordinator(
+                    tables,
+                    DatabaseCoordinatorConfig::new(coordinator_path),
+                )
+                .expect("inspect recovered global state");
+                assert_eq!(
+                    recovered.visibility_mode(),
+                    super::DatabaseVisibilityMode::Global
+                );
+                let inspection = recovered
+                    .inspect_global_visibility()
+                    .expect("inspect recovered visibility");
+                assert_eq!(
+                    inspection.published_commit_seq,
+                    Some(DatabaseCommitSeq(u64::from(committed)))
+                );
+                assert_eq!(
+                    inspection.next_commit_seq,
+                    Some(DatabaseCommitSeq(u64::from(committed) + 1))
+                );
+                recovered.close().expect("close recovered global state");
+                cleanup_coordinator_fixture(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn global_single_heap_and_lsm_crashes_publish_one_sequence_exactly_once() {
+        for (engine, table_id) in [("heap", TableId(1)), ("lsm", TableId(2))] {
+            for point in [
+                "after-durable-decision",
+                "after-commit-1",
+                "after-durable-complete-before-publication",
+            ] {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-global-single-{engine}-{point}-{}",
+                    std::process::id()
+                ));
+                cleanup_mixed_crash_fixture(&root);
+                let (_, _, coordinator) = mixed_crash_paths(&root);
+                Database::create_storages_with_coordinator(
+                    mixed_create_specs(&root),
+                    DatabaseCoordinatorConfig::new(coordinator).with_global_visibility(),
+                )
+                .expect("create global single-writer fixture")
+                .close()
+                .expect("close global single-writer fixture");
+
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("current core test executable"),
+                );
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                crate::coordinator_crash::configure_child(
+                    &mut command,
+                    &format!("global-single-{engine}:{point}"),
+                    &root,
+                    point,
+                );
+                let status = command.status().expect("start global single-writer child");
+                assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+
+                let (_, _, coordinator) = mixed_crash_paths(&root);
+                let mut recovered = Database::open_storages_with_coordinator(
+                    mixed_open_specs(&root),
+                    DatabaseCoordinatorConfig::new(coordinator),
+                )
+                .expect("recover global single-writer database");
+                let heap = recovered.query("SELECT id FROM users").expect("Heap query");
+                let lsm = recovered
+                    .query("SELECT id FROM lsm_items")
+                    .expect("LSM query");
+                if table_id == TableId(1) {
+                    assert_eq!(heap.rows, vec![vec![ScalarValue::Int64(1)]]);
+                    assert!(lsm.rows.is_empty());
+                } else {
+                    assert!(heap.rows.is_empty());
+                    assert_eq!(lsm.rows, vec![vec![ScalarValue::Int64(2)]]);
+                }
+                let inspection = recovered
+                    .inspect_global_visibility()
+                    .expect("inspect single-writer recovery");
+                assert_eq!(inspection.published_commit_seq, Some(DatabaseCommitSeq(1)));
+                assert_eq!(inspection.next_commit_seq, Some(DatabaseCommitSeq(2)));
+                recovered
+                    .close()
+                    .expect("close recovered single-writer database");
+                cleanup_mixed_crash_fixture(&root);
+            }
         }
     }
 
@@ -6432,6 +6929,7 @@ mod tests {
             transaction_owner: Rc::new(()),
             next_transaction_id: DatabaseTxnId(1),
             coordinator: None,
+            published_visibility: None,
             catalog_generation: 0,
             catalog_path: None,
             mutation_journal: None,
@@ -8485,6 +8983,434 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
         let _ = std::fs::remove_file(&wal);
+    }
+
+    #[test]
+    fn global_snapshot_sequences_single_and_three_storage_commits_and_pins_repeatable_read() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3a-global-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database = Database::create_tables_with_coordinator(tables.clone(), config.clone())
+            .expect("create global database");
+        assert_eq!(
+            database.visibility_mode(),
+            super::DatabaseVisibilityMode::Global
+        );
+        let baseline = database
+            .current_database_snapshot()
+            .expect("inspect G0")
+            .expect("global snapshot");
+        assert_eq!(baseline.commit_seq(), DatabaseCommitSeq(0));
+        assert_eq!(baseline.boundaries().len(), 3);
+
+        let mut read_only = database.begin_transaction().expect("begin read-only");
+        database
+            .execute_in(&mut read_only, "SELECT id FROM users")
+            .expect("read-only statement");
+        read_only.commit().expect("commit read-only");
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("inspect after read")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(0)
+        );
+
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .expect("single-storage global commit");
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("inspect G1")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(1)
+        );
+
+        let mut repeatable = database
+            .begin_transaction_with_isolation(IsolationLevel::RepeatableRead)
+            .expect("begin repeatable read");
+        database
+            .execute_in(&mut repeatable, "SELECT id FROM users")
+            .expect("pin G1");
+
+        let mut writer = database
+            .begin_transaction()
+            .expect("begin three-storage writer");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut writer,
+                &[ScalarValue::Int64(2), ScalarValue::Text("Grace".into())],
+            )
+            .expect("write users");
+        database
+            .insert_into_in(TableId(2), &mut writer, &[ScalarValue::Int64(2)])
+            .expect("write teams");
+        database
+            .insert_into_in(TableId(3), &mut writer, &[ScalarValue::Int64(2)])
+            .expect("write projects");
+        writer.commit().expect("publish G2");
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("inspect G2")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(2)
+        );
+
+        let repeatable_teams = database
+            .execute_in(&mut repeatable, "SELECT id FROM teams")
+            .expect("late storage read at pinned G1");
+        assert!(
+            matches!(repeatable_teams, ExecutionResult::Query(result) if result.rows.is_empty())
+        );
+        let repeatable_users = database
+            .execute_in(&mut repeatable, "SELECT id FROM users ORDER BY id")
+            .expect("repeat old users");
+        assert!(
+            matches!(repeatable_users, ExecutionResult::Query(result) if result.rows == vec![vec![ScalarValue::Int64(1)]])
+        );
+        repeatable.commit().expect("finish repeatable reader");
+
+        let mut own_writes = database
+            .begin_transaction_with_isolation(IsolationLevel::RepeatableRead)
+            .expect("begin own-write RR");
+        database
+            .execute_in(&mut own_writes, "SELECT id FROM projects")
+            .expect("pin G2 for own-write RR");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut own_writes,
+                &[ScalarValue::Int64(3), ScalarValue::Text("own".into())],
+            )
+            .expect("stage own Heap write");
+        let mut outside = database.begin_transaction().expect("begin outside writer");
+        database
+            .insert_into_in(TableId(2), &mut outside, &[ScalarValue::Int64(3)])
+            .expect("write newer external state");
+        outside.commit().expect("publish external G3");
+        let own_users = database
+            .execute_in(&mut own_writes, "SELECT id FROM users ORDER BY id")
+            .expect("read own Heap write");
+        assert!(
+            matches!(own_users, ExecutionResult::Query(result) if result.rows == vec![
+                vec![ScalarValue::Int64(1)],
+                vec![ScalarValue::Int64(2)],
+                vec![ScalarValue::Int64(3)],
+            ])
+        );
+        let old_teams = database
+            .execute_in(&mut own_writes, "SELECT id FROM teams ORDER BY id")
+            .expect("hide external G3");
+        assert!(
+            matches!(old_teams, ExecutionResult::Query(result) if result.rows == vec![vec![ScalarValue::Int64(2)]])
+        );
+        own_writes.rollback().expect("discard own write");
+
+        let mut read_committed = database
+            .begin_transaction_with_isolation(IsolationLevel::ReadCommitted)
+            .expect("begin RC");
+        let before = database
+            .execute_in(&mut read_committed, "SELECT id FROM projects ORDER BY id")
+            .expect("RC before external commit");
+        assert!(
+            matches!(before, ExecutionResult::Query(result) if result.rows == vec![vec![ScalarValue::Int64(2)]])
+        );
+        database
+            .execute("INSERT INTO projects (id) VALUES (4)")
+            .expect("publish external G4");
+        let after = database
+            .execute_in(&mut read_committed, "SELECT id FROM projects ORDER BY id")
+            .expect("RC after external commit");
+        assert!(
+            matches!(after, ExecutionResult::Query(result) if result.rows == vec![
+                vec![ScalarValue::Int64(2)],
+                vec![ScalarValue::Int64(4)],
+            ])
+        );
+        read_committed.commit().expect("finish RC reader");
+
+        let mut uncertain = database
+            .begin_transaction_for(TableId(1))
+            .expect("begin single-writer retry");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut uncertain,
+                &[ScalarValue::Int64(5), ScalarValue::Text("retry".into())],
+            )
+            .expect("write single participant");
+        database
+            .coordinator
+            .as_ref()
+            .expect("coordinator")
+            .borrow_mut()
+            .inject_decision_sync_failure();
+        assert!(uncertain.commit().is_err());
+        assert_eq!(uncertain.state(), TransactionState::DecisionPending);
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("snapshot after uncertain decision")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(4)
+        );
+        assert!(uncertain.rollback().is_err());
+        uncertain.commit().expect("retry same G5 decision");
+
+        database.close().expect("close global database");
+        let reopened =
+            Database::open_tables_with_coordinator(tables, config).expect("reopen global database");
+        assert_eq!(
+            reopened.visibility_mode(),
+            super::DatabaseVisibilityMode::Global
+        );
+        assert_eq!(
+            reopened
+                .current_database_snapshot()
+                .expect("inspect reopened G5")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(5)
+        );
+        reopened.close().expect("close reopened database");
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn global_mode_commits_mixed_heap_lsm_and_legacy_upgrade_is_durable() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3a-mixed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path);
+        let mut database =
+            Database::create_storages_with_coordinator(mixed_create_specs(&root), config.clone())
+                .expect("create legacy mixed database");
+        assert_eq!(
+            database.visibility_mode(),
+            super::DatabaseVisibilityMode::LegacyLocal
+        );
+        let mut blocker = database.begin_transaction().expect("begin upgrade blocker");
+        assert!(matches!(
+            database.enable_global_visibility(),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::GlobalEnableRequiresQuiescence { outstanding: 1 }
+            ))
+        ));
+        blocker.rollback().expect("roll back blocker");
+        drop(blocker);
+        database
+            .enable_global_visibility()
+            .expect("durably enable global mode");
+
+        let mut transaction = database.begin_transaction().expect("begin mixed writer");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut transaction,
+                &[ScalarValue::Int64(7), ScalarValue::Text("heap".into())],
+            )
+            .expect("write Heap");
+        database
+            .insert_into_in(TableId(2), &mut transaction, &[ScalarValue::Int64(7)])
+            .expect("write LSM");
+        transaction.commit().expect("publish mixed G1");
+        let inspection = database
+            .inspect_global_visibility()
+            .expect("inspect mixed publication");
+        assert_eq!(inspection.published_commit_seq, Some(DatabaseCommitSeq(1)));
+        assert_eq!(inspection.next_commit_seq, Some(DatabaseCommitSeq(2)));
+        assert_eq!(inspection.boundaries.len(), 2);
+        database.close().expect("close mixed database");
+
+        let mut reopened = Database::open_storages_with_coordinator(
+            mixed_open_specs(&root),
+            DatabaseCoordinatorConfig::new(&coordinator_path),
+        )
+        .expect("reopen durable global mode");
+        assert_eq!(
+            reopened.visibility_mode(),
+            super::DatabaseVisibilityMode::Global
+        );
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM users")
+                .expect("read Heap")
+                .rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM lsm_items")
+                .expect("read LSM")
+                .rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        reopened.close().expect("close reopened mixed database");
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn global_complete_sync_failure_keeps_cross_storage_readers_on_old_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3a-publication-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator) = mixed_crash_paths(&root);
+        let mut database = Database::create_storages_with_coordinator(
+            mixed_create_specs(&root),
+            DatabaseCoordinatorConfig::new(coordinator).with_global_visibility(),
+        )
+        .expect("create publication-gate database");
+
+        let mut seed = database
+            .begin_transaction()
+            .expect("begin seed transaction");
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut seed,
+                &[ScalarValue::Int64(1), ScalarValue::Text("old".into())],
+            )
+            .expect("seed Heap");
+        database
+            .insert_into_in(TableId(2), &mut seed, &[ScalarValue::Int64(1)])
+            .expect("seed LSM");
+        seed.commit().expect("publish seed G1");
+
+        let mut writer = database.begin_transaction().expect("begin G2 writer");
+        database
+            .execute_in(&mut writer, "UPDATE users SET id = 2 WHERE id = 1")
+            .expect("update Heap");
+        database
+            .execute_in(&mut writer, "UPDATE lsm_items SET id = 2 WHERE id = 1")
+            .expect("update LSM");
+        database
+            .coordinator
+            .as_ref()
+            .expect("coordinator")
+            .borrow_mut()
+            .inject_complete_sync_failure();
+        assert!(writer.commit().is_err());
+        assert_eq!(writer.state(), TransactionState::FinalizePending);
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("snapshot while Complete is uncertain")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(1)
+        );
+
+        let old_join = database
+            .query(
+                "SELECT users.id, lsm_items.id FROM users JOIN lsm_items ON users.id = lsm_items.id",
+            )
+            .expect("join while G2 is not published");
+        assert_eq!(
+            old_join.rows,
+            vec![vec![ScalarValue::Int64(1), ScalarValue::Int64(1)]]
+        );
+
+        writer.commit().expect("retry Complete and publish G2");
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .expect("snapshot after Complete retry")
+                .expect("global snapshot")
+                .commit_seq(),
+            DatabaseCommitSeq(2)
+        );
+        let new_join = database
+            .query(
+                "SELECT users.id, lsm_items.id FROM users JOIN lsm_items ON users.id = lsm_items.id",
+            )
+            .expect("join after G2 publication");
+        assert_eq!(
+            new_join.rows,
+            vec![vec![ScalarValue::Int64(2), ScalarValue::Int64(2)]]
+        );
+
+        database.close().expect("close publication-gate database");
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn global_schema_publication_rebaselines_the_authoritative_storage_vector() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3a-schema-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create schema root");
+        let catalog = root.join("catalog");
+        let heap = root.join("users");
+        let coordinator = root.join("coordinator");
+        let mut database = Database::create_catalog(
+            &catalog,
+            vec![TableStorageCreateSpec::heap(&heap, table())],
+            Some(DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility()),
+        )
+        .expect("create managed global database");
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .boundaries()
+                .len(),
+            1
+        );
+        database
+            .execute("CREATE TABLE extras (id BIGINT NOT NULL)")
+            .expect("publish create table");
+        let created = database.current_database_snapshot().unwrap().unwrap();
+        assert_eq!(created.commit_seq(), DatabaseCommitSeq(1));
+        assert_eq!(created.boundaries().len(), 2);
+        database
+            .execute("INSERT INTO extras (id) VALUES (8)")
+            .expect("publish new-table row");
+        database
+            .execute("DROP TABLE extras")
+            .expect("publish drop table");
+        let dropped = database.current_database_snapshot().unwrap().unwrap();
+        assert_eq!(dropped.commit_seq(), DatabaseCommitSeq(3));
+        assert_eq!(dropped.boundaries().len(), 1);
+        database.close().expect("close managed global database");
+
+        let reopened = Database::open_catalog(&catalog).expect("reopen managed global database");
+        assert_eq!(
+            reopened.visibility_mode(),
+            super::DatabaseVisibilityMode::Global
+        );
+        assert_eq!(
+            reopened
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(3)
+        );
+        reopened.close().expect("close reopened managed database");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

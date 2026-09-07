@@ -565,6 +565,7 @@ struct LsmShared {
     next_row_id: u64,
     next_txn_id: u64,
     next_commit_seq: u64,
+    visible_commit_seq: LsmCommitSeq,
     flush_threshold: u64,
     runtime: Rc<Runtime>,
     table_statistics: Option<TableStatistics>,
@@ -824,6 +825,7 @@ impl LsmStorage {
                     next_row_id: 1,
                     next_txn_id: 1,
                     next_commit_seq: 1,
+                    visible_commit_seq: LsmCommitSeq(0),
                     flush_threshold: DEFAULT_LSM_MEMTABLE_FLUSH_BYTES,
                     runtime,
                     table_statistics: None,
@@ -860,8 +862,11 @@ impl LsmStorage {
             );
         }
         let mut sstables = Vec::with_capacity(manifest.sstables.len());
+        let mut max_commit = 0_u64;
         for reference in &manifest.sstables {
-            sstables.push(open_sstable(&root, &manifest, reference, &table)?);
+            let (sstable, sstable_max_commit) = open_sstable(&root, &manifest, reference, &table)?;
+            sstables.push(sstable);
+            max_commit = max_commit.max(sstable_max_commit);
         }
         let (mut wal, records) = LsmWal::open(&root, manifest.storage_id, manifest.wal_generation)?;
         let recovered = analyze_wal(&records)?;
@@ -869,7 +874,6 @@ impl LsmStorage {
         let prepared = classify_prepared(&recovered);
         validate_resolutions(&prepared, resolutions)?;
         let mut memtable = BTreeMap::new();
-        let mut max_commit = 0_u64;
         let mut recovery_commit = allocate_recovery_commit(&manifest, &recovered)?;
         let mut change_outcomes = BTreeMap::new();
         for (txn_id, transaction) in &recovered {
@@ -965,6 +969,7 @@ impl LsmStorage {
                 next_row_id: manifest.row_reservation_end,
                 next_txn_id: manifest.txn_reservation_end,
                 next_commit_seq: manifest.commit_reservation_end.max(max_commit + 1),
+                visible_commit_seq: LsmCommitSeq(max_commit),
                 flush_threshold: DEFAULT_LSM_MEMTABLE_FLUSH_BYTES,
                 runtime,
                 table_statistics: manifest.table_statistics,
@@ -1142,6 +1147,24 @@ impl LsmStorage {
     pub fn read_view(&self) -> Result<LsmReadView, StorageError> {
         let shared = self.shared.borrow();
         new_read_view(&shared, None, BTreeMap::new(), shared.maximum_commit_seq())
+    }
+
+    #[must_use]
+    pub(crate) fn current_commit_seq(&self) -> LsmCommitSeq {
+        self.shared.borrow().maximum_commit_seq()
+    }
+
+    pub(crate) fn read_view_at(&self, horizon: LsmCommitSeq) -> Result<LsmReadView, StorageError> {
+        let shared = self.shared.borrow();
+        let current = shared.maximum_commit_seq();
+        if horizon > current {
+            return Err(StorageError::FutureVisibilityBoundary {
+                storage_id: shared.manifest.storage_id,
+                requested: horizon.0.saturating_add(1),
+                current: current.0.saturating_add(1),
+            });
+        }
+        new_read_view(&shared, None, BTreeMap::new(), horizon)
     }
 
     pub(crate) fn enable_change_stream(
@@ -1800,6 +1823,28 @@ impl LsmTransaction {
         new_read_view(&shared, Some(self.id), self.pending.clone(), horizon)
     }
 
+    pub(crate) fn begin_statement_at(
+        &mut self,
+        horizon: LsmCommitSeq,
+    ) -> Result<LsmReadView, StorageError> {
+        self.ensure_active()?;
+        let shared = self.shared.borrow();
+        let current = shared.maximum_commit_seq();
+        if horizon > current {
+            return Err(StorageError::FutureVisibilityBoundary {
+                storage_id: shared.manifest.storage_id,
+                requested: horizon.0.saturating_add(1),
+                current: current.0.saturating_add(1),
+            });
+        }
+        new_read_view(&shared, Some(self.id), self.pending.clone(), horizon)
+    }
+
+    #[must_use]
+    pub(crate) fn current_commit_seq(&self) -> LsmCommitSeq {
+        self.shared.borrow().maximum_commit_seq()
+    }
+
     pub fn commit(&mut self) -> Result<(), StorageError> {
         self.ensure_recovery_not_required()?;
         let commit_seq = match self.state {
@@ -1871,6 +1916,7 @@ impl LsmTransaction {
                 .ok_or(LsmError::InvalidWal("pending commit batch is missing"))?;
             apply_mutations(&mut shared.memtable, batch, commit_seq)?;
             shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+            shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
             if let Some(prepared) = self.prepared_change {
                 shared
                     .change_stream
@@ -1998,6 +2044,7 @@ impl LsmTransaction {
                 .ok_or(LsmError::InvalidWal("prepared mutation batch is missing"))?;
             apply_mutations(&mut shared.memtable, batch, commit_seq)?;
             shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+            shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
             if let Some(prepared) = self.prepared_change {
                 shared
                     .change_stream
@@ -2354,25 +2401,7 @@ impl Drop for LsmTransaction {
 
 impl LsmShared {
     fn maximum_commit_seq(&self) -> LsmCommitSeq {
-        let mem_max = self
-            .memtable
-            .values()
-            .flat_map(|versions| versions.keys())
-            .map(|seq| seq.0)
-            .max()
-            .unwrap_or(0);
-        let sst_max = self
-            .sstables
-            .iter()
-            .flat_map(|sst| sst.blocks.iter())
-            .map(|_| 0_u64)
-            .max()
-            .unwrap_or(0);
-        LsmCommitSeq(
-            mem_max
-                .max(sst_max)
-                .max(self.next_commit_seq.saturating_sub(1)),
-        )
+        self.visible_commit_seq
     }
 
     fn allocate_row_id(&mut self) -> Result<u64, StorageError> {
@@ -5637,7 +5666,7 @@ fn open_sstable(
     manifest: &Manifest,
     reference: &SstableRef,
     table: &TableDef,
-) -> Result<Sstable, StorageError> {
+) -> Result<(Sstable, u64), StorageError> {
     let path = sstable_path(root, reference.id, reference.level);
     let mut file = File::open(&path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -5692,6 +5721,7 @@ fn open_sstable(
     let mut total_entries = 0_u64;
     let mut previous = None;
     let mut actual_min = None;
+    let mut max_commit = 0_u64;
     for (block_index, expected) in blocks.iter().enumerate() {
         let (meta, entries, _) = read_sstable_block(
             &mut file,
@@ -5714,6 +5744,7 @@ fn open_sstable(
             .into());
         }
         for entry in &entries {
+            max_commit = max_commit.max(entry.version.0);
             actual_min.get_or_insert(entry.key);
             if previous.is_some_and(|previous: (PhysicalKey, LsmCommitSeq)| {
                 previous >= (entry.key, entry.version)
@@ -5751,12 +5782,15 @@ fn open_sstable(
         }
         .into());
     }
-    Ok(Sstable {
-        reference: reference.clone(),
-        path,
-        blocks,
-        bloom,
-    })
+    Ok((
+        Sstable {
+            reference: reference.clone(),
+            path,
+            blocks,
+            bloom,
+        },
+        max_commit,
+    ))
 }
 
 fn decode_bloom_payload(

@@ -45,6 +45,13 @@ pub struct ColumnarGeneration(pub u64);
 /// Heap WAL transactions retain their independent [`TxnId`] identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatabaseTxnId(pub u64);
+/// Durable, database-scoped order in which committed states become visible.
+///
+/// `G0` is the bootstrap baseline. Every published write uses a non-zero value;
+/// this identity is distinct from both [`DatabaseTxnId`] and storage-local
+/// commit sequences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DatabaseCommitSeq(pub u64);
 /// Query-local identity for one occurrence of a relation in a FROM tree.
 /// Unlike [`TableId`], this identifier is never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

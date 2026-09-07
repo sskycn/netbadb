@@ -578,6 +578,42 @@ impl Transaction {
         )
     }
 
+    pub(crate) fn begin_statement_at(
+        &mut self,
+        visible_csn: CommitSeq,
+    ) -> Result<ReadView, StorageError> {
+        self.ensure_active()?;
+        let current = self.current_commit_seq();
+        if visible_csn > current {
+            return Err(StorageError::FutureVisibilityBoundary {
+                storage_id: netbadb_types::StorageId(0),
+                requested: visible_csn.0.saturating_add(1),
+                current: current.0.saturating_add(1),
+            });
+        }
+        let command_id = self.next_command_id;
+        self.command_id = command_id;
+        self.next_command_id = CommandId(
+            command_id
+                .0
+                .checked_add(1)
+                .ok_or(TransactionError::CommandIdExhausted)?,
+        );
+        ReadView::new(
+            Snapshot {
+                visible_csn,
+                own_txn: Some(self.id),
+                command_id,
+            },
+            self.statuses.clone(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn current_commit_seq(&self) -> CommitSeq {
+        self.statuses.borrow().maximum_commit_seq()
+    }
+
     pub(crate) fn current_read_view(&mut self) -> Result<ReadView, StorageError> {
         self.ensure_active()?;
         let visible_csn = match self.isolation_level {

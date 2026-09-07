@@ -114,3 +114,27 @@ semantics; the live committed schema remains old until complete publication.
 
 Old readers correctly reject CORD v2; do not downgrade a database that has used
 runtime schema creation. Existing v1-only databases remain readable by Round 18.
+
+## Phase 3A global visibility records (CORD v3)
+
+The NBCO file header remains v1. Phase 3A adds these record-version-3 tags:
+
+| Tag | Meaning | Payload before participants |
+| ---: | --- | --- |
+| 4 | `GlobalEnable` | none; header transaction ID and count are zero |
+| 5 | sequenced data CommitDecision | nonzero 8-byte `DatabaseCommitSeq` |
+| 6 | sequenced schema CommitDecision | nonzero 8-byte `DatabaseCommitSeq` |
+| 7 | sequenced Complete | nonzero 8-byte `DatabaseCommitSeq` |
+
+`GlobalEnable` is synchronized as an append-only one-way mode transition. A
+sequenced record before it is invalid. Tags 5 and 6 retain the canonical
+participant tuples after the sequence; tag 6 then retains the same 56-byte
+schema reference as CORD v2. Tag 7 has no participants and must match both the
+transaction and sequence of an earlier decision.
+
+Sequenced decisions are consecutive beginning at G1. Complete records are
+gap-free: G(n+1) cannot Complete while an earlier G remains incomplete.
+Successful Complete synchronization is the durable database-snapshot
+publication point. Startup finishes incomplete decided transactions in G order
+and reconstructs the current storage visibility vector before admitting reads.
+See [Phase 3A global snapshots](phase3a-global-snapshot.md).
