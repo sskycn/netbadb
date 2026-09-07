@@ -1494,9 +1494,9 @@ same TableId cannot exchange physical locators.
 
 `DatabaseTransaction` owns database-level identity, isolation intent,
 lifecycle, and a deterministic participant set. Its `DatabaseTxnId` is
-distinct from each Heap WAL `TxnId`; coordinator history plus prepared WAL
-records provide the restart high-water mark so a still-relevant identity is
-never reused.
+distinct from each Heap WAL `TxnId`; retained coordinator decisions, the Phase
+3B.5 checkpoint high-water, and prepared WAL records provide the restart floor
+so a historical identity is never reused.
 Participants are registered on first access and contain:
 
 ```text
@@ -1544,7 +1544,10 @@ error. Complete is appended only after every participant commit is durable.
 Checkpoint and close retain their quiescent rule, so prepared/in-doubt state is
 rejected rather than recycling required WAL.
 
-The coordinator log is append-only in this phase; GC/checkpoint is deferred.
+Phase 3B.5 adds explicit, quiescent checkpoint compaction for completed
+data-only global coordinator history. Normal commit/open/close remain
+append-only and never compact automatically; retained structural decisions are
+still an explicit compaction blocker.
 HASH/LIST/DEFAULT partitioning, partition DDL/split/merge, global indexes,
 remote placement, Columnar, Raft, replication, and distributed transactions
 are not implemented.

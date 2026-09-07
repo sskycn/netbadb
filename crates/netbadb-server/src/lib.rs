@@ -692,6 +692,7 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::CoordinatorPathConflictsWithStorage(_)
         | DatabaseError::MissingCommitParticipant { .. }
         | DatabaseError::PreparedParticipantMismatch { .. }
+        | DatabaseError::CompactedPreparedParticipant { .. }
         | DatabaseError::InspectionStorageMissing { .. }
         | DatabaseError::InspectionIndexColumnMissing { .. }
         | DatabaseError::InspectionRegistrationOrderOverflow { .. }

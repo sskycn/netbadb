@@ -128,6 +128,7 @@ current environment. The structural result is the sync count—N sequential
 commits use N Decision syncs plus one close checkpoint—not a promised latency
 ratio.
 
-Phase 3B deliberately defers coordinator-log compaction/GC, persistent
+Phase 3B originally deferred coordinator-log compaction. Phase 3B.5 now adds
+explicit checkpoint compaction without changing this pipeline. Persistent
 historical G vectors, group commit, async commit, concurrent coordinator
-writers, replication, and distributed consensus.
+writers, replication, and distributed consensus remain deferred.

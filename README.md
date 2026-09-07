@@ -100,6 +100,13 @@ index, backfill, replacement, and catalog commits retain the conservative
 two-sync path. This is synchronous single-writer pipelining, not async or group
 commit, and CORD v3 is unchanged.
 
+[Phase 3B.5](docs/phase3b5-coordinator-compaction.md) adds explicit,
+synchronous coordinator checkpoint/log compaction for quiescent global
+databases. It preserves the published sequence and storage visibility while
+replacing a completed data-only history with one bounded CORD checkpoint.
+Compaction remains administrator-controlled; it is not automatic coordinator
+GC or group commit.
+
 [Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
 durable per-storage committed change stream for Heap and LSM, with exact
 row-version identities, transaction coalescing, bounded replay, gap detection,

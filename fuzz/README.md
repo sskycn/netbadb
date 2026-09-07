@@ -48,7 +48,10 @@ bytes must remain bounded and return either a catalog node or typed error.
 
 `coordinator_log_decode` accepts at most 64 KiB and opens it through the
 version-1 coordinator scanner. Participant counts and record sizes are bounded;
-malformed records must return a typed error without panicking.
+malformed records must return a typed error without panicking. The same target
+also exercises Phase 3B.5 CORD v4 checkpoints, including checkpoint/tail
+ordering, gap, transaction-high-water, truncation, and checksum validation;
+the NBCO header remains version 1.
 
 `partition_catalog_decode` accepts at most 64 KiB and exercises the immutable
 PartitionCatalog v1 decoder directly. Header, checksum, bounded table and

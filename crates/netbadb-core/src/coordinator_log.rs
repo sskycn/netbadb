@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId, TxnId};
 
@@ -21,8 +21,10 @@ const GLOBAL_ENABLE_TAG: u8 = 4;
 const SEQUENCED_COMMIT_TAG: u8 = 5;
 const SEQUENCED_SCHEMA_COMMIT_TAG: u8 = 6;
 const SEQUENCED_COMPLETE_TAG: u8 = 7;
+const CHECKPOINT_TAG: u8 = 8;
 const SEQUENCED_PREFIX_SIZE: usize = 8;
 const SCHEMA_REFERENCE_SIZE: usize = 56;
+const CHECKPOINT_PAYLOAD_SIZE: usize = 24;
 pub(crate) const MAX_COORDINATOR_PARTICIPANTS: usize = 1_024;
 const PARTICIPANT_SIZE: usize = 16;
 const MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE
@@ -53,11 +55,43 @@ pub(crate) struct CoordinatorDecision {
     pub(crate) schema: Option<SchemaParticipantReference>,
 }
 
+/// Durable summary of a fully completed, globally published coordinator prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoordinatorCheckpoint {
+    pub(crate) published_commit_seq: DatabaseCommitSeq,
+    pub(crate) last_sequenced_decision: DatabaseCommitSeq,
+    pub(crate) database_txn_id_high_water: DatabaseTxnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoordinatorLogCompactionReport {
+    pub(crate) checkpointed_through: DatabaseCommitSeq,
+    pub(crate) database_txn_id_high_water: DatabaseTxnId,
+    pub(crate) bytes_before: u64,
+    pub(crate) bytes_after: u64,
+    pub(crate) decisions_before: usize,
+    pub(crate) decisions_after: usize,
+    pub(crate) pending_completes_flushed: usize,
+    pub(crate) compacted: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionFailureStage {
+    TempWrite,
+    TempSync,
+    Rename,
+    DirectorySync,
+    Reopen,
+}
+
 #[derive(Debug)]
 pub(crate) struct CoordinatorLog {
-    file: File,
+    path: PathBuf,
+    file: Option<File>,
     decisions: BTreeMap<DatabaseTxnId, CoordinatorDecision>,
     global_visibility: bool,
+    checkpoint: Option<CoordinatorCheckpoint>,
     pending_complete_checkpoints: BTreeSet<DatabaseCommitSeq>,
     last_appended_complete: DatabaseCommitSeq,
     last_synced_complete: DatabaseCommitSeq,
@@ -73,6 +107,8 @@ pub(crate) struct CoordinatorLog {
     fail_next_complete_append: bool,
     #[cfg(test)]
     fail_next_complete_sync: bool,
+    #[cfg(test)]
+    fail_next_compaction: Option<CompactionFailureStage>,
 }
 
 impl CoordinatorLog {
@@ -87,9 +123,11 @@ impl CoordinatorLog {
         file.sync_all()?;
         sync_parent_directory(&path)?;
         Ok(Self {
-            file,
+            path,
+            file: Some(file),
             decisions: BTreeMap::new(),
             global_visibility: false,
+            checkpoint: None,
             pending_complete_checkpoints: BTreeSet::new(),
             last_appended_complete: DatabaseCommitSeq(0),
             last_synced_complete: DatabaseCommitSeq(0),
@@ -105,6 +143,8 @@ impl CoordinatorLog {
             fail_next_complete_append: false,
             #[cfg(test)]
             fail_next_complete_sync: false,
+            #[cfg(test)]
+            fail_next_compaction: None,
         })
     }
 
@@ -125,11 +165,16 @@ impl CoordinatorLog {
             .filter(|decision| decision.complete)
             .filter_map(|decision| decision.commit_seq)
             .max()
-            .unwrap_or(DatabaseCommitSeq(0));
+            .unwrap_or(DatabaseCommitSeq(0))
+            .max(scan.checkpoint.map_or(DatabaseCommitSeq(0), |checkpoint| {
+                checkpoint.published_commit_seq
+            }));
         Ok(Self {
-            file,
+            path,
+            file: Some(file),
             decisions: scan.decisions,
             global_visibility: scan.global_visibility,
+            checkpoint: scan.checkpoint,
             pending_complete_checkpoints: BTreeSet::new(),
             last_appended_complete: last_complete,
             last_synced_complete: last_complete,
@@ -145,11 +190,32 @@ impl CoordinatorLog {
             fail_next_complete_append: false,
             #[cfg(test)]
             fail_next_complete_sync: false,
+            #[cfg(test)]
+            fail_next_compaction: None,
         })
     }
 
     pub(crate) fn decisions(&self) -> impl Iterator<Item = &CoordinatorDecision> {
         self.decisions.values()
+    }
+
+    pub(crate) fn retained_decision_count(&self) -> usize {
+        self.decisions.len()
+    }
+
+    pub(crate) const fn checkpoint(&self) -> Option<CoordinatorCheckpoint> {
+        self.checkpoint
+    }
+
+    pub(crate) fn database_txn_id_high_water(&self) -> DatabaseTxnId {
+        self.decisions
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(DatabaseTxnId(0))
+            .max(self.checkpoint.map_or(DatabaseTxnId(0), |checkpoint| {
+                checkpoint.database_txn_id_high_water
+            }))
     }
 
     pub(crate) const fn global_visibility_enabled(&self) -> bool {
@@ -163,6 +229,9 @@ impl CoordinatorLog {
             .filter_map(|decision| decision.commit_seq)
             .max()
             .unwrap_or(DatabaseCommitSeq(0))
+            .max(self.checkpoint.map_or(DatabaseCommitSeq(0), |checkpoint| {
+                checkpoint.published_commit_seq
+            }))
     }
 
     pub(crate) fn next_commit_seq(&self) -> Result<DatabaseCommitSeq, CoordinatorLogError> {
@@ -171,7 +240,10 @@ impl CoordinatorLog {
             .values()
             .filter_map(|decision| decision.commit_seq)
             .max()
-            .unwrap_or(DatabaseCommitSeq(0));
+            .unwrap_or(DatabaseCommitSeq(0))
+            .max(self.checkpoint.map_or(DatabaseCommitSeq(0), |checkpoint| {
+                checkpoint.last_sequenced_decision
+            }));
         last.0
             .checked_add(1)
             .map(DatabaseCommitSeq)
@@ -184,6 +256,9 @@ impl CoordinatorLog {
             .filter_map(|decision| decision.commit_seq)
             .max()
             .unwrap_or(DatabaseCommitSeq(0))
+            .max(self.checkpoint.map_or(DatabaseCommitSeq(0), |checkpoint| {
+                checkpoint.last_sequenced_decision
+            }))
     }
 
     pub(crate) const fn last_appended_complete(&self) -> DatabaseCommitSeq {
@@ -215,21 +290,33 @@ impl CoordinatorLog {
     }
 
     pub(crate) fn byte_len(&self) -> Result<u64, CoordinatorLogError> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file_ref()?.metadata()?.len())
+    }
+
+    fn file_ref(&self) -> Result<&File, CoordinatorLogError> {
+        self.file
+            .as_ref()
+            .ok_or(CoordinatorLogError::AuthorityUnavailable)
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, CoordinatorLogError> {
+        self.file
+            .as_mut()
+            .ok_or(CoordinatorLogError::AuthorityUnavailable)
     }
 
     /// Durably and irreversibly enables database-global snapshot publication.
     pub(crate) fn enable_global_visibility(&mut self) -> Result<(), CoordinatorLogError> {
         if self.global_visibility {
-            self.file.sync_data()?;
+            self.file_ref()?.sync_data()?;
             return Ok(());
         }
         if self.decisions.values().any(|decision| !decision.complete) {
             return Err(CoordinatorLogError::GlobalEnableWithIncompleteDecision);
         }
         let bytes = encode_record(DatabaseTxnId(0), CoordinatorRecord::GlobalEnable)?;
-        append_record(&mut self.file, &bytes)?;
-        self.file.sync_data()?;
+        append_record(self.file_mut()?, &bytes)?;
+        self.file_ref()?.sync_data()?;
         self.global_visibility = true;
         Ok(())
     }
@@ -242,6 +329,16 @@ impl CoordinatorLog {
     ) -> Result<DatabaseCommitSeq, CoordinatorLogError> {
         if !self.global_visibility {
             return Err(CoordinatorLogError::GlobalVisibilityNotEnabled);
+        }
+        if self
+            .checkpoint
+            .is_some_and(|checkpoint| database_txn_id <= checkpoint.database_txn_id_high_water)
+        {
+            return Err(CoordinatorLogError::CheckpointTransactionIdRegression {
+                offset: 0,
+                high_water: self.database_txn_id_high_water(),
+                actual: database_txn_id,
+            });
         }
         let participants = canonical_participants(database_txn_id, participants, schema.is_some())?;
         let combined_checkpoint = !self.pending_complete_checkpoints.is_empty();
@@ -266,15 +363,15 @@ impl CoordinatorLog {
         let bytes = encode_record(database_txn_id, record)?;
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_decision_append) {
-            inject_partial_append_failure(&mut self.file, &bytes)?;
+            inject_partial_append_failure(self.file_mut()?, &bytes)?;
         }
         #[cfg(test)]
         if crate::coordinator_crash::enabled("during-decision-append") {
-            self.file.seek(SeekFrom::End(0))?;
-            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            self.file_mut()?.seek(SeekFrom::End(0))?;
+            self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-decision-append");
         }
-        append_record(&mut self.file, &bytes)?;
+        append_record(self.file_mut()?, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-decision-append");
         self.decisions.insert(
@@ -332,7 +429,7 @@ impl CoordinatorLog {
             .get(&database_txn_id)
             .is_some_and(|decision| decision.complete)
         {
-            if let Err(error) = self.file.sync_data() {
+            if let Err(error) = self.file_ref()?.sync_data() {
                 let error = CoordinatorLogError::from(error);
                 self.last_checkpoint_error = Some(error.to_string());
                 return Err(error);
@@ -350,7 +447,7 @@ impl CoordinatorLog {
             self.last_checkpoint_error = Some(error.to_string());
             return Err(error);
         }
-        if let Err(error) = self.file.sync_data() {
+        if let Err(error) = self.file_ref()?.sync_data() {
             let error = CoordinatorLogError::from(error);
             self.last_checkpoint_error = Some(error.to_string());
             return Err(error);
@@ -372,7 +469,7 @@ impl CoordinatorLog {
             self.last_checkpoint_error = Some(error.to_string());
             return Err(error);
         }
-        if let Err(error) = self.file.sync_data() {
+        if let Err(error) = self.file_ref()?.sync_data() {
             let error = CoordinatorLogError::from(error);
             self.last_checkpoint_error = Some(error.to_string());
             return Err(error);
@@ -381,6 +478,174 @@ impl CoordinatorLog {
         self.mark_pending_completes_synced();
         self.last_checkpoint_error = None;
         Ok(())
+    }
+
+    pub(crate) fn compaction_possible(&self) -> bool {
+        self.global_visibility
+            && !self.decisions.is_empty()
+            && self.decisions.values().all(|decision| decision.complete)
+            && self.file.is_some()
+    }
+
+    /// Rewrites one fully completed global history prefix as a constant-size
+    /// checkpoint. The primary path remains the sole authority; an orphan
+    /// `.next` file is never consulted by [`Self::open`].
+    pub(crate) fn compact(
+        &mut self,
+    ) -> Result<CoordinatorLogCompactionReport, CoordinatorLogError> {
+        if !self.global_visibility {
+            return Err(CoordinatorLogError::CompactionRequiresGlobalVisibility);
+        }
+        let pending_completes_flushed = self.pending_complete_checkpoints.len();
+        self.flush_complete_checkpoints()?;
+        if self.decisions.values().any(|decision| !decision.complete) {
+            return Err(CoordinatorLogError::IncompleteDecisionBlocksCompaction);
+        }
+        let decisions_before = self.decisions.len();
+        let bytes_before = self.byte_len()?;
+        let checkpointed_through = self.published_commit_seq();
+        let database_txn_id_high_water = self.database_txn_id_high_water();
+        if decisions_before == 0 {
+            return Ok(CoordinatorLogCompactionReport {
+                checkpointed_through,
+                database_txn_id_high_water,
+                bytes_before,
+                bytes_after: bytes_before,
+                decisions_before: 0,
+                decisions_after: 0,
+                pending_completes_flushed,
+                compacted: false,
+            });
+        }
+        if checkpointed_through.0 == 0
+            || checkpointed_through != self.last_sequenced_decision()
+            || database_txn_id_high_water.0 == 0
+        {
+            return Err(CoordinatorLogError::IncompleteDecisionBlocksCompaction);
+        }
+        let checkpoint = CoordinatorCheckpoint {
+            published_commit_seq: checkpointed_through,
+            last_sequenced_decision: checkpointed_through,
+            database_txn_id_high_water,
+        };
+        let global_enable = encode_record(DatabaseTxnId(0), CoordinatorRecord::GlobalEnable)?;
+        let checkpoint_record =
+            encode_record(DatabaseTxnId(0), CoordinatorRecord::Checkpoint(checkpoint))?;
+        let mut next_path = self.path.as_os_str().to_owned();
+        next_path.push(".next");
+        let next_path = PathBuf::from(next_path);
+
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-before-temp-create");
+        match std::fs::remove_file(&next_path) {
+            Ok(()) => sync_parent_directory(&next_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut next = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&next_path)?;
+        #[cfg(test)]
+        if self.fail_next_compaction == Some(CompactionFailureStage::TempWrite) {
+            self.fail_next_compaction = None;
+            return Err(injected_io_error("compaction temp write").into());
+        }
+        next.write_all(&encode_header())?;
+        next.write_all(&global_enable)?;
+        #[cfg(test)]
+        if crate::coordinator_crash::enabled("coordinator-compact-during-temp-write") {
+            next.write_all(&checkpoint_record[..checkpoint_record.len() / 2])?;
+            crate::coordinator_crash::maybe_crash("coordinator-compact-during-temp-write");
+        }
+        next.write_all(&checkpoint_record)?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-after-temp-write");
+        #[cfg(test)]
+        if self.fail_next_compaction == Some(CompactionFailureStage::TempSync) {
+            self.fail_next_compaction = None;
+            return Err(injected_io_error("compaction temp sync").into());
+        }
+        next.sync_all()?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-after-temp-sync");
+        drop(next);
+
+        let old = self
+            .file
+            .take()
+            .ok_or(CoordinatorLogError::AuthorityUnavailable)?;
+        drop(old);
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-after-handle-release");
+        #[cfg(test)]
+        if self.fail_next_compaction == Some(CompactionFailureStage::Rename) {
+            self.fail_next_compaction = None;
+            self.file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .ok();
+            return Err(injected_io_error("compaction rename").into());
+        }
+        if let Err(error) = std::fs::rename(&next_path, &self.path) {
+            let reopened = OpenOptions::new().read(true).write(true).open(&self.path);
+            let Ok(reopened) = reopened else {
+                return Err(CoordinatorLogError::AuthorityUnavailable);
+            };
+            self.file = Some(reopened);
+            return Err(error.into());
+        }
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-after-rename");
+        #[cfg(test)]
+        if self.fail_next_compaction == Some(CompactionFailureStage::DirectorySync) {
+            self.fail_next_compaction = None;
+            return Err(CoordinatorLogError::DirectorySyncUncertain(
+                "injected coordinator compaction directory sync failure".to_owned(),
+            ));
+        }
+        if let Err(error) = sync_parent_directory(&self.path) {
+            return Err(CoordinatorLogError::DirectorySyncUncertain(
+                error.to_string(),
+            ));
+        }
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-after-directory-sync");
+
+        #[cfg(test)]
+        if self.fail_next_compaction == Some(CompactionFailureStage::Reopen) {
+            self.fail_next_compaction = None;
+            return Err(CoordinatorLogError::AuthorityUnavailable);
+        }
+
+        let mut replacement = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let scan = scan_file(&mut replacement, false)?;
+        if scan.checkpoint != Some(checkpoint)
+            || !scan.global_visibility
+            || !scan.decisions.is_empty()
+        {
+            return Err(CoordinatorLogError::InvalidCheckpoint { offset: 0 });
+        }
+        let bytes_after = replacement.metadata()?.len();
+        self.file = Some(replacement);
+        self.checkpoint = Some(checkpoint);
+        self.decisions.clear();
+        self.last_appended_complete = checkpointed_through;
+        self.last_synced_complete = checkpointed_through;
+        self.last_checkpoint_error = None;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("coordinator-compact-after-state-replacement");
+        Ok(CoordinatorLogCompactionReport {
+            checkpointed_through,
+            database_txn_id_high_water,
+            bytes_before,
+            bytes_after,
+            decisions_before,
+            decisions_after: 0,
+            pending_completes_flushed,
+            compacted: true,
+        })
     }
 
     fn validate_sequenced_complete(
@@ -423,15 +688,15 @@ impl CoordinatorLog {
         )?;
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_complete_append) {
-            inject_partial_append_failure(&mut self.file, &bytes)?;
+            inject_partial_append_failure(self.file_mut()?, &bytes)?;
         }
         #[cfg(test)]
         if crate::coordinator_crash::enabled("during-complete-append") {
-            self.file.seek(SeekFrom::End(0))?;
-            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            self.file_mut()?.seek(SeekFrom::End(0))?;
+            self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-complete-append");
         }
-        append_record(&mut self.file, &bytes)?;
+        append_record(self.file_mut()?, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-complete-append");
         self.decisions
@@ -463,7 +728,7 @@ impl CoordinatorLog {
     }
 
     fn sync_decision(&mut self, combined_checkpoint: bool) -> Result<(), CoordinatorLogError> {
-        if let Err(error) = self.file.sync_data() {
+        if let Err(error) = self.file_ref()?.sync_data() {
             let error = CoordinatorLogError::from(error);
             if combined_checkpoint {
                 self.last_checkpoint_error = Some(error.to_string());
@@ -507,12 +772,15 @@ impl CoordinatorLog {
         participants: &[CoordinatorParticipant],
         schema: Option<&SchemaParticipantReference>,
     ) -> Result<(), CoordinatorLogError> {
+        if self.checkpoint.is_some() {
+            return Err(CoordinatorLogError::UnsequencedRecordAfterCheckpoint { offset: 0 });
+        }
         let participants = canonical_participants(database_txn_id, participants, schema.is_some())?;
         if let Some(existing) = self.decisions.get(&database_txn_id) {
             if existing.participants != participants || existing.schema.as_ref() != schema {
                 return Err(CoordinatorLogError::ConflictingDecision { database_txn_id });
             }
-            self.file.sync_data()?;
+            self.file_ref()?.sync_data()?;
             return Ok(());
         }
         let bytes = encode_record(
@@ -524,15 +792,15 @@ impl CoordinatorLog {
         )?;
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_decision_append) {
-            inject_partial_append_failure(&mut self.file, &bytes)?;
+            inject_partial_append_failure(self.file_mut()?, &bytes)?;
         }
         #[cfg(test)]
         if crate::coordinator_crash::enabled("during-decision-append") {
-            self.file.seek(SeekFrom::End(0))?;
-            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            self.file_mut()?.seek(SeekFrom::End(0))?;
+            self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-decision-append");
         }
-        append_record(&mut self.file, &bytes)?;
+        append_record(self.file_mut()?, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-decision-append");
         self.decisions.insert(
@@ -549,7 +817,7 @@ impl CoordinatorLog {
         if std::mem::take(&mut self.fail_next_decision_sync) {
             return Err(injected_io_error("decision sync").into());
         }
-        self.file.sync_data()?;
+        self.file_ref()?.sync_data()?;
         Ok(())
     }
 
@@ -564,21 +832,21 @@ impl CoordinatorLog {
             .get(&database_txn_id)
             .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?;
         if decision.complete {
-            self.file.sync_data()?;
+            self.file_ref()?.sync_data()?;
             return Ok(());
         }
         let bytes = encode_record(database_txn_id, CoordinatorRecord::Complete)?;
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_complete_append) {
-            inject_partial_append_failure(&mut self.file, &bytes)?;
+            inject_partial_append_failure(self.file_mut()?, &bytes)?;
         }
         #[cfg(test)]
         if crate::coordinator_crash::enabled("during-complete-append") {
-            self.file.seek(SeekFrom::End(0))?;
-            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            self.file_mut()?.seek(SeekFrom::End(0))?;
+            self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-complete-append");
         }
-        append_record(&mut self.file, &bytes)?;
+        append_record(self.file_mut()?, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-complete-append");
         self.decisions
@@ -589,7 +857,7 @@ impl CoordinatorLog {
         if std::mem::take(&mut self.fail_next_complete_sync) {
             return Err(injected_io_error("Complete sync").into());
         }
-        self.file.sync_data()?;
+        self.file_ref()?.sync_data()?;
         Ok(())
     }
 
@@ -612,6 +880,11 @@ impl CoordinatorLog {
     pub(crate) fn inject_complete_sync_failure(&mut self) {
         self.fail_next_complete_sync = true;
     }
+
+    #[cfg(test)]
+    fn inject_compaction_failure(&mut self, stage: CompactionFailureStage) {
+        self.fail_next_compaction = Some(stage);
+    }
 }
 
 enum CoordinatorRecord<'a> {
@@ -626,12 +899,14 @@ enum CoordinatorRecord<'a> {
         &'a SchemaParticipantReference,
     ),
     SequencedComplete(DatabaseCommitSeq),
+    Checkpoint(CoordinatorCheckpoint),
 }
 
 #[derive(Debug)]
 struct CoordinatorScan {
     decisions: BTreeMap<DatabaseTxnId, CoordinatorDecision>,
     global_visibility: bool,
+    checkpoint: Option<CoordinatorCheckpoint>,
     valid_end: u64,
     incomplete_tail: bool,
 }
@@ -652,6 +927,7 @@ fn scan_file(
     let mut offset = LOG_HEADER_SIZE as u64;
     let mut decisions = BTreeMap::new();
     let mut global_visibility = false;
+    let mut checkpoint = None;
     while offset < length {
         let remaining = length - offset;
         if remaining < RECORD_HEADER_SIZE as u64 {
@@ -662,10 +938,14 @@ fn scan_file(
             ];
             file.read_exact(&mut partial)?;
             validate_partial_header(&partial, offset)?;
+            if partial.get(6) == Some(&CHECKPOINT_TAG) {
+                return Err(CoordinatorLogError::TruncatedRecord { offset });
+            }
             if allow_incomplete_tail {
                 return Ok(CoordinatorScan {
                     decisions,
                     global_visibility,
+                    checkpoint,
                     valid_end: offset,
                     incomplete_tail: true,
                 });
@@ -677,10 +957,14 @@ fn scan_file(
         file.read_exact(&mut record_header)?;
         let total_len = validate_record_header(&record_header, offset)?;
         if u64::from(total_len) > remaining {
+            if record_header[6] == CHECKPOINT_TAG {
+                return Err(CoordinatorLogError::TruncatedRecord { offset });
+            }
             if allow_incomplete_tail {
                 return Ok(CoordinatorScan {
                     decisions,
                     global_visibility,
+                    checkpoint,
                     valid_end: offset,
                     incomplete_tail: true,
                 });
@@ -695,7 +979,13 @@ fn scan_file(
         bytes[..RECORD_HEADER_SIZE].copy_from_slice(&record_header);
         file.read_exact(&mut bytes[RECORD_HEADER_SIZE..])?;
         verify_record_checksum(&bytes, offset)?;
-        apply_decoded_record(&bytes, offset, &mut decisions, &mut global_visibility)?;
+        apply_decoded_record(
+            &bytes,
+            offset,
+            &mut decisions,
+            &mut global_visibility,
+            &mut checkpoint,
+        )?;
         offset = offset
             .checked_add(u64::from(total_len))
             .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
@@ -703,6 +993,7 @@ fn scan_file(
     Ok(CoordinatorScan {
         decisions,
         global_visibility,
+        checkpoint,
         valid_end: offset,
         incomplete_tail: false,
     })
@@ -713,10 +1004,11 @@ fn apply_decoded_record(
     offset: u64,
     decisions: &mut BTreeMap<DatabaseTxnId, CoordinatorDecision>,
     global_visibility: &mut bool,
+    checkpoint: &mut Option<CoordinatorCheckpoint>,
 ) -> Result<(), CoordinatorLogError> {
     let database_txn_id = DatabaseTxnId(read_u64(bytes, 16));
     let tag = bytes[6];
-    if database_txn_id.0 == 0 && tag != GLOBAL_ENABLE_TAG {
+    if database_txn_id.0 == 0 && !matches!(tag, GLOBAL_ENABLE_TAG | CHECKPOINT_TAG) {
         return Err(CoordinatorLogError::InvalidTransactionId { offset });
     }
     let participant_count = usize::try_from(read_u32(bytes, 24))
@@ -726,11 +1018,45 @@ fn apply_decoded_record(
     }
     match tag {
         GLOBAL_ENABLE_TAG => {
+            if checkpoint.is_some() {
+                return Err(CoordinatorLogError::UnsequencedRecordAfterCheckpoint { offset });
+            }
             if database_txn_id.0 != 0 || participant_count != 0 || bytes.len() != RECORD_HEADER_SIZE
             {
                 return Err(CoordinatorLogError::InvalidGlobalEnable { offset });
             }
             *global_visibility = true;
+        }
+        CHECKPOINT_TAG => {
+            if !*global_visibility {
+                return Err(CoordinatorLogError::CheckpointBeforeGlobalEnable { offset });
+            }
+            if checkpoint.is_some() {
+                return Err(CoordinatorLogError::DuplicateCheckpoint { offset });
+            }
+            if !decisions.is_empty()
+                || database_txn_id.0 != 0
+                || participant_count != 0
+                || bytes.len() != RECORD_HEADER_SIZE + CHECKPOINT_PAYLOAD_SIZE
+            {
+                return Err(CoordinatorLogError::InvalidCheckpoint { offset });
+            }
+            let published_commit_seq = DatabaseCommitSeq(read_u64(bytes, RECORD_HEADER_SIZE));
+            let last_sequenced_decision =
+                DatabaseCommitSeq(read_u64(bytes, RECORD_HEADER_SIZE + 8));
+            let database_txn_id_high_water =
+                DatabaseTxnId(read_u64(bytes, RECORD_HEADER_SIZE + 16));
+            if published_commit_seq.0 == 0
+                || published_commit_seq != last_sequenced_decision
+                || database_txn_id_high_water.0 == 0
+            {
+                return Err(CoordinatorLogError::InvalidCheckpoint { offset });
+            }
+            *checkpoint = Some(CoordinatorCheckpoint {
+                published_commit_seq,
+                last_sequenced_decision,
+                database_txn_id_high_water,
+            });
         }
         COMMIT_DECISION_TAG
         | SCHEMA_COMMIT_TAG
@@ -740,6 +1066,9 @@ fn apply_decoded_record(
             let schema_record = matches!(tag, SCHEMA_COMMIT_TAG | SEQUENCED_SCHEMA_COMMIT_TAG);
             if sequenced && !*global_visibility {
                 return Err(CoordinatorLogError::SequencedRecordBeforeGlobalEnable { offset });
+            }
+            if checkpoint.is_some() && !sequenced {
+                return Err(CoordinatorLogError::UnsequencedRecordAfterCheckpoint { offset });
             }
             if (participant_count == 0 && !schema_record)
                 || participant_count > MAX_COORDINATOR_PARTICIPANTS
@@ -776,7 +1105,11 @@ fn apply_decoded_record(
                     .values()
                     .filter_map(|decision| decision.commit_seq)
                     .max()
-                    .unwrap_or(DatabaseCommitSeq(0))
+                    .unwrap_or_else(|| {
+                        checkpoint.map_or(DatabaseCommitSeq(0), |checkpoint| {
+                            checkpoint.last_sequenced_decision
+                        })
+                    })
                     .0
                     .checked_add(1)
                     .ok_or(CoordinatorLogError::CommitSequenceExhausted)?;
@@ -791,6 +1124,15 @@ fn apply_decoded_record(
             } else {
                 None
             };
+            if let Some(checkpoint) = checkpoint {
+                if database_txn_id <= checkpoint.database_txn_id_high_water {
+                    return Err(CoordinatorLogError::CheckpointTransactionIdRegression {
+                        offset,
+                        high_water: checkpoint.database_txn_id_high_water,
+                        actual: database_txn_id,
+                    });
+                }
+            }
             let schema = if schema_record {
                 let base = RECORD_HEADER_SIZE
                     + if sequenced { SEQUENCED_PREFIX_SIZE } else { 0 }
@@ -832,6 +1174,9 @@ fn apply_decoded_record(
             }
         }
         COMPLETE_TAG => {
+            if checkpoint.is_some() {
+                return Err(CoordinatorLogError::UnsequencedRecordAfterCheckpoint { offset });
+            }
             if participant_count != 0 || bytes.len() != RECORD_HEADER_SIZE {
                 return Err(CoordinatorLogError::InvalidCompleteLength { offset });
             }
@@ -963,6 +1308,10 @@ fn encode_record(
         | CoordinatorRecord::SequencedComplete(sequence) => Some(*sequence),
         _ => None,
     };
+    let checkpoint = match &record {
+        CoordinatorRecord::Checkpoint(checkpoint) => Some(*checkpoint),
+        _ => None,
+    };
     let (tag, participants) = match record {
         CoordinatorRecord::CommitDecision(participants) => (
             COMMIT_DECISION_TAG,
@@ -993,7 +1342,12 @@ fn encode_record(
             )
         }
         CoordinatorRecord::SequencedComplete(_) => (SEQUENCED_COMPLETE_TAG, Vec::new()),
+        CoordinatorRecord::Checkpoint(_) => (CHECKPOINT_TAG, Vec::new()),
     };
+    let participant_bytes = participants
+        .len()
+        .checked_mul(PARTICIPANT_SIZE)
+        .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
     let total_len = (RECORD_HEADER_SIZE
         + if sequence.is_some() {
             SEQUENCED_PREFIX_SIZE
@@ -1005,12 +1359,12 @@ fn encode_record(
         } else {
             0
         })
-    .checked_add(
-        participants
-            .len()
-            .checked_mul(PARTICIPANT_SIZE)
-            .ok_or(CoordinatorLogError::RecordSizeOverflow)?,
-    )
+    .checked_add(if checkpoint.is_some() {
+        CHECKPOINT_PAYLOAD_SIZE
+    } else {
+        0
+    })
+    .and_then(|base| base.checked_add(participant_bytes))
     .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
     let total_len_u32 =
         u32::try_from(total_len).map_err(|_| CoordinatorLogError::RecordSizeOverflow)?;
@@ -1019,7 +1373,9 @@ fn encode_record(
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(RECORD_MAGIC);
     bytes.extend_from_slice(
-        &(if sequence.is_some() || tag == GLOBAL_ENABLE_TAG {
+        &(if checkpoint.is_some() {
+            4_u16
+        } else if sequence.is_some() || tag == GLOBAL_ENABLE_TAG {
             3_u16
         } else if schema.is_some() {
             2_u16
@@ -1050,6 +1406,17 @@ fn encode_record(
         bytes.extend_from_slice(&reference.target_epoch.to_le_bytes());
         bytes.extend_from_slice(&reference.digest);
     }
+    if let Some(checkpoint) = checkpoint {
+        if checkpoint.published_commit_seq.0 == 0
+            || checkpoint.published_commit_seq != checkpoint.last_sequenced_decision
+            || checkpoint.database_txn_id_high_water.0 == 0
+        {
+            return Err(CoordinatorLogError::InvalidCheckpoint { offset: 0 });
+        }
+        bytes.extend_from_slice(&checkpoint.published_commit_seq.0.to_le_bytes());
+        bytes.extend_from_slice(&checkpoint.last_sequenced_decision.0.to_le_bytes());
+        bytes.extend_from_slice(&checkpoint.database_txn_id_high_water.0.to_le_bytes());
+    }
     let checksum = crc32c::crc32c(&bytes);
     bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + 4]
         .copy_from_slice(&checksum.to_le_bytes());
@@ -1061,7 +1428,7 @@ fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorL
     if bytes[..magic_len] != RECORD_MAGIC[..magic_len] {
         return Err(CoordinatorLogError::InvalidRecordMagic { offset });
     }
-    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1..=3) {
+    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1..=4) {
         return Err(CoordinatorLogError::UnsupportedRecordVersion {
             offset,
             version: read_u16(bytes, 4),
@@ -1079,6 +1446,7 @@ fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorL
                         | SEQUENCED_SCHEMA_COMMIT_TAG
                         | SEQUENCED_COMPLETE_TAG
                 )
+                | (4, CHECKPOINT_TAG)
         )
     {
         return Err(CoordinatorLogError::UnknownRecordTag {
@@ -1134,6 +1502,7 @@ fn validate_record_header(
         ),
         COMPLETE_TAG | GLOBAL_ENABLE_TAG => Some(RECORD_HEADER_SIZE),
         SEQUENCED_COMPLETE_TAG => Some(RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE),
+        CHECKPOINT_TAG => Some(RECORD_HEADER_SIZE + CHECKPOINT_PAYLOAD_SIZE),
         _ => None,
     }
     .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
@@ -1279,6 +1648,23 @@ pub enum CoordinatorLogError {
     InvalidGlobalEnable {
         offset: u64,
     },
+    CheckpointBeforeGlobalEnable {
+        offset: u64,
+    },
+    DuplicateCheckpoint {
+        offset: u64,
+    },
+    InvalidCheckpoint {
+        offset: u64,
+    },
+    UnsequencedRecordAfterCheckpoint {
+        offset: u64,
+    },
+    CheckpointTransactionIdRegression {
+        offset: u64,
+        high_water: DatabaseTxnId,
+        actual: DatabaseTxnId,
+    },
     SequencedRecordBeforeGlobalEnable {
         offset: u64,
     },
@@ -1307,6 +1693,10 @@ pub enum CoordinatorLogError {
     InvalidCompleteLength {
         offset: u64,
     },
+    CompactionRequiresGlobalVisibility,
+    IncompleteDecisionBlocksCompaction,
+    AuthorityUnavailable,
+    DirectorySyncUncertain(String),
     RecordSizeOverflow,
 }
 
@@ -1409,6 +1799,33 @@ impl fmt::Display for CoordinatorLogError {
                 formatter,
                 "coordinator global-enable record at {offset} has an invalid payload"
             ),
+            Self::CheckpointBeforeGlobalEnable { offset } => write!(
+                formatter,
+                "coordinator checkpoint at {offset} precedes global-enable"
+            ),
+            Self::DuplicateCheckpoint { offset } => {
+                write!(
+                    formatter,
+                    "coordinator checkpoint at {offset} is duplicated"
+                )
+            }
+            Self::InvalidCheckpoint { offset } => write!(
+                formatter,
+                "coordinator checkpoint at {offset} has invalid high-water state"
+            ),
+            Self::UnsequencedRecordAfterCheckpoint { offset } => write!(
+                formatter,
+                "unsequenced coordinator record at {offset} follows a global checkpoint"
+            ),
+            Self::CheckpointTransactionIdRegression {
+                offset,
+                high_water,
+                actual,
+            } => write!(
+                formatter,
+                "coordinator record at {offset} reuses database transaction {} at or below checkpoint high-water {}",
+                actual.0, high_water.0
+            ),
             Self::SequencedRecordBeforeGlobalEnable { offset } => write!(
                 formatter,
                 "coordinator sequenced record at {offset} precedes global-enable"
@@ -1452,6 +1869,19 @@ impl fmt::Display for CoordinatorLogError {
                 formatter,
                 "Complete record at {offset} has an invalid payload"
             ),
+            Self::CompactionRequiresGlobalVisibility => {
+                formatter.write_str("coordinator compaction requires database-global visibility")
+            }
+            Self::IncompleteDecisionBlocksCompaction => {
+                formatter.write_str("an incomplete coordinator decision blocks compaction")
+            }
+            Self::AuthorityUnavailable => {
+                formatter.write_str("coordinator authority is unavailable after uncertain I/O")
+            }
+            Self::DirectorySyncUncertain(detail) => write!(
+                formatter,
+                "coordinator replacement is visible but directory durability is uncertain: {detail}"
+            ),
             Self::RecordSizeOverflow => formatter.write_str("coordinator record size overflows"),
         }
     }
@@ -1477,9 +1907,9 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
 
     use super::{
-        CoordinatorLog, CoordinatorLogError, CoordinatorParticipant, CoordinatorRecord,
-        LOG_HEADER_SIZE, MAX_COORDINATOR_PARTICIPANTS, RECORD_CHECKSUM_OFFSET, RECORD_HEADER_SIZE,
-        encode_record,
+        CompactionFailureStage, CoordinatorLog, CoordinatorLogError, CoordinatorParticipant,
+        CoordinatorRecord, LOG_HEADER_SIZE, MAX_COORDINATOR_PARTICIPANTS, RECORD_CHECKSUM_OFFSET,
+        RECORD_HEADER_SIZE, encode_header, encode_record,
     };
     use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId, TxnId};
 
@@ -1853,6 +2283,310 @@ mod tests {
         assert_eq!(log.pending_complete_count(), 0);
         assert!(log.last_checkpoint_error().is_none());
         assert_eq!(log.combined_pipeline_sync_count(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn completed_global_prefix_compacts_to_constant_checkpoint_and_continues() {
+        let path = path("compact-round-trip");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).expect("create compactable log");
+        log.enable_global_visibility().expect("enable global mode");
+        for id in 1..=25 {
+            let transaction = DatabaseTxnId(id);
+            let sequence = log
+                .sequenced_commit_decision(transaction, &participants(), None)
+                .expect("append decision");
+            log.defer_complete_sequenced(transaction, sequence)
+                .expect("append Complete");
+        }
+        let before = log.byte_len().expect("bytes before");
+        let report = log.compact().expect("compact history");
+        assert!(report.compacted);
+        assert_eq!(report.decisions_before, 25);
+        assert_eq!(report.decisions_after, 0);
+        assert_eq!(report.pending_completes_flushed, 1);
+        assert_eq!(report.checkpointed_through, DatabaseCommitSeq(25));
+        assert_eq!(report.database_txn_id_high_water, DatabaseTxnId(25));
+        assert!(before > report.bytes_after);
+        assert_eq!(report.bytes_after, 16 + 32 + 56);
+        assert_eq!(log.retained_decision_count(), 0);
+        assert_eq!(log.published_commit_seq(), DatabaseCommitSeq(25));
+        assert_eq!(
+            log.next_commit_seq().expect("next G"),
+            DatabaseCommitSeq(26)
+        );
+
+        let no_work = log.compact().expect("idempotent no-op");
+        assert!(!no_work.compacted);
+        assert_eq!(no_work.bytes_before, no_work.bytes_after);
+
+        let next = log
+            .sequenced_commit_decision(DatabaseTxnId(26), &participants(), None)
+            .expect("append post-checkpoint decision");
+        assert_eq!(next, DatabaseCommitSeq(26));
+        log.complete_sequenced(DatabaseTxnId(26), next)
+            .expect("complete post-checkpoint decision");
+        drop(log);
+
+        let reopened = CoordinatorLog::open(&path).expect("reopen checkpoint and tail");
+        assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(26));
+        assert_eq!(
+            reopened.next_commit_seq().expect("next G"),
+            DatabaseCommitSeq(27)
+        );
+        assert_eq!(reopened.database_txn_id_high_water(), DatabaseTxnId(26));
+        assert_eq!(reopened.retained_decision_count(), 1);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incomplete_and_legacy_histories_refuse_compaction() {
+        let legacy = path("compact-legacy");
+        let _ = std::fs::remove_file(&legacy);
+        let mut log = CoordinatorLog::create(&legacy).expect("create legacy log");
+        assert!(matches!(
+            log.compact(),
+            Err(CoordinatorLogError::CompactionRequiresGlobalVisibility)
+        ));
+        drop(log);
+        let _ = std::fs::remove_file(legacy);
+
+        let incomplete = path("compact-incomplete");
+        let _ = std::fs::remove_file(&incomplete);
+        let mut log = CoordinatorLog::create(&incomplete).expect("create global log");
+        log.enable_global_visibility().expect("enable global mode");
+        log.sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+            .expect("append incomplete decision");
+        assert!(matches!(
+            log.compact(),
+            Err(CoordinatorLogError::IncompleteDecisionBlocksCompaction)
+        ));
+        drop(log);
+        let _ = std::fs::remove_file(incomplete);
+    }
+
+    #[test]
+    fn checkpoint_corruption_and_sequence_regressions_fail_closed() {
+        let checkpoint = super::CoordinatorCheckpoint {
+            published_commit_seq: DatabaseCommitSeq(100),
+            last_sequenced_decision: DatabaseCommitSeq(100),
+            database_txn_id_high_water: DatabaseTxnId(100),
+        };
+        let enable = encode_record(DatabaseTxnId(0), CoordinatorRecord::GlobalEnable)
+            .expect("encode enable");
+        let record = encode_record(DatabaseTxnId(0), CoordinatorRecord::Checkpoint(checkpoint))
+            .expect("encode checkpoint");
+        for case in [
+            "bad-tag",
+            "bad-version",
+            "bad-checksum",
+            "truncated",
+            "reserved",
+            "before-enable",
+            "duplicate",
+            "published-mismatch",
+            "zero-high-water",
+            "old-decision",
+            "gap",
+            "unsequenced-after",
+        ] {
+            let path = path(&format!("checkpoint-{case}"));
+            let _ = std::fs::remove_file(&path);
+            let mut bytes = encode_header().to_vec();
+            if case != "before-enable" {
+                bytes.extend_from_slice(&enable);
+            }
+            let checkpoint_offset = bytes.len();
+            bytes.extend_from_slice(&record);
+            match case {
+                "bad-tag" => bytes[checkpoint_offset + 6] = 99,
+                "bad-version" => bytes[checkpoint_offset + 4..checkpoint_offset + 6]
+                    .copy_from_slice(&99_u16.to_le_bytes()),
+                "bad-checksum" => bytes[checkpoint_offset + 12] ^= 1,
+                "truncated" => {
+                    bytes.pop();
+                }
+                "reserved" => bytes[checkpoint_offset + 7] = 1,
+                "before-enable" => {}
+                "duplicate" => bytes.extend_from_slice(&record),
+                "published-mismatch" => {
+                    bytes[checkpoint_offset + RECORD_HEADER_SIZE + 8
+                        ..checkpoint_offset + RECORD_HEADER_SIZE + 16]
+                        .copy_from_slice(&99_u64.to_le_bytes());
+                    rewrite_record_checksum(&mut bytes, checkpoint_offset, record.len());
+                }
+                "zero-high-water" => {
+                    bytes[checkpoint_offset + RECORD_HEADER_SIZE + 16
+                        ..checkpoint_offset + RECORD_HEADER_SIZE + 24]
+                        .fill(0);
+                    rewrite_record_checksum(&mut bytes, checkpoint_offset, record.len());
+                }
+                "old-decision" | "gap" => {
+                    let sequence = if case == "old-decision" { 99 } else { 102 };
+                    bytes.extend_from_slice(
+                        &encode_record(
+                            DatabaseTxnId(101),
+                            CoordinatorRecord::SequencedCommit(
+                                DatabaseCommitSeq(sequence),
+                                &participants(),
+                            ),
+                        )
+                        .expect("encode malformed tail"),
+                    );
+                }
+                "unsequenced-after" => bytes.extend_from_slice(
+                    &encode_record(DatabaseTxnId(101), CoordinatorRecord::Complete)
+                        .expect("encode unsequenced tail"),
+                ),
+                _ => unreachable!(),
+            }
+            if matches!(case, "bad-tag" | "bad-version" | "reserved") {
+                rewrite_record_checksum(&mut bytes, checkpoint_offset, record.len());
+            }
+            std::fs::write(&path, bytes).expect("write malformed checkpoint");
+            assert!(CoordinatorLog::open(&path).is_err(), "case {case}");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn orphan_next_never_overrides_the_primary_authority() {
+        let path = path("orphan-next");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).expect("create primary");
+        log.enable_global_visibility().expect("enable global mode");
+        let sequence = log
+            .sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+            .expect("append primary decision");
+        log.complete_sequenced(DatabaseTxnId(1), sequence)
+            .expect("complete primary");
+        drop(log);
+
+        let mut next_name = path.as_os_str().to_owned();
+        next_name.push(".next");
+        let next = std::path::PathBuf::from(next_name);
+        let checkpoint = super::CoordinatorCheckpoint {
+            published_commit_seq: DatabaseCommitSeq(99),
+            last_sequenced_decision: DatabaseCommitSeq(99),
+            database_txn_id_high_water: DatabaseTxnId(99),
+        };
+        let mut bytes = encode_header().to_vec();
+        bytes.extend_from_slice(
+            &encode_record(DatabaseTxnId(0), CoordinatorRecord::GlobalEnable)
+                .expect("encode enable"),
+        );
+        bytes.extend_from_slice(
+            &encode_record(DatabaseTxnId(0), CoordinatorRecord::Checkpoint(checkpoint))
+                .expect("encode checkpoint"),
+        );
+        std::fs::write(&next, bytes).expect("write orphan next");
+        let reopened = CoordinatorLog::open(&path).expect("open primary only");
+        assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(1));
+        drop(reopened);
+        let mut primary = std::fs::read(&path).expect("read primary");
+        primary[12] ^= 1;
+        std::fs::write(&path, primary).expect("corrupt primary checksum");
+        assert!(
+            CoordinatorLog::open(&path).is_err(),
+            "valid orphan temp must not mask primary corruption"
+        );
+        let _ = std::fs::remove_file(next);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compaction_io_failures_preserve_or_fail_closed_on_authority() {
+        for stage in [
+            CompactionFailureStage::TempWrite,
+            CompactionFailureStage::TempSync,
+            CompactionFailureStage::Rename,
+        ] {
+            let path = path(&format!("compact-io-{stage:?}"));
+            let _ = std::fs::remove_file(&path);
+            let mut log = CoordinatorLog::create(&path).expect("create log");
+            log.enable_global_visibility().expect("enable global mode");
+            let sequence = log
+                .sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+                .expect("append decision");
+            log.complete_sequenced(DatabaseTxnId(1), sequence)
+                .expect("complete decision");
+            log.inject_compaction_failure(stage);
+            assert!(log.compact().is_err(), "stage {stage:?}");
+            assert_eq!(log.published_commit_seq(), DatabaseCommitSeq(1));
+            let next = log
+                .sequenced_commit_decision(DatabaseTxnId(2), &participants(), None)
+                .expect("old authority remains writable");
+            assert_eq!(next, DatabaseCommitSeq(2));
+            log.complete_sequenced(DatabaseTxnId(2), next)
+                .expect("complete on old authority");
+            drop(log);
+            let reopened = CoordinatorLog::open(&path).expect("reopen old authority");
+            assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(2));
+            drop(reopened);
+            let mut next_name = path.as_os_str().to_owned();
+            next_name.push(".next");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(next_name));
+            let _ = std::fs::remove_file(path);
+        }
+
+        for stage in [
+            CompactionFailureStage::DirectorySync,
+            CompactionFailureStage::Reopen,
+        ] {
+            let path = path(&format!("compact-uncertain-{stage:?}"));
+            let _ = std::fs::remove_file(&path);
+            let mut log = CoordinatorLog::create(&path).expect("create log");
+            log.enable_global_visibility().expect("enable global mode");
+            let sequence = log
+                .sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+                .expect("append decision");
+            log.complete_sequenced(DatabaseTxnId(1), sequence)
+                .expect("complete decision");
+            log.inject_compaction_failure(stage);
+            let error = log.compact().expect_err("publication-stage failure");
+            assert!(matches!(
+                error,
+                CoordinatorLogError::DirectorySyncUncertain(_)
+                    | CoordinatorLogError::AuthorityUnavailable
+            ));
+            assert!(matches!(
+                log.sequenced_commit_decision(DatabaseTxnId(2), &participants(), None),
+                Err(CoordinatorLogError::AuthorityUnavailable)
+            ));
+            drop(log);
+            let mut reopened = CoordinatorLog::open(&path).expect("reopen published checkpoint");
+            assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(1));
+            let next = reopened
+                .sequenced_commit_decision(DatabaseTxnId(2), &participants(), None)
+                .expect("continue after explicit reopen");
+            assert_eq!(next, DatabaseCommitSeq(2));
+            drop(reopened);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn pending_complete_sync_failure_prevents_rewrite() {
+        let path = path("compact-complete-sync");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).expect("create log");
+        log.enable_global_visibility().expect("enable global mode");
+        let sequence = log
+            .sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+            .expect("append decision");
+        log.defer_complete_sequenced(DatabaseTxnId(1), sequence)
+            .expect("defer Complete");
+        let bytes_before = log.byte_len().expect("old bytes");
+        log.inject_complete_sync_failure();
+        assert!(log.compact().is_err());
+        assert_eq!(log.retained_decision_count(), 1);
+        assert_eq!(log.byte_len().expect("unchanged authority"), bytes_before);
+        log.flush_complete_checkpoints()
+            .expect("retry Complete synchronization");
+        assert!(log.compact().expect("retry compaction").compacted);
+        drop(log);
         let _ = std::fs::remove_file(path);
     }
 }

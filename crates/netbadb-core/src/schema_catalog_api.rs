@@ -1031,11 +1031,9 @@ pub(crate) fn recover_physical(
                     &[],
                     config.retired_storage_ids(),
                 )?;
-                let next = decisions
-                    .iter()
-                    .map(|d| d.database_txn_id.0)
-                    .max()
-                    .unwrap_or(0)
+                let next = log
+                    .database_txn_id_high_water()
+                    .0
                     .checked_add(1)
                     .ok_or(crate::CoordinatorError::TransactionIdExhausted)?;
                 Ok::<_, DatabaseError>((log, netbadb_types::DatabaseTxnId(next)))

@@ -189,7 +189,25 @@ pub struct DatabaseVisibilityInspection {
     pub checkpoint_sync_count: u64,
     pub combined_pipeline_sync_count: u64,
     pub coordinator_bytes: u64,
+    pub checkpointed_through: Option<DatabaseCommitSeq>,
+    pub retained_decision_count: usize,
+    pub compaction_possible: bool,
     pub boundaries: Vec<VisibilityBoundaryInspection>,
+}
+
+/// Result of one explicit, synchronous coordinator-history compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorCompactionReport {
+    pub checkpointed_through: DatabaseCommitSeq,
+    pub database_txn_id_high_water: DatabaseTxnId,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub bytes_reclaimed: u64,
+    pub decisions_before: usize,
+    pub decisions_after: usize,
+    pub decisions_compacted: usize,
+    pub pending_completes_flushed: usize,
+    pub compacted: bool,
 }
 
 impl DatabaseCoordinatorConfig {
@@ -590,6 +608,12 @@ pub enum DatabaseError {
         storage_id: StorageId,
         physical_txn_id: TxnId,
     },
+    CompactedPreparedParticipant {
+        database_txn_id: DatabaseTxnId,
+        storage_id: StorageId,
+        physical_txn_id: TxnId,
+        checkpoint_high_water: DatabaseTxnId,
+    },
     InspectionStorageMissing {
         table_id: TableId,
     },
@@ -752,6 +776,7 @@ impl DatabaseError {
             | Self::EmptyCatalog
             | Self::MissingCommitParticipant { .. }
             | Self::PreparedParticipantMismatch { .. }
+            | Self::CompactedPreparedParticipant { .. }
             | Self::InspectionStorageMissing { .. }
             | Self::InspectionIndexColumnMissing { .. }
             | Self::InspectionRegistrationOrderOverflow { .. }
@@ -825,6 +850,16 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "storage {} physical transaction {} is inconsistent with database transaction {} commit decision",
                 storage_id.0, physical_txn_id.0, database_txn_id.0
+            ),
+            Self::CompactedPreparedParticipant {
+                database_txn_id,
+                storage_id,
+                physical_txn_id,
+                checkpoint_high_water,
+            } => write!(
+                formatter,
+                "storage {} physical transaction {} remains prepared for database transaction {}, but checkpoint high-water {} proves its individual decision was already compacted",
+                storage_id.0, physical_txn_id.0, database_txn_id.0, checkpoint_high_water.0
             ),
             Self::InspectionStorageMissing { table_id } => write!(
                 formatter,
@@ -920,6 +955,7 @@ impl Error for DatabaseError {
             | Self::CoordinatorPathConflictsWithStorage(_)
             | Self::MissingCommitParticipant { .. }
             | Self::PreparedParticipantMismatch { .. }
+            | Self::CompactedPreparedParticipant { .. }
             | Self::InspectionStorageMissing { .. }
             | Self::InspectionIndexColumnMissing { .. }
             | Self::InspectionRegistrationOrderOverflow { .. } => None,
@@ -1105,6 +1141,9 @@ impl Database {
                 checkpoint_sync_count: 0,
                 combined_pipeline_sync_count: 0,
                 coordinator_bytes: 0,
+                checkpointed_through: None,
+                retained_decision_count: 0,
+                compaction_possible: false,
                 boundaries: Vec::new(),
             });
         };
@@ -1115,6 +1154,14 @@ impl Database {
             .try_borrow()
             .map_err(|_| CoordinatorError::CoordinatorBusy)?;
         let next_commit_seq = coordinator.next_commit_seq()?;
+        let outstanding = Rc::strong_count(&self.transaction_owner).saturating_sub(1);
+        let structural_history = coordinator
+            .decisions()
+            .any(|decision| decision.schema.is_some());
+        let storages_ready = self
+            .registry
+            .iter()
+            .all(|entry| entry.storage.ensure_recovery_ready().is_ok());
         Ok(DatabaseVisibilityInspection {
             mode: DatabaseVisibilityMode::Global,
             published_commit_seq: Some(snapshot.commit_seq()),
@@ -1128,6 +1175,14 @@ impl Database {
             checkpoint_sync_count: coordinator.checkpoint_sync_count(),
             combined_pipeline_sync_count: coordinator.combined_pipeline_sync_count(),
             coordinator_bytes: coordinator.byte_len()?,
+            checkpointed_through: coordinator
+                .checkpoint()
+                .map(|checkpoint| checkpoint.published_commit_seq),
+            retained_decision_count: coordinator.retained_decision_count(),
+            compaction_possible: outstanding == 0
+                && !structural_history
+                && storages_ready
+                && coordinator.compaction_possible(),
             boundaries: snapshot
                 .boundaries()
                 .iter()
@@ -1163,6 +1218,62 @@ impl Database {
             snapshot: DatabaseSnapshot::new(DatabaseCommitSeq(0), boundaries)?,
         })));
         Ok(())
+    }
+
+    /// Explicitly replaces a fully completed global coordinator history with
+    /// one durable checkpoint. This never creates a transaction or commit
+    /// sequence and never changes the published visibility vector.
+    pub fn compact_coordinator_log(
+        &mut self,
+    ) -> Result<CoordinatorCompactionReport, DatabaseError> {
+        if self.visibility_mode() != DatabaseVisibilityMode::Global {
+            return Err(CoordinatorError::CoordinatorCompactionRequiresGlobalVisibility.into());
+        }
+        let outstanding = Rc::strong_count(&self.transaction_owner).saturating_sub(1);
+        if outstanding != 0 {
+            return Err(
+                CoordinatorError::CoordinatorCompactionRequiresQuiescence { outstanding }.into(),
+            );
+        }
+        self.ensure_schema_available(None)?;
+        for entry in self.registry.iter() {
+            entry.storage.ensure_recovery_ready()?;
+        }
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::DurableCoordinatorRequired)?;
+        let mut coordinator = coordinator
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?;
+        if coordinator
+            .decisions()
+            .any(|decision| decision.schema.is_some())
+        {
+            return Err(CoordinatorError::CoordinatorCompactionStructuralHistoryRequired.into());
+        }
+        let report = coordinator.compact()?;
+        let next_transaction_id = report
+            .database_txn_id_high_water
+            .0
+            .checked_add(1)
+            .map(DatabaseTxnId)
+            .ok_or(CoordinatorError::TransactionIdExhausted)?;
+        self.next_transaction_id = self.next_transaction_id.max(next_transaction_id);
+        Ok(CoordinatorCompactionReport {
+            checkpointed_through: report.checkpointed_through,
+            database_txn_id_high_water: report.database_txn_id_high_water,
+            bytes_before: report.bytes_before,
+            bytes_after: report.bytes_after,
+            bytes_reclaimed: report.bytes_before.saturating_sub(report.bytes_after),
+            decisions_before: report.decisions_before,
+            decisions_after: report.decisions_after,
+            decisions_compacted: report
+                .decisions_before
+                .saturating_sub(report.decisions_after),
+            pending_completes_flushed: report.pending_completes_flushed,
+            compacted: report.compacted,
+        })
     }
 
     fn configure_managed_projection_catalog(&mut self, incarnation: [u8; 16]) {
@@ -1344,21 +1455,23 @@ impl Database {
         }
         validate_generic_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
 
-        let mut maximum_database_txn_id = decisions
-            .iter()
-            .map(|decision| decision.database_txn_id.0)
-            .max()
-            .unwrap_or(0);
+        let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
+        let checkpoint_high_water = coordinator
+            .checkpoint()
+            .map(|checkpoint| checkpoint.database_txn_id_high_water);
         let mut storages = Vec::with_capacity(specs.len());
         for (spec, inspected_storage) in specs.into_iter().zip(&inspected) {
             let mut resolutions = Vec::new();
             for prepared in &inspected_storage.recovery.prepared_transactions {
                 maximum_database_txn_id = maximum_database_txn_id.max(prepared.database_txn_id.0);
-                resolutions.push(resolution_for_prepared(
+                if let Some(resolution) = resolution_for_recovery_prepared(
                     prepared,
                     inspected_storage.recovery.storage_id,
                     &decisions,
-                )?);
+                    checkpoint_high_water,
+                )? {
+                    resolutions.push(resolution);
+                }
             }
             storages.push(match spec {
                 TableStorageOpenSpec::Heap { path, table } => {
@@ -1516,47 +1629,23 @@ impl Database {
         }
         validate_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
 
-        let mut maximum_database_txn_id = decisions
-            .iter()
-            .map(|decision| decision.database_txn_id.0)
-            .max()
-            .unwrap_or(0);
+        let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
+        let checkpoint_high_water = coordinator
+            .checkpoint()
+            .map(|checkpoint| checkpoint.database_txn_id_high_water);
         let mut storages = Vec::with_capacity(inspected.len());
         for storage in inspected {
             let mut resolutions = Vec::new();
             for prepared in &storage.recovery.prepared_transactions {
                 maximum_database_txn_id = maximum_database_txn_id.max(prepared.database_txn_id.0);
-                let decision = decisions
-                    .iter()
-                    .find(|decision| decision.database_txn_id == prepared.database_txn_id);
-                let resolution = if let Some(decision) = decision {
-                    let participant_matches = decision.participants.iter().any(|participant| {
-                        participant.storage_id == storage.recovery.storage_id
-                            && participant.physical_txn_id == prepared.physical_txn_id
-                    });
-                    if !participant_matches {
-                        return Err(DatabaseError::PreparedParticipantMismatch {
-                            database_txn_id: prepared.database_txn_id,
-                            storage_id: storage.recovery.storage_id,
-                            physical_txn_id: prepared.physical_txn_id,
-                        });
-                    }
-                    if prepared.state == PreparedTransactionState::RolledBack {
-                        return Err(DatabaseError::PreparedParticipantMismatch {
-                            database_txn_id: prepared.database_txn_id,
-                            storage_id: storage.recovery.storage_id,
-                            physical_txn_id: prepared.physical_txn_id,
-                        });
-                    }
-                    PreparedDecision::Commit
-                } else {
-                    PreparedDecision::Abort
-                };
-                resolutions.push(PreparedTxnResolution {
-                    database_txn_id: prepared.database_txn_id,
-                    physical_txn_id: prepared.physical_txn_id,
-                    decision: resolution,
-                });
+                if let Some(resolution) = resolution_for_recovery_prepared(
+                    prepared,
+                    storage.recovery.storage_id,
+                    &decisions,
+                    checkpoint_high_water,
+                )? {
+                    resolutions.push(resolution);
+                }
             }
             storages.push(TableStorage::open_heap_with_prepared_resolutions(
                 storage.path,
@@ -1753,40 +1842,23 @@ impl Database {
         validate_catalog_storage_set(&catalog, &inspected)?;
         validate_coordinator_recovery(&decisions, &inspected, &[])?;
 
-        let mut maximum_database_txn_id = decisions
-            .iter()
-            .map(|decision| decision.database_txn_id.0)
-            .max()
-            .unwrap_or(0);
+        let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
+        let checkpoint_high_water = coordinator
+            .checkpoint()
+            .map(|checkpoint| checkpoint.database_txn_id_high_water);
         let mut storages = Vec::with_capacity(inspected.len());
         for storage in inspected {
             let mut resolutions = Vec::new();
             for prepared in &storage.recovery.prepared_transactions {
                 maximum_database_txn_id = maximum_database_txn_id.max(prepared.database_txn_id.0);
-                let decision = decisions
-                    .iter()
-                    .find(|decision| decision.database_txn_id == prepared.database_txn_id);
-                let resolution = if let Some(decision) = decision {
-                    if !decision.participants.iter().any(|participant| {
-                        participant.storage_id == storage.recovery.storage_id
-                            && participant.physical_txn_id == prepared.physical_txn_id
-                    }) || prepared.state == PreparedTransactionState::RolledBack
-                    {
-                        return Err(DatabaseError::PreparedParticipantMismatch {
-                            database_txn_id: prepared.database_txn_id,
-                            storage_id: storage.recovery.storage_id,
-                            physical_txn_id: prepared.physical_txn_id,
-                        });
-                    }
-                    PreparedDecision::Commit
-                } else {
-                    PreparedDecision::Abort
-                };
-                resolutions.push(PreparedTxnResolution {
-                    database_txn_id: prepared.database_txn_id,
-                    physical_txn_id: prepared.physical_txn_id,
-                    decision: resolution,
-                });
+                if let Some(resolution) = resolution_for_recovery_prepared(
+                    prepared,
+                    storage.recovery.storage_id,
+                    &decisions,
+                    checkpoint_high_water,
+                )? {
+                    resolutions.push(resolution);
+                }
             }
             storages.push(TableStorage::open_heap_with_prepared_resolutions(
                 storage.path,
@@ -5442,6 +5514,87 @@ fn resolution_for_prepared(
         physical_txn_id: prepared.physical_txn_id,
         decision: resolution,
     })
+}
+
+fn resolution_for_recovery_prepared(
+    prepared: &PreparedTransaction,
+    storage_id: StorageId,
+    decisions: &[CoordinatorDecision],
+    checkpoint_high_water: Option<DatabaseTxnId>,
+) -> Result<Option<PreparedTxnResolution>, DatabaseError> {
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.database_txn_id == prepared.database_txn_id);
+    if prepared.state == PreparedTransactionState::RolledBack {
+        if decision.is_some() {
+            return Err(DatabaseError::PreparedParticipantMismatch {
+                database_txn_id: prepared.database_txn_id,
+                storage_id,
+                physical_txn_id: prepared.physical_txn_id,
+            });
+        }
+        return Ok(Some(PreparedTxnResolution {
+            database_txn_id: prepared.database_txn_id,
+            physical_txn_id: prepared.physical_txn_id,
+            decision: PreparedDecision::Abort,
+        }));
+    }
+    if prepared.state == PreparedTransactionState::Committed {
+        if let Some(decision) = decision {
+            if !decision.participants.iter().any(|participant| {
+                participant.storage_id == storage_id
+                    && participant.physical_txn_id == prepared.physical_txn_id
+            }) {
+                return Err(DatabaseError::PreparedParticipantMismatch {
+                    database_txn_id: prepared.database_txn_id,
+                    storage_id,
+                    physical_txn_id: prepared.physical_txn_id,
+                });
+            }
+            return Ok(None);
+        }
+        // A checkpoint proves every transaction through its high-water was
+        // resolved before the individual decision was removed. Without that
+        // proof, retain presumed-abort conflict detection for a committed WAL.
+        if checkpoint_high_water.is_some_and(|high_water| prepared.database_txn_id <= high_water) {
+            return Ok(None);
+        }
+        return Ok(Some(PreparedTxnResolution {
+            database_txn_id: prepared.database_txn_id,
+            physical_txn_id: prepared.physical_txn_id,
+            decision: PreparedDecision::Abort,
+        }));
+    }
+    let resolution = if let Some(decision) = decision {
+        if !decision.participants.iter().any(|participant| {
+            participant.storage_id == storage_id
+                && participant.physical_txn_id == prepared.physical_txn_id
+        }) {
+            return Err(DatabaseError::PreparedParticipantMismatch {
+                database_txn_id: prepared.database_txn_id,
+                storage_id,
+                physical_txn_id: prepared.physical_txn_id,
+            });
+        }
+        PreparedDecision::Commit
+    } else {
+        if let Some(high_water) = checkpoint_high_water {
+            if prepared.database_txn_id <= high_water {
+                return Err(DatabaseError::CompactedPreparedParticipant {
+                    database_txn_id: prepared.database_txn_id,
+                    storage_id,
+                    physical_txn_id: prepared.physical_txn_id,
+                    checkpoint_high_water: high_water,
+                });
+            }
+        }
+        PreparedDecision::Abort
+    };
+    Ok(Some(PreparedTxnResolution {
+        database_txn_id: prepared.database_txn_id,
+        physical_txn_id: prepared.physical_txn_id,
+        decision: resolution,
+    }))
 }
 
 fn validate_generic_coordinator_recovery(
@@ -9700,6 +9853,8 @@ mod tests {
 mod adopted_source_refinement_expansion_audit_tests;
 #[cfg(test)]
 mod change_stream_schema_replacement_audit_tests;
+#[cfg(test)]
+mod coordinator_compaction_tests;
 #[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]

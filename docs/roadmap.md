@@ -1,5 +1,24 @@
 # NetbaDB roadmap
 
+## Coordinator checkpoint and log compaction (Phase 3B.5 complete)
+
+- added explicit synchronous `Database::compact_coordinator_log()` for a
+  quiescent Global database; no close, commit, timer, background worker, or
+  maintenance action invokes it automatically;
+- added a checksummed CORD v4 checkpoint while retaining the NBCO v1 header,
+  explicit GlobalEnable record, and full CORD v1/v2/v3 read compatibility;
+- retained published/last G and the `DatabaseTxnId` high-water, rebuilt the
+  latest visibility vector from authoritative storage, and kept only the
+  post-checkpoint decision tail in memory;
+- atomically publishes `NBCO.next` through write, file sync, old-handle
+  release, rename, parent-directory sync, reopen, and in-memory replacement;
+  an orphan `.next` is never recovery authority;
+- conservatively rejects incomplete/prepared work and any retained structural
+  decision whose schema/journal recovery evidence cannot yet be summarized.
+
+See
+[`phase3b5-coordinator-compaction.md`](phase3b5-coordinator-compaction.md).
+
 ## Indexed shadow-column swap audit (Round 57 complete; production deferred)
 
 - selected terminal logical index evacuation: an effective same-table DROP in

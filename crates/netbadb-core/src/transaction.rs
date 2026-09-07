@@ -1413,6 +1413,11 @@ pub enum CoordinatorError {
     GlobalEnableRequiresQuiescence {
         outstanding: usize,
     },
+    CoordinatorCompactionRequiresGlobalVisibility,
+    CoordinatorCompactionRequiresQuiescence {
+        outstanding: usize,
+    },
+    CoordinatorCompactionStructuralHistoryRequired,
     SnapshotMissingStorage {
         storage_id: StorageId,
     },
@@ -1481,6 +1486,16 @@ impl fmt::Display for CoordinatorError {
                 formatter,
                 "database-global visibility requires quiescence but {outstanding} database transaction handle(s) are outstanding"
             ),
+            Self::CoordinatorCompactionRequiresGlobalVisibility => {
+                formatter.write_str("coordinator compaction requires database-global visibility")
+            }
+            Self::CoordinatorCompactionRequiresQuiescence { outstanding } => write!(
+                formatter,
+                "coordinator compaction requires quiescence but {outstanding} database transaction handle(s) are outstanding"
+            ),
+            Self::CoordinatorCompactionStructuralHistoryRequired => formatter.write_str(
+                "completed structural coordinator evidence blocks first-version compaction",
+            ),
             Self::SnapshotMissingStorage { storage_id } => write!(
                 formatter,
                 "database snapshot has no boundary for physical storage {}",
@@ -1543,6 +1558,9 @@ impl Error for CoordinatorError {
             | Self::PublishedVisibilityBusy
             | Self::GlobalVisibilityNotEnabled
             | Self::GlobalEnableRequiresQuiescence { .. }
+            | Self::CoordinatorCompactionRequiresGlobalVisibility
+            | Self::CoordinatorCompactionRequiresQuiescence { .. }
+            | Self::CoordinatorCompactionStructuralHistoryRequired
             | Self::SnapshotMissingStorage { .. }
             | Self::DuplicateSnapshotStorage { .. }
             | Self::CommitAlreadyDecided { .. }

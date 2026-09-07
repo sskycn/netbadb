@@ -63,5 +63,9 @@ harness = false
 name = "global_commit_pipeline_phase3b"
 harness = false
 
+[[bench]]
+name = "coordinator_compaction_phase3b5"
+harness = false
+
 [lints]
 workspace = true

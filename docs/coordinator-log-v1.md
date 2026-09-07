@@ -2,8 +2,9 @@
 
 CoordinatorLog is the independent database-level durability object used only
 by explicitly coordinator-enabled local databases. It is not stored in a Heap
-participant WAL. All integers are unsigned little-endian. The log is
-append-only in v1 and has no GC/checkpoint.
+participant WAL. All integers are unsigned little-endian. Normal operation is
+append-only. Phase 3B.5 adds an explicit rewrite into a bounded checkpoint
+representation without changing the NBCO v1 file header.
 
 Round 38 startup may resolve a schema winner absent from the old active NBSC
 only through exact typed NBSJ stage/final authority and an exact CORD StorageId
@@ -154,3 +155,46 @@ during recovery. Fully present checksum-invalid records remain hard errors.
 Schema, composition, backfill, replacement, index, and catalog transactions
 retain immediate Complete synchronization before structural publication. See
 [Phase 3B global commit sync pipeline](phase3b-global-commit-pipeline.md).
+
+## Phase 3B.5 coordinator checkpoint (CORD v4)
+
+CORD **record version 4, tag 8** is `CoordinatorCheckpoint`. Its record header
+has transaction ID zero, participant count zero, and the existing reserved and
+CRC32C rules. Its fixed 24-byte payload contains three little-endian u64 values:
+
+| Width | Meaning |
+| ---: | --- |
+| 8 | nonzero published `DatabaseCommitSeq` |
+| 8 | nonzero last sequenced decision; equal to published G in this version |
+| 8 | nonzero `DatabaseTxnId` high-water |
+
+A checkpoint is legal only after one explicit CORD v3 `GlobalEnable`, before
+all tail decisions, and at most once per file. A following sequenced decision
+must be exactly checkpoint G + 1 and must use a `DatabaseTxnId` above the
+checkpoint high-water. Unsequenced records, duplicate checkpoints, malformed
+high-waters, gaps, checksum failures, and truncated checkpoint records are hard
+errors. A checkpoint is not treated as a truncatable append tail.
+
+The compacted file is exactly `NBCO header + GlobalEnable + checkpoint`.
+Opening old files does not rewrite them. Opening a checkpointed file rebuilds
+published G and next G from the checkpoint, keeps only post-checkpoint
+decisions in the runtime map, and rebuilds the current visibility vector from
+authoritative Heap/LSM boundaries. Terminal physical participants carry their
+own durable outcome; only an actually Prepared participant requires an exact
+tail decision. A Prepared participant at or below the compacted transaction
+high-water is a fail-closed inconsistency.
+
+Explicit compaction writes and synchronizes `<coordinator>.next`, releases the
+old long-lived file handle, replaces the primary path, synchronizes the parent
+directory, reopens and validates the new primary, then replaces in-memory
+state. The primary path is always the sole recovery authority. An orphan
+`.next` is ignored, including when the primary is corrupt. Failures before
+replacement leave the old authority usable; uncertainty after replacement
+leaves the live coordinator handle unavailable so global writes fail closed
+until an explicit reopen.
+
+The first version compacts only a fully completed data-only prefix through the
+current published frontier. LegacyLocal mode, outstanding transaction handles,
+unresolved storage recovery, and any retained schema/structural decision reject
+the operation. This conservative structural rule preserves NBSJ/NBSC recovery
+and retired-resource evidence without pretending the checkpoint contains it.
