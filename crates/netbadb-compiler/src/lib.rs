@@ -151,6 +151,7 @@ impl CompileError {
                 | HirError::TypeMismatch { .. }
                 | HirError::IncompatibleComparison { .. }
                 | HirError::CannotInferNullType { .. }
+                | HirError::InvalidLiteral { .. }
                 | HirError::ParameterTypeConflict { .. }
                 | HirError::ValueCountMismatch { .. }
                 | HirError::InsertValueReferencesColumn { .. }

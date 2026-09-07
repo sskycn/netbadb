@@ -8,9 +8,20 @@ fn typed_declaration_is_unnamed_and_preserves_source_order() {
         ("BIGINT", PhysicalType::Int64),
         ("INT64", PhysicalType::Int64),
         ("INT8", PhysicalType::Int64),
+        ("TINYINT", PhysicalType::Int8),
+        ("SMALLINT", PhysicalType::Int16),
+        ("INTEGER", PhysicalType::Int32),
+        ("INT128", PhysicalType::Int128),
+        ("UINT8", PhysicalType::UInt8),
+        ("UINT16", PhysicalType::UInt16),
+        ("UINT32", PhysicalType::UInt32),
         ("TEXT", PhysicalType::Text),
         ("VARCHAR", PhysicalType::Text),
         ("UINT64", PhysicalType::UInt64),
+        ("UINT128", PhysicalType::UInt128),
+        ("REAL", PhysicalType::Float32),
+        ("DOUBLE", PhysicalType::Float64),
+        ("BYTEA", PhysicalType::Bytes),
     ] {
         let sql = format!("CREATE TABLE t (id {name} NOT NULL, next {name}, ending {name} NULL)");
         let AstStatement::CreateTable(ast) = netbadb_parser::parse_statement(&sql).unwrap() else {
@@ -37,11 +48,10 @@ fn typed_declaration_is_unnamed_and_preserves_source_order() {
 }
 
 #[test]
-fn duplicate_unknown_and_known_unsupported_types_have_precise_positions() {
+fn duplicate_and_unknown_types_have_precise_positions() {
     for (sql, expected) in [
         ("CREATE TABLE t (a TEXT, a BIGINT)", "a"),
         ("CREATE TABLE t (a MAGIC_TYPE)", "MAGIC_TYPE"),
-        ("CREATE TABLE t (a INTEGER)", "INTEGER"),
     ] {
         let AstStatement::CreateTable(ast) = netbadb_parser::parse_statement(sql).unwrap() else {
             panic!()
@@ -52,21 +62,17 @@ fn duplicate_unknown_and_known_unsupported_types_have_precise_positions() {
         match expected {
             "a" => assert!(matches!(error, HirError::DuplicateColumn { .. })),
             "MAGIC_TYPE" => assert!(matches!(error, HirError::UnknownType { .. })),
-            _ => assert!(matches!(error, HirError::UnsupportedType { .. })),
+            _ => unreachable!(),
         }
     }
     for name in [
-        "SMALLINT",
-        "INTEGER",
         "NUMERIC",
         "DECIMAL",
         "FLOAT",
-        "DOUBLE",
         "DATE",
         "TIMESTAMP",
         "JSON",
         "UUID",
-        "BYTEA",
         "ARRAY",
         "SERIAL",
         "BIGSERIAL",

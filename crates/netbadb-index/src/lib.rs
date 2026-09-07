@@ -14,8 +14,8 @@ pub use retired::{
 };
 
 use netbadb_types::{
-    ColumnId, IndexId, IndexName, PageGeneration, PageId, PageRef, PhysicalType, RowId,
-    ScalarValue, SemanticType,
+    ColumnId, Float32Value, Float64Value, IndexId, IndexName, PageGeneration, PageId, PageRef,
+    PhysicalType, RowId, ScalarValue, SemanticType,
 };
 
 pub const BTREE_FORMAT_VERSION: u16 = 3;
@@ -752,16 +752,8 @@ pub fn compare_row_ids(left: RowId, right: RowId) -> Ordering {
 
 /// Compares index values with NULL first and native typed value ordering.
 pub fn compare_values(left: &ScalarValue, right: &ScalarValue) -> Ordering {
-    match (left, right) {
-        (ScalarValue::Null, ScalarValue::Null) => Ordering::Equal,
-        (ScalarValue::Null, _) => Ordering::Less,
-        (_, ScalarValue::Null) => Ordering::Greater,
-        (ScalarValue::Bool(left), ScalarValue::Bool(right)) => left.cmp(right),
-        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => left.cmp(right),
-        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => left.cmp(right),
-        (ScalarValue::Text(left), ScalarValue::Text(right)) => left.cmp(right),
-        (left, right) => value_rank(left).cmp(&value_rank(right)),
-    }
+    left.database_cmp(right)
+        .unwrap_or_else(|| value_rank(left).cmp(&value_rank(right)))
 }
 
 /// Compares complete entry identities by key and then explicit RowId order.
@@ -2133,6 +2125,50 @@ fn encode_entry(output: &mut Vec<u8>, entry: &IndexEntry) -> Result<(), IndexErr
             output.push(4);
             push_text(output, value)?;
         }
+        ScalarValue::Int8(value) => {
+            output.push(5);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Int16(value) => {
+            output.push(6);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Int32(value) => {
+            output.push(7);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Int128(value) => {
+            output.push(8);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt8(value) => {
+            output.push(9);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt16(value) => {
+            output.push(10);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt32(value) => {
+            output.push(11);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt128(value) => {
+            output.push(12);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Float32(value) => {
+            output.push(13);
+            output.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        ScalarValue::Float64(value) => {
+            output.push(14);
+            output.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        ScalarValue::Bytes(value) => {
+            output.push(15);
+            push_bytes(output, value)?;
+        }
     }
     output.extend_from_slice(&entry.row_id.page.0.to_le_bytes());
     output.extend_from_slice(&entry.row_id.slot.to_le_bytes());
@@ -2144,8 +2180,15 @@ fn encoded_key_len(key: &ScalarValue) -> Result<usize, IndexError> {
     Ok(match key {
         ScalarValue::Null => 1,
         ScalarValue::Bool(_) => 2,
-        ScalarValue::Int64(_) | ScalarValue::UInt64(_) => 9,
+        ScalarValue::Int8(_) | ScalarValue::UInt8(_) => 2,
+        ScalarValue::Int16(_) | ScalarValue::UInt16(_) => 3,
+        ScalarValue::Int32(_) | ScalarValue::UInt32(_) | ScalarValue::Float32(_) => 5,
+        ScalarValue::Int64(_) | ScalarValue::UInt64(_) | ScalarValue::Float64(_) => 9,
+        ScalarValue::Int128(_) | ScalarValue::UInt128(_) => 17,
         ScalarValue::Text(value) => 5_usize
+            .checked_add(value.len())
+            .ok_or(IndexError::LengthOverflow)?,
+        ScalarValue::Bytes(value) => 5_usize
             .checked_add(value.len())
             .ok_or(IndexError::LengthOverflow)?,
     })
@@ -2171,12 +2214,30 @@ fn push_text(output: &mut Vec<u8>, value: &str) -> Result<(), IndexError> {
     Ok(())
 }
 
+fn push_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), IndexError> {
+    let length = u32::try_from(value.len()).map_err(|_| IndexError::LengthOverflow)?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
 const fn physical_type_tag(value: PhysicalType) -> u8 {
     match value {
         PhysicalType::Bool => 1,
         PhysicalType::Int64 => 2,
         PhysicalType::UInt64 => 3,
         PhysicalType::Text => 4,
+        PhysicalType::Int8 => 5,
+        PhysicalType::Int16 => 6,
+        PhysicalType::Int32 => 7,
+        PhysicalType::Int128 => 8,
+        PhysicalType::UInt8 => 9,
+        PhysicalType::UInt16 => 10,
+        PhysicalType::UInt32 => 11,
+        PhysicalType::UInt128 => 12,
+        PhysicalType::Float32 => 13,
+        PhysicalType::Float64 => 14,
+        PhysicalType::Bytes => 15,
     }
 }
 
@@ -2186,6 +2247,17 @@ fn physical_type_from_tag(tag: u8) -> Result<PhysicalType, IndexError> {
         2 => Ok(PhysicalType::Int64),
         3 => Ok(PhysicalType::UInt64),
         4 => Ok(PhysicalType::Text),
+        5 => Ok(PhysicalType::Int8),
+        6 => Ok(PhysicalType::Int16),
+        7 => Ok(PhysicalType::Int32),
+        8 => Ok(PhysicalType::Int128),
+        9 => Ok(PhysicalType::UInt8),
+        10 => Ok(PhysicalType::UInt16),
+        11 => Ok(PhysicalType::UInt32),
+        12 => Ok(PhysicalType::UInt128),
+        13 => Ok(PhysicalType::Float32),
+        14 => Ok(PhysicalType::Float64),
+        15 => Ok(PhysicalType::Bytes),
         other => Err(IndexError::InvalidPhysicalType(other)),
     }
 }
@@ -2197,6 +2269,17 @@ const fn value_rank(value: &ScalarValue) -> u8 {
         ScalarValue::Int64(_) => 2,
         ScalarValue::UInt64(_) => 3,
         ScalarValue::Text(_) => 4,
+        ScalarValue::Int8(_) => 5,
+        ScalarValue::Int16(_) => 6,
+        ScalarValue::Int32(_) => 7,
+        ScalarValue::Int128(_) => 8,
+        ScalarValue::UInt8(_) => 9,
+        ScalarValue::UInt16(_) => 10,
+        ScalarValue::UInt32(_) => 11,
+        ScalarValue::UInt128(_) => 12,
+        ScalarValue::Float32(_) => 13,
+        ScalarValue::Float64(_) => 14,
+        ScalarValue::Bytes(_) => 15,
     }
 }
 
@@ -2299,6 +2382,17 @@ impl<'a> Decoder<'a> {
             2 => ScalarValue::Int64(i64::from_le_bytes(self.array()?)),
             3 => ScalarValue::UInt64(u64::from_le_bytes(self.array()?)),
             4 => ScalarValue::Text(self.text()?),
+            5 => ScalarValue::Int8(i8::from_le_bytes(self.array()?)),
+            6 => ScalarValue::Int16(i16::from_le_bytes(self.array()?)),
+            7 => ScalarValue::Int32(i32::from_le_bytes(self.array()?)),
+            8 => ScalarValue::Int128(i128::from_le_bytes(self.array()?)),
+            9 => ScalarValue::UInt8(self.u8()?),
+            10 => ScalarValue::UInt16(self.u16()?),
+            11 => ScalarValue::UInt32(self.u32()?),
+            12 => ScalarValue::UInt128(u128::from_le_bytes(self.array()?)),
+            13 => ScalarValue::Float32(Float32Value::from_bits(self.u32()?)),
+            14 => ScalarValue::Float64(Float64Value::from_bits(self.u64()?)),
+            15 => ScalarValue::Bytes(self.bytes()?),
             other => return Err(IndexError::InvalidValueTag(other)),
         };
         spec.validate_key(&key)?;
@@ -2325,6 +2419,20 @@ impl<'a> Decoder<'a> {
         std::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_| IndexError::InvalidUtf8)
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, IndexError> {
+        let length = self.u32()? as usize;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(IndexError::LengthOverflow)?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or(IndexError::Truncated)?;
+        self.offset = end;
+        Ok(bytes.to_vec())
     }
 
     fn u8(&mut self) -> Result<u8, IndexError> {
@@ -2464,9 +2572,26 @@ mod tests {
     fn leaf_codec_round_trips_every_supported_scalar_key() {
         for (physical, key) in [
             (PhysicalType::Bool, ScalarValue::Bool(true)),
+            (PhysicalType::Int8, ScalarValue::Int8(i8::MIN)),
+            (PhysicalType::Int16, ScalarValue::Int16(i16::MAX)),
+            (PhysicalType::Int32, ScalarValue::Int32(i32::MIN)),
             (PhysicalType::Int64, ScalarValue::Int64(-42)),
+            (PhysicalType::Int128, ScalarValue::Int128(i128::MAX)),
+            (PhysicalType::UInt8, ScalarValue::UInt8(u8::MAX)),
+            (PhysicalType::UInt16, ScalarValue::UInt16(u16::MAX)),
+            (PhysicalType::UInt32, ScalarValue::UInt32(u32::MAX)),
             (PhysicalType::UInt64, ScalarValue::UInt64(42)),
+            (PhysicalType::UInt128, ScalarValue::UInt128(u128::MAX)),
+            (
+                PhysicalType::Float32,
+                ScalarValue::Float32(Float32Value::from_bits(0xffff_ffff)),
+            ),
+            (
+                PhysicalType::Float64,
+                ScalarValue::Float64(Float64Value::new(f64::INFINITY)),
+            ),
             (PhysicalType::Text, ScalarValue::Text("用户".into())),
+            (PhysicalType::Bytes, ScalarValue::Bytes(vec![0, 0xff, 0x80])),
         ] {
             let spec = spec(physical, false);
             let leaf = LeafNode {
@@ -2478,6 +2603,45 @@ mod tests {
                 leaf
             );
         }
+    }
+
+    #[test]
+    fn float_and_bytes_key_order_uses_database_semantics() {
+        let mut floats = vec![
+            ScalarValue::Float64(Float64Value::from_bits(u64::MAX)),
+            ScalarValue::Float64(Float64Value::new(0.0)),
+            ScalarValue::Float64(Float64Value::new(f64::NEG_INFINITY)),
+            ScalarValue::Float64(Float64Value::new(f64::INFINITY)),
+            ScalarValue::Float64(Float64Value::new(-1.0)),
+        ];
+        floats.sort_by(compare_values);
+        assert_eq!(
+            floats,
+            vec![
+                ScalarValue::Float64(Float64Value::new(f64::NEG_INFINITY)),
+                ScalarValue::Float64(Float64Value::new(-1.0)),
+                ScalarValue::Float64(Float64Value::new(0.0)),
+                ScalarValue::Float64(Float64Value::new(f64::INFINITY)),
+                ScalarValue::Float64(Float64Value::new(f64::NAN)),
+            ]
+        );
+
+        let mut bytes = vec![
+            ScalarValue::Bytes(vec![0xff]),
+            ScalarValue::Bytes(vec![1]),
+            ScalarValue::Bytes(vec![0, 0xff]),
+            ScalarValue::Bytes(vec![]),
+        ];
+        bytes.sort_by(compare_values);
+        assert_eq!(
+            bytes,
+            vec![
+                ScalarValue::Bytes(vec![]),
+                ScalarValue::Bytes(vec![0, 0xff]),
+                ScalarValue::Bytes(vec![1]),
+                ScalarValue::Bytes(vec![0xff]),
+            ]
+        );
     }
 
     #[test]

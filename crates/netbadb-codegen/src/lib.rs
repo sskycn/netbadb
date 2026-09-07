@@ -43,6 +43,14 @@ pub fn generate_go(source: &str, request: &GoGenerationRequest) -> Result<String
     validate_command_path("output", &request.output_path)?;
     let schema = parse_schema_spec(source)?;
     let tables = select_tables(&schema, &request.table_ids)?;
+    for table in &tables {
+        for column in &table.columns {
+            let physical = column.semantic_type().physical;
+            if matches!(physical, PhysicalType::Int128 | PhysicalType::UInt128) {
+                return Err(CodegenError::UnsupportedGoPhysicalType(physical));
+            }
+        }
+    }
     let names = GoNames::build(&tables)?;
     render_go(request, &tables, &names)
 }
@@ -670,27 +678,60 @@ fn go_column_type(column: &ColumnDef) -> String {
 const fn go_physical_type(physical: PhysicalType) -> &'static str {
     match physical {
         PhysicalType::Bool => "bool",
+        PhysicalType::Int8 => "int8",
+        PhysicalType::Int16 => "int16",
+        PhysicalType::Int32 => "int32",
         PhysicalType::Int64 => "int64",
+        PhysicalType::Int128 => "unsupportedInt128",
+        PhysicalType::UInt8 => "uint8",
+        PhysicalType::UInt16 => "uint16",
+        PhysicalType::UInt32 => "uint32",
         PhysicalType::UInt64 => "uint64",
+        PhysicalType::UInt128 => "unsupportedUInt128",
+        PhysicalType::Float32 => "float32",
+        PhysicalType::Float64 => "float64",
         PhysicalType::Text => "string",
+        PhysicalType::Bytes => "[]byte",
     }
 }
 
 const fn go_physical_constant(physical: PhysicalType) -> &'static str {
     match physical {
         PhysicalType::Bool => "PhysicalTypeBool",
+        PhysicalType::Int8 => "PhysicalTypeInt8",
+        PhysicalType::Int16 => "PhysicalTypeInt16",
+        PhysicalType::Int32 => "PhysicalTypeInt32",
         PhysicalType::Int64 => "PhysicalTypeInt64",
+        PhysicalType::Int128 => "PhysicalTypeInt128",
+        PhysicalType::UInt8 => "PhysicalTypeUInt8",
+        PhysicalType::UInt16 => "PhysicalTypeUInt16",
+        PhysicalType::UInt32 => "PhysicalTypeUInt32",
         PhysicalType::UInt64 => "PhysicalTypeUInt64",
+        PhysicalType::UInt128 => "PhysicalTypeUInt128",
+        PhysicalType::Float32 => "PhysicalTypeFloat32",
+        PhysicalType::Float64 => "PhysicalTypeFloat64",
         PhysicalType::Text => "PhysicalTypeText",
+        PhysicalType::Bytes => "PhysicalTypeBytes",
     }
 }
 
 const fn go_value_accessor(physical: PhysicalType) -> &'static str {
     match physical {
         PhysicalType::Bool => "Bool",
+        PhysicalType::Int8 => "Int8",
+        PhysicalType::Int16 => "Int16",
+        PhysicalType::Int32 => "Int32",
         PhysicalType::Int64 => "Int64",
+        PhysicalType::Int128 => "Int128",
+        PhysicalType::UInt8 => "UInt8",
+        PhysicalType::UInt16 => "UInt16",
+        PhysicalType::UInt32 => "UInt32",
         PhysicalType::UInt64 => "UInt64",
+        PhysicalType::UInt128 => "UInt128",
+        PhysicalType::Float32 => "Float32",
+        PhysicalType::Float64 => "Float64",
         PhysicalType::Text => "Text",
+        PhysicalType::Bytes => "Bytes",
     }
 }
 
@@ -722,6 +763,7 @@ pub enum CodegenError {
         first: PhysicalType,
         second: PhysicalType,
     },
+    UnsupportedGoPhysicalType(PhysicalType),
     UnknownSelectedTable(TableId),
     DuplicateSelectedTable(TableId),
     OutputRead {
@@ -777,6 +819,10 @@ impl fmt::Display for CodegenError {
             } => write!(
                 formatter,
                 "semantic Go type `{name}` has conflicting physical types {first} and {second}"
+            ),
+            Self::UnsupportedGoPhysicalType(physical) => write!(
+                formatter,
+                "NetbaDB {physical} has no lossless Go v1 representation"
             ),
             Self::UnknownSelectedTable(id) => write!(
                 formatter,
@@ -941,6 +987,22 @@ mod tests {
             "Label    string",
         ] {
             assert!(output.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn go_generation_explicitly_rejects_128_bit_physical_types() {
+        for (name, physical) in [
+            ("int128", PhysicalType::Int128),
+            ("uint128", PhysicalType::UInt128),
+        ] {
+            let spec = format!(
+                r#"{{"version":1,"tables":[{{"id":1,"name":"values","columns":[{{"id":1,"name":"value","physical_type":"{name}","semantic_type":null,"nullable":false,"primary_key":false}}]}}]}}"#
+            );
+            assert!(matches!(
+                generate_go(&spec, &request()),
+                Err(CodegenError::UnsupportedGoPhysicalType(actual)) if actual == physical
+            ));
         }
     }
 

@@ -6333,7 +6333,8 @@ mod tests {
     use netbadb_index::{IndexBound, IndexRange};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{
-        ColumnId, DatabaseTxnId, LsmRowId, PhysicalType, ScalarValue, StorageId, TableId, TxnId,
+        ColumnId, DatabaseTxnId, Float32Value, Float64Value, LsmRowId, PhysicalType, ScalarValue,
+        StorageId, TableId, TxnId,
     };
 
     use super::{LsmObservedVersion, LsmStorage};
@@ -6394,6 +6395,100 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    fn all_scalar_table() -> TableDef {
+        let mut columns = vec![ColumnDef::new(
+            ColumnId(1),
+            "cluster",
+            TypeSpec::Physical(PhysicalType::Int64),
+        )];
+        for (position, physical) in [
+            PhysicalType::Bool,
+            PhysicalType::Int8,
+            PhysicalType::Int16,
+            PhysicalType::Int32,
+            PhysicalType::Int128,
+            PhysicalType::UInt8,
+            PhysicalType::UInt16,
+            PhysicalType::UInt32,
+            PhysicalType::UInt64,
+            PhysicalType::UInt128,
+            PhysicalType::Float32,
+            PhysicalType::Float64,
+            PhysicalType::Text,
+            PhysicalType::Bytes,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            columns.push(ColumnDef::new(
+                ColumnId(position as u32 + 2),
+                format!("v{position}"),
+                TypeSpec::Physical(physical),
+            ));
+        }
+        TableDef::new(TableId(13), "all_scalars", columns)
+    }
+
+    fn all_scalar_row(key: i64, alternate: bool) -> Vec<ScalarValue> {
+        vec![
+            ScalarValue::Int64(key),
+            ScalarValue::Bool(alternate),
+            ScalarValue::Int8(if alternate { i8::MAX } else { i8::MIN }),
+            ScalarValue::Int16(if alternate { i16::MAX } else { i16::MIN }),
+            ScalarValue::Int32(if alternate { i32::MAX } else { i32::MIN }),
+            ScalarValue::Int128(if alternate { i128::MAX } else { i128::MIN }),
+            ScalarValue::UInt8(if alternate { u8::MAX } else { 0 }),
+            ScalarValue::UInt16(if alternate { u16::MAX } else { 0 }),
+            ScalarValue::UInt32(if alternate { u32::MAX } else { 0 }),
+            ScalarValue::UInt64(if alternate { u64::MAX } else { 0 }),
+            ScalarValue::UInt128(if alternate { u128::MAX } else { 0 }),
+            ScalarValue::Float32(Float32Value::new(if alternate {
+                f32::INFINITY
+            } else {
+                f32::NEG_INFINITY
+            })),
+            ScalarValue::Float64(Float64Value::new(if alternate {
+                f64::NAN
+            } else {
+                f64::from_bits(1)
+            })),
+            ScalarValue::Text(if alternate { "updated" } else { "initial" }.into()),
+            ScalarValue::Bytes(if alternate {
+                vec![0, 0xff, 0x80]
+            } else {
+                vec![]
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_scalar_payload_survives_lsm_wal_update_flush_and_reopen() {
+        let root = root("all-scalar-payloads");
+        cleanup(&root);
+        let schema = all_scalar_table();
+        let mut storage = LsmStorage::create(&root, schema.clone(), ColumnId(1)).expect("create");
+        let handle = storage
+            .insert(&all_scalar_row(7, false))
+            .expect("insert all scalar payloads");
+        storage
+            .update(handle, &all_scalar_row(7, true))
+            .expect("update all scalar payloads");
+        storage.flush().expect("flush all scalar payloads");
+        storage.close().expect("close all scalar payloads");
+
+        let mut reopened = LsmStorage::open(&root, schema).expect("reopen all scalar payloads");
+        let view = reopened.read_view().expect("read view");
+        let columns = (1..=15).map(ColumnId).collect::<Vec<_>>();
+        let rows = reopened
+            .scan_columns_with_view(&columns, &view)
+            .expect("scan reopened all scalar payloads");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, all_scalar_row(7, true));
+        drop(view);
+        reopened.close().expect("close reopened storage");
+        cleanup(&root);
     }
 
     #[test]

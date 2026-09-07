@@ -1,5 +1,5 @@
 use netbadb_schema::{ColumnDef, TableDef};
-use netbadb_types::{ColumnId, ScalarRef, ScalarValue};
+use netbadb_types::{ColumnId, Float32Value, Float64Value, ScalarRef, ScalarValue};
 
 use crate::{CodecError, StorageError};
 
@@ -32,6 +32,56 @@ pub(crate) fn encode_row(values: &[ScalarValue]) -> Result<Vec<u8>, StorageError
                 encoded.extend_from_slice(value.as_bytes());
             }
             ScalarValue::Null => encoded.push(4),
+            ScalarValue::Int8(value) => {
+                encoded.push(5);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::Int16(value) => {
+                encoded.push(6);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::Int32(value) => {
+                encoded.push(7);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::Int128(value) => {
+                encoded.push(8);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::UInt8(value) => {
+                encoded.push(9);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::UInt16(value) => {
+                encoded.push(10);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::UInt32(value) => {
+                encoded.push(11);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::UInt128(value) => {
+                encoded.push(12);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            ScalarValue::Float32(value) => {
+                encoded.push(13);
+                encoded.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            ScalarValue::Float64(value) => {
+                encoded.push(14);
+                encoded.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            ScalarValue::Bytes(value) => {
+                encoded.push(15);
+                let length =
+                    u32::try_from(value.len()).map_err(|_| StorageError::ResourceLimit {
+                        resource: "encoded row bytes",
+                        limit: u32::MAX as u64,
+                    })?;
+                encoded.extend_from_slice(&length.to_le_bytes());
+                encoded.extend_from_slice(value);
+            }
         }
     }
     Ok(encoded)
@@ -157,6 +207,47 @@ fn decode_value<'a>(payload: &'a [u8], offset: &mut usize) -> Result<ScalarRef<'
             ))
         }
         4 => Ok(ScalarRef::Null),
+        5 => Ok(ScalarRef::Int8(i8::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        6 => Ok(ScalarRef::Int16(i16::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        7 => Ok(ScalarRef::Int32(i32::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        8 => Ok(ScalarRef::Int128(i128::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        9 => Ok(ScalarRef::UInt8(u8::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        10 => Ok(ScalarRef::UInt16(u16::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        11 => Ok(ScalarRef::UInt32(u32::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        12 => Ok(ScalarRef::UInt128(u128::from_le_bytes(take_array(
+            payload, offset,
+        )?))),
+        13 => Ok(ScalarRef::Float32(Float32Value::from_bits(
+            u32::from_le_bytes(take_array(payload, offset)?),
+        ))),
+        14 => Ok(ScalarRef::Float64(Float64Value::from_bits(
+            u64::from_le_bytes(take_array(payload, offset)?),
+        ))),
+        15 => {
+            let length = u32::from_le_bytes(take_array(payload, offset)?) as usize;
+            let end = offset
+                .checked_add(length)
+                .ok_or(CodecError::LengthOverflow)?;
+            let bytes = payload
+                .get(*offset..end)
+                .ok_or(CodecError::ScalarTruncated)?;
+            *offset = end;
+            Ok(ScalarRef::Bytes(bytes))
+        }
         other => Err(CodecError::UnknownScalarTag(other).into()),
     }
 }
@@ -192,7 +283,7 @@ fn validate_decoded_scalar(value: ScalarRef<'_>, column: &ColumnDef) -> Result<(
 #[cfg(test)]
 mod tests {
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+    use netbadb_types::{ColumnId, Float32Value, Float64Value, PhysicalType, ScalarValue, TableId};
 
     use super::{decode_row, decode_row_columns, encode_row};
     use crate::{CodecError, StorageError};
@@ -316,5 +407,64 @@ mod tests {
             decode_row(&bytes, &dropped_trailing),
             Err(StorageError::Codec(CodecError::ExtraValues))
         ));
+    }
+
+    #[test]
+    fn every_appended_scalar_tag_round_trips_without_changing_legacy_tags() {
+        let values = vec![
+            ScalarValue::Int8(i8::MIN),
+            ScalarValue::Int16(i16::MAX),
+            ScalarValue::Int32(i32::MIN),
+            ScalarValue::Int128(i128::MAX),
+            ScalarValue::UInt8(u8::MAX),
+            ScalarValue::UInt16(u16::MAX),
+            ScalarValue::UInt32(u32::MAX),
+            ScalarValue::UInt128(u128::MAX),
+            ScalarValue::Float32(Float32Value::from_bits(0xffff_ffff)),
+            ScalarValue::Float64(Float64Value::new(f64::NEG_INFINITY)),
+            ScalarValue::Bytes(vec![0, 0xff, 0x80]),
+        ];
+        let physical = [
+            PhysicalType::Int8,
+            PhysicalType::Int16,
+            PhysicalType::Int32,
+            PhysicalType::Int128,
+            PhysicalType::UInt8,
+            PhysicalType::UInt16,
+            PhysicalType::UInt32,
+            PhysicalType::UInt128,
+            PhysicalType::Float32,
+            PhysicalType::Float64,
+            PhysicalType::Bytes,
+        ];
+        let table = TableDef::new(
+            TableId(20),
+            "all_scalars",
+            physical
+                .into_iter()
+                .enumerate()
+                .map(|(index, physical)| {
+                    ColumnDef::new(
+                        ColumnId(index as u32 + 1),
+                        format!("c{index}"),
+                        TypeSpec::Physical(physical),
+                    )
+                })
+                .collect(),
+        );
+
+        let bytes = encode_row(&values).expect("encode all scalar kinds");
+        let mut offset = 0;
+        let widths = [1, 2, 4, 16, 1, 2, 4, 16, 4, 8];
+        for (expected_tag, width) in (5_u8..=14).zip(widths) {
+            assert_eq!(bytes[offset], expected_tag);
+            offset += 1 + width;
+        }
+        assert_eq!(bytes[offset], 15);
+        assert_eq!(&bytes[offset + 1..offset + 5], &3_u32.to_le_bytes());
+        assert_eq!(
+            decode_row(&bytes, &table).expect("decode all scalar kinds"),
+            values
+        );
     }
 }

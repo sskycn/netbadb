@@ -52,18 +52,40 @@ struct ColumnSpec {
 #[serde(rename_all = "lowercase")]
 enum PhysicalTypeSpec {
     Bool,
+    Int8,
+    Int16,
+    Int32,
     Int64,
+    Int128,
+    Uint8,
+    Uint16,
+    Uint32,
     Uint64,
+    Uint128,
+    Float32,
+    Float64,
     Text,
+    Bytes,
 }
 
 impl From<PhysicalTypeSpec> for PhysicalType {
     fn from(value: PhysicalTypeSpec) -> Self {
         match value {
             PhysicalTypeSpec::Bool => Self::Bool,
+            PhysicalTypeSpec::Int8 => Self::Int8,
+            PhysicalTypeSpec::Int16 => Self::Int16,
+            PhysicalTypeSpec::Int32 => Self::Int32,
             PhysicalTypeSpec::Int64 => Self::Int64,
+            PhysicalTypeSpec::Int128 => Self::Int128,
+            PhysicalTypeSpec::Uint8 => Self::UInt8,
+            PhysicalTypeSpec::Uint16 => Self::UInt16,
+            PhysicalTypeSpec::Uint32 => Self::UInt32,
             PhysicalTypeSpec::Uint64 => Self::UInt64,
+            PhysicalTypeSpec::Uint128 => Self::UInt128,
+            PhysicalTypeSpec::Float32 => Self::Float32,
+            PhysicalTypeSpec::Float64 => Self::Float64,
             PhysicalTypeSpec::Text => Self::Text,
+            PhysicalTypeSpec::Bytes => Self::Bytes,
         }
     }
 }
@@ -221,5 +243,31 @@ mod tests {
             parse_schema_spec(&alias),
             Err(SchemaSpecError::Json(_))
         ));
+    }
+
+    #[test]
+    fn strict_spec_accepts_every_canonical_physical_spelling() {
+        let names = [
+            "bool", "int8", "int16", "int32", "int64", "int128", "uint8", "uint16", "uint32",
+            "uint64", "uint128", "float32", "float64", "text", "bytes",
+        ];
+        let columns = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                format!(
+                    r#"{{"id":{},"name":"c{}","physical_type":"{}","semantic_type":null,"nullable":false,"primary_key":false}}"#,
+                    index + 1,
+                    index + 1,
+                    name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            r#"{{"version":1,"tables":[{{"id":1,"name":"values","columns":[{columns}]}}]}}"#
+        );
+        let schema = parse_schema_spec(&source).expect("all physical spellings");
+        assert_eq!(schema.tables()[0].columns.len(), names.len());
     }
 }

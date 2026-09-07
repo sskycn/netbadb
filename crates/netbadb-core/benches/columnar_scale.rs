@@ -158,8 +158,13 @@ fn logical_bytes(values: &[ScalarValue]) -> u64 {
         .map(|value| match value {
             ScalarValue::Null => 0,
             ScalarValue::Bool(_) => 1,
-            ScalarValue::Int64(_) | ScalarValue::UInt64(_) => 8,
+            ScalarValue::Int8(_) | ScalarValue::UInt8(_) => 1,
+            ScalarValue::Int16(_) | ScalarValue::UInt16(_) => 2,
+            ScalarValue::Int32(_) | ScalarValue::UInt32(_) | ScalarValue::Float32(_) => 4,
+            ScalarValue::Int64(_) | ScalarValue::UInt64(_) | ScalarValue::Float64(_) => 8,
+            ScalarValue::Int128(_) | ScalarValue::UInt128(_) => 16,
             ScalarValue::Text(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+            ScalarValue::Bytes(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
         })
         .sum()
 }

@@ -452,9 +452,20 @@ impl<'a> From<&'a SemanticType> for SemanticTypeJson<'a> {
 fn physical_type(physical: PhysicalType) -> &'static str {
     match physical {
         PhysicalType::Bool => "bool",
+        PhysicalType::Int8 => "int8",
+        PhysicalType::Int16 => "int16",
+        PhysicalType::Int32 => "int32",
         PhysicalType::Int64 => "int64",
+        PhysicalType::Int128 => "int128",
+        PhysicalType::UInt8 => "uint8",
+        PhysicalType::UInt16 => "uint16",
+        PhysicalType::UInt32 => "uint32",
         PhysicalType::UInt64 => "uint64",
+        PhysicalType::UInt128 => "uint128",
+        PhysicalType::Float32 => "float32",
+        PhysicalType::Float64 => "float64",
         PhysicalType::Text => "text",
+        PhysicalType::Bytes => "bytes",
     }
 }
 
@@ -1055,12 +1066,45 @@ enum ScalarJson<'a> {
     Int64 {
         value: i64,
     },
+    Int8 {
+        value: i8,
+    },
+    Int16 {
+        value: i16,
+    },
+    Int32 {
+        value: i32,
+    },
+    Int128 {
+        value: String,
+    },
+    UInt8 {
+        value: u8,
+    },
+    UInt16 {
+        value: u16,
+    },
+    UInt32 {
+        value: u32,
+    },
     #[serde(rename = "uint64")]
     UInt64 {
         value: u64,
     },
+    UInt128 {
+        value: String,
+    },
+    Float32 {
+        bits: String,
+    },
+    Float64 {
+        bits: String,
+    },
     Text {
         value: &'a str,
+    },
+    Bytes {
+        hex: String,
     },
 }
 
@@ -1069,9 +1113,30 @@ impl<'a> From<&'a ScalarValue> for ScalarJson<'a> {
         match value {
             ScalarValue::Null => Self::Null,
             ScalarValue::Bool(value) => Self::Bool { value: *value },
+            ScalarValue::Int8(value) => Self::Int8 { value: *value },
+            ScalarValue::Int16(value) => Self::Int16 { value: *value },
+            ScalarValue::Int32(value) => Self::Int32 { value: *value },
             ScalarValue::Int64(value) => Self::Int64 { value: *value },
+            ScalarValue::Int128(value) => Self::Int128 {
+                value: value.to_string(),
+            },
+            ScalarValue::UInt8(value) => Self::UInt8 { value: *value },
+            ScalarValue::UInt16(value) => Self::UInt16 { value: *value },
+            ScalarValue::UInt32(value) => Self::UInt32 { value: *value },
             ScalarValue::UInt64(value) => Self::UInt64 { value: *value },
+            ScalarValue::UInt128(value) => Self::UInt128 {
+                value: value.to_string(),
+            },
+            ScalarValue::Float32(value) => Self::Float32 {
+                bits: format!("{:08x}", value.to_bits()),
+            },
+            ScalarValue::Float64(value) => Self::Float64 {
+                bits: format!("{:016x}", value.to_bits()),
+            },
             ScalarValue::Text(value) => Self::Text { value },
+            ScalarValue::Bytes(value) => Self::Bytes {
+                hex: value.iter().map(|byte| format!("{byte:02x}")).collect(),
+            },
         }
     }
 }

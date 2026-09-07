@@ -531,6 +531,51 @@ fn put_scalar(hash: &mut Sha256, value: &ScalarValue) {
             hash.update((value.len() as u64).to_le_bytes());
             hash.update(value.as_bytes());
         }
+        ScalarValue::Int8(value) => {
+            hash.update([5]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::Int16(value) => {
+            hash.update([6]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::Int32(value) => {
+            hash.update([7]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::Int128(value) => {
+            hash.update([8]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::UInt8(value) => {
+            hash.update([9]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::UInt16(value) => {
+            hash.update([10]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::UInt32(value) => {
+            hash.update([11]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::UInt128(value) => {
+            hash.update([12]);
+            hash.update(value.to_le_bytes());
+        }
+        ScalarValue::Float32(value) => {
+            hash.update([13]);
+            hash.update(value.to_bits().to_le_bytes());
+        }
+        ScalarValue::Float64(value) => {
+            hash.update([14]);
+            hash.update(value.to_bits().to_le_bytes());
+        }
+        ScalarValue::Bytes(value) => {
+            hash.update([15]);
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value);
+        }
     }
 }
 
@@ -547,6 +592,17 @@ fn put_physical(hash: &mut Sha256, physical: PhysicalType) {
         PhysicalType::Int64 => 2,
         PhysicalType::UInt64 => 3,
         PhysicalType::Text => 4,
+        PhysicalType::Int8 => 5,
+        PhysicalType::Int16 => 6,
+        PhysicalType::Int32 => 7,
+        PhysicalType::Int128 => 8,
+        PhysicalType::UInt8 => 9,
+        PhysicalType::UInt16 => 10,
+        PhysicalType::UInt32 => 11,
+        PhysicalType::UInt128 => 12,
+        PhysicalType::Float32 => 13,
+        PhysicalType::Float64 => 14,
+        PhysicalType::Bytes => 15,
     }]);
 }
 

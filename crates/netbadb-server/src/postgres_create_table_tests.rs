@@ -143,7 +143,7 @@ fn pg_preflight_errors_have_no_storage_effects_and_poison_explicit_transactions(
         ("CREATE TABLE t (a BIGINT PRIMARY KEY)", "0A000"),
         ("CREATE TABLE t (a TEXT, a TEXT)", "42701"),
         ("CREATE TABLE t (a MAGIC_TYPE)", "42704"),
-        ("CREATE TABLE t (a INTEGER)", "0A000"),
+        ("CREATE TABLE t (a NUMERIC)", "0A000"),
         ("CREATE TABLE t (a UINT64)", "0A000"),
         ("CREATE TABLE t (a VARCHAR(20))", "0A000"),
         ("CREATE TABLE t (a TEXT,)", "42601"),

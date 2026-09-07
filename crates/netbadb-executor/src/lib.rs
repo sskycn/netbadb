@@ -19,8 +19,8 @@ use netbadb_storage::{
     TableStorage,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, ColumnarProjectionId, PhysicalType, RelationBindingId, ScalarRef,
-    ScalarValue, StorageId, TableId,
+    AccessPathId, ColumnId, ColumnarProjectionId, Float32Value, Float64Value, PhysicalType,
+    RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
 };
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
@@ -730,6 +730,25 @@ fn values_to_vector(
 ) -> Result<netbadb_storage::ColumnarVector, ExecutionError> {
     let mut validity = vec![0_u8; values.len().div_ceil(8)];
     let mut mark = |row: usize| validity[row / 8] |= 1 << (row % 8);
+    macro_rules! fixed_vector {
+        ($scalar:path, $variant:ident, $zero:expr) => {{
+            let mut output = Vec::with_capacity(values.len());
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    $scalar(value) => {
+                        mark(row);
+                        output.push(*value);
+                    }
+                    ScalarValue::Null => output.push($zero),
+                    _ => return Err(ExecutionError::TypeMismatch),
+                }
+            }
+            Ok(netbadb_storage::ColumnarVector::$variant {
+                values: output,
+                validity,
+            })
+        }};
+    }
     match physical {
         PhysicalType::Bool => {
             let mut output = Vec::with_capacity(values.len());
@@ -748,6 +767,9 @@ fn values_to_vector(
                 validity,
             })
         }
+        PhysicalType::Int8 => fixed_vector!(ScalarValue::Int8, Int8, 0),
+        PhysicalType::Int16 => fixed_vector!(ScalarValue::Int16, Int16, 0),
+        PhysicalType::Int32 => fixed_vector!(ScalarValue::Int32, Int32, 0),
         PhysicalType::Int64 => {
             let mut output = Vec::with_capacity(values.len());
             for (row, value) in values.iter().enumerate() {
@@ -765,6 +787,10 @@ fn values_to_vector(
                 validity,
             })
         }
+        PhysicalType::Int128 => fixed_vector!(ScalarValue::Int128, Int128, 0),
+        PhysicalType::UInt8 => fixed_vector!(ScalarValue::UInt8, UInt8, 0),
+        PhysicalType::UInt16 => fixed_vector!(ScalarValue::UInt16, UInt16, 0),
+        PhysicalType::UInt32 => fixed_vector!(ScalarValue::UInt32, UInt32, 0),
         PhysicalType::UInt64 => {
             let mut output = Vec::with_capacity(values.len());
             for (row, value) in values.iter().enumerate() {
@@ -782,6 +808,13 @@ fn values_to_vector(
                 validity,
             })
         }
+        PhysicalType::UInt128 => fixed_vector!(ScalarValue::UInt128, UInt128, 0),
+        PhysicalType::Float32 => {
+            fixed_vector!(ScalarValue::Float32, Float32, Float32Value::from_bits(0))
+        }
+        PhysicalType::Float64 => {
+            fixed_vector!(ScalarValue::Float64, Float64, Float64Value::from_bits(0))
+        }
         PhysicalType::Text => {
             let mut offsets = vec![0_u32];
             let mut bytes = Vec::new();
@@ -797,6 +830,26 @@ fn values_to_vector(
                 offsets.push(u32::try_from(bytes.len()).map_err(|_| ExecutionError::TypeMismatch)?);
             }
             Ok(netbadb_storage::ColumnarVector::Text {
+                offsets,
+                bytes,
+                validity,
+            })
+        }
+        PhysicalType::Bytes => {
+            let mut offsets = vec![0_u32];
+            let mut bytes = Vec::new();
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    ScalarValue::Bytes(value) => {
+                        mark(row);
+                        bytes.extend_from_slice(value);
+                    }
+                    ScalarValue::Null => {}
+                    _ => return Err(ExecutionError::TypeMismatch),
+                }
+                offsets.push(u32::try_from(bytes.len()).map_err(|_| ExecutionError::TypeMismatch)?);
+            }
+            Ok(netbadb_storage::ColumnarVector::Bytes {
                 offsets,
                 bytes,
                 validity,
@@ -3087,8 +3140,19 @@ fn sort_execution_rows(
                     ScalarValue::Text(value) => Some(value.len()),
                     ScalarValue::Null
                     | ScalarValue::Bool(_)
+                    | ScalarValue::Int8(_)
+                    | ScalarValue::Int16(_)
+                    | ScalarValue::Int32(_)
                     | ScalarValue::Int64(_)
-                    | ScalarValue::UInt64(_) => None,
+                    | ScalarValue::Int128(_)
+                    | ScalarValue::UInt8(_)
+                    | ScalarValue::UInt16(_)
+                    | ScalarValue::UInt32(_)
+                    | ScalarValue::UInt64(_)
+                    | ScalarValue::UInt128(_)
+                    | ScalarValue::Float32(_)
+                    | ScalarValue::Float64(_)
+                    | ScalarValue::Bytes(_) => None,
                 })
                 .sum(),
         };
@@ -3288,27 +3352,27 @@ fn find_source_position(
 #[derive(Debug)]
 enum AggregateState {
     Count(u64),
-    SumInt(Option<i64>),
-    SumUInt(Option<u64>),
+    Sum {
+        physical: PhysicalType,
+        value: Option<ScalarValue>,
+    },
     Min(ExtremeState),
     Max(ExtremeState),
 }
 
 #[derive(Debug)]
 enum ExtremeState {
-    Bool(Option<bool>),
-    Int64(Option<i64>),
-    UInt64(Option<u64>),
-    Text(Option<String>),
+    Value {
+        physical: PhysicalType,
+        current: Option<ScalarValue>,
+    },
 }
 
 impl ExtremeState {
     const fn empty(physical: PhysicalType) -> Self {
-        match physical {
-            PhysicalType::Bool => Self::Bool(None),
-            PhysicalType::Int64 => Self::Int64(None),
-            PhysicalType::UInt64 => Self::UInt64(None),
-            PhysicalType::Text => Self::Text(None),
+        Self::Value {
+            physical,
+            current: None,
         }
     }
 
@@ -3316,45 +3380,31 @@ impl ExtremeState {
         &self,
         candidate: &ScalarValue,
     ) -> Result<Option<Ordering>, ExecutionError> {
-        match (self, candidate) {
-            (Self::Bool(None), ScalarValue::Bool(_))
-            | (Self::Int64(None), ScalarValue::Int64(_))
-            | (Self::UInt64(None), ScalarValue::UInt64(_))
-            | (Self::Text(None), ScalarValue::Text(_)) => Ok(None),
-            (Self::Bool(Some(current)), ScalarValue::Bool(candidate)) => {
-                Ok(Some(candidate.cmp(current)))
-            }
-            (Self::Int64(Some(current)), ScalarValue::Int64(candidate)) => {
-                Ok(Some(candidate.cmp(current)))
-            }
-            (Self::UInt64(Some(current)), ScalarValue::UInt64(candidate)) => {
-                Ok(Some(candidate.cmp(current)))
-            }
-            (Self::Text(Some(current)), ScalarValue::Text(candidate)) => {
-                Ok(Some(candidate.as_str().cmp(current.as_str())))
-            }
-            _ => Err(ExecutionError::TypeMismatch),
+        let Self::Value { physical, current } = self;
+        if candidate.physical_type() != Some(*physical) {
+            return Err(ExecutionError::TypeMismatch);
+        }
+        match current {
+            None => Ok(None),
+            Some(current) => candidate
+                .database_cmp(current)
+                .map(Some)
+                .ok_or(ExecutionError::TypeMismatch),
         }
     }
 
     fn replace(&mut self, candidate: ScalarValue) -> Result<(), ExecutionError> {
-        match (self, candidate) {
-            (Self::Bool(current), ScalarValue::Bool(candidate)) => *current = Some(candidate),
-            (Self::Int64(current), ScalarValue::Int64(candidate)) => *current = Some(candidate),
-            (Self::UInt64(current), ScalarValue::UInt64(candidate)) => *current = Some(candidate),
-            (Self::Text(current), ScalarValue::Text(candidate)) => *current = Some(candidate),
-            _ => return Err(ExecutionError::TypeMismatch),
+        let Self::Value { physical, current } = self;
+        if candidate.physical_type() != Some(*physical) {
+            return Err(ExecutionError::TypeMismatch);
         }
+        *current = Some(candidate);
         Ok(())
     }
 
     fn into_scalar(self) -> ScalarValue {
-        match self {
-            Self::Bool(value) => value.map_or(ScalarValue::Null, ScalarValue::Bool),
-            Self::Int64(value) => value.map_or(ScalarValue::Null, ScalarValue::Int64),
-            Self::UInt64(value) => value.map_or(ScalarValue::Null, ScalarValue::UInt64),
-            Self::Text(value) => value.map_or(ScalarValue::Null, ScalarValue::Text),
-        }
+        let Self::Value { current, .. } = self;
+        current.unwrap_or(ScalarValue::Null)
     }
 }
 
@@ -4871,13 +4921,13 @@ fn same_source_column(left: &ColumnRef, right: &ColumnRef) -> bool {
 fn initial_aggregate_state(aggregate: &AggregateExpr) -> Result<AggregateState, ExecutionError> {
     match aggregate.function {
         AggregateFunction::Count => Ok(AggregateState::Count(0)),
-        AggregateFunction::Sum => match aggregate.output.data_type.physical {
-            netbadb_types::PhysicalType::Int64 => Ok(AggregateState::SumInt(None)),
-            netbadb_types::PhysicalType::UInt64 => Ok(AggregateState::SumUInt(None)),
-            netbadb_types::PhysicalType::Bool | netbadb_types::PhysicalType::Text => {
-                Err(ExecutionError::TypeMismatch)
-            }
-        },
+        AggregateFunction::Sum if aggregate.output.data_type.physical.is_numeric() => {
+            Ok(AggregateState::Sum {
+                physical: aggregate.output.data_type.physical,
+                value: None,
+            })
+        }
+        AggregateFunction::Sum => Err(ExecutionError::TypeMismatch),
         AggregateFunction::Min => Ok(AggregateState::Min(ExtremeState::empty(
             aggregate.output.data_type.physical,
         ))),
@@ -4925,9 +4975,7 @@ fn aggregate_extreme_replaces(
         AggregateState::Max(current) => Ok(current
             .compare_candidate(value)?
             .is_none_or(|ordering| ordering == Ordering::Greater)),
-        AggregateState::Count(_) | AggregateState::SumInt(_) | AggregateState::SumUInt(_) => {
-            Err(ExecutionError::TypeMismatch)
-        }
+        AggregateState::Count(_) | AggregateState::Sum { .. } => Err(ExecutionError::TypeMismatch),
     }
 }
 
@@ -4937,9 +4985,7 @@ fn replace_aggregate_extreme(
 ) -> Result<(), ExecutionError> {
     match state {
         AggregateState::Min(current) | AggregateState::Max(current) => current.replace(value),
-        AggregateState::Count(_) | AggregateState::SumInt(_) | AggregateState::SumUInt(_) => {
-            Err(ExecutionError::TypeMismatch)
-        }
+        AggregateState::Count(_) | AggregateState::Sum { .. } => Err(ExecutionError::TypeMismatch),
     }
 }
 
@@ -4956,29 +5002,18 @@ fn update_aggregate_state(
                     .ok_or_else(|| aggregate_overflow(aggregate))?;
             }
         }
-        AggregateState::SumInt(sum) => {
+        AggregateState::Sum {
+            physical,
+            value: sum,
+        } => {
             if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
-                let ScalarValue::Int64(value) = value else {
+                if value.physical_type() != Some(*physical) {
                     return Err(ExecutionError::TypeMismatch);
-                };
+                }
                 *sum = Some(match sum {
-                    Some(sum) => sum
-                        .checked_add(*value)
+                    Some(current) => checked_scalar_add(current, value)
                         .ok_or_else(|| aggregate_overflow(aggregate))?,
-                    None => *value,
-                });
-            }
-        }
-        AggregateState::SumUInt(sum) => {
-            if let Some(value) = value.filter(|value| !matches!(value, ScalarValue::Null)) {
-                let ScalarValue::UInt64(value) = value else {
-                    return Err(ExecutionError::TypeMismatch);
-                };
-                *sum = Some(match sum {
-                    Some(sum) => sum
-                        .checked_add(*value)
-                        .ok_or_else(|| aggregate_overflow(aggregate))?,
-                    None => *value,
+                    None => value.clone(),
                 });
             }
         }
@@ -5000,11 +5035,52 @@ fn aggregate_overflow(aggregate: &AggregateExpr) -> ExecutionError {
     }
 }
 
+fn checked_scalar_add(left: &ScalarValue, right: &ScalarValue) -> Option<ScalarValue> {
+    match (left, right) {
+        (ScalarValue::Int8(left), ScalarValue::Int8(right)) => {
+            left.checked_add(*right).map(ScalarValue::Int8)
+        }
+        (ScalarValue::Int16(left), ScalarValue::Int16(right)) => {
+            left.checked_add(*right).map(ScalarValue::Int16)
+        }
+        (ScalarValue::Int32(left), ScalarValue::Int32(right)) => {
+            left.checked_add(*right).map(ScalarValue::Int32)
+        }
+        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => {
+            left.checked_add(*right).map(ScalarValue::Int64)
+        }
+        (ScalarValue::Int128(left), ScalarValue::Int128(right)) => {
+            left.checked_add(*right).map(ScalarValue::Int128)
+        }
+        (ScalarValue::UInt8(left), ScalarValue::UInt8(right)) => {
+            left.checked_add(*right).map(ScalarValue::UInt8)
+        }
+        (ScalarValue::UInt16(left), ScalarValue::UInt16(right)) => {
+            left.checked_add(*right).map(ScalarValue::UInt16)
+        }
+        (ScalarValue::UInt32(left), ScalarValue::UInt32(right)) => {
+            left.checked_add(*right).map(ScalarValue::UInt32)
+        }
+        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => {
+            left.checked_add(*right).map(ScalarValue::UInt64)
+        }
+        (ScalarValue::UInt128(left), ScalarValue::UInt128(right)) => {
+            left.checked_add(*right).map(ScalarValue::UInt128)
+        }
+        (ScalarValue::Float32(left), ScalarValue::Float32(right)) => Some(ScalarValue::Float32(
+            Float32Value::new(left.get() + right.get()),
+        )),
+        (ScalarValue::Float64(left), ScalarValue::Float64(right)) => Some(ScalarValue::Float64(
+            Float64Value::new(left.get() + right.get()),
+        )),
+        _ => None,
+    }
+}
+
 fn finalize_aggregate_state(state: AggregateState) -> ScalarValue {
     match state {
         AggregateState::Count(value) => ScalarValue::UInt64(value),
-        AggregateState::SumInt(value) => value.map_or(ScalarValue::Null, ScalarValue::Int64),
-        AggregateState::SumUInt(value) => value.map_or(ScalarValue::Null, ScalarValue::UInt64),
+        AggregateState::Sum { value, .. } => value.unwrap_or(ScalarValue::Null),
         AggregateState::Min(value) | AggregateState::Max(value) => value.into_scalar(),
     }
 }
@@ -6365,13 +6441,7 @@ fn compare_scalar_refs(
     left: ScalarRef<'_>,
     right: ScalarRef<'_>,
 ) -> Result<Ordering, ExecutionError> {
-    match (left, right) {
-        (ScalarRef::Bool(left), ScalarRef::Bool(right)) => Ok(left.cmp(&right)),
-        (ScalarRef::Int64(left), ScalarRef::Int64(right)) => Ok(left.cmp(&right)),
-        (ScalarRef::UInt64(left), ScalarRef::UInt64(right)) => Ok(left.cmp(&right)),
-        (ScalarRef::Text(left), ScalarRef::Text(right)) => Ok(left.cmp(right)),
-        _ => Err(ExecutionError::TypeMismatch),
-    }
+    left.database_cmp(right).ok_or(ExecutionError::TypeMismatch)
 }
 
 #[cfg(test)]
@@ -6420,8 +6490,8 @@ mod tests {
         IndexStatistics, PresenceCountSummary, StorageRowHandle, TableStatistics, TableStorage,
     };
     use netbadb_types::{
-        ColumnId, ExprType, PartitionId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue,
-        SemanticType, StorageId, TableId,
+        ColumnId, ExprType, Float32Value, Float64Value, PartitionId, PhysicalType,
+        RelationBindingId, ScalarRef, ScalarValue, SemanticType, StorageId, TableId,
     };
 
     fn text_pointer(value: &ScalarValue) -> *const u8 {
@@ -7037,24 +7107,37 @@ mod tests {
         };
         assert!(matches!(
             super::initial_aggregate_state(&aggregate(PhysicalType::Bool)),
-            Ok(super::AggregateState::Min(super::ExtremeState::Bool(None)))
+            Ok(super::AggregateState::Min(super::ExtremeState::Value {
+                physical: PhysicalType::Bool,
+                current: None
+            }))
         ));
         assert!(matches!(
             super::initial_aggregate_state(&aggregate(PhysicalType::Int64)),
-            Ok(super::AggregateState::Min(super::ExtremeState::Int64(None)))
+            Ok(super::AggregateState::Min(super::ExtremeState::Value {
+                physical: PhysicalType::Int64,
+                current: None
+            }))
         ));
         assert!(matches!(
             super::initial_aggregate_state(&aggregate(PhysicalType::UInt64)),
-            Ok(super::AggregateState::Min(super::ExtremeState::UInt64(
-                None
-            )))
+            Ok(super::AggregateState::Min(super::ExtremeState::Value {
+                physical: PhysicalType::UInt64,
+                current: None
+            }))
         ));
         assert!(matches!(
             super::initial_aggregate_state(&aggregate(PhysicalType::Text)),
-            Ok(super::AggregateState::Min(super::ExtremeState::Text(None)))
+            Ok(super::AggregateState::Min(super::ExtremeState::Value {
+                physical: PhysicalType::Text,
+                current: None
+            }))
         ));
 
-        let mut text_min = super::AggregateState::Min(super::ExtremeState::Text(None));
+        let mut text_min = super::AggregateState::Min(super::ExtremeState::Value {
+            physical: PhysicalType::Text,
+            current: None,
+        });
         assert!(
             !super::aggregate_extreme_replaces(&text_min, &ScalarValue::Null)
                 .expect("NULL candidate is ignored")
@@ -7133,6 +7216,67 @@ mod tests {
                     ScalarValue::UInt64(current),
                 );
             }
+        }
+
+        for (physical, low, high) in [
+            (
+                PhysicalType::Int8,
+                ScalarValue::Int8(i8::MIN),
+                ScalarValue::Int8(i8::MAX),
+            ),
+            (
+                PhysicalType::Int16,
+                ScalarValue::Int16(i16::MIN),
+                ScalarValue::Int16(i16::MAX),
+            ),
+            (
+                PhysicalType::Int32,
+                ScalarValue::Int32(i32::MIN),
+                ScalarValue::Int32(i32::MAX),
+            ),
+            (
+                PhysicalType::Int128,
+                ScalarValue::Int128(i128::MIN),
+                ScalarValue::Int128(i128::MAX),
+            ),
+            (
+                PhysicalType::UInt8,
+                ScalarValue::UInt8(0),
+                ScalarValue::UInt8(u8::MAX),
+            ),
+            (
+                PhysicalType::UInt16,
+                ScalarValue::UInt16(0),
+                ScalarValue::UInt16(u16::MAX),
+            ),
+            (
+                PhysicalType::UInt32,
+                ScalarValue::UInt32(0),
+                ScalarValue::UInt32(u32::MAX),
+            ),
+            (
+                PhysicalType::UInt128,
+                ScalarValue::UInt128(0),
+                ScalarValue::UInt128(u128::MAX),
+            ),
+            (
+                PhysicalType::Float32,
+                ScalarValue::Float32(Float32Value::new(f32::NEG_INFINITY)),
+                ScalarValue::Float32(Float32Value::new(f32::NAN)),
+            ),
+            (
+                PhysicalType::Float64,
+                ScalarValue::Float64(Float64Value::new(f64::NEG_INFINITY)),
+                ScalarValue::Float64(Float64Value::new(f64::NAN)),
+            ),
+            (
+                PhysicalType::Bytes,
+                ScalarValue::Bytes(vec![]),
+                ScalarValue::Bytes(vec![0xff]),
+            ),
+        ] {
+            assert_pair(physical, low.clone(), high.clone());
+            assert_pair(physical, high, low);
         }
 
         let mut common_prefix_a = "p".repeat(63);
@@ -7462,7 +7606,7 @@ mod tests {
                 .filter(|state| {
                     matches!(
                         state,
-                        super::AggregateState::Max(super::ExtremeState::Text(Some(value)))
+                        super::AggregateState::Max(super::ExtremeState::Value { current: Some(ScalarValue::Text(value)), .. })
                             if value.as_ptr() == final_pointer
                     )
                 })
@@ -7531,7 +7675,7 @@ mod tests {
                         .filter(|state| {
                             matches!(
                                 state,
-                                super::AggregateState::Max(super::ExtremeState::Text(Some(value)))
+                                super::AggregateState::Max(super::ExtremeState::Value { current: Some(ScalarValue::Text(value)), .. })
                                     if value.as_ptr() == original_pointer
                             )
                         })
@@ -7541,7 +7685,7 @@ mod tests {
                 text_pointer(&group.key_values[0]) != hit_pointer
                     && group.aggregate_states.iter().all(|state| matches!(
                         state,
-                        super::AggregateState::Max(super::ExtremeState::Text(Some(value)))
+                        super::AggregateState::Max(super::ExtremeState::Value { current: Some(ScalarValue::Text(value)), .. })
                             if value.as_ptr() != hit_pointer
                     ))
             );
@@ -8921,8 +9065,19 @@ mod tests {
                     ScalarValue::Text(value) => Some(value.len()),
                     ScalarValue::Null
                     | ScalarValue::Bool(_)
+                    | ScalarValue::Int8(_)
+                    | ScalarValue::Int16(_)
+                    | ScalarValue::Int32(_)
                     | ScalarValue::Int64(_)
-                    | ScalarValue::UInt64(_) => None,
+                    | ScalarValue::Int128(_)
+                    | ScalarValue::UInt8(_)
+                    | ScalarValue::UInt16(_)
+                    | ScalarValue::UInt32(_)
+                    | ScalarValue::UInt64(_)
+                    | ScalarValue::UInt128(_)
+                    | ScalarValue::Float32(_)
+                    | ScalarValue::Float64(_)
+                    | ScalarValue::Bytes(_) => None,
                 })
                 .sum::<usize>(),
             0
@@ -14074,12 +14229,29 @@ mod tests {
         fn key_values(physical: PhysicalType) -> (ScalarValue, ScalarValue) {
             match physical {
                 PhysicalType::Bool => (ScalarValue::Bool(true), ScalarValue::Bool(false)),
+                PhysicalType::Int8 => (ScalarValue::Int8(-7), ScalarValue::Int8(9)),
+                PhysicalType::Int16 => (ScalarValue::Int16(-7), ScalarValue::Int16(9)),
+                PhysicalType::Int32 => (ScalarValue::Int32(-7), ScalarValue::Int32(9)),
                 PhysicalType::Int64 => (ScalarValue::Int64(-7), ScalarValue::Int64(9)),
+                PhysicalType::Int128 => (ScalarValue::Int128(-7), ScalarValue::Int128(9)),
+                PhysicalType::UInt8 => (ScalarValue::UInt8(7), ScalarValue::UInt8(9)),
+                PhysicalType::UInt16 => (ScalarValue::UInt16(7), ScalarValue::UInt16(9)),
+                PhysicalType::UInt32 => (ScalarValue::UInt32(7), ScalarValue::UInt32(9)),
                 PhysicalType::UInt64 => (ScalarValue::UInt64(7), ScalarValue::UInt64(9)),
+                PhysicalType::UInt128 => (ScalarValue::UInt128(7), ScalarValue::UInt128(9)),
+                PhysicalType::Float32 => (
+                    ScalarValue::Float32(Float32Value::new(-7.0)),
+                    ScalarValue::Float32(Float32Value::new(9.0)),
+                ),
+                PhysicalType::Float64 => (
+                    ScalarValue::Float64(Float64Value::new(-7.0)),
+                    ScalarValue::Float64(Float64Value::new(9.0)),
+                ),
                 PhysicalType::Text => (
                     ScalarValue::Text("alpha".into()),
                     ScalarValue::Text("omega".into()),
                 ),
+                PhysicalType::Bytes => (ScalarValue::Bytes(vec![0]), ScalarValue::Bytes(vec![255])),
             }
         }
 

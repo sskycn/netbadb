@@ -6547,9 +6547,24 @@ fn primitive_values_checksum(values: &[ScalarValue]) -> BenchResult<u128> {
             ScalarValue::Int64(value) => u128::try_from(*value)
                 .map_err(|_| message_error("negative primitive aggregate result"))?,
             ScalarValue::UInt64(value) => u128::from(*value),
-            ScalarValue::Text(_) => {
+            ScalarValue::Int8(value) => u128::try_from(*value)
+                .map_err(|_| message_error("negative primitive aggregate result"))?,
+            ScalarValue::Int16(value) => u128::try_from(*value)
+                .map_err(|_| message_error("negative primitive aggregate result"))?,
+            ScalarValue::Int32(value) => u128::try_from(*value)
+                .map_err(|_| message_error("negative primitive aggregate result"))?,
+            ScalarValue::Int128(value) => u128::try_from(*value)
+                .map_err(|_| message_error("negative primitive aggregate result"))?,
+            ScalarValue::UInt8(value) => u128::from(*value),
+            ScalarValue::UInt16(value) => u128::from(*value),
+            ScalarValue::UInt32(value) => u128::from(*value),
+            ScalarValue::UInt128(value) => *value,
+            ScalarValue::Float32(_)
+            | ScalarValue::Float64(_)
+            | ScalarValue::Text(_)
+            | ScalarValue::Bytes(_) => {
                 return Err(message_error(
-                    "primitive aggregate result unexpectedly contained Text",
+                    "primitive aggregate result unexpectedly contained a non-integer",
                 ));
             }
         };

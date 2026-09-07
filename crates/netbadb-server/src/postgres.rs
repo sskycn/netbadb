@@ -16,7 +16,7 @@ use netbadb_core::{
 use netbadb_pgwire::{
     BackendMessage, CloseTarget, DescribeTarget, ErrorResponse, FieldDescription, FormatCode,
     FrontendMessage, PostgresOid, PostgresType, StartupMessage, StartupPacket, TypeMappingError,
-    WireError, decode_binary_parameter, decode_text_parameter, encode_binary_value,
+    WireError, decode_binary_parameter_as, decode_text_parameter_as, encode_binary_value,
     encode_text_value, read_frontend_message, read_startup_packet, write_backend_message,
 };
 use netbadb_protocol::WireTransactionState;
@@ -594,6 +594,7 @@ struct PreparedStatement {
     sql: String,
     execution: PreparedExecution,
     parameters: Vec<PostgresOid>,
+    parameter_targets: Vec<Option<PhysicalType>>,
     fields: Vec<FieldDescription>,
     is_query: bool,
 }
@@ -1182,6 +1183,7 @@ impl PgWorkerSession {
                     sql: query,
                     execution: PreparedExecution::Ddl(Box::new(prepared)),
                     parameters: Vec::new(),
+                    parameter_targets: Vec::new(),
                     fields: Vec::new(),
                     is_query: false,
                 },
@@ -1222,6 +1224,7 @@ impl PgWorkerSession {
                         sql: query,
                         execution: PreparedExecution::Ddl(Box::new(prepared)),
                         parameters: Vec::new(),
+                        parameter_targets: Vec::new(),
                         fields: Vec::new(),
                         is_query: false,
                     },
@@ -1231,6 +1234,11 @@ impl PgWorkerSession {
             Err(error) => return self.extended_error(map_database_error(&error)),
         };
         let description = prepared.description();
+        let parameter_targets = prepared
+            .parameters()
+            .iter()
+            .map(|parameter| Some(parameter.data_type.physical))
+            .collect::<Vec<_>>();
         let inferred_oids = match prepared
             .parameters()
             .iter()
@@ -1267,6 +1275,7 @@ impl PgWorkerSession {
                 sql: query,
                 execution: PreparedExecution::Core(Box::new(prepared)),
                 parameters: inferred_oids,
+                parameter_targets,
                 fields,
                 is_query: description.is_query,
             },
@@ -1340,6 +1349,10 @@ impl PgWorkerSession {
                 sql: query,
                 execution: PreparedExecution::Compatibility(compatibility),
                 parameters,
+                parameter_targets: expected_parameters
+                    .iter()
+                    .map(|data_type| data_type.netbadb_physical())
+                    .collect(),
                 fields: compatibility_fields(compatibility),
                 is_query: true,
             },
@@ -1381,10 +1394,16 @@ impl PgWorkerSession {
         let values = match parameters
             .iter()
             .zip(&prepared.parameters)
+            .zip(&prepared.parameter_targets)
             .zip(&parameter_formats)
-            .map(|((bytes, oid), format)| match format {
-                FormatCode::Text => decode_text_parameter(bytes.as_deref(), *oid),
-                FormatCode::Binary => decode_binary_parameter(bytes.as_deref(), *oid),
+            .map(|(((bytes, oid), target), format)| match (format, target) {
+                (FormatCode::Text, Some(target)) => {
+                    decode_text_parameter_as(bytes.as_deref(), *oid, *target)
+                }
+                (FormatCode::Binary, Some(target)) => {
+                    decode_binary_parameter_as(bytes.as_deref(), *oid, *target)
+                }
+                (_, None) => Err(TypeMappingError::TypeMismatch),
             })
             .collect::<Result<Vec<_>, _>>()
         {
@@ -4189,12 +4208,22 @@ fn execute_compatibility_statement_for_owner(
                         debug_assert_ne!(index.oid, table.oid);
                         let opclass = match index.column_physical {
                             PhysicalType::Bool => Ok("bool_ops"),
+                            PhysicalType::Int8 | PhysicalType::Int16 | PhysicalType::UInt8 => {
+                                Ok("int2_ops")
+                            }
+                            PhysicalType::Int32 | PhysicalType::UInt16 => Ok("int4_ops"),
                             PhysicalType::Int64 => Ok("int8_ops"),
+                            PhysicalType::UInt32 => Ok("int8_ops"),
+                            PhysicalType::Float32 => Ok("float4_ops"),
+                            PhysicalType::Float64 => Ok("float8_ops"),
                             PhysicalType::Text => Ok("text_ops"),
-                            PhysicalType::UInt64 => Err(fixed_error(
-                                "0A000",
-                                "UINT64 indexes cannot be represented by PostgreSQL reflection",
-                            )),
+                            PhysicalType::Bytes => Ok("bytea_ops"),
+                            PhysicalType::Int128 | PhysicalType::UInt64 | PhysicalType::UInt128 => {
+                                Err(fixed_error(
+                                    "0A000",
+                                    "index type has no lossless PostgreSQL reflection",
+                                ))
+                            }
                         }?;
                         Ok(vec![
                             ScalarValue::Int64(i64::from(table.oid)),
@@ -4338,11 +4367,19 @@ fn execute_compatibility_statement_for_owner(
 fn postgres_reflection_type(physical: PhysicalType) -> Result<&'static str, ErrorResponse> {
     match physical {
         PhysicalType::Bool => Ok("boolean"),
+        PhysicalType::Int8 | PhysicalType::Int16 => Ok("smallint"),
+        PhysicalType::Int32 => Ok("integer"),
         PhysicalType::Int64 => Ok("bigint"),
+        PhysicalType::UInt8 => Ok("smallint"),
+        PhysicalType::UInt16 => Ok("integer"),
+        PhysicalType::UInt32 => Ok("bigint"),
+        PhysicalType::Float32 => Ok("real"),
+        PhysicalType::Float64 => Ok("double precision"),
         PhysicalType::Text => Ok("text"),
-        PhysicalType::UInt64 => Err(fixed_error(
+        PhysicalType::Bytes => Ok("bytea"),
+        PhysicalType::Int128 | PhysicalType::UInt64 | PhysicalType::UInt128 => Err(fixed_error(
             "0A000",
-            "UINT64 has no lossless PostgreSQL reflection type",
+            "type has no lossless PostgreSQL reflection type",
         )),
     }
 }
@@ -4634,6 +4671,7 @@ fn map_database_error(error: &DatabaseError) -> ErrorResponse {
 fn map_type_error(error: TypeMappingError) -> ErrorResponse {
     let state = match error {
         TypeMappingError::UnsupportedUInt64
+        | TypeMappingError::UnsupportedPhysicalType(_)
         | TypeMappingError::UnsupportedOid(_)
         | TypeMappingError::BinaryFormatUnsupported(_) => "0A000",
         TypeMappingError::InvalidTextValue(_) => "22P02",
