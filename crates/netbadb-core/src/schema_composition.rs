@@ -316,6 +316,13 @@ enum IndexCompositionContext {
     AdoptedFinal,
 }
 
+#[derive(Clone, Copy)]
+enum AdoptedIndexDropContext {
+    Finalizing,
+    #[cfg(test)]
+    TerminalEvacuation,
+}
+
 impl SchemaCompositionState {
     pub(crate) fn adopted_source(&self) -> Option<&AdoptedSourceTransaction> {
         match self {
@@ -4568,7 +4575,45 @@ impl Database {
         transaction: &mut Transaction,
         target: crate::DropIndexTarget,
     ) -> Result<crate::DdlOutcome, DatabaseError> {
+        self.apply_adopted_source_drop_index_with_context(
+            transaction,
+            target,
+            AdoptedIndexDropContext::Finalizing,
+        )
+    }
+
+    fn apply_adopted_source_drop_index_with_context(
+        &mut self,
+        transaction: &mut Transaction,
+        target: crate::DropIndexTarget,
+        context: AdoptedIndexDropContext,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
         self.validate_transaction(transaction)?;
+        #[cfg(test)]
+        if matches!(context, AdoptedIndexDropContext::TerminalEvacuation) {
+            let first = matches!(
+                transaction.schema_composition,
+                SchemaCompositionState::AdoptedSourceBackfilling(_)
+            );
+            let adopted = match &transaction.schema_composition {
+                SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+                | SchemaCompositionState::AdoptedSourceFinalRefining(adopted) => adopted,
+                _ => {
+                    return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+                }
+            };
+            if adopted.logical.deferred_backfill.is_empty()
+                || !adopted.logical.deferred_backfill.has_evaluation_schema()
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "terminal index evacuation lacks frozen evaluation schema",
+                )
+                .into());
+            }
+            if first {
+                self.revalidate_adopted_source_authority(transaction)?;
+            }
+        }
         let adopted = transaction
             .schema_composition
             .adopted_source_mut()
@@ -4576,8 +4621,58 @@ impl Database {
         Self::validate_adopted_index_table(&adopted.logical, target.table_id)?;
         Self::canonical_adopted_index_version(&adopted.logical, target.table_id)?;
         let result = self.apply_index_drop_to_plan(&mut adopted.logical, target)?;
-        Self::seal_adopted_index_schema(transaction, target.table_id);
+        match context {
+            AdoptedIndexDropContext::Finalizing => {
+                Self::seal_adopted_index_schema(transaction, target.table_id);
+            }
+            #[cfg(test)]
+            AdoptedIndexDropContext::TerminalEvacuation => {
+                let previous = std::mem::replace(
+                    &mut transaction.schema_composition,
+                    SchemaCompositionState::None,
+                );
+                transaction.schema_composition = match previous {
+                    SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+                    | SchemaCompositionState::AdoptedSourceFinalRefining(adopted) => {
+                        SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
+                    }
+                    other => {
+                        transaction.schema_composition = other;
+                        return Err(SchemaMutationError::Corrupt(
+                            "terminal index evacuation state disappeared after acceptance",
+                        )
+                        .into());
+                    }
+                };
+                crash("round57-after-logical-index-evacuation");
+            }
+        }
         Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_execute_adopted_terminal_index_evacuation_in(
+        &mut self,
+        transaction: &mut Transaction,
+        prepared: &crate::PreparedDdlStatement,
+    ) -> Result<crate::DdlOutcome, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let crate::CompiledDdlStatement::DropIndex(statement) = &prepared.compiled else {
+            return Err(DatabaseError::UnsupportedDdlCombination);
+        };
+        if transaction.has_pending_index_creations() {
+            return Err(DatabaseError::UnsupportedDdlCombination);
+        }
+        let Some(target) = self.validate_drop_target(statement, Some(transaction))? else {
+            return Ok(crate::DdlOutcome::Unchanged);
+        };
+        let result = self.apply_adopted_source_drop_index_with_context(
+            transaction,
+            target,
+            AdoptedIndexDropContext::TerminalEvacuation,
+        );
+        self.handle_composition_accept_result(transaction, &result);
+        result
     }
 
     fn apply_index_drop_to_plan(

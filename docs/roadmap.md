@@ -1,5 +1,27 @@
 # NetbaDB roadmap
 
+## Indexed shadow-column swap audit (Round 57 complete; production deferred)
+
+- selected terminal logical index evacuation: an effective same-table DROP in
+  Backfilling should seal the deferred program and enter FinalRefining, while
+  further drops remain there and the first CREATE still enters
+  IndexFinalizing;
+- proved with a test-only typed routing context that S1/I1 and the captured
+  source index digest remain unchanged, same-name recreation reserves a fresh
+  IndexId, and full C2-to-C4 replacement uses one source pass and one S2;
+- proved table-noop/index-effective composition collapses to the existing
+  same-S1 `InPlaceIndexDelta`, including the Enabled Change Stream control,
+  while real replacement remains subject to the Round 52 guard;
+- covered pre/post-CORD recovery, three reopens, Phase 3A one-G structural
+  publication, Phase 3B prior-pending-Complete ordering, rollback and allocator
+  burns without adding a format or recovery replay;
+- retained the production blocker: DROP INDEX still seals IndexFinalizing, so
+  the following structural ALTER remains `25000`. Round 58 owns the bounded
+  production routing change.
+
+See
+[`deferred-index-evacuation-round57.md`](deferred-index-evacuation-round57.md).
+
 ## Global commit sync pipeline (Phase 3B complete)
 
 - pure global Heap/LSM data commits retain a synced sequenced Decision as the
