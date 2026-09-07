@@ -455,6 +455,16 @@ written to S2. The existing ColumnId-only E-to-F projection, one source pass,
 one S2, tag25/tag35 evidence, CORD recovery, Round 52 replacement guard, and
 Phase 3A single-snapshot publication remain authoritative.
 
+[Round 58](deferred-index-evacuation-round58.md) makes terminal index
+evacuation a production context in that same state machine. Only an effective
+DROP INDEX in Backfilling or FinalRefining removes the exact I1 binding from the
+private logical inventory and enters or remains in FinalRefining. Physical and
+committed S1 retain I1/C2, and the captured index digest is revalidated without
+being rewritten. A same-name CREATE reserves fresh I2/C4 and seals
+IndexFinalizing. The existing finalizer chooses one S1-to-S2 rewrite or an
+honest same-S1 index delta; Round 52 admission, CORD recovery, Phase 3A
+publication and Phase 3B structural Complete synchronization are unchanged.
+
 [Phase 3B](phase3b-global-commit-pipeline.md) preserves that one-G publication
 model while moving only a pure data transaction's Complete sync out of its
 foreground path. Decision sync remains the irreversible commit point;

@@ -1,9 +1,7 @@
-//! Round 57 executable architecture evidence for terminal logical index evacuation.
+//! Round 58 production coverage for terminal logical index evacuation.
 //!
-//! Production DROP INDEX routing deliberately remains unchanged. The only
-//! prototype seam is `audit_execute_adopted_terminal_index_evacuation_in`,
-//! which selects the proposed typed context around the production logical
-//! drop composer.
+//! Statements enter through the ordinary Database execution API. The
+//! source Heap and its indexes remain physical authority until finalization.
 
 use super::*;
 use crate::schema_composition::SchemaCompositionState;
@@ -23,7 +21,7 @@ const SHADOW: ColumnId = ColumnId(4);
 
 fn root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "netbadb-round57-{name}-{}-{:?}",
+        "netbadb-round58-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -131,7 +129,7 @@ fn evacuate(
     transaction: &mut Transaction,
     prepared: &PreparedDdlStatement,
 ) -> Result<DdlOutcome, DatabaseError> {
-    database.audit_execute_adopted_terminal_index_evacuation_in(transaction, prepared)
+    database.execute_ddl_in(transaction, prepared)
 }
 
 fn source_digest(database: &mut Database, storage: StorageId) -> [u8; 32] {
@@ -251,8 +249,8 @@ fn finish_shadow_swap(database: &mut Database, transaction: &mut Transaction) ->
 }
 
 #[test]
-fn production_drop_still_seals_and_exposes_the_round57_blocker() {
-    let path = root("production-negative");
+fn production_drop_enters_final_refining_and_keeps_terminal_structure_open() {
+    let path = root("production-route");
     let mut database = seed(&path);
     let mut transaction = adopt_shadow(&mut database);
     prepare_shadow(&mut database, &mut transaction);
@@ -263,22 +261,22 @@ fn production_drop_still_seals_and_exposes_the_round57_blocker() {
     );
     assert!(matches!(
         transaction.schema_composition,
-        SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
+        SchemaCompositionState::AdoptedSourceFinalRefining(_)
     ));
-    assert!(matches!(
-        database.execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN legacy"),
-        Err(DatabaseError::SchemaMutation(
-            SchemaMutationError::SchemaMutationAfterMaterialization
-        ))
-    ));
+    assert_eq!(
+        database
+            .execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN legacy")
+            .unwrap(),
+        ExecutionResult::AffectedRows(0)
+    );
     transaction.rollback().unwrap();
     database.close().unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
-fn candidate_a_full_indexed_swap_is_logical_until_one_s2_finalization() {
-    let path = root("candidate-a-full");
+fn full_indexed_swap_is_logical_until_one_s2_finalization() {
+    let path = root("full-indexed-swap");
     let mut database = seed(&path);
     let source = database.bindings.resolve_single(USERS).unwrap();
     let target_floor = database.next_storage_id().unwrap();
@@ -485,16 +483,18 @@ fn evacuation_requires_backfilling_but_any_effective_same_table_drop_qualifies()
     let mut database = seed_with_config(&path, false, true);
     let mut transaction = adopt_shadow(&mut database);
     let early = prepared_ddl(&database, &transaction, "DROP INDEX users_legacy_idx");
-    assert!(matches!(
-        evacuate(&mut database, &mut transaction, &early),
-        Err(DatabaseError::SchemaMutation(
-            SchemaMutationError::SchemaMutationAfterMaterialization
-        ))
-    ));
+    assert_eq!(
+        evacuate(&mut database, &mut transaction, &early).unwrap(),
+        DdlOutcome::Dropped
+    );
     assert!(matches!(
         transaction.schema_composition,
-        SchemaCompositionState::AdoptedSourceRefining(_)
+        SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
     ));
+    transaction.rollback().unwrap();
+    std::mem::drop(transaction);
+
+    let mut transaction = adopt_shadow(&mut database);
     prepare_shadow(&mut database, &mut transaction);
     let unrelated = prepared_ddl(&database, &transaction, "DROP INDEX users_flag_idx");
     assert_eq!(
@@ -596,10 +596,12 @@ fn table_noop_index_delta_stays_on_s1_and_is_change_stream_safe() {
         } else {
             "index-only"
         });
-        let mut database = seed(&path);
+        let mut database = seed_with_config(&path, true, false);
         if enabled {
             database.enable_change_stream(USERS).unwrap();
         }
+        let visibility_before = database.inspect_global_visibility().unwrap();
+        let snapshot_before = database.current_database_snapshot().unwrap().unwrap();
         let stream_before = database.inspect_change_stream(USERS).unwrap();
         let source = database.bindings.resolve_single(USERS).unwrap();
         let storage_floor = database.next_storage_id().unwrap();
@@ -639,6 +641,34 @@ fn table_noop_index_delta_stays_on_s1_and_is_change_stream_safe() {
         assert_eq!(base_indexes.active, vec![old]);
         assert!(final_indexes.active.is_empty());
         database.commit_transaction(&mut transaction).unwrap();
+        let snapshot_after = database.current_database_snapshot().unwrap().unwrap();
+        assert_eq!(
+            snapshot_after.commit_seq(),
+            DatabaseCommitSeq(snapshot_before.commit_seq().0 + 1)
+        );
+        assert!(snapshot_after.boundary(source).is_some());
+        let visibility_after = database.inspect_global_visibility().unwrap();
+        assert_eq!(
+            visibility_after.published_commit_seq,
+            Some(snapshot_after.commit_seq())
+        );
+        assert_eq!(
+            visibility_after.decision_sync_count,
+            visibility_before.decision_sync_count + 1
+        );
+        assert_eq!(
+            visibility_after.combined_pipeline_sync_count,
+            visibility_before.combined_pipeline_sync_count
+        );
+        assert_eq!(
+            visibility_after.checkpoint_sync_count,
+            visibility_before.checkpoint_sync_count + 1
+        );
+        assert_eq!(visibility_after.pending_complete_count, 0);
+        assert_eq!(
+            visibility_after.last_synced_complete,
+            Some(snapshot_after.commit_seq())
+        );
         assert_eq!(database.bindings.resolve_single(USERS), Ok(source));
         assert_eq!(database.next_storage_id(), Some(storage_floor));
         assert!(database.indexes(USERS).unwrap().is_empty());
@@ -663,6 +693,46 @@ fn table_noop_index_delta_stays_on_s1_and_is_change_stream_safe() {
         database.close().unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }
+}
+
+#[test]
+fn indexed_terminal_migration_keeps_maintenance_busy_and_non_authoritative() {
+    let path = root("maintenance");
+    let projection_path = path.join("projection");
+    let mut database = seed(&path);
+    database.enable_change_stream(USERS).unwrap();
+    database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            USERS,
+            &projection_path,
+            vec![ID, OLD_LEGACY],
+        ))
+        .unwrap();
+    database
+        .execute("UPDATE users SET legacy = 'pending' WHERE id = 1")
+        .unwrap();
+    let manifest = projection_path.join("projection.nbcmanifest");
+    let before = std::fs::read(&manifest).unwrap();
+    let mut transaction = adopt_shadow(&mut database);
+    prepare_shadow(&mut database, &mut transaction);
+    let drop = prepared_ddl(&database, &transaction, "DROP INDEX users_legacy_idx");
+    evacuate(&mut database, &mut transaction, &drop).unwrap();
+
+    let budget = MaintenanceBudget::new(1 << 20, 1 << 30, 1 << 20, 16);
+    let inspection = database.inspect_maintenance(budget).unwrap();
+    assert!(inspection.decision.is_none());
+    assert!(inspection.candidates.iter().any(|candidate| {
+        matches!(candidate.action, MaintenanceAction::AdvanceColumnar { .. })
+            && candidate.blocker == Some(MaintenanceBlocker::Busy)
+    }));
+    assert!(matches!(
+        database.maintenance_step(budget).unwrap().outcome,
+        MaintenanceOutcome::NoWork
+    ));
+    assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -764,6 +834,10 @@ fn structural_swap_checkpoints_a_prior_phase3b_complete_and_publishes_one_g() {
     assert_eq!(pure.checkpoint_sync_count, baseline.checkpoint_sync_count);
 
     let structural_before = database.current_database_snapshot().unwrap().unwrap();
+    let source = database.bindings.resolve_single(USERS).unwrap();
+    let target = database.next_storage_id().unwrap();
+    assert!(structural_before.boundary(source).is_some());
+    assert!(structural_before.boundary(target).is_none());
     let mut transaction = adopt_shadow(&mut database);
     prepare_shadow(&mut database, &mut transaction);
     let drop = prepared_ddl(&database, &transaction, "DROP INDEX users_legacy_idx");
@@ -780,6 +854,8 @@ fn structural_swap_checkpoints_a_prior_phase3b_complete_and_publishes_one_g() {
         final_snapshot.commit_seq().0,
         structural_before.commit_seq().0 + 1
     );
+    assert!(final_snapshot.boundary(source).is_none());
+    assert!(final_snapshot.boundary(target).is_some());
     let structural = database.inspect_global_visibility().unwrap();
     assert_eq!(
         structural.published_commit_seq,
@@ -874,12 +950,12 @@ fn rollback_needs_no_physical_restore_and_index_id_burns_remain_monotonic() {
 }
 
 #[test]
-fn round57_indexed_swap_crash_child() {
-    let Ok(path) = std::env::var("NETBADB_ROUND57_CRASH_ROOT") else {
+fn round58_indexed_swap_crash_child() {
+    let Ok(path) = std::env::var("NETBADB_ROUND58_CRASH_ROOT") else {
         return;
     };
     let mut database = Database::open_catalog(Path::new(&path).join("catalog")).unwrap();
-    if std::env::var_os("NETBADB_ROUND57_PRIOR_PENDING").is_some() {
+    if std::env::var_os("NETBADB_ROUND58_PRIOR_PENDING").is_some() {
         database
             .execute("UPDATE users SET flag = false WHERE id = 1")
             .unwrap();
@@ -900,7 +976,7 @@ fn round57_indexed_swap_crash_child() {
     evacuate(&mut database, &mut transaction, &drop).unwrap();
     finish_shadow_swap(&mut database, &mut transaction);
     database.commit_transaction(&mut transaction).unwrap();
-    panic!("configured Round 57 crash hook was not reached");
+    panic!("configured Round 58 crash hook was not reached");
 }
 
 fn assert_no_stage(path: &Path) {
@@ -962,7 +1038,7 @@ fn assert_recovered_indexed_swap(database: &mut Database, source: StorageId, win
 fn indexed_swap_pre_and_post_cord_matrix_converges_on_three_reopens() {
     let cases = [
         (
-            "round57-after-logical-index-evacuation",
+            "round58-after-logical-index-evacuation",
             false,
             false,
             false,
@@ -999,10 +1075,10 @@ fn indexed_swap_pre_and_post_cord_matrix_converges_on_three_reopens() {
         command
             .args([
                 "--exact",
-                "deferred_index_evacuation_audit_tests::round57_indexed_swap_crash_child",
+                "deferred_index_evacuation_tests::round58_indexed_swap_crash_child",
                 "--nocapture",
             ])
-            .env("NETBADB_ROUND57_CRASH_ROOT", &path);
+            .env("NETBADB_ROUND58_CRASH_ROOT", &path);
         if reverse {
             command.env("NETBADB_REVERSE_PARTICIPANT_COMMIT", "1");
         }
@@ -1046,11 +1122,11 @@ fn prior_pending_complete_and_structural_crash_preserve_g_order() {
         command
             .args([
                 "--exact",
-                "deferred_index_evacuation_audit_tests::round57_indexed_swap_crash_child",
+                "deferred_index_evacuation_tests::round58_indexed_swap_crash_child",
                 "--nocapture",
             ])
-            .env("NETBADB_ROUND57_CRASH_ROOT", &path)
-            .env("NETBADB_ROUND57_PRIOR_PENDING", "1")
+            .env("NETBADB_ROUND58_CRASH_ROOT", &path)
+            .env("NETBADB_ROUND58_PRIOR_PENDING", "1")
             .env(
                 "NETBADB_COORDINATOR_CRASH_ARM_FILE",
                 path.join("arm-structural-crash"),

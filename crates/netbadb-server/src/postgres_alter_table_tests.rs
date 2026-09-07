@@ -83,6 +83,26 @@ fn terminal_layout_project(name: &str) -> (std::path::PathBuf, Database) {
     (root, db)
 }
 
+fn indexed_terminal_layout_project(name: &str) -> (std::path::PathBuf, Database) {
+    let (root, mut db) = terminal_layout_project(name);
+    db.execute("CREATE INDEX accounts_legacy_idx ON accounts(legacy)")
+        .unwrap();
+    (root, db)
+}
+
+fn prepare_indexed_terminal_swap(admin: &mut PgWorkerSession, db: &mut Database) {
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 999",
+        "ALTER TABLE accounts ADD COLUMN shadow TEXT",
+        "UPDATE accounts SET shadow = legacy WHERE legacy IS NOT NULL",
+        "UPDATE accounts SET shadow = 'missing' WHERE shadow IS NULL",
+        "ALTER TABLE accounts ALTER COLUMN shadow SET NOT NULL",
+    ] {
+        ok(&sql(admin, db, source));
+    }
+}
+
 fn layout_project_with_email_nullability(
     name: &str,
     email_not_null: bool,
@@ -2560,6 +2580,198 @@ fn pg_round56_simple_atomic_shadow_swap_uses_exact_tags_and_reopens() {
     }
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round58_simple_indexed_shadow_swap_reuses_name_and_reopens() {
+    let (root, mut db) = indexed_terminal_layout_project("round58-indexed-swap");
+    let table_id = db.schema().table("accounts").unwrap().id;
+    let old_index = db.indexes(table_id).unwrap()[0].id;
+    let mut admin = session(&db, true);
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
+        (
+            "UPDATE accounts SET legacy = 'updated1' WHERE id = 1",
+            "UPDATE 1",
+        ),
+        (
+            "INSERT INTO accounts VALUES (4, 'inserted4', true)",
+            "INSERT 0 1",
+        ),
+        ("DELETE FROM accounts WHERE id = 2", "DELETE 1"),
+        ("ALTER TABLE accounts ADD COLUMN shadow TEXT", "ALTER TABLE"),
+        (
+            "UPDATE accounts SET shadow = legacy WHERE legacy IS NOT NULL",
+            "UPDATE 2",
+        ),
+        (
+            "UPDATE accounts SET shadow = 'missing' WHERE shadow IS NULL",
+            "UPDATE 1",
+        ),
+        (
+            "ALTER TABLE accounts ALTER COLUMN shadow SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        ("DROP INDEX accounts_legacy_idx", "DROP INDEX"),
+        ("ALTER TABLE accounts DROP COLUMN legacy", "ALTER TABLE"),
+        (
+            "ALTER TABLE accounts RENAME COLUMN shadow TO legacy",
+            "ALTER TABLE",
+        ),
+        (
+            "CREATE INDEX accounts_legacy_idx ON accounts(legacy)",
+            "CREATE INDEX",
+        ),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+            ],
+            "{source}"
+        );
+    }
+
+    for _ in 0..3 {
+        let table = db.schema().table("accounts").unwrap();
+        assert_eq!(table.column("legacy").unwrap().id, ColumnId(4));
+        assert!(table.column_by_id(ColumnId(2)).is_none());
+        let indexes = db.indexes(table_id).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_ne!(indexes[0].id, old_index);
+        assert_eq!(indexes[0].column_id, ColumnId(4));
+        assert_eq!(
+            db.query("SELECT id, legacy FROM accounts ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![ScalarValue::Int64(1), ScalarValue::Text("updated1".into())],
+                vec![ScalarValue::Int64(3), ScalarValue::Text("missing".into())],
+                vec![ScalarValue::Int64(4), ScalarValue::Text("inserted4".into())],
+            ]
+        );
+        db.close().unwrap();
+        db = Database::open_catalog(root.join("catalog")).unwrap();
+    }
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round58_unchanged_drop_does_not_seal_but_effective_drop_does() {
+    let (root, mut db) = indexed_terminal_layout_project("round58-drop-phases");
+    let mut admin = session(&db, true);
+    prepare_indexed_terminal_swap(&mut admin, &mut db);
+    assert_eq!(
+        sql(
+            &mut admin,
+            &mut db,
+            "DROP INDEX IF EXISTS index_that_is_not_here"
+        ),
+        [
+            BackendMessage::CommandComplete("DROP INDEX".into()),
+            BackendMessage::ReadyForQuery(b'T'),
+        ]
+    );
+    assert_eq!(
+        sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET shadow = shadow WHERE id = 999"
+        ),
+        [
+            BackendMessage::CommandComplete("UPDATE 0".into()),
+            BackendMessage::ReadyForQuery(b'T'),
+        ]
+    );
+    ok(&sql(&mut admin, &mut db, "DROP INDEX accounts_legacy_idx"));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET shadow = shadow WHERE id = 999",
+        ),
+        "25000",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    for (name, statement) in [
+        (
+            "round58-nullability-closed",
+            "ALTER TABLE accounts ALTER COLUMN shadow DROP NOT NULL",
+        ),
+        (
+            "round58-add-closed",
+            "ALTER TABLE accounts ADD COLUMN later TEXT",
+        ),
+    ] {
+        let (root, mut db) = indexed_terminal_layout_project(name);
+        let mut admin = session(&db, true);
+        prepare_indexed_terminal_swap(&mut admin, &mut db);
+        ok(&sql(&mut admin, &mut db, "DROP INDEX accounts_legacy_idx"));
+        state(&sql(&mut admin, &mut db, statement), "25000");
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn pg_round58_rollback_and_active_stream_keep_the_old_indexed_source() {
+    for enabled in [false, true] {
+        let (root, mut db) = indexed_terminal_layout_project(if enabled {
+            "round58-stream-block"
+        } else {
+            "round58-rollback"
+        });
+        let table_id = db.schema().table("accounts").unwrap().id;
+        let old_index = db.indexes(table_id).unwrap()[0].clone();
+        if enabled {
+            db.enable_change_stream(table_id).unwrap();
+        }
+        let storage_floor = db.next_storage_id();
+        let mut admin = session(&db, true);
+        prepare_indexed_terminal_swap(&mut admin, &mut db);
+        for statement in [
+            "DROP INDEX accounts_legacy_idx",
+            "ALTER TABLE accounts DROP COLUMN legacy",
+            "ALTER TABLE accounts RENAME COLUMN shadow TO legacy",
+            "CREATE INDEX accounts_legacy_idx ON accounts(legacy)",
+        ] {
+            ok(&sql(&mut admin, &mut db, statement));
+        }
+        if enabled {
+            state(&sql(&mut admin, &mut db, "COMMIT"), "0A000");
+            state(
+                &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+                "25000",
+            );
+        }
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        assert_eq!(db.next_storage_id(), storage_floor);
+        let table = db.schema().table("accounts").unwrap();
+        assert_eq!(table.column("legacy").unwrap().id, ColumnId(2));
+        assert!(table.column_by_id(ColumnId(4)).is_none());
+        assert_eq!(db.indexes(table_id).unwrap(), &[old_index]);
+        db.close().unwrap();
+        db = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            db.schema()
+                .table("accounts")
+                .unwrap()
+                .column("legacy")
+                .unwrap()
+                .id,
+            ColumnId(2)
+        );
+        assert_eq!(db.indexes(table_id).unwrap().len(), 1);
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

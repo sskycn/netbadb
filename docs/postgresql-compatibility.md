@@ -375,6 +375,15 @@ nullability changes, and relational access are closed once the first terminal
 operation succeeds. See
 [production terminal structural refinement](deferred-terminal-structural-round56.md).
 
+Round 58 extends that bounded sequence to indexed shadow replacement. Once the
+deferred program is frozen, `DROP INDEX` logically evacuates the exact old
+binding without mutating its physical S1 BTree; terminal DROP/RENAME and a
+same-name CREATE INDEX then commit as one S2 with a fresh IndexId. An unchanged
+`DROP INDEX IF EXISTS` does not seal the program. Post-evacuation DML and
+nullability remain `25000`, and an active source Change Stream still rejects
+the replacement COMMIT as `0A000`. PostgreSQL delegates all behavior to Core.
+See [Round 58](deferred-index-evacuation-round58.md).
+
 ## Compatibility tracing
 
 Set `NETBADB_POSTGRES_TRACE=1` when starting the listener to log startup

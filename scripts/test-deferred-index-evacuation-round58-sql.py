@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 57 real-psql audit of the retained production index-swap blocker."""
+"""Round 58 real-psql indexed shadow-column replacement acceptance."""
 from __future__ import annotations
 
 import importlib.util
@@ -44,34 +44,41 @@ def main() -> None:
     )
 
     retained.run_fixture(
-        "indexed-drop",
+        "indexed-swap",
         r"""
 BEGIN;
 UPDATE projects SET legacy = 'updated1' WHERE id = 1;
+INSERT INTO projects VALUES (4, 'inserted4', true);
+DELETE FROM projects WHERE id = 2;
 ALTER TABLE projects ADD COLUMN shadow TEXT;
 UPDATE projects SET shadow = legacy WHERE legacy IS NOT NULL;
 UPDATE projects SET shadow = 'missing' WHERE shadow IS NULL;
 ALTER TABLE projects ALTER COLUMN shadow SET NOT NULL;
 DROP INDEX projects_legacy_idx;
-\echo ROUND57_DROP_INDEX :SQLSTATE
 ALTER TABLE projects DROP COLUMN legacy;
-\echo ROUND57_DROP_COLUMN :SQLSTATE
 ALTER TABLE projects RENAME COLUMN shadow TO legacy;
-\echo ROUND57_ABORTED :SQLSTATE
-ROLLBACK;
+CREATE INDEX projects_legacy_idx ON projects(legacy);
+COMMIT;
+SELECT id, legacy FROM projects ORDER BY id;
 """,
         (
+            "BEGIN",
+            "UPDATE 1",
+            "INSERT 0 1",
+            "DELETE 1",
+            "ALTER TABLE",
+            "UPDATE 2",
+            "UPDATE 1",
             "DROP INDEX",
-            "ROUND57_DROP_INDEX 00000",
-            "ROUND57_DROP_COLUMN 25000",
-            "ROUND57_ABORTED 25P02",
-            "ROLLBACK",
+            "CREATE INDEX",
+            "COMMIT",
+            "1|updated1",
+            "3|missing",
+            "4|inserted4",
         ),
-        # The retained fixture's indexed source is deliberately the unchanged
-        # Round 56 production route. Round 57 adds no production behavior.
-        round_number=56,
+        round_number=58,
     )
-    print("Round 57 indexed shadow-swap production blocker audit passed")
+    print("Round 58 indexed shadow-swap production acceptance passed")
 
 
 if __name__ == "__main__":
