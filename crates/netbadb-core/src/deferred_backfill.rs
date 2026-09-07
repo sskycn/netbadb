@@ -5,7 +5,7 @@
 //! finalization replays the program while projecting S1 rows into S2 and
 //! verifies that the replay produced the same ordered observation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use netbadb_executor::{evaluate_typed_row_expression, typed_row_predicate_matches};
@@ -13,7 +13,7 @@ use netbadb_rel::{
     Assignment, BinaryOp, Expr, ExprKind, LogicalPlan, LogicalStatement, OutputField,
 };
 use netbadb_schema::TableDef;
-use netbadb_types::{ColumnId, PhysicalType, ScalarValue, StorageId, TableId};
+use netbadb_types::{ColumnId, PhysicalType, ScalarValue, StorageId, TableId, TableSchemaVersion};
 use sha2::{Digest, Sha256};
 
 use crate::schema_composition::{MAX_SCHEMA_ACTIONS, RowProjection, SchemaCompositionState};
@@ -31,6 +31,152 @@ type EvaluatedAssignments = Vec<(ColumnId, usize, ScalarValue)>;
 struct EvaluationLayout {
     fields: Vec<OutputField>,
     target_positions: Vec<usize>,
+}
+
+/// Immutable row layout captured by the first accepted deferred action.
+///
+/// Names and nullability are retained because `TableDef` is the existing
+/// checked schema primitive, but only TableId, ordered ColumnIds, and semantic
+/// types define compatibility with later action layouts. Final constraints
+/// always come from the final table, not this snapshot.
+#[derive(Debug, Clone)]
+struct FrozenEvaluationSchema {
+    table: TableDef,
+    version: TableSchemaVersion,
+}
+
+impl FrozenEvaluationSchema {
+    fn capture(table: &TableDef, version: TableSchemaVersion) -> Self {
+        Self {
+            table: table.clone(),
+            version,
+        }
+    }
+
+    fn validate_layout(&self, table: &TableDef) -> Result<(), DatabaseError> {
+        if self.table.id != table.id
+            || self.table.columns.len() != table.columns.len()
+            || self
+                .table
+                .columns
+                .iter()
+                .zip(&table.columns)
+                .any(|(frozen, current)| {
+                    frozen.id != current.id || frozen.semantic_type() != current.semantic_type()
+                })
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "deferred evaluation layout changed after freeze",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalOutputEntry {
+    column_id: ColumnId,
+    evaluation_position: usize,
+    target_nullable: bool,
+}
+
+/// Checked E-to-F projection. Output order and constraints come exclusively
+/// from F; cached ordinals are derived only after exact ColumnId/type matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalOutputProjection {
+    evaluation_width: usize,
+    entries: Vec<FinalOutputEntry>,
+    identity: bool,
+}
+
+impl FinalOutputProjection {
+    fn build(evaluation: &TableDef, final_table: &TableDef) -> Result<Self, DatabaseError> {
+        evaluation.validate()?;
+        final_table.validate()?;
+        if evaluation.id != final_table.id {
+            return Err(SchemaMutationError::InvalidSchemaEvolution(
+                "final output projection changes TableId",
+            )
+            .into());
+        }
+        let evaluation_by_id = evaluation
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| (column.id, (position, column)))
+            .collect::<HashMap<_, _>>();
+        let entries = final_table
+            .columns
+            .iter()
+            .map(|final_column| {
+                let (evaluation_position, evaluation_column) = evaluation_by_id
+                    .get(&final_column.id)
+                    .ok_or(SchemaMutationError::InvalidSchemaEvolution(
+                        "final column is absent from frozen evaluation schema",
+                    ))?;
+                if evaluation_column.semantic_type() != final_column.semantic_type() {
+                    return Err(SchemaMutationError::UnsupportedSchemaEvolution);
+                }
+                Ok(FinalOutputEntry {
+                    column_id: final_column.id,
+                    evaluation_position: *evaluation_position,
+                    target_nullable: final_column.nullable,
+                })
+            })
+            .collect::<Result<Vec<_>, SchemaMutationError>>()?;
+        let identity = entries.len() == evaluation.columns.len()
+            && entries
+                .iter()
+                .enumerate()
+                .all(|(position, entry)| entry.evaluation_position == position);
+        Ok(Self {
+            evaluation_width: evaluation.columns.len(),
+            entries,
+            identity,
+        })
+    }
+
+    fn project(
+        &self,
+        evaluation_values: Vec<ScalarValue>,
+    ) -> Result<Vec<ScalarValue>, DatabaseError> {
+        if evaluation_values.len() != self.evaluation_width {
+            return Err(SchemaMutationError::Corrupt(
+                "final output projection source width mismatch",
+            )
+            .into());
+        }
+        let final_values = if self.identity {
+            evaluation_values
+        } else {
+            self.entries
+                .iter()
+                .map(|entry| {
+                    evaluation_values
+                        .get(entry.evaluation_position)
+                        .cloned()
+                        .ok_or_else(|| {
+                            SchemaMutationError::Corrupt(
+                                "final output projection ordinal out of bounds",
+                            )
+                            .into()
+                        })
+                })
+                .collect::<Result<Vec<_>, DatabaseError>>()?
+        };
+        for (entry, value) in self.entries.iter().zip(&final_values) {
+            if !entry.target_nullable && matches!(value, ScalarValue::Null) {
+                return Err(SchemaMutationError::NotNullViolation(entry.column_id).into());
+            }
+        }
+        Ok(final_values)
+    }
+}
+
+pub(crate) struct DeferredFinalizationProjection {
+    base_to_evaluation: RowProjection,
+    evaluation_to_final: FinalOutputProjection,
 }
 
 impl EvaluationLayout {
@@ -149,11 +295,31 @@ impl DeferredBackfillAction {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeferredBackfillProgram {
     actions: Vec<DeferredBackfillAction>,
+    evaluation_schema: Option<FrozenEvaluationSchema>,
 }
 
 impl DeferredBackfillProgram {
     pub(crate) fn is_empty(&self) -> bool {
         self.actions.is_empty()
+    }
+
+    fn validate_evaluation_layout(&self, target: &TableDef) -> Result<(), DatabaseError> {
+        if let Some(evaluation) = &self.evaluation_schema {
+            evaluation.validate_layout(target)?;
+        }
+        Ok(())
+    }
+
+    fn accept_action(
+        &mut self,
+        action: DeferredBackfillAction,
+        target: &TableDef,
+        target_version: TableSchemaVersion,
+    ) {
+        if self.evaluation_schema.is_none() {
+            self.evaluation_schema = Some(FrozenEvaluationSchema::capture(target, target_version));
+        }
+        self.actions.push(action);
     }
 
     pub(crate) fn begin_finalization(&self) -> Vec<ActionAccumulator> {
@@ -195,6 +361,44 @@ impl DeferredBackfillProgram {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn build_finalization_projection(
+        &self,
+        source: &TableDef,
+        source_version: TableSchemaVersion,
+        final_table: &TableDef,
+        reserved_new_columns: &BTreeSet<ColumnId>,
+    ) -> Result<DeferredFinalizationProjection, DatabaseError> {
+        let evaluation = self
+            .evaluation_schema
+            .as_ref()
+            .ok_or(SchemaMutationError::Corrupt(
+                "deferred evaluation schema is absent",
+            ))?;
+        Ok(DeferredFinalizationProjection {
+            base_to_evaluation: RowProjection::build(
+                source,
+                source_version,
+                &evaluation.table,
+                evaluation.version,
+                reserved_new_columns,
+            )?,
+            evaluation_to_final: FinalOutputProjection::build(&evaluation.table, final_table)?,
+        })
+    }
+
+    pub(crate) fn project_final_row(
+        &self,
+        projection: &DeferredFinalizationProjection,
+        source_values: &[ScalarValue],
+        observations: &mut [ActionAccumulator],
+    ) -> Result<Vec<ScalarValue>, DatabaseError> {
+        let mut evaluation_values = projection
+            .base_to_evaluation
+            .project_without_target_constraints(source_values)?;
+        self.apply_row(source_values, &mut evaluation_values, observations)?;
+        projection.evaluation_to_final.project(evaluation_values)
     }
 
     pub(crate) fn verify_finalization(
@@ -249,6 +453,9 @@ impl DeferredBackfillProgram {
         use std::mem::size_of;
 
         size_of::<Self>()
+            + self.evaluation_schema.as_ref().map_or(0, |evaluation| {
+                evaluation.table.columns.capacity() * size_of::<netbadb_schema::ColumnDef>()
+            })
             + self.actions.capacity() * size_of::<DeferredBackfillAction>()
             + self
                 .actions
@@ -259,6 +466,32 @@ impl DeferredBackfillProgram {
                         + action.assignments.capacity() * size_of::<DeferredAssignment>()
                 })
                 .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluation_column_ids(&self) -> Option<Vec<ColumnId>> {
+        self.evaluation_schema.as_ref().map(|evaluation| {
+            evaluation
+                .table
+                .columns
+                .iter()
+                .map(|column| column.id)
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action_cached_positions(&self, index: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        self.actions.get(index).map(|action| {
+            (
+                action.layout.target_positions.clone(),
+                action
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.target_position)
+                    .collect(),
+            )
+        })
     }
 }
 
@@ -660,6 +893,14 @@ fn try_execute_adopted_update_inner(
     ) {
         return Ok(None);
     }
+    #[cfg(test)]
+    if transaction
+        .schema_composition
+        .adopted_source()
+        .is_some_and(|adopted| adopted.terminal_structural_audit_sealed)
+    {
+        return Ok(None);
+    }
     let parts = adopted_parts(transaction)?;
     let Some(mut action) = build_action(statement, &parts.base, &parts.target, &parts.reserved)?
     else {
@@ -669,6 +910,9 @@ fn try_execute_adopted_update_inner(
         .schema_composition
         .plan()
         .ok_or(SchemaMutationError::Corrupt("deferred plan absent"))?;
+    plan.deferred_backfill
+        .validate_evaluation_layout(&parts.target)?;
+    let target_version = plan.dependency(parts.table)?.table_version;
     if plan.deferred_backfill.actions.len() >= MAX_DEFERRED_ACTIONS
         || plan.action_count() >= MAX_SCHEMA_ACTIONS
     {
@@ -740,7 +984,10 @@ fn try_execute_adopted_update_inner(
                 "deferred adopted state disappeared",
             ))?;
     adopted.logical.action_evidence.push(semantic_digest);
-    adopted.logical.deferred_backfill.actions.push(action);
+    adopted
+        .logical
+        .deferred_backfill
+        .accept_action(action, &parts.target, target_version);
 
     let previous = std::mem::replace(
         &mut transaction.schema_composition,
@@ -770,6 +1017,55 @@ pub(crate) struct VirtualAuditReplayCost {
     pub(crate) actions: usize,
     pub(crate) action_evaluations: u64,
     pub(crate) resident_metadata_bytes_estimate: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FinalOutputAuditCost {
+    pub(crate) rows: usize,
+    pub(crate) evaluation_width: usize,
+    pub(crate) final_width: usize,
+    pub(crate) dropped_columns: usize,
+    pub(crate) output_allocations: usize,
+    pub(crate) copied_values: usize,
+}
+
+/// Deterministic Round 55 cost probe for the additional E-to-F projection.
+#[cfg(test)]
+pub(crate) fn audit_final_output_projection(
+    evaluation: &TableDef,
+    final_table: &TableDef,
+    row: &[ScalarValue],
+    rows: usize,
+) -> Result<FinalOutputAuditCost, DatabaseError> {
+    let projection = FinalOutputProjection::build(evaluation, final_table)?;
+    if row.len() != evaluation.columns.len() {
+        return Err(
+            SchemaMutationError::Corrupt("terminal projection audit row width mismatch").into(),
+        );
+    }
+    for _ in 0..rows {
+        let projected = projection.project(row.to_vec())?;
+        std::hint::black_box(projected);
+    }
+    Ok(FinalOutputAuditCost {
+        rows,
+        evaluation_width: evaluation.columns.len(),
+        final_width: final_table.columns.len(),
+        dropped_columns: evaluation
+            .columns
+            .len()
+            .checked_sub(final_table.columns.len())
+            .ok_or(SchemaMutationError::Corrupt(
+                "terminal projection audit expands final schema",
+            ))?,
+        output_allocations: usize::from(!projection.identity).checked_mul(rows).ok_or(
+            SchemaMutationError::Corrupt("terminal projection allocation count overflow"),
+        )?,
+        copied_values: final_table.columns.len().checked_mul(rows).ok_or(
+            SchemaMutationError::Corrupt("terminal projection copy count overflow"),
+        )?,
+    })
 }
 
 /// Deterministic in-memory replay probe retained for the bounded cost test.

@@ -1,5 +1,10 @@
 # Production VirtualRow late-column reads (Round 54)
 
+> Round 55 subsequently audited a test-only frozen-E/final-F terminal
+> structural architecture. Production DROP/RENAME after deferred backfill
+> remains closed; see
+> [`deferred-terminal-structural-round55.md`](deferred-terminal-structural-round55.md).
+
 Round 54 productionizes the Candidate A semantics selected by the
 [Round 53 audit](deferred-virtual-row-round53.md). During the bounded adopted-
 source backfill phase, a deferred same-table `UPDATE` may now read both

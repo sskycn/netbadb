@@ -1,5 +1,22 @@
 # NetbaDB roadmap
 
+## Post-backfill terminal structural refinement audit (Round 55 complete)
+
+- selected Frozen EvaluationSchema E plus a checked ColumnId-only
+  FinalOutputProjection into final TableDef F;
+- proved test-only DROP of program sources and late intermediates, same-name
+  C2-to-C4 replacement, RENAME TABLE, final C4 BTree binding, one S2/no S3,
+  rollback, digest binding, and three-reopen crash convergence;
+- retained the production structural-after-backfill gate, PostgreSQL
+  `25000`/`25P02`, Round 52 stream guard, derived Columnar authority, and Phase
+  2E maintenance isolation;
+- recommends a bounded Round 56 `AdoptedSourceFinalRefining` phase for
+  unindexed, non-PK source columns only; ADD, type conversion, post-terminal
+  DML/nullability, implicit index changes, and persistent E remain closed.
+
+See
+[`deferred-terminal-structural-round55.md`](deferred-terminal-structural-round55.md).
+
 ## Production VirtualRow late-column reads (Round 54 complete)
 
 - removed the test-only read-authority split and productionized Candidate A

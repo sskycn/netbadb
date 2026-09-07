@@ -2477,6 +2477,46 @@ fn pg_round54_terminal_index_phase_closes_late_read_updates() {
 }
 
 #[test]
+fn pg_round55_terminal_structural_alter_remains_a_production_error() {
+    for (name, terminal) in [
+        (
+            "round55-drop-closed",
+            "ALTER TABLE accounts DROP COLUMN legacy",
+        ),
+        (
+            "round55-rename-column-closed",
+            "ALTER TABLE accounts RENAME COLUMN shadow TO replacement",
+        ),
+        (
+            "round55-rename-table-closed",
+            "ALTER TABLE accounts RENAME TO people",
+        ),
+    ] {
+        let (root, mut db) = layout_project(name);
+        let mut admin = session(&db, true);
+        for source in [
+            "BEGIN",
+            "UPDATE accounts SET legacy = legacy WHERE id = 999",
+            "ALTER TABLE accounts ADD COLUMN shadow TEXT",
+            "UPDATE accounts SET shadow = legacy WHERE shadow IS NULL",
+        ] {
+            ok(&sql(&mut admin, &mut db, source));
+        }
+        state(&sql(&mut admin, &mut db, terminal), "25000");
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        let table = db.schema().table("accounts").unwrap();
+        assert_eq!(table.column("legacy").unwrap().id, ColumnId(2));
+        assert!(table.column("shadow").is_none());
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn pg_round54_enabled_stream_accepts_updates_but_blocks_commit() {
     let (root, mut db) = layout_project("round54-enabled-stream");
     let table = db.schema().table("accounts").unwrap().id;

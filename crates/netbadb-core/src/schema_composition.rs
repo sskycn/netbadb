@@ -256,6 +256,10 @@ pub(crate) struct AdoptedSourceTransaction {
     pub(crate) base_generation: netbadb_types::SchemaGeneration,
     pub(crate) base_epoch: u64,
     pub(crate) source_index_digest: [u8; 32],
+    /// Round 55 executable-audit carrier. Production builds have no terminal
+    /// structural state and continue rejecting layout ALTER after backfill.
+    #[cfg(test)]
+    pub(crate) terminal_structural_audit_sealed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1347,6 +1351,10 @@ impl Database {
                 .schema_composition
                 .adopted_source()
                 .ok_or(SchemaMutationError::Corrupt("adopted source state absent"))?;
+            #[cfg(test)]
+            if adopted.terminal_structural_audit_sealed {
+                return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+            }
             if !Self::is_adopted_source_operation(&spec.operation) {
                 return Err(SchemaMutationError::TransactionNotPristine.into());
             }
@@ -1403,6 +1411,65 @@ impl Database {
         self.ensure_composition_started(transaction)?;
         let result = self.apply_composed_alter(transaction, spec);
         self.handle_composition_accept_result(transaction, &result);
+        result
+    }
+
+    /// Round 55 executable prototype only. This carries terminal DROP/RENAME
+    /// through the real logical ALTER composer without opening the production
+    /// gate in `compose_heap_table_schema_in`.
+    #[cfg(test)]
+    pub(crate) fn audit_apply_terminal_alter_in(
+        &mut self,
+        transaction: &mut Transaction,
+        spec: AlterTableSpec,
+    ) -> Result<(), DatabaseError> {
+        self.validate_transaction(transaction)?;
+        let adopted = match &transaction.schema_composition {
+            SchemaCompositionState::AdoptedSourceBackfilling(adopted) => adopted,
+            _ => {
+                return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+            }
+        };
+        if adopted.logical.deferred_backfill.is_empty()
+            || adopted
+                .logical
+                .deferred_backfill
+                .evaluation_column_ids()
+                .is_none()
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "terminal audit lacks frozen evaluation schema",
+            )
+            .into());
+        }
+        if !matches!(
+            spec.operation,
+            AlterTableOperation::DropColumn { .. }
+                | AlterTableOperation::RenameColumn { .. }
+                | AlterTableOperation::RenameTable { .. }
+        ) {
+            return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+        }
+        let crash_point = match &spec.operation {
+            AlterTableOperation::DropColumn { .. } => Some("round55-after-terminal-drop"),
+            AlterTableOperation::RenameColumn { .. } => Some("round55-after-terminal-rename"),
+            AlterTableOperation::RenameTable { .. } => Some("round55-after-terminal-table-rename"),
+            _ => None,
+        };
+        let result = self.apply_composed_alter(transaction, spec);
+        self.handle_composition_accept_result(transaction, &result);
+        if result.is_ok() {
+            transaction
+                .schema_composition
+                .adopted_source_mut()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "terminal audit adopted state disappeared",
+                ))?
+                .terminal_structural_audit_sealed = true;
+            if let Some(point) = crash_point {
+                crash(point);
+            }
+        }
         result
     }
 
@@ -2557,6 +2624,8 @@ impl Database {
             base_generation: snapshot.committed.generation,
             base_epoch: snapshot.epoch,
             source_index_digest,
+            #[cfg(test)]
+            terminal_structural_audit_sealed: false,
         })
     }
 
@@ -6172,19 +6241,34 @@ impl Database {
                 .map(|reservation| reservation.column)
                 .collect::<BTreeSet<_>>()
         };
-        let projection = RowProjection::build(
-            &source_table,
-            table_plan.base.committed.tables[0].version,
-            &final_table,
-            table_plan.target.committed.tables[0].version,
-            &reserved_new_columns,
-        )?;
         let deferred_backfill = transaction
             .schema_composition
             .plan()
             .ok_or(SchemaMutationError::Corrupt("composition plan absent"))?
             .deferred_backfill
             .clone();
+        let direct_projection = deferred_backfill
+            .is_empty()
+            .then(|| {
+                RowProjection::build(
+                    &source_table,
+                    table_plan.base.committed.tables[0].version,
+                    &final_table,
+                    table_plan.target.committed.tables[0].version,
+                    &reserved_new_columns,
+                )
+            })
+            .transpose()?;
+        let deferred_projection = if deferred_backfill.is_empty() {
+            None
+        } else {
+            Some(deferred_backfill.build_finalization_projection(
+                &source_table,
+                table_plan.base.committed.tables[0].version,
+                &final_table,
+                &reserved_new_columns,
+            )?)
+        };
         let mut deferred_observations = deferred_backfill.begin_finalization();
         let catalog = &transaction
             .schema_composition
@@ -6268,18 +6352,19 @@ impl Database {
                 &old_columns,
                 source_view,
                 |_row, old_values| {
-                    let values = if deferred_backfill.is_empty() {
-                        projection.project(&old_values)?
-                    } else {
-                        let mut values =
-                            projection.project_without_target_constraints(&old_values)?;
-                        deferred_backfill.apply_row(
+                    let values = match (&direct_projection, &deferred_projection) {
+                        (Some(projection), None) => projection.project(&old_values)?,
+                        (None, Some(projection)) => deferred_backfill.project_final_row(
+                            projection,
                             &old_values,
-                            &mut values,
                             &mut deferred_observations,
-                        )?;
-                        projection.validate_target_constraints(&values)?;
-                        values
+                        )?,
+                        _ => {
+                            return Err(SchemaMutationError::Corrupt(
+                                "composition row projection state invalid",
+                            )
+                            .into());
+                        }
                     };
                     transaction.with_composed_staged_write(new_storage, |storage, context| {
                         storage.insert_in(context, &values).map(|_| ())

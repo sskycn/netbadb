@@ -9421,6 +9421,8 @@ mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]
+mod deferred_terminal_structural_audit_tests;
+#[cfg(test)]
 mod deferred_virtual_row_tests;
 #[cfg(test)]
 mod indexed_nullability_audit_tests;
