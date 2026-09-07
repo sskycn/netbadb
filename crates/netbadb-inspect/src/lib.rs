@@ -1045,9 +1045,26 @@ fn scalar_text(value: &ScalarValue) -> String {
     match value {
         ScalarValue::Null => "NULL".to_owned(),
         ScalarValue::Bool(value) => format!("BOOL({value})"),
+        ScalarValue::Int8(value) => format!("INT8({value})"),
+        ScalarValue::Int16(value) => format!("INT16({value})"),
+        ScalarValue::Int32(value) => format!("INT32({value})"),
         ScalarValue::Int64(value) => format!("INT64({value})"),
+        ScalarValue::Int128(value) => format!("INT128({value})"),
+        ScalarValue::UInt8(value) => format!("UINT8({value})"),
+        ScalarValue::UInt16(value) => format!("UINT16({value})"),
+        ScalarValue::UInt32(value) => format!("UINT32({value})"),
         ScalarValue::UInt64(value) => format!("UINT64({value})"),
+        ScalarValue::UInt128(value) => format!("UINT128({value})"),
+        ScalarValue::Float32(value) => format!("FLOAT32({value})"),
+        ScalarValue::Float64(value) => format!("FLOAT64({value})"),
         ScalarValue::Text(value) => format!("TEXT(\"{}\")", escape_text(value)),
+        ScalarValue::Bytes(value) => {
+            let hex = value
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("BYTES(X'{hex}')")
+        }
     }
 }
 

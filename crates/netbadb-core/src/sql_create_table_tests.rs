@@ -87,7 +87,7 @@ fn prepare_and_invalid_sql_are_pure_then_execute_rechecks_duplicate() {
         "CREATE TABLE bad (id BIGINT PRIMARY KEY)",
         "CREATE TABLE bad (a TEXT, a TEXT)",
         "CREATE TABLE bad (a MAGIC)",
-        "CREATE TABLE bad (a INTEGER)",
+        "CREATE TABLE bad (a NUMERIC)",
         "CREATE TABLE bad (\"\" TEXT)",
         "CREATE TABLE $1 (a TEXT)",
     ] {

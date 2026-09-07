@@ -4,7 +4,9 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-pub use netbadb_types::{PhysicalType, ScalarValue, SemanticType, TableId};
+pub use netbadb_types::{
+    Float32Value, Float64Value, PhysicalType, ScalarValue, SemanticType, TableId,
+};
 
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"NDBP";
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -718,6 +720,17 @@ fn physical_type_tag(data_type: PhysicalType) -> u8 {
         PhysicalType::Int64 => 2,
         PhysicalType::UInt64 => 3,
         PhysicalType::Text => 4,
+        PhysicalType::Int8 => 5,
+        PhysicalType::Int16 => 6,
+        PhysicalType::Int32 => 7,
+        PhysicalType::Int128 => 8,
+        PhysicalType::UInt8 => 9,
+        PhysicalType::UInt16 => 10,
+        PhysicalType::UInt32 => 11,
+        PhysicalType::UInt128 => 12,
+        PhysicalType::Float32 => 13,
+        PhysicalType::Float64 => 14,
+        PhysicalType::Bytes => 15,
     }
 }
 
@@ -727,6 +740,17 @@ fn physical_type_from_tag(tag: u8) -> Result<PhysicalType, ProtocolError> {
         2 => Ok(PhysicalType::Int64),
         3 => Ok(PhysicalType::UInt64),
         4 => Ok(PhysicalType::Text),
+        5 => Ok(PhysicalType::Int8),
+        6 => Ok(PhysicalType::Int16),
+        7 => Ok(PhysicalType::Int32),
+        8 => Ok(PhysicalType::Int128),
+        9 => Ok(PhysicalType::UInt8),
+        10 => Ok(PhysicalType::UInt16),
+        11 => Ok(PhysicalType::UInt32),
+        12 => Ok(PhysicalType::UInt128),
+        13 => Ok(PhysicalType::Float32),
+        14 => Ok(PhysicalType::Float64),
+        15 => Ok(PhysicalType::Bytes),
         other => Err(ProtocolError::InvalidPhysicalType(other)),
     }
 }
@@ -750,6 +774,52 @@ fn encode_scalar(output: &mut Vec<u8>, value: &ScalarValue) -> Result<(), Protoc
             output.push(4);
             push_string(output, value)?;
         }
+        ScalarValue::Int8(value) => {
+            output.push(5);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Int16(value) => {
+            output.push(6);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Int32(value) => {
+            output.push(7);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Int128(value) => {
+            output.push(8);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt8(value) => {
+            output.push(9);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt16(value) => {
+            output.push(10);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt32(value) => {
+            output.push(11);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::UInt128(value) => {
+            output.push(12);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ScalarValue::Float32(value) => {
+            output.push(13);
+            output.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        ScalarValue::Float64(value) => {
+            output.push(14);
+            output.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        ScalarValue::Bytes(value) => {
+            output.push(15);
+            let length = u32::try_from(value.len()).map_err(|_| ProtocolError::LengthOverflow)?;
+            output.extend_from_slice(&length.to_le_bytes());
+            output.extend_from_slice(value);
+        }
     }
     Ok(())
 }
@@ -761,6 +831,25 @@ fn decode_scalar(input: &mut Cursor<'_>) -> Result<ScalarValue, ProtocolError> {
         2 => Ok(ScalarValue::Int64(input.read_i64()?)),
         3 => Ok(ScalarValue::UInt64(input.read_u64()?)),
         4 => Ok(ScalarValue::Text(input.read_string()?)),
+        5 => Ok(ScalarValue::Int8(i8::from_le_bytes(input.read_array()?))),
+        6 => Ok(ScalarValue::Int16(i16::from_le_bytes(input.read_array()?))),
+        7 => Ok(ScalarValue::Int32(i32::from_le_bytes(input.read_array()?))),
+        8 => Ok(ScalarValue::Int128(i128::from_le_bytes(
+            input.read_array()?,
+        ))),
+        9 => Ok(ScalarValue::UInt8(input.read_u8()?)),
+        10 => Ok(ScalarValue::UInt16(input.read_u16()?)),
+        11 => Ok(ScalarValue::UInt32(input.read_u32()?)),
+        12 => Ok(ScalarValue::UInt128(u128::from_le_bytes(
+            input.read_array()?,
+        ))),
+        13 => Ok(ScalarValue::Float32(Float32Value::from_bits(
+            input.read_u32()?,
+        ))),
+        14 => Ok(ScalarValue::Float64(Float64Value::from_bits(
+            input.read_u64()?,
+        ))),
+        15 => Ok(ScalarValue::Bytes(input.read_bytes()?)),
         other => Err(ProtocolError::InvalidScalarTag(other)),
     }
 }
@@ -846,6 +935,19 @@ impl<'a> Cursor<'a> {
         let value = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
         self.position = end;
         Ok(value.to_owned())
+    }
+
+    fn read_bytes(&mut self) -> Result<Vec<u8>, ProtocolError> {
+        let length = self.read_u32()? as usize;
+        if length > self.remaining() {
+            return Err(ProtocolError::InvalidPayload(
+                "byte string length exceeds remaining payload",
+            ));
+        }
+        let end = self.position + length;
+        let value = self.bytes[self.position..end].to_vec();
+        self.position = end;
+        Ok(value)
     }
 
     fn finish(self) -> Result<(), ProtocolError> {
@@ -987,6 +1089,43 @@ mod tests {
         error_expected.extend_from_slice(&7_u32.to_le_bytes());
         error_expected.extend_from_slice(b"bad SQL");
         assert_eq!(encode_server_frame(5, &error).unwrap(), error_expected);
+    }
+
+    #[test]
+    fn appended_scalar_tags_and_payloads_are_exact_and_round_trip() {
+        let values = vec![
+            ScalarValue::Int8(-1),
+            ScalarValue::Int16(-2),
+            ScalarValue::Int32(-3),
+            ScalarValue::Int128(-4),
+            ScalarValue::UInt8(5),
+            ScalarValue::UInt16(6),
+            ScalarValue::UInt32(7),
+            ScalarValue::UInt128(8),
+            ScalarValue::Float32(Float32Value::from_bits(0xffff_ffff)),
+            ScalarValue::Float64(Float64Value::new(f64::INFINITY)),
+            ScalarValue::Bytes(vec![0, 0xff]),
+        ];
+        let message = ServerMessage::QueryRow {
+            values: values.clone(),
+        };
+        let frame = encode_server_frame(77, &message).expect("encode new scalar frame");
+        let payload = &frame[FRAME_HEADER_SIZE..];
+        assert_eq!(&payload[..4], &11_u32.to_le_bytes());
+        let mut offset = 4;
+        for (tag, width) in (5_u8..=14).zip([1, 2, 4, 16, 1, 2, 4, 16, 4, 8]) {
+            assert_eq!(payload[offset], tag);
+            offset += 1 + width;
+        }
+        assert_eq!(payload[offset], 15);
+        assert_eq!(&payload[offset + 1..offset + 5], &2_u32.to_le_bytes());
+        assert_eq!(&payload[offset + 5..], &[0, 0xff]);
+        assert_eq!(
+            decode_server_frame(&frame)
+                .expect("decode new scalar frame")
+                .message,
+            ServerMessage::QueryRow { values }
+        );
     }
 
     #[test]

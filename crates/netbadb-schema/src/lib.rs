@@ -390,12 +390,23 @@ const fn physical_type_tag(physical: PhysicalType) -> u8 {
         PhysicalType::Int64 => 2,
         PhysicalType::UInt64 => 3,
         PhysicalType::Text => 4,
+        PhysicalType::Int8 => 5,
+        PhysicalType::Int16 => 6,
+        PhysicalType::Int32 => 7,
+        PhysicalType::Int128 => 8,
+        PhysicalType::UInt8 => 9,
+        PhysicalType::UInt16 => 10,
+        PhysicalType::UInt32 => 11,
+        PhysicalType::UInt128 => 12,
+        PhysicalType::Float32 => 13,
+        PhysicalType::Float64 => 14,
+        PhysicalType::Bytes => 15,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
+    use super::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec, physical_type_tag};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
 
     fn user_table() -> TableDef {
@@ -549,6 +560,31 @@ mod tests {
         assert_eq!(
             table.fingerprint().expect("fingerprint").to_string(),
             "823e72558862af9f9520020c872b4ebbdc5f63b9a93a4c460f849b935493f7c4"
+        );
+    }
+
+    #[test]
+    fn canonical_physical_tags_are_legacy_stable_and_append_only() {
+        let physical = [
+            PhysicalType::Bool,
+            PhysicalType::Int64,
+            PhysicalType::UInt64,
+            PhysicalType::Text,
+            PhysicalType::Int8,
+            PhysicalType::Int16,
+            PhysicalType::Int32,
+            PhysicalType::Int128,
+            PhysicalType::UInt8,
+            PhysicalType::UInt16,
+            PhysicalType::UInt32,
+            PhysicalType::UInt128,
+            PhysicalType::Float32,
+            PhysicalType::Float64,
+            PhysicalType::Bytes,
+        ];
+        assert_eq!(
+            physical.map(physical_type_tag),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
     }
 

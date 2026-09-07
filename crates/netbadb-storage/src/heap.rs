@@ -12,7 +12,8 @@ use netbadb_index::{
 };
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{
-    ColumnId, IndexId, IndexName, PageId, RowId, ScalarRef, ScalarValue, SlotId, StorageId, TableId,
+    ColumnId, Float32Value, Float64Value, IndexId, IndexName, PageId, RowId, ScalarRef,
+    ScalarValue, SlotId, StorageId, TableId,
 };
 
 use crate::change_stream::{AuthoritativeOutcome, ChangeStreamManager, SharedChangeStream};
@@ -3579,6 +3580,47 @@ fn decode_value<'a>(payload: &'a [u8], offset: &mut usize) -> Result<ScalarRef<'
             Ok(ScalarRef::Text(text))
         }
         4 => Ok(ScalarRef::Null),
+        5 => Ok(ScalarRef::Int8(i8::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        6 => Ok(ScalarRef::Int16(i16::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        7 => Ok(ScalarRef::Int32(i32::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        8 => Ok(ScalarRef::Int128(i128::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        9 => Ok(ScalarRef::UInt8(u8::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        10 => Ok(ScalarRef::UInt16(u16::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        11 => Ok(ScalarRef::UInt32(u32::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        12 => Ok(ScalarRef::UInt128(u128::from_le_bytes(read_array(
+            payload, offset,
+        )?))),
+        13 => Ok(ScalarRef::Float32(Float32Value::from_bits(
+            u32::from_le_bytes(read_array(payload, offset)?),
+        ))),
+        14 => Ok(ScalarRef::Float64(Float64Value::from_bits(
+            u64::from_le_bytes(read_array(payload, offset)?),
+        ))),
+        15 => {
+            let length = u32::from_le_bytes(read_array(payload, offset)?) as usize;
+            let end = (*offset)
+                .checked_add(length)
+                .ok_or(CodecError::LengthOverflow)?;
+            let bytes = payload
+                .get(*offset..end)
+                .ok_or(CodecError::ScalarTruncated)?;
+            *offset = end;
+            Ok(ScalarRef::Bytes(bytes))
+        }
         other => Err(CodecError::UnknownScalarTag(other).into()),
     }
 }
@@ -3637,8 +3679,8 @@ mod tests {
     };
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{
-        ColumnId, DatabaseTxnId, IndexId, IndexName, Lsn, PageId, PhysicalType, ScalarRef,
-        ScalarValue, SemanticType, StorageId, TableId,
+        ColumnId, DatabaseTxnId, Float32Value, Float64Value, IndexId, IndexName, Lsn, PageId,
+        PhysicalType, ScalarRef, ScalarValue, SemanticType, StorageId, TableId,
     };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
@@ -3653,6 +3695,98 @@ mod tests {
                 ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
             ],
         )
+    }
+
+    fn all_scalar_table() -> TableDef {
+        TableDef::new(
+            TableId(2),
+            "all_scalars",
+            [
+                PhysicalType::Bool,
+                PhysicalType::Int8,
+                PhysicalType::Int16,
+                PhysicalType::Int32,
+                PhysicalType::Int64,
+                PhysicalType::Int128,
+                PhysicalType::UInt8,
+                PhysicalType::UInt16,
+                PhysicalType::UInt32,
+                PhysicalType::UInt64,
+                PhysicalType::UInt128,
+                PhysicalType::Float32,
+                PhysicalType::Float64,
+                PhysicalType::Text,
+                PhysicalType::Bytes,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(position, physical)| {
+                ColumnDef::new(
+                    ColumnId(position as u32 + 1),
+                    format!("v{position}"),
+                    TypeSpec::Physical(physical),
+                )
+            })
+            .collect(),
+        )
+    }
+
+    fn all_scalar_row(alternate: bool) -> Vec<ScalarValue> {
+        vec![
+            ScalarValue::Bool(alternate),
+            ScalarValue::Int8(if alternate { i8::MAX } else { i8::MIN }),
+            ScalarValue::Int16(if alternate { i16::MAX } else { i16::MIN }),
+            ScalarValue::Int32(if alternate { i32::MAX } else { i32::MIN }),
+            ScalarValue::Int64(if alternate { i64::MAX } else { i64::MIN }),
+            ScalarValue::Int128(if alternate { i128::MAX } else { i128::MIN }),
+            ScalarValue::UInt8(if alternate { u8::MAX } else { 0 }),
+            ScalarValue::UInt16(if alternate { u16::MAX } else { 0 }),
+            ScalarValue::UInt32(if alternate { u32::MAX } else { 0 }),
+            ScalarValue::UInt64(if alternate { u64::MAX } else { 0 }),
+            ScalarValue::UInt128(if alternate { u128::MAX } else { 0 }),
+            ScalarValue::Float32(Float32Value::new(if alternate {
+                f32::INFINITY
+            } else {
+                f32::NEG_INFINITY
+            })),
+            ScalarValue::Float64(Float64Value::new(if alternate {
+                f64::NAN
+            } else {
+                f64::from_bits(1)
+            })),
+            ScalarValue::Text(if alternate { "updated" } else { "initial" }.into()),
+            ScalarValue::Bytes(if alternate {
+                vec![0, 0xff, 0x80]
+            } else {
+                vec![]
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_scalar_survives_heap_insert_update_checkpoint_and_reopen() {
+        let path = test_path("all-scalars");
+        cleanup(&path);
+        let schema = all_scalar_table();
+        let mut storage = HeapStorage::create(&path, schema.clone()).expect("create all scalars");
+        let row_id = storage
+            .insert(&all_scalar_row(false))
+            .expect("insert all scalars");
+        let row_id = storage
+            .update(row_id, &all_scalar_row(true))
+            .expect("update all scalars");
+        storage.checkpoint().expect("checkpoint all scalars");
+        storage.close().expect("close all scalars");
+
+        let reopened = HeapStorage::open(&path, schema).expect("reopen all scalars");
+        assert_eq!(
+            reopened
+                .read_row(row_id)
+                .expect("read reopened all scalars"),
+            all_scalar_row(true)
+        );
+        reopened.close().expect("close reopened all scalars");
+        cleanup(&path);
     }
 
     fn test_path(name: &str) -> std::path::PathBuf {

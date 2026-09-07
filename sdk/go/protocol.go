@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"unicode/utf8"
 )
 
@@ -348,7 +349,7 @@ func decodeSemanticType(c *wireCursor) (SemanticType, error) {
 	if err != nil {
 		return SemanticType{}, err
 	}
-	if physical < uint8(PhysicalTypeBool) || physical > uint8(PhysicalTypeText) {
+	if physical < uint8(PhysicalTypeBool) || physical > uint8(PhysicalTypeBytes) {
 		return SemanticType{}, &ProtocolError{Reason: fmt.Sprintf("invalid physical type %d", physical)}
 	}
 	named, err := c.boolean()
@@ -383,12 +384,45 @@ func decodeValue(c *wireCursor) (Value, error) {
 	case ValueKindInt64:
 		v, e := c.i64()
 		return Int64Value(v), e
+	case ValueKindInt8:
+		v, e := c.u8()
+		return Int8Value(int8(v)), e
+	case ValueKindInt16:
+		v, e := c.u16()
+		return Int16Value(int16(v)), e
+	case ValueKindInt32:
+		v, e := c.u32()
+		return Int32Value(int32(v)), e
+	case ValueKindInt128, ValueKindUInt128:
+		return Value{}, &ProtocolError{Reason: "128-bit scalar values are unsupported by the Go v1 client"}
+	case ValueKindUInt8:
+		v, e := c.u8()
+		return UInt8Value(v), e
+	case ValueKindUInt16:
+		v, e := c.u16()
+		return UInt16Value(v), e
+	case ValueKindUInt32:
+		v, e := c.u32()
+		return UInt32Value(v), e
 	case ValueKindUInt64:
 		v, e := c.u64()
 		return UInt64Value(v), e
 	case ValueKindText:
 		v, e := c.string()
 		return TextValue(v), e
+	case ValueKindFloat32:
+		v, e := c.u32()
+		return Float32Value(math.Float32frombits(v)), e
+	case ValueKindFloat64:
+		v, e := c.u64()
+		return Float64Value(math.Float64frombits(v)), e
+	case ValueKindBytes:
+		length, e := c.u32()
+		if e != nil {
+			return Value{}, e
+		}
+		v, e := c.take(int(length))
+		return BytesValue(v), e
 	default:
 		return Value{}, &ProtocolError{Reason: fmt.Sprintf("invalid scalar value tag %d", tag)}
 	}

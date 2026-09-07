@@ -5217,6 +5217,17 @@ fn encode_semantic_type(
         PhysicalType::Int64 => 2,
         PhysicalType::UInt64 => 3,
         PhysicalType::Text => 4,
+        PhysicalType::Int8 => 5,
+        PhysicalType::Int16 => 6,
+        PhysicalType::Int32 => 7,
+        PhysicalType::Int128 => 8,
+        PhysicalType::UInt8 => 9,
+        PhysicalType::UInt16 => 10,
+        PhysicalType::UInt32 => 11,
+        PhysicalType::UInt128 => 12,
+        PhysicalType::Float32 => 13,
+        PhysicalType::Float64 => 14,
+        PhysicalType::Bytes => 15,
     });
     writer.u8(u8::from(data_type.name.is_some()));
     if let Some(name) = &data_type.name {
@@ -5231,6 +5242,17 @@ fn decode_semantic_type(reader: &mut Reader<'_>) -> Result<SemanticType, SchemaM
         2 => PhysicalType::Int64,
         3 => PhysicalType::UInt64,
         4 => PhysicalType::Text,
+        5 => PhysicalType::Int8,
+        6 => PhysicalType::Int16,
+        7 => PhysicalType::Int32,
+        8 => PhysicalType::Int128,
+        9 => PhysicalType::UInt8,
+        10 => PhysicalType::UInt16,
+        11 => PhysicalType::UInt32,
+        12 => PhysicalType::UInt128,
+        13 => PhysicalType::Float32,
+        14 => PhysicalType::Float64,
+        15 => PhysicalType::Bytes,
         _ => return Err(corrupt("unknown rewrite physical type")),
     };
     match reader.u8()? {

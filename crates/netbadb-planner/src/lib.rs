@@ -3569,7 +3569,18 @@ mod tests {
                     (ScalarValue::Text("a".into()), ScalarValue::Text("b".into()))
                 }
                 PhysicalType::Bool => (ScalarValue::Bool(false), ScalarValue::Bool(true)),
-                PhysicalType::UInt64 => return,
+                PhysicalType::Int8
+                | PhysicalType::Int16
+                | PhysicalType::Int32
+                | PhysicalType::Int128
+                | PhysicalType::UInt8
+                | PhysicalType::UInt16
+                | PhysicalType::UInt32
+                | PhysicalType::UInt64
+                | PhysicalType::UInt128
+                | PhysicalType::Float32
+                | PhysicalType::Float64
+                | PhysicalType::Bytes => continue,
             };
             let predicate = binary(
                 BinaryOp::And,

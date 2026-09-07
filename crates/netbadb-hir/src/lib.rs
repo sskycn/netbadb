@@ -15,8 +15,8 @@ use netbadb_parser::{
 };
 use netbadb_schema::{DropTableTarget, Schema, TableDef};
 use netbadb_types::{
-    ColumnId, ExprType, IndexId, IndexName, ParameterId, PhysicalType, RelationBindingId,
-    ScalarValue, SemanticType, TableId,
+    ColumnId, ExprType, Float32Value, Float64Value, IndexId, IndexName, ParameterId, PhysicalType,
+    RelationBindingId, ScalarValue, SemanticType, TableId,
 };
 
 /// Checked logical columns in declaration order; identities are allocated at Execute.
@@ -228,12 +228,22 @@ pub fn lower_create_table(
 fn resolve_declared_type(name: &Ident) -> Result<SemanticType, HirError> {
     let physical = match name.name.to_ascii_uppercase().as_str() {
         "BOOL" | "BOOLEAN" => PhysicalType::Bool,
+        "TINYINT" => PhysicalType::Int8,
+        "SMALLINT" | "INT2" | "INT16" => PhysicalType::Int16,
+        "INTEGER" | "INT" | "INT4" | "INT32" => PhysicalType::Int32,
         "BIGINT" | "INT64" | "INT8" => PhysicalType::Int64,
+        "INT128" => PhysicalType::Int128,
+        "UINT8" => PhysicalType::UInt8,
+        "UINT16" => PhysicalType::UInt16,
+        "UINT32" => PhysicalType::UInt32,
         "TEXT" | "VARCHAR" => PhysicalType::Text,
         "UINT64" => PhysicalType::UInt64,
-        "SMALLINT" | "INT2" | "INTEGER" | "INT" | "INT4" | "NUMERIC" | "DECIMAL" | "REAL"
-        | "FLOAT" | "DOUBLE" | "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL"
-        | "JSON" | "JSONB" | "UUID" | "BYTEA" | "ARRAY" | "SERIAL" | "BIGSERIAL"
+        "UINT128" => PhysicalType::UInt128,
+        "REAL" | "FLOAT4" | "FLOAT32" => PhysicalType::Float32,
+        "DOUBLE" | "FLOAT8" | "FLOAT64" => PhysicalType::Float64,
+        "BYTES" | "BYTEA" => PhysicalType::Bytes,
+        "NUMERIC" | "DECIMAL" | "FLOAT" | "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ"
+        | "INTERVAL" | "JSON" | "JSONB" | "UUID" | "ARRAY" | "SERIAL" | "BIGSERIAL"
         | "SMALLSERIAL" | "CHAR" | "CHARACTER" => {
             return Err(HirError::UnsupportedType {
                 name: name.name.clone(),
@@ -576,6 +586,10 @@ pub enum HirError {
     CannotInferNullType {
         span: Span,
     },
+    InvalidLiteral {
+        message: &'static str,
+        span: Span,
+    },
     CannotInferParameterType {
         id: ParameterId,
         span: Span,
@@ -646,6 +660,7 @@ impl HirError {
             | Self::TypeMismatch { span, .. }
             | Self::IncompatibleComparison { span, .. }
             | Self::CannotInferNullType { span }
+            | Self::InvalidLiteral { span, .. }
             | Self::CannotInferParameterType { span, .. }
             | Self::ParameterTypeConflict { span, .. }
             | Self::DuplicateColumn { span, .. }
@@ -700,6 +715,7 @@ impl fmt::Display for HirError {
             Self::CannotInferNullType { .. } => {
                 formatter.write_str("cannot infer the type of NULL in this expression")
             }
+            Self::InvalidLiteral { message, .. } => formatter.write_str(message),
             Self::CannotInferParameterType { id, .. } => {
                 write!(
                     formatter,
@@ -1163,18 +1179,17 @@ fn lower_aggregate(
                     span: aggregate.span,
                 });
             };
-            match column.data_type.physical {
-                PhysicalType::Int64 | PhysicalType::UInt64 => ExprType {
+            if column.data_type.physical.is_numeric() {
+                ExprType {
                     data_type: SemanticType::physical(column.data_type.physical),
                     nullable: true,
-                },
-                PhysicalType::Bool | PhysicalType::Text => {
-                    return Err(HirError::InvalidAggregateType {
-                        function,
-                        actual: column.data_type.clone(),
-                        span: aggregate.span,
-                    });
                 }
+            } else {
+                return Err(HirError::InvalidAggregateType {
+                    function,
+                    actual: column.data_type.clone(),
+                    span: aggregate.span,
+                });
             }
         }
         AggregateFunction::Min | AggregateFunction::Max => {
@@ -1627,30 +1642,7 @@ fn lower_expr_in_scope(
             })
         }
         AstExpr::Literal { value, span } => {
-            let (value, data_type, nullable) = match value {
-                Literal::Bool(value) => (
-                    ScalarValue::Bool(*value),
-                    SemanticType::physical(PhysicalType::Bool),
-                    false,
-                ),
-                Literal::Int(value) => (
-                    ScalarValue::Int64(*value),
-                    SemanticType::physical(PhysicalType::Int64),
-                    false,
-                ),
-                Literal::String(value) => (
-                    ScalarValue::Text(value.clone()),
-                    SemanticType::physical(PhysicalType::Text),
-                    false,
-                ),
-                Literal::Null => (
-                    ScalarValue::Null,
-                    expected
-                        .cloned()
-                        .ok_or(HirError::CannotInferNullType { span: *span })?,
-                    true,
-                ),
-            };
+            let (value, data_type, nullable) = lower_literal(value, expected, *span)?;
             Ok(TypedExpr {
                 kind: TypedExprKind::Literal(value),
                 expr_type: ExprType {
@@ -1678,9 +1670,24 @@ fn lower_expr_in_scope(
         } => {
             let physical = match data_type {
                 AstSqlTypeName::Bool => PhysicalType::Bool,
+                AstSqlTypeName::Int8 => PhysicalType::Int8,
+                AstSqlTypeName::Int16 => PhysicalType::Int16,
+                AstSqlTypeName::Int32 => PhysicalType::Int32,
                 AstSqlTypeName::Int64 => PhysicalType::Int64,
+                AstSqlTypeName::Int128 => PhysicalType::Int128,
+                AstSqlTypeName::UInt8 => PhysicalType::UInt8,
+                AstSqlTypeName::UInt16 => PhysicalType::UInt16,
+                AstSqlTypeName::UInt32 => PhysicalType::UInt32,
+                AstSqlTypeName::UInt64 => PhysicalType::UInt64,
+                AstSqlTypeName::UInt128 => PhysicalType::UInt128,
+                AstSqlTypeName::Float32 => PhysicalType::Float32,
+                AstSqlTypeName::Float64 => PhysicalType::Float64,
                 AstSqlTypeName::Text => PhysicalType::Text,
+                AstSqlTypeName::Bytes => PhysicalType::Bytes,
             };
+            // A typed parameter cast may adopt an already-resolved nominal
+            // context, while raw literals remain physical-only in
+            // `lower_literal` and therefore cannot mint that identity.
             let target = expected
                 .filter(|expected| expected.physical == physical)
                 .cloned()
@@ -1797,12 +1804,147 @@ fn lower_expr_in_scope(
     }
 }
 
+fn lower_literal(
+    literal: &Literal,
+    expected: Option<&SemanticType>,
+    span: Span,
+) -> Result<(ScalarValue, SemanticType, bool), HirError> {
+    // Context chooses a literal's physical width, but it must never mint a
+    // nominal application identity such as UserId from raw SQL syntax.
+    let typed = SemanticType::physical;
+    match literal {
+        Literal::Bool(value) => Ok((ScalarValue::Bool(*value), typed(PhysicalType::Bool), false)),
+        Literal::Int(value) => {
+            let (value, physical) = parse_integer_literal(&value.to_string(), expected, span)?;
+            Ok((value, typed(physical), false))
+        }
+        Literal::LargeInteger(value) => {
+            let (value, physical) = parse_integer_literal(value, expected, span)?;
+            Ok((value, typed(physical), false))
+        }
+        Literal::Float(value) => {
+            let parsed = value.parse::<f64>().map_err(|_| HirError::InvalidLiteral {
+                message: "invalid floating-point literal",
+                span,
+            })?;
+            if !parsed.is_finite() {
+                return Err(HirError::InvalidLiteral {
+                    message: "FLOAT64 literal is out of range",
+                    span,
+                });
+            }
+            if expected.is_some_and(|expected| expected.physical == PhysicalType::Float32) {
+                let narrowed = parsed as f32;
+                if parsed.is_finite() && !narrowed.is_finite() {
+                    return Err(HirError::InvalidLiteral {
+                        message: "FLOAT32 literal is out of range",
+                        span,
+                    });
+                }
+                Ok((
+                    ScalarValue::Float32(Float32Value::new(narrowed)),
+                    typed(PhysicalType::Float32),
+                    false,
+                ))
+            } else {
+                Ok((
+                    ScalarValue::Float64(Float64Value::new(parsed)),
+                    typed(PhysicalType::Float64),
+                    false,
+                ))
+            }
+        }
+        Literal::String(value) => Ok((
+            ScalarValue::Text(value.clone()),
+            typed(PhysicalType::Text),
+            false,
+        )),
+        Literal::Bytes(value) => Ok((
+            ScalarValue::Bytes(value.clone()),
+            typed(PhysicalType::Bytes),
+            false,
+        )),
+        Literal::Null => Ok((
+            ScalarValue::Null,
+            expected
+                .cloned()
+                .ok_or(HirError::CannotInferNullType { span })?,
+            true,
+        )),
+    }
+}
+
+fn parse_integer_literal(
+    value: &str,
+    expected: Option<&SemanticType>,
+    span: Span,
+) -> Result<(ScalarValue, PhysicalType), HirError> {
+    macro_rules! signed {
+        ($kind:ident, $type:ty) => {
+            value
+                .parse::<$type>()
+                .map(|value| (ScalarValue::$kind(value), PhysicalType::$kind))
+                .map_err(|_| HirError::InvalidLiteral {
+                    message: concat!(stringify!($kind), " literal is out of range"),
+                    span,
+                })
+        };
+    }
+    macro_rules! unsigned {
+        ($kind:ident, $type:ty) => {
+            value
+                .parse::<$type>()
+                .map(|value| (ScalarValue::$kind(value), PhysicalType::$kind))
+                .map_err(|_| HirError::InvalidLiteral {
+                    message: concat!(stringify!($kind), " literal is out of range"),
+                    span,
+                })
+        };
+    }
+    match expected.map(|expected| expected.physical) {
+        Some(PhysicalType::Int8) => signed!(Int8, i8),
+        Some(PhysicalType::Int16) => signed!(Int16, i16),
+        Some(PhysicalType::Int32) => signed!(Int32, i32),
+        Some(PhysicalType::Int64) => signed!(Int64, i64),
+        Some(PhysicalType::Int128) => signed!(Int128, i128),
+        Some(PhysicalType::UInt8) => unsigned!(UInt8, u8),
+        Some(PhysicalType::UInt16) => unsigned!(UInt16, u16),
+        Some(PhysicalType::UInt32) => unsigned!(UInt32, u32),
+        Some(PhysicalType::UInt64) => unsigned!(UInt64, u64),
+        Some(PhysicalType::UInt128) => unsigned!(UInt128, u128),
+        _ => {
+            if let Ok(value) = value.parse::<i64>() {
+                Ok((ScalarValue::Int64(value), PhysicalType::Int64))
+            } else if let Ok(value) = value.parse::<i128>() {
+                Ok((ScalarValue::Int128(value), PhysicalType::Int128))
+            } else if let Ok(value) = value.parse::<u128>() {
+                Ok((ScalarValue::UInt128(value), PhysicalType::UInt128))
+            } else {
+                Err(HirError::InvalidLiteral {
+                    message: "integer literal is out of UInt128 range",
+                    span,
+                })
+            }
+        }
+    }
+}
+
 fn lower_comparison_operands(
     scope: &RelationScope<'_>,
     left: &AstExpr,
     right: &AstExpr,
     parameters: &mut ParameterContext,
 ) -> Result<(TypedExpr, TypedExpr), HirError> {
+    if is_literal_expression(left) && !is_literal_expression(right) {
+        let right = lower_expr_in_scope(scope, right, None, parameters)?;
+        let left = lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type), parameters)?;
+        return Ok((left, right));
+    }
+    if !is_literal_expression(left) && is_literal_expression(right) {
+        let left = lower_expr_in_scope(scope, left, None, parameters)?;
+        let right = lower_expr_in_scope(scope, right, Some(&left.expr_type.data_type), parameters)?;
+        return Ok((left, right));
+    }
     if is_parameter_expression(left) && !is_parameter_expression(right) {
         let right = lower_expr_in_scope(scope, right, None, parameters)?;
         let left = lower_expr_in_scope(scope, left, Some(&right.expr_type.data_type), parameters)?;
@@ -1840,6 +1982,10 @@ fn lower_comparison_operands(
             lower_expr_in_scope(scope, right, None, parameters)?,
         )),
     }
+}
+
+fn is_literal_expression(expression: &AstExpr) -> bool {
+    matches!(expression, AstExpr::Literal { .. })
 }
 
 fn is_parameter_expression(expression: &AstExpr) -> bool {
@@ -1916,7 +2062,57 @@ mod tests {
     };
     use netbadb_parser::{parse, parse_statement};
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
-    use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, TableId};
+    use netbadb_types::{ColumnId, PhysicalType, RelationBindingId, ScalarValue, TableId};
+
+    fn only_literal(query: &super::TypedQuery) -> &ScalarValue {
+        let TypedProjectionItem::Expression { expression, .. } = &query.projection[0] else {
+            panic!("expected expression projection");
+        };
+        let TypedExprKind::Cast { expression } = &expression.kind else {
+            panic!("expected typed cast");
+        };
+        let TypedExprKind::Literal(value) = &expression.kind else {
+            panic!("expected literal below cast");
+        };
+        value
+    }
+
+    #[test]
+    fn contextual_literals_preserve_width_and_reject_integer_boundaries() {
+        let empty = Schema::new(vec![]).expect("empty schema");
+        let cases = [
+            ("SELECT -128::TINYINT", ScalarValue::Int8(i8::MIN)),
+            ("SELECT 255::UINT8", ScalarValue::UInt8(u8::MAX)),
+            (
+                "SELECT 170141183460469231731687303715884105727::INT128",
+                ScalarValue::Int128(i128::MAX),
+            ),
+            (
+                "SELECT 340282366920938463463374607431768211455::UINT128",
+                ScalarValue::UInt128(u128::MAX),
+            ),
+        ];
+        for (sql, expected) in cases {
+            let typed =
+                lower_query(&empty, &parse(sql).expect("parse boundary")).expect("lower boundary");
+            assert_eq!(only_literal(&typed), &expected, "{sql}");
+        }
+        for sql in [
+            "SELECT -129::TINYINT",
+            "SELECT 256::UINT8",
+            "SELECT -1::UINT8",
+            "SELECT 340282366920938463463374607431768211456::UINT128",
+            "SELECT 1e400::FLOAT64",
+        ] {
+            assert!(
+                matches!(
+                    lower_query(&empty, &parse(sql).expect("parse overflow")),
+                    Err(HirError::InvalidLiteral { .. })
+                ),
+                "{sql}"
+            );
+        }
+    }
 
     fn schema() -> Schema {
         Schema::new(vec![

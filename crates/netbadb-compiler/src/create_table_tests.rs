@@ -17,6 +17,12 @@ fn generic_dispatch_produces_logical_ddl_without_catalog_identities() {
     assert!(!table.columns[0].nullable);
     assert!(table.columns[1].nullable);
     assert!(compile_sql_statement(&schema, sql, &[], &[], &[Some(PhysicalType::Int64)]).is_err());
+    assert!(matches!(
+        compile_sql_statement(&schema, "CREATE TABLE t (a INTEGER)", &[], &[], &[]),
+        Ok(CompiledSqlStatement::Ddl(
+            CompiledDdlStatement::CreateTable(_)
+        ))
+    ));
     for (sql, kind) in [
         (
             "CREATE TABLE t (a TEXT, a TEXT)",
@@ -25,10 +31,6 @@ fn generic_dispatch_produces_logical_ddl_without_catalog_identities() {
         (
             "CREATE TABLE t (a UNKNOWN)",
             CompileErrorKind::UndefinedType,
-        ),
-        (
-            "CREATE TABLE t (a INTEGER)",
-            CompileErrorKind::FeatureNotSupported,
         ),
         (
             "CREATE TABLE t (a TEXT PRIMARY KEY)",

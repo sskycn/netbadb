@@ -262,15 +262,30 @@ pub enum Expr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlTypeName {
     Bool,
+    Int8,
+    Int16,
+    Int32,
     Int64,
+    Int128,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    UInt128,
+    Float32,
+    Float64,
     Text,
+    Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Literal {
     Bool(bool),
     Int(i64),
+    LargeInteger(String),
+    Float(String),
     String(String),
+    Bytes(Vec<u8>),
     Null,
 }
 
@@ -354,6 +369,9 @@ enum TokenKind {
     Null,
     Ident(String),
     Number(i64),
+    LargeInteger(String),
+    Float(String),
+    Bytes(Vec<u8>),
     String(String),
     Parameter(ParameterId),
     ColonColon,
@@ -539,22 +557,114 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 position += 1;
                 TokenKind::String(value)
             }
-            byte if byte.is_ascii_digit() || byte == b'-' => {
+            b'x' | b'X' if bytes.get(position + 1) == Some(&b'\'') => {
+                position += 2;
+                let content_start = position;
+                while position < bytes.len() && bytes[position] != b'\'' {
+                    position += 1;
+                }
+                if position == bytes.len() {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::Syntax,
+                        message: "unterminated binary literal".into(),
+                        span: Span {
+                            start,
+                            end: position,
+                        },
+                    });
+                }
+                let hex = &input.as_bytes()[content_start..position];
+                if hex.len() % 2 != 0 {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::Syntax,
+                        message: "binary literal must contain an even number of hex digits".into(),
+                        span: Span {
+                            start,
+                            end: position + 1,
+                        },
+                    });
+                }
+                let mut value = Vec::with_capacity(hex.len() / 2);
+                for pair in hex.chunks_exact(2) {
+                    let high = hex_digit(pair[0]).ok_or_else(|| ParseError {
+                        kind: ParseErrorKind::Syntax,
+                        message: "binary literal contains a non-hex digit".into(),
+                        span: Span {
+                            start,
+                            end: position + 1,
+                        },
+                    })?;
+                    let low = hex_digit(pair[1]).ok_or_else(|| ParseError {
+                        kind: ParseErrorKind::Syntax,
+                        message: "binary literal contains a non-hex digit".into(),
+                        span: Span {
+                            start,
+                            end: position + 1,
+                        },
+                    })?;
+                    value.push((high << 4) | low);
+                }
+                position += 1;
+                TokenKind::Bytes(value)
+            }
+            byte if byte.is_ascii_digit()
+                || (byte == b'-' && bytes.get(position + 1).is_some_and(u8::is_ascii_digit)) =>
+            {
                 position += 1;
                 while bytes.get(position).is_some_and(u8::is_ascii_digit) {
                     position += 1;
                 }
-                let value = input[start..position]
-                    .parse::<i64>()
-                    .map_err(|_| ParseError {
+                let mut floating = false;
+                if bytes.get(position) == Some(&b'.') {
+                    floating = true;
+                    position += 1;
+                    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                        position += 1;
+                    }
+                }
+                if bytes
+                    .get(position)
+                    .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+                {
+                    floating = true;
+                    position += 1;
+                    if bytes
+                        .get(position)
+                        .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+                    {
+                        position += 1;
+                    }
+                    let exponent_start = position;
+                    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                        position += 1;
+                    }
+                    if exponent_start == position {
+                        return Err(ParseError {
+                            kind: ParseErrorKind::Syntax,
+                            message: "invalid floating-point exponent".into(),
+                            span: Span {
+                                start,
+                                end: position,
+                            },
+                        });
+                    }
+                }
+                let lexeme = &input[start..position];
+                if floating {
+                    lexeme.parse::<f64>().map_err(|_| ParseError {
                         kind: ParseErrorKind::Syntax,
-                        message: "invalid integer literal".into(),
+                        message: "invalid floating-point literal".into(),
                         span: Span {
                             start,
                             end: position,
                         },
                     })?;
-                TokenKind::Number(value)
+                    TokenKind::Float(lexeme.to_owned())
+                } else if let Ok(value) = lexeme.parse::<i64>() {
+                    TokenKind::Number(value)
+                } else {
+                    TokenKind::LargeInteger(lexeme.to_owned())
+                }
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
                 position += 1;
@@ -639,6 +749,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
         },
     });
     Ok(tokens)
+}
+
+const fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 struct Parser {
@@ -1497,21 +1616,29 @@ impl Parser {
                 let TokenKind::Ident(name) = data_type_token.kind else {
                     return Err(self.error_here("expected a type name after `::`"));
                 };
-                let data_type = if name.eq_ignore_ascii_case("bool")
-                    || name.eq_ignore_ascii_case("boolean")
-                {
-                    SqlTypeName::Bool
-                } else if name.eq_ignore_ascii_case("bigint") || name.eq_ignore_ascii_case("int8") {
-                    SqlTypeName::Int64
-                } else if name.eq_ignore_ascii_case("text") || name.eq_ignore_ascii_case("varchar")
-                {
-                    SqlTypeName::Text
-                } else {
-                    return Err(ParseError {
-                        kind: ParseErrorKind::Syntax,
-                        message: format!("unsupported cast type `{name}`"),
-                        span: data_type_token.span,
-                    });
+                let data_type = match name.to_ascii_uppercase().as_str() {
+                    "BOOL" | "BOOLEAN" => SqlTypeName::Bool,
+                    "TINYINT" => SqlTypeName::Int8,
+                    "SMALLINT" | "INT2" | "INT16" => SqlTypeName::Int16,
+                    "INTEGER" | "INT" | "INT4" | "INT32" => SqlTypeName::Int32,
+                    "BIGINT" | "INT8" | "INT64" => SqlTypeName::Int64,
+                    "INT128" => SqlTypeName::Int128,
+                    "UINT8" => SqlTypeName::UInt8,
+                    "UINT16" => SqlTypeName::UInt16,
+                    "UINT32" => SqlTypeName::UInt32,
+                    "UINT64" => SqlTypeName::UInt64,
+                    "UINT128" => SqlTypeName::UInt128,
+                    "REAL" | "FLOAT4" | "FLOAT32" => SqlTypeName::Float32,
+                    "DOUBLE" | "FLOAT8" | "FLOAT64" => SqlTypeName::Float64,
+                    "TEXT" | "VARCHAR" => SqlTypeName::Text,
+                    "BYTES" | "BYTEA" => SqlTypeName::Bytes,
+                    _ => {
+                        return Err(ParseError {
+                            kind: ParseErrorKind::Syntax,
+                            message: format!("unsupported cast type `{name}`"),
+                            span: data_type_token.span,
+                        });
+                    }
                 };
                 self.position += 1;
                 let span = Span {
@@ -1609,6 +1736,27 @@ impl Parser {
                 self.position += 1;
                 Ok(Expr::Literal {
                     value: Literal::Int(value),
+                    span: token.span,
+                })
+            }
+            TokenKind::LargeInteger(value) => {
+                self.position += 1;
+                Ok(Expr::Literal {
+                    value: Literal::LargeInteger(value),
+                    span: token.span,
+                })
+            }
+            TokenKind::Float(value) => {
+                self.position += 1;
+                Ok(Expr::Literal {
+                    value: Literal::Float(value),
+                    span: token.span,
+                })
+            }
+            TokenKind::Bytes(value) => {
+                self.position += 1;
+                Ok(Expr::Literal {
+                    value: Literal::Bytes(value),
                     span: token.span,
                 })
             }
@@ -2198,6 +2346,61 @@ mod tests {
         .expect("parse cast parameters in DML");
         assert!(matches!(statement, Statement::Insert(_)));
         assert!(parse("SELECT $1::REGCLASS").is_err());
+    }
+
+    #[test]
+    fn parses_wide_numeric_float_and_lossless_bytes_literals() {
+        let query = parse(
+            "SELECT 170141183460469231731687303715884105727::INT128, \
+             340282366920938463463374607431768211455::UINT128, \
+             1.25e-10::FLOAT64, X'00ff80'::BYTES",
+        )
+        .expect("extended literals parse");
+        assert!(matches!(
+            &query.projection[0],
+            SelectItem::Expression {
+                expression: Expr::Cast { expression, data_type: SqlTypeName::Int128, .. }, ..
+            } if matches!(**expression, Expr::Literal { value: Literal::LargeInteger(_), .. })
+        ));
+        assert!(matches!(
+            &query.projection[1],
+            SelectItem::Expression {
+                expression: Expr::Cast { expression, data_type: SqlTypeName::UInt128, .. }, ..
+            } if matches!(**expression, Expr::Literal { value: Literal::LargeInteger(_), .. })
+        ));
+        assert!(matches!(
+            &query.projection[2],
+            SelectItem::Expression {
+                expression: Expr::Cast { expression, data_type: SqlTypeName::Float64, .. }, ..
+            } if matches!(&**expression, Expr::Literal { value: Literal::Float(value), .. } if value == "1.25e-10")
+        ));
+        assert!(matches!(
+            &query.projection[3],
+            SelectItem::Expression {
+                expression: Expr::Cast { expression, data_type: SqlTypeName::Bytes, .. }, ..
+            } if matches!(**expression, Expr::Literal { value: Literal::Bytes(ref value), .. } if value == &[0, 0xff, 0x80])
+        ));
+
+        for invalid in ["SELECT X'0'", "SELECT X'gg'", "SELECT 1e", "SELECT 1e+"] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn sql_int8_alias_remains_int64_while_tinyint_names_int8() {
+        for (sql, expected) in [
+            ("SELECT $1::INT8", SqlTypeName::Int64),
+            ("SELECT $1::BIGINT", SqlTypeName::Int64),
+            ("SELECT $1::TINYINT", SqlTypeName::Int8),
+        ] {
+            let query = parse(sql).expect("cast parses");
+            assert!(matches!(
+                &query.projection[0],
+                SelectItem::Expression {
+                    expression: Expr::Cast { data_type, .. }, ..
+                } if *data_type == expected
+            ));
+        }
     }
 
     #[test]

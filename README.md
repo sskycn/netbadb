@@ -165,6 +165,12 @@ semantic: UserId
 representation is the same. The storage format encodes physical values; the
 Canonical Schema remains the source of semantic meaning. Each validated table
 also has a versioned canonical byte encoding and SHA-256 schema fingerprint.
+The foundational physical set is Bool; signed and unsigned 8/16/32/64/128-bit
+integers; canonical Float32 and Float64; UTF-8 Text; and opaque Bytes. Physical
+identity is exact—there is no implicit numeric widening—and durable tags are
+append-only so the original Bool/Int64/UInt64/Text/NULL bytes remain stable.
+See [Physical Types v2](docs/physical-types-v2.md) for the SQL, storage,
+protocol, pgwire and SDK contract.
 Heap/LSM metadata validates that fingerprint against the persisted logical schema.
 The [Round 17 runtime schema catalog](docs/runtime-schema-catalog-round17.md)
 installs a full database schema snapshot once at create or explicit legacy import.
@@ -279,8 +285,8 @@ The current code genuinely supports:
   aliases, chained `JOIN`/`INNER JOIN ... ON`, single-row `INSERT` with explicit columns or declaration order, `UPDATE`,
   `DELETE`, optional DML `WHERE`, source-column `GROUP BY`, multi-key
   source-column `ORDER BY`, contextual `COUNT`/`SUM`/`MIN`/`MAX`, `LIMIT`, wildcard projection,
-  `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, integer/string/
-  boolean/NULL literals, and parentheses;
+  `AND`/`OR`/`NOT`, comparisons, `IS NULL`/`IS NOT NULL`, exact-width integer,
+  float, string, hex Bytes, boolean and NULL literals, and parentheses;
 - name resolution and expression type checking with nominal semantic types and
   explicit nullability;
 - typed query/DML HIR and logical relational IR;
@@ -769,7 +775,8 @@ replace the root without changing the handle. Leaf (`NBTL`) and internal
 (`NBTI`) v1/v2 payloads encode fixed-width little-endian fields and typed
 keys. Every v2 payload has a nonzero file-local IndexId owner, including split
 and orphan pages. The extra eight bytes reduce the safe Text key bound from
-4013 to 4005 bytes; oversized new builds and DML return typed errors. Supported keys are Bool, Int64, UInt64, Text, and nullable NULL. Ordering
+4013 to 4005 bytes; oversized new builds and DML return typed errors. Supported
+keys cover every foundational physical type plus nullable NULL. Ordering
 is typed value order with NULL first, followed by explicit
 `(PageId, SlotId, generation)` RowId order. Equal keys are supported; only an
 exact `(key, RowId)` duplicate is rejected. Insert splits by encoded byte size,
@@ -1107,11 +1114,11 @@ The implementation sequence is intentionally vertical:
     Ordinary hits and extrema hits without a replacement move no scalar slots;
     misses and actual extrema replacements move only their selected values, then
     the complete batch is cleared while retaining its allocation.
-62. Typed MIN/MAX Extreme State + Direct Text Comparison — complete; Aggregate
-    binds Bool, Int64, UInt64, or Text extrema state from typed plan metadata at
-    construction. MIN/MAX candidates compare directly against that physical
-    state, Text uses borrowed `str::cmp`, and existing move/clone, NULL, grouped,
-    batch, and legacy semantics remain unchanged.
+62. Typed MIN/MAX Extreme State + Direct Scalar Comparison — complete; Aggregate
+    binds every foundational physical type from typed plan metadata at
+    construction. MIN/MAX candidates use the shared database total order,
+    including canonical floats and lexicographic Bytes, while existing
+    move/clone, NULL, grouped, batch, and legacy semantics remain unchanged.
 63. Generic Filter Position Prebinding — complete; valid borrowed streaming
     and materialized legacy Filter paths reuse the executor-private `BoundExpr`
     and resolve column identities once before row evaluation. Streaming FALSE

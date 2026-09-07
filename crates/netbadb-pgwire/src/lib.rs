@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use netbadb_types::{PhysicalType, ScalarValue};
+use netbadb_types::{Float32Value, Float64Value, PhysicalType, ScalarValue};
 
 pub const PROTOCOL_VERSION_3: u32 = 196_608;
 pub const SSL_REQUEST_CODE: u32 = 80_877_103;
@@ -215,10 +215,13 @@ pub struct PostgresOid(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresType {
     Bool,
+    Bytea,
     BoolArray,
     Int2,
     Int4,
     Int8,
+    Float4,
+    Float8,
     Text,
     Varchar,
     Unknown,
@@ -230,11 +233,14 @@ impl PostgresType {
     pub const fn oid(self) -> PostgresOid {
         PostgresOid(match self {
             Self::Bool => 16,
+            Self::Bytea => 17,
             Self::BoolArray => 1_000,
             Self::Int8 => 20,
             Self::Int2 => 21,
             Self::Int4 => 23,
             Self::Text => 25,
+            Self::Float4 => 700,
+            Self::Float8 => 701,
             Self::Varchar => 1_043,
             Self::Unknown => 705,
             Self::TextArray => 1_009,
@@ -246,9 +252,14 @@ impl PostgresType {
         match self {
             Self::Bool => 1,
             Self::Int2 => 2,
-            Self::Int4 => 4,
-            Self::Int8 => 8,
-            Self::Text | Self::Varchar | Self::Unknown | Self::BoolArray | Self::TextArray => -1,
+            Self::Int4 | Self::Float4 => 4,
+            Self::Int8 | Self::Float8 => 8,
+            Self::Bytea
+            | Self::Text
+            | Self::Varchar
+            | Self::Unknown
+            | Self::BoolArray
+            | Self::TextArray => -1,
         }
     }
 
@@ -256,11 +267,14 @@ impl PostgresType {
     pub const fn from_oid(oid: PostgresOid) -> Option<Self> {
         match oid.0 {
             16 => Some(Self::Bool),
+            17 => Some(Self::Bytea),
             1_000 => Some(Self::BoolArray),
             20 => Some(Self::Int8),
             21 => Some(Self::Int2),
             23 => Some(Self::Int4),
             25 => Some(Self::Text),
+            700 => Some(Self::Float4),
+            701 => Some(Self::Float8),
             705 => Some(Self::Unknown),
             1_009 => Some(Self::TextArray),
             1_043 => Some(Self::Varchar),
@@ -272,7 +286,10 @@ impl PostgresType {
     pub const fn netbadb_physical(self) -> Option<PhysicalType> {
         match self {
             Self::Bool => Some(PhysicalType::Bool),
+            Self::Bytea => Some(PhysicalType::Bytes),
             Self::Int2 | Self::Int4 | Self::Int8 => Some(PhysicalType::Int64),
+            Self::Float4 => Some(PhysicalType::Float32),
+            Self::Float8 => Some(PhysicalType::Float64),
             Self::Text | Self::Varchar | Self::Unknown => Some(PhysicalType::Text),
             Self::BoolArray | Self::TextArray => None,
         }
@@ -281,9 +298,20 @@ impl PostgresType {
     pub fn from_netbadb(physical: PhysicalType) -> Result<Self, TypeMappingError> {
         match physical {
             PhysicalType::Bool => Ok(Self::Bool),
+            PhysicalType::Int8 | PhysicalType::Int16 => Ok(Self::Int2),
+            PhysicalType::Int32 => Ok(Self::Int4),
             PhysicalType::Int64 => Ok(Self::Int8),
+            PhysicalType::UInt8 => Ok(Self::Int2),
+            PhysicalType::UInt16 => Ok(Self::Int4),
+            PhysicalType::UInt32 => Ok(Self::Int8),
+            PhysicalType::Float32 => Ok(Self::Float4),
+            PhysicalType::Float64 => Ok(Self::Float8),
             PhysicalType::Text => Ok(Self::Text),
+            PhysicalType::Bytes => Ok(Self::Bytea),
             PhysicalType::UInt64 => Err(TypeMappingError::UnsupportedUInt64),
+            PhysicalType::Int128 | PhysicalType::UInt128 => {
+                Err(TypeMappingError::UnsupportedPhysicalType(physical))
+            }
         }
     }
 }
@@ -291,6 +319,7 @@ impl PostgresType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeMappingError {
     UnsupportedUInt64,
+    UnsupportedPhysicalType(PhysicalType),
     UnsupportedOid(PostgresOid),
     InvalidTextValue(PostgresType),
     ValueOutOfRange(PostgresType),
@@ -304,6 +333,12 @@ impl fmt::Display for TypeMappingError {
         match self {
             Self::UnsupportedUInt64 => {
                 formatter.write_str("NetbaDB UINT64 has no lossless PostgreSQL integer mapping")
+            }
+            Self::UnsupportedPhysicalType(data_type) => {
+                write!(
+                    formatter,
+                    "NetbaDB {data_type} has no lossless PostgreSQL mapping"
+                )
             }
             Self::UnsupportedOid(oid) => {
                 write!(formatter, "PostgreSQL type OID {} is unsupported", oid.0)
@@ -348,6 +383,23 @@ pub fn encode_text_value(
             Ok(Some(if *value { b"t".to_vec() } else { b"f".to_vec() }))
         }
         (ScalarValue::Int64(value), PostgresType::Int8) => Ok(Some(value.to_string().into_bytes())),
+        (ScalarValue::Int8(value), PostgresType::Int2) => Ok(Some(value.to_string().into_bytes())),
+        (ScalarValue::Int16(value), PostgresType::Int2) => Ok(Some(value.to_string().into_bytes())),
+        (ScalarValue::Int32(value), PostgresType::Int4) => Ok(Some(value.to_string().into_bytes())),
+        (ScalarValue::UInt8(value), PostgresType::Int2) => Ok(Some(value.to_string().into_bytes())),
+        (ScalarValue::UInt16(value), PostgresType::Int4) => {
+            Ok(Some(value.to_string().into_bytes()))
+        }
+        (ScalarValue::UInt32(value), PostgresType::Int8) => {
+            Ok(Some(value.to_string().into_bytes()))
+        }
+        (ScalarValue::Float32(value), PostgresType::Float4) => {
+            Ok(Some(value.to_string().into_bytes()))
+        }
+        (ScalarValue::Float64(value), PostgresType::Float8) => {
+            Ok(Some(value.to_string().into_bytes()))
+        }
+        (ScalarValue::Bytes(value), PostgresType::Bytea) => Ok(Some(bytea_text(value))),
         (
             ScalarValue::Text(value),
             PostgresType::Text
@@ -367,6 +419,27 @@ pub fn encode_binary_value(
         (ScalarValue::Null, _) => Ok(None),
         (ScalarValue::Bool(value), PostgresType::Bool) => Ok(Some(vec![u8::from(*value)])),
         (ScalarValue::Int64(value), PostgresType::Int8) => Ok(Some(value.to_be_bytes().to_vec())),
+        (ScalarValue::Int8(value), PostgresType::Int2) => {
+            Ok(Some(i16::from(*value).to_be_bytes().to_vec()))
+        }
+        (ScalarValue::Int16(value), PostgresType::Int2) => Ok(Some(value.to_be_bytes().to_vec())),
+        (ScalarValue::Int32(value), PostgresType::Int4) => Ok(Some(value.to_be_bytes().to_vec())),
+        (ScalarValue::UInt8(value), PostgresType::Int2) => {
+            Ok(Some(i16::from(*value).to_be_bytes().to_vec()))
+        }
+        (ScalarValue::UInt16(value), PostgresType::Int4) => {
+            Ok(Some(i32::from(*value).to_be_bytes().to_vec()))
+        }
+        (ScalarValue::UInt32(value), PostgresType::Int8) => {
+            Ok(Some(i64::from(*value).to_be_bytes().to_vec()))
+        }
+        (ScalarValue::Float32(value), PostgresType::Float4) => {
+            Ok(Some(value.to_bits().to_be_bytes().to_vec()))
+        }
+        (ScalarValue::Float64(value), PostgresType::Float8) => {
+            Ok(Some(value.to_bits().to_be_bytes().to_vec()))
+        }
+        (ScalarValue::Bytes(value), PostgresType::Bytea) => Ok(Some(value.clone())),
         (ScalarValue::Text(value), PostgresType::Text | PostgresType::Varchar) => {
             Ok(Some(value.as_bytes().to_vec()))
         }
@@ -374,6 +447,9 @@ pub fn encode_binary_value(
             _,
             PostgresType::Int2
             | PostgresType::Int4
+            | PostgresType::Float4
+            | PostgresType::Float8
+            | PostgresType::Bytea
             | PostgresType::Unknown
             | PostgresType::BoolArray
             | PostgresType::TextArray,
@@ -410,6 +486,15 @@ pub fn decode_text_parameter(
             .parse::<i64>()
             .map(ScalarValue::Int64)
             .map_err(|error| integer_text_error(data_type, &error)),
+        PostgresType::Float4 => value
+            .parse::<f32>()
+            .map(|value| ScalarValue::Float32(Float32Value::new(value)))
+            .map_err(|_| TypeMappingError::InvalidTextValue(data_type)),
+        PostgresType::Float8 => value
+            .parse::<f64>()
+            .map(|value| ScalarValue::Float64(Float64Value::new(value)))
+            .map_err(|_| TypeMappingError::InvalidTextValue(data_type)),
+        PostgresType::Bytea => decode_bytea_text(value).map(ScalarValue::Bytes),
         PostgresType::Text | PostgresType::Varchar | PostgresType::Unknown => {
             Ok(ScalarValue::Text(value.to_owned()))
         }
@@ -417,6 +502,14 @@ pub fn decode_text_parameter(
             Err(TypeMappingError::InvalidTextValue(data_type))
         }
     }
+}
+
+pub fn decode_text_parameter_as(
+    bytes: Option<&[u8]>,
+    oid: PostgresOid,
+    expected: PhysicalType,
+) -> Result<ScalarValue, TypeMappingError> {
+    coerce_parameter(decode_text_parameter(bytes, oid)?, expected)
 }
 
 fn integer_text_error(
@@ -456,6 +549,21 @@ pub fn decode_binary_parameter(
         PostgresType::Int8 if bytes.len() == 8 => Ok(ScalarValue::Int64(i64::from_be_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))),
+        PostgresType::Float4 if bytes.len() == 4 => Ok(ScalarValue::Float32(
+            Float32Value::from_bits(u32::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| TypeMappingError::InvalidBinaryValue(data_type))?,
+            )),
+        )),
+        PostgresType::Float8 if bytes.len() == 8 => Ok(ScalarValue::Float64(
+            Float64Value::from_bits(u64::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| TypeMappingError::InvalidBinaryValue(data_type))?,
+            )),
+        )),
+        PostgresType::Bytea => Ok(ScalarValue::Bytes(bytes.to_vec())),
         PostgresType::Text | PostgresType::Varchar => std::str::from_utf8(bytes)
             .map(|value| ScalarValue::Text(value.to_owned()))
             .map_err(|_| TypeMappingError::InvalidBinaryValue(data_type)),
@@ -463,6 +571,103 @@ pub fn decode_binary_parameter(
             Err(TypeMappingError::BinaryFormatUnsupported(data_type))
         }
         _ => Err(TypeMappingError::InvalidBinaryValue(data_type)),
+    }
+}
+
+pub fn decode_binary_parameter_as(
+    bytes: Option<&[u8]>,
+    oid: PostgresOid,
+    expected: PhysicalType,
+) -> Result<ScalarValue, TypeMappingError> {
+    coerce_parameter(decode_binary_parameter(bytes, oid)?, expected)
+}
+
+fn coerce_parameter(
+    value: ScalarValue,
+    expected: PhysicalType,
+) -> Result<ScalarValue, TypeMappingError> {
+    if matches!(value, ScalarValue::Null) {
+        return Ok(value);
+    }
+    if value.physical_type() == Some(expected) {
+        return Ok(value);
+    }
+    let integer = match value {
+        ScalarValue::Int64(value) => value,
+        _ => return Err(TypeMappingError::TypeMismatch),
+    };
+    let range_type = match expected {
+        PhysicalType::Int8 | PhysicalType::Int16 | PhysicalType::UInt8 => PostgresType::Int2,
+        PhysicalType::Int32 | PhysicalType::UInt16 => PostgresType::Int4,
+        PhysicalType::Int64
+        | PhysicalType::Int128
+        | PhysicalType::UInt32
+        | PhysicalType::UInt64
+        | PhysicalType::UInt128 => PostgresType::Int8,
+        _ => return Err(TypeMappingError::TypeMismatch),
+    };
+    macro_rules! checked {
+        ($kind:ident, $type:ty) => {
+            <$type>::try_from(integer)
+                .map(ScalarValue::$kind)
+                .map_err(|_| TypeMappingError::ValueOutOfRange(range_type))
+        };
+    }
+    match expected {
+        PhysicalType::Int8 => checked!(Int8, i8),
+        PhysicalType::Int16 => checked!(Int16, i16),
+        PhysicalType::Int32 => checked!(Int32, i32),
+        PhysicalType::Int64 => Ok(ScalarValue::Int64(integer)),
+        PhysicalType::Int128 => Ok(ScalarValue::Int128(i128::from(integer))),
+        PhysicalType::UInt8 => checked!(UInt8, u8),
+        PhysicalType::UInt16 => checked!(UInt16, u16),
+        PhysicalType::UInt32 => checked!(UInt32, u32),
+        PhysicalType::UInt64 => checked!(UInt64, u64),
+        PhysicalType::UInt128 => checked!(UInt128, u128),
+        PhysicalType::Bool
+        | PhysicalType::Float32
+        | PhysicalType::Float64
+        | PhysicalType::Text
+        | PhysicalType::Bytes => Err(TypeMappingError::TypeMismatch),
+    }
+}
+
+fn bytea_text(value: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = Vec::with_capacity(2 + value.len() * 2);
+    output.extend_from_slice(b"\\x");
+    for byte in value {
+        output.push(HEX[usize::from(byte >> 4)]);
+        output.push(HEX[usize::from(byte & 0x0f)]);
+    }
+    output
+}
+
+fn decode_bytea_text(value: &str) -> Result<Vec<u8>, TypeMappingError> {
+    let hex = value
+        .strip_prefix("\\x")
+        .ok_or(TypeMappingError::InvalidTextValue(PostgresType::Bytea))?;
+    if hex.len() % 2 != 0 {
+        return Err(TypeMappingError::InvalidTextValue(PostgresType::Bytea));
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_digit(pair[0])
+                .ok_or(TypeMappingError::InvalidTextValue(PostgresType::Bytea))?;
+            let low = hex_digit(pair[1])
+                .ok_or(TypeMappingError::InvalidTextValue(PostgresType::Bytea))?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+const fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1212,6 +1417,80 @@ mod tests {
         assert_eq!(
             encode_binary_value(&ScalarValue::Null, PostgresType::Text).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn extended_lossless_mappings_parameters_and_results_are_explicit() {
+        for (physical, postgres) in [
+            (PhysicalType::Int8, PostgresType::Int2),
+            (PhysicalType::Int16, PostgresType::Int2),
+            (PhysicalType::Int32, PostgresType::Int4),
+            (PhysicalType::Int64, PostgresType::Int8),
+            (PhysicalType::UInt8, PostgresType::Int2),
+            (PhysicalType::UInt16, PostgresType::Int4),
+            (PhysicalType::UInt32, PostgresType::Int8),
+            (PhysicalType::Float32, PostgresType::Float4),
+            (PhysicalType::Float64, PostgresType::Float8),
+            (PhysicalType::Bytes, PostgresType::Bytea),
+        ] {
+            assert_eq!(PostgresType::from_netbadb(physical).unwrap(), postgres);
+            assert_eq!(PostgresType::from_oid(postgres.oid()), Some(postgres));
+        }
+        for physical in [
+            PhysicalType::UInt64,
+            PhysicalType::Int128,
+            PhysicalType::UInt128,
+        ] {
+            assert!(PostgresType::from_netbadb(physical).is_err());
+        }
+
+        assert_eq!(
+            decode_text_parameter_as(Some(b"255"), PostgresType::Int2.oid(), PhysicalType::UInt8)
+                .unwrap(),
+            ScalarValue::UInt8(u8::MAX)
+        );
+        assert_eq!(
+            decode_binary_parameter_as(
+                Some(&i64::MAX.to_be_bytes()),
+                PostgresType::Int8.oid(),
+                PhysicalType::Int128,
+            )
+            .unwrap(),
+            ScalarValue::Int128(i128::from(i64::MAX))
+        );
+        assert_eq!(
+            decode_text_parameter_as(
+                Some(b"9223372036854775807"),
+                PostgresType::Int8.oid(),
+                PhysicalType::UInt128,
+            )
+            .unwrap(),
+            ScalarValue::UInt128(i64::MAX as u128)
+        );
+        assert!(matches!(
+            decode_text_parameter_as(Some(b"-1"), PostgresType::Int2.oid(), PhysicalType::UInt8),
+            Err(TypeMappingError::ValueOutOfRange(PostgresType::Int2))
+        ));
+
+        let bytes = ScalarValue::Bytes(vec![0, 0xff, 0x80]);
+        assert_eq!(
+            encode_text_value(&bytes, PostgresType::Bytea).unwrap(),
+            Some(b"\\x00ff80".to_vec())
+        );
+        assert_eq!(
+            decode_text_parameter(Some(b"\\x00ff80"), PostgresType::Bytea.oid()).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            encode_binary_value(&bytes, PostgresType::Bytea).unwrap(),
+            Some(vec![0, 0xff, 0x80])
+        );
+
+        let nan = ScalarValue::Float32(Float32Value::from_bits(0xffff_ffff));
+        assert_eq!(
+            encode_binary_value(&nan, PostgresType::Float4).unwrap(),
+            Some(Float32Value::CANONICAL_NAN_BITS.to_be_bytes().to_vec())
         );
     }
 }

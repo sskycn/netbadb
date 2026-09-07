@@ -21,8 +21,8 @@ use netbadb_index::compare_values;
 use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_types::{
     ChangeStreamGeneration, ColumnId, ColumnarGeneration, ColumnarProjectionId, ColumnarSegmentId,
-    LsmCommitSeq, LsmRowId, PageId, PhysicalType, RowId, ScalarValue, StorageDataVersion,
-    StorageId, TableId,
+    Float32Value, Float64Value, LsmCommitSeq, LsmRowId, PageId, PhysicalType, RowId, ScalarValue,
+    StorageDataVersion, StorageId, TableId,
 };
 
 use crate::{ChangeBatch, ChangeStreamCursor, StorageChange, StorageVersionKey};
@@ -195,11 +195,56 @@ pub enum ColumnarVector {
         values: Vec<i64>,
         validity: Vec<u8>,
     },
+    Int8 {
+        values: Vec<i8>,
+        validity: Vec<u8>,
+    },
+    Int16 {
+        values: Vec<i16>,
+        validity: Vec<u8>,
+    },
+    Int32 {
+        values: Vec<i32>,
+        validity: Vec<u8>,
+    },
+    Int128 {
+        values: Vec<i128>,
+        validity: Vec<u8>,
+    },
+    UInt8 {
+        values: Vec<u8>,
+        validity: Vec<u8>,
+    },
+    UInt16 {
+        values: Vec<u16>,
+        validity: Vec<u8>,
+    },
+    UInt32 {
+        values: Vec<u32>,
+        validity: Vec<u8>,
+    },
     UInt64 {
         values: Vec<u64>,
         validity: Vec<u8>,
     },
+    UInt128 {
+        values: Vec<u128>,
+        validity: Vec<u8>,
+    },
+    Float32 {
+        values: Vec<Float32Value>,
+        validity: Vec<u8>,
+    },
+    Float64 {
+        values: Vec<Float64Value>,
+        validity: Vec<u8>,
+    },
     Text {
+        offsets: Vec<u32>,
+        bytes: Vec<u8>,
+        validity: Vec<u8>,
+    },
+    Bytes {
         offsets: Vec<u32>,
         bytes: Vec<u8>,
         validity: Vec<u8>,
@@ -211,9 +256,21 @@ impl ColumnarVector {
     pub fn len(&self) -> usize {
         match self {
             Self::Bool { values, .. } => values.len(),
+            Self::Int8 { values, .. } => values.len(),
+            Self::Int16 { values, .. } => values.len(),
+            Self::Int32 { values, .. } => values.len(),
             Self::Int64 { values, .. } => values.len(),
+            Self::Int128 { values, .. } => values.len(),
+            Self::UInt8 { values, .. } => values.len(),
+            Self::UInt16 { values, .. } => values.len(),
+            Self::UInt32 { values, .. } => values.len(),
             Self::UInt64 { values, .. } => values.len(),
-            Self::Text { offsets, .. } => offsets.len().saturating_sub(1),
+            Self::UInt128 { values, .. } => values.len(),
+            Self::Float32 { values, .. } => values.len(),
+            Self::Float64 { values, .. } => values.len(),
+            Self::Text { offsets, .. } | Self::Bytes { offsets, .. } => {
+                offsets.len().saturating_sub(1)
+            }
         }
     }
 
@@ -225,9 +282,20 @@ impl ColumnarVector {
     pub fn value(&self, row: usize) -> Result<ScalarValue, ColumnarError> {
         let validity = match self {
             Self::Bool { validity, .. }
+            | Self::Int8 { validity, .. }
+            | Self::Int16 { validity, .. }
+            | Self::Int32 { validity, .. }
             | Self::Int64 { validity, .. }
+            | Self::Int128 { validity, .. }
+            | Self::UInt8 { validity, .. }
+            | Self::UInt16 { validity, .. }
+            | Self::UInt32 { validity, .. }
             | Self::UInt64 { validity, .. }
-            | Self::Text { validity, .. } => validity,
+            | Self::UInt128 { validity, .. }
+            | Self::Float32 { validity, .. }
+            | Self::Float64 { validity, .. }
+            | Self::Text { validity, .. }
+            | Self::Bytes { validity, .. } => validity,
         };
         if row >= self.len() {
             return Err(ColumnarError::Corrupt("column row index is out of bounds"));
@@ -237,8 +305,18 @@ impl ColumnarVector {
         }
         match self {
             Self::Bool { values, .. } => Ok(ScalarValue::Bool(values[row])),
+            Self::Int8 { values, .. } => Ok(ScalarValue::Int8(values[row])),
+            Self::Int16 { values, .. } => Ok(ScalarValue::Int16(values[row])),
+            Self::Int32 { values, .. } => Ok(ScalarValue::Int32(values[row])),
             Self::Int64 { values, .. } => Ok(ScalarValue::Int64(values[row])),
+            Self::Int128 { values, .. } => Ok(ScalarValue::Int128(values[row])),
+            Self::UInt8 { values, .. } => Ok(ScalarValue::UInt8(values[row])),
+            Self::UInt16 { values, .. } => Ok(ScalarValue::UInt16(values[row])),
+            Self::UInt32 { values, .. } => Ok(ScalarValue::UInt32(values[row])),
             Self::UInt64 { values, .. } => Ok(ScalarValue::UInt64(values[row])),
+            Self::UInt128 { values, .. } => Ok(ScalarValue::UInt128(values[row])),
+            Self::Float32 { values, .. } => Ok(ScalarValue::Float32(values[row])),
+            Self::Float64 { values, .. } => Ok(ScalarValue::Float64(values[row])),
             Self::Text { offsets, bytes, .. } => {
                 let start = usize::try_from(offsets[row])
                     .map_err(|_| ColumnarError::Corrupt("text start offset overflow"))?;
@@ -251,6 +329,18 @@ impl ColumnarVector {
                     std::str::from_utf8(value)
                         .map_err(|_| ColumnarError::Corrupt("text payload is not UTF-8"))?
                         .to_owned(),
+                ))
+            }
+            Self::Bytes { offsets, bytes, .. } => {
+                let start = usize::try_from(offsets[row])
+                    .map_err(|_| ColumnarError::Corrupt("bytes start offset overflow"))?;
+                let end = usize::try_from(offsets[row + 1])
+                    .map_err(|_| ColumnarError::Corrupt("bytes end offset overflow"))?;
+                Ok(ScalarValue::Bytes(
+                    bytes
+                        .get(start..end)
+                        .ok_or(ColumnarError::Corrupt("bytes offsets are out of bounds"))?
+                        .to_vec(),
                 ))
             }
         }
@@ -1235,8 +1325,13 @@ fn scalar_resident_bytes(value: &ScalarValue) -> u64 {
     match value {
         ScalarValue::Null => 0,
         ScalarValue::Bool(_) => 1,
-        ScalarValue::Int64(_) | ScalarValue::UInt64(_) => 8,
+        ScalarValue::Int8(_) | ScalarValue::UInt8(_) => 1,
+        ScalarValue::Int16(_) | ScalarValue::UInt16(_) => 2,
+        ScalarValue::Int32(_) | ScalarValue::UInt32(_) | ScalarValue::Float32(_) => 4,
+        ScalarValue::Int64(_) | ScalarValue::UInt64(_) | ScalarValue::Float64(_) => 8,
+        ScalarValue::Int128(_) | ScalarValue::UInt128(_) => 16,
         ScalarValue::Text(value) => value.len() as u64,
+        ScalarValue::Bytes(value) => value.len() as u64,
     }
 }
 
@@ -2388,12 +2483,7 @@ impl ColumnarProjection {
 fn select_vector_rows(vector: &ColumnarVector, rows: &[usize]) -> ColumnarVector {
     let mut validity = vec![0_u8; rows.len().div_ceil(8)];
     for (output, input) in rows.iter().copied().enumerate() {
-        let source = match vector {
-            ColumnarVector::Bool { validity, .. }
-            | ColumnarVector::Int64 { validity, .. }
-            | ColumnarVector::UInt64 { validity, .. }
-            | ColumnarVector::Text { validity, .. } => validity,
-        };
+        let source = vector_validity(vector);
         if valid_at(source, input) {
             set_valid(&mut validity, output);
         }
@@ -2403,11 +2493,51 @@ fn select_vector_rows(vector: &ColumnarVector, rows: &[usize]) -> ColumnarVector
             values: rows.iter().map(|row| values[*row]).collect(),
             validity,
         },
+        ColumnarVector::Int8 { values, .. } => ColumnarVector::Int8 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::Int16 { values, .. } => ColumnarVector::Int16 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::Int32 { values, .. } => ColumnarVector::Int32 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
         ColumnarVector::Int64 { values, .. } => ColumnarVector::Int64 {
             values: rows.iter().map(|row| values[*row]).collect(),
             validity,
         },
+        ColumnarVector::Int128 { values, .. } => ColumnarVector::Int128 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::UInt8 { values, .. } => ColumnarVector::UInt8 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::UInt16 { values, .. } => ColumnarVector::UInt16 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::UInt32 { values, .. } => ColumnarVector::UInt32 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
         ColumnarVector::UInt64 { values, .. } => ColumnarVector::UInt64 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::UInt128 { values, .. } => ColumnarVector::UInt128 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::Float32 { values, .. } => ColumnarVector::Float32 {
+            values: rows.iter().map(|row| values[*row]).collect(),
+            validity,
+        },
+        ColumnarVector::Float64 { values, .. } => ColumnarVector::Float64 {
             values: rows.iter().map(|row| values[*row]).collect(),
             validity,
         },
@@ -2427,6 +2557,41 @@ fn select_vector_rows(vector: &ColumnarVector, rows: &[usize]) -> ColumnarVector
                 validity,
             }
         }
+        ColumnarVector::Bytes { offsets, bytes, .. } => {
+            let mut selected_offsets = Vec::with_capacity(rows.len() + 1);
+            let mut selected_bytes = Vec::new();
+            selected_offsets.push(0);
+            for row in rows {
+                selected_bytes
+                    .extend_from_slice(&bytes[offsets[*row] as usize..offsets[*row + 1] as usize]);
+                selected_offsets.push(u32::try_from(selected_bytes.len()).unwrap_or(u32::MAX));
+            }
+            ColumnarVector::Bytes {
+                offsets: selected_offsets,
+                bytes: selected_bytes,
+                validity,
+            }
+        }
+    }
+}
+
+fn vector_validity(vector: &ColumnarVector) -> &[u8] {
+    match vector {
+        ColumnarVector::Bool { validity, .. }
+        | ColumnarVector::Int8 { validity, .. }
+        | ColumnarVector::Int16 { validity, .. }
+        | ColumnarVector::Int32 { validity, .. }
+        | ColumnarVector::Int64 { validity, .. }
+        | ColumnarVector::Int128 { validity, .. }
+        | ColumnarVector::UInt8 { validity, .. }
+        | ColumnarVector::UInt16 { validity, .. }
+        | ColumnarVector::UInt32 { validity, .. }
+        | ColumnarVector::UInt64 { validity, .. }
+        | ColumnarVector::UInt128 { validity, .. }
+        | ColumnarVector::Float32 { validity, .. }
+        | ColumnarVector::Float64 { validity, .. }
+        | ColumnarVector::Text { validity, .. }
+        | ColumnarVector::Bytes { validity, .. } => validity,
     }
 }
 
@@ -2501,13 +2666,47 @@ fn version_key_sort_key(key: StorageVersionKey) -> (u8, u64, u64, u64) {
 fn vector_encoded_bytes(vector: &ColumnarVector) -> u64 {
     let (validity, data) = match vector {
         ColumnarVector::Bool { values, validity } => (validity.len(), values.len()),
+        ColumnarVector::Int8 { values, validity } => (validity.len(), values.len()),
+        ColumnarVector::UInt8 { values, validity } => (validity.len(), values.len()),
+        ColumnarVector::Int16 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(2))
+        }
+        ColumnarVector::UInt16 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(2))
+        }
+        ColumnarVector::Int32 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(4))
+        }
+        ColumnarVector::UInt32 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(4))
+        }
+        ColumnarVector::Float32 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(4))
+        }
         ColumnarVector::Int64 { values, validity } => {
             (validity.len(), values.len().saturating_mul(8))
         }
         ColumnarVector::UInt64 { values, validity } => {
             (validity.len(), values.len().saturating_mul(8))
         }
+        ColumnarVector::Float64 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(8))
+        }
+        ColumnarVector::Int128 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(16))
+        }
+        ColumnarVector::UInt128 { values, validity } => {
+            (validity.len(), values.len().saturating_mul(16))
+        }
         ColumnarVector::Text {
+            offsets,
+            bytes,
+            validity,
+        } => (
+            validity.len(),
+            offsets.len().saturating_mul(4).saturating_add(bytes.len()),
+        ),
+        ColumnarVector::Bytes {
             offsets,
             bytes,
             validity,
@@ -2678,6 +2877,25 @@ fn vector_from_values(
     values: &[&ScalarValue],
 ) -> Result<ColumnarVector, ColumnarError> {
     let mut validity = vec![0_u8; values.len().div_ceil(8)];
+    macro_rules! fixed_vector {
+        ($scalar:path, $variant:ident, $zero:expr) => {{
+            let mut output = Vec::with_capacity(values.len());
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    $scalar(value) => {
+                        set_valid(&mut validity, row);
+                        output.push(*value);
+                    }
+                    ScalarValue::Null if spec.nullable => output.push($zero),
+                    _ => return Err(ColumnarError::TypeMismatch(spec.column_id)),
+                }
+            }
+            Ok(ColumnarVector::$variant {
+                values: output,
+                validity,
+            })
+        }};
+    }
     match spec.physical_type {
         PhysicalType::Bool => {
             let mut output = Vec::with_capacity(values.len());
@@ -2696,6 +2914,9 @@ fn vector_from_values(
                 validity,
             })
         }
+        PhysicalType::Int8 => fixed_vector!(ScalarValue::Int8, Int8, 0),
+        PhysicalType::Int16 => fixed_vector!(ScalarValue::Int16, Int16, 0),
+        PhysicalType::Int32 => fixed_vector!(ScalarValue::Int32, Int32, 0),
         PhysicalType::Int64 => {
             let mut output = Vec::with_capacity(values.len());
             for (row, value) in values.iter().enumerate() {
@@ -2713,6 +2934,10 @@ fn vector_from_values(
                 validity,
             })
         }
+        PhysicalType::Int128 => fixed_vector!(ScalarValue::Int128, Int128, 0),
+        PhysicalType::UInt8 => fixed_vector!(ScalarValue::UInt8, UInt8, 0),
+        PhysicalType::UInt16 => fixed_vector!(ScalarValue::UInt16, UInt16, 0),
+        PhysicalType::UInt32 => fixed_vector!(ScalarValue::UInt32, UInt32, 0),
         PhysicalType::UInt64 => {
             let mut output = Vec::with_capacity(values.len());
             for (row, value) in values.iter().enumerate() {
@@ -2729,6 +2954,13 @@ fn vector_from_values(
                 values: output,
                 validity,
             })
+        }
+        PhysicalType::UInt128 => fixed_vector!(ScalarValue::UInt128, UInt128, 0),
+        PhysicalType::Float32 => {
+            fixed_vector!(ScalarValue::Float32, Float32, Float32Value::from_bits(0))
+        }
+        PhysicalType::Float64 => {
+            fixed_vector!(ScalarValue::Float64, Float64, Float64Value::from_bits(0))
         }
         PhysicalType::Text => {
             let mut offsets = Vec::with_capacity(values.len() + 1);
@@ -2751,6 +2983,32 @@ fn vector_from_values(
                 })?);
             }
             Ok(ColumnarVector::Text {
+                offsets,
+                bytes,
+                validity,
+            })
+        }
+        PhysicalType::Bytes => {
+            let mut offsets = Vec::with_capacity(values.len() + 1);
+            let mut bytes = Vec::new();
+            offsets.push(0);
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    ScalarValue::Bytes(value) => {
+                        set_valid(&mut validity, row);
+                        bytes.extend_from_slice(value);
+                    }
+                    ScalarValue::Null if spec.nullable => {}
+                    _ => return Err(ColumnarError::TypeMismatch(spec.column_id)),
+                }
+                offsets.push(u32::try_from(bytes.len()).map_err(|_| {
+                    ColumnarError::ResourceLimit {
+                        resource: "bytes payload bytes",
+                        value: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    }
+                })?);
+            }
+            Ok(ColumnarVector::Bytes {
                 offsets,
                 bytes,
                 validity,
@@ -5020,17 +5278,7 @@ fn decode_column_chunk(
     let data = reader.take(data_len)?;
     let vector = decode_vector_data(spec.physical_type, rows as usize, validity, data)?;
     let actual_nulls = (0..rows as usize)
-        .filter(|row| {
-            !valid_at(
-                match &vector {
-                    ColumnarVector::Bool { validity, .. }
-                    | ColumnarVector::Int64 { validity, .. }
-                    | ColumnarVector::UInt64 { validity, .. }
-                    | ColumnarVector::Text { validity, .. } => validity,
-                },
-                *row,
-            )
-        })
+        .filter(|row| !valid_at(vector_validity(&vector), *row))
         .count() as u64;
     if actual_nulls != null_count {
         return Err(ColumnarError::Corrupt(
@@ -5056,6 +5304,44 @@ fn encode_vector_data(vector: &ColumnarVector) -> Result<(&[u8], Vec<u8>), Colum
             data.extend(values.iter().map(|value| u8::from(*value)));
             validity
         }
+        ColumnarVector::Int8 { values, validity } => {
+            data.extend(values.iter().map(|value| value.to_le_bytes()[0]));
+            validity
+        }
+        ColumnarVector::Int16 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            validity
+        }
+        ColumnarVector::Int32 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            validity
+        }
+        ColumnarVector::Int128 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            validity
+        }
+        ColumnarVector::UInt8 { values, validity } => {
+            data.extend_from_slice(values);
+            validity
+        }
+        ColumnarVector::UInt16 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            validity
+        }
+        ColumnarVector::UInt32 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            validity
+        }
         ColumnarVector::Int64 { values, validity } => {
             for value in values {
                 data.extend_from_slice(&value.to_le_bytes());
@@ -5068,7 +5354,36 @@ fn encode_vector_data(vector: &ColumnarVector) -> Result<(&[u8], Vec<u8>), Colum
             }
             validity
         }
+        ColumnarVector::UInt128 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            validity
+        }
+        ColumnarVector::Float32 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            validity
+        }
+        ColumnarVector::Float64 { values, validity } => {
+            for value in values {
+                data.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            validity
+        }
         ColumnarVector::Text {
+            offsets,
+            bytes,
+            validity,
+        } => {
+            for offset in offsets {
+                data.extend_from_slice(&offset.to_le_bytes());
+            }
+            data.extend_from_slice(bytes);
+            validity
+        }
+        ColumnarVector::Bytes {
             offsets,
             bytes,
             validity,
@@ -5099,6 +5414,27 @@ fn decode_vector_data(
                 validity,
             })
         }
+        PhysicalType::Int8 => Ok(ColumnarVector::Int8 {
+            values: decode_fixed::<1>(data, rows)?
+                .into_iter()
+                .map(i8::from_le_bytes)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::Int16 => Ok(ColumnarVector::Int16 {
+            values: decode_fixed::<2>(data, rows)?
+                .into_iter()
+                .map(i16::from_le_bytes)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::Int32 => Ok(ColumnarVector::Int32 {
+            values: decode_fixed::<4>(data, rows)?
+                .into_iter()
+                .map(i32::from_le_bytes)
+                .collect(),
+            validity,
+        }),
         PhysicalType::Int64 => Ok(ColumnarVector::Int64 {
             values: decode_fixed_u64(data, rows)?
                 .into_iter()
@@ -5106,8 +5442,59 @@ fn decode_vector_data(
                 .collect(),
             validity,
         }),
+        PhysicalType::Int128 => Ok(ColumnarVector::Int128 {
+            values: decode_fixed::<16>(data, rows)?
+                .into_iter()
+                .map(i128::from_le_bytes)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::UInt8 => Ok(ColumnarVector::UInt8 {
+            values: decode_fixed::<1>(data, rows)?
+                .into_iter()
+                .map(u8::from_le_bytes)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::UInt16 => Ok(ColumnarVector::UInt16 {
+            values: decode_fixed::<2>(data, rows)?
+                .into_iter()
+                .map(u16::from_le_bytes)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::UInt32 => Ok(ColumnarVector::UInt32 {
+            values: decode_fixed::<4>(data, rows)?
+                .into_iter()
+                .map(u32::from_le_bytes)
+                .collect(),
+            validity,
+        }),
         PhysicalType::UInt64 => Ok(ColumnarVector::UInt64 {
             values: decode_fixed_u64(data, rows)?,
+            validity,
+        }),
+        PhysicalType::UInt128 => Ok(ColumnarVector::UInt128 {
+            values: decode_fixed::<16>(data, rows)?
+                .into_iter()
+                .map(u128::from_le_bytes)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::Float32 => Ok(ColumnarVector::Float32 {
+            values: decode_fixed::<4>(data, rows)?
+                .into_iter()
+                .map(u32::from_le_bytes)
+                .map(Float32Value::from_bits)
+                .collect(),
+            validity,
+        }),
+        PhysicalType::Float64 => Ok(ColumnarVector::Float64 {
+            values: decode_fixed::<8>(data, rows)?
+                .into_iter()
+                .map(u64::from_le_bytes)
+                .map(Float64Value::from_bits)
+                .collect(),
             validity,
         }),
         PhysicalType::Text => {
@@ -5142,7 +5529,50 @@ fn decode_vector_data(
                 validity,
             })
         }
+        PhysicalType::Bytes => {
+            let offset_count = rows
+                .checked_add(1)
+                .ok_or(ColumnarError::Corrupt("bytes offset count overflow"))?;
+            let offset_bytes = offset_count
+                .checked_mul(4)
+                .ok_or(ColumnarError::Corrupt("bytes offset bytes overflow"))?;
+            let (encoded_offsets, bytes) = data
+                .split_at_checked(offset_bytes)
+                .ok_or(ColumnarError::Corrupt("truncated bytes offsets"))?;
+            let offsets = encoded_offsets
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])))
+                .collect::<Vec<_>>();
+            if offsets.first().copied() != Some(0)
+                || offsets.windows(2).any(|pair| pair[0] > pair[1])
+                || usize::try_from(offsets.last().copied().unwrap_or(0)).ok() != Some(bytes.len())
+            {
+                return Err(ColumnarError::Corrupt("invalid bytes offsets"));
+            }
+            Ok(ColumnarVector::Bytes {
+                offsets,
+                bytes: bytes.to_vec(),
+                validity,
+            })
+        }
     }
+}
+
+fn decode_fixed<const N: usize>(data: &[u8], rows: usize) -> Result<Vec<[u8; N]>, ColumnarError> {
+    if data.len()
+        != rows
+            .checked_mul(N)
+            .ok_or(ColumnarError::Corrupt("fixed data overflow"))?
+    {
+        return Err(ColumnarError::Corrupt("invalid fixed-width column data"));
+    }
+    data.chunks_exact(N)
+        .map(|chunk| {
+            chunk
+                .try_into()
+                .map_err(|_| ColumnarError::Corrupt("invalid fixed-width column data"))
+        })
+        .collect()
 }
 
 fn decode_fixed_u64(data: &[u8], rows: usize) -> Result<Vec<u64>, ColumnarError> {
@@ -5206,6 +5636,44 @@ fn encode_scalar(
             );
             output.extend_from_slice(value.as_bytes());
         }
+        (PhysicalType::Int8, ScalarValue::Int8(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::Int16, ScalarValue::Int16(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::Int32, ScalarValue::Int32(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::Int128, ScalarValue::Int128(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::UInt8, ScalarValue::UInt8(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::UInt16, ScalarValue::UInt16(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::UInt32, ScalarValue::UInt32(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::UInt128, ScalarValue::UInt128(value)) => {
+            output.extend_from_slice(&value.to_le_bytes())
+        }
+        (PhysicalType::Float32, ScalarValue::Float32(value)) => {
+            output.extend_from_slice(&value.to_bits().to_le_bytes())
+        }
+        (PhysicalType::Float64, ScalarValue::Float64(value)) => {
+            output.extend_from_slice(&value.to_bits().to_le_bytes())
+        }
+        (PhysicalType::Bytes, ScalarValue::Bytes(value)) => {
+            push_u32(
+                output,
+                u32::try_from(value.len())
+                    .map_err(|_| ColumnarError::InvalidInput("statistic bytes too long"))?,
+            );
+            output.extend_from_slice(value);
+        }
         _ => return Err(ColumnarError::InvalidInput("statistic type mismatch")),
     }
     Ok(())
@@ -5224,6 +5692,17 @@ fn decode_scalar(
         PhysicalType::Int64 => Ok(ScalarValue::Int64(i64::from_le_bytes(reader.array()?))),
         PhysicalType::UInt64 => Ok(ScalarValue::UInt64(reader.u64()?)),
         PhysicalType::Text => Ok(ScalarValue::Text(reader.string()?)),
+        PhysicalType::Int8 => Ok(ScalarValue::Int8(i8::from_le_bytes(reader.array()?))),
+        PhysicalType::Int16 => Ok(ScalarValue::Int16(i16::from_le_bytes(reader.array()?))),
+        PhysicalType::Int32 => Ok(ScalarValue::Int32(i32::from_le_bytes(reader.array()?))),
+        PhysicalType::Int128 => Ok(ScalarValue::Int128(i128::from_le_bytes(reader.array()?))),
+        PhysicalType::UInt8 => Ok(ScalarValue::UInt8(reader.u8()?)),
+        PhysicalType::UInt16 => Ok(ScalarValue::UInt16(reader.u16()?)),
+        PhysicalType::UInt32 => Ok(ScalarValue::UInt32(reader.u32()?)),
+        PhysicalType::UInt128 => Ok(ScalarValue::UInt128(u128::from_le_bytes(reader.array()?))),
+        PhysicalType::Float32 => Ok(ScalarValue::Float32(Float32Value::from_bits(reader.u32()?))),
+        PhysicalType::Float64 => Ok(ScalarValue::Float64(Float64Value::from_bits(reader.u64()?))),
+        PhysicalType::Bytes => Ok(ScalarValue::Bytes(reader.bytes()?)),
     }
 }
 
@@ -5282,6 +5761,17 @@ const fn type_tag(physical: PhysicalType) -> u8 {
         PhysicalType::Int64 => 2,
         PhysicalType::UInt64 => 3,
         PhysicalType::Text => 4,
+        PhysicalType::Int8 => 5,
+        PhysicalType::Int16 => 6,
+        PhysicalType::Int32 => 7,
+        PhysicalType::Int128 => 8,
+        PhysicalType::UInt8 => 9,
+        PhysicalType::UInt16 => 10,
+        PhysicalType::UInt32 => 11,
+        PhysicalType::UInt128 => 12,
+        PhysicalType::Float32 => 13,
+        PhysicalType::Float64 => 14,
+        PhysicalType::Bytes => 15,
     }
 }
 
@@ -5291,6 +5781,17 @@ fn decode_type_tag(tag: u8) -> Result<PhysicalType, ColumnarError> {
         2 => Ok(PhysicalType::Int64),
         3 => Ok(PhysicalType::UInt64),
         4 => Ok(PhysicalType::Text),
+        5 => Ok(PhysicalType::Int8),
+        6 => Ok(PhysicalType::Int16),
+        7 => Ok(PhysicalType::Int32),
+        8 => Ok(PhysicalType::Int128),
+        9 => Ok(PhysicalType::UInt8),
+        10 => Ok(PhysicalType::UInt16),
+        11 => Ok(PhysicalType::UInt32),
+        12 => Ok(PhysicalType::UInt128),
+        13 => Ok(PhysicalType::Float32),
+        14 => Ok(PhysicalType::Float64),
+        15 => Ok(PhysicalType::Bytes),
         _ => Err(ColumnarError::Corrupt("unknown physical type tag")),
     }
 }
@@ -5372,6 +5873,11 @@ impl<'a> Reader<'a> {
             .to_owned())
     }
 
+    fn bytes(&mut self) -> Result<Vec<u8>, ColumnarError> {
+        let length = self.u32()? as usize;
+        Ok(self.take(length)?.to_vec())
+    }
+
     fn finish(self) -> Result<(), ColumnarError> {
         if self.offset != self.bytes.len() {
             return Err(ColumnarError::Corrupt("trailing bytes"));
@@ -5392,13 +5898,16 @@ fn crash(_: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnarConstraint, ColumnarError, ColumnarProjection, StorageSnapshotToken};
+    use super::{
+        ColumnarColumnSpec, ColumnarConstraint, ColumnarError, ColumnarProjection,
+        StorageSnapshotToken, decode_vector_data, encode_vector_data, vector_from_values,
+    };
     use crate::{ChangeBatch, StorageChange, StorageVersionKey};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{
-        ChangeStreamGeneration, ColumnId, ColumnarGeneration, ColumnarProjectionId, LsmCommitSeq,
-        LsmRowId, PageId, PhysicalType, RowId, ScalarValue, StorageDataVersion, StorageId, TableId,
-        TxnId,
+        ChangeStreamGeneration, ColumnId, ColumnarGeneration, ColumnarProjectionId, Float32Value,
+        Float64Value, LsmCommitSeq, LsmRowId, PageId, PhysicalType, RowId, ScalarValue,
+        StorageDataVersion, StorageId, TableId, TxnId,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -5420,6 +5929,51 @@ mod tests {
             )
             .and_then(|prepared| prepared.publish())
         };
+    }
+
+    #[test]
+    fn native_vectors_round_trip_every_appended_physical_type() {
+        let cases = vec![
+            (PhysicalType::Int8, ScalarValue::Int8(i8::MIN)),
+            (PhysicalType::Int16, ScalarValue::Int16(i16::MAX)),
+            (PhysicalType::Int32, ScalarValue::Int32(i32::MIN)),
+            (PhysicalType::Int128, ScalarValue::Int128(i128::MAX)),
+            (PhysicalType::UInt8, ScalarValue::UInt8(u8::MAX)),
+            (PhysicalType::UInt16, ScalarValue::UInt16(u16::MAX)),
+            (PhysicalType::UInt32, ScalarValue::UInt32(u32::MAX)),
+            (PhysicalType::UInt128, ScalarValue::UInt128(u128::MAX)),
+            (
+                PhysicalType::Float32,
+                ScalarValue::Float32(Float32Value::from_bits(0xffff_ffff)),
+            ),
+            (
+                PhysicalType::Float64,
+                ScalarValue::Float64(Float64Value::new(f64::NEG_INFINITY)),
+            ),
+            (PhysicalType::Bytes, ScalarValue::Bytes(vec![0, 0xff, 0x80])),
+        ];
+        for (physical, value) in cases {
+            let values = [&value, &ScalarValue::Null];
+            let vector = vector_from_values(
+                &ColumnarColumnSpec {
+                    column_id: ColumnId(1),
+                    physical_type: physical,
+                    nullable: true,
+                },
+                &values,
+            )
+            .expect("build native vector");
+            assert_eq!(vector.value(0).expect("first vector value"), value);
+            assert_eq!(
+                vector.value(1).expect("nullable vector value"),
+                ScalarValue::Null
+            );
+            let (validity, data) = encode_vector_data(&vector).expect("encode vector");
+            assert_eq!(
+                decode_vector_data(physical, 2, validity.to_vec(), &data).expect("decode vector"),
+                vector
+            );
+        }
     }
 
     fn rewrite_checksum(bytes: &mut [u8]) {
