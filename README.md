@@ -431,9 +431,18 @@ backfill, each statement reads one immutable pre-statement VirtualRow;
 assignments are simultaneous, and later statements observe earlier deferred
 results. Actions are observed against authoritative S1/P1 and replayed in order
 during the single final S1-to-S2 projection. General post-ALTER DML, base
-writes, structural ALTER after backfill starts, non-Heap placements, and
-cross-table migration remain closed. The program is transaction-local; no
-persistent or wire format changes.
+writes, non-Heap placements, and cross-table migration remain closed. The
+program is transaction-local; no persistent or wire format changes.
+
+[Round 56](docs/deferred-terminal-structural-round56.md) adds a bounded
+production terminal phase after that value program. A successful same-table
+DROP COLUMN, RENAME COLUMN, or RENAME TABLE seals deferred DML and composes a
+private final schema before the one final Heap replacement. This enables atomic
+unindexed shadow-column replacement without physically mutating S1 or exposing
+an intermediate schema. Dropped source and late-intermediate ColumnIds may
+remain evaluation-only dependencies in frozen E, but are absent from final F
+and S2. ADD, type conversion, post-terminal nullability, indexed shadow swap,
+and general post-refinement DML remain unsupported.
 
 
 Offline catalog and statement inspection is documented in

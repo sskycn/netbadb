@@ -62,6 +62,7 @@ production or build dependencies.
 | One managed Heap DML + surviving-column SET/DROP NOT NULL | psql yes, bounded | Round 46 transaction-visible SET validation; indexed survivors supported; new-column nullability and later DML unsupported; final indexes added in Round 48 |
 | Adopted refinement + terminal CREATE/DROP INDEX | psql and Extended Query, bounded | Round 48: one S2 for dirty tables; same S1/P1 for index-only; later ALTER/DML closed |
 | Adopted ADD + deferred late-column UPDATE + projected NOT NULL + final index | psql and Extended Query, bounded | Round 54 managed Single Heap: reads surviving base plus visible reserved late columns from one pre-statement VirtualRow; simultaneous assignments, owned bound scalars, exact S1/P1 observation, one final S2; other relational access closed |
+| Deferred program + terminal unindexed shadow-column swap | Simple and Extended Query, bounded | Round 56 managed Single Heap: DROP/RENAME only after value repair/nullability; frozen E retains hidden evaluation dependencies, final F/S2 omits them; exact prepared staleness, optional C4 index, one S2; indexed source/type conversion/later DML closed |
 | Alembic table operations | bounded | add-column/create-index and drop-index/drop-column compose; CREATE/DROP TABLE mixing remains unsupported |
 | DROP IF EXISTS/qualified/multiple, extended ALTER grammar | unsupported | explicit rejection |
 
@@ -214,3 +215,11 @@ consumer-before-producer and bound-late-predicate cases, true unsupported
 behavior. Run `python3 scripts/test-deferred-virtual-row-sql.py` from the
 repository root with the documented PostgreSQL and ICU installation. See
 [`deferred-virtual-row-round54.md`](deferred-virtual-row-round54.md).
+
+Round 56 reproduction from the repository root:
+`python3 scripts/test-deferred-terminal-structural-sql.py`. It uses the same
+PostgreSQL 17.11 and ICU installation, exercises the complete terminal shadow
+swap and table rename through unmodified psql Simple Query, pins indexed-source
+`2BP01`, and verifies every outcome across three catalog-only reopens. Core
+server tests additionally cover exact Extended Parse/Bind stale dependency
+ordering and fresh post-terminal `25000` behavior.

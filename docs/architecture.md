@@ -445,6 +445,16 @@ not stale prepared statements, while normal T/V/F changes do. S1 remains the
 only pre-final physical authority; one final S2, tag25/tag35 evidence, Round 52
 replacement admission and CORD recovery are unchanged.
 
+[Round 56](deferred-terminal-structural-round56.md) adds the production-private
+`AdoptedSourceFinalRefining` phase. The first successful terminal same-table
+DROP/RENAME after a nonempty deferred program seals further deferred DML but
+keeps additional DROP/RENAME and the first final index operation open. Frozen E
+continues to own program slots while the private overlay owns final schema F;
+dropped evaluation dependencies remain readable only during replay and are not
+written to S2. The existing ColumnId-only E-to-F projection, one source pass,
+one S2, tag25/tag35 evidence, CORD recovery, Round 52 replacement guard, and
+Phase 3A single-snapshot publication remain authoritative.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old

@@ -3847,6 +3847,7 @@ impl Database {
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceBackfilling(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceFinalRefining(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ) {
             self.finalize_adopted_source(transaction)?;
@@ -4136,6 +4137,7 @@ impl Database {
                 | schema_composition::SchemaCompositionState::LateCloneReady(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceRefining(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceBackfilling(_)
+                | schema_composition::SchemaCompositionState::AdoptedSourceFinalRefining(_)
                 | schema_composition::SchemaCompositionState::AdoptedSourceIndexFinalizing(_)
         ) && (!logical.read_tables().is_empty() || !logical.write_tables().is_empty())
         {
@@ -9421,7 +9423,7 @@ mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]
 mod deferred_backfill_tests;
 #[cfg(test)]
-mod deferred_terminal_structural_audit_tests;
+mod deferred_terminal_structural_tests;
 #[cfg(test)]
 mod deferred_virtual_row_tests;
 #[cfg(test)]

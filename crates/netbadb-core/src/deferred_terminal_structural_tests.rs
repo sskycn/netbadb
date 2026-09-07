@@ -1,7 +1,8 @@
 use super::*;
 use crate::deferred_backfill::audit_final_output_projection;
+use crate::schema_composition::SchemaCompositionState;
 use crate::schema_mutation_journal::SchemaIndexTablePlan;
-use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
 use netbadb_storage::ChangeStreamStatus;
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, StorageId, TableId};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::time::Instant;
 
 fn root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "netbadb-round55-{name}-{}-{:?}",
+        "netbadb-round56-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -17,7 +18,7 @@ fn root(name: &str) -> PathBuf {
     path
 }
 
-fn seed(path: &Path) -> Database {
+fn seed_with_config(path: &Path, config: DatabaseCoordinatorConfig) -> Database {
     let mut database = Database::create_catalog(
         path.join("catalog"),
         vec![TableStorageCreateSpec::heap(
@@ -32,7 +33,7 @@ fn seed(path: &Path) -> Database {
                 )],
             ),
         )],
-        Some(DatabaseCoordinatorConfig::new(path.join("coordinator"))),
+        Some(config),
     )
     .unwrap();
     database
@@ -46,6 +47,20 @@ fn seed(path: &Path) -> Database {
         database.execute(statement).unwrap();
     }
     database
+}
+
+fn seed(path: &Path) -> Database {
+    seed_with_config(
+        path,
+        DatabaseCoordinatorConfig::new(path.join("coordinator")),
+    )
+}
+
+fn seed_global(path: &Path) -> Database {
+    seed_with_config(
+        path,
+        DatabaseCoordinatorConfig::new(path.join("coordinator")).with_global_visibility(),
+    )
 }
 
 fn adopt_shadow(database: &mut Database) -> Transaction {
@@ -125,10 +140,9 @@ fn audit_terminal_prepared(
     transaction: &mut Transaction,
     prepared: &PreparedDdlStatement,
 ) -> Result<(), DatabaseError> {
-    let CompiledDdlStatement::AlterTable(statement) = &prepared.compiled else {
-        return Err(DatabaseError::UnsupportedDdlCombination);
-    };
-    database.audit_apply_terminal_alter_in(transaction, AlterTableSpec::from(statement))
+    database
+        .execute_ddl_in(transaction, prepared)
+        .map(|outcome| assert_eq!(outcome, DdlOutcome::Altered))
 }
 
 fn audit_terminal(
@@ -136,8 +150,7 @@ fn audit_terminal(
     transaction: &mut Transaction,
     sql: &str,
 ) -> Result<(), DatabaseError> {
-    let prepared = prepared_ddl(database, transaction, sql);
-    audit_terminal_prepared(database, transaction, &prepared)
+    database.execute_in(transaction, sql).map(|_| ())
 }
 
 fn assert_physical_index_key(
@@ -167,7 +180,7 @@ fn assert_physical_index_key(
 }
 
 #[test]
-fn production_terminal_structural_alter_remains_closed() {
+fn production_terminal_structural_alter_enters_final_refining() {
     for statement in [
         "ALTER TABLE users DROP COLUMN legacy",
         "ALTER TABLE users RENAME COLUMN shadow TO replacement",
@@ -184,11 +197,10 @@ fn production_terminal_structural_alter_remains_closed() {
                 "UPDATE users SET shadow = legacy WHERE id = 999",
             )
             .unwrap();
+        database.execute_in(&mut transaction, statement).unwrap();
         assert!(matches!(
-            database.execute_in(&mut transaction, statement),
-            Err(DatabaseError::SchemaMutation(
-                SchemaMutationError::SchemaMutationAfterMaterialization
-            ))
+            transaction.schema_composition,
+            SchemaCompositionState::AdoptedSourceFinalRefining(_)
         ));
         assert_eq!(database.bindings.resolve_single(TableId(2)), Ok(source));
         assert_eq!(database.next_storage_id().unwrap(), storage_floor);
@@ -645,6 +657,199 @@ fn indexed_old_column_is_outside_the_round56_baseline() {
 }
 
 #[test]
+fn failed_terminal_drop_does_not_seal_the_deferred_program() {
+    let path = root("failed-indexed-drop");
+    let mut database = seed(&path);
+    database
+        .execute("CREATE INDEX users_old_idx ON users(legacy)")
+        .unwrap();
+    let mut transaction = adopt_shadow(&mut database);
+    prepare_shadow(&mut database, &mut transaction);
+    assert!(matches!(
+        database.execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN legacy"),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::IndexedColumn(ColumnId(2))
+        ))
+    ));
+    assert!(matches!(
+        transaction.schema_composition,
+        SchemaCompositionState::AdoptedSourceBackfilling(_)
+    ));
+    assert_eq!(
+        affected(
+            database
+                .execute_in(
+                    &mut transaction,
+                    "UPDATE users SET shadow = shadow WHERE id = 999",
+                )
+                .unwrap(),
+        ),
+        0
+    );
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn primary_key_terminal_drop_uses_the_existing_error_and_does_not_seal() {
+    let path = root("failed-primary-key-drop");
+    let mut database = seed(&path);
+    let mut transaction = adopt_shadow(&mut database);
+    prepare_shadow(&mut database, &mut transaction);
+
+    // Runtime CREATE TABLE deliberately does not expose PRIMARY KEY yet. Mark
+    // the private canonical overlay to exercise the production terminal route
+    // and its existing typed boundary without expanding SQL DDL in this round.
+    let adopted = transaction.schema_composition.adopted_source_mut().unwrap();
+    let mut tables = adopted.logical.overlay.schema.tables().to_vec();
+    tables
+        .iter_mut()
+        .find(|table| table.id == TableId(2))
+        .unwrap()
+        .columns
+        .iter_mut()
+        .find(|column| column.id == ColumnId(2))
+        .unwrap()
+        .primary_key = true;
+    adopted.logical.overlay.schema = Schema::new(tables).unwrap();
+
+    assert!(matches!(
+        database.execute_in(&mut transaction, "ALTER TABLE users DROP COLUMN legacy"),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::PrimaryKeyColumn(ColumnId(2))
+        ))
+    ));
+    assert!(matches!(
+        transaction.schema_composition,
+        SchemaCompositionState::AdoptedSourceBackfilling(_)
+    ));
+    assert_eq!(
+        affected(
+            database
+                .execute_in(
+                    &mut transaction,
+                    "UPDATE users SET shadow = shadow WHERE id = 999",
+                )
+                .unwrap(),
+        ),
+        0
+    );
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn final_refining_rejects_dml_add_and_nullability_but_commits_without_an_index() {
+    let path = root("terminal-boundary");
+    let mut database = seed(&path);
+    let mut transaction = adopt_shadow(&mut database);
+    prepare_shadow(&mut database, &mut transaction);
+    for statement in [
+        "ALTER TABLE users DROP COLUMN legacy",
+        "ALTER TABLE users RENAME COLUMN shadow TO legacy",
+    ] {
+        database.execute_in(&mut transaction, statement).unwrap();
+    }
+    assert!(matches!(
+        transaction.schema_composition,
+        SchemaCompositionState::AdoptedSourceFinalRefining(_)
+    ));
+    for statement in [
+        "ALTER TABLE users ADD COLUMN too_late TEXT",
+        "ALTER TABLE users ALTER COLUMN legacy DROP NOT NULL",
+        "ALTER TABLE users ALTER COLUMN legacy SET NOT NULL",
+    ] {
+        assert!(matches!(
+            database.execute_in(&mut transaction, statement),
+            Err(DatabaseError::SchemaMutation(
+                SchemaMutationError::SchemaMutationAfterMaterialization
+            ))
+        ));
+    }
+    for statement in [
+        "SELECT id FROM users",
+        "UPDATE users SET legacy = legacy WHERE id = 1",
+        "INSERT INTO users VALUES (9, NULL, 'late')",
+        "DELETE FROM users WHERE id = 1",
+    ] {
+        assert!(matches!(
+            database.execute_in(&mut transaction, statement),
+            Err(DatabaseError::SchemaMutation(
+                SchemaMutationError::MigrationDataAccessAfterRefinement
+            ))
+        ));
+    }
+    database.commit_transaction(&mut transaction).unwrap();
+    assert_eq!(
+        database
+            .query("SELECT id, legacy FROM users ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![ScalarValue::Int64(1), ScalarValue::Text("updated1".into())],
+            vec![ScalarValue::Int64(3), ScalarValue::Text("missing".into())],
+            vec![ScalarValue::Int64(4), ScalarValue::Text("inserted4".into())],
+        ]
+    );
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn global_visibility_publishes_only_the_single_final_shadow_snapshot() {
+    let path = root("global");
+    let mut database = seed_global(&path);
+    let before = database.current_database_snapshot().unwrap().unwrap();
+    let source = database.bindings.resolve_single(TableId(2)).unwrap();
+    let mut transaction = database.begin_transaction().unwrap();
+    for statement in [
+        "UPDATE users SET legacy = 'updated1' WHERE id = 1",
+        "INSERT INTO users VALUES (4, 'inserted4', true)",
+        "DELETE FROM users WHERE id = 2",
+        "ALTER TABLE users ADD COLUMN shadow TEXT",
+        "UPDATE users SET shadow = legacy WHERE legacy IS NOT NULL",
+        "UPDATE users SET shadow = 'missing' WHERE shadow IS NULL",
+        "ALTER TABLE users ALTER COLUMN shadow SET NOT NULL",
+        "ALTER TABLE users DROP COLUMN legacy",
+        "ALTER TABLE users RENAME COLUMN shadow TO legacy",
+        "CREATE INDEX users_legacy_idx ON users(legacy)",
+    ] {
+        database.execute_in(&mut transaction, statement).unwrap();
+        assert_eq!(
+            database.current_database_snapshot().unwrap(),
+            Some(before.clone()),
+            "private step published global visibility: {statement}"
+        );
+    }
+    database.commit_transaction(&mut transaction).unwrap();
+    drop(transaction);
+    let after = database.current_database_snapshot().unwrap().unwrap();
+    assert_eq!(after.commit_seq().0, before.commit_seq().0 + 1);
+    let target = database.bindings.resolve_single(TableId(2)).unwrap();
+    assert_ne!(target, source);
+    assert!(after.boundary(source).is_none());
+    assert!(after.boundary(target).is_some());
+
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+
+    let rollback_path = root("global-rollback");
+    let mut database = seed_global(&rollback_path);
+    let rollback_before = database.current_database_snapshot().unwrap();
+    let mut rollback = adopt_shadow_without_physical_change(&mut database);
+    prepare_terminal_swap(&mut database, &mut rollback);
+    rollback.rollback().unwrap();
+    assert_eq!(
+        database.current_database_snapshot().unwrap(),
+        rollback_before
+    );
+    database.close().unwrap();
+    std::fs::remove_dir_all(rollback_path).unwrap();
+}
+
+#[test]
 fn terminal_table_rename_composes_with_column_swap() {
     let path = root("rename-table");
     let mut database = seed(&path);
@@ -946,11 +1151,26 @@ fn enabled_and_unavailable_streams_still_block_terminal_replacement() {
     assert_eq!(database.bindings.resolve_single(table), Ok(source));
     database.close().unwrap();
     std::fs::remove_dir_all(unavailable_path).unwrap();
+
+    let global_path = root("stream-enabled-global");
+    let mut database = seed_global(&global_path);
+    let source = database.enable_change_stream(table).unwrap().storage_id;
+    let snapshot = database.current_database_snapshot().unwrap();
+    let storage_floor = database.next_storage_id();
+    let mut transaction = adopt_shadow(&mut database);
+    prepare_terminal_swap(&mut database, &mut transaction);
+    let error = database.commit_transaction(&mut transaction).unwrap_err();
+    assert_stream_block(error, table, source, ChangeStreamStatus::Enabled);
+    assert_eq!(database.current_database_snapshot().unwrap(), snapshot);
+    assert_eq!(database.next_storage_id(), storage_floor);
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(global_path).unwrap();
 }
 
 #[test]
-fn round55_crash_child() {
-    let Ok(root) = std::env::var("NETBADB_ROUND55_CRASH_ROOT") else {
+fn round56_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_ROUND56_CRASH_ROOT") else {
         return;
     };
     let mut database = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
@@ -963,7 +1183,7 @@ fn round55_crash_child() {
         )
         .unwrap();
     database.commit_transaction(&mut transaction).unwrap();
-    panic!("configured Round 55 crash hook was not reached");
+    panic!("configured Round 56 crash hook was not reached");
 }
 
 fn assert_no_stage(path: &Path) {
@@ -979,8 +1199,8 @@ fn assert_no_stage(path: &Path) {
 #[test]
 fn terminal_structural_crash_matrix_converges_without_replaying_e() {
     let cases = [
-        ("round55-after-terminal-drop", false, false, false),
-        ("round55-after-terminal-rename", false, false, false),
+        ("round56-after-terminal-drop", false, false, false),
+        ("round56-after-terminal-rename", false, false, false),
         ("composition-before-intent", false, false, false),
         ("composition-intent-durable", false, false, false),
         ("source-backfill-intent-durable", false, false, false),
@@ -1005,10 +1225,10 @@ fn terminal_structural_crash_matrix_converges_without_replaying_e() {
         command
             .args([
                 "--exact",
-                "deferred_terminal_structural_audit_tests::round55_crash_child",
+                "deferred_terminal_structural_tests::round56_crash_child",
                 "--nocapture",
             ])
-            .env("NETBADB_ROUND55_CRASH_ROOT", &path);
+            .env("NETBADB_ROUND56_CRASH_ROOT", &path);
         if reverse {
             command.env("NETBADB_REVERSE_PARTICIPANT_COMMIT", "1");
         }

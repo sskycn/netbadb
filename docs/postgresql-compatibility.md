@@ -365,6 +365,16 @@ unsupported. See [Round 30](table-ddl-composition-round30.md),
 [Round 29](schema-index-composition-round29.md), and
 [Round 26](sql-alter-table-round26.md).
 
+Round 56 adds one narrower adopted-source sequence: after a nonempty deferred
+late-column UPDATE program and any required repair/SET NOT NULL, same-table
+DROP COLUMN, RENAME COLUMN, and RENAME TABLE may compose before the one final
+Heap replacement and optional final index phase. PostgreSQL Simple and Extended
+Query use the Core state machine; stale prepared statements and dependent
+indexed-column DROP retain the existing `25000` and `2BP01` mappings. ADD,
+nullability changes, and relational access are closed once the first terminal
+operation succeeds. See
+[production terminal structural refinement](deferred-terminal-structural-round56.md).
+
 ## Compatibility tracing
 
 Set `NETBADB_POSTGRES_TRACE=1` when starting the listener to log startup

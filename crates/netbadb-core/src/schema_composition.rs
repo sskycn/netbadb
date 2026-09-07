@@ -256,10 +256,6 @@ pub(crate) struct AdoptedSourceTransaction {
     pub(crate) base_generation: netbadb_types::SchemaGeneration,
     pub(crate) base_epoch: u64,
     pub(crate) source_index_digest: [u8; 32],
-    /// Round 55 executable-audit carrier. Production builds have no terminal
-    /// structural state and continue rejecting layout ALTER after backfill.
-    #[cfg(test)]
-    pub(crate) terminal_structural_audit_sealed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +279,9 @@ pub(crate) enum SchemaCompositionState {
     // S1 remains the only physical table; ordered deferred UPDATE actions are
     // observed and retained in the transaction-local logical plan.
     AdoptedSourceBackfilling(Box<AdoptedSourceTransaction>),
+    // The deferred value program is sealed, while same-table terminal
+    // DROP/RENAME composition remains open against the private final schema.
+    AdoptedSourceFinalRefining(Box<AdoptedSourceTransaction>),
     // Final TableDef is frozen; index inventory remains logical until commit.
     AdoptedSourceIndexFinalizing(Box<AdoptedSourceTransaction>),
     SealingAndMaterializing(Box<MaterializedSchemaTransaction>),
@@ -322,6 +321,7 @@ impl SchemaCompositionState {
         match self {
             Self::AdoptedSourceRefining(adopted)
             | Self::AdoptedSourceBackfilling(adopted)
+            | Self::AdoptedSourceFinalRefining(adopted)
             | Self::AdoptedSourceIndexFinalizing(adopted) => Some(adopted),
             _ => None,
         }
@@ -331,6 +331,7 @@ impl SchemaCompositionState {
         match self {
             Self::AdoptedSourceRefining(adopted)
             | Self::AdoptedSourceBackfilling(adopted)
+            | Self::AdoptedSourceFinalRefining(adopted)
             | Self::AdoptedSourceIndexFinalizing(adopted) => Some(adopted),
             _ => None,
         }
@@ -382,6 +383,7 @@ impl SchemaCompositionState {
             | Self::RollbackRequiredLogical(plan) => Some(plan),
             Self::AdoptedSourceRefining(adopted)
             | Self::AdoptedSourceBackfilling(adopted)
+            | Self::AdoptedSourceFinalRefining(adopted)
             | Self::AdoptedSourceIndexFinalizing(adopted) => Some(&adopted.logical),
             Self::SealingAndMaterializing(materialized)
             | Self::Materialized(materialized)
@@ -1346,15 +1348,12 @@ impl Database {
             transaction.schema_composition,
             SchemaCompositionState::AdoptedSourceRefining(_)
                 | SchemaCompositionState::AdoptedSourceBackfilling(_)
+                | SchemaCompositionState::AdoptedSourceFinalRefining(_)
         ) {
             let adopted = transaction
                 .schema_composition
                 .adopted_source()
                 .ok_or(SchemaMutationError::Corrupt("adopted source state absent"))?;
-            #[cfg(test)]
-            if adopted.terminal_structural_audit_sealed {
-                return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
-            }
             if !Self::is_adopted_source_operation(&spec.operation) {
                 return Err(SchemaMutationError::TransactionNotPristine.into());
             }
@@ -1366,18 +1365,34 @@ impl Database {
                 )
                 .into());
             }
-            if Self::is_adopted_source_nullability_operation(&spec.operation) {
-                return self.apply_adopted_source_nullability(transaction, spec);
-            }
-            if matches!(
-                transaction.schema_composition,
-                SchemaCompositionState::AdoptedSourceBackfilling(_)
-            ) {
-                return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
-            }
-            let result = self.apply_composed_alter(transaction, spec);
-            self.handle_composition_accept_result(transaction, &result);
-            return result;
+            return match transaction.schema_composition {
+                SchemaCompositionState::AdoptedSourceRefining(_) => {
+                    if Self::is_adopted_source_nullability_operation(&spec.operation) {
+                        self.apply_adopted_source_nullability(transaction, spec)
+                    } else {
+                        let result = self.apply_composed_alter(transaction, spec);
+                        self.handle_composition_accept_result(transaction, &result);
+                        result
+                    }
+                }
+                SchemaCompositionState::AdoptedSourceBackfilling(_) => {
+                    if Self::is_adopted_source_nullability_operation(&spec.operation) {
+                        self.apply_adopted_source_nullability(transaction, spec)
+                    } else if Self::is_terminal_adopted_source_operation(&spec.operation) {
+                        self.apply_adopted_source_terminal_alter(transaction, spec)
+                    } else {
+                        Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
+                    }
+                }
+                SchemaCompositionState::AdoptedSourceFinalRefining(_) => {
+                    if Self::is_terminal_adopted_source_operation(&spec.operation) {
+                        self.apply_adopted_source_terminal_alter(transaction, spec)
+                    } else {
+                        Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
+                    }
+                }
+                _ => Err(SchemaMutationError::Corrupt("adopted source phase changed").into()),
+            };
         }
         if matches!(
             &transaction.schema_composition,
@@ -1414,58 +1429,63 @@ impl Database {
         result
     }
 
-    /// Round 55 executable prototype only. This carries terminal DROP/RENAME
-    /// through the real logical ALTER composer without opening the production
-    /// gate in `compose_heap_table_schema_in`.
-    #[cfg(test)]
-    pub(crate) fn audit_apply_terminal_alter_in(
+    fn apply_adopted_source_terminal_alter(
         &mut self,
         transaction: &mut Transaction,
         spec: AlterTableSpec,
     ) -> Result<(), DatabaseError> {
         self.validate_transaction(transaction)?;
+        let first = matches!(
+            transaction.schema_composition,
+            SchemaCompositionState::AdoptedSourceBackfilling(_)
+        );
         let adopted = match &transaction.schema_composition {
-            SchemaCompositionState::AdoptedSourceBackfilling(adopted) => adopted,
+            SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+            | SchemaCompositionState::AdoptedSourceFinalRefining(adopted) => adopted,
             _ => {
                 return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
             }
         };
         if adopted.logical.deferred_backfill.is_empty()
-            || adopted
-                .logical
-                .deferred_backfill
-                .evaluation_column_ids()
-                .is_none()
+            || !adopted.logical.deferred_backfill.has_evaluation_schema()
         {
             return Err(SchemaMutationError::Corrupt(
-                "terminal audit lacks frozen evaluation schema",
+                "terminal refinement lacks frozen evaluation schema",
             )
             .into());
         }
-        if !matches!(
-            spec.operation,
-            AlterTableOperation::DropColumn { .. }
-                | AlterTableOperation::RenameColumn { .. }
-                | AlterTableOperation::RenameTable { .. }
-        ) {
+        if !Self::is_terminal_adopted_source_operation(&spec.operation) {
             return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
         }
+        if first {
+            self.revalidate_adopted_source_authority(transaction)?;
+        }
         let crash_point = match &spec.operation {
-            AlterTableOperation::DropColumn { .. } => Some("round55-after-terminal-drop"),
-            AlterTableOperation::RenameColumn { .. } => Some("round55-after-terminal-rename"),
-            AlterTableOperation::RenameTable { .. } => Some("round55-after-terminal-table-rename"),
+            AlterTableOperation::DropColumn { .. } => Some("round56-after-terminal-drop"),
+            AlterTableOperation::RenameColumn { .. } => Some("round56-after-terminal-rename"),
+            AlterTableOperation::RenameTable { .. } => Some("round56-after-terminal-table-rename"),
             _ => None,
         };
         let result = self.apply_composed_alter(transaction, spec);
         self.handle_composition_accept_result(transaction, &result);
         if result.is_ok() {
-            transaction
-                .schema_composition
-                .adopted_source_mut()
-                .ok_or(SchemaMutationError::Corrupt(
-                    "terminal audit adopted state disappeared",
-                ))?
-                .terminal_structural_audit_sealed = true;
+            let previous = std::mem::replace(
+                &mut transaction.schema_composition,
+                SchemaCompositionState::None,
+            );
+            transaction.schema_composition = match previous {
+                SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+                | SchemaCompositionState::AdoptedSourceFinalRefining(adopted) => {
+                    SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
+                }
+                other => {
+                    transaction.schema_composition = other;
+                    return Err(SchemaMutationError::Corrupt(
+                        "terminal refinement state disappeared after acceptance",
+                    )
+                    .into());
+                }
+            };
             if let Some(point) = crash_point {
                 crash(point);
             }
@@ -2484,6 +2504,15 @@ impl Database {
         )
     }
 
+    fn is_terminal_adopted_source_operation(operation: &AlterTableOperation) -> bool {
+        matches!(
+            operation,
+            AlterTableOperation::DropColumn { .. }
+                | AlterTableOperation::RenameTable { .. }
+                | AlterTableOperation::RenameColumn { .. }
+        )
+    }
+
     fn is_adopted_source_operation(operation: &AlterTableOperation) -> bool {
         Self::is_adopted_source_layout_operation(operation)
             || Self::is_adopted_source_nullability_operation(operation)
@@ -2624,8 +2653,6 @@ impl Database {
             base_generation: snapshot.committed.generation,
             base_epoch: snapshot.epoch,
             source_index_digest,
-            #[cfg(test)]
-            terminal_structural_audit_sealed: false,
         })
     }
 
@@ -2980,6 +3007,7 @@ impl Database {
         let adopted = match &transaction.schema_composition {
             SchemaCompositionState::AdoptedSourceRefining(adopted)
             | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+            | SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
             | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => adopted,
             _ => {
                 return Err(
@@ -3071,6 +3099,7 @@ impl Database {
         let adopted = match previous {
             SchemaCompositionState::AdoptedSourceRefining(adopted)
             | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+            | SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
             | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => *adopted,
             other => {
                 transaction.schema_composition = other;
@@ -3159,6 +3188,7 @@ impl Database {
                 }
                 SchemaCompositionState::AdoptedSourceRefining(adopted)
                 | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+                | SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
                 | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => {
                     SchemaCompositionState::RollbackRequiredLogical(Box::new(adopted.logical))
                 }
@@ -3492,7 +3522,8 @@ impl Database {
         let plan = match &mut transaction.schema_composition {
             SchemaCompositionState::Composing(plan) => plan,
             SchemaCompositionState::AdoptedSourceRefining(adopted)
-            | SchemaCompositionState::AdoptedSourceBackfilling(adopted) => &mut adopted.logical,
+            | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+            | SchemaCompositionState::AdoptedSourceFinalRefining(adopted) => &mut adopted.logical,
             _ => return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into()),
         };
         if plan.action_count() >= MAX_SCHEMA_ACTIONS {
@@ -4202,6 +4233,7 @@ impl Database {
         transaction.schema_composition = match previous {
             SchemaCompositionState::AdoptedSourceRefining(adopted)
             | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+            | SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
             | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => {
                 SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted)
             }
@@ -4235,6 +4267,7 @@ impl Database {
             (
                 SchemaCompositionState::AdoptedSourceRefining(adopted)
                 | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+                | SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
                 | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted),
                 IndexCompositionContext::AdoptedFinal,
             ) => &mut adopted.logical,
@@ -7035,6 +7068,7 @@ pub(crate) fn cleanup_composition_loser(
         | SchemaCompositionState::RollbackRequiredLogical(plan) => (*plan, None),
         SchemaCompositionState::AdoptedSourceRefining(adopted)
         | SchemaCompositionState::AdoptedSourceBackfilling(adopted)
+        | SchemaCompositionState::AdoptedSourceFinalRefining(adopted)
         | SchemaCompositionState::AdoptedSourceIndexFinalizing(adopted) => (adopted.logical, None),
         SchemaCompositionState::SealingAndMaterializing(mut materialized)
         | SchemaCompositionState::Materialized(mut materialized)

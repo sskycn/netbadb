@@ -69,6 +69,20 @@ fn layout_project(name: &str) -> (std::path::PathBuf, Database) {
     layout_project_with_email_nullability(name, false)
 }
 
+fn terminal_layout_project(name: &str) -> (std::path::PathBuf, Database) {
+    let (root, mut db) = seed(name);
+    db.execute("CREATE TABLE accounts (id BIGINT NOT NULL, legacy TEXT, flag BOOLEAN)")
+        .unwrap();
+    for statement in [
+        "INSERT INTO accounts VALUES (1, 'old1', true)",
+        "INSERT INTO accounts VALUES (2, 'old2', false)",
+        "INSERT INTO accounts VALUES (3, NULL, NULL)",
+    ] {
+        db.execute(statement).unwrap();
+    }
+    (root, db)
+}
+
 fn layout_project_with_email_nullability(
     name: &str,
     email_not_null: bool,
@@ -2477,43 +2491,199 @@ fn pg_round54_terminal_index_phase_closes_late_read_updates() {
 }
 
 #[test]
-fn pg_round55_terminal_structural_alter_remains_a_production_error() {
-    for (name, terminal) in [
+fn pg_round56_simple_atomic_shadow_swap_uses_exact_tags_and_reopens() {
+    let (root, mut db) = terminal_layout_project("round56-shadow-swap");
+    let table_id = db.schema().table("accounts").unwrap().id;
+    let mut admin = session(&db, true);
+    for (source, tag) in [
+        ("BEGIN", "BEGIN"),
         (
-            "round55-drop-closed",
-            "ALTER TABLE accounts DROP COLUMN legacy",
+            "UPDATE accounts SET legacy = 'updated1' WHERE id = 1",
+            "UPDATE 1",
         ),
         (
-            "round55-rename-column-closed",
+            "INSERT INTO accounts VALUES (4, 'inserted4', true)",
+            "INSERT 0 1",
+        ),
+        ("DELETE FROM accounts WHERE id = 2", "DELETE 1"),
+        ("ALTER TABLE accounts ADD COLUMN shadow TEXT", "ALTER TABLE"),
+        (
+            "UPDATE accounts SET shadow = legacy WHERE legacy IS NOT NULL",
+            "UPDATE 2",
+        ),
+        (
+            "UPDATE accounts SET shadow = 'missing' WHERE shadow IS NULL",
+            "UPDATE 1",
+        ),
+        (
+            "ALTER TABLE accounts ALTER COLUMN shadow SET NOT NULL",
+            "ALTER TABLE",
+        ),
+        ("ALTER TABLE accounts DROP COLUMN legacy", "ALTER TABLE"),
+        (
+            "ALTER TABLE accounts RENAME COLUMN shadow TO legacy",
+            "ALTER TABLE",
+        ),
+        (
+            "CREATE INDEX accounts_legacy_idx ON accounts(legacy)",
+            "CREATE INDEX",
+        ),
+        ("COMMIT", "COMMIT"),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(if source == "COMMIT" { b'I' } else { b'T' }),
+            ],
+            "{source}"
+        );
+    }
+    for _ in 0..3 {
+        let table = db.schema().table("accounts").unwrap();
+        assert_eq!(table.column("legacy").unwrap().id, ColumnId(4));
+        assert!(table.column_by_id(ColumnId(2)).is_none());
+        assert_eq!(table.columns.len(), 3);
+        assert_eq!(db.indexes(table_id).unwrap()[0].column_id, ColumnId(4));
+        assert_eq!(
+            db.query("SELECT id, legacy FROM accounts ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![ScalarValue::Int64(1), ScalarValue::Text("updated1".into())],
+                vec![ScalarValue::Int64(3), ScalarValue::Text("missing".into())],
+                vec![ScalarValue::Int64(4), ScalarValue::Text("inserted4".into())],
+            ]
+        );
+        db.close().unwrap();
+        db = Database::open_catalog(root.join("catalog")).unwrap();
+    }
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round56_prepared_update_and_ddl_stale_before_final_phase_guard() {
+    for (name, query, statement_name, portal_name) in [
+        (
+            "round56-stale-update",
+            "UPDATE accounts SET shadow = 'late' WHERE id = 1",
+            "old-update",
+            "old-update-portal",
+        ),
+        (
+            "round56-stale-rename",
             "ALTER TABLE accounts RENAME COLUMN shadow TO replacement",
-        ),
-        (
-            "round55-rename-table-closed",
-            "ALTER TABLE accounts RENAME TO people",
+            "old-rename",
+            "old-rename-portal",
         ),
     ] {
-        let (root, mut db) = layout_project(name);
+        let (root, mut db) = terminal_layout_project(name);
         let mut admin = session(&db, true);
         for source in [
             "BEGIN",
-            "UPDATE accounts SET legacy = legacy WHERE id = 999",
+            "UPDATE accounts SET legacy = legacy WHERE id = 1",
             "ALTER TABLE accounts ADD COLUMN shadow TEXT",
-            "UPDATE accounts SET shadow = legacy WHERE shadow IS NULL",
+            "UPDATE accounts SET shadow = legacy WHERE legacy IS NOT NULL",
         ] {
             ok(&sql(&mut admin, &mut db, source));
         }
-        state(&sql(&mut admin, &mut db, terminal), "25000");
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Parse {
+                    statement: statement_name.into(),
+                    query: query.into(),
+                    parameter_types: vec![],
+                },
+            ),
+            [BackendMessage::ParseComplete]
+        );
+        assert_eq!(
+            admin.handle(
+                &mut db,
+                FrontendMessage::Bind {
+                    portal: portal_name.into(),
+                    statement: statement_name.into(),
+                    parameter_formats: vec![],
+                    parameters: vec![],
+                    result_formats: vec![],
+                },
+            ),
+            [BackendMessage::BindComplete]
+        );
+        ok(&admin.handle(&mut db, FrontendMessage::Sync));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE accounts DROP COLUMN legacy",
+        ));
         state(
-            &sql(&mut admin, &mut db, "SELECT id FROM accounts"),
-            "25P02",
+            &admin.handle(
+                &mut db,
+                FrontendMessage::Execute {
+                    portal: portal_name.into(),
+                    max_rows: 0,
+                },
+            ),
+            "25000",
+        );
+        assert_eq!(
+            admin.handle(&mut db, FrontendMessage::Sync),
+            [BackendMessage::ReadyForQuery(b'E')]
         );
         ok(&sql(&mut admin, &mut db, "ROLLBACK"));
-        let table = db.schema().table("accounts").unwrap();
-        assert_eq!(table.column("legacy").unwrap().id, ColumnId(2));
-        assert!(table.column("shadow").is_none());
         db.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn pg_round56_final_phase_and_indexed_drop_keep_existing_sqlstates() {
+    let (root, mut db) = terminal_layout_project("round56-final-guard");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN shadow TEXT",
+        "UPDATE accounts SET shadow = legacy WHERE legacy IS NOT NULL",
+        "ALTER TABLE accounts DROP COLUMN legacy",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE accounts SET shadow = 'late' WHERE id = 1",
+        ),
+        "25000",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (root, mut db) = layout_project("round56-indexed-drop");
+    let mut admin = session(&db, true);
+    for source in [
+        "BEGIN",
+        "UPDATE accounts SET legacy = legacy WHERE id = 1",
+        "ALTER TABLE accounts ADD COLUMN shadow TEXT",
+        "UPDATE accounts SET shadow = legacy WHERE legacy IS NOT NULL",
+    ] {
+        ok(&sql(&mut admin, &mut db, source));
+    }
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE accounts DROP COLUMN legacy",
+        ),
+        "2BP01",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

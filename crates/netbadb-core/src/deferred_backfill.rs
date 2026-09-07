@@ -303,6 +303,10 @@ impl DeferredBackfillProgram {
         self.actions.is_empty()
     }
 
+    pub(crate) fn has_evaluation_schema(&self) -> bool {
+        self.evaluation_schema.is_some()
+    }
+
     fn validate_evaluation_layout(&self, target: &TableDef) -> Result<(), DatabaseError> {
         if let Some(evaluation) = &self.evaluation_schema {
             evaluation.validate_layout(target)?;
@@ -891,14 +895,6 @@ fn try_execute_adopted_update_inner(
         SchemaCompositionState::AdoptedSourceRefining(_)
             | SchemaCompositionState::AdoptedSourceBackfilling(_)
     ) {
-        return Ok(None);
-    }
-    #[cfg(test)]
-    if transaction
-        .schema_composition
-        .adopted_source()
-        .is_some_and(|adopted| adopted.terminal_structural_audit_sealed)
-    {
         return Ok(None);
     }
     let parts = adopted_parts(transaction)?;

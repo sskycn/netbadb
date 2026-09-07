@@ -1,21 +1,24 @@
 # NetbaDB roadmap
 
-## Post-backfill terminal structural refinement audit (Round 55 complete)
+## Production terminal structural refinement (Round 56 complete)
 
-- selected Frozen EvaluationSchema E plus a checked ColumnId-only
-  FinalOutputProjection into final TableDef F;
-- proved test-only DROP of program sources and late intermediates, same-name
-  C2-to-C4 replacement, RENAME TABLE, final C4 BTree binding, one S2/no S3,
-  rollback, digest binding, and three-reopen crash convergence;
-- retained the production structural-after-backfill gate, PostgreSQL
-  `25000`/`25P02`, Round 52 stream guard, derived Columnar authority, and Phase
-  2E maintenance isolation;
-- recommends a bounded Round 56 `AdoptedSourceFinalRefining` phase for
-  unindexed, non-PK source columns only; ADD, type conversion, post-terminal
-  DML/nullability, implicit index changes, and persistent E remain closed.
+- added production `AdoptedSourceFinalRefining` entered only by the first
+  successful same-table terminal DROP/RENAME after frozen E and a nonempty
+  deferred program;
+- removed the Round 55 test-only seal/carrier and routes native, prepared, and
+  PostgreSQL execution through the real ALTER composer and state machine;
+- supports dropped source and late-intermediate evaluation dependencies,
+  same-name C2-to-C4 replacement, RENAME TABLE, optional final C4 index, one
+  source pass, one S2, and no hidden final columns or S3;
+- retains exact prepared staleness, failure-does-not-seal behavior, Round 52
+  Change Stream admission, derived Columnar/maintenance authority, CORD
+  recovery without E, and Phase 3A one-G publication;
+- keeps indexed shadow swap, ADD after E freeze, type conversion,
+  post-terminal DML/nullability, implicit index changes, and persistent E
+  closed.
 
 See
-[`deferred-terminal-structural-round55.md`](deferred-terminal-structural-round55.md).
+[`deferred-terminal-structural-round56.md`](deferred-terminal-structural-round56.md).
 
 ## Production VirtualRow late-column reads (Round 54 complete)
 

@@ -1,5 +1,8 @@
 # Post-backfill terminal structural refinement audit (Round 55)
 
+> Round 56 subsequently productionized the selected frozen-E/final-F design.
+> See [production terminal structural refinement](deferred-terminal-structural-round56.md).
+
 Round 55 is an architecture audit with executable, test-only prototypes. It
 does **not** enable terminal structural ALTER in production. The production
 gate still returns `SchemaMutationAfterMaterialization`; PostgreSQL reports
