@@ -113,6 +113,129 @@ pub struct ColumnarPlanningCost {
     pub projection_work_units: u64,
 }
 
+/// Deterministic, runtime-only identity assigned by physical-plan preorder.
+///
+/// Ordinals are meaningful only with the exact plan that produced them. They
+/// are deliberately neither persistent identities nor pointer-derived values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlanNodeOrdinal(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerAccessKind {
+    SeqScan,
+    IndexPoint,
+    IndexRange,
+    Columnar,
+    PartitionedSeqScan,
+    PartitionedIndexPoint,
+    PartitionedIndexRange,
+}
+
+/// Parameters retained from the canonical planning formula so actual evidence
+/// can be evaluated in the same unit system without consulting newer stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerWorkModel {
+    SequentialRows,
+    Index {
+        startup_work_units: u64,
+        candidate_work_units: u64,
+    },
+    Columnar {
+        projected_column_count: u64,
+    },
+}
+
+/// Planning-time evidence for one selected physical access operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerAccessEstimate {
+    pub node: PlanNodeOrdinal,
+    pub binding_id: RelationBindingId,
+    pub table_id: TableId,
+    pub storage_id: Option<StorageId>,
+    pub kind: PlannerAccessKind,
+    pub access_path: Option<AccessPathId>,
+    pub projection_id: Option<ColumnarProjectionId>,
+    pub projection_generation: Option<ColumnarGeneration>,
+    pub estimated_work_units: Option<u64>,
+    /// Selected Columnar scans retain the authoritative source alternative
+    /// used at planning time. Other access kinds have no Phase 2 alternative.
+    pub source_alternative_work_units: Option<u64>,
+    pub work_model: PlannerWorkModel,
+}
+
+/// Storage-independent actual evidence accepted by the planner's pure work
+/// evaluator. These are raw counters, not work units.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlannerActualAccessEvidence {
+    pub rows_examined: u64,
+    pub index_point_probes: u64,
+    pub index_range_probes: u64,
+    pub index_candidates_examined: u64,
+    pub columnar: Option<PlannerColumnarExecutionEvidence>,
+    pub incomplete: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlannerColumnarExecutionEvidence {
+    pub row_groups_read: u64,
+    pub rows_read: u64,
+    pub physical_block_reads: u64,
+    pub physical_bytes_read: u64,
+    pub decoded_column_chunks: u64,
+    pub decoded_version_blocks: u64,
+    pub delta_segments: u64,
+    pub delta_bytes_read: u64,
+    pub delta_mutations: u64,
+    pub delta_live_rows: u64,
+    pub suppressed_version_rows: u64,
+    pub merged_rows: u64,
+}
+
+/// One estimate/actual pair. Signed arithmetic is represented without lossy
+/// casts: direction and absolute error remain correct over the full `u64`
+/// domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerCalibrationSample {
+    pub estimated_work_units: u64,
+    pub actual_work_units: Option<u64>,
+    pub direction: PlannerEstimateDirection,
+    pub absolute_error_work_units: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerEstimateDirection {
+    Exact,
+    Underestimated,
+    Overestimated,
+    ActualUnavailable,
+}
+
+impl PlannerCalibrationSample {
+    #[must_use]
+    pub fn new(estimated_work_units: u64, actual_work_units: Option<u64>) -> Self {
+        let (direction, absolute_error_work_units) = match actual_work_units {
+            None => (PlannerEstimateDirection::ActualUnavailable, None),
+            Some(actual) if actual == estimated_work_units => {
+                (PlannerEstimateDirection::Exact, Some(0))
+            }
+            Some(actual) if actual > estimated_work_units => (
+                PlannerEstimateDirection::Underestimated,
+                Some(actual - estimated_work_units),
+            ),
+            Some(actual) => (
+                PlannerEstimateDirection::Overestimated,
+                Some(estimated_work_units - actual),
+            ),
+        };
+        Self {
+            estimated_work_units,
+            actual_work_units,
+            direction,
+            absolute_error_work_units,
+        }
+    }
+}
+
 impl ColumnarPlanningCost {
     #[must_use]
     pub const fn benefit_work_units(self) -> u64 {
@@ -657,6 +780,474 @@ fn columnar_work_units(
                 .saturating_add(projection.suppressed_version_count)
                 .div_ceil(256),
         )
+}
+
+/// Captures access estimates from the same immutable snapshots used to create
+/// `plan`. Callers must invoke this before execution and retain the result;
+/// this function intentionally has no access to storage or mutable statistics.
+#[must_use]
+pub fn estimate_execution_accesses(
+    plan: &PhysicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+) -> Vec<PlannerAccessEstimate> {
+    let mut estimates = Vec::new();
+    let mut next_node = 0_u32;
+    collect_access_estimates(
+        plan,
+        table_statistics,
+        access_paths,
+        range_tables,
+        projections,
+        &[],
+        &mut next_node,
+        &mut estimates,
+    );
+    estimates
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_access_estimates(
+    plan: &PhysicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+    constraints: &[ColumnarPlanningConstraint],
+    next_node: &mut u32,
+    output: &mut Vec<PlannerAccessEstimate>,
+) {
+    let node = PlanNodeOrdinal(*next_node);
+    *next_node = next_node.saturating_add(1);
+    let table_stats = |table_id| {
+        table_statistics
+            .iter()
+            .find(|entry| entry.table_id == table_id)
+            .and_then(|entry| entry.statistics)
+    };
+    match plan {
+        PhysicalPlan::SeqScan {
+            binding_id,
+            table_id,
+            ..
+        } => {
+            let fallback_rows = projections
+                .iter()
+                .filter(|projection| projection.table_id == *table_id)
+                .map(|projection| projection.row_count)
+                .max()
+                .unwrap_or(0);
+            output.push(PlannerAccessEstimate {
+                node,
+                binding_id: *binding_id,
+                table_id: *table_id,
+                storage_id: None,
+                kind: PlannerAccessKind::SeqScan,
+                access_path: None,
+                projection_id: None,
+                projection_generation: None,
+                estimated_work_units: Some(source_scan_work_units(
+                    table_stats(*table_id),
+                    fallback_rows,
+                )),
+                source_alternative_work_units: None,
+                work_model: PlannerWorkModel::SequentialRows,
+            });
+        }
+        PhysicalPlan::IndexScan {
+            binding_id,
+            table_id,
+            access_path,
+            key,
+            ..
+        } => output.push(index_access_estimate(
+            node,
+            *binding_id,
+            *table_id,
+            None,
+            PlannerAccessKind::IndexPoint,
+            *access_path,
+            Some(key),
+            None,
+            table_stats(*table_id),
+            access_paths,
+        )),
+        PhysicalPlan::RangeIndexScan {
+            binding_id,
+            table_id,
+            access_path,
+            range,
+            ..
+        } => output.push(index_access_estimate(
+            node,
+            *binding_id,
+            *table_id,
+            None,
+            PlannerAccessKind::IndexRange,
+            *access_path,
+            None,
+            Some(range),
+            table_stats(*table_id),
+            access_paths,
+        )),
+        PhysicalPlan::ColumnarScan {
+            binding_id,
+            table_id,
+            columns,
+            projection_id,
+            generation,
+            source_storage_id,
+            ..
+        } => {
+            let projection = projections.iter().find(|projection| {
+                projection.projection_id == *projection_id
+                    && projection.generation == *generation
+                    && projection.source_storage_id == *source_storage_id
+            });
+            let required = columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
+            output.push(PlannerAccessEstimate {
+                node,
+                binding_id: *binding_id,
+                table_id: *table_id,
+                storage_id: Some(*source_storage_id),
+                kind: PlannerAccessKind::Columnar,
+                access_path: None,
+                projection_id: Some(*projection_id),
+                projection_generation: Some(*generation),
+                estimated_work_units: projection
+                    .map(|projection| columnar_work_units(projection, &required, constraints)),
+                source_alternative_work_units: projection.map(|projection| {
+                    source_scan_work_units(table_stats(*table_id), projection.row_count)
+                }),
+                work_model: PlannerWorkModel::Columnar {
+                    projected_column_count: u64::try_from(required.len()).unwrap_or(u64::MAX),
+                },
+            });
+        }
+        PhysicalPlan::PartitionedScan {
+            binding_id,
+            table_id,
+            partitions,
+            ..
+        } => {
+            let range = range_tables
+                .iter()
+                .find(|range| range.table_id == *table_id);
+            for partition in partitions {
+                let snapshot = range.and_then(|range| {
+                    range
+                        .partitions
+                        .iter()
+                        .find(|candidate| candidate.storage_id == partition.storage_id)
+                });
+                match &partition.access {
+                    PartitionAccessPlan::SeqScan => output.push(PlannerAccessEstimate {
+                        node,
+                        binding_id: *binding_id,
+                        table_id: *table_id,
+                        storage_id: Some(partition.storage_id),
+                        kind: PlannerAccessKind::PartitionedSeqScan,
+                        access_path: None,
+                        projection_id: None,
+                        projection_generation: None,
+                        estimated_work_units: Some(source_scan_work_units(
+                            snapshot.and_then(|snapshot| snapshot.statistics),
+                            0,
+                        )),
+                        source_alternative_work_units: None,
+                        work_model: PlannerWorkModel::SequentialRows,
+                    }),
+                    PartitionAccessPlan::IndexScan {
+                        access_path, key, ..
+                    } => output.push(index_access_estimate(
+                        node,
+                        *binding_id,
+                        *table_id,
+                        Some(partition.storage_id),
+                        PlannerAccessKind::PartitionedIndexPoint,
+                        *access_path,
+                        Some(key),
+                        None,
+                        snapshot.and_then(|snapshot| snapshot.statistics),
+                        snapshot.map_or(&[], |snapshot| snapshot.access_paths.as_slice()),
+                    )),
+                    PartitionAccessPlan::RangeIndexScan {
+                        access_path, range, ..
+                    } => output.push(index_access_estimate(
+                        node,
+                        *binding_id,
+                        *table_id,
+                        Some(partition.storage_id),
+                        PlannerAccessKind::PartitionedIndexRange,
+                        *access_path,
+                        None,
+                        Some(range),
+                        snapshot.and_then(|snapshot| snapshot.statistics),
+                        snapshot.map_or(&[], |snapshot| snapshot.access_paths.as_slice()),
+                    )),
+                }
+            }
+        }
+        PhysicalPlan::Filter { input, predicate } => {
+            let mut pushed = constraints.to_vec();
+            collect_columnar_constraints(predicate, &mut pushed);
+            collect_access_estimates(
+                input,
+                table_statistics,
+                access_paths,
+                range_tables,
+                projections,
+                &pushed,
+                next_node,
+                output,
+            );
+        }
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. } => {
+            collect_access_estimates(
+                left,
+                table_statistics,
+                access_paths,
+                range_tables,
+                projections,
+                &[],
+                next_node,
+                output,
+            );
+            collect_access_estimates(
+                right,
+                table_statistics,
+                access_paths,
+                range_tables,
+                projections,
+                &[],
+                next_node,
+                output,
+            );
+        }
+        PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            right_binding_id,
+            right_table_id,
+            right_access_path,
+            ..
+        } => {
+            let path = access_paths
+                .iter()
+                .find(|path| path.table_id == *right_table_id && path.id == *right_access_path);
+            let right_statistics = table_stats(*right_table_id);
+            let left_rows = physical_access_table(left)
+                .and_then(table_stats)
+                .map(|statistics| statistics.row_count);
+            let estimated_work_units = path
+                .zip(right_statistics.as_ref())
+                .and_then(|(path, table)| {
+                    let index = path.statistics.as_ref()?;
+                    let matches = estimate_non_null_point_rows(table, index)?;
+                    let point = point_lookup_cost(index, path.cost_hints.as_ref(), matches)?;
+                    point.checked_mul(u128::from(left_rows?))
+                })
+                .and_then(|work| u64::try_from(work).ok());
+            output.push(PlannerAccessEstimate {
+                node,
+                binding_id: *right_binding_id,
+                table_id: *right_table_id,
+                storage_id: None,
+                kind: PlannerAccessKind::IndexPoint,
+                access_path: Some(*right_access_path),
+                projection_id: None,
+                projection_generation: None,
+                estimated_work_units,
+                source_alternative_work_units: None,
+                work_model: path
+                    .and_then(|path| index_work_model(path, PlannerAccessKind::IndexPoint))
+                    .unwrap_or(PlannerWorkModel::Index {
+                        startup_work_units: 0,
+                        candidate_work_units: 1,
+                    }),
+            });
+            collect_access_estimates(
+                left,
+                table_statistics,
+                access_paths,
+                range_tables,
+                projections,
+                constraints,
+                next_node,
+                output,
+            );
+        }
+        PhysicalPlan::Sort { input: left, .. }
+        | PhysicalPlan::Project { input: left, .. }
+        | PhysicalPlan::ScalarProject { input: left, .. }
+        | PhysicalPlan::Aggregate { input: left, .. }
+        | PhysicalPlan::Limit { input: left, .. } => collect_access_estimates(
+            left,
+            table_statistics,
+            access_paths,
+            range_tables,
+            projections,
+            constraints,
+            next_node,
+            output,
+        ),
+        PhysicalPlan::OneRow => {}
+    }
+}
+
+fn physical_access_table(plan: &PhysicalPlan) -> Option<TableId> {
+    match plan {
+        PhysicalPlan::SeqScan { table_id, .. }
+        | PhysicalPlan::ColumnarScan { table_id, .. }
+        | PhysicalPlan::IndexScan { table_id, .. }
+        | PhysicalPlan::RangeIndexScan { table_id, .. }
+        | PhysicalPlan::PartitionedScan { table_id, .. } => Some(*table_id),
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::ScalarProject { input, .. }
+        | PhysicalPlan::Aggregate { input, .. }
+        | PhysicalPlan::Limit { input, .. } => physical_access_table(input),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_access_estimate(
+    node: PlanNodeOrdinal,
+    binding_id: RelationBindingId,
+    table_id: TableId,
+    storage_id: Option<StorageId>,
+    kind: PlannerAccessKind,
+    access_path_id: AccessPathId,
+    point: Option<&ScalarValue>,
+    range: Option<&IndexRange>,
+    table: Option<TableStatistics>,
+    access_paths: &[AccessPath],
+) -> PlannerAccessEstimate {
+    let path = access_paths
+        .iter()
+        .find(|path| path.id == access_path_id && path.table_id == table_id);
+    let model = path
+        .and_then(|path| index_work_model(path, kind))
+        .unwrap_or(PlannerWorkModel::Index {
+            startup_work_units: 0,
+            candidate_work_units: 1,
+        });
+    let estimated_work_units = table
+        .as_ref()
+        .zip(path)
+        .and_then(|(table, path)| {
+            let index = path.statistics.as_ref()?;
+            let lookup = match (point, range) {
+                (Some(key), None) => IndexLookupCandidate::Point { key: key.clone() },
+                (None, Some(range)) => IndexLookupCandidate::Range {
+                    range: range.clone(),
+                    possible_integer_keys: estimated_integer_key_count(range)?,
+                },
+                _ => return None,
+            };
+            candidate_cost(table, index, path.cost_hints.as_ref(), &lookup)
+        })
+        .and_then(|work| u64::try_from(work).ok());
+    PlannerAccessEstimate {
+        node,
+        binding_id,
+        table_id,
+        storage_id,
+        kind,
+        access_path: Some(access_path_id),
+        projection_id: None,
+        projection_generation: None,
+        estimated_work_units,
+        source_alternative_work_units: None,
+        work_model: model,
+    }
+}
+
+fn index_work_model(path: &AccessPath, kind: PlannerAccessKind) -> Option<PlannerWorkModel> {
+    if let Some(hints) = path.cost_hints {
+        let startup = if matches!(
+            kind,
+            PlannerAccessKind::IndexPoint | PlannerAccessKind::PartitionedIndexPoint
+        ) {
+            u64::from(hints.point_probe_base_cost)
+                .saturating_add(u64::from(hints.expected_point_io))
+        } else {
+            u64::from(hints.range_startup_cost)
+        };
+        return Some(PlannerWorkModel::Index {
+            startup_work_units: startup,
+            candidate_work_units: u64::from(hints.sequential_unit_cost),
+        });
+    }
+    let height = path.statistics.as_ref()?.tree_height;
+    Some(PlannerWorkModel::Index {
+        startup_work_units: 1_u64.saturating_add(u64::from(height)),
+        candidate_work_units: 1,
+    })
+}
+
+/// Converts raw execution evidence to canonical planner work units.
+/// Incomplete evidence never participates in calibration or adaptive policy.
+#[must_use]
+pub fn evaluate_actual_access_work(
+    estimate: &PlannerAccessEstimate,
+    actual: PlannerActualAccessEvidence,
+) -> Option<u64> {
+    if actual.incomplete {
+        return None;
+    }
+    match estimate.work_model {
+        PlannerWorkModel::SequentialRows => Some(1_u64.saturating_add(actual.rows_examined / 32)),
+        PlannerWorkModel::Index {
+            startup_work_units,
+            candidate_work_units,
+        } => {
+            let probes = match estimate.kind {
+                PlannerAccessKind::IndexPoint | PlannerAccessKind::PartitionedIndexPoint => {
+                    actual.index_point_probes
+                }
+                PlannerAccessKind::IndexRange | PlannerAccessKind::PartitionedIndexRange => {
+                    actual.index_range_probes
+                }
+                _ => return None,
+            };
+            startup_work_units
+                .checked_mul(probes)?
+                .checked_add(candidate_work_units.checked_mul(actual.index_candidates_examined)?)
+        }
+        PlannerWorkModel::Columnar {
+            projected_column_count,
+        } => {
+            let columnar = actual.columnar?;
+            let decoded_values = columnar
+                .rows_read
+                .checked_mul(projected_column_count)?
+                .div_ceil(256);
+            let version_rows = columnar
+                .delta_live_rows
+                .checked_add(columnar.suppressed_version_rows)?
+                .div_ceil(256);
+            2_u64
+                .checked_add(columnar.row_groups_read)?
+                .checked_add(columnar.physical_block_reads)?
+                .checked_add(columnar.physical_bytes_read.div_ceil(4096))?
+                .checked_add(columnar.decoded_column_chunks)?
+                .checked_add(columnar.decoded_version_blocks)?
+                .checked_add(decoded_values)?
+                .checked_add(columnar.delta_segments)?
+                .checked_add(columnar.delta_bytes_read.div_ceil(4096))?
+                .checked_add(columnar.delta_mutations.div_ceil(256))?
+                .checked_add(version_rows)?
+                .checked_add(columnar.merged_rows.div_ceil(256))
+        }
+    }
 }
 
 fn planning_group_cannot_match(
@@ -2340,10 +2931,11 @@ mod tests {
         AccessCostHints, AccessPath, AccessPathCapabilities, ColumnarPlanningConstraint,
         ColumnarProjectionPlanningSnapshot, ColumnarRowGroupPlanningSnapshot,
         ColumnarZoneMapPlanningSnapshot, PhysicalPlan, PhysicalStatement,
-        RangeTablePlanningSnapshot, TableAccessStatistics, columnar_work_units, plan,
-        plan_statement, plan_statement_with_access_paths, plan_statement_with_statistics,
-        plan_with_access_paths, plan_with_columnar_snapshots, plan_with_partition_snapshots,
-        plan_with_statistics, point_lookup_cost,
+        PlannerActualAccessEvidence, PlannerColumnarExecutionEvidence, RangeTablePlanningSnapshot,
+        TableAccessStatistics, columnar_work_units, estimate_execution_accesses,
+        evaluate_actual_access_work, plan, plan_statement, plan_statement_with_access_paths,
+        plan_statement_with_statistics, plan_with_access_paths, plan_with_columnar_snapshots,
+        plan_with_partition_snapshots, plan_with_statistics, point_lookup_cost,
     };
     use netbadb_index::{IndexBound, IndexRange, IndexStatistics, TableStatistics};
     use netbadb_rel::{BinaryOp, ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
@@ -4685,6 +5277,116 @@ mod tests {
                 (RelationBindingId(20), ColumnId(1)),
                 (RelationBindingId(20), ColumnId(2)),
             ]
+        );
+    }
+
+    #[test]
+    fn execution_estimate_is_frozen_from_the_supplied_planning_snapshot() {
+        let column = test_column(1, "id", false);
+        let plan = PhysicalPlan::ColumnarScan {
+            binding_id: column.binding_id,
+            table_id: column.table_id,
+            table_name: "items".to_owned(),
+            columns: vec![column],
+            projection_id: ColumnarProjectionId(1),
+            generation: ColumnarGeneration(1),
+            source_storage_id: StorageId(1),
+        };
+        let initial = columnar_snapshot(
+            vec![ColumnId(1)],
+            vec![planning_group(256, &[ColumnId(1)], 4_096, 0, 255)],
+        );
+        let estimates = estimate_execution_accesses(
+            &plan,
+            &[TableAccessStatistics {
+                table_id: TableId(1),
+                statistics: Some(TableStatistics {
+                    row_count: 256,
+                    managed_page_count: 100,
+                }),
+            }],
+            &[],
+            &[],
+            std::slice::from_ref(&initial),
+        );
+        let frozen = estimates[0].estimated_work_units;
+
+        let mut latest = initial;
+        latest.delta_segment_count = 10_000;
+        let recomputed = estimate_execution_accesses(
+            &plan,
+            &[TableAccessStatistics {
+                table_id: TableId(1),
+                statistics: Some(TableStatistics {
+                    row_count: 256,
+                    managed_page_count: 1,
+                }),
+            }],
+            &[],
+            &[],
+            &[latest],
+        );
+        assert_eq!(estimates[0].estimated_work_units, frozen);
+        assert_ne!(
+            estimates[0].estimated_work_units,
+            recomputed[0].estimated_work_units
+        );
+    }
+
+    #[test]
+    fn planner_evaluates_raw_columnar_evidence_in_canonical_work_units() {
+        let column = test_column(1, "id", false);
+        let plan = PhysicalPlan::ColumnarScan {
+            binding_id: column.binding_id,
+            table_id: column.table_id,
+            table_name: "items".to_owned(),
+            columns: vec![column],
+            projection_id: ColumnarProjectionId(1),
+            generation: ColumnarGeneration(1),
+            source_storage_id: StorageId(1),
+        };
+        let projection = columnar_snapshot(
+            vec![ColumnId(1)],
+            vec![planning_group(256, &[ColumnId(1)], 4_096, 0, 255)],
+        );
+        let estimate = estimate_execution_accesses(&plan, &[], &[], &[], &[projection]).remove(0);
+        assert_eq!(
+            evaluate_actual_access_work(
+                &estimate,
+                PlannerActualAccessEvidence {
+                    columnar: Some(PlannerColumnarExecutionEvidence {
+                        row_groups_read: 1,
+                        rows_read: 256,
+                        physical_bytes_read: 4_096,
+                        ..PlannerColumnarExecutionEvidence::default()
+                    }),
+                    ..PlannerActualAccessEvidence::default()
+                }
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            evaluate_actual_access_work(
+                &estimate,
+                PlannerActualAccessEvidence {
+                    incomplete: true,
+                    ..PlannerActualAccessEvidence::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            evaluate_actual_access_work(
+                &estimate,
+                PlannerActualAccessEvidence {
+                    columnar: Some(PlannerColumnarExecutionEvidence {
+                        row_groups_read: u64::MAX,
+                        ..PlannerColumnarExecutionEvidence::default()
+                    }),
+                    ..PlannerActualAccessEvidence::default()
+                }
+            ),
+            None
         );
     }
 }

@@ -266,7 +266,11 @@ impl AdaptiveRuntimeState {
             .any(|entry| entry.projection_id == projection_id && entry.generation == generation)
     }
 
-    fn suppress(&mut self, projection_id: ColumnarProjectionId, generation: ColumnarGeneration) {
+    pub(crate) fn suppress(
+        &mut self,
+        projection_id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+    ) {
         if !self.is_suppressed(projection_id, generation) {
             self.suppressed.push(SuppressedProjection {
                 projection_id,
@@ -277,7 +281,11 @@ impl AdaptiveRuntimeState {
         }
     }
 
-    fn keep(&mut self, projection_id: ColumnarProjectionId, generation: ColumnarGeneration) {
+    pub(crate) fn keep(
+        &mut self,
+        projection_id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+    ) {
         self.suppressed
             .retain(|entry| entry.projection_id != projection_id || entry.generation != generation);
     }

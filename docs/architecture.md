@@ -129,6 +129,16 @@ first-class maintenance budget. Revert is runtime-only planner suppression of
 one derived generation; it never changes authoritative data or the logical
 projection definition.
 
+[Adaptive Operations Phase 2](adaptive-operations-phase2.md) adds opt-in
+execution feedback without changing that maintenance action surface. Planner
+estimates are frozen from the snapshots that selected the physical plan,
+Executor records real access-path counters, Core correlates them by typed
+identity and deterministic runtime plan-node ordinal, and the planner's pure
+evaluator converts raw evidence to canonical work units. A separate Phase 2
+outcome can validate or runtime-suppress only the exact Columnar generation;
+feedback never publishes user data, mutates cost coefficients, or changes
+Inspection JSON v7.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

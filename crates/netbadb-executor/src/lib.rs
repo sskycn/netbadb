@@ -8,7 +8,9 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::ControlFlow;
 
-use netbadb_planner::{PartitionAccessPlan, PartitionScanPlan, PhysicalPlan, PhysicalStatement};
+use netbadb_planner::{
+    PartitionAccessPlan, PartitionScanPlan, PhysicalPlan, PhysicalStatement, PlanNodeOrdinal,
+};
 use netbadb_rel::{
     AggregateExpr, AggregateFunction, AggregateInput, AggregateOutput, Assignment, BinaryOp,
     ColumnRef, Expr, ExprKind, JoinKind, NullOrder, OutputField, SortDirection, SortKey, UnaryOp,
@@ -19,8 +21,8 @@ use netbadb_storage::{
     TableStorage,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, ColumnarProjectionId, Float32Value, Float64Value, PhysicalType,
-    RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
+    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, Float32Value, Float64Value,
+    PartitionId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
 };
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
@@ -54,7 +56,98 @@ pub struct ExecutionColumnarProjection<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColumnarExecutionStatistics {
     pub projection_id: Option<ColumnarProjectionId>,
+    pub generation: Option<ColumnarGeneration>,
+    pub table_id: Option<TableId>,
+    pub storage_id: Option<StorageId>,
     pub scan: ColumnarScanStatistics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionAccessKind {
+    SeqScan,
+    IndexPoint,
+    IndexRange,
+    Columnar,
+    PartitionedSeqScan,
+    PartitionedIndexPoint,
+    PartitionedIndexRange,
+}
+
+/// Raw counters measured by execution. They are deliberately not planner work
+/// units and never cause query execution to fail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionWork {
+    pub rows_examined: u64,
+    pub rows_output: u64,
+    pub filter_rows_evaluated: u64,
+    pub filter_rows_passed: u64,
+    pub filter_rows_rejected: u64,
+    pub index_point_probes: u64,
+    pub index_range_probes: u64,
+    pub index_candidates_examined: u64,
+    pub columnar: Option<ColumnarExecutionStatistics>,
+    pub overflowed: bool,
+    pub incomplete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionAccessSample {
+    pub node: PlanNodeOrdinal,
+    pub binding_id: RelationBindingId,
+    pub table_id: TableId,
+    pub storage_id: StorageId,
+    pub partition_id: Option<PartitionId>,
+    pub kind: ExecutionAccessKind,
+    pub access_path: Option<AccessPathId>,
+    pub work: ExecutionWork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionFilterSample {
+    pub node: PlanNodeOrdinal,
+    pub work: ExecutionWork,
+}
+
+/// Opt-in execution telemetry. Normal execution constructs none of these
+/// vectors and retains its existing API and fast paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionStatistics {
+    pub accesses: Vec<ExecutionAccessSample>,
+    pub filters: Vec<ExecutionFilterSample>,
+    pub overflowed: bool,
+    pub incomplete: bool,
+}
+
+fn saturating_add_counter(target: &mut u64, value: u64) -> bool {
+    let (sum, overflowed) = target.overflowing_add(value);
+    if overflowed {
+        *target = u64::MAX;
+    } else {
+        *target = sum;
+    }
+    overflowed
+}
+
+impl ExecutionWork {
+    /// Saturating counter update used by instrumentation sites that receive
+    /// more than one batch. Overflow degrades telemetry, never query results.
+    pub fn add_rows_examined(&mut self, value: u64) {
+        if saturating_add_counter(&mut self.rows_examined, value) {
+            self.overflowed = true;
+            self.incomplete = true;
+        }
+    }
+}
+
+fn measured_len(value: usize, work: &mut ExecutionWork) -> u64 {
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => {
+            work.overflowed = true;
+            work.incomplete = true;
+            u64::MAX
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +455,173 @@ pub fn execute_with_columnar_context(
     })
 }
 
+/// Executes with opt-in raw access-path telemetry. The feedback path uses the
+/// same typed physical plan and storage read views, but does not impose any
+/// adaptive policy.
+pub fn execute_with_feedback_context(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    projections: &[ExecutionColumnarProjection<'_>],
+    statistics: &mut ExecutionStatistics,
+) -> Result<QueryResult, ExecutionError> {
+    statistics.accesses.clear();
+    statistics.filters.clear();
+    statistics.overflowed = false;
+    statistics.incomplete = false;
+
+    let mut columnar = ColumnarExecutionStatistics::default();
+    if let Some(rows) = execute_columnar_subtree(plan, projections, Some(&mut columnar))? {
+        record_columnar_access(plan, &columnar, statistics);
+        summarize_statistics(statistics);
+        return Ok(QueryResult {
+            columns: rows
+                .fields
+                .into_iter()
+                .map(|field| ResultColumn {
+                    name: field.name().to_owned(),
+                    data_type: field.data_type().clone(),
+                    nullable: field.nullable(),
+                })
+                .collect(),
+            rows: rows.rows.into_iter().map(|row| row.values).collect(),
+        });
+    }
+    let rows = execute_rows_legacy_with_feedback(
+        plan,
+        bindings,
+        storages,
+        read_views,
+        statistics,
+        PlanNodeOrdinal(0),
+    )?;
+    summarize_statistics(statistics);
+    Ok(QueryResult {
+        columns: rows
+            .fields
+            .into_iter()
+            .map(|field| ResultColumn {
+                name: field.name().to_owned(),
+                data_type: field.data_type().clone(),
+                nullable: field.nullable(),
+            })
+            .collect(),
+        rows: rows.rows.into_iter().map(|row| row.values).collect(),
+    })
+}
+
+fn summarize_statistics(statistics: &mut ExecutionStatistics) {
+    statistics.overflowed = statistics
+        .accesses
+        .iter()
+        .any(|sample| sample.work.overflowed)
+        || statistics
+            .filters
+            .iter()
+            .any(|sample| sample.work.overflowed);
+    statistics.incomplete = statistics
+        .accesses
+        .iter()
+        .any(|sample| sample.work.incomplete)
+        || statistics
+            .filters
+            .iter()
+            .any(|sample| sample.work.incomplete);
+}
+
+fn record_columnar_access(
+    plan: &PhysicalPlan,
+    columnar: &ColumnarExecutionStatistics,
+    statistics: &mut ExecutionStatistics,
+) {
+    let Some((node, binding_id, table_id, storage_id)) = find_columnar_access(plan) else {
+        statistics.incomplete = true;
+        return;
+    };
+    let incomplete = columnar_statistics_saturated(&columnar.scan);
+    let work = ExecutionWork {
+        rows_examined: columnar.scan.rows_read,
+        rows_output: columnar.scan.merged_rows,
+        columnar: Some(columnar.clone()),
+        overflowed: incomplete,
+        incomplete,
+        ..ExecutionWork::default()
+    };
+    statistics.accesses.push(ExecutionAccessSample {
+        node,
+        binding_id,
+        table_id,
+        storage_id,
+        partition_id: None,
+        kind: ExecutionAccessKind::Columnar,
+        access_path: None,
+        work,
+    });
+}
+
+fn columnar_statistics_saturated(scan: &ColumnarScanStatistics) -> bool {
+    [
+        scan.row_groups_total,
+        scan.row_groups_read,
+        scan.row_groups_pruned,
+        scan.rows_read,
+        scan.column_chunks_read,
+        scan.bytes_read,
+        scan.base_rows_suppressed,
+        scan.delta_segments,
+        scan.delta_mutations,
+        scan.delta_live_rows,
+        scan.delta_rows_emitted,
+        scan.delta_bytes_read,
+        scan.merged_rows,
+        scan.physical_block_reads,
+        scan.physical_bytes_read,
+        scan.decoded_column_chunks,
+        scan.decoded_version_blocks,
+        scan.base_data_bytes_read,
+        scan.base_version_key_bytes_read,
+        scan.delta_data_bytes_read,
+        scan.version_key_chunks_read,
+        scan.blocks_verified,
+        scan.row_groups_pruned_before_data_read,
+    ]
+    .contains(&u64::MAX)
+}
+
+fn find_columnar_access(
+    plan: &PhysicalPlan,
+) -> Option<(PlanNodeOrdinal, RelationBindingId, TableId, StorageId)> {
+    fn visit(
+        plan: &PhysicalPlan,
+        next: &mut u32,
+    ) -> Option<(PlanNodeOrdinal, RelationBindingId, TableId, StorageId)> {
+        let node = PlanNodeOrdinal(*next);
+        *next = next.saturating_add(1);
+        match plan {
+            PhysicalPlan::ColumnarScan {
+                binding_id,
+                table_id,
+                source_storage_id,
+                ..
+            } => Some((node, *binding_id, *table_id, *source_storage_id)),
+            PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::HashJoin { left, right, .. } => {
+                visit(left, next).or_else(|| visit(right, next))
+            }
+            PhysicalPlan::IndexNestedLoopJoin { left, .. }
+            | PhysicalPlan::Filter { input: left, .. }
+            | PhysicalPlan::Sort { input: left, .. }
+            | PhysicalPlan::Project { input: left, .. }
+            | PhysicalPlan::ScalarProject { input: left, .. }
+            | PhysicalPlan::Aggregate { input: left, .. }
+            | PhysicalPlan::Limit { input: left, .. } => visit(left, next),
+            _ => None,
+        }
+    }
+    visit(plan, &mut 0)
+}
+
 fn compatibility_bindings(
     storages: &[TableStorage],
 ) -> Result<Vec<ExecutionStorageBinding>, ExecutionError> {
@@ -570,9 +830,11 @@ fn build_vector_rows(
 ) -> Result<Option<VectorRows>, ExecutionError> {
     match plan {
         PhysicalPlan::ColumnarScan {
+            table_id,
             columns,
             projection_id,
             generation,
+            source_storage_id,
             ..
         } => {
             let projection = projections
@@ -597,6 +859,9 @@ fn build_vector_rows(
             })?;
             if let Some(statistics) = statistics {
                 statistics.projection_id = Some(*projection_id);
+                statistics.generation = Some(*generation);
+                statistics.table_id = Some(*table_id);
+                statistics.storage_id = Some(*source_storage_id);
                 statistics.scan = scan;
             }
             Ok(Some(VectorRows {
@@ -1890,6 +2155,27 @@ fn execute_rows_legacy_with_views(
         storages,
         read_views,
         FilterEvaluationMode::ShortCircuitWhenSafe,
+        None,
+        PlanNodeOrdinal(0),
+    )
+}
+
+fn execute_rows_legacy_with_feedback(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    statistics: &mut ExecutionStatistics,
+    node: PlanNodeOrdinal,
+) -> Result<ExecutionRows, ExecutionError> {
+    execute_rows_legacy_with_filter_mode(
+        plan,
+        bindings,
+        storages,
+        read_views,
+        FilterEvaluationMode::ShortCircuitWhenSafe,
+        Some(statistics),
+        node,
     )
 }
 
@@ -1905,6 +2191,8 @@ fn execute_rows_legacy_eager_filter_with_views(
         storages,
         read_views,
         FilterEvaluationMode::Eager,
+        None,
+        PlanNodeOrdinal(0),
     )
 }
 
@@ -1914,6 +2202,8 @@ fn execute_rows_legacy_with_filter_mode(
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
     filter_mode: FilterEvaluationMode,
+    mut feedback: Option<&mut ExecutionStatistics>,
+    node: PlanNodeOrdinal,
 ) -> Result<ExecutionRows, ExecutionError> {
     match plan {
         PhysicalPlan::OneRow => Ok(ExecutionRows {
@@ -1924,13 +2214,17 @@ fn execute_rows_legacy_with_filter_mode(
             }],
         }),
         PhysicalPlan::SeqScan {
-            table_id, columns, ..
+            binding_id,
+            table_id,
+            columns,
+            ..
         } => {
             let column_ids = columns
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
             let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage_id = storage_id_for_table(bindings, *table_id)?;
             let storage = storage_for_table(bindings, storages, *table_id)?;
             let rows = storage
                 .scan_columns_with_view(&column_ids, view)?
@@ -1939,7 +2233,23 @@ fn execute_rows_legacy_with_filter_mode(
                     row_id: Some(row_id),
                     values,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if let Some(feedback) = feedback.as_deref_mut() {
+                let mut work = ExecutionWork::default();
+                let count = measured_len(rows.len(), &mut work);
+                work.rows_examined = count;
+                work.rows_output = count;
+                feedback.accesses.push(ExecutionAccessSample {
+                    node,
+                    binding_id: *binding_id,
+                    table_id: *table_id,
+                    storage_id,
+                    partition_id: None,
+                    kind: ExecutionAccessKind::SeqScan,
+                    access_path: None,
+                    work,
+                });
+            }
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
@@ -1949,6 +2259,7 @@ fn execute_rows_legacy_with_filter_mode(
             Err(ExecutionError::MissingColumnarProjection(*projection_id))
         }
         PhysicalPlan::IndexScan {
+            binding_id,
             table_id,
             columns,
             access_path,
@@ -1956,6 +2267,7 @@ fn execute_rows_legacy_with_filter_mode(
             ..
         } => {
             let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage_id = storage_id_for_table(bindings, *table_id)?;
             let storage = storage_for_table(bindings, storages, *table_id)?;
             let column_ids = columns
                 .iter()
@@ -1968,13 +2280,34 @@ fn execute_rows_legacy_with_filter_mode(
                     row_id: Some(row_id),
                     values,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if let Some(feedback) = feedback.as_deref_mut() {
+                let mut work = ExecutionWork {
+                    index_point_probes: 1,
+                    ..ExecutionWork::default()
+                };
+                let count = measured_len(rows.len(), &mut work);
+                work.rows_examined = count;
+                work.rows_output = count;
+                work.index_candidates_examined = count;
+                feedback.accesses.push(ExecutionAccessSample {
+                    node,
+                    binding_id: *binding_id,
+                    table_id: *table_id,
+                    storage_id,
+                    partition_id: None,
+                    kind: ExecutionAccessKind::IndexPoint,
+                    access_path: Some(*access_path),
+                    work,
+                });
+            }
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
             })
         }
         PhysicalPlan::RangeIndexScan {
+            binding_id,
             table_id,
             columns,
             access_path,
@@ -1982,6 +2315,7 @@ fn execute_rows_legacy_with_filter_mode(
             ..
         } => {
             let view = read_view_for_table(bindings, read_views, *table_id)?;
+            let storage_id = storage_id_for_table(bindings, *table_id)?;
             let storage = storage_for_table(bindings, storages, *table_id)?;
             let column_ids = columns
                 .iter()
@@ -1994,13 +2328,34 @@ fn execute_rows_legacy_with_filter_mode(
                     row_id: Some(row_id),
                     values,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if let Some(feedback) = feedback.as_deref_mut() {
+                let mut work = ExecutionWork {
+                    index_range_probes: 1,
+                    ..ExecutionWork::default()
+                };
+                let count = measured_len(rows.len(), &mut work);
+                work.rows_examined = count;
+                work.rows_output = count;
+                work.index_candidates_examined = count;
+                feedback.accesses.push(ExecutionAccessSample {
+                    node,
+                    binding_id: *binding_id,
+                    table_id: *table_id,
+                    storage_id,
+                    partition_id: None,
+                    kind: ExecutionAccessKind::IndexRange,
+                    access_path: Some(*access_path),
+                    work,
+                });
+            }
             Ok(ExecutionRows {
                 fields: columns.iter().cloned().map(OutputField::Source).collect(),
                 rows,
             })
         }
         PhysicalPlan::PartitionedScan {
+            binding_id,
             table_id,
             columns,
             partitions,
@@ -2036,6 +2391,43 @@ fn execute_rows_legacy_with_filter_mode(
                         view,
                     )?,
                 };
+                if let Some(feedback) = feedback.as_deref_mut() {
+                    let mut work = ExecutionWork::default();
+                    let count = measured_len(partition_rows.len(), &mut work);
+                    work.rows_examined = count;
+                    work.rows_output = count;
+                    let (kind, access_path) = match &partition.access {
+                        PartitionAccessPlan::SeqScan => {
+                            (ExecutionAccessKind::PartitionedSeqScan, None)
+                        }
+                        PartitionAccessPlan::IndexScan { access_path, .. } => {
+                            work.index_point_probes = 1;
+                            work.index_candidates_examined = count;
+                            (
+                                ExecutionAccessKind::PartitionedIndexPoint,
+                                Some(*access_path),
+                            )
+                        }
+                        PartitionAccessPlan::RangeIndexScan { access_path, .. } => {
+                            work.index_range_probes = 1;
+                            work.index_candidates_examined = count;
+                            (
+                                ExecutionAccessKind::PartitionedIndexRange,
+                                Some(*access_path),
+                            )
+                        }
+                    };
+                    feedback.accesses.push(ExecutionAccessSample {
+                        node,
+                        binding_id: *binding_id,
+                        table_id: *table_id,
+                        storage_id: partition.storage_id,
+                        partition_id: Some(partition.partition_id),
+                        kind,
+                        access_path,
+                        work,
+                    });
+                }
                 rows.extend(
                     partition_rows
                         .into_iter()
@@ -2057,12 +2449,17 @@ fn execute_rows_legacy_with_filter_mode(
             columns,
             ..
         } => {
+            let left_node = child_node(node);
+            let right_node =
+                PlanNodeOrdinal(left_node.0.saturating_add(physical_plan_node_count(left)));
             let left = execute_rows_legacy_with_filter_mode(
                 left,
                 bindings,
                 storages,
                 read_views,
                 filter_mode,
+                feedback.as_deref_mut(),
+                left_node,
             )?;
             let right = execute_rows_legacy_with_filter_mode(
                 right,
@@ -2070,6 +2467,8 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback,
+                right_node,
             )?;
             let mut joined_fields = left.fields.clone();
             joined_fields.extend(right.fields.clone());
@@ -2198,6 +2597,8 @@ fn execute_rows_legacy_with_filter_mode(
             bindings,
             storages,
             read_views,
+            feedback,
+            node,
             #[cfg(test)]
             None,
         ),
@@ -2211,21 +2612,23 @@ fn execute_rows_legacy_with_filter_mode(
             columns,
             ..
         } => {
-            if let Some(result) = try_execute_streaming_hash_join_probe(
-                left,
-                right,
-                *kind,
-                left_key,
-                right_key,
-                predicate,
-                columns,
-                bindings,
-                storages,
-                read_views,
-                #[cfg(test)]
-                None,
-            )? {
-                return Ok(result);
+            if feedback.is_none() {
+                if let Some(result) = try_execute_streaming_hash_join_probe(
+                    left,
+                    right,
+                    *kind,
+                    left_key,
+                    right_key,
+                    predicate,
+                    columns,
+                    bindings,
+                    storages,
+                    read_views,
+                    #[cfg(test)]
+                    None,
+                )? {
+                    return Ok(result);
+                }
             }
             execute_hash_join_materialized_with_filter_mode(
                 left,
@@ -2238,10 +2641,12 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback,
+                node,
             )
         }
         PhysicalPlan::Filter { input, predicate } => {
-            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+            if feedback.is_none() && filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
                 if let Some(result) = try_execute_streaming_seq_filter(
                     input, predicate, bindings, storages, read_views,
                 )? {
@@ -2254,7 +2659,10 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback.as_deref_mut(),
+                child_node(node),
             )?;
+            let evaluated = result.rows.len();
             let fields = result.fields.clone();
             result.rows = match bind_filter_predicate(predicate, &fields) {
                 Ok(mut bound_predicate) => {
@@ -2296,6 +2704,15 @@ fn execute_rows_legacy_with_filter_mode(
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             };
+            if let Some(feedback) = feedback.as_deref_mut() {
+                let mut work = ExecutionWork::default();
+                work.filter_rows_evaluated = measured_len(evaluated, &mut work);
+                work.filter_rows_passed = measured_len(result.rows.len(), &mut work);
+                work.filter_rows_rejected = work
+                    .filter_rows_evaluated
+                    .saturating_sub(work.filter_rows_passed);
+                feedback.filters.push(ExecutionFilterSample { node, work });
+            }
             Ok(result)
         }
         PhysicalPlan::Sort { input, keys } => {
@@ -2305,6 +2722,8 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback,
+                child_node(node),
             )?;
             sort_execution_rows(
                 &mut result,
@@ -2315,7 +2734,7 @@ fn execute_rows_legacy_with_filter_mode(
             Ok(result)
         }
         PhysicalPlan::Project { input, columns } => {
-            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+            if feedback.is_none() && filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
                 if let Some(result) = try_execute_projected_streaming_seq_filter(
                     input, columns, bindings, storages, read_views,
                 )? {
@@ -2328,6 +2747,8 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback.as_deref_mut(),
+                child_node(node),
             )?;
             let projection = build_projection_plan(&input_result.fields, columns)?;
             let rows = if projection.identity {
@@ -2351,6 +2772,8 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback.as_deref_mut(),
+                child_node(node),
             )?;
             let fields = input_result.fields;
             let rows = input_result
@@ -2380,19 +2803,21 @@ fn execute_rows_legacy_with_filter_mode(
             group_keys,
             outputs,
         } => {
-            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+            if feedback.is_none() && filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
                 if let Some(result) = try_execute_filtered_counts(
                     input, group_keys, outputs, bindings, storages, read_views,
                 )? {
                     return Ok(result);
                 }
             }
-            if let Some(result) = try_execute_direct_counts(
-                input, group_keys, outputs, bindings, storages, read_views,
-            )? {
-                return Ok(result);
+            if feedback.is_none() {
+                if let Some(result) = try_execute_direct_counts(
+                    input, group_keys, outputs, bindings, storages, read_views,
+                )? {
+                    return Ok(result);
+                }
             }
-            if filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
+            if feedback.is_none() && filter_mode == FilterEvaluationMode::ShortCircuitWhenSafe {
                 if let Some(result) = try_execute_batch_aggregate(
                     input, group_keys, outputs, bindings, storages, read_views,
                 )? {
@@ -2405,6 +2830,8 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback.as_deref_mut(),
+                child_node(node),
             )?;
             execute_aggregate(input, group_keys, outputs)
         }
@@ -2415,6 +2842,8 @@ fn execute_rows_legacy_with_filter_mode(
                 storages,
                 read_views,
                 filter_mode,
+                feedback,
+                child_node(node),
             )?;
             let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
             result.rows.truncate(limit);
@@ -2438,6 +2867,8 @@ fn execute_index_nested_loop_join(
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
+    feedback: Option<&mut ExecutionStatistics>,
+    node: PlanNodeOrdinal,
     #[cfg(test)] mut stats: Option<&mut IndexNestedLoopJoinStats>,
 ) -> Result<ExecutionRows, ExecutionError> {
     if !matches!(kind, JoinKind::Inner)
@@ -2528,6 +2959,8 @@ fn execute_index_nested_loop_join(
     }
 
     let mut rows = Vec::new();
+    let mut left_work = ExecutionWork::default();
+    let mut right_work = ExecutionWork::default();
     let mut batch = ExecutionBatch::with_capacity();
     let mut deliver = |batch: &mut ExecutionBatch| -> Result<(), ExecutionError> {
         #[cfg(test)]
@@ -2536,6 +2969,7 @@ fn execute_index_nested_loop_join(
             stats.max_outer_batch_rows = stats.max_outer_batch_rows.max(batch.rows.len());
         }
         for left_row in &batch.rows {
+            left_work.add_rows_examined(1);
             #[cfg(test)]
             if let Some(stats) = stats.as_deref_mut() {
                 stats.outer_rows_seen += 1;
@@ -2547,6 +2981,10 @@ fn execute_index_nested_loop_join(
                 }
                 continue;
             };
+            if saturating_add_counter(&mut right_work.index_point_probes, 1) {
+                right_work.overflowed = true;
+                right_work.incomplete = true;
+            }
             #[cfg(test)]
             if let Some(stats) = stats.as_deref_mut() {
                 stats.point_probes += 1;
@@ -2557,6 +2995,17 @@ fn execute_index_nested_loop_join(
                 &right_column_ids,
                 right_view,
             )?;
+            let candidate_count = measured_len(candidates.len(), &mut right_work);
+            if saturating_add_counter(&mut right_work.index_candidates_examined, candidate_count) {
+                right_work.overflowed = true;
+                right_work.incomplete = true;
+            }
+            if saturating_add_counter(&mut right_work.rows_examined, candidate_count)
+                || saturating_add_counter(&mut right_work.rows_output, candidate_count)
+            {
+                right_work.overflowed = true;
+                right_work.incomplete = true;
+            }
             #[cfg(test)]
             if let Some(stats) = stats.as_deref_mut() {
                 stats.point_rows_returned += candidates.len();
@@ -2609,6 +3058,33 @@ fn execute_index_nested_loop_join(
     )?;
     if !batch.rows.is_empty() {
         deliver(&mut batch)?;
+    }
+    left_work.rows_output = left_work.rows_examined;
+    if let Some(feedback) = feedback {
+        let left_binding_id = match left {
+            PhysicalPlan::SeqScan { binding_id, .. } => *binding_id,
+            _ => return Err(ExecutionError::TypeMismatch),
+        };
+        feedback.accesses.push(ExecutionAccessSample {
+            node: child_node(node),
+            binding_id: left_binding_id,
+            table_id: left_table_id,
+            storage_id: left_storage_id,
+            partition_id: None,
+            kind: ExecutionAccessKind::SeqScan,
+            access_path: None,
+            work: left_work,
+        });
+        feedback.accesses.push(ExecutionAccessSample {
+            node,
+            binding_id: right_binding_id,
+            table_id: right_table_id,
+            storage_id: right_storage_id,
+            partition_id: None,
+            kind: ExecutionAccessKind::IndexPoint,
+            access_path: Some(right_access_path),
+            work: right_work,
+        });
     }
     Ok(ExecutionRows { fields, rows })
 }
@@ -2927,6 +3403,8 @@ fn execute_hash_join_materialized(
         storages,
         read_views,
         FilterEvaluationMode::ShortCircuitWhenSafe,
+        None,
+        PlanNodeOrdinal(0),
     )
 }
 
@@ -2942,14 +3420,32 @@ fn execute_hash_join_materialized_with_filter_mode(
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
     filter_mode: FilterEvaluationMode,
+    mut feedback: Option<&mut ExecutionStatistics>,
+    node: PlanNodeOrdinal,
 ) -> Result<ExecutionRows, ExecutionError> {
     if !left_key.data_type.is_compatible_with(&right_key.data_type) {
         return Err(ExecutionError::TypeMismatch);
     }
-    let left =
-        execute_rows_legacy_with_filter_mode(left, bindings, storages, read_views, filter_mode)?;
-    let right =
-        execute_rows_legacy_with_filter_mode(right, bindings, storages, read_views, filter_mode)?;
+    let left_node = child_node(node);
+    let right_node = PlanNodeOrdinal(left_node.0.saturating_add(physical_plan_node_count(left)));
+    let left = execute_rows_legacy_with_filter_mode(
+        left,
+        bindings,
+        storages,
+        read_views,
+        filter_mode,
+        feedback.as_deref_mut(),
+        left_node,
+    )?;
+    let right = execute_rows_legacy_with_filter_mode(
+        right,
+        bindings,
+        storages,
+        read_views,
+        filter_mode,
+        feedback,
+        right_node,
+    )?;
     let left_key_position = find_source_position(&left.fields, left_key)?;
     let right_key_position = find_source_position(&right.fields, right_key)?;
     let buckets = build_hash_join_buckets(
@@ -5128,6 +5624,40 @@ fn storage_for_table<'a>(
         .find(|storage| storage.storage_id == storage_id)
         .map(|storage| &mut *storage.storage)
         .ok_or(ExecutionError::MissingPhysicalStorage(storage_id))
+}
+
+fn storage_id_for_table(
+    bindings: &[ExecutionStorageBinding],
+    table_id: TableId,
+) -> Result<StorageId, ExecutionError> {
+    bindings
+        .iter()
+        .find(|binding| binding.table_id == table_id)
+        .map(|binding| binding.storage_id)
+        .ok_or(ExecutionError::MissingTableStorage(table_id))
+}
+
+fn child_node(node: PlanNodeOrdinal) -> PlanNodeOrdinal {
+    PlanNodeOrdinal(node.0.saturating_add(1))
+}
+
+fn physical_plan_node_count(plan: &PhysicalPlan) -> u32 {
+    match plan {
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. } => 1_u32
+            .saturating_add(physical_plan_node_count(left))
+            .saturating_add(physical_plan_node_count(right)),
+        PhysicalPlan::IndexNestedLoopJoin { left, .. }
+        | PhysicalPlan::Filter { input: left, .. }
+        | PhysicalPlan::Sort { input: left, .. }
+        | PhysicalPlan::Project { input: left, .. }
+        | PhysicalPlan::ScalarProject { input: left, .. }
+        | PhysicalPlan::Aggregate { input: left, .. }
+        | PhysicalPlan::Limit { input: left, .. } => {
+            1_u32.saturating_add(physical_plan_node_count(left))
+        }
+        _ => 1,
+    }
 }
 
 fn storage_for_id<'a>(
@@ -13733,6 +14263,8 @@ mod tests {
             &bindings,
             &mut execution_storages,
             &execution_views,
+            None,
+            super::PlanNodeOrdinal(0),
             Some(stats),
         )
     }

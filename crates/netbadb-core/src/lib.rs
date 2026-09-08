@@ -10,6 +10,9 @@ mod columnar_tests;
 mod coordinator_crash;
 mod coordinator_log;
 mod deferred_backfill;
+mod execution_feedback;
+#[cfg(test)]
+mod execution_feedback_tests;
 mod inspection;
 mod maintenance;
 #[cfg(test)]
@@ -48,14 +51,15 @@ use netbadb_compiler::{
 use netbadb_executor::{
     ExecutionColumnarProjection, ExecutionError, ExecutionReadView, ExecutionStorage,
     ExecutionStorageBinding, PreparedMutation, execute_with_columnar_context,
-    prepare_mutation_with_storage_context,
+    execute_with_feedback_context, prepare_mutation_with_storage_context,
 };
 use netbadb_inspect::StatementInspection;
 use netbadb_planner::{
     AccessCostHints, AccessPath, AccessPathCapabilities, ColumnarProjectionPlanningSnapshot,
     ColumnarRowGroupPlanningSnapshot, ColumnarZoneMapPlanningSnapshot, PartitionPlanningSnapshot,
     PhysicalStatement, RangeTablePlanningSnapshot, TableAccessStatistics,
-    plan_statement_with_columnar_snapshots, plan_statement_with_partition_snapshots,
+    estimate_execution_accesses, plan_statement_with_columnar_snapshots,
+    plan_statement_with_partition_snapshots,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
@@ -89,6 +93,10 @@ pub use columnar::{
     ColumnarProjectionSpec,
 };
 pub use coordinator_log::CoordinatorLogError;
+pub use execution_feedback::{
+    AccessExecutionFeedback, AdaptiveExecutionFeedbackOutcome, AdaptiveExecutionFeedbackReport,
+    ExecutionFeedbackAnchor, ExecutionFeedbackPolicy, ExecutionFeedbackReport,
+};
 pub use maintenance::{
     LsmMaintenanceReport, MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker,
     MaintenanceBound, MaintenanceBudget, MaintenanceCandidate, MaintenanceConsumption,
@@ -96,9 +104,14 @@ pub use maintenance::{
     MaintenanceReason, MaintenanceStepReport,
 };
 pub use netbadb_executor::{
-    ColumnarExecutionStatistics, ExecutionResult, QueryResult, ResultColumn,
+    ColumnarExecutionStatistics, ExecutionAccessKind, ExecutionAccessSample, ExecutionFilterSample,
+    ExecutionResult, ExecutionStatistics, ExecutionWork, QueryResult, ResultColumn,
 };
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
+pub use netbadb_planner::{
+    PlanNodeOrdinal, PlannerAccessEstimate, PlannerAccessKind, PlannerCalibrationSample,
+    PlannerEstimateDirection, PlannerWorkModel,
+};
 pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
     ChangeBatch, ChangeBatchInspection, ChangeBatchMaintenanceInspection, ChangeReadResult,
@@ -3872,7 +3885,7 @@ impl Database {
         };
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
-        match self.execute_query_plan(&plan, &view, None, None) {
+        match self.execute_query_plan(&plan, &view, None, None, None) {
             Ok(result) => Ok(result),
             Err(error) => {
                 let Some((projection_id, detail)) = columnar_read_failure(&error) else {
@@ -3883,7 +3896,7 @@ impl Database {
                 let PhysicalStatement::Query(retry) = retry else {
                     return Err(DatabaseError::ExpectedQuery);
                 };
-                self.execute_query_plan(&retry, &view, None, None)
+                self.execute_query_plan(&retry, &view, None, None, None)
             }
         }
     }
@@ -3901,7 +3914,7 @@ impl Database {
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
         let mut statistics = ColumnarExecutionStatistics::default();
-        match self.execute_query_plan(&plan, &view, None, Some(&mut statistics)) {
+        match self.execute_query_plan(&plan, &view, None, Some(&mut statistics), None) {
             Ok(result) => Ok((result, statistics)),
             Err(error) => {
                 let Some((projection_id, detail)) = columnar_read_failure(&error) else {
@@ -3913,8 +3926,56 @@ impl Database {
                     return Err(DatabaseError::ExpectedQuery);
                 };
                 statistics = ColumnarExecutionStatistics::default();
-                let result = self.execute_query_plan(&retry, &view, None, Some(&mut statistics))?;
+                let result =
+                    self.execute_query_plan(&retry, &view, None, Some(&mut statistics), None)?;
                 Ok((result, statistics))
+            }
+        }
+    }
+
+    /// Executes one query with planning-time estimates correlated to opt-in
+    /// raw executor counters. The returned report is runtime-only and does not
+    /// publish a database commit.
+    pub fn query_with_feedback(
+        &mut self,
+        source: &str,
+    ) -> Result<(QueryResult, ExecutionFeedbackReport), DatabaseError> {
+        let (compiled, physical, estimates) = self.compile_and_plan_with_estimates(source)?;
+        let PhysicalStatement::Query(plan) = physical else {
+            return Err(DatabaseError::ExpectedQuery);
+        };
+        let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
+        let view = self.autocommit_read_view(&storage_ids)?;
+        let anchor = ExecutionFeedbackAnchor {
+            global_commit_seq: view.snapshot().map(|snapshot| snapshot.commit_seq()),
+            schema_generation: self.schema_generation(),
+        };
+        let mut statistics = ExecutionStatistics::default();
+        match self.execute_query_plan(&plan, &view, None, None, Some(&mut statistics)) {
+            Ok(result) => Ok((
+                result,
+                execution_feedback::correlate_execution_feedback(anchor, &estimates, statistics),
+            )),
+            Err(error) => {
+                let Some((projection_id, detail)) = columnar_read_failure(&error) else {
+                    return Err(error);
+                };
+                self.projections.quarantine(projection_id, detail);
+                let (_, retry, retry_estimates) = self.compile_and_plan_with_estimates(source)?;
+                let PhysicalStatement::Query(retry) = retry else {
+                    return Err(DatabaseError::ExpectedQuery);
+                };
+                statistics = ExecutionStatistics::default();
+                let result =
+                    self.execute_query_plan(&retry, &view, None, None, Some(&mut statistics))?;
+                Ok((
+                    result,
+                    execution_feedback::correlate_execution_feedback(
+                        anchor,
+                        &retry_estimates,
+                        statistics,
+                    ),
+                ))
             }
         }
     }
@@ -4661,7 +4722,7 @@ impl Database {
             let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
             let view = self.autocommit_read_view(&storage_ids)?;
             return self
-                .execute_query_plan(plan, &view, None, None)
+                .execute_query_plan(plan, &view, None, None, None)
                 .map(ExecutionResult::Query);
         }
 
@@ -4852,6 +4913,42 @@ impl Database {
         let compiled = compile_statement(&self.committed.schema, source)?;
         let physical = self.plan_logical_statement(&compiled.logical_statement);
         Ok((compiled, physical))
+    }
+
+    fn compile_and_plan_with_estimates(
+        &self,
+        source: &str,
+    ) -> Result<
+        (
+            CompiledStatement,
+            PhysicalStatement,
+            Vec<netbadb_planner::PlannerAccessEstimate>,
+        ),
+        DatabaseError,
+    > {
+        let compiled = compile_statement(&self.committed.schema, source)?;
+        let table_statistics = self.planner_table_statistics();
+        let access_paths = self.planner_access_paths();
+        let range_tables = self.planner_range_tables();
+        let projections = self.planner_columnar_projections();
+        let physical = plan_statement_with_columnar_snapshots(
+            &compiled.logical_statement,
+            &table_statistics,
+            &access_paths,
+            &range_tables,
+            &projections,
+        );
+        let estimates = match &physical {
+            PhysicalStatement::Query(plan) => estimate_execution_accesses(
+                plan,
+                &table_statistics,
+                &access_paths,
+                &range_tables,
+                &projections,
+            ),
+            _ => Vec::new(),
+        };
+        Ok((compiled, physical, estimates))
     }
 
     fn plan_logical_statement(&self, logical: &netbadb_rel::LogicalStatement) -> PhysicalStatement {
@@ -5196,6 +5293,7 @@ impl Database {
         view: &DatabaseReadView,
         staged: Option<&mut TableStorage>,
         columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
+        execution_statistics: Option<&mut ExecutionStatistics>,
     ) -> Result<QueryResult, DatabaseError> {
         let staged_table = staged.as_ref().map(|storage| storage.table().id);
         let mut bindings = self
@@ -5243,14 +5341,25 @@ impl Database {
                 projection,
             })
             .collect::<Vec<_>>();
-        Ok(execute_with_columnar_context(
-            plan,
-            &bindings,
-            &mut storages,
-            &read_views,
-            &projections,
-            columnar_statistics,
-        )?)
+        if let Some(statistics) = execution_statistics {
+            Ok(execute_with_feedback_context(
+                plan,
+                &bindings,
+                &mut storages,
+                &read_views,
+                &projections,
+                statistics,
+            )?)
+        } else {
+            Ok(execute_with_columnar_context(
+                plan,
+                &bindings,
+                &mut storages,
+                &read_views,
+                &projections,
+                columnar_statistics,
+            )?)
+        }
     }
 
     fn execute_query_plan_in(
