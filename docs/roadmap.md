@@ -1,5 +1,23 @@
 # NetbaDB roadmap
 
+## Cross-physical CAST and atomic shadow conversion audit (Round 59 complete)
+
+- selected the existing typed `ExprKind::Cast` plus the deferred shadow-column
+  program as the single conversion architecture, without opening production
+  cross-physical SQL casts or `ALTER COLUMN TYPE`;
+- defined and executable-tested the complete 15-type policy: identity casts,
+  checked integer conversions, Text/integer conversions and Bool/Text, while
+  rejecting unsupported pairs and separating invalid text from range errors;
+- proved repair/retry, ordered VirtualRow prefixes, digest binding, index
+  evacuation, one-S2/one-G publication, Change Stream blocking, corruption
+  handling and the pre/post-Decision crash matrix;
+- fixed sequenced structural recovery after a CORD v4 checkpoint so recovery
+  appends Complete with the Decision's G instead of an invalid legacy record;
+- changed no persistent or wire format and retained the production HIR gate.
+
+See
+[`deferred-type-conversion-round59.md`](deferred-type-conversion-round59.md).
+
 ## Coordinator checkpoint and log compaction (Phase 3B.5 complete)
 
 - added explicit synchronous `Database::compact_coordinator_log()` for a

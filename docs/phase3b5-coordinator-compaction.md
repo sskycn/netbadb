@@ -106,6 +106,12 @@ tests cover malformed checkpoints, orphan `.next`, injected write/sync/rename
 failures, deferred Complete recovery, a partial post-checkpoint Decision,
 DatabaseTxnId non-reuse, and schema commit after a data-only checkpoint.
 
+Round 59 additionally exercised a crash after a sequenced structural Decision
+following a checkpoint. Schema-mutation recovery now derives Complete encoding
+from that decoded Decision: post-checkpoint decisions append sequenced Complete
+with the same G, while legacy local decisions retain the unsequenced record.
+This corrects recovery without changing CORD v4 or its compaction policy.
+
 ## Semantic non-effects
 
 - `CoordinatorCheckpoint` is not a historical `DatabaseSnapshot`.

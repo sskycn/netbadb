@@ -1887,6 +1887,48 @@ fn pg_alter_permission_errors_unsupported_forms_and_sqlstates_fail_closed() {
 }
 
 #[test]
+fn pg_round59_keeps_cross_physical_cast_and_alter_type_closed() {
+    let (root, mut db) = project("pg-round59-cast-negative");
+    let mut admin = session(&db, true);
+
+    for supported in [
+        "SELECT 42::BIGINT",
+        "SELECT '42'::TEXT",
+        "SELECT true::BOOL",
+    ] {
+        ok(&sql(&mut admin, &mut db, supported));
+    }
+    state(&sql(&mut admin, &mut db, "SELECT '42'::BIGINT"), "42804");
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "UPDATE projects SET id = name::BIGINT WHERE name IS NOT NULL",
+        ),
+        "42804",
+    );
+    state(&sql(&mut admin, &mut db, "SELECT * FROM projects"), "25P02");
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT",
+        ),
+        "0A000",
+    );
+    state(&sql(&mut admin, &mut db, "SELECT * FROM projects"), "25P02");
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pg_round48_extended_final_create_is_pure_until_execute_and_terminal() {
     for (case, alters, create) in [
         (

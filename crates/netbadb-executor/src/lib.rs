@@ -108,6 +108,21 @@ pub enum ExecutionError {
     MissingColumn(String),
     ExpectedBoolean,
     TypeMismatch,
+    InvalidCastText {
+        target: PhysicalType,
+    },
+    CastOutOfRange {
+        source: PhysicalType,
+        target: PhysicalType,
+    },
+    UnsupportedCast {
+        source: PhysicalType,
+        target: PhysicalType,
+    },
+    InvalidCastInput {
+        declared: PhysicalType,
+        actual: PhysicalType,
+    },
     TransactionRequired,
     AffectedRowsOverflow,
     AggregateOverflow {
@@ -159,6 +174,19 @@ impl fmt::Display for ExecutionError {
                 formatter.write_str("predicate evaluated to a non-boolean value")
             }
             Self::TypeMismatch => formatter.write_str("values have incompatible runtime types"),
+            Self::InvalidCastText { target } => {
+                write!(formatter, "invalid textual representation for {target}")
+            }
+            Self::CastOutOfRange { source, target } => {
+                write!(formatter, "{source} value is out of range for {target}")
+            }
+            Self::UnsupportedCast { source, target } => {
+                write!(formatter, "cast from {source} to {target} is not supported")
+            }
+            Self::InvalidCastInput { declared, actual } => write!(
+                formatter,
+                "cast child declared {declared}, but evaluated to {actual}"
+            ),
             Self::TransactionRequired => {
                 formatter.write_str("a mutating statement requires an active transaction")
             }
@@ -5197,6 +5225,11 @@ enum BoundExprKind<'a> {
         name: &'a str,
     },
     Literal(&'a ScalarValue),
+    Cast {
+        source: PhysicalType,
+        target: PhysicalType,
+        expression: Box<BoundExpr<'a>>,
+    },
     Binary {
         operator: BinaryOp,
         left: Box<BoundExpr<'a>>,
@@ -5216,6 +5249,14 @@ fn bind_expression<'a>(
     expression: &'a Expr,
     fields: &[OutputField],
 ) -> Result<BoundExpr<'a>, ExecutionError> {
+    bind_expression_with_cast_semantics(expression, fields, CastSemantics::IdentityOnly)
+}
+
+fn bind_expression_with_cast_semantics<'a>(
+    expression: &'a Expr,
+    fields: &[OutputField],
+    cast_semantics: CastSemantics,
+) -> Result<BoundExpr<'a>, ExecutionError> {
     let kind = match &expression.kind {
         ExprKind::Column(column) => BoundExprKind::Column {
             position: find_source_position(fields, column)?,
@@ -5223,28 +5264,57 @@ fn bind_expression<'a>(
         },
         ExprKind::Literal(value) => BoundExprKind::Literal(value),
         ExprKind::Parameter(_) => return Err(ExecutionError::TypeMismatch),
-        ExprKind::Cast { expression } => return bind_expression(expression, fields),
+        ExprKind::Cast { expression: child } => {
+            if cast_semantics == CastSemantics::IdentityOnly {
+                return bind_expression_with_cast_semantics(child, fields, cast_semantics);
+            }
+            BoundExprKind::Cast {
+                source: child.expr_type.data_type.physical,
+                target: expression.expr_type.data_type.physical,
+                expression: Box::new(bind_expression_with_cast_semantics(
+                    child,
+                    fields,
+                    cast_semantics,
+                )?),
+            }
+        }
         ExprKind::Binary {
             operator,
             left,
             right,
         } => BoundExprKind::Binary {
             operator: *operator,
-            left: Box::new(bind_expression(left, fields)?),
-            right: Box::new(bind_expression(right, fields)?),
+            left: Box::new(bind_expression_with_cast_semantics(
+                left,
+                fields,
+                cast_semantics,
+            )?),
+            right: Box::new(bind_expression_with_cast_semantics(
+                right,
+                fields,
+                cast_semantics,
+            )?),
         },
         ExprKind::Unary {
             operator,
             expression,
         } => BoundExprKind::Unary {
             operator: *operator,
-            expression: Box::new(bind_expression(expression, fields)?),
+            expression: Box::new(bind_expression_with_cast_semantics(
+                expression,
+                fields,
+                cast_semantics,
+            )?),
         },
         ExprKind::IsNull {
             expression,
             negated,
         } => BoundExprKind::IsNull {
-            expression: Box::new(bind_expression(expression, fields)?),
+            expression: Box::new(bind_expression_with_cast_semantics(
+                expression,
+                fields,
+                cast_semantics,
+            )?),
             negated: *negated,
         },
     };
@@ -5978,6 +6048,182 @@ impl EvaluatedScalar<'_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CastSemantics {
+    IdentityOnly,
+    #[cfg(any(test, feature = "round59-audit"))]
+    Round59Audit,
+}
+
+#[derive(Clone, Copy)]
+enum IntegerValue {
+    Signed(i128),
+    Unsigned(u128),
+}
+
+fn integer_value(value: ScalarRef<'_>) -> Option<IntegerValue> {
+    match value {
+        ScalarRef::Int8(value) => Some(IntegerValue::Signed(i128::from(value))),
+        ScalarRef::Int16(value) => Some(IntegerValue::Signed(i128::from(value))),
+        ScalarRef::Int32(value) => Some(IntegerValue::Signed(i128::from(value))),
+        ScalarRef::Int64(value) => Some(IntegerValue::Signed(i128::from(value))),
+        ScalarRef::Int128(value) => Some(IntegerValue::Signed(value)),
+        ScalarRef::UInt8(value) => Some(IntegerValue::Unsigned(u128::from(value))),
+        ScalarRef::UInt16(value) => Some(IntegerValue::Unsigned(u128::from(value))),
+        ScalarRef::UInt32(value) => Some(IntegerValue::Unsigned(u128::from(value))),
+        ScalarRef::UInt64(value) => Some(IntegerValue::Unsigned(u128::from(value))),
+        ScalarRef::UInt128(value) => Some(IntegerValue::Unsigned(value)),
+        _ => None,
+    }
+}
+
+fn cast_range_error(source: PhysicalType, target: PhysicalType) -> ExecutionError {
+    ExecutionError::CastOutOfRange { source, target }
+}
+
+fn integer_as_i128(
+    value: IntegerValue,
+    source: PhysicalType,
+    target: PhysicalType,
+) -> Result<i128, ExecutionError> {
+    match value {
+        IntegerValue::Signed(value) => Ok(value),
+        IntegerValue::Unsigned(value) => {
+            i128::try_from(value).map_err(|_| cast_range_error(source, target))
+        }
+    }
+}
+
+fn integer_as_u128(
+    value: IntegerValue,
+    source: PhysicalType,
+    target: PhysicalType,
+) -> Result<u128, ExecutionError> {
+    match value {
+        IntegerValue::Signed(value) => {
+            u128::try_from(value).map_err(|_| cast_range_error(source, target))
+        }
+        IntegerValue::Unsigned(value) => Ok(value),
+    }
+}
+
+fn cast_integer(
+    value: IntegerValue,
+    source: PhysicalType,
+    target: PhysicalType,
+) -> Result<ScalarValue, ExecutionError> {
+    macro_rules! signed_target {
+        ($variant:ident, $type:ty) => {{
+            let value = integer_as_i128(value, source, target)?;
+            <$type>::try_from(value)
+                .map(ScalarValue::$variant)
+                .map_err(|_| cast_range_error(source, target))
+        }};
+    }
+    macro_rules! unsigned_target {
+        ($variant:ident, $type:ty) => {{
+            let value = integer_as_u128(value, source, target)?;
+            <$type>::try_from(value)
+                .map(ScalarValue::$variant)
+                .map_err(|_| cast_range_error(source, target))
+        }};
+    }
+    match target {
+        PhysicalType::Int8 => signed_target!(Int8, i8),
+        PhysicalType::Int16 => signed_target!(Int16, i16),
+        PhysicalType::Int32 => signed_target!(Int32, i32),
+        PhysicalType::Int64 => signed_target!(Int64, i64),
+        PhysicalType::Int128 => Ok(ScalarValue::Int128(integer_as_i128(value, source, target)?)),
+        PhysicalType::UInt8 => unsigned_target!(UInt8, u8),
+        PhysicalType::UInt16 => unsigned_target!(UInt16, u16),
+        PhysicalType::UInt32 => unsigned_target!(UInt32, u32),
+        PhysicalType::UInt64 => unsigned_target!(UInt64, u64),
+        PhysicalType::UInt128 => Ok(ScalarValue::UInt128(integer_as_u128(
+            value, source, target,
+        )?)),
+        _ => Err(ExecutionError::UnsupportedCast { source, target }),
+    }
+}
+
+fn text_integer_grammar(value: &str, signed: bool) -> bool {
+    let bytes = value.as_bytes();
+    let digits = if signed && bytes.first() == Some(&b'-') {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+fn cast_text_integer(value: &str, target: PhysicalType) -> Result<ScalarValue, ExecutionError> {
+    let signed = target.is_signed_integer();
+    if !text_integer_grammar(value, signed) {
+        return Err(ExecutionError::InvalidCastText { target });
+    }
+    let integer = if signed {
+        IntegerValue::Signed(
+            value
+                .parse::<i128>()
+                .map_err(|_| cast_range_error(PhysicalType::Text, target))?,
+        )
+    } else {
+        IntegerValue::Unsigned(
+            value
+                .parse::<u128>()
+                .map_err(|_| cast_range_error(PhysicalType::Text, target))?,
+        )
+    };
+    cast_integer(integer, PhysicalType::Text, target)
+}
+
+fn cast_scalar_round59(
+    value: ScalarRef<'_>,
+    source: PhysicalType,
+    target: PhysicalType,
+) -> Result<ScalarValue, ExecutionError> {
+    if value.is_null() {
+        return Ok(ScalarValue::Null);
+    }
+    let Some(actual) = value.physical_type() else {
+        return Err(ExecutionError::TypeMismatch);
+    };
+    if actual != source {
+        return Err(ExecutionError::InvalidCastInput {
+            declared: source,
+            actual,
+        });
+    }
+    if source == target {
+        return Ok(value.to_owned());
+    }
+    match (value, target) {
+        (ScalarRef::Text(value), target) if target.is_integer() => cast_text_integer(value, target),
+        (ScalarRef::Text("true"), PhysicalType::Bool) => Ok(ScalarValue::Bool(true)),
+        (ScalarRef::Text("false"), PhysicalType::Bool) => Ok(ScalarValue::Bool(false)),
+        (ScalarRef::Text(_), PhysicalType::Bool) => Err(ExecutionError::InvalidCastText { target }),
+        (ScalarRef::Bool(value), PhysicalType::Text) => Ok(ScalarValue::Text(value.to_string())),
+        (value, PhysicalType::Text) if source.is_integer() => {
+            let integer = integer_value(value).ok_or(ExecutionError::InvalidCastInput {
+                declared: source,
+                actual,
+            })?;
+            let text = match integer {
+                IntegerValue::Signed(value) => value.to_string(),
+                IntegerValue::Unsigned(value) => value.to_string(),
+            };
+            Ok(ScalarValue::Text(text))
+        }
+        (value, target) if source.is_integer() && target.is_integer() => {
+            let integer = integer_value(value).ok_or(ExecutionError::InvalidCastInput {
+                declared: source,
+                actual,
+            })?;
+            cast_integer(integer, source, target)
+        }
+        _ => Err(ExecutionError::UnsupportedCast { source, target }),
+    }
+}
+
 fn evaluate_bound_with<'a, G>(
     expression: &'a BoundExpr<'_>,
     value_at: &G,
@@ -5990,6 +6236,14 @@ where
             .map(EvaluatedScalar::Borrowed)
             .ok_or_else(|| ExecutionError::MissingColumn((*name).to_owned())),
         BoundExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(*value))),
+        BoundExprKind::Cast {
+            source,
+            target,
+            expression,
+        } => {
+            let value = evaluate_bound_with(expression, value_at)?;
+            cast_scalar_round59(value.as_scalar_ref(), *source, *target).map(EvaluatedScalar::Owned)
+        }
         BoundExprKind::Binary {
             operator,
             left,
@@ -6051,6 +6305,14 @@ where
             .map(EvaluatedScalar::Borrowed)
             .ok_or_else(|| ExecutionError::MissingColumn((*name).to_owned())),
         BoundExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(*value))),
+        BoundExprKind::Cast {
+            source,
+            target,
+            expression,
+        } => {
+            let value = evaluate_short_circuit_bound_with(expression, value_at)?;
+            cast_scalar_round59(value.as_scalar_ref(), *source, *target).map(EvaluatedScalar::Owned)
+        }
         BoundExprKind::Binary {
             operator,
             left,
@@ -6146,6 +6408,18 @@ fn evaluate_dynamic_with<'a, G>(
 where
     G: Fn(usize) -> Option<ScalarRef<'a>>,
 {
+    evaluate_dynamic_with_cast_semantics(expression, fields, value_at, CastSemantics::IdentityOnly)
+}
+
+fn evaluate_dynamic_with_cast_semantics<'a, G>(
+    expression: &'a Expr,
+    fields: &[OutputField],
+    value_at: &G,
+    cast_semantics: CastSemantics,
+) -> Result<EvaluatedScalar<'a>, ExecutionError>
+where
+    G: Fn(usize) -> Option<ScalarRef<'a>>,
+{
     match &expression.kind {
         ExprKind::Column(column) => {
             let position = find_source_position(fields, column)?;
@@ -6155,14 +6429,29 @@ where
         }
         ExprKind::Literal(value) => Ok(EvaluatedScalar::Borrowed(ScalarRef::from(value))),
         ExprKind::Parameter(_) => Err(ExecutionError::TypeMismatch),
-        ExprKind::Cast { expression } => evaluate_dynamic_with(expression, fields, value_at),
+        ExprKind::Cast { expression: child } => {
+            let value =
+                evaluate_dynamic_with_cast_semantics(child, fields, value_at, cast_semantics)?;
+            if cast_semantics == CastSemantics::IdentityOnly {
+                Ok(value)
+            } else {
+                cast_scalar_round59(
+                    value.as_scalar_ref(),
+                    child.expr_type.data_type.physical,
+                    expression.expr_type.data_type.physical,
+                )
+                .map(EvaluatedScalar::Owned)
+            }
+        }
         ExprKind::Binary {
             operator,
             left,
             right,
         } => {
-            let left = evaluate_dynamic_with(left, fields, value_at)?;
-            let right = evaluate_dynamic_with(right, fields, value_at)?;
+            let left =
+                evaluate_dynamic_with_cast_semantics(left, fields, value_at, cast_semantics)?;
+            let right =
+                evaluate_dynamic_with_cast_semantics(right, fields, value_at, cast_semantics)?;
             evaluate_binary_scalar_refs(*operator, left.as_scalar_ref(), right.as_scalar_ref())
                 .map(EvaluatedScalar::Owned)
         }
@@ -6171,7 +6460,8 @@ where
             expression,
         } => Ok(EvaluatedScalar::Owned(
             TruthValue::from_scalar_view(
-                evaluate_dynamic_with(expression, fields, value_at)?.as_scalar_ref(),
+                evaluate_dynamic_with_cast_semantics(expression, fields, value_at, cast_semantics)?
+                    .as_scalar_ref(),
             )?
             .not()
             .into_scalar(),
@@ -6180,7 +6470,8 @@ where
             expression,
             negated,
         } => {
-            let value = evaluate_dynamic_with(expression, fields, value_at)?;
+            let value =
+                evaluate_dynamic_with_cast_semantics(expression, fields, value_at, cast_semantics)?;
             let is_null = value.as_scalar_ref().is_null();
             Ok(EvaluatedScalar::Owned(ScalarValue::Bool(if *negated {
                 !is_null
@@ -6226,6 +6517,15 @@ fn evaluate_values(
     values: EvaluationValues<'_>,
     fields: &[OutputField],
 ) -> Result<ScalarValue, ExecutionError> {
+    evaluate_values_with_cast_semantics(expression, values, fields, CastSemantics::IdentityOnly)
+}
+
+fn evaluate_values_with_cast_semantics(
+    expression: &Expr,
+    values: EvaluationValues<'_>,
+    fields: &[OutputField],
+    cast_semantics: CastSemantics,
+) -> Result<ScalarValue, ExecutionError> {
     match &expression.kind {
         ExprKind::Column(column) => {
             let position = find_source_position(fields, column)?;
@@ -6236,28 +6536,44 @@ fn evaluate_values(
         }
         ExprKind::Literal(value) => Ok(value.clone()),
         ExprKind::Parameter(_) => Err(ExecutionError::TypeMismatch),
-        ExprKind::Cast { expression } => evaluate_values(expression, values, fields),
+        ExprKind::Cast { expression: child } => {
+            let value = evaluate_values_with_cast_semantics(child, values, fields, cast_semantics)?;
+            if cast_semantics == CastSemantics::IdentityOnly {
+                Ok(value)
+            } else {
+                cast_scalar_round59(
+                    ScalarRef::from(&value),
+                    child.expr_type.data_type.physical,
+                    expression.expr_type.data_type.physical,
+                )
+            }
+        }
         ExprKind::Binary {
             operator,
             left,
             right,
         } => {
-            let left = evaluate_values(left, values, fields)?;
-            let right = evaluate_values(right, values, fields)?;
+            let left = evaluate_values_with_cast_semantics(left, values, fields, cast_semantics)?;
+            let right = evaluate_values_with_cast_semantics(right, values, fields, cast_semantics)?;
             evaluate_binary(*operator, left, right)
         }
         ExprKind::Unary {
             operator: UnaryOp::Not,
             expression,
-        } => Ok(evaluate_truth_values(expression, values, fields)?
-            .not()
-            .into_scalar()),
+        } => Ok(TruthValue::from_scalar(evaluate_values_with_cast_semantics(
+            expression,
+            values,
+            fields,
+            cast_semantics,
+        )?)?
+        .not()
+        .into_scalar()),
         ExprKind::IsNull {
             expression,
             negated,
         } => {
             let is_null = matches!(
-                evaluate_values(expression, values, fields)?,
+                evaluate_values_with_cast_semantics(expression, values, fields, cast_semantics,)?,
                 ScalarValue::Null
             );
             Ok(ScalarValue::Bool(if *negated { !is_null } else { is_null }))
@@ -6284,6 +6600,24 @@ pub fn evaluate_typed_row_expression(
     row: &[ScalarValue],
 ) -> Result<ScalarValue, ExecutionError> {
     evaluate(expression, row, fields)
+}
+
+/// Executes the non-default Round 59 typed-IR conversion probe.
+///
+/// This entry point exists only when the audit feature is explicitly enabled;
+/// the production SQL/HIR route continues to reject cross-physical casts.
+#[cfg(feature = "round59-audit")]
+pub fn evaluate_typed_row_expression_round59_audit(
+    expression: &Expr,
+    fields: &[OutputField],
+    row: &[ScalarValue],
+) -> Result<ScalarValue, ExecutionError> {
+    evaluate_values_with_cast_semantics(
+        expression,
+        EvaluationValues::Contiguous(row),
+        fields,
+        CastSemantics::Round59Audit,
+    )
 }
 
 /// Applies SQL three-valued predicate semantics to one typed row.
@@ -6452,21 +6786,23 @@ mod tests {
     use std::ops::ControlFlow;
 
     use super::{
-        AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, EXECUTION_BATCH_CAPACITY,
-        EvaluatedScalar, EvaluationValues, ExecutionBatch, ExecutionError, ExecutionReadView,
-        ExecutionRow, ExecutionRows, ExecutionStorage, FilteredCountSummary, FullSortStats,
-        GroupLookup, GroupState, HashJoinBuildSide, IndexNestedLoopJoinStats,
-        InequalityExecutionStrategy, PartitionedBatchStats, PrehashedBuildHasher, PrehashedKey,
-        ProjectionPlan, QueryResult, StreamingHashJoinStats, TopNState, TruthValue,
-        bind_expression, bind_filter_predicate, build_batch_pipeline, build_hash_join_buckets,
-        build_top_n_plan, choose_inequality_strategy, collect_filter_columns,
+        AggregateAccumulator, BoundExpr, BoundExprKind, BoundInequality, CastSemantics,
+        EXECUTION_BATCH_CAPACITY, EvaluatedScalar, EvaluationValues, ExecutionBatch,
+        ExecutionError, ExecutionReadView, ExecutionRow, ExecutionRows, ExecutionStorage,
+        FilteredCountSummary, FullSortStats, GroupLookup, GroupState, HashJoinBuildSide,
+        IndexNestedLoopJoinStats, InequalityExecutionStrategy, PartitionedBatchStats,
+        PrehashedBuildHasher, PrehashedKey, ProjectionPlan, QueryResult, StreamingHashJoinStats,
+        TopNState, TruthValue, bind_expression, bind_expression_with_cast_semantics,
+        bind_filter_predicate, build_batch_pipeline, build_hash_join_buckets, build_top_n_plan,
+        cast_scalar_round59, choose_inequality_strategy, collect_filter_columns,
         collect_streaming_filter_row, compatibility_bindings, count_to_sql_u64,
         direct_count_eligibility, evaluate, evaluate_binary, evaluate_binary_refs,
         evaluate_binary_scalar_refs, evaluate_bound_scalar_ref_truth, evaluate_bound_truth,
         evaluate_bound_values, evaluate_bound_with, evaluate_dynamic_borrowed_truth_values,
         evaluate_dynamic_borrowed_values, evaluate_dynamic_scalar_ref_truth, evaluate_dynamic_with,
-        evaluate_filter_bound_truth, evaluate_filter_bound_with, evaluate_truth,
-        evaluate_truth_values, evaluate_values, exact_candidate_pair_count, execute,
+        evaluate_dynamic_with_cast_semantics, evaluate_filter_bound_truth,
+        evaluate_filter_bound_with, evaluate_truth, evaluate_truth_values, evaluate_values,
+        evaluate_values_with_cast_semantics, exact_candidate_pair_count, execute,
         execute_index_nested_loop_join, execute_inequality_sweep, execute_nested_loop_join,
         execute_rows, execute_rows_legacy, execute_with_storages, filtered_count_eligibility,
         find_required_inequality, hash_group_key, inequality_can_match, materialize_count_values,
@@ -6505,6 +6841,324 @@ mod tests {
         match value {
             ScalarRef::Text(value) => value.as_ptr(),
             _ => panic!("expected Text scalar view"),
+        }
+    }
+
+    fn physical_expr(value: ScalarValue, physical: PhysicalType) -> Expr {
+        Expr {
+            kind: ExprKind::Literal(value),
+            expr_type: ExprType {
+                data_type: SemanticType::physical(physical),
+                nullable: false,
+            },
+        }
+    }
+
+    fn audit_cast(value: ScalarValue, source: PhysicalType, target: PhysicalType) -> Expr {
+        Expr {
+            kind: ExprKind::Cast {
+                expression: Box::new(physical_expr(value, source)),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(target),
+                nullable: false,
+            },
+        }
+    }
+
+    #[test]
+    fn round59_audit_cast_kernel_is_deterministic_checked_and_shared_by_evaluators() {
+        let cases = [
+            (
+                audit_cast(
+                    ScalarValue::Text("42".into()),
+                    PhysicalType::Text,
+                    PhysicalType::Int64,
+                ),
+                ScalarValue::Int64(42),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::Int64(-7),
+                    PhysicalType::Int64,
+                    PhysicalType::Text,
+                ),
+                ScalarValue::Text("-7".into()),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::Text("18446744073709551615".into()),
+                    PhysicalType::Text,
+                    PhysicalType::UInt64,
+                ),
+                ScalarValue::UInt64(u64::MAX),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::UInt64(u64::MAX),
+                    PhysicalType::UInt64,
+                    PhysicalType::Text,
+                ),
+                ScalarValue::Text("18446744073709551615".into()),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::Int64(42),
+                    PhysicalType::Int64,
+                    PhysicalType::UInt64,
+                ),
+                ScalarValue::UInt64(42),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::UInt64(i64::MAX as u64),
+                    PhysicalType::UInt64,
+                    PhysicalType::Int64,
+                ),
+                ScalarValue::Int64(i64::MAX),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::Text("true".into()),
+                    PhysicalType::Text,
+                    PhysicalType::Bool,
+                ),
+                ScalarValue::Bool(true),
+            ),
+            (
+                audit_cast(
+                    ScalarValue::Bool(false),
+                    PhysicalType::Bool,
+                    PhysicalType::Text,
+                ),
+                ScalarValue::Text("false".into()),
+            ),
+        ];
+        for (expression, expected) in cases {
+            assert_eq!(
+                evaluate_values_with_cast_semantics(
+                    &expression,
+                    EvaluationValues::Contiguous(&[]),
+                    &[],
+                    CastSemantics::Round59Audit,
+                )
+                .unwrap(),
+                expected
+            );
+            let dynamic = evaluate_dynamic_with_cast_semantics(
+                &expression,
+                &[],
+                &|_| None,
+                CastSemantics::Round59Audit,
+            )
+            .unwrap();
+            assert_eq!(dynamic.as_scalar_ref().to_owned(), expected);
+            let bound =
+                bind_expression_with_cast_semantics(&expression, &[], CastSemantics::Round59Audit)
+                    .unwrap();
+            assert_eq!(
+                super::evaluate_bound_with(&bound, &|_| None)
+                    .unwrap()
+                    .as_scalar_ref()
+                    .to_owned(),
+                expected
+            );
+        }
+
+        let production = audit_cast(
+            ScalarValue::Text("42".into()),
+            PhysicalType::Text,
+            PhysicalType::Int64,
+        );
+        assert_eq!(
+            evaluate_values(&production, EvaluationValues::Contiguous(&[]), &[]).unwrap(),
+            ScalarValue::Text("42".into())
+        );
+
+        let null = Expr {
+            kind: ExprKind::Cast {
+                expression: Box::new(Expr {
+                    kind: ExprKind::Literal(ScalarValue::Null),
+                    expr_type: ExprType {
+                        data_type: SemanticType::physical(PhysicalType::Text),
+                        nullable: true,
+                    },
+                }),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(PhysicalType::Int64),
+                nullable: true,
+            },
+        };
+        assert_eq!(
+            evaluate_values_with_cast_semantics(
+                &null,
+                EvaluationValues::Contiguous(&[]),
+                &[],
+                CastSemantics::Round59Audit,
+            )
+            .unwrap(),
+            ScalarValue::Null
+        );
+    }
+
+    #[test]
+    fn round59_audit_cast_grammar_ranges_and_rejections_are_typed() {
+        for accepted in [
+            "0",
+            "-0",
+            "00",
+            "-007",
+            &i64::MIN.to_string(),
+            &i64::MAX.to_string(),
+        ] {
+            let expression = audit_cast(
+                ScalarValue::Text(accepted.into()),
+                PhysicalType::Text,
+                PhysicalType::Int64,
+            );
+            assert!(
+                evaluate_values_with_cast_semantics(
+                    &expression,
+                    EvaluationValues::Contiguous(&[]),
+                    &[],
+                    CastSemantics::Round59Audit,
+                )
+                .is_ok()
+            );
+        }
+        for rejected in ["", " ", " 1", "1 ", "+1", "1_0", "-", "１２"] {
+            let expression = audit_cast(
+                ScalarValue::Text(rejected.into()),
+                PhysicalType::Text,
+                PhysicalType::Int64,
+            );
+            assert!(matches!(
+                evaluate_values_with_cast_semantics(
+                    &expression,
+                    EvaluationValues::Contiguous(&[]),
+                    &[],
+                    CastSemantics::Round59Audit,
+                ),
+                Err(ExecutionError::InvalidCastText {
+                    target: PhysicalType::Int64
+                })
+            ));
+        }
+        for expression in [
+            audit_cast(
+                ScalarValue::Int64(-1),
+                PhysicalType::Int64,
+                PhysicalType::UInt64,
+            ),
+            audit_cast(
+                ScalarValue::UInt64(i64::MAX as u64 + 1),
+                PhysicalType::UInt64,
+                PhysicalType::Int64,
+            ),
+            audit_cast(
+                ScalarValue::Text("9223372036854775808".into()),
+                PhysicalType::Text,
+                PhysicalType::Int64,
+            ),
+        ] {
+            assert!(matches!(
+                evaluate_values_with_cast_semantics(
+                    &expression,
+                    EvaluationValues::Contiguous(&[]),
+                    &[],
+                    CastSemantics::Round59Audit,
+                ),
+                Err(ExecutionError::CastOutOfRange { .. })
+            ));
+        }
+        for expression in [
+            audit_cast(
+                ScalarValue::Bool(true),
+                PhysicalType::Bool,
+                PhysicalType::Int64,
+            ),
+            audit_cast(
+                ScalarValue::Int64(1),
+                PhysicalType::Int64,
+                PhysicalType::Bool,
+            ),
+            audit_cast(
+                ScalarValue::Bytes(vec![b'1']),
+                PhysicalType::Bytes,
+                PhysicalType::Int64,
+            ),
+        ] {
+            assert!(matches!(
+                evaluate_values_with_cast_semantics(
+                    &expression,
+                    EvaluationValues::Contiguous(&[]),
+                    &[],
+                    CastSemantics::Round59Audit,
+                ),
+                Err(ExecutionError::UnsupportedCast { .. })
+            ));
+        }
+        let mismatch = audit_cast(
+            ScalarValue::UInt64(1),
+            PhysicalType::Int64,
+            PhysicalType::Text,
+        );
+        assert!(matches!(
+            evaluate_values_with_cast_semantics(
+                &mismatch,
+                EvaluationValues::Contiguous(&[]),
+                &[],
+                CastSemantics::Round59Audit,
+            ),
+            Err(ExecutionError::InvalidCastInput {
+                declared: PhysicalType::Int64,
+                actual: PhysicalType::UInt64
+            })
+        ));
+    }
+
+    #[test]
+    fn round59_audit_conversion_cost_observation_10k_and_100k() {
+        for rows in [10_000_u64, 100_000] {
+            let started = std::time::Instant::now();
+            for _ in 0..rows {
+                std::hint::black_box(
+                    cast_scalar_round59(
+                        ScalarRef::Text("123456789"),
+                        PhysicalType::Text,
+                        PhysicalType::Int64,
+                    )
+                    .unwrap(),
+                );
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "round59 Text->Int64 rows={rows} elapsed_ns={} rows_per_second={:.0} temporary_text_allocations=0 output_text_bytes=0",
+                elapsed.as_nanos(),
+                rows as f64 / elapsed.as_secs_f64()
+            );
+
+            let started = std::time::Instant::now();
+            let mut output_text_bytes = 0_u64;
+            for _ in 0..rows {
+                let ScalarValue::Text(value) = cast_scalar_round59(
+                    ScalarRef::Int64(-123456789),
+                    PhysicalType::Int64,
+                    PhysicalType::Text,
+                )
+                .unwrap() else {
+                    panic!("expected Text output")
+                };
+                output_text_bytes += value.len() as u64;
+                std::hint::black_box(value);
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "round59 Int64->Text rows={rows} elapsed_ns={} rows_per_second={:.0} temporary_text_allocations={rows} output_text_bytes={output_text_bytes}",
+                elapsed.as_nanos(),
+                rows as f64 / elapsed.as_secs_f64()
+            );
         }
     }
 
@@ -12181,7 +12835,8 @@ mod tests {
                     collect_columns(left, output);
                     collect_columns(right, output);
                 }
-                BoundExprKind::Unary { expression, .. }
+                BoundExprKind::Cast { expression, .. }
+                | BoundExprKind::Unary { expression, .. }
                 | BoundExprKind::IsNull { expression, .. } => collect_columns(expression, output),
             }
         }
@@ -12281,7 +12936,8 @@ mod tests {
                     collect_positions(left, positions);
                     collect_positions(right, positions);
                 }
-                BoundExprKind::Unary { expression, .. }
+                BoundExprKind::Cast { expression, .. }
+                | BoundExprKind::Unary { expression, .. }
                 | BoundExprKind::IsNull { expression, .. } => {
                     collect_positions(expression, positions);
                 }

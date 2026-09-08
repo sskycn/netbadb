@@ -861,6 +861,23 @@ impl CoordinatorLog {
         Ok(())
     }
 
+    /// Completes an already-decoded decision using its recorded sequencing
+    /// class. Recovery must not append a legacy Complete after a v4 checkpoint.
+    pub(crate) fn complete_decision(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), CoordinatorLogError> {
+        let commit_seq = self
+            .decisions
+            .get(&database_txn_id)
+            .ok_or(CoordinatorLogError::CompleteWithoutDecision { database_txn_id })?
+            .commit_seq;
+        match commit_seq {
+            Some(commit_seq) => self.complete_sequenced(database_txn_id, commit_seq),
+            None => self.complete(database_txn_id),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_decision_append_failure(&mut self) {
         self.fail_next_decision_append = true;

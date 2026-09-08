@@ -9893,6 +9893,8 @@ mod deferred_index_evacuation_tests;
 #[cfg(test)]
 mod deferred_terminal_structural_tests;
 #[cfg(test)]
+mod deferred_type_conversion_audit_tests;
+#[cfg(test)]
 mod deferred_virtual_row_tests;
 #[cfg(test)]
 mod indexed_nullability_audit_tests;

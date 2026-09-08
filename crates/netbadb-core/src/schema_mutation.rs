@@ -4380,7 +4380,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         open_finished_heap_snapshot(catalog, &target)?.close()?;
         validate_rewrite_source(catalog, &rewrite)?;
         file::publish_runtime(catalog, &target)?;
-        coordinator.complete(rewrite.reservation.transaction)?;
+        coordinator.complete_decision(rewrite.reservation.transaction)?;
         decisions
             .iter_mut()
             .find(|candidate| candidate.database_txn_id == rewrite.reservation.transaction)
@@ -4502,7 +4502,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         journal.retire_composition_table(source.transaction, source.table)?;
         crash("source-backfill-retirement-durable");
         file::publish_runtime(catalog, &target)?;
-        coordinator.complete(source.transaction)?;
+        coordinator.complete_decision(source.transaction)?;
         decisions
             .iter_mut()
             .find(|candidate| candidate.database_txn_id == source.transaction)
@@ -4703,7 +4703,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 journal.retire_composition_table(txn, plan.table())?;
             }
             file::publish_runtime(catalog, &target)?;
-            coordinator.complete(txn)?;
+            coordinator.complete_decision(txn)?;
             journal.resolve_composition(txn, CompositionResolution::Winner)?;
             if let Some(first) = intent.tables.first() {
                 cleanup_prepared(
@@ -4877,7 +4877,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             let database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
             database.close()?;
             file::publish_runtime(catalog, &target)?;
-            coordinator.complete(reservation.transaction)?;
+            coordinator.complete_decision(reservation.transaction)?;
             journal.resolve(reservation.transaction, true)?;
             cleanup_prepared(catalog, &reservation, marker.incarnation)?;
         } else {
@@ -4977,7 +4977,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             database.close()?;
             validate_rewrite_source(catalog, &rewrite)?;
             file::publish_runtime(catalog, &target)?;
-            coordinator.complete(txn)?;
+            coordinator.complete_decision(txn)?;
             journal.resolve_rewrite(txn, true)?;
             cleanup_prepared(catalog, &reservation, marker.incarnation)?;
         } else {
@@ -5050,7 +5050,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             journal.retire_drop(intent.transaction)?;
             crash("drop-retirement-durable");
             file::publish_runtime(catalog, &target)?;
-            coordinator.complete(intent.transaction)?;
+            coordinator.complete_decision(intent.transaction)?;
             journal.resolve_drop(intent.transaction, true)?;
             cleanup_drop_prepared(catalog, &intent)?;
         } else {
@@ -5434,7 +5434,7 @@ fn recover_table_object_composition(
         verify_table_object_inventory(&mut database, intent, true)?;
         database.close()?;
         file::publish_runtime(catalog, &target)?;
-        coordinator.complete(intent.transaction)?;
+        coordinator.complete_decision(intent.transaction)?;
         journal.resolve_composition(intent.transaction, CompositionResolution::Winner)?;
         cleanup_table_object_prepared(catalog, incarnation, intent, Some(true))?;
         return Ok(());
@@ -5757,7 +5757,7 @@ fn recover_schema_index_composition(
         if intent.target_generation.is_some() {
             file::publish_runtime(catalog, &target)?;
         }
-        coordinator.complete(intent.transaction)?;
+        coordinator.complete_decision(intent.transaction)?;
         journal.resolve_composition(intent.transaction, CompositionResolution::Winner)?;
         cleanup_schema_index_prepared(catalog, incarnation, intent, Some(true))?;
         return Ok(());

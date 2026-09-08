@@ -38,6 +38,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round54_probe = std::env::var("NETBADB_ROUND54_PROBE").ok();
     let round56_probe = std::env::var("NETBADB_ROUND56_PROBE").ok();
     let round58_probe = std::env::var("NETBADB_ROUND58_PROBE").ok();
+    let round59_probe = std::env::var("NETBADB_ROUND59_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -200,6 +201,36 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round59_probe {
+        if probe != "cast-negative" {
+            return Err(format!("unknown Round 59 probe {probe}").into());
+        }
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 59 source table absent")?;
+            let indexes = reopened.indexes(TableId(2))?;
+            if projects.columns.len() != 2
+                || projects
+                    .column("name")
+                    .is_none_or(|column| column.id != ColumnId(2) || !column.nullable)
+                || indexes.len() != 1
+                || indexes[0].id != old_index_id
+                || indexes[0].column_id != ColumnId(2)
+                || reopened.query("SELECT id, name FROM projects")?.rows
+                    != [vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())]]
+            {
+                return Err("Round 59 negative cast probe changed source authority".into());
+            }
+            reopened.close()?;
+        }
+        println!(
+            "REOPEN PASS: Round 59 cross-physical CAST and ALTER TYPE remained closed across three catalog-only opens; manifest unchanged"
+        );
+        return Ok(());
     }
     if let Some(probe) = round58_probe {
         if probe != "indexed-swap" {

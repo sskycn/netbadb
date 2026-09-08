@@ -127,3 +127,9 @@ Refining, reopening IndexFinalizing, physical online index evacuation, IndexId
 retarget/reuse, unique or multicolumn expansion, ALTER TYPE/USING,
 post-terminal DML/nullability, imported/partitioned/LSM migration, historical
 schema snapshots, or resumable migration.
+
+Round 59 audits the previously deferred physical-conversion case and selects a
+typed Cast into a fresh shadow ColumnId followed by this unchanged evacuation
+and recreation sequence. Production cross-physical SQL remains closed in that
+round; see
+[`deferred-type-conversion-round59.md`](deferred-type-conversion-round59.md).
