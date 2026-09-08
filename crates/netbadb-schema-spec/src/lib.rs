@@ -1,4 +1,4 @@
-//! Strict parsing of the language-neutral SDK Schema Spec v1 contract.
+//! Strict parsing of the language-neutral SDK Schema Spec v1 and v2 contracts.
 
 use std::error::Error;
 use std::fmt;
@@ -10,7 +10,8 @@ use serde::Deserialize;
 pub use netbadb_schema::Schema;
 
 /// Version of the language-neutral SDK schema input.
-pub const SDK_SCHEMA_SPEC_VERSION: u32 = 1;
+pub const SDK_SCHEMA_SPEC_VERSION: u32 = 2;
+const SDK_SCHEMA_SPEC_VERSION_V1: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 struct SpecVersion {
@@ -48,7 +49,7 @@ struct ColumnSpec {
     primary_key: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum PhysicalTypeSpec {
     Bool,
@@ -92,13 +93,38 @@ impl From<PhysicalTypeSpec> for PhysicalType {
 
 impl SchemaSpec {
     fn into_schema(self) -> Result<Schema, SchemaSpecError> {
-        debug_assert_eq!(self.version, SDK_SCHEMA_SPEC_VERSION);
         let tables = self
             .tables
             .into_iter()
             .map(TableSpec::into_table)
             .collect::<Vec<_>>();
         Schema::new(tables).map_err(SchemaSpecError::Schema)
+    }
+}
+
+impl PhysicalTypeSpec {
+    const fn is_v1(self) -> bool {
+        matches!(self, Self::Bool | Self::Int64 | Self::Uint64 | Self::Text)
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::Int8 => "int8",
+            Self::Int16 => "int16",
+            Self::Int32 => "int32",
+            Self::Int64 => "int64",
+            Self::Int128 => "int128",
+            Self::Uint8 => "uint8",
+            Self::Uint16 => "uint16",
+            Self::Uint32 => "uint32",
+            Self::Uint64 => "uint64",
+            Self::Uint128 => "uint128",
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
+            Self::Text => "text",
+            Self::Bytes => "bytes",
+        }
     }
 }
 
@@ -128,13 +154,30 @@ impl ColumnSpec {
     }
 }
 
-/// Parses SDK Schema Spec v1 and validates it through the canonical schema API.
+/// Parses SDK Schema Spec v1 or v2 and validates it through the canonical schema API.
 pub fn parse_schema_spec(source: &str) -> Result<Schema, SchemaSpecError> {
     let version: SpecVersion = serde_json::from_str(source).map_err(SchemaSpecError::Json)?;
-    if version.version != SDK_SCHEMA_SPEC_VERSION {
+    if !matches!(
+        version.version,
+        SDK_SCHEMA_SPEC_VERSION_V1 | SDK_SCHEMA_SPEC_VERSION
+    ) {
         return Err(SchemaSpecError::UnsupportedVersion(version.version));
     }
     let spec: SchemaSpec = serde_json::from_str(source).map_err(SchemaSpecError::Json)?;
+    if spec.version == SDK_SCHEMA_SPEC_VERSION_V1 {
+        if let Some(physical) = spec
+            .tables
+            .iter()
+            .flat_map(|table| &table.columns)
+            .map(|column| column.physical_type)
+            .find(|physical| !physical.is_v1())
+        {
+            return Err(SchemaSpecError::PhysicalTypeNotSupported {
+                version: spec.version,
+                physical: physical.name(),
+            });
+        }
+    }
     spec.into_schema()
 }
 
@@ -145,6 +188,11 @@ pub enum SchemaSpecError {
     Json(serde_json::Error),
     /// The input declares a version other than [`SDK_SCHEMA_SPEC_VERSION`].
     UnsupportedVersion(u32),
+    /// A known historical version used a type introduced by a later version.
+    PhysicalTypeNotSupported {
+        version: u32,
+        physical: &'static str,
+    },
     /// The decoded tables violate canonical schema invariants.
     Schema(SchemaError),
 }
@@ -155,7 +203,11 @@ impl fmt::Display for SchemaSpecError {
             Self::Json(error) => write!(formatter, "invalid SDK Schema Spec JSON: {error}"),
             Self::UnsupportedVersion(version) => write!(
                 formatter,
-                "unsupported SDK Schema Spec version {version}; expected {SDK_SCHEMA_SPEC_VERSION}"
+                "unsupported SDK Schema Spec version {version}; supported versions are 1 and {SDK_SCHEMA_SPEC_VERSION}"
+            ),
+            Self::PhysicalTypeNotSupported { version, physical } => write!(
+                formatter,
+                "physical type `{physical}` is not supported by SDK Schema Spec v{version}"
             ),
             Self::Schema(error) => write!(formatter, "invalid canonical schema: {error}"),
         }
@@ -167,7 +219,7 @@ impl Error for SchemaSpecError {
         match self {
             Self::Json(error) => Some(error),
             Self::Schema(error) => Some(error),
-            Self::UnsupportedVersion(_) => None,
+            Self::UnsupportedVersion(_) | Self::PhysicalTypeNotSupported { .. } => None,
         }
     }
 }
@@ -209,10 +261,10 @@ mod tests {
             parse_schema_spec(&unknown),
             Err(SchemaSpecError::Json(_))
         ));
-        let unsupported = SPEC.replacen("\"version\": 1", "\"version\": 2", 1);
+        let unsupported = SPEC.replacen("\"version\": 1", "\"version\": 3", 1);
         assert!(matches!(
             parse_schema_spec(&unsupported),
-            Err(SchemaSpecError::UnsupportedVersion(2))
+            Err(SchemaSpecError::UnsupportedVersion(3))
         ));
         let missing_identity_field = r#"{"version":1,"tables":[{"id":1,"name":"users","columns":[{"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false}]}]}"#;
         assert!(matches!(
@@ -246,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_spec_accepts_every_canonical_physical_spelling() {
+    fn versions_gate_physical_type_grammar() {
         let names = [
             "bool", "int8", "int16", "int32", "int64", "int128", "uint8", "uint16", "uint32",
             "uint64", "uint128", "float32", "float64", "text", "bytes",
@@ -265,9 +317,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let source = format!(
-            r#"{{"version":1,"tables":[{{"id":1,"name":"values","columns":[{columns}]}}]}}"#
+            r#"{{"version":2,"tables":[{{"id":1,"name":"values","columns":[{columns}]}}]}}"#
         );
         let schema = parse_schema_spec(&source).expect("all physical spellings");
         assert_eq!(schema.tables()[0].columns.len(), names.len());
+
+        let v1_new_type = source.replacen("\"version\":2", "\"version\":1", 1);
+        assert!(matches!(
+            parse_schema_spec(&v1_new_type),
+            Err(SchemaSpecError::PhysicalTypeNotSupported {
+                version: 1,
+                physical: "int8"
+            })
+        ));
+
+        let v2_unknown = source.replacen("\"tables\"", "\"unknown\":true,\"tables\"", 1);
+        assert!(matches!(
+            parse_schema_spec(&v2_unknown),
+            Err(SchemaSpecError::Json(_))
+        ));
     }
 }

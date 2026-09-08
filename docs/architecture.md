@@ -53,7 +53,7 @@ Editor diagnostics and runtime inspection are deliberately separate paths:
 ```text
 Schema-only editing                         Runtime inspection
 
-SDK Schema Spec v1                         Database runtime state
+SDK Schema Spec v1/v2                      Database runtime state
         ↓                                           ↓
 netbadb-schema-spec                         real planner + storage metadata
         ↓                                           ↓
@@ -61,7 +61,7 @@ Canonical Schema + source SQL               netbadb-inspect DTOs
         ↓                                           ↓
 netbadb-compiler                             embedded SDK / offline CLI
         ↓                                           ↓
-ToolingDiagnostic                           text / Inspection JSON v6
+ToolingDiagnostic                           text / Inspection JSON v7
         ↓
 netbadb-lsp UTF-16 adapter
 ```
@@ -94,7 +94,7 @@ compiler / planner / storage internal state
                     ↓
              embedded SDK
                     ↓
-       offline CLI text / explicit JSON v4
+       offline CLI text / explicit JSON v7
 ```
 
 `netbadb-inspect` depends only on canonical schema and type domains. Its DTOs
@@ -140,16 +140,17 @@ netbadb-sdk embedded Database
           ↓
 netbadb-inspect DTOs
        ↙       ↘
-human text   Inspection JSON v6
+human text   Inspection JSON v7
 ```
 
 The CLI uses `ServerConfig` only to validate deployment configuration and
 obtain required table expectation paths and canonical definitions. It never starts a TCP
 server, creates a session, or applies network-principal authorization to local
-filesystem access. JSON v6 is the current explicit external CLI contract when
-ColumnarScan appears; IndexNestedLoopJoin uses v5, ordinary plans remain v3,
-partition plans remain v4, and v1/v2 are historical
-contracts and the DTOs themselves remain serde-free.
+filesystem access. JSON v7 is used whenever Physical Types v2 values or
+metadata appear. With legacy types only, ColumnarScan remains v6,
+IndexNestedLoopJoin uses v5, ordinary plans remain v3, and partition plans
+remain v4. V1-v6 remain historical contracts and the DTOs themselves remain
+serde-free.
 Future runtime-inspection tooling, including MCP, consumes those DTOs directly
 rather than spawning the CLI. The diagnostics-only LSP does not use this path.
 
@@ -2938,7 +2939,7 @@ PostgreSQL compatibility-query string matcher.
 
 The first executable boundary is deliberately an exclusive listener mode:
 `netbadbd --postgres` uses manifest v4's existing loopback listen address for
-PostgreSQL instead of Protocol v1. It has the same dedicated synchronous
+PostgreSQL instead of Protocol v2. It has the same dedicated synchronous
 Database owner/worker model, compiler-resolved table authorization, connection
 cap, and socket timeouts. A future versioned deployment manifest may configure
 simultaneous native and PostgreSQL listeners backed by one worker; manifest v4
@@ -3036,7 +3037,7 @@ correctness and contain no SQL, values, table names, certificate contents, or
 client-address labels.
 
 Networking remains synchronous and must not leak async into parser, compiler,
-planner, executor, page, storage, WAL, or recovery. Protocol v1 is a network
+planner, executor, page, storage, WAL, or recovery. Protocol v2 is a network
 contract, not a database-file format. The current independent persistent
 contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
 transaction-status v1, Page v5, WAL v4/record v3 plus v4 reservations and v5 transitions, BTree
@@ -3058,7 +3059,7 @@ Remote Rust application
     -> netbadbd
 ```
 
-`netbadb-client` owns blocking TCP/rustls transport and the Protocol v1 client
+`netbadb-client` owns blocking TCP/rustls transport and the Protocol v2 client
 state machine. It has no production dependency on core, server, executor,
 planner, or storage. It reuses the authoritative Rust protocol frame and value
 codec, while the Go client intentionally remains an independent implementation
@@ -3073,14 +3074,14 @@ lost response can therefore leave DML, commit, or rollback outcome ambiguous;
 the client never reconnects, retries, or replays a request.
 
 Go applications can use generated typed bindings above the independent
-Protocol v1 client under `sdk/go`:
+Protocol v2 client under `sdk/go`:
 
 ```text
-Language-neutral SDK Schema Spec v1
+Language-neutral SDK Schema Spec v1/v2
     -> Rust validation and canonical TableDef fingerprints
     -> deterministic generated Go bindings
-    -> Go Protocol v1 client
-    -> Protocol v1
+    -> Go Protocol v2 client
+    -> Protocol v2
     -> netbadbd
 ```
 
@@ -3094,7 +3095,7 @@ identity. Generated table wrappers accept only the complete canonical table row
 shape in canonical column order and explicitly decode nominal and nullable
 values without reflection.
 
-Schema Spec v1 is code-generation input only. It is not Canonical Schema v1's
+Schema Spec v1/v2 is code-generation input only. It is not Canonical Schema v1's
 binary identity encoding, cannot configure listeners, TLS, authorization, or
 heap paths, and is not the server's deployment source of truth. Server startup
 still gates manifest `TableDef` against heap metadata, while generated `Dial`

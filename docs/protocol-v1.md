@@ -1,7 +1,9 @@
 # NetbaDB binary protocol v1
 
-This document is the language-neutral byte contract for experimental NetbaDB
-protocol version 1. It is versioned, but the project has not declared a
+This document is the historical language-neutral byte contract for NetbaDB
+protocol version 1. Current clients and servers use v2 and reject v1 during
+frame decoding; frozen v1 golden vectors preserve this contract. It is
+versioned, but the project has not declared a
 permanent compatibility policy. Multi-byte integers are little-endian. Strings
 are strict UTF-8 prefixed by a little-endian `u32` byte length.
 
@@ -275,8 +277,8 @@ client receives the response, an implicit DML or explicit Commit may already be
 durable and its outcome is ambiguous to that client. These transport rules do
 not change protocol v1 bytes or any database file format.
 
-An independent standard-library Go implementation of this byte contract lives
-under `sdk/go`. Its hard-coded golden vectors are checked against the Rust
-protocol crate's vectors, and a separate integration harness runs it against a
+The historical independent Go implementation's hard-coded golden vectors are
+preserved alongside the Rust protocol crate's v1 vectors. Current `sdk/go`
+speaks Protocol v2, and a separate integration harness runs it against a
 real `netbadbd` session over loopback plaintext and mutual TLS. This adds no
 Protocol v1 field, tag, capability, or encoding.

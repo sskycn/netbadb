@@ -8,6 +8,7 @@ pub use netbadb_hir::{
     TypedAlterTableOperation, TypedCreateIndex, TypedCreateTable, TypedDropIndex, TypedDropTable,
 };
 
+pub use netbadb_hir::ParameterTypeHint;
 use netbadb_hir::{
     AggregateFunction as HirAggregateFunction, ColumnRef as HirColumnRef, HirError,
     NullOrder as HirNullOrder, ParameterMetadata, SortDirection as HirSortDirection,
@@ -83,9 +84,10 @@ impl fmt::Display for BindError {
                 actual,
             } => write!(
                 formatter,
-                "parameter ${} expects {expected}, found {}",
+                "parameter ${} expects {}, found {}",
                 id.0 + 1,
-                actual.map_or_else(|| "NULL".into(), |actual| actual.to_string())
+                expected.sql_name(),
+                actual.map_or("NULL", PhysicalType::sql_name)
             ),
         }
     }
@@ -222,15 +224,28 @@ pub fn compile_statement_with_parameters(
     declared: &[Option<PhysicalType>],
 ) -> Result<CompiledStatement, CompileError> {
     let ast = parse_statement(source)?;
-    compile_relational_ast(schema, &ast, declared)
+    let hints = declared
+        .iter()
+        .map(|physical| physical.map(ParameterTypeHint::Exact))
+        .collect::<Vec<_>>();
+    compile_relational_ast(schema, &ast, &hints)
+}
+
+pub fn compile_statement_with_parameter_hints(
+    schema: &Schema,
+    source: &str,
+    hints: &[Option<ParameterTypeHint>],
+) -> Result<CompiledStatement, CompileError> {
+    let ast = parse_statement(source)?;
+    compile_relational_ast(schema, &ast, hints)
 }
 
 fn compile_relational_ast(
     schema: &Schema,
     ast: &netbadb_parser::Statement,
-    declared: &[Option<PhysicalType>],
+    hints: &[Option<ParameterTypeHint>],
 ) -> Result<CompiledStatement, CompileError> {
-    let (hir, parameters) = netbadb_hir::lower_statement_with_parameters(schema, ast, declared)?;
+    let (hir, parameters) = netbadb_hir::lower_statement_with_parameter_hints(schema, ast, hints)?;
     let logical_statement = lower_statement(&hir);
     Ok(CompiledStatement {
         hir,
@@ -256,6 +271,20 @@ pub fn compile_sql_statement(
     tables: &[TableIdentityBinding],
     declared: &[Option<PhysicalType>],
 ) -> Result<CompiledSqlStatement, CompileError> {
+    let hints = declared
+        .iter()
+        .map(|physical| physical.map(ParameterTypeHint::Exact))
+        .collect::<Vec<_>>();
+    compile_sql_statement_with_parameter_hints(schema, source, indexes, tables, &hints)
+}
+
+pub fn compile_sql_statement_with_parameter_hints(
+    schema: &Schema,
+    source: &str,
+    indexes: &[IndexNameBinding],
+    tables: &[TableIdentityBinding],
+    hints: &[Option<ParameterTypeHint>],
+) -> Result<CompiledSqlStatement, CompileError> {
     let ast = parse_statement(source)?;
     match ast {
         netbadb_parser::Statement::CreateTable(_)
@@ -263,7 +292,7 @@ pub fn compile_sql_statement(
         | netbadb_parser::Statement::AlterTable(_)
         | netbadb_parser::Statement::CreateIndex(_)
         | netbadb_parser::Statement::DropIndex(_) => {
-            if !declared.is_empty() {
+            if !hints.is_empty() {
                 return Err(CompileError::Hir(HirError::InvalidTableDefinition {
                     message: "DDL does not accept parameters",
                     span: netbadb_parser::Span {
@@ -274,7 +303,7 @@ pub fn compile_sql_statement(
             }
             compile_ddl_ast(schema, ast, indexes, tables).map(CompiledSqlStatement::Ddl)
         }
-        _ => compile_relational_ast(schema, &ast, declared)
+        _ => compile_relational_ast(schema, &ast, hints)
             .map(|statement| CompiledSqlStatement::Relational(Box::new(statement))),
     }
 }
@@ -714,7 +743,10 @@ fn bind_expr(expression: &mut Expr, values: &[ScalarValue]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_statement, compile, compile_statement, compile_statement_with_parameters};
+    use super::{
+        ParameterTypeHint, bind_statement, compile, compile_statement,
+        compile_statement_with_parameter_hints, compile_statement_with_parameters,
+    };
     use netbadb_rel::{
         AggregateFunction, ExprKind, LogicalPlan, LogicalStatement, NullOrder, OutputField,
         SortDirection,
@@ -1125,6 +1157,78 @@ mod tests {
             expressions[0].expression.kind,
             ExprKind::Literal(ScalarValue::Int64(42))
         ));
+    }
+
+    #[test]
+    fn frontend_fallback_does_not_override_contextual_exact_parameter_type() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "typed_values",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "value",
+                TypeSpec::Semantic {
+                    name: "SmallValue".into(),
+                    physical: PhysicalType::Int8,
+                },
+            )],
+        )])
+        .expect("schema");
+        let contextual = compile_statement_with_parameter_hints(
+            &schema,
+            "INSERT INTO typed_values (value) VALUES ($1)",
+            &[Some(ParameterTypeHint::Fallback(PhysicalType::Int16))],
+        )
+        .expect("context wins over carrier fallback");
+        assert_eq!(
+            contextual.parameters[0].data_type.physical,
+            PhysicalType::Int8
+        );
+        assert_eq!(
+            contextual.parameters[0].data_type.name.as_deref(),
+            Some("SmallValue")
+        );
+
+        let empty = Schema::new(Vec::new()).expect("empty schema");
+        let uncontextual = compile_statement_with_parameter_hints(
+            &empty,
+            "SELECT $1",
+            &[Some(ParameterTypeHint::Fallback(PhysicalType::Int32))],
+        )
+        .expect("fallback types uncontextual parameter");
+        assert_eq!(
+            uncontextual.parameters[0].data_type,
+            netbadb_types::SemanticType::physical(PhysicalType::Int32)
+        );
+
+        assert!(matches!(
+            compile_statement_with_parameter_hints(
+                &schema,
+                "INSERT INTO typed_values (value) VALUES ($1)",
+                &[Some(ParameterTypeHint::Exact(PhysicalType::Int64))],
+            ),
+            Err(super::CompileError::Hir(
+                netbadb_hir::HirError::ParameterTypeConflict { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn sql_facing_int8_diagnostic_uses_tinyint_spelling() {
+        let schema = Schema::new(vec![TableDef::new(
+            TableId(1),
+            "typed_values",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "value",
+                TypeSpec::Physical(PhysicalType::Int8),
+            )],
+        )])
+        .expect("schema");
+        let error = compile_statement(&schema, "INSERT INTO typed_values (value) VALUES ('wrong')")
+            .expect_err("reject text for Int8");
+        assert!(error.to_string().contains("TINYINT"), "{error}");
+        assert!(!error.to_string().contains("expected INT8"), "{error}");
     }
 
     #[test]

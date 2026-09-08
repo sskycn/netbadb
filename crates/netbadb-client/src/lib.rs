@@ -1,4 +1,4 @@
-//! Blocking Protocol v1 client for a single NetbaDB remote session.
+//! Blocking Protocol v2 client for a single NetbaDB remote session.
 
 mod tls;
 
@@ -23,7 +23,7 @@ pub use netbadb_protocol::{
 use tls::ConnectionStream;
 pub use tls::{TlsConfig, TlsConfigError, TlsHandshakeError};
 
-/// Canonical identity required or advertised during Protocol v1 Hello.
+/// Canonical identity required or advertised during Protocol v2 Hello.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TableIdentity {
     pub table_id: TableId,
@@ -253,7 +253,7 @@ impl Config {
     }
 }
 
-/// One blocking Protocol v1 connection. Every operation requires exclusive
+/// One blocking Protocol v2 connection. Every operation requires exclusive
 /// access and one request is completed before the next is sent.
 pub struct Client {
     stream: Option<ConnectionStream>,
@@ -412,7 +412,7 @@ impl Client {
             return Err(self.unexpected("HelloAck", message_name(&message)));
         };
         if protocol_version != PROTOCOL_VERSION {
-            return Err(self.protocol_failure("HelloAck inner protocol version is not 1"));
+            return Err(self.protocol_failure("HelloAck inner protocol version is not 2"));
         }
         if max_frame_payload == 0 || max_frame_payload > MAX_FRAME_PAYLOAD {
             return Err(self.protocol_failure("HelloAck maximum frame payload is invalid"));

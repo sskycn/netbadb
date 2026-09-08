@@ -12,20 +12,24 @@ use netbadb_sdk::{PhysicalType, ScalarValue, SemanticType};
 use serde::Serialize;
 
 const BASE_INSPECTION_JSON_VERSION: u32 = 3;
+const PARTITION_INSPECTION_JSON_VERSION: u32 = 4;
 const INDEX_JOIN_INSPECTION_JSON_VERSION: u32 = 5;
-pub(crate) const INSPECTION_JSON_VERSION: u32 = 6;
+const COLUMNAR_INSPECTION_JSON_VERSION: u32 = 6;
+pub(crate) const INSPECTION_JSON_VERSION: u32 = 7;
 const INSPECTION_JSON_FORMAT: &str = "netbadb-inspection";
 
 pub(crate) fn render_catalog(catalog: &CatalogInspection) -> Result<String, serde_json::Error> {
     let envelope = CatalogEnvelope {
         format: INSPECTION_JSON_FORMAT,
-        version: if catalog.tables.iter().any(|table| {
+        version: if catalog_uses_physical_types_v2(catalog) {
+            INSPECTION_JSON_VERSION
+        } else if catalog.tables.iter().any(|table| {
             matches!(
                 table.placement,
                 TablePlacementInspection::RangePartitioned { .. }
             )
         }) {
-            4
+            PARTITION_INSPECTION_JSON_VERSION
         } else {
             BASE_INSPECTION_JSON_VERSION
         },
@@ -102,15 +106,235 @@ fn statement_json_version(statement: &StatementInspection) -> u32 {
         | StatementPlanInspection::Delete { input, .. } => plan_has_columnar(input),
         StatementPlanInspection::Insert { .. } => false,
     };
-    if has_columnar {
-        INSPECTION_JSON_VERSION
+    let structural = if has_columnar {
+        COLUMNAR_INSPECTION_JSON_VERSION
     } else if has_index_join {
         INDEX_JOIN_INSPECTION_JSON_VERSION
     } else if statement_has_partitions(statement) {
-        4
+        PARTITION_INSPECTION_JSON_VERSION
     } else {
         BASE_INSPECTION_JSON_VERSION
+    };
+    if statement_uses_physical_types_v2(statement) {
+        structural.max(INSPECTION_JSON_VERSION)
+    } else {
+        structural
     }
+}
+
+fn is_physical_types_v2(physical: PhysicalType) -> bool {
+    !matches!(
+        physical,
+        PhysicalType::Bool | PhysicalType::Int64 | PhysicalType::UInt64 | PhysicalType::Text
+    )
+}
+
+fn scalar_uses_physical_types_v2(value: &ScalarValue) -> bool {
+    value.physical_type().is_some_and(is_physical_types_v2)
+}
+
+fn column_uses_physical_types_v2(column: &ColumnReferenceInspection) -> bool {
+    is_physical_types_v2(column.data_type.physical)
+}
+
+fn catalog_uses_physical_types_v2(catalog: &CatalogInspection) -> bool {
+    catalog.tables.iter().any(|table| {
+        table
+            .columns
+            .iter()
+            .any(|column| is_physical_types_v2(column.data_type.physical))
+            || match &table.placement {
+                TablePlacementInspection::Single => false,
+                TablePlacementInspection::RangePartitioned { partitions, .. } => {
+                    partitions.iter().any(|partition| {
+                        partition
+                            .lower
+                            .as_ref()
+                            .is_some_and(scalar_uses_physical_types_v2)
+                            || partition
+                                .upper
+                                .as_ref()
+                                .is_some_and(scalar_uses_physical_types_v2)
+                    })
+                }
+            }
+    })
+}
+
+fn expression_uses_physical_types_v2(expression: &ExpressionInspection) -> bool {
+    is_physical_types_v2(expression.data_type.physical)
+        || match &expression.kind {
+            ExpressionKindInspection::Column(column) => column_uses_physical_types_v2(column),
+            ExpressionKindInspection::Literal(value) => scalar_uses_physical_types_v2(value),
+            ExpressionKindInspection::Parameter(_) => false,
+            ExpressionKindInspection::Binary { left, right, .. } => {
+                expression_uses_physical_types_v2(left) || expression_uses_physical_types_v2(right)
+            }
+            ExpressionKindInspection::Unary { expression, .. }
+            | ExpressionKindInspection::IsNull { expression, .. } => {
+                expression_uses_physical_types_v2(expression)
+            }
+        }
+}
+
+fn bound_uses_physical_types_v2(bound: &RangeBoundInspection) -> bool {
+    match bound {
+        RangeBoundInspection::Unbounded => false,
+        RangeBoundInspection::Included(value) | RangeBoundInspection::Excluded(value) => {
+            scalar_uses_physical_types_v2(value)
+        }
+    }
+}
+
+fn plan_uses_physical_types_v2(plan: &PlanNodeInspection) -> bool {
+    let columns_use_v2 =
+        |columns: &[ColumnReferenceInspection]| columns.iter().any(column_uses_physical_types_v2);
+    match plan {
+        PlanNodeInspection::OneRow => false,
+        PlanNodeInspection::SeqScan { columns, .. }
+        | PlanNodeInspection::ColumnarScan { columns, .. } => columns_use_v2(columns),
+        PlanNodeInspection::IndexScan {
+            columns,
+            index_column,
+            key,
+            ..
+        } => {
+            columns_use_v2(columns)
+                || column_uses_physical_types_v2(index_column)
+                || scalar_uses_physical_types_v2(key)
+        }
+        PlanNodeInspection::RangeIndexScan {
+            columns,
+            index_column,
+            range,
+            ..
+        } => {
+            columns_use_v2(columns)
+                || column_uses_physical_types_v2(index_column)
+                || bound_uses_physical_types_v2(&range.lower)
+                || bound_uses_physical_types_v2(&range.upper)
+        }
+        PlanNodeInspection::PartitionedScan {
+            columns,
+            partitions,
+            ..
+        } => {
+            columns_use_v2(columns)
+                || partitions.iter().any(|partition| match &partition.access {
+                    PartitionAccessInspection::SeqScan => false,
+                    PartitionAccessInspection::IndexScan { column } => {
+                        column_uses_physical_types_v2(column)
+                    }
+                    PartitionAccessInspection::RangeIndexScan { column, range } => {
+                        column_uses_physical_types_v2(column)
+                            || bound_uses_physical_types_v2(&range.lower)
+                            || bound_uses_physical_types_v2(&range.upper)
+                    }
+                })
+        }
+        PlanNodeInspection::NestedLoopJoin {
+            predicate,
+            left,
+            right,
+            ..
+        } => {
+            expression_uses_physical_types_v2(predicate)
+                || plan_uses_physical_types_v2(left)
+                || plan_uses_physical_types_v2(right)
+        }
+        PlanNodeInspection::IndexNestedLoopJoin {
+            left_key,
+            right_key,
+            right_columns,
+            columns,
+            predicate,
+            left,
+            ..
+        } => {
+            column_uses_physical_types_v2(left_key)
+                || column_uses_physical_types_v2(right_key)
+                || columns_use_v2(right_columns)
+                || columns_use_v2(columns)
+                || expression_uses_physical_types_v2(predicate)
+                || plan_uses_physical_types_v2(left)
+        }
+        PlanNodeInspection::HashJoin {
+            left_key,
+            right_key,
+            predicate,
+            left,
+            right,
+            ..
+        } => {
+            column_uses_physical_types_v2(left_key)
+                || column_uses_physical_types_v2(right_key)
+                || expression_uses_physical_types_v2(predicate)
+                || plan_uses_physical_types_v2(left)
+                || plan_uses_physical_types_v2(right)
+        }
+        PlanNodeInspection::Filter { predicate, input } => {
+            expression_uses_physical_types_v2(predicate) || plan_uses_physical_types_v2(input)
+        }
+        PlanNodeInspection::Sort { keys, input } => {
+            keys.iter()
+                .any(|key| column_uses_physical_types_v2(&key.column))
+                || plan_uses_physical_types_v2(input)
+        }
+        PlanNodeInspection::Project { columns, input } => {
+            columns_use_v2(columns) || plan_uses_physical_types_v2(input)
+        }
+        PlanNodeInspection::ScalarProject { expressions, input } => {
+            expressions.iter().any(expression_uses_physical_types_v2)
+                || plan_uses_physical_types_v2(input)
+        }
+        PlanNodeInspection::Aggregate {
+            group_keys,
+            outputs,
+            input,
+        } => {
+            columns_use_v2(group_keys)
+                || outputs.iter().any(|output| match output {
+                    AggregateOutputInspection::GroupKey(column) => {
+                        column_uses_physical_types_v2(column)
+                    }
+                    AggregateOutputInspection::Aggregate { input, output, .. } => {
+                        matches!(
+                            input,
+                            AggregateInputInspection::Column(column)
+                                if column_uses_physical_types_v2(column)
+                        ) || is_physical_types_v2(output.data_type.physical)
+                    }
+                })
+                || plan_uses_physical_types_v2(input)
+        }
+        PlanNodeInspection::Limit { input, .. } => plan_uses_physical_types_v2(input),
+    }
+}
+
+fn statement_uses_physical_types_v2(statement: &StatementInspection) -> bool {
+    let result_uses_v2 = match &statement.result {
+        StatementResultInspection::AffectedRows => false,
+        StatementResultInspection::Query { columns } => columns
+            .iter()
+            .any(|column| is_physical_types_v2(column.data_type.physical)),
+    };
+    result_uses_v2
+        || match &statement.plan {
+            StatementPlanInspection::Query { root } => plan_uses_physical_types_v2(root),
+            StatementPlanInspection::Insert { values, .. } => {
+                values.iter().any(expression_uses_physical_types_v2)
+            }
+            StatementPlanInspection::Update {
+                input, assignments, ..
+            } => {
+                plan_uses_physical_types_v2(input)
+                    || assignments.iter().any(|assignment| {
+                        column_uses_physical_types_v2(&assignment.column)
+                            || expression_uses_physical_types_v2(&assignment.value)
+                    })
+            }
+            StatementPlanInspection::Delete { input, .. } => plan_uses_physical_types_v2(input),
+        }
 }
 
 fn statement_has_partitions(statement: &StatementInspection) -> bool {
@@ -1268,6 +1492,35 @@ mod tests {
     }
 
     #[test]
+    fn catalog_with_physical_types_v2_uses_json_v7() {
+        let catalog = CatalogInspection {
+            tables: vec![TableInspection {
+                table_id: TableId(1),
+                name: "measurements".into(),
+                fingerprint: SchemaFingerprint::from_bytes([0x17; 32]),
+                columns: vec![ColumnInspection {
+                    column_id: ColumnId(1),
+                    name: "value".into(),
+                    data_type: SemanticType::physical(PhysicalType::Int8),
+                    nullable: false,
+                    primary_key: false,
+                }],
+                indexes: Vec::new(),
+                statistics: None,
+                placement: TablePlacementInspection::Single,
+            }],
+        };
+        let json = render_catalog(&catalog).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["version"], 7);
+        assert_eq!(
+            value["catalog"]["tables"][0]["columns"][0]["data_type"]["physical"],
+            "int8"
+        );
+        assert!(json.ends_with('\n'));
+    }
+
+    #[test]
     fn partition_catalog_and_plan_use_json_v4_without_changing_v3() {
         let catalog = CatalogInspection {
             tables: vec![TableInspection {
@@ -1377,6 +1630,64 @@ mod tests {
         assert_eq!(root["projection_id"], 11);
         assert_eq!(root["generation"], 3);
         assert_eq!(root["source_storage_id"], 7);
+    }
+
+    #[test]
+    fn physical_types_v2_raise_statement_structural_versions_to_v7() {
+        for (scalar, physical, expected_shape) in [
+            (
+                ScalarValue::Float64(netbadb_sdk::Float64Value::new(-0.0)),
+                PhysicalType::Float64,
+                serde_json::json!({"kind":"float64","bits":"0000000000000000"}),
+            ),
+            (
+                ScalarValue::Int128(i128::MIN),
+                PhysicalType::Int128,
+                serde_json::json!({"kind":"int128","value":i128::MIN.to_string()}),
+            ),
+            (
+                ScalarValue::Bytes(vec![0, 0xff, 0x80]),
+                PhysicalType::Bytes,
+                serde_json::json!({"kind":"bytes","hex":"00ff80"}),
+            ),
+        ] {
+            let inspection = statement(
+                PlanNodeInspection::ScalarProject {
+                    expressions: vec![literal(scalar, physical)],
+                    input: Box::new(PlanNodeInspection::OneRow),
+                },
+                vec![ResultFieldInspection {
+                    name: "value".into(),
+                    data_type: SemanticType::physical(physical),
+                    nullable: false,
+                    source: None,
+                }],
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
+            assert_eq!(value["version"], 7);
+            assert_eq!(
+                value["statement"]["plan"]["root"]["expressions"][0]["value"],
+                expected_shape
+            );
+        }
+
+        let bytes = column(1, "payload", PhysicalType::Bytes);
+        let inspection = statement(
+            PlanNodeInspection::ColumnarScan {
+                binding_id: RelationBindingId(0),
+                table_id: TableId(1),
+                table_name: "events".into(),
+                columns: vec![bytes.clone()],
+                projection_id: ColumnarProjectionId(12),
+                generation: ColumnarGeneration(4),
+                source_storage_id: StorageId(8),
+            },
+            vec![result(&bytes)],
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
+        assert_eq!(value["version"], 7);
     }
 
     fn join_statement(hash: bool) -> StatementInspection {

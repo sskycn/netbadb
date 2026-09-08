@@ -32,6 +32,9 @@ pub fn parse_schema_spec(source: &str) -> Result<Schema, CodegenError> {
         SchemaSpecError::UnsupportedVersion(version) => {
             CodegenError::UnsupportedSchemaSpecVersion(version)
         }
+        SchemaSpecError::PhysicalTypeNotSupported { version, physical } => {
+            CodegenError::PhysicalTypeNotSupported { version, physical }
+        }
         SchemaSpecError::Schema(error) => CodegenError::Schema(error),
     })
 }
@@ -743,6 +746,10 @@ pub enum CodegenError {
     },
     Json(serde_json::Error),
     UnsupportedSchemaSpecVersion(u32),
+    PhysicalTypeNotSupported {
+        version: u32,
+        physical: &'static str,
+    },
     Schema(SchemaError),
     InvalidPackage(String),
     InvalidCommandPath {
@@ -790,7 +797,11 @@ impl fmt::Display for CodegenError {
             Self::Json(error) => write!(formatter, "invalid SDK Schema Spec JSON: {error}"),
             Self::UnsupportedSchemaSpecVersion(version) => write!(
                 formatter,
-                "unsupported SDK Schema Spec version {version}; expected {SDK_SCHEMA_SPEC_VERSION}"
+                "unsupported SDK Schema Spec version {version}; supported versions are 1 and {SDK_SCHEMA_SPEC_VERSION}"
+            ),
+            Self::PhysicalTypeNotSupported { version, physical } => write!(
+                formatter,
+                "physical type `{physical}` is not supported by SDK Schema Spec v{version}"
             ),
             Self::Schema(error) => write!(formatter, "invalid canonical schema: {error}"),
             Self::InvalidPackage(package) => {
@@ -822,7 +833,7 @@ impl fmt::Display for CodegenError {
             ),
             Self::UnsupportedGoPhysicalType(physical) => write!(
                 formatter,
-                "NetbaDB {physical} has no lossless Go v1 representation"
+                "NetbaDB {physical} has no lossless representation in the Go target"
             ),
             Self::UnknownSelectedTable(id) => write!(
                 formatter,
@@ -919,10 +930,10 @@ mod tests {
             parse_schema_spec(&unknown),
             Err(CodegenError::Json(_))
         ));
-        let unsupported = SPEC.replacen("\"version\": 1", "\"version\": 2", 1);
+        let unsupported = SPEC.replacen("\"version\": 1", "\"version\": 3", 1);
         assert!(matches!(
             parse_schema_spec(&unsupported),
-            Err(CodegenError::UnsupportedSchemaSpecVersion(2))
+            Err(CodegenError::UnsupportedSchemaSpecVersion(3))
         ));
         let missing_identity_field = r#"{"version":1,"tables":[{"id":1,"name":"users","columns":[{"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false}]}]}"#;
         assert!(matches!(
@@ -991,13 +1002,53 @@ mod tests {
     }
 
     #[test]
+    fn schema_spec_v2_generates_every_supported_go_physical_width() {
+        let physical = [
+            ("bool_value", "bool"),
+            ("int8_value", "int8"),
+            ("int16_value", "int16"),
+            ("int32_value", "int32"),
+            ("int64_value", "int64"),
+            ("uint8_value", "uint8"),
+            ("uint16_value", "uint16"),
+            ("uint32_value", "uint32"),
+            ("uint64_value", "uint64"),
+            ("float32_value", "float32"),
+            ("float64_value", "float64"),
+            ("text_value", "text"),
+            ("bytes_value", "bytes"),
+        ];
+        let columns = physical
+            .iter()
+            .enumerate()
+            .map(|(index, (name, physical))| {
+                format!(
+                    r#"{{"id":{},"name":"{name}","physical_type":"{physical}","semantic_type":null,"nullable":false,"primary_key":false}}"#,
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let spec = format!(
+            r#"{{"version":2,"tables":[{{"id":1,"name":"values","columns":[{columns}]}}]}}"#
+        );
+        let output = generate_go(&spec, &request()).expect("generate all supported widths");
+        for go_type in [
+            "bool", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+            "float32", "float64", "string", "[]byte",
+        ] {
+            assert!(output.contains(go_type), "missing Go type {go_type}");
+        }
+    }
+
+    #[test]
     fn go_generation_explicitly_rejects_128_bit_physical_types() {
         for (name, physical) in [
             ("int128", PhysicalType::Int128),
             ("uint128", PhysicalType::UInt128),
         ] {
             let spec = format!(
-                r#"{{"version":1,"tables":[{{"id":1,"name":"values","columns":[{{"id":1,"name":"value","physical_type":"{name}","semantic_type":null,"nullable":false,"primary_key":false}}]}}]}}"#
+                r#"{{"version":2,"tables":[{{"id":1,"name":"values","columns":[{{"id":1,"name":"value","physical_type":"{name}","semantic_type":null,"nullable":false,"primary_key":false}}]}}]}}"#
             );
             assert!(matches!(
                 generate_go(&spec, &request()),

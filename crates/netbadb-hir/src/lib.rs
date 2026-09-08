@@ -708,9 +708,19 @@ impl fmt::Display for HirError {
             }
             Self::TypeMismatch {
                 expected, actual, ..
-            } => write!(formatter, "expected {expected}, found {actual}"),
+            } => write!(
+                formatter,
+                "expected {}, found {}",
+                expected.sql_name(),
+                actual.sql_name()
+            ),
             Self::IncompatibleComparison { left, right, .. } => {
-                write!(formatter, "cannot compare {left} with {right}")
+                write!(
+                    formatter,
+                    "cannot compare {} with {}",
+                    left.sql_name(),
+                    right.sql_name()
+                )
             }
             Self::CannotInferNullType { .. } => {
                 formatter.write_str("cannot infer the type of NULL in this expression")
@@ -730,8 +740,10 @@ impl fmt::Display for HirError {
                 ..
             } => write!(
                 formatter,
-                "parameter ${} is constrained as both {previous} and {required}",
-                id.0 + 1
+                "parameter ${} is constrained as both {} and {}",
+                id.0 + 1,
+                previous.sql_name(),
+                required.sql_name()
             ),
             Self::DuplicateColumn { name, .. } => {
                 write!(formatter, "column `{name}` is specified more than once")
@@ -766,7 +778,12 @@ impl fmt::Display for HirError {
             }
             Self::InvalidAggregateType {
                 function, actual, ..
-            } => write!(formatter, "{} does not support {actual}", function.as_str()),
+            } => write!(
+                formatter,
+                "{} does not support {}",
+                function.as_str(),
+                actual.sql_name()
+            ),
         }
     }
 }
@@ -779,18 +796,29 @@ pub struct ParameterMetadata {
     pub data_type: SemanticType,
 }
 
+/// Frontend-supplied information used while resolving a parameter.
+///
+/// Exact constraints are database type declarations and must agree with SQL
+/// context. Fallbacks describe a frontend representation to use only when SQL
+/// provides no contextual target, such as a PostgreSQL parameter OID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterTypeHint {
+    Exact(PhysicalType),
+    Fallback(PhysicalType),
+}
+
 struct ParameterContext {
-    declared: Vec<Option<PhysicalType>>,
+    hints: Vec<Option<ParameterTypeHint>>,
     inferred: Vec<Option<SemanticType>>,
     spans: Vec<Option<Span>>,
 }
 
 impl ParameterContext {
-    fn new(declared: &[Option<PhysicalType>]) -> Self {
+    fn new(hints: &[Option<ParameterTypeHint>]) -> Self {
         Self {
-            declared: declared.to_vec(),
-            inferred: vec![None; declared.len()],
-            spans: vec![None; declared.len()],
+            hints: hints.to_vec(),
+            inferred: vec![None; hints.len()],
+            spans: vec![None; hints.len()],
         }
     }
 
@@ -804,23 +832,31 @@ impl ParameterContext {
             usize::try_from(id.0).map_err(|_| HirError::CannotInferParameterType { id, span })?;
         if self.inferred.len() <= index {
             self.inferred.resize(index + 1, None);
-            self.declared.resize(index + 1, None);
+            self.hints.resize(index + 1, None);
             self.spans.resize(index + 1, None);
         }
         self.spans[index].get_or_insert(span);
-        let declared = self.declared[index].map(SemanticType::physical);
-        let required = match (expected, declared.as_ref()) {
-            (Some(expected), Some(declared)) if expected.physical != declared.physical => {
+        let exact = match self.hints[index] {
+            Some(ParameterTypeHint::Exact(physical)) => Some(SemanticType::physical(physical)),
+            Some(ParameterTypeHint::Fallback(_)) | None => None,
+        };
+        let fallback = match self.hints[index] {
+            Some(ParameterTypeHint::Fallback(physical)) => Some(SemanticType::physical(physical)),
+            Some(ParameterTypeHint::Exact(_)) | None => None,
+        };
+        let required = match (expected, exact.as_ref(), fallback) {
+            (Some(expected), Some(exact), _) if expected.physical != exact.physical => {
                 return Err(HirError::ParameterTypeConflict {
                     id,
-                    previous: declared.clone(),
+                    previous: exact.clone(),
                     required: expected.clone(),
                     span,
                 });
             }
-            (Some(expected), _) => expected.clone(),
-            (None, Some(declared)) => declared.clone(),
-            (None, None) => self.inferred[index]
+            (Some(expected), _, _) => expected.clone(),
+            (None, Some(exact), _) => exact.clone(),
+            (None, None, Some(fallback)) => fallback,
+            (None, None, None) => self.inferred[index]
                 .clone()
                 .ok_or(HirError::CannotInferParameterType { id, span })?,
         };
@@ -869,7 +905,19 @@ pub fn lower_statement_with_parameters(
     statement: &AstStatement,
     declared: &[Option<PhysicalType>],
 ) -> Result<(TypedStatement, Vec<ParameterMetadata>), HirError> {
-    let mut parameters = ParameterContext::new(declared);
+    let hints = declared
+        .iter()
+        .map(|physical| physical.map(ParameterTypeHint::Exact))
+        .collect::<Vec<_>>();
+    lower_statement_with_parameter_hints(schema, statement, &hints)
+}
+
+pub fn lower_statement_with_parameter_hints(
+    schema: &Schema,
+    statement: &AstStatement,
+    hints: &[Option<ParameterTypeHint>],
+) -> Result<(TypedStatement, Vec<ParameterMetadata>), HirError> {
+    let mut parameters = ParameterContext::new(hints);
     let statement = match statement {
         AstStatement::Select(query) => {
             lower_query_with_context(schema, query, &mut parameters).map(TypedStatement::Select)

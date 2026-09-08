@@ -282,16 +282,65 @@ impl PostgresType {
         }
     }
 
+    /// NetbaDB type used only when SQL supplies no contextual parameter type.
+    ///
+    /// This is a transport fallback, not an exact database type declaration.
     #[must_use]
-    pub const fn netbadb_physical(self) -> Option<PhysicalType> {
+    pub const fn parameter_fallback(self) -> Option<PhysicalType> {
         match self {
             Self::Bool => Some(PhysicalType::Bool),
             Self::Bytea => Some(PhysicalType::Bytes),
-            Self::Int2 | Self::Int4 | Self::Int8 => Some(PhysicalType::Int64),
+            Self::Int2 => Some(PhysicalType::Int16),
+            Self::Int4 => Some(PhysicalType::Int32),
+            Self::Int8 => Some(PhysicalType::Int64),
             Self::Float4 => Some(PhysicalType::Float32),
             Self::Float8 => Some(PhysicalType::Float64),
             Self::Text | Self::Varchar | Self::Unknown => Some(PhysicalType::Text),
             Self::BoolArray | Self::TextArray => None,
+        }
+    }
+
+    /// Whether this PostgreSQL type is a valid value carrier for an exact
+    /// NetbaDB parameter target. Carrier compatibility does not imply type
+    /// identity; integer range checks happen while binding the value.
+    #[must_use]
+    pub const fn is_parameter_carrier_for(self, target: PhysicalType) -> bool {
+        match target {
+            PhysicalType::Bool => matches!(self, Self::Bool),
+            PhysicalType::Int8
+            | PhysicalType::Int16
+            | PhysicalType::Int32
+            | PhysicalType::Int64
+            | PhysicalType::Int128
+            | PhysicalType::UInt8
+            | PhysicalType::UInt16
+            | PhysicalType::UInt32
+            | PhysicalType::UInt64
+            | PhysicalType::UInt128 => matches!(self, Self::Int2 | Self::Int4 | Self::Int8),
+            PhysicalType::Float32 => matches!(self, Self::Float4),
+            PhysicalType::Float64 => matches!(self, Self::Float8),
+            PhysicalType::Text => matches!(self, Self::Text | Self::Varchar | Self::Unknown),
+            PhysicalType::Bytes => matches!(self, Self::Bytea),
+        }
+    }
+
+    /// Default PostgreSQL carrier for one exact NetbaDB parameter target.
+    /// This differs from result-type reflection for unsigned and 128-bit
+    /// integers, whose full domains cannot be represented by PostgreSQL.
+    pub const fn for_parameter(target: PhysicalType) -> Self {
+        match target {
+            PhysicalType::Bool => Self::Bool,
+            PhysicalType::Int8 | PhysicalType::Int16 | PhysicalType::UInt8 => Self::Int2,
+            PhysicalType::Int32 | PhysicalType::UInt16 => Self::Int4,
+            PhysicalType::Int64
+            | PhysicalType::Int128
+            | PhysicalType::UInt32
+            | PhysicalType::UInt64
+            | PhysicalType::UInt128 => Self::Int8,
+            PhysicalType::Float32 => Self::Float4,
+            PhysicalType::Float64 => Self::Float8,
+            PhysicalType::Text => Self::Text,
+            PhysicalType::Bytes => Self::Bytea,
         }
     }
 
@@ -1305,7 +1354,7 @@ mod tests {
             PostgresType::from_oid(PostgresOid(1_009)),
             Some(PostgresType::TextArray)
         );
-        assert_eq!(PostgresType::TextArray.netbadb_physical(), None);
+        assert_eq!(PostgresType::TextArray.parameter_fallback(), None);
         assert_eq!(
             encode_text_value(&ScalarValue::Text("{id}".into()), PostgresType::TextArray).unwrap(),
             Some(b"{id}".to_vec())
@@ -1318,7 +1367,7 @@ mod tests {
             PostgresType::from_oid(PostgresOid(1_000)),
             Some(PostgresType::BoolArray)
         );
-        assert_eq!(PostgresType::BoolArray.netbadb_physical(), None);
+        assert_eq!(PostgresType::BoolArray.parameter_fallback(), None);
         assert_eq!(
             encode_text_value(&ScalarValue::Text("{t,f}".into()), PostgresType::BoolArray).unwrap(),
             Some(b"{t,f}".to_vec())
@@ -1492,5 +1541,120 @@ mod tests {
             encode_binary_value(&nan, PostgresType::Float4).unwrap(),
             Some(Float32Value::CANONICAL_NAN_BITS.to_be_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn integer_parameter_narrowing_checks_every_boundary_in_text_and_binary() {
+        fn binary(carrier: PostgresType, value: i64) -> Vec<u8> {
+            match carrier {
+                PostgresType::Int2 => i16::try_from(value).unwrap().to_be_bytes().to_vec(),
+                PostgresType::Int4 => i32::try_from(value).unwrap().to_be_bytes().to_vec(),
+                PostgresType::Int8 => value.to_be_bytes().to_vec(),
+                _ => panic!("test carrier must be an integer"),
+            }
+        }
+
+        let cases = [
+            (
+                PhysicalType::Int8,
+                PostgresType::Int2,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+                i64::from(i8::MIN) - 1,
+                i64::from(i8::MAX) + 1,
+                ScalarValue::Int8(i8::MIN),
+                ScalarValue::Int8(i8::MAX),
+            ),
+            (
+                PhysicalType::Int16,
+                PostgresType::Int4,
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+                i64::from(i16::MIN) - 1,
+                i64::from(i16::MAX) + 1,
+                ScalarValue::Int16(i16::MIN),
+                ScalarValue::Int16(i16::MAX),
+            ),
+            (
+                PhysicalType::Int32,
+                PostgresType::Int8,
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+                i64::from(i32::MIN) - 1,
+                i64::from(i32::MAX) + 1,
+                ScalarValue::Int32(i32::MIN),
+                ScalarValue::Int32(i32::MAX),
+            ),
+            (
+                PhysicalType::UInt8,
+                PostgresType::Int2,
+                0,
+                i64::from(u8::MAX),
+                -1,
+                i64::from(u8::MAX) + 1,
+                ScalarValue::UInt8(u8::MIN),
+                ScalarValue::UInt8(u8::MAX),
+            ),
+            (
+                PhysicalType::UInt16,
+                PostgresType::Int4,
+                0,
+                i64::from(u16::MAX),
+                -1,
+                i64::from(u16::MAX) + 1,
+                ScalarValue::UInt16(u16::MIN),
+                ScalarValue::UInt16(u16::MAX),
+            ),
+            (
+                PhysicalType::UInt32,
+                PostgresType::Int8,
+                0,
+                i64::from(u32::MAX),
+                -1,
+                i64::from(u32::MAX) + 1,
+                ScalarValue::UInt32(u32::MIN),
+                ScalarValue::UInt32(u32::MAX),
+            ),
+        ];
+        for (target, carrier, min, max, below, above, min_value, max_value) in cases {
+            for (value, expected) in [(min, min_value), (max, max_value)] {
+                assert_eq!(
+                    decode_text_parameter_as(
+                        Some(value.to_string().as_bytes()),
+                        carrier.oid(),
+                        target,
+                    )
+                    .unwrap(),
+                    expected.clone()
+                );
+                assert_eq!(
+                    decode_binary_parameter_as(
+                        Some(&binary(carrier, value)),
+                        carrier.oid(),
+                        target
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+            for value in [below, above] {
+                assert!(matches!(
+                    decode_text_parameter_as(
+                        Some(value.to_string().as_bytes()),
+                        carrier.oid(),
+                        target,
+                    ),
+                    Err(TypeMappingError::ValueOutOfRange(_))
+                ));
+                assert!(matches!(
+                    decode_binary_parameter_as(
+                        Some(&binary(carrier, value)),
+                        carrier.oid(),
+                        target
+                    ),
+                    Err(TypeMappingError::ValueOutOfRange(_))
+                ));
+            }
+        }
     }
 }

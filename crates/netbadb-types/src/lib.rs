@@ -197,6 +197,30 @@ pub enum PhysicalType {
 }
 
 impl PhysicalType {
+    /// Canonical spelling accepted by the SQL parser for this exact type.
+    /// This is intentionally separate from the internal [`Display`] name:
+    /// PostgreSQL-compatible `INT8` means Int64, while Int8 is `TINYINT`.
+    #[must_use]
+    pub const fn sql_name(self) -> &'static str {
+        match self {
+            Self::Bool => "BOOL",
+            Self::Int8 => "TINYINT",
+            Self::Int16 => "INT16",
+            Self::Int32 => "INT32",
+            Self::Int64 => "INT64",
+            Self::Int128 => "INT128",
+            Self::UInt8 => "UINT8",
+            Self::UInt16 => "UINT16",
+            Self::UInt32 => "UINT32",
+            Self::UInt64 => "UINT64",
+            Self::UInt128 => "UINT128",
+            Self::Float32 => "FLOAT32",
+            Self::Float64 => "FLOAT64",
+            Self::Text => "TEXT",
+            Self::Bytes => "BYTES",
+        }
+    }
+
     #[must_use]
     pub const fn is_integer(self) -> bool {
         self.is_signed_integer() || self.is_unsigned_integer()
@@ -303,6 +327,15 @@ impl SemanticType {
                 (None, None) => true,
                 _ => false,
             }
+    }
+
+    /// SQL-facing name for diagnostics. Nominal semantic names remain
+    /// authoritative; unnamed values use the exact canonical SQL spelling.
+    #[must_use]
+    pub fn sql_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .unwrap_or_else(|| self.physical.sql_name())
     }
 }
 
@@ -787,6 +820,16 @@ mod tests {
             assert_eq!(physical.fixed_width(), width);
             assert!(physical.is_orderable());
         }
+        assert_eq!(PhysicalType::Int8.sql_name(), "TINYINT");
+        assert_eq!(PhysicalType::Int64.sql_name(), "INT64");
+        assert_eq!(
+            SemanticType::physical(PhysicalType::Int8).sql_name(),
+            "TINYINT"
+        );
+        assert_eq!(
+            SemanticType::named("TinyId", PhysicalType::Int8).sql_name(),
+            "TinyId"
+        );
     }
 
     #[test]

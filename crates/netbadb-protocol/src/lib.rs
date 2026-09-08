@@ -1,4 +1,4 @@
-//! Versioned, language-neutral NetbaDB wire protocol v1.
+//! Versioned, language-neutral NetbaDB wire protocol v2.
 
 use std::error::Error;
 use std::fmt;
@@ -9,7 +9,8 @@ pub use netbadb_types::{
 };
 
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"NDBP";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION_V1: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const FRAME_HEADER_SIZE: usize = 24;
 pub const MAX_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
 pub const MAX_COLLECTION_ITEMS: u32 = 65_536;
@@ -305,7 +306,7 @@ pub fn decode_server_frame(input: &[u8]) -> Result<Frame<ServerMessage>, Protoco
     })
 }
 
-/// Validates one response against all v1 payload bounds without writing it.
+/// Validates one response against all v2 payload bounds without writing it.
 pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolError> {
     let (_, payload) = encode_server_payload(message)?;
     validate_payload_length(payload.len()).map(|_| ())
@@ -968,13 +969,50 @@ mod tests {
     fn frame_header(kind: u16, payload_length: u32, request_id: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"NDBP");
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         bytes.extend_from_slice(&kind.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&payload_length.to_le_bytes());
         bytes.extend_from_slice(&request_id.to_le_bytes());
         bytes
+    }
+
+    fn v1_frame_header(kind: u16, payload_length: u32, request_id: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NDBP");
+        bytes.extend_from_slice(&PROTOCOL_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&payload_length.to_le_bytes());
+        bytes.extend_from_slice(&request_id.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn protocol_v1_legacy_golden_bytes_remain_frozen() {
+        assert_eq!(
+            v1_frame_header(CLIENT_HELLO, 0, 1),
+            b"NDBP\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        let mut payload = 5_u32.to_le_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(&[1, 1]);
+        payload.push(2);
+        payload.extend_from_slice(&(-2_i64).to_le_bytes());
+        payload.push(3);
+        payload.extend_from_slice(&3_u64.to_le_bytes());
+        payload.push(4);
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(b'x');
+        let mut row = v1_frame_header(SERVER_QUERY_ROW, payload.len() as u32, 4);
+        row.extend_from_slice(&payload);
+        assert_eq!(
+            row,
+            b"NDBP\x01\x00\x03\x80\x00\x00\x00\x00\x1f\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x01\x01\x02\xfe\xff\xff\xff\xff\xff\xff\xff\x03\x03\x00\x00\x00\x00\x00\x00\x00\x04\x01\x00\x00\x00x"
+        );
     }
 
     #[test]
@@ -1011,7 +1049,7 @@ mod tests {
     fn server_golden_frames_are_exact() {
         let fingerprint = [0xAB; 32];
         let hello = ServerMessage::HelloAck {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             max_frame_payload: MAX_FRAME_PAYLOAD,
             capabilities: SERVER_CAPABILITIES,
             tables: vec![TableSchemaIdentity {
@@ -1020,7 +1058,7 @@ mod tests {
             }],
         };
         let mut hello_expected = frame_header(0x8001, 60, 1);
-        hello_expected.extend_from_slice(&1_u16.to_le_bytes());
+        hello_expected.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         hello_expected.extend_from_slice(&0_u16.to_le_bytes());
         hello_expected.extend_from_slice(&16_777_216_u32.to_le_bytes());
         hello_expected.extend_from_slice(&7_u64.to_le_bytes());
@@ -1129,6 +1167,86 @@ mod tests {
     }
 
     #[test]
+    fn v2_query_start_uses_append_only_physical_type_tags() {
+        let physical = [
+            PhysicalType::Int8,
+            PhysicalType::Int16,
+            PhysicalType::Int32,
+            PhysicalType::Int128,
+            PhysicalType::UInt8,
+            PhysicalType::UInt16,
+            PhysicalType::UInt32,
+            PhysicalType::UInt128,
+            PhysicalType::Float32,
+            PhysicalType::Float64,
+            PhysicalType::Bytes,
+        ];
+        let columns = physical
+            .iter()
+            .enumerate()
+            .map(|(index, physical)| WireResultColumn {
+                name: format!("c{index}"),
+                data_type: SemanticType::physical(*physical),
+                nullable: false,
+            })
+            .collect::<Vec<_>>();
+        let frame = encode_server_frame(
+            9,
+            &ServerMessage::QueryStart {
+                columns: columns.clone(),
+            },
+        )
+        .expect("encode v2 metadata");
+        assert_eq!(&frame[4..6], &PROTOCOL_VERSION.to_le_bytes());
+        let mut cursor = Cursor::new(&frame[FRAME_HEADER_SIZE..]);
+        assert_eq!(cursor.read_u32().unwrap(), physical.len() as u32);
+        for (index, tag) in (5_u8..=15).enumerate() {
+            assert_eq!(cursor.read_string().unwrap(), format!("c{index}"));
+            assert_eq!(cursor.read_u8().unwrap(), tag);
+            assert!(!cursor.read_bool().unwrap());
+            assert_eq!(cursor.read_u16().unwrap(), 0);
+            assert!(!cursor.read_bool().unwrap());
+        }
+        cursor.finish().unwrap();
+        assert_eq!(
+            decode_server_frame(&frame).unwrap().message,
+            ServerMessage::QueryStart { columns }
+        );
+    }
+
+    #[test]
+    fn v2_float_scalar_bits_are_canonical() {
+        let values = vec![
+            ScalarValue::Float32(Float32Value::from_bits(u32::MAX)),
+            ScalarValue::Float32(Float32Value::new(-0.0)),
+            ScalarValue::Float64(Float64Value::from_bits(u64::MAX)),
+            ScalarValue::Float64(Float64Value::new(-0.0)),
+        ];
+        let frame = encode_server_frame(
+            10,
+            &ServerMessage::QueryRow {
+                values: values.clone(),
+            },
+        )
+        .unwrap();
+        let payload = &frame[FRAME_HEADER_SIZE..];
+        assert_eq!(
+            &payload[5..9],
+            &Float32Value::CANONICAL_NAN_BITS.to_le_bytes()
+        );
+        assert_eq!(&payload[10..14], &0_u32.to_le_bytes());
+        assert_eq!(
+            &payload[15..23],
+            &Float64Value::CANONICAL_NAN_BITS.to_le_bytes()
+        );
+        assert_eq!(&payload[24..32], &0_u64.to_le_bytes());
+        assert_eq!(
+            decode_server_frame(&frame).unwrap().message,
+            ServerMessage::QueryRow { values }
+        );
+    }
+
+    #[test]
     fn all_stable_tags_and_capability_bits_are_exact() {
         assert_eq!(CAPABILITY_EXPLICIT_TRANSACTIONS, 0x1);
         assert_eq!(CAPABILITY_ANALYZE, 0x2);
@@ -1164,7 +1282,7 @@ mod tests {
         let servers = [
             (
                 ServerMessage::HelloAck {
-                    protocol_version: 1,
+                    protocol_version: PROTOCOL_VERSION,
                     max_frame_payload: 16_777_216,
                     capabilities: 7,
                     tables: vec![],
@@ -1309,7 +1427,7 @@ mod tests {
 
         let servers = vec![
             ServerMessage::HelloAck {
-                protocol_version: 1,
+                protocol_version: PROTOCOL_VERSION,
                 max_frame_payload: MAX_FRAME_PAYLOAD,
                 capabilities: SERVER_CAPABILITIES,
                 tables: vec![],
@@ -1396,10 +1514,10 @@ mod tests {
         ));
 
         let mut bad_version = frame_header(CLIENT_HELLO, 0, 1);
-        bad_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        bad_version[4..6].copy_from_slice(&PROTOCOL_VERSION_V1.to_le_bytes());
         assert!(matches!(
             decode_client_frame(&bad_version),
-            Err(ProtocolError::UnsupportedVersion(2))
+            Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION_V1))
         ));
 
         let mut flags = frame_header(CLIENT_HELLO, 0, 1);

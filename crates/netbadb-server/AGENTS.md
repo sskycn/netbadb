@@ -16,7 +16,7 @@
   guess a request identity or attempt to resynchronize the stream.
 - Keep transport authentication in connection handling, principal admission
   and authorization in the database worker, and SQL access extraction at the
-  typed core/compiler boundary. `SessionState`, Protocol v1, and persistent
+  typed core/compiler boundary. `SessionState`, Protocol v2, and persistent
   database layers MUST remain identity- and policy-unaware.
 - Authorization MUST run after handshake sequencing and successful SQL
   compilation but before planning, execution, writer acquisition, or ANALYZE.

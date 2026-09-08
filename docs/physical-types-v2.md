@@ -92,6 +92,14 @@ and Bytes uses `BYTEA`. UInt64, Int128 and UInt128 result columns return an
 explicit unsupported-type error because PostgreSQL has no lossless built-in
 scalar mapping for them. Parameter narrowing is explicit and range checked.
 
+These PostgreSQL types are value carriers, not NetbaDB type identities. SQL
+context determines the exact NetbaDB parameter type; an OID supplies only a
+fallback when context is absent. Likewise, PostgreSQL introspection followed by
+DDL recreation does not preserve exact NetbaDB physical identity when several
+types share a carrier: both Int8 and Int16 reflect as `smallint`, for example,
+and recreating `smallint` produces Int16. Pgwire guarantees lossless value
+transport where a result mapping exists, not exact type-identity round trips.
+
 Generated Go models map the supported fixed widths to `int8` through `int64`,
 `uint8` through `uint64`, `float32`, `float64`, `string`, and `[]byte`. Go
 generation explicitly rejects Int128 and UInt128 rather than silently changing

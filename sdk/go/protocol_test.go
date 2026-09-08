@@ -12,7 +12,7 @@ import (
 func testHeader(kind uint16, payloadLength uint32, requestID uint64) []byte {
 	b := make([]byte, frameHeaderSize)
 	copy(b, "NDBP")
-	binary.LittleEndian.PutUint16(b[4:6], 1)
+	binary.LittleEndian.PutUint16(b[4:6], ProtocolVersion)
 	binary.LittleEndian.PutUint16(b[6:8], kind)
 	binary.LittleEndian.PutUint32(b[12:16], payloadLength)
 	binary.LittleEndian.PutUint64(b[16:24], requestID)
@@ -61,14 +61,14 @@ func TestServerGoldenFramesMatchRust(t *testing.T) {
 		message serverMessage
 		want    []byte
 	}{
-		{"HelloAck", 1, serverMessage{kind: kindServerHelloAck, protocolVersion: 1, maxFramePayload: maxFramePayload, capabilities: 7, tables: []TableIdentity{{TableID: 5, Fingerprint: fingerprint}}}, nil},
+		{"HelloAck", 1, serverMessage{kind: kindServerHelloAck, protocolVersion: ProtocolVersion, maxFramePayload: maxFramePayload, capabilities: 7, tables: []TableIdentity{{TableID: 5, Fingerprint: fingerprint}}}, nil},
 		{"AffectedRows", 2, serverMessage{kind: kindServerAffectedRows, count: 3}, nil},
 		{"QueryStart", 3, serverMessage{kind: kindServerQueryStart, columns: []ResultColumn{{Name: "id", Type: SemanticType{Physical: PhysicalTypeUInt64, Name: "UserId", Named: true}}}}, nil},
 		{"QueryRow", 4, serverMessage{kind: kindServerQueryRow, values: []Value{Null(), BoolValue(true), Int64Value(-2), UInt64Value(3), TextValue("x")}}, nil},
 		{"Error", 5, serverMessage{kind: kindServerError, remoteError: &RemoteError{Code: ErrorCodeCompile, TransactionState: TransactionStateActive, Message: "bad SQL"}}, nil},
 	}
 	cases[0].want = testHeader(0x8001, 60, 1)
-	cases[0].want = append(cases[0].want, 1, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0)
+	cases[0].want = append(cases[0].want, 2, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0)
 	cases[0].want = append(cases[0].want, fingerprint[:]...)
 	cases[1].want = append(testHeader(0x8005, 8, 2), 3, 0, 0, 0, 0, 0, 0, 0)
 	cases[2].want = append(testHeader(0x8002, 25, 3), 1, 0, 0, 0, 2, 0, 0, 0, 'i', 'd', 3, 1, 0, 0, 6, 0, 0, 0, 'U', 's', 'e', 'r', 'I', 'd', 0)
@@ -113,7 +113,7 @@ func TestAllClientKindsHaveExplicitTags(t *testing.T) {
 
 func TestAllServerMessagesDecodeInTheirOwnDirection(t *testing.T) {
 	messages := []serverMessage{
-		{kind: kindServerHelloAck, protocolVersion: 1, maxFramePayload: maxFramePayload, capabilities: 7, tables: []TableIdentity{}},
+		{kind: kindServerHelloAck, protocolVersion: ProtocolVersion, maxFramePayload: maxFramePayload, capabilities: 7, tables: []TableIdentity{}},
 		{kind: kindServerQueryStart, columns: []ResultColumn{}},
 		{kind: kindServerQueryRow, values: []Value{}},
 		{kind: kindServerQueryEnd, count: 0},
@@ -152,7 +152,7 @@ func TestMalformedServerFramesAreRejected(t *testing.T) {
 	}
 	cases := map[string][]byte{
 		"bad magic":        mutate(0, 'X'),
-		"bad version":      mutate(4, 2, 0),
+		"bad version":      mutate(4, 1, 0),
 		"client-only kind": mutate(6, 1, 0),
 		"flags":            mutate(8, 1, 0),
 		"reserved":         mutate(10, 1, 0),

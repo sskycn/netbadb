@@ -40,7 +40,7 @@ types and cannot call the database. `netbadb-server` owns sockets, startup
 policy, prepared statements, portals, compatibility queries, SQLSTATE mapping,
 authorization, and PostgreSQL transaction-aborted behavior.
 
-Native Protocol v1 and PostgreSQL share the server's private synchronous
+Native Protocol v2 and PostgreSQL share the server's private synchronous
 `DatabaseSession`: optional transaction ownership, execute/commit/rollback,
 disconnect rollback, and result-row policy. They also share the dedicated
 worker ownership rule: the worker constructs and exclusively owns `Database`,
@@ -143,6 +143,13 @@ User tables map to `public`; `current_schema()`, `SHOW search_path`, qualified
 lookups, and the namespace projection all agree. Metadata visibility reuses the
 existing principal's table grants. `UINT64` column reflection fails with
 SQLSTATE `0A000` because no lossless PostgreSQL base integer mapping exists.
+
+Catalog reflection reports real PostgreSQL carrier types. It guarantees
+lossless value transport for mapped types, but not preservation of exact
+NetbaDB physical identity through reflection and DDL recreation when multiple
+NetbaDB types share one carrier. For example, Int8 and Int16 both reflect as
+`smallint`; recreating that PostgreSQL spelling produces NetbaDB Int16. No fake
+OID is allocated to manufacture an identity round trip.
 
 Synthetic table and index OIDs use the high range beginning at `0x80000000`,
 separate from centralized PostgreSQL built-in type OIDs. Domain-separated
@@ -433,7 +440,7 @@ Successful loopback admission maps to manifest v4's `local_plaintext`
 principal and returns `AuthenticationOk`. This is a local development
 authentication mode, not PostgreSQL password authentication. Authorization is
 still checked after compiler name/type resolution and before execution using
-the same per-TableId read/write/transaction grants as Protocol v1.
+the same per-TableId read/write/transaction grants as Protocol v2.
 
 ## Protocol support
 
@@ -517,23 +524,39 @@ not added to the user type system; they remain catalog-adapter details.
 | NetbaDB physical type | PostgreSQL type | OID | Text | Binary |
 | --- | --- | ---: | --- | --- |
 | BOOL | bool | 16 | yes (`t` / `f`) | yes |
+| INT8 / INT16 | int2 | 21 | yes | yes, big-endian 2 bytes |
+| INT32 | int4 | 23 | yes | yes, big-endian 4 bytes |
 | INT64 | int8 | 20 | yes | yes, big-endian 8 bytes |
+| UINT8 | int2 | 21 | yes, checked | yes, checked |
+| UINT16 | int4 | 23 | yes, checked | yes, checked |
+| UINT32 | int8 | 20 | yes, checked | yes, checked |
+| FLOAT32 | float4 | 700 | yes | yes, canonical big-endian bits |
+| FLOAT64 | float8 | 701 | yes | yes, canonical big-endian bits |
 | TEXT | text | 25 | yes, UTF-8 | yes, UTF-8 bytes |
-| UINT64 | none | — | rejected | no |
+| BYTES | bytea | 17 | yes, hex | yes, arbitrary octets |
+| UINT64 / INT128 / UINT128 result | none | — | rejected | no |
 | NULL value | field's declared type | field OID | length `-1` | length `-1` |
 
-PostgreSQL input type definitions also recognize int2 (21), int4 (23), int8
-(20), text (25), varchar (1043), bool (16), and unknown (705), with checked
-text and binary decoders. int2/int4 inputs widen losslessly to NetbaDB INT64;
-their binary widths and all integer ranges are checked exactly.
+PostgreSQL input definitions recognize these carriers plus varchar (1043) and
+unknown (705), with checked text and binary decoders. Parse keeps the OID as a
+transport carrier while SQL context supplies the exact NetbaDB target. Bind
+decodes the carrier and performs checked conversion to that target. Thus INT2
+can carry Int8, Int16, or UInt8, while negative and out-of-range unsigned values
+return SQLSTATE `22003`. INT8 may carry nonnegative values for UInt64, Int128,
+and UInt128 parameters even though those full result domains have no lossless
+PostgreSQL mapping.
 
 Parse OID `0`, an omitted trailing declaration, or an empty declaration array
 means unspecified. Context such as `id = $1` or an INSERT target column infers
 the frontend-neutral semantic type, including nominal identity. Repeated uses
-must agree. A parameter with no declaration or usable context returns `42P18`.
+must agree. When context is absent, an explicit OID supplies the natural
+fallback (INT2→Int16, INT4→Int32, INT8→Int64, FLOAT4→Float32,
+FLOAT8→Float64, and analogous Bool/Text/Bytes mappings). A parameter with
+neither declaration nor usable context returns `42P18`.
 
-UINT64 is deliberately unsupported because PostgreSQL has no lossless unsigned
-64-bit integer type. It is not silently narrowed to int8 or mislabeled as text.
+UINT64 result reflection is deliberately unsupported because PostgreSQL has no
+lossless unsigned 64-bit integer type. It is not silently narrowed to int8 or
+mislabeled as text.
 Nominal semantic types remain attached to NetbaDB HIR and are never weakened;
 the PostgreSQL client sees only their supported physical representation.
 

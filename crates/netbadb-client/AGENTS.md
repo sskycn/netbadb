@@ -2,7 +2,7 @@
 
 - This crate is synchronous and blocking only. Do not introduce Tokio, async
   APIs, pooling, request pipelining, multiplexing, reconnect, or replay.
-- Use `netbadb-protocol` for every Protocol v1 frame and domain value. Do not
+- Use `netbadb-protocol` for every Protocol v2 frame and domain value. Do not
   duplicate frame, scalar, semantic-type, transaction-state, or error codecs.
 - A malformed response, wrong request ID, invalid row, unexpected response
   sequence, or premature EOF MUST poison and close the connection. A valid

@@ -213,7 +213,7 @@ netbadb/
 ├── crates/
 │   ├── netbadb-types/       shared IDs, physical and semantic types
 │   ├── netbadb-schema/      language-independent Canonical Schema IR
-│   ├── netbadb-schema-spec/ strict SDK Schema Spec v1 parsing
+│   ├── netbadb-schema-spec/ strict SDK Schema Spec v1/v2 parsing
 │   ├── netbadb-parser/      small typed-query AST and parser
 │   ├── netbadb-hir/         name resolution and type checking
 │   ├── netbadb-rel/         typed logical relational IR
@@ -226,10 +226,10 @@ netbadb/
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
 │   ├── netbadb-pgwire/      bounded PostgreSQL v3 codecs and OID adaptation
-│   ├── netbadb-client/      synchronous Protocol v1 remote client
+│   ├── netbadb-client/      synchronous Protocol v2 remote client
 │   ├── netbadb-inspect/     stable inspection DTOs and deterministic text
 │   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
-│   └── netbadb-codegen/     strict Schema Spec v1 and typed Go generation
+│   └── netbadb-codegen/     strict Schema Spec v1/v2 and typed Go generation
 ├── cmd/
 │   ├── netbadb/             offline local inspection CLI
 │   ├── netbadb-lsp/         diagnostics-only stdio language server
@@ -337,7 +337,7 @@ The current code genuinely supports:
 - executor support for INNER JOIN, filter, stable in-memory sort, one-pass
   global/grouped aggregates, projection, limit, typed DML, affected-row results, SQL
   three-valued boolean logic, and NULL comparisons;
-- versioned protocol v1 framing, schema-fingerprint handshake, streamed query
+- versioned protocol v2 framing, schema-fingerprint handshake, streamed query
   response messages, bounded synchronous codecs, and stable wire errors;
 - experimental PostgreSQL v3 wire framing with bounded Startup, SSLRequest,
   CancelRequest, Simple Query, and typed-parameter Extended Query codecs,
@@ -360,24 +360,26 @@ The current code genuinely supports:
   storage internals and never drives execution;
 - an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
   embedded inspection API, with deterministic human text and explicit
-  current versioned Inspection JSON v6 output (with v1/v2/v3/v4/v5 retained
+  current versioned Inspection JSON v7 output (with v1-v6 retained
   historically);
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
-  Spec v1 once, compiles full editor buffers without database access, and maps
+  Spec v1 or v2 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
-- a blocking Rust Protocol v1 client with loopback plaintext, verified mTLS,
+- a blocking Rust Protocol v2 client with loopback plaintext, verified mTLS,
   schema/capability gates, streamed rows, and explicit transaction lifecycle,
   exposed under the optional `netbadb-sdk::remote` feature;
-- an independent standard-library Go Protocol v1 client plus deterministic
+- an independent standard-library Go Protocol v2 client plus deterministic
   Rust-generated semantic types, canonical IDs/fingerprints, nullable full-row
   decoders, typed row streams, and automatic schema gates.
 
-Protocol v1 is specified byte-for-byte in
-[`docs/protocol-v1.md`](docs/protocol-v1.md), and current standalone
+Current Protocol v2 is specified in
+[`docs/protocol-v2.md`](docs/protocol-v2.md); the frozen v1 byte contract remains
+in [`docs/protocol-v1.md`](docs/protocol-v1.md). Current standalone
 configuration is documented in
 [`docs/server-manifest-v4.md`](docs/server-manifest-v4.md). The generated SDK
 input contract is documented in
-[`docs/sdk-schema-v1.md`](docs/sdk-schema-v1.md). Manifests v1 through v3 are
+[`docs/sdk-schema-v2.md`](docs/sdk-schema-v2.md), with v1 retained as a readable
+historical contract. Manifests v1 through v3 are
 retained as historical documentation and rejected by current
 `netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
 database worker authorizes compiler-resolved TableIds before execution.
@@ -487,7 +489,7 @@ never executed.
 Schema-driven editor diagnostics are documented in [`docs/lsp.md`](docs/lsp.md).
 Run `netbadb-lsp --schema schema.json` as an LSP stdio process. It neither opens
 database files nor reports physical plans; it validates one SQL statement per
-document against the canonical schema decoded from SDK Schema Spec v1.
+document against the canonical schema decoded from SDK Schema Spec v1 or v2.
 
 The reproducible warm-cache performance baseline is documented in
 [`docs/performance.md`](docs/performance.md). It measures current public
@@ -885,13 +887,13 @@ support boundary is:
 
 ```text
 Rust embedded: netbadb-sdk -> netbadb-core
-Rust remote:   netbadb-sdk::remote -> netbadb-client -> Protocol v1
-Go remote:     generated typed bindings over the independent Go Protocol v1 client
+Rust remote:   netbadb-sdk::remote -> netbadb-client -> Protocol v2
+Go remote:     generated typed bindings over the independent Go Protocol v2 client
 ```
 
-The language-neutral SDK Schema Spec v1 is validated and fingerprinted by the
+The language-neutral SDK Schema Spec v2 (with historical v1 input support) is validated and fingerprinted by the
 Rust `netbadb-codegen` crate, which emits deterministic Go source above the
-independent Protocol v1 client. The JSON spec is neither Canonical Schema
+independent Protocol v2 client. The JSON spec is neither Canonical Schema
 encoding nor deployment configuration. Generated full-row wrappers validate
 exact result order, names, physical and semantic types, and nullability before
 decoding; they do not generate SQL, CRUD, or query-builder APIs.

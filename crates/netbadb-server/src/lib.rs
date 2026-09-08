@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_core::{
-    Database, DatabaseError, DatabaseTransaction, DdlOutcome, ExecutionResult,
+    Database, DatabaseError, DatabaseTransaction, DdlOutcome, ExecutionResult, ParameterTypeHint,
     PreparedDdlStatement, PreparedSqlStatement, QueryResult, TransactionState,
 };
 use netbadb_protocol::{
@@ -154,11 +154,13 @@ impl DatabaseSession {
         &self,
         database: &Database,
         sql: &str,
-        declared: &[Option<netbadb_types::PhysicalType>],
+        hints: &[Option<ParameterTypeHint>],
     ) -> Result<PreparedSqlStatement, DatabaseError> {
         match &self.transaction {
-            Some(transaction) => database.prepare_sql_statement_in(transaction, sql, declared),
-            None => database.prepare_sql_statement(sql, declared),
+            Some(transaction) => {
+                database.prepare_sql_statement_in_with_parameter_hints(transaction, sql, hints)
+            }
+            None => database.prepare_sql_statement_with_parameter_hints(sql, hints),
         }
     }
 

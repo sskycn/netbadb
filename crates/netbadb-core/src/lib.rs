@@ -35,6 +35,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub use netbadb_compiler::ParameterTypeHint;
 use netbadb_compiler::{
     BindError, CompileError, CompileErrorKind, CompiledDdlStatement, CompiledStatement,
     DropIndexTarget, IndexNameBinding, PreparedParameter, TableIdentityBinding, TypedCreateIndex,
@@ -3591,7 +3592,21 @@ impl Database {
         source: &str,
         declared: &[Option<PhysicalType>],
     ) -> Result<PreparedSqlStatement, DatabaseError> {
-        self.prepare_sql_with_transaction(None, source, declared)
+        let hints = declared
+            .iter()
+            .map(|physical| physical.map(ParameterTypeHint::Exact))
+            .collect::<Vec<_>>();
+        self.prepare_sql_with_transaction(None, source, &hints)
+    }
+
+    /// Prepares using frontend hints that distinguish exact database types
+    /// from representation-only fallbacks.
+    pub fn prepare_sql_statement_with_parameter_hints(
+        &self,
+        source: &str,
+        hints: &[Option<ParameterTypeHint>],
+    ) -> Result<PreparedSqlStatement, DatabaseError> {
+        self.prepare_sql_with_transaction(None, source, hints)
     }
 
     /// Prepares against the transaction view, including logical DDL. Unlike
@@ -3604,24 +3619,40 @@ impl Database {
         declared: &[Option<PhysicalType>],
     ) -> Result<PreparedSqlStatement, DatabaseError> {
         self.validate_transaction(transaction)?;
-        self.prepare_sql_with_transaction(Some(transaction), source, declared)
+        let hints = declared
+            .iter()
+            .map(|physical| physical.map(ParameterTypeHint::Exact))
+            .collect::<Vec<_>>();
+        self.prepare_sql_with_transaction(Some(transaction), source, &hints)
+    }
+
+    /// Transaction-view counterpart of
+    /// [`Self::prepare_sql_statement_with_parameter_hints`].
+    pub fn prepare_sql_statement_in_with_parameter_hints(
+        &self,
+        transaction: &Transaction,
+        source: &str,
+        hints: &[Option<ParameterTypeHint>],
+    ) -> Result<PreparedSqlStatement, DatabaseError> {
+        self.validate_transaction(transaction)?;
+        self.prepare_sql_with_transaction(Some(transaction), source, hints)
     }
 
     fn prepare_sql_with_transaction(
         &self,
         transaction: Option<&Transaction>,
         source: &str,
-        declared: &[Option<PhysicalType>],
+        hints: &[Option<ParameterTypeHint>],
     ) -> Result<PreparedSqlStatement, DatabaseError> {
         let schema = transaction.map_or(&self.committed.schema, |t| {
             t.visible_schema(&self.committed.schema)
         });
-        let compiled = netbadb_compiler::compile_sql_statement(
+        let compiled = netbadb_compiler::compile_sql_statement_with_parameter_hints(
             schema,
             source,
             &self.index_name_bindings(transaction),
             &self.table_identity_bindings(transaction)?,
-            declared,
+            hints,
         )?;
         match compiled {
             netbadb_compiler::CompiledSqlStatement::Ddl(compiled) => {

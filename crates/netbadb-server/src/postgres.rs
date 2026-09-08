@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use netbadb_core::{
     Database, DatabaseError, DatabaseErrorKind, DdlOutcome, ExecutionResult, IndexKindInspection,
-    PreparedDdlStatement as CorePreparedDdl, PreparedSqlStatement,
+    ParameterTypeHint, PreparedDdlStatement as CorePreparedDdl, PreparedSqlStatement,
     PreparedStatement as CorePrepared, QueryResult, StatementAccess, StatementDescription,
     TablePlacementInspection,
 };
@@ -594,7 +594,9 @@ struct PreparedStatement {
     sql: String,
     execution: PreparedExecution,
     parameters: Vec<PostgresOid>,
-    parameter_targets: Vec<Option<PhysicalType>>,
+    /// Exact NetbaDB targets inferred from SQL context. PostgreSQL OIDs in
+    /// `parameters` remain transport carriers and are never stored here.
+    parameter_targets: Vec<PhysicalType>,
     fields: Vec<FieldDescription>,
     is_query: bool,
 }
@@ -1201,7 +1203,7 @@ impl PgWorkerSession {
         }
         let declared = match parameter_types
             .iter()
-            .map(|oid| parameter_constraint(*oid))
+            .map(|oid| parameter_hint(*oid))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(declared) => declared,
@@ -1237,7 +1239,7 @@ impl PgWorkerSession {
         let parameter_targets = prepared
             .parameters()
             .iter()
-            .map(|parameter| Some(parameter.data_type.physical))
+            .map(|parameter| parameter.data_type.physical)
             .collect::<Vec<_>>();
         let inferred_oids = match prepared
             .parameters()
@@ -1245,14 +1247,19 @@ impl PgWorkerSession {
             .enumerate()
             .map(
                 |(index, parameter)| match parameter_types.get(index).copied() {
-                    Some(PostgresOid(oid)) if oid != 0 => PostgresType::from_oid(PostgresOid(oid))
-                        .map(PostgresType::oid)
-                        .ok_or_else(|| {
-                            map_type_error(TypeMappingError::UnsupportedOid(PostgresOid(oid)))
-                        }),
-                    _ => PostgresType::from_netbadb(parameter.data_type.physical)
-                        .map(PostgresType::oid)
-                        .map_err(map_type_error),
+                    Some(oid) if oid.0 != 0 => {
+                        let carrier = PostgresType::from_oid(oid).ok_or_else(|| {
+                            map_type_error(TypeMappingError::UnsupportedOid(oid))
+                        })?;
+                        if !carrier.is_parameter_carrier_for(parameter.data_type.physical) {
+                            return Err(fixed_error(
+                                "42804",
+                                "PostgreSQL parameter type is not a valid carrier for the SQL target type",
+                            ));
+                        }
+                        Ok(oid)
+                    }
+                    _ => Ok(PostgresType::for_parameter(parameter.data_type.physical).oid()),
                 },
             )
             .collect::<Result<Vec<_>, _>>()
@@ -1322,7 +1329,13 @@ impl PgWorkerSession {
                         let Some(supplied) = PostgresType::from_oid(oid) else {
                             return Err(map_type_error(TypeMappingError::UnsupportedOid(oid)));
                         };
-                        if supplied.netbadb_physical() == expected.netbadb_physical() {
+                        let Some(target) = expected.parameter_fallback() else {
+                            return Err(fixed_error(
+                                "0A000",
+                                "compatibility parameter type has no scalar carrier",
+                            ));
+                        };
+                        if supplied.is_parameter_carrier_for(target) {
                             Ok(oid)
                         } else {
                             Err(fixed_error(
@@ -1338,6 +1351,21 @@ impl PgWorkerSession {
             Ok(parameters) => parameters,
             Err(error) => return self.extended_error(error),
         };
+        let parameter_targets = match expected_parameters
+            .iter()
+            .map(|data_type| {
+                data_type.parameter_fallback().ok_or_else(|| {
+                    fixed_error(
+                        "0A000",
+                        "compatibility parameter type has no scalar carrier",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(targets) => targets,
+            Err(error) => return self.extended_error(error),
+        };
         if statement.is_empty() {
             self.prepared.remove("");
             self.portals
@@ -1349,10 +1377,7 @@ impl PgWorkerSession {
                 sql: query,
                 execution: PreparedExecution::Compatibility(compatibility),
                 parameters,
-                parameter_targets: expected_parameters
-                    .iter()
-                    .map(|data_type| data_type.netbadb_physical())
-                    .collect(),
+                parameter_targets,
                 fields: compatibility_fields(compatibility),
                 is_query: true,
             },
@@ -1396,14 +1421,9 @@ impl PgWorkerSession {
             .zip(&prepared.parameters)
             .zip(&prepared.parameter_targets)
             .zip(&parameter_formats)
-            .map(|(((bytes, oid), target), format)| match (format, target) {
-                (FormatCode::Text, Some(target)) => {
-                    decode_text_parameter_as(bytes.as_deref(), *oid, *target)
-                }
-                (FormatCode::Binary, Some(target)) => {
-                    decode_binary_parameter_as(bytes.as_deref(), *oid, *target)
-                }
-                (_, None) => Err(TypeMappingError::TypeMismatch),
+            .map(|(((bytes, oid), target), format)| match format {
+                FormatCode::Text => decode_text_parameter_as(bytes.as_deref(), *oid, *target),
+                FormatCode::Binary => decode_binary_parameter_as(bytes.as_deref(), *oid, *target),
             })
             .collect::<Result<Vec<_>, _>>()
         {
@@ -4477,13 +4497,13 @@ fn parameter_status(name: &str, value: &str) -> BackendMessage {
     }
 }
 
-fn parameter_constraint(oid: PostgresOid) -> Result<Option<PhysicalType>, ErrorResponse> {
+fn parameter_hint(oid: PostgresOid) -> Result<Option<ParameterTypeHint>, ErrorResponse> {
     if oid.0 == 0 {
         return Ok(None);
     }
     PostgresType::from_oid(oid)
-        .and_then(PostgresType::netbadb_physical)
-        .map(Some)
+        .and_then(PostgresType::parameter_fallback)
+        .map(|physical| Some(ParameterTypeHint::Fallback(physical)))
         .ok_or_else(|| map_type_error(TypeMappingError::UnsupportedOid(oid)))
 }
 
@@ -4837,6 +4857,236 @@ mod tests {
         .expect("authorization policy")
         .admit(&ClientIdentity::LocalPlaintext)
         .expect("principal")
+    }
+
+    #[test]
+    fn extended_query_keeps_postgres_carriers_distinct_from_exact_targets() {
+        let root = test_path("physical-parameter-carriers");
+        std::fs::create_dir(&root).unwrap();
+        let physical = [
+            ("int8_value", PhysicalType::Int8),
+            ("int16_value", PhysicalType::Int16),
+            ("int32_value", PhysicalType::Int32),
+            ("uint8_value", PhysicalType::UInt8),
+            ("uint16_value", PhysicalType::UInt16),
+            ("uint32_value", PhysicalType::UInt32),
+            ("uint64_value", PhysicalType::UInt64),
+            ("int128_value", PhysicalType::Int128),
+            ("uint128_value", PhysicalType::UInt128),
+            ("float32_value", PhysicalType::Float32),
+            ("float64_value", PhysicalType::Float64),
+            ("bytes_value", PhysicalType::Bytes),
+        ];
+        let table = TableDef::new(
+            TableId(1),
+            "typed_values",
+            physical
+                .iter()
+                .enumerate()
+                .map(|(index, (name, physical))| {
+                    ColumnDef::new(
+                        ColumnId(u32::try_from(index + 1).unwrap()),
+                        *name,
+                        TypeSpec::Physical(*physical),
+                    )
+                    .nullable(true)
+                })
+                .collect(),
+        );
+        let mut database =
+            Database::create_tables(vec![(root.join("typed_values"), table)]).unwrap();
+        let authorization = AuthorizationPolicy::new(
+            TransportKind::PlaintextLoopback,
+            Some(crate::authorization::PrincipalGrants {
+                schema_admin: false,
+                tables: vec![TablePermissions::new(TableId(1), true, true, true, false)],
+            }),
+            Vec::new(),
+            &[TableId(1)],
+        )
+        .unwrap()
+        .admit(&ClientIdentity::LocalPlaintext)
+        .unwrap();
+        let (mut session, _) = PgWorkerSession::new(
+            &database,
+            SessionPolicy::default(),
+            authorization,
+            StartupMessage {
+                parameters: Default::default(),
+            },
+            1,
+        )
+        .unwrap();
+
+        let cases = [
+            (
+                "int8_value",
+                PostgresType::Int2,
+                b"-7".to_vec(),
+                (-7_i16).to_be_bytes().to_vec(),
+            ),
+            (
+                "int16_value",
+                PostgresType::Int2,
+                b"-8".to_vec(),
+                (-8_i16).to_be_bytes().to_vec(),
+            ),
+            (
+                "int32_value",
+                PostgresType::Int4,
+                b"-9".to_vec(),
+                (-9_i32).to_be_bytes().to_vec(),
+            ),
+            (
+                "uint8_value",
+                PostgresType::Int2,
+                b"255".to_vec(),
+                255_i16.to_be_bytes().to_vec(),
+            ),
+            (
+                "uint16_value",
+                PostgresType::Int4,
+                b"65535".to_vec(),
+                65_535_i32.to_be_bytes().to_vec(),
+            ),
+            (
+                "uint32_value",
+                PostgresType::Int8,
+                b"4294967295".to_vec(),
+                4_294_967_295_i64.to_be_bytes().to_vec(),
+            ),
+            (
+                "uint64_value",
+                PostgresType::Int8,
+                b"7".to_vec(),
+                7_i64.to_be_bytes().to_vec(),
+            ),
+            (
+                "int128_value",
+                PostgresType::Int8,
+                b"-10".to_vec(),
+                (-10_i64).to_be_bytes().to_vec(),
+            ),
+            (
+                "uint128_value",
+                PostgresType::Int8,
+                b"11".to_vec(),
+                11_i64.to_be_bytes().to_vec(),
+            ),
+            (
+                "float32_value",
+                PostgresType::Float4,
+                b"1.5".to_vec(),
+                1.5_f32.to_be_bytes().to_vec(),
+            ),
+            (
+                "float64_value",
+                PostgresType::Float8,
+                b"2.5".to_vec(),
+                2.5_f64.to_be_bytes().to_vec(),
+            ),
+            (
+                "bytes_value",
+                PostgresType::Bytea,
+                b"\\x00ff80".to_vec(),
+                vec![0, 0xff, 0x80],
+            ),
+        ];
+        for (index, (column, carrier, text, binary)) in cases.into_iter().enumerate() {
+            for (suffix, format, bytes) in [
+                ("text", FormatCode::Text, text),
+                ("binary", FormatCode::Binary, binary),
+            ] {
+                let name = format!("s{index}_{suffix}");
+                let parse = session.handle(
+                    &mut database,
+                    FrontendMessage::Parse {
+                        statement: name.clone(),
+                        query: format!("INSERT INTO typed_values ({column}) VALUES ($1)"),
+                        parameter_types: vec![carrier.oid()],
+                    },
+                );
+                assert_eq!(
+                    parse,
+                    vec![BackendMessage::ParseComplete],
+                    "{column} {suffix}"
+                );
+                let bind = session.handle(
+                    &mut database,
+                    FrontendMessage::Bind {
+                        portal: name.clone(),
+                        statement: name,
+                        parameter_formats: vec![format],
+                        parameters: vec![Some(bytes)],
+                        result_formats: Vec::new(),
+                    },
+                );
+                assert_eq!(
+                    bind,
+                    vec![BackendMessage::BindComplete],
+                    "{column} {suffix}"
+                );
+            }
+        }
+
+        let parse = session.handle(
+            &mut database,
+            FrontendMessage::Parse {
+                statement: "fallback".into(),
+                query: "SELECT $1".into(),
+                parameter_types: vec![PostgresType::Int2.oid()],
+            },
+        );
+        assert_eq!(parse, vec![BackendMessage::ParseComplete]);
+        assert_eq!(
+            session.prepared["fallback"].parameter_targets,
+            vec![PhysicalType::Int16]
+        );
+
+        for name in ["uint8_below", "uint8_above"] {
+            let parse = session.handle(
+                &mut database,
+                FrontendMessage::Parse {
+                    statement: name.into(),
+                    query: "INSERT INTO typed_values (uint8_value) VALUES ($1)".into(),
+                    parameter_types: vec![PostgresType::Int2.oid()],
+                },
+            );
+            assert_eq!(parse, vec![BackendMessage::ParseComplete]);
+        }
+        for (name, format, bytes) in [
+            ("uint8_below", FormatCode::Text, b"-1".to_vec()),
+            (
+                "uint8_above",
+                FormatCode::Binary,
+                256_i16.to_be_bytes().to_vec(),
+            ),
+        ] {
+            let bind = session.handle(
+                &mut database,
+                FrontendMessage::Bind {
+                    portal: name.into(),
+                    statement: name.into(),
+                    parameter_formats: vec![format],
+                    parameters: vec![Some(bytes)],
+                    result_formats: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                bind.as_slice(),
+                [BackendMessage::ErrorResponse(error)] if error.sqlstate == "22003"
+            ));
+            assert!(matches!(
+                session
+                    .handle(&mut database, FrontendMessage::Sync)
+                    .as_slice(),
+                [BackendMessage::ReadyForQuery(_)]
+            ));
+        }
+
+        drop(session);
+        database.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

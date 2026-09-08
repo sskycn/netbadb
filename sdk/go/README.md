@@ -1,10 +1,10 @@
 # NetbaDB Go client
 
-This module is the independent, standard-library Protocol v1 client for
+This module is the independent, standard-library Protocol v2 client for
 `netbadbd`:
 
 ```text
-Go application -> github.com/sskycn/netbadb/sdk/go -> Protocol v1 -> netbadbd
+Go application -> github.com/sskycn/netbadb/sdk/go -> Protocol v2 -> netbadbd
 ```
 
 It uses no cgo, Rust FFI, shared Rust memory, JSON execution IR, or third-party
@@ -87,7 +87,7 @@ err = tx.Rollback(ctx) // use Commit for a durable commit
 While a transaction is active, query and DML operations must use `Tx`; Ping is
 still allowed. Wire transaction state controls whether an error leaves the
 transaction retryable or terminal. A `RemoteError` exposes a stable `ErrorCode`
-and `TransactionState`; do not classify errors by message text. In Protocol v1,
+and `TransactionState`; do not classify errors by message text. In Protocol v2,
 authorization denial still uses `ErrorCodeDatabase`.
 
 Protocol violations and network failures close the connection. The client does
@@ -99,7 +99,7 @@ on server cleanup.
 
 ## Generated typed bindings
 
-Write a strict language-neutral SDK Schema Spec v1, then generate one package:
+Write a strict language-neutral SDK Schema Spec v2, then generate one package:
 
 ```bash
 cargo run -p netbadb-codegen -- go \

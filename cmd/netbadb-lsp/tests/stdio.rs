@@ -203,8 +203,8 @@ fn invalid_schema_fails_before_protocol_startup() {
             "invalid SDK Schema Spec JSON",
         ),
         (
-            r#"{"version":2,"tables":[]}"#,
-            "unsupported SDK Schema Spec version 2",
+            r#"{"version":3,"tables":[]}"#,
+            "unsupported SDK Schema Spec version 3",
         ),
         (
             r#"{"version":1,"tables":[{"id":1,"name":"a","columns":[]},{"id":1,"name":"b","columns":[]}]}"#,

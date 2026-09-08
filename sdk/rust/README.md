@@ -116,7 +116,7 @@ close or Drop is therefore not proof that rollback completed.
 
 Transport failure after Execute, Commit, or Rollback may occur after the server
 has durably acted but before the response arrives. The outcome is ambiguous and
-the client deliberately does not retry or replay the request. Protocol v1 also
+the client deliberately does not retry or replay the request. Protocol v2 also
 reports authorization denial with the generic `ProtocolErrorCode::Database`;
 clients must not reclassify it by matching message text.
 

@@ -21,8 +21,8 @@ pub use netbadb_schema::{
 };
 pub use netbadb_types::{
     AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, ColumnarSegmentId,
-    DatabaseCommitSeq, PartitionId, PhysicalType, RelationBindingId, ScalarValue, SemanticType,
-    StorageId, TableId,
+    DatabaseCommitSeq, Float32Value, Float64Value, PartitionId, PhysicalType, RelationBindingId,
+    ScalarValue, SemanticType, StorageId, TableId,
 };
 
 /// Stable embedded catalog and physical-plan inspection values and renderers.
@@ -42,7 +42,7 @@ pub mod inspection {
     };
 }
 
-/// Synchronous Protocol v1 remote client APIs.
+/// Synchronous Protocol v2 remote client APIs.
 #[cfg(feature = "remote")]
 pub mod remote {
     pub use netbadb_client::{

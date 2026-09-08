@@ -7,7 +7,7 @@ diagnostics:
 netbadb-lsp --schema path/to/schema.json
 ```
 
-The schema argument is SDK Schema Spec v1, parsed once at startup by
+The schema argument is SDK Schema Spec v1 or v2, parsed once at startup by
 `netbadb-schema-spec` and validated through Canonical Schema IR. Invalid JSON,
 unknown fields or physical types, unsupported versions, and canonical schema
 violations fail the process before the LSP initialization handshake. Schema

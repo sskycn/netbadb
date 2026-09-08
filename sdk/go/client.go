@@ -19,8 +19,8 @@ type Config struct {
 	RequiredCapabilities uint64
 }
 
-// Client owns one Protocol v1 connection and session. It is not safe for
-// concurrent use and Protocol v1 does not multiplex requests.
+// Client owns one Protocol v2 connection and session. It is not safe for
+// concurrent use and Protocol v2 does not multiplex requests.
 type Client struct {
 	conn          net.Conn
 	nextRequestID uint64
@@ -115,7 +115,7 @@ func (c *Client) handshake(ctx context.Context, requiredCapabilities uint64, req
 		return c.protocolFailure("Hello response is not HelloAck")
 	}
 	if message.protocolVersion != protocolVersion {
-		return c.protocolFailure("HelloAck inner protocol version is not 1")
+		return c.protocolFailure("HelloAck inner protocol version is not 2")
 	}
 	if message.maxFramePayload == 0 || message.maxFramePayload > maxFramePayload {
 		return c.protocolFailure("HelloAck maximum frame payload is invalid")

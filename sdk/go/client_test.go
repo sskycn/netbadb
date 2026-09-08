@@ -141,6 +141,44 @@ func TestStreamingRowsDrainAndMonotonicRequestIDs(t *testing.T) {
 	}
 }
 
+func TestQueryStartRejectsUnsupported128BitResultsBeforeRows(t *testing.T) {
+	for _, physical := range []PhysicalType{PhysicalTypeInt128, PhysicalTypeUInt128} {
+		t.Run(physical.String(), func(t *testing.T) {
+			client, server := pipeClient()
+			defer server.Close()
+			go func() {
+				id, _, _, _ := readClientTestFrame(server)
+				writeTestMessage(t, server, id, serverMessage{kind: kindServerQueryStart, columns: []ResultColumn{{Name: "value", Type: SemanticType{Physical: physical}}}})
+			}()
+			_, err := client.Query(context.Background(), "SELECT value FROM values WHERE false")
+			var protocol *ProtocolError
+			if !errors.As(err, &protocol) {
+				t.Fatalf("Query error = %T %v", err, err)
+			}
+			if !client.closed {
+				t.Fatal("unsupported result metadata did not close client")
+			}
+		})
+	}
+
+	client, server := pipeClient()
+	defer client.Close()
+	defer server.Close()
+	go func() {
+		id, _, _, _ := readClientTestFrame(server)
+		writeTestMessage(t, server, id, serverMessage{kind: kindServerQueryStart, columns: []ResultColumn{{Name: "value", Type: SemanticType{Physical: PhysicalTypeInt64}}}})
+		writeTestMessage(t, server, id, serverMessage{kind: kindServerQueryEnd, count: 0})
+	}()
+	rows, err := client.Query(context.Background(), "SELECT value FROM values WHERE false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := rows.Next()
+	if next || rows.Err() != nil {
+		t.Fatalf("supported empty result: Next=%v Err=%v", next, rows.Err())
+	}
+}
+
 func TestRowsRejectShapeTypeNullabilityAndCountMismatches(t *testing.T) {
 	cases := []struct {
 		name string
@@ -316,7 +354,7 @@ func TestSchemaFingerprintGateAndExtraVisibleTables(t *testing.T) {
 			go func() {
 				id, _, _, err := readClientTestFrame(server)
 				if err == nil {
-					writeTestMessage(t, server, id, serverMessage{kind: kindServerHelloAck, protocolVersion: 1, maxFramePayload: maxFramePayload, capabilities: 7, tables: tc.tables})
+					writeTestMessage(t, server, id, serverMessage{kind: kindServerHelloAck, protocolVersion: ProtocolVersion, maxFramePayload: maxFramePayload, capabilities: 7, tables: tc.tables})
 				}
 			}()
 			err := client.handshake(context.Background(), 7, []TableIdentity{required})
@@ -349,7 +387,7 @@ func TestHelloAckValidationAndServerInfoCopy(t *testing.T) {
 	tables := []TableIdentity{{TableID: 1, Fingerprint: SchemaFingerprint{1}}}
 	go func() {
 		id, _, _, _ := readClientTestFrame(server)
-		writeTestMessage(t, server, id, serverMessage{kind: kindServerHelloAck, protocolVersion: 1, maxFramePayload: maxFramePayload, capabilities: 7, tables: tables})
+		writeTestMessage(t, server, id, serverMessage{kind: kindServerHelloAck, protocolVersion: ProtocolVersion, maxFramePayload: maxFramePayload, capabilities: 7, tables: tables})
 	}()
 	if err := client.handshake(context.Background(), 7, tables); err != nil {
 		t.Fatal(err)

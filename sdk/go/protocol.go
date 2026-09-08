@@ -9,13 +9,13 @@ import (
 )
 
 const (
-	// ProtocolMagic is the fixed Protocol v1 frame marker.
+	// ProtocolMagic is the fixed Protocol v2 frame marker.
 	ProtocolMagic = "NDBP"
 	// ProtocolVersion is the only protocol version supported by this module.
-	ProtocolVersion uint16 = 1
-	// FrameHeaderSize is the fixed Protocol v1 header width.
+	ProtocolVersion uint16 = 2
+	// FrameHeaderSize is the fixed Protocol v2 header width.
 	FrameHeaderSize = 24
-	// MaxFramePayload is the Protocol v1 payload allocation bound.
+	// MaxFramePayload is the Protocol v2 payload allocation bound.
 	MaxFramePayload uint32 = 16 * 1024 * 1024
 	// MaxCollectionItems bounds every repeated wire collection.
 	MaxCollectionItems uint32 = 65_536
@@ -284,6 +284,9 @@ func decodeServerPayload(kind uint16, payload []byte) (serverMessage, error) {
 			if e != nil {
 				return m, e
 			}
+			if semantic.Physical == PhysicalTypeInt128 || semantic.Physical == PhysicalTypeUInt128 {
+				return m, &ProtocolError{Reason: fmt.Sprintf("128-bit result type %s is unsupported by the Go Protocol v2 client", semantic.Physical)}
+			}
 			nullable, e := c.boolean()
 			if e != nil {
 				return m, e
@@ -394,7 +397,7 @@ func decodeValue(c *wireCursor) (Value, error) {
 		v, e := c.u32()
 		return Int32Value(int32(v)), e
 	case ValueKindInt128, ValueKindUInt128:
-		return Value{}, &ProtocolError{Reason: "128-bit scalar values are unsupported by the Go v1 client"}
+		return Value{}, &ProtocolError{Reason: "128-bit scalar values are unsupported by the Go Protocol v2 client"}
 	case ValueKindUInt8:
 		v, e := c.u8()
 		return UInt8Value(v), e
