@@ -102,6 +102,30 @@ pub struct ColumnarProjectionPlanningSnapshot {
     pub row_groups: Vec<ColumnarRowGroupPlanningSnapshot>,
 }
 
+/// Storage-neutral work comparison for one concrete columnar projection.
+///
+/// This is immutable planner evidence, not a maintenance recommendation. Core
+/// may use it to evaluate an already-existing derived projection without
+/// copying the planner's cost formula or allowing planning to mutate storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnarPlanningCost {
+    pub source_work_units: u64,
+    pub projection_work_units: u64,
+}
+
+impl ColumnarPlanningCost {
+    #[must_use]
+    pub const fn benefit_work_units(self) -> u64 {
+        self.source_work_units
+            .saturating_sub(self.projection_work_units)
+    }
+
+    #[must_use]
+    pub const fn projection_is_preferred(self) -> bool {
+        self.projection_work_units <= self.source_work_units
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnarRowGroupPlanningSnapshot {
     pub rows: u32,
@@ -344,6 +368,20 @@ pub fn plan_with_columnar_snapshots(
     select_columnar_scans(plan, table_statistics, projections, true, &[])
 }
 
+/// Evaluates one existing projection with the same storage-neutral work model
+/// used by physical scan selection. The projection's complete declared column
+/// set is used because Adaptive Operations Phase 1 has no workload model.
+#[must_use]
+pub fn evaluate_columnar_projection_cost(
+    statistics: Option<TableStatistics>,
+    projection: &ColumnarProjectionPlanningSnapshot,
+) -> ColumnarPlanningCost {
+    ColumnarPlanningCost {
+        source_work_units: source_scan_work_units(statistics, projection.row_count),
+        projection_work_units: columnar_work_units(projection, &projection.projected_columns, &[]),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ColumnarPlanningConstraint {
     column_id: ColumnId,
@@ -369,21 +407,17 @@ fn select_columnar_scans(
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
-            let source_work = table_statistics
+            let source_statistics = table_statistics
                 .iter()
                 .find(|entry| entry.table_id == table_id)
-                .and_then(|entry| entry.statistics)
-                .map_or_else(
-                    || {
-                        projections
-                            .iter()
-                            .filter(|projection| projection.table_id == table_id)
-                            .map(|projection| 1_u64.saturating_add(projection.row_count / 32))
-                            .max()
-                            .unwrap_or(1)
-                    },
-                    |statistics| statistics.managed_page_count.max(1),
-                );
+                .and_then(|entry| entry.statistics);
+            let fallback_rows = projections
+                .iter()
+                .filter(|projection| projection.table_id == table_id)
+                .map(|projection| projection.row_count)
+                .max()
+                .unwrap_or(0);
+            let source_work = source_scan_work_units(source_statistics, fallback_rows);
             let selected = projections
                 .iter()
                 .filter(|projection| {
@@ -569,6 +603,13 @@ fn select_columnar_scans(
             columns,
         },
         other => other,
+    }
+}
+
+fn source_scan_work_units(statistics: Option<TableStatistics>, fallback_rows: u64) -> u64 {
+    match statistics {
+        Some(statistics) => statistics.managed_page_count.max(1),
+        None => 1_u64.saturating_add(fallback_rows / 32),
     }
 }
 

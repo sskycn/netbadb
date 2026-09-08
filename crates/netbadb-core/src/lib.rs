@@ -1,5 +1,8 @@
 //! Native synchronous embedded API for NetbaDB.
 
+mod adaptive;
+#[cfg(test)]
+mod adaptive_tests;
 mod columnar;
 #[cfg(test)]
 mod columnar_tests;
@@ -73,6 +76,13 @@ use registry::{
 use schema_catalog::CommittedCatalogState;
 use transaction::{PublishedVisibility, SharedCoordinatorLog, SharedPublishedVisibility};
 
+pub use adaptive::{
+    AdaptiveAbortReason, AdaptiveColumnarAction, AdaptiveColumnarMeasurement,
+    AdaptiveColumnarObservation, AdaptiveColumnarState, AdaptiveCycleReport, AdaptiveDecision,
+    AdaptiveError, AdaptiveExecutionReport, AdaptiveMaintenanceOutcome,
+    AdaptiveMaintenanceProposal, AdaptiveNoAction, AdaptiveNoActionReason, AdaptiveObservation,
+    AdaptiveObservationAnchor, AdaptivePlannerEvidence, AdaptivePolicy, AdaptiveSourceObservation,
+};
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
     ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
@@ -91,12 +101,13 @@ pub use netbadb_executor::{
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
-    ChangeBatch, ChangeBatchInspection, ChangeReadResult, ChangeStreamCursor, ChangeStreamError,
-    ChangeStreamInspection, CommittedReadAnchor, HistoricalOrphanAdoptionReport, IndexDefinition,
-    IndexMaintenanceReport, IndexReclaimReport, IndexStatistics, IndexTailReclaimReport,
-    IsolationLevel, LsmInspection, LsmLevelInspection, LsmReadAmplification, LsmWriteAmplification,
-    PageReuseClass, PageReuseInspection, PreparedRuntimeInspection, ReusablePageInspection,
-    StorageChange, StorageError, StorageKind, StorageVersionKey, TableStatistics,
+    ChangeBatch, ChangeBatchInspection, ChangeBatchMaintenanceInspection, ChangeReadResult,
+    ChangeStreamCursor, ChangeStreamError, ChangeStreamInspection, CommittedReadAnchor,
+    HistoricalOrphanAdoptionReport, IndexDefinition, IndexMaintenanceReport, IndexReclaimReport,
+    IndexStatistics, IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
+    LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
+    PreparedRuntimeInspection, ReusablePageInspection, StorageChange, StorageError, StorageKind,
+    StorageSnapshotToken, StorageVersionKey, TableStatistics,
 };
 pub use netbadb_types::{
     ChangeStreamGeneration, SchemaGeneration, StorageDataVersion, TableSchemaVersion,
@@ -1120,6 +1131,7 @@ pub struct Database {
     mutation_journal: Option<schema_mutation::SharedMutationJournal>,
     schema_writer: schema_mutation::SchemaWriter,
     maintenance_cursor: Option<maintenance::MaintenanceCursor>,
+    adaptive_runtime: adaptive::AdaptiveRuntimeState,
     group_barrier: Rc<Cell<Option<u64>>>,
     active_group: Option<ActiveGroupCommit>,
     next_group_id: u64,
@@ -1153,6 +1165,67 @@ fn initial_published_visibility(
     Ok(Some(Rc::new(RefCell::new(PublishedVisibility {
         snapshot,
     }))))
+}
+
+fn columnar_planning_snapshot(
+    projection: &ColumnarProjection,
+) -> ColumnarProjectionPlanningSnapshot {
+    let metadata = projection.metadata();
+    let (
+        delta_segment_count,
+        delta_bytes,
+        delta_mutation_count,
+        delta_live_row_count,
+        suppressed_version_count,
+    ) = metadata
+        .incremental
+        .as_ref()
+        .map_or((0, 0, 0, 0, 0), |incremental| {
+            (
+                incremental.delta_segments.len() as u64,
+                incremental.delta_bytes,
+                incremental.delta_mutation_count,
+                incremental.delta_live_row_count,
+                incremental.suppressed_version_count,
+            )
+        });
+    ColumnarProjectionPlanningSnapshot {
+        projection_id: metadata.id,
+        generation: metadata.generation,
+        table_id: metadata.table_id,
+        source_storage_id: metadata.source_storage_id,
+        projected_columns: metadata
+            .columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        row_count: metadata.row_count,
+        row_group_count: metadata.row_group_count,
+        segment_bytes: metadata.segment_bytes,
+        delta_segment_count,
+        delta_bytes,
+        delta_mutation_count,
+        delta_live_row_count,
+        suppressed_version_count,
+        row_groups: projection
+            .row_group_statistics()
+            .into_iter()
+            .map(|group| ColumnarRowGroupPlanningSnapshot {
+                rows: group.rows,
+                columns: group
+                    .columns
+                    .into_iter()
+                    .map(|(column_id, statistics)| ColumnarZoneMapPlanningSnapshot {
+                        column_id,
+                        null_count: statistics.null_count,
+                        minimum: statistics.minimum,
+                        maximum: statistics.maximum,
+                        encoded_bytes: statistics.encoded_bytes,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 impl Database {
@@ -1974,6 +2047,7 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -2005,6 +2079,7 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -2053,6 +2128,7 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -2126,6 +2202,7 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -5014,6 +5091,12 @@ impl Database {
             .filter_map(|entry| {
                 let projection = entry.projection.as_ref()?;
                 let metadata = projection.metadata();
+                if self
+                    .adaptive_runtime
+                    .is_suppressed(metadata.id, metadata.generation)
+                {
+                    return None;
+                }
                 let placement = self.bindings.placement(metadata.table_id).ok()?;
                 let TablePlacement::Single { storage_id, .. } = placement else {
                     return None;
@@ -5025,13 +5108,7 @@ impl Database {
                 if storage.table().fingerprint().ok()? != metadata.schema_fingerprint {
                     return None;
                 }
-                let (
-                    delta_segment_count,
-                    delta_bytes,
-                    delta_mutation_count,
-                    delta_live_row_count,
-                    suppressed_version_count,
-                ) = match &metadata.incremental {
+                match &metadata.incremental {
                     Some(incremental) => {
                         let stream = storage.inspect_change_stream();
                         if stream.status != netbadb_storage::ChangeStreamStatus::Enabled
@@ -5040,58 +5117,14 @@ impl Database {
                         {
                             return None;
                         }
-                        (
-                            incremental.delta_segments.len() as u64,
-                            incremental.delta_bytes,
-                            incremental.delta_mutation_count,
-                            incremental.delta_live_row_count,
-                            incremental.suppressed_version_count,
-                        )
                     }
                     None => {
                         if storage.current_snapshot_token().ok()? != metadata.source_token {
                             return None;
                         }
-                        (0, 0, 0, 0, 0)
                     }
-                };
-                Some(ColumnarProjectionPlanningSnapshot {
-                    projection_id: metadata.id,
-                    generation: metadata.generation,
-                    table_id: metadata.table_id,
-                    source_storage_id: metadata.source_storage_id,
-                    projected_columns: metadata
-                        .columns
-                        .iter()
-                        .map(|column| column.column_id)
-                        .collect(),
-                    row_count: metadata.row_count,
-                    row_group_count: metadata.row_group_count,
-                    segment_bytes: metadata.segment_bytes,
-                    delta_segment_count,
-                    delta_bytes,
-                    delta_mutation_count,
-                    delta_live_row_count,
-                    suppressed_version_count,
-                    row_groups: projection
-                        .row_group_statistics()
-                        .into_iter()
-                        .map(|group| ColumnarRowGroupPlanningSnapshot {
-                            rows: group.rows,
-                            columns: group
-                                .columns
-                                .into_iter()
-                                .map(|(column_id, statistics)| ColumnarZoneMapPlanningSnapshot {
-                                    column_id,
-                                    null_count: statistics.null_count,
-                                    minimum: statistics.minimum,
-                                    maximum: statistics.maximum,
-                                    encoded_bytes: statistics.encoded_bytes,
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                })
+                }
+                Some(columnar_planning_snapshot(projection))
             })
             .collect()
     }
@@ -7637,6 +7670,7 @@ mod tests {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            adaptive_runtime: crate::adaptive::AdaptiveRuntimeState::default(),
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,

@@ -120,6 +120,15 @@ projection handles separately from mutable `TableStorage` and its read views.
 See [Columnar Phase 1](columnar-phase1.md) for token, format, publication,
 fallback, and vector-execution invariants.
 
+[Adaptive Operations Phase 1](adaptive-operations-phase1.md)
+adds the explicit synchronous Observe→Decide→Revalidate→Change→Measure→Outcome
+composition layer for existing incremental projections. It consumes the
+planner's immutable cost evaluator without letting planning mutate storage,
+binds every proposal to global/source/projection/stream evidence, and uses a
+first-class maintenance budget. Revert is runtime-only planner suppression of
+one derived generation; it never changes authoritative data or the logical
+projection definition.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
