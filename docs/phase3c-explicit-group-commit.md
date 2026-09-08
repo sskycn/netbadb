@@ -112,7 +112,7 @@ cargo bench -p netbadb-core --bench global_group_commit_phase3c
 ```
 
 It covers Heap, LSM, and mixed Heap+LSM members at 100 and 1,000 transactions
-with group sizes 1, 4, 8, 16, and 32. Output includes exact coordinator sync
+with group sizes 1, 4, 8, 10, 16, and 32. Output includes exact coordinator sync
 counters, transactions per sync, elapsed time, coordinator bytes, published G,
 and authoritative Heap/LSM WAL bytes. It also runs explicit Heap and LSM
 same-row conflict scenarios and verifies the surviving group and final data.

@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     for engine in ["heap", "lsm", "heap+lsm"] {
         for transactions in [100, 1_000] {
-            for group_size in [1, 4, 8, 16, 32] {
+            for group_size in [1, 4, 8, 10, 16, 32] {
                 run(engine, transactions, group_size)?;
             }
         }
