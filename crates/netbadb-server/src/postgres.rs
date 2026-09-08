@@ -2105,68 +2105,72 @@ fn classify_simple_compatibility_query(
     }
     let tokens = lex_compatibility_query(sql)?;
     if let Some(class_alias) = relation_alias(&tokens, "pg_catalog", "pg_class") {
-        if let Some(namespace_alias) = relation_alias(&tokens, "pg_catalog", "pg_namespace")
-            && !normalized.contains("pg_catalog.pg_get_userbyid(")
-            && has_column_reference(&tokens, class_alias, "oid")
-            && has_column_reference(&tokens, class_alias, "relname")
-            && has_column_reference(&tokens, class_alias, "relnamespace")
-            && has_column_reference(&tokens, namespace_alias, "oid")
-            && has_column_reference(&tokens, namespace_alias, "nspname")
-            && let Some((PgCompatibilityOperator::RegexMatch, pattern)) =
-                column_pattern(&tokens, class_alias, "relname")
-        {
-            PgCatalogPattern::compile(&pattern)?;
-            if has_visible_table_predicate(&tokens, class_alias) {
-                return Ok(Some(SimpleCompatibilityQuery {
-                    statement: CompatibilityStatement::PsqlRelationLookup,
-                    values: vec![ScalarValue::Text(pattern)],
-                }));
-            }
-            if let Some((PgCompatibilityOperator::RegexMatch, schema_pattern)) =
-                column_pattern(&tokens, namespace_alias, "nspname")
+        if let Some(namespace_alias) = relation_alias(&tokens, "pg_catalog", "pg_namespace") {
+            if !normalized.contains("pg_catalog.pg_get_userbyid(")
+                && has_column_reference(&tokens, class_alias, "oid")
+                && has_column_reference(&tokens, class_alias, "relname")
+                && has_column_reference(&tokens, class_alias, "relnamespace")
+                && has_column_reference(&tokens, namespace_alias, "oid")
+                && has_column_reference(&tokens, namespace_alias, "nspname")
             {
-                PgCatalogPattern::compile(&schema_pattern)?;
-                return Ok(Some(SimpleCompatibilityQuery {
-                    statement: CompatibilityStatement::PsqlRelationLookupQualified,
-                    values: vec![
-                        ScalarValue::Text(schema_pattern),
-                        ScalarValue::Text(pattern),
-                    ],
-                }));
+                if let Some((PgCompatibilityOperator::RegexMatch, pattern)) =
+                    column_pattern(&tokens, class_alias, "relname")
+                {
+                    PgCatalogPattern::compile(&pattern)?;
+                    if has_visible_table_predicate(&tokens, class_alias) {
+                        return Ok(Some(SimpleCompatibilityQuery {
+                            statement: CompatibilityStatement::PsqlRelationLookup,
+                            values: vec![ScalarValue::Text(pattern)],
+                        }));
+                    }
+                    if let Some((PgCompatibilityOperator::RegexMatch, schema_pattern)) =
+                        column_pattern(&tokens, namespace_alias, "nspname")
+                    {
+                        PgCatalogPattern::compile(&schema_pattern)?;
+                        return Ok(Some(SimpleCompatibilityQuery {
+                            statement: CompatibilityStatement::PsqlRelationLookupQualified,
+                            values: vec![
+                                ScalarValue::Text(schema_pattern),
+                                ScalarValue::Text(pattern),
+                            ],
+                        }));
+                    }
+                }
             }
         }
-        if let Some(namespace_alias) = relation_alias(&tokens, "pg_catalog", "pg_namespace")
-            && relation_alias(&tokens, "pg_catalog", "pg_am").is_some()
-            && normalized.contains("pg_catalog.pg_get_userbyid(")
-            && ["relname", "relkind", "relowner", "relnamespace"]
-                .into_iter()
-                .all(|column| has_column_reference(&tokens, class_alias, column))
-            && has_column_reference(&tokens, namespace_alias, "oid")
-            && has_column_reference(&tokens, namespace_alias, "nspname")
-        {
-            let schema_pattern = column_pattern(&tokens, namespace_alias, "nspname")
-                .map(|(_, pattern)| PgCatalogPattern::compile(&pattern).map(|_| pattern))
-                .transpose()?;
-            let name_pattern = column_pattern(&tokens, class_alias, "relname")
-                .map(|(_, pattern)| PgCatalogPattern::compile(&pattern).map(|_| pattern))
-                .transpose()?;
-            let values = vec![
-                schema_pattern.map_or(ScalarValue::Null, ScalarValue::Text),
-                name_pattern.map_or(ScalarValue::Null, ScalarValue::Text),
-            ];
-            if relation_alias(&tokens, "pg_catalog", "pg_index").is_some()
-                && normalized.contains("indexrelid")
-                && normalized.contains("indrelid")
+        if let Some(namespace_alias) = relation_alias(&tokens, "pg_catalog", "pg_namespace") {
+            if relation_alias(&tokens, "pg_catalog", "pg_am").is_some()
+                && normalized.contains("pg_catalog.pg_get_userbyid(")
+                && ["relname", "relkind", "relowner", "relnamespace"]
+                    .into_iter()
+                    .all(|column| has_column_reference(&tokens, class_alias, column))
+                && has_column_reference(&tokens, namespace_alias, "oid")
+                && has_column_reference(&tokens, namespace_alias, "nspname")
             {
+                let schema_pattern = column_pattern(&tokens, namespace_alias, "nspname")
+                    .map(|(_, pattern)| PgCatalogPattern::compile(&pattern).map(|_| pattern))
+                    .transpose()?;
+                let name_pattern = column_pattern(&tokens, class_alias, "relname")
+                    .map(|(_, pattern)| PgCatalogPattern::compile(&pattern).map(|_| pattern))
+                    .transpose()?;
+                let values = vec![
+                    schema_pattern.map_or(ScalarValue::Null, ScalarValue::Text),
+                    name_pattern.map_or(ScalarValue::Null, ScalarValue::Text),
+                ];
+                if relation_alias(&tokens, "pg_catalog", "pg_index").is_some()
+                    && normalized.contains("indexrelid")
+                    && normalized.contains("indrelid")
+                {
+                    return Ok(Some(SimpleCompatibilityQuery {
+                        statement: CompatibilityStatement::PsqlIndexList,
+                        values,
+                    }));
+                }
                 return Ok(Some(SimpleCompatibilityQuery {
-                    statement: CompatibilityStatement::PsqlIndexList,
+                    statement: CompatibilityStatement::PsqlTableList,
                     values,
                 }));
             }
-            return Ok(Some(SimpleCompatibilityQuery {
-                statement: CompatibilityStatement::PsqlTableList,
-                values,
-            }));
         }
         if relation_alias(&tokens, "pg_catalog", "pg_am").is_some()
             && [
@@ -2185,83 +2189,90 @@ fn classify_simple_compatibility_query(
             ]
             .into_iter()
             .all(|column| has_column_reference(&tokens, class_alias, column))
-            && let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")?
         {
-            return Ok(Some(SimpleCompatibilityQuery {
-                statement: CompatibilityStatement::PsqlRelationProperties,
-                values: vec![ScalarValue::Int64(i64::from(oid))],
-            }));
+            if let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")? {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlRelationProperties,
+                    values: vec![ScalarValue::Int64(i64::from(oid))],
+                }));
+            }
         }
-        if let Some(index_alias) = relation_alias(&tokens, "pg_catalog", "pg_index")
-            && relation_alias(&tokens, "pg_catalog", "pg_constraint").is_some()
-            && normalized.contains("pg_catalog.pg_get_indexdef(")
-            && normalized.contains("pg_catalog.pg_get_constraintdef(")
+        if let Some(index_alias) = relation_alias(&tokens, "pg_catalog", "pg_index") {
+            if relation_alias(&tokens, "pg_catalog", "pg_constraint").is_some()
+                && normalized.contains("pg_catalog.pg_get_indexdef(")
+                && normalized.contains("pg_catalog.pg_get_constraintdef(")
+                && [
+                    "indrelid",
+                    "indexrelid",
+                    "indisprimary",
+                    "indisunique",
+                    "indisclustered",
+                    "indisvalid",
+                    "indisreplident",
+                ]
+                .into_iter()
+                .all(|column| has_column_reference(&tokens, index_alias, column))
+            {
+                if let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")? {
+                    return Ok(Some(SimpleCompatibilityQuery {
+                        statement: CompatibilityStatement::PsqlIndexes,
+                        values: vec![ScalarValue::Int64(i64::from(oid))],
+                    }));
+                }
+            }
+        }
+    }
+    if let Some(attribute_alias) = relation_alias(&tokens, "pg_catalog", "pg_attribute") {
+        if relation_alias(&tokens, "pg_catalog", "pg_attrdef").is_some()
+            && relation_alias(&tokens, "pg_catalog", "pg_collation").is_some()
+            && relation_alias(&tokens, "pg_catalog", "pg_type").is_some()
+            && normalized.contains("pg_catalog.format_type(")
+            && normalized.contains("pg_catalog.pg_get_expr(")
             && [
-                "indrelid",
-                "indexrelid",
-                "indisprimary",
-                "indisunique",
-                "indisclustered",
-                "indisvalid",
-                "indisreplident",
+                "attname",
+                "atttypid",
+                "atttypmod",
+                "attrelid",
+                "attnum",
+                "attnotnull",
+                "attcollation",
+                "attidentity",
+                "attgenerated",
+                "attisdropped",
             ]
             .into_iter()
-            .all(|column| has_column_reference(&tokens, index_alias, column))
-            && let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")?
+            .all(|column| has_column_reference(&tokens, attribute_alias, column))
         {
-            return Ok(Some(SimpleCompatibilityQuery {
-                statement: CompatibilityStatement::PsqlIndexes,
-                values: vec![ScalarValue::Int64(i64::from(oid))],
-            }));
+            if let Some(oid) = relation_oid_literal(&tokens, attribute_alias, "attrelid")? {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlColumns,
+                    values: vec![ScalarValue::Int64(i64::from(oid))],
+                }));
+            }
         }
     }
-    if let Some(attribute_alias) = relation_alias(&tokens, "pg_catalog", "pg_attribute")
-        && relation_alias(&tokens, "pg_catalog", "pg_attrdef").is_some()
-        && relation_alias(&tokens, "pg_catalog", "pg_collation").is_some()
-        && relation_alias(&tokens, "pg_catalog", "pg_type").is_some()
-        && normalized.contains("pg_catalog.format_type(")
-        && normalized.contains("pg_catalog.pg_get_expr(")
-        && [
-            "attname",
-            "atttypid",
-            "atttypmod",
-            "attrelid",
-            "attnum",
-            "attnotnull",
-            "attcollation",
-            "attidentity",
-            "attgenerated",
-            "attisdropped",
-        ]
-        .into_iter()
-        .all(|column| has_column_reference(&tokens, attribute_alias, column))
-        && let Some(oid) = relation_oid_literal(&tokens, attribute_alias, "attrelid")?
-    {
-        return Ok(Some(SimpleCompatibilityQuery {
-            statement: CompatibilityStatement::PsqlColumns,
-            values: vec![ScalarValue::Int64(i64::from(oid))],
-        }));
-    }
-    if let Some(policy_alias) = relation_alias(&tokens, "pg_catalog", "pg_policy")
-        && relation_alias(&tokens, "pg_catalog", "pg_roles").is_some()
-        && normalized.contains("pg_catalog.pg_get_expr(")
-        && [
-            "polname",
-            "polpermissive",
-            "polroles",
-            "polqual",
-            "polrelid",
-            "polwithcheck",
-            "polcmd",
-        ]
-        .into_iter()
-        .all(|column| has_column_reference(&tokens, policy_alias, column))
-        && let Some(oid) = relation_oid_literal(&tokens, policy_alias, "polrelid")?
-    {
-        return Ok(Some(SimpleCompatibilityQuery {
-            statement: CompatibilityStatement::PsqlPolicies,
-            values: vec![ScalarValue::Int64(i64::from(oid))],
-        }));
+    if let Some(policy_alias) = relation_alias(&tokens, "pg_catalog", "pg_policy") {
+        if relation_alias(&tokens, "pg_catalog", "pg_roles").is_some()
+            && normalized.contains("pg_catalog.pg_get_expr(")
+            && [
+                "polname",
+                "polpermissive",
+                "polroles",
+                "polqual",
+                "polrelid",
+                "polwithcheck",
+                "polcmd",
+            ]
+            .into_iter()
+            .all(|column| has_column_reference(&tokens, policy_alias, column))
+        {
+            if let Some(oid) = relation_oid_literal(&tokens, policy_alias, "polrelid")? {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlPolicies,
+                    values: vec![ScalarValue::Int64(i64::from(oid))],
+                }));
+            }
+        }
     }
     if normalized.contains(" from pg_catalog.pg_statistic_ext ")
         && normalized.contains("pg_catalog.pg_get_statisticsobjdef_columns(")
@@ -2275,12 +2286,13 @@ fn classify_simple_compatibility_query(
         ]
         .into_iter()
         .all(|column| normalized.contains(column))
-        && let Some(oid) = unqualified_oid_literal(&tokens, "stxrelid")?
     {
-        return Ok(Some(SimpleCompatibilityQuery {
-            statement: CompatibilityStatement::PsqlExtendedStatistics,
-            values: vec![ScalarValue::Int64(i64::from(oid))],
-        }));
+        if let Some(oid) = unqualified_oid_literal(&tokens, "stxrelid")? {
+            return Ok(Some(SimpleCompatibilityQuery {
+                statement: CompatibilityStatement::PsqlExtendedStatistics,
+                values: vec![ScalarValue::Int64(i64::from(oid))],
+            }));
+        }
     }
     if relation_alias(&tokens, "pg_catalog", "pg_publication").is_some()
         && relation_alias(&tokens, "pg_catalog", "pg_publication_namespace").is_some()
@@ -2288,41 +2300,47 @@ fn classify_simple_compatibility_query(
         && normalized.contains("pg_catalog.pg_relation_is_publishable(")
         && normalized.contains(" union ")
         && normalized.contains("pubname")
-        && let Some(class_alias) = relation_alias(&tokens, "pg_catalog", "pg_class")
-        && let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")?
     {
-        return Ok(Some(SimpleCompatibilityQuery {
-            statement: CompatibilityStatement::PsqlPublications,
-            values: vec![ScalarValue::Int64(i64::from(oid))],
-        }));
+        if let Some(class_alias) = relation_alias(&tokens, "pg_catalog", "pg_class") {
+            if let Some(oid) = relation_oid_literal(&tokens, class_alias, "oid")? {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlPublications,
+                    values: vec![ScalarValue::Int64(i64::from(oid))],
+                }));
+            }
+        }
     }
-    if let Some(inherits_alias) = relation_alias(&tokens, "pg_catalog", "pg_inherits")
-        && normalized.contains("::pg_catalog.regclass")
-        && ["inhparent", "inhrelid"]
-            .into_iter()
-            .all(|column| has_column_reference(&tokens, inherits_alias, column))
-        && normalized.contains("inhseqno")
-        && let Some(oid) = relation_oid_literal(&tokens, inherits_alias, "inhrelid")?
-    {
-        return Ok(Some(SimpleCompatibilityQuery {
-            statement: CompatibilityStatement::PsqlInheritanceParents,
-            values: vec![ScalarValue::Int64(i64::from(oid))],
-        }));
+    if let Some(inherits_alias) = relation_alias(&tokens, "pg_catalog", "pg_inherits") {
+        if normalized.contains("::pg_catalog.regclass")
+            && ["inhparent", "inhrelid"]
+                .into_iter()
+                .all(|column| has_column_reference(&tokens, inherits_alias, column))
+            && normalized.contains("inhseqno")
+        {
+            if let Some(oid) = relation_oid_literal(&tokens, inherits_alias, "inhrelid")? {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlInheritanceParents,
+                    values: vec![ScalarValue::Int64(i64::from(oid))],
+                }));
+            }
+        }
     }
-    if let Some(inherits_alias) = relation_alias(&tokens, "pg_catalog", "pg_inherits")
-        && normalized.contains("::pg_catalog.regclass")
-        && normalized.contains("pg_catalog.pg_get_expr(")
-        && normalized.contains("relpartbound")
-        && normalized.contains("inhdetachpending")
-        && ["inhparent", "inhrelid"]
-            .into_iter()
-            .all(|column| has_column_reference(&tokens, inherits_alias, column))
-        && let Some(oid) = relation_oid_literal(&tokens, inherits_alias, "inhparent")?
-    {
-        return Ok(Some(SimpleCompatibilityQuery {
-            statement: CompatibilityStatement::PsqlInheritanceChildren,
-            values: vec![ScalarValue::Int64(i64::from(oid))],
-        }));
+    if let Some(inherits_alias) = relation_alias(&tokens, "pg_catalog", "pg_inherits") {
+        if normalized.contains("::pg_catalog.regclass")
+            && normalized.contains("pg_catalog.pg_get_expr(")
+            && normalized.contains("relpartbound")
+            && normalized.contains("inhdetachpending")
+            && ["inhparent", "inhrelid"]
+                .into_iter()
+                .all(|column| has_column_reference(&tokens, inherits_alias, column))
+        {
+            if let Some(oid) = relation_oid_literal(&tokens, inherits_alias, "inhparent")? {
+                return Ok(Some(SimpleCompatibilityQuery {
+                    statement: CompatibilityStatement::PsqlInheritanceChildren,
+                    values: vec![ScalarValue::Int64(i64::from(oid))],
+                }));
+            }
+        }
     }
     Ok(None)
 }

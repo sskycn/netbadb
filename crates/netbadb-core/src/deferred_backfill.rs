@@ -266,10 +266,10 @@ impl DeferredBackfillAction {
         target_values: &[ScalarValue],
     ) -> Result<Option<EvaluatedAssignments>, DatabaseError> {
         let values = self.layout.values(target_values)?;
-        if let Some(predicate) = &self.predicate
-            && !typed_row_predicate_matches(predicate, &self.layout.fields, &values)?
-        {
-            return Ok(None);
+        if let Some(predicate) = &self.predicate {
+            if !typed_row_predicate_matches(predicate, &self.layout.fields, &values)? {
+                return Ok(None);
+            }
         }
         let evaluated = self
             .assignments
@@ -810,10 +810,10 @@ fn build_action(
             .collect(),
     };
     let mut node_count = 0;
-    if let Some(expression) = predicate
-        && !expression_is_eligible(expression, *table_id, &readable, 1, &mut node_count)?
-    {
-        return Ok(None);
+    if let Some(expression) = predicate {
+        if !expression_is_eligible(expression, *table_id, &readable, 1, &mut node_count)? {
+            return Ok(None);
+        }
     }
     let mut deferred_assignments = Vec::with_capacity(assignments.len());
     for Assignment { column, value } in assignments {

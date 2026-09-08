@@ -4446,12 +4446,12 @@ fn decode_lazy_delta_descriptors(
                 },
                 _ => return Err(ColumnarError::Corrupt("unknown lazy delta mutation tag")),
             };
-            if let Some(row) = descriptor.after_row
-                && (row >= after_count || !used.insert(row))
-            {
-                return Err(ColumnarError::Corrupt(
-                    "invalid lazy delta after-row reference",
-                ));
+            if let Some(row) = descriptor.after_row {
+                if row >= after_count || !used.insert(row) {
+                    return Err(ColumnarError::Corrupt(
+                        "invalid lazy delta after-row reference",
+                    ));
+                }
             }
             descriptors.push(descriptor);
         }

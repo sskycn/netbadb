@@ -1321,21 +1321,24 @@ fn choose_direct_inner_join(
         table_statistics,
         access_paths,
         range_tables,
-    ) && left_table_id != right_table_id
-        && {
-            !range_tables
+    ) {
+        if left_table_id != right_table_id
+            && !range_tables
                 .iter()
                 .any(|placement| placement.table_id == left_table_id)
+        {
+            if let Some(index_join_inner_work) = u128::from(left_rows).checked_mul(point_cost) {
+                if index_join_inner_work < nested_loop_work
+                    && index_join_inner_work < hash_join_right_work
+                {
+                    return DirectInnerJoin::Index {
+                        left_key,
+                        right_key,
+                        right_access_path,
+                    };
+                }
+            }
         }
-        && let Some(index_join_inner_work) = u128::from(left_rows).checked_mul(point_cost)
-        && index_join_inner_work < nested_loop_work
-        && index_join_inner_work < hash_join_right_work
-    {
-        return DirectInnerJoin::Index {
-            left_key,
-            right_key,
-            right_access_path,
-        };
     }
 
     if hash_join_work < nested_loop_work {

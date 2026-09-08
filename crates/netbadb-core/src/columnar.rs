@@ -385,10 +385,10 @@ impl ProjectionRegistry {
                 "replacement projection identity changed",
             ));
         }
-        if let Some(catalog) = &mut self.catalog
-            && metadata.generation != self.entries[position].identity.generation
-        {
-            catalog.update_generation(id, metadata.generation)?;
+        if let Some(catalog) = &mut self.catalog {
+            if metadata.generation != self.entries[position].identity.generation {
+                catalog.update_generation(id, metadata.generation)?;
+            }
         }
         crash("compact-catalog-updated-before-registry");
         let old = self.entries[position]

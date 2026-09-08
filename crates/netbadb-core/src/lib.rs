@@ -2454,16 +2454,16 @@ impl Database {
         column_id: ColumnId,
     ) -> Result<IndexDefinition, DatabaseError> {
         self.ensure_schema_available(None)?;
-        if let Some(name) = &name
-            && self.registry.iter().any(|entry| {
+        if let Some(name) = &name {
+            if self.registry.iter().any(|entry| {
                 entry
                     .storage
                     .indexes()
                     .iter()
                     .any(|definition| definition.name.as_ref() == Some(name))
-            })
-        {
-            return Err(DatabaseError::DuplicateIndexName(name.clone()));
+            }) {
+                return Err(DatabaseError::DuplicateIndexName(name.clone()));
+            }
         }
         let storage_id = match self.bindings.placement(table_id)? {
             TablePlacement::Single { storage_id, .. } => *storage_id,
@@ -3283,10 +3283,10 @@ impl Database {
                     .ok_or(CoordinatorError::SnapshotMissingStorage { storage_id })
             })
             .transpose()?;
-        if let Some(boundary) = global_boundary
-            && storage.current_visibility_boundary()? != boundary
-        {
-            return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+        if let Some(boundary) = global_boundary {
+            if storage.current_visibility_boundary()? != boundary {
+                return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+            }
         }
         let table = storage.table().clone();
         let view = match global_boundary {
@@ -4224,25 +4224,25 @@ impl Database {
         {
             return Ok(ExecutionResult::AffectedRows(affected_rows));
         }
-        if let Some(composition) = transaction.schema_composition.plan()
-            && Self::is_backfill_candidate(composition)
-        {
-            let target = composition
-                .touched
-                .keys()
-                .next()
-                .copied()
-                .ok_or(SchemaMutationError::Corrupt("backfill target absent"))?;
-            if logical
-                .read_tables()
-                .into_iter()
-                .chain(logical.write_tables())
-                .any(|table| table != target)
-            {
-                return Err(SchemaMutationError::UnsupportedBackfillRefinement(
-                    crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
-                )
-                .into());
+        if let Some(composition) = transaction.schema_composition.plan() {
+            if Self::is_backfill_candidate(composition) {
+                let target = composition
+                    .touched
+                    .keys()
+                    .next()
+                    .copied()
+                    .ok_or(SchemaMutationError::Corrupt("backfill target absent"))?;
+                if logical
+                    .read_tables()
+                    .into_iter()
+                    .chain(logical.write_tables())
+                    .any(|table| table != target)
+                {
+                    return Err(SchemaMutationError::UnsupportedBackfillRefinement(
+                        crate::schema_mutation::BackfillRefinementReason::CrossTableAccess,
+                    )
+                    .into());
+                }
             }
         }
         if let Some(source_backfill) = transaction.schema_composition.source_backfill() {
