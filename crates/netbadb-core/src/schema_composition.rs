@@ -1347,6 +1347,7 @@ impl Database {
         transaction: &mut Transaction,
         spec: AlterTableSpec,
     ) -> Result<(), DatabaseError> {
+        transaction.reject_group_structural_mutation()?;
         self.compose_heap_table_schema_in(transaction, spec)
     }
 

@@ -481,6 +481,9 @@ struct Runtime {
     recovery_required: Cell<bool>,
     outstanding_transactions: Cell<u64>,
     outstanding_read_views: Cell<u64>,
+    parked_prepared: RefCell<VecDeque<TxnId>>,
+    parked_writes: RefCell<BTreeMap<LsmRowId, (TxnId, LsmCommitSeq)>>,
+    prepared_write_conflict_count: Cell<u64>,
     amplification: AmplificationCounters,
 }
 
@@ -654,6 +657,7 @@ enum WalRecord {
 struct RecoveredTxn {
     mutations: Option<Vec<WalMutation>>,
     prepared: Option<DatabaseTxnId>,
+    prepare_order: Option<u64>,
     commit: Option<LsmCommitSeq>,
     aborted: bool,
 }
@@ -722,6 +726,22 @@ struct VisibleRow {
 }
 
 impl LsmStorage {
+    pub fn prepared_runtime_inspection(&self) -> crate::PreparedRuntimeInspection {
+        let shared = self.shared.borrow();
+        let chain = shared
+            .runtime
+            .parked_prepared
+            .borrow()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        crate::PreparedRuntimeInspection {
+            parked_prepared_count: chain.len(),
+            active_group_chain: chain,
+            prepared_write_conflict_count: shared.runtime.prepared_write_conflict_count.get(),
+        }
+    }
+
     /// Equality-only committed-state token for derived projections.
     ///
     /// Allocator reservations and manifest generations can advance without a
@@ -803,6 +823,9 @@ impl LsmStorage {
                 recovery_required: Cell::new(false),
                 outstanding_transactions: Cell::new(0),
                 outstanding_read_views: Cell::new(0),
+                parked_prepared: RefCell::new(VecDeque::new()),
+                parked_writes: RefCell::new(BTreeMap::new()),
+                prepared_write_conflict_count: Cell::new(0),
                 amplification: AmplificationCounters::default(),
             });
             let change_stream = ChangeStreamManager::disabled(
@@ -871,7 +894,7 @@ impl LsmStorage {
         let (mut wal, records) = LsmWal::open(&root, manifest.storage_id, manifest.wal_generation)?;
         let recovered = analyze_wal(&records)?;
         validate_recovered_transactions(&recovered, &manifest, &table)?;
-        let prepared = classify_prepared(&recovered);
+        let prepared = classify_prepared(&recovered)?;
         validate_resolutions(&prepared, resolutions)?;
         let mut memtable = BTreeMap::new();
         let mut recovery_commit = allocate_recovery_commit(&manifest, &recovered)?;
@@ -941,6 +964,9 @@ impl LsmStorage {
             recovery_required: Cell::new(false),
             outstanding_transactions: Cell::new(0),
             outstanding_read_views: Cell::new(0),
+            parked_prepared: RefCell::new(VecDeque::new()),
+            parked_writes: RefCell::new(BTreeMap::new()),
+            prepared_write_conflict_count: Cell::new(0),
             amplification: AmplificationCounters::default(),
         });
         let change_stream = ChangeStreamManager::open(
@@ -1001,7 +1027,7 @@ impl LsmStorage {
         validate_recovered_transactions(&recovered, &manifest, table)?;
         Ok(LsmRecoveryInspection {
             storage_id: manifest.storage_id,
-            prepared_transactions: classify_prepared(&recovered),
+            prepared_transactions: classify_prepared(&recovered)?,
         })
     }
 
@@ -1357,6 +1383,7 @@ impl LsmStorage {
         validate_row(&self.shared.borrow().table, values)?;
         transaction.acquire_writer()?;
         transaction.validate_handle(self, handle)?;
+        transaction.ensure_no_prepared_write_conflict(handle.row_id, handle.observed)?;
         let encoded = encode_row(values)?;
         transaction.ensure_capacity(encoded.len() as u64, 0)?;
         let key = clustering_key_from_values(&self.shared.borrow(), values)?;
@@ -1404,6 +1431,7 @@ impl LsmStorage {
         transaction.ensure_active()?;
         transaction.acquire_writer()?;
         transaction.validate_handle(self, handle)?;
+        transaction.ensure_no_prepared_write_conflict(handle.row_id, handle.observed)?;
         let revision = transaction.next_revision()?;
         if let Some(pending) = transaction.pending.get_mut(&handle.row_id) {
             if pending.original_key.is_none() {
@@ -2002,11 +2030,60 @@ impl LsmTransaction {
         Ok(())
     }
 
+    /// Parks a durably prepared participant and releases the LSM writer lease.
+    pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        self.validate_database_txn(database_txn_id)?;
+        if self.state == TransactionState::ParkedPrepared {
+            return Ok(());
+        }
+        if self.state != TransactionState::Prepared {
+            return Err(TransactionError::NotPrepared {
+                txn_id: self.id,
+                state: self.state,
+            }
+            .into());
+        }
+        {
+            let shared = self.shared.borrow();
+            let mut writes = shared.runtime.parked_writes.borrow_mut();
+            for (row_id, pending) in &self.pending {
+                if pending.base_version.is_some() {
+                    if let Some((conflicting_txn_id, _)) = writes.get(row_id) {
+                        return Err(TransactionError::PreparedWriteConflict {
+                            txn_id: self.id,
+                            conflicting_txn_id: *conflicting_txn_id,
+                        }
+                        .into());
+                    }
+                }
+            }
+            for (row_id, pending) in &self.pending {
+                if let Some(base_version) = pending.base_version {
+                    writes.insert(*row_id, (self.id, base_version));
+                }
+            }
+            shared
+                .runtime
+                .parked_prepared
+                .borrow_mut()
+                .push_back(self.id);
+            if shared.runtime.writer.get() == Some(self.id) {
+                shared.runtime.writer.set(None);
+            }
+        }
+        self.owns_writer = false;
+        self.state = TransactionState::ParkedPrepared;
+        Ok(())
+    }
+
     pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         self.ensure_recovery_not_required()?;
         self.validate_database_txn(database_txn_id)?;
         let commit_seq = match self.state {
-            TransactionState::Prepared => {
+            TransactionState::Prepared | TransactionState::ParkedPrepared => {
+                if self.state == TransactionState::ParkedPrepared {
+                    self.acquire_parked_resolution(false)?;
+                }
                 let mut shared = self.shared.borrow_mut();
                 let seq = LsmCommitSeq(shared.allocate_commit_seq()?);
                 self.pending_commit_seq = Some(seq);
@@ -2067,6 +2144,7 @@ impl LsmTransaction {
         if !matches!(
             self.state,
             TransactionState::Prepared
+                | TransactionState::ParkedPrepared
                 | TransactionState::PreparePending
                 | TransactionState::RollbackPending
         ) {
@@ -2077,6 +2155,9 @@ impl LsmTransaction {
             .into());
         }
         if self.state != TransactionState::RollbackPending {
+            if self.state == TransactionState::ParkedPrepared {
+                self.acquire_parked_resolution(true)?;
+            }
             let mut shared = self.shared.borrow_mut();
             self.state = TransactionState::RollbackPending;
             self.last_lsn = shared.wal.append(&WalRecord::Abort { txn_id: self.id })?;
@@ -2085,7 +2166,7 @@ impl LsmTransaction {
             self.last_lsn = ensure_abort_record(&mut shared, self.id, self.last_lsn)?;
         }
         self.shared.borrow_mut().wal.sync()?;
-        self.shared.borrow_mut().change_stream.abandon(self.id);
+        self.shared.borrow_mut().change_stream.abandon(self.id)?;
         self.finish_terminal(TransactionState::RolledBack);
         Ok(())
     }
@@ -2095,7 +2176,7 @@ impl LsmTransaction {
             TransactionState::Active => {
                 self.pending.clear();
                 self.pending_bytes = 0;
-                self.shared.borrow_mut().change_stream.abandon(self.id);
+                self.shared.borrow_mut().change_stream.abandon(self.id)?;
                 self.finish_terminal(TransactionState::RolledBack);
                 Ok(())
             }
@@ -2166,6 +2247,62 @@ impl LsmTransaction {
             }
             Some(txn_id) => Err(TransactionError::WriterBusy { txn_id }.into()),
         }
+    }
+
+    fn ensure_no_prepared_write_conflict(
+        &self,
+        row_id: LsmRowId,
+        observed: LsmObservedVersion,
+    ) -> Result<(), StorageError> {
+        let LsmObservedVersion::Committed(base_version) = observed else {
+            return Ok(());
+        };
+        let shared = self.shared.borrow();
+        if let Some((conflicting_txn_id, conflicting_version)) =
+            shared.runtime.parked_writes.borrow().get(&row_id).copied()
+        {
+            if conflicting_version == base_version && conflicting_txn_id != self.id {
+                shared.runtime.prepared_write_conflict_count.set(
+                    shared
+                        .runtime
+                        .prepared_write_conflict_count
+                        .get()
+                        .saturating_add(1),
+                );
+                return Err(TransactionError::PreparedWriteConflict {
+                    txn_id: self.id,
+                    conflicting_txn_id,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_parked_resolution(&mut self, abort: bool) -> Result<(), StorageError> {
+        let shared = self.shared.borrow();
+        let parked = shared.runtime.parked_prepared.borrow();
+        let expected = if abort { parked.back() } else { parked.front() }
+            .copied()
+            .ok_or(TransactionError::NotPrepared {
+                txn_id: self.id,
+                state: self.state,
+            })?;
+        if expected != self.id {
+            return Err(TransactionError::PreparedResolutionOrder {
+                txn_id: self.id,
+                expected,
+            }
+            .into());
+        }
+        drop(parked);
+        match shared.runtime.writer.get() {
+            None => shared.runtime.writer.set(Some(self.id)),
+            Some(txn_id) if txn_id == self.id => {}
+            Some(txn_id) => return Err(TransactionError::WriterBusy { txn_id }.into()),
+        }
+        self.owns_writer = true;
+        Ok(())
     }
 
     fn next_revision(&mut self) -> Result<u64, StorageError> {
@@ -2361,6 +2498,30 @@ impl LsmTransaction {
             }
             self.owns_writer = false;
         }
+        {
+            let shared = self.shared.borrow();
+            let mut parked = shared.runtime.parked_prepared.borrow_mut();
+            let removed = match state {
+                TransactionState::Committed => parked
+                    .front()
+                    .copied()
+                    .filter(|id| *id == self.id)
+                    .map(|_| parked.pop_front()),
+                TransactionState::RolledBack => parked
+                    .back()
+                    .copied()
+                    .filter(|id| *id == self.id)
+                    .map(|_| parked.pop_back()),
+                _ => None,
+            };
+            if removed.is_some() {
+                shared
+                    .runtime
+                    .parked_writes
+                    .borrow_mut()
+                    .retain(|_, (txn_id, _)| *txn_id != self.id);
+            }
+        }
         self.unregister();
     }
 
@@ -2381,6 +2542,16 @@ impl LsmTransaction {
 
 impl Drop for LsmTransaction {
     fn drop(&mut self) {
+        if self
+            .shared
+            .borrow()
+            .runtime
+            .parked_prepared
+            .borrow()
+            .contains(&self.id)
+        {
+            self.shared.borrow().runtime.recovery_required.set(true);
+        }
         if self.owns_writer {
             let shared = self.shared.borrow();
             if matches!(
@@ -3991,7 +4162,7 @@ fn decode_wal_record(tag: u8, payload: &[u8]) -> Result<WalRecord, StorageError>
 fn analyze_wal(records: &[WalRecord]) -> Result<BTreeMap<TxnId, RecoveredTxn>, StorageError> {
     let mut transactions = BTreeMap::<TxnId, RecoveredTxn>::new();
     let mut commits = BTreeSet::new();
-    for record in records {
+    for (position, record) in records.iter().enumerate() {
         match record {
             WalRecord::MutationBatch { txn_id, mutations } => {
                 let txn = transactions.entry(*txn_id).or_default();
@@ -4009,6 +4180,7 @@ fn analyze_wal(records: &[WalRecord]) -> Result<BTreeMap<TxnId, RecoveredTxn>, S
                 let txn = transactions.entry(*txn_id).or_default();
                 if txn.mutations.is_none()
                     || txn.prepared.replace(*database_txn_id).is_some()
+                    || txn.prepare_order.replace(position as u64 + 1).is_some()
                     || txn.commit.is_some()
                     || txn.aborted
                 {
@@ -4037,20 +4209,27 @@ fn analyze_wal(records: &[WalRecord]) -> Result<BTreeMap<TxnId, RecoveredTxn>, S
     Ok(transactions)
 }
 
-fn classify_prepared(recovered: &BTreeMap<TxnId, RecoveredTxn>) -> Vec<PreparedTransaction> {
+fn classify_prepared(
+    recovered: &BTreeMap<TxnId, RecoveredTxn>,
+) -> Result<Vec<PreparedTransaction>, StorageError> {
     recovered
         .iter()
         .filter_map(|(txn_id, txn)| {
-            txn.prepared.map(|database_txn_id| PreparedTransaction {
-                database_txn_id,
-                physical_txn_id: *txn_id,
-                state: if txn.commit.is_some() {
-                    PreparedTransactionState::Committed
-                } else if txn.aborted {
-                    PreparedTransactionState::RolledBack
-                } else {
-                    PreparedTransactionState::Prepared
-                },
+            txn.prepared.map(|database_txn_id| {
+                Ok(PreparedTransaction {
+                    database_txn_id,
+                    physical_txn_id: *txn_id,
+                    prepare_order: txn.prepare_order.ok_or(LsmError::InvalidWal(
+                        "prepared transaction has no WAL order",
+                    ))?,
+                    state: if txn.commit.is_some() {
+                        PreparedTransactionState::Committed
+                    } else if txn.aborted {
+                        PreparedTransactionState::RolledBack
+                    } else {
+                        PreparedTransactionState::Prepared
+                    },
+                })
             })
         })
         .collect()

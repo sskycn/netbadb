@@ -245,6 +245,10 @@ impl PreparedInsert {
 }
 
 impl HeapStorage {
+    pub fn prepared_runtime_inspection(&self) -> crate::PreparedRuntimeInspection {
+        self.transactions.prepared_runtime_inspection()
+    }
+
     /// Borrows this heap's shared file, buffer, transaction, and WAL domain as
     /// a persistent B+Tree API.
     pub fn btree(&mut self) -> crate::BTree<'_> {
@@ -2341,6 +2345,7 @@ impl HeapStorage {
             .read_record(slot)
             .map_err(|error| map_row_error(error, row_id))?;
         let (mut old_header, old_payload) = decode_tuple(old_tuple)?;
+        transaction.ensure_no_prepared_write_conflict(old_header.xmax)?;
         let mut destination = self.prepare_insert(payload, None)?;
         let new_row_id = destination.row_id();
         old_header.expire(transaction.id(), transaction.command_id(), Some(new_row_id));
@@ -2459,6 +2464,7 @@ impl HeapStorage {
             .read_record(slot)
             .map_err(|error| map_row_error(error, row_id))?;
         let (mut header, payload) = decode_tuple(tuple)?;
+        transaction.ensure_no_prepared_write_conflict(header.xmax)?;
         header.expire(transaction.id(), transaction.command_id(), None);
         let expired = encode_tuple(&header, payload);
         after

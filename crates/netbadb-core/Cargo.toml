@@ -70,5 +70,9 @@ harness = false
 name = "coordinator_compaction_phase3b5"
 harness = false
 
+[[bench]]
+name = "global_group_commit_phase3c"
+harness = false
+
 [lints]
 workspace = true

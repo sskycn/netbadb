@@ -22,13 +22,17 @@ const SEQUENCED_COMMIT_TAG: u8 = 5;
 const SEQUENCED_SCHEMA_COMMIT_TAG: u8 = 6;
 const SEQUENCED_COMPLETE_TAG: u8 = 7;
 const CHECKPOINT_TAG: u8 = 8;
+const GROUP_DECISION_TAG: u8 = 9;
 const SEQUENCED_PREFIX_SIZE: usize = 8;
 const SCHEMA_REFERENCE_SIZE: usize = 56;
 const CHECKPOINT_PAYLOAD_SIZE: usize = 24;
+const GROUP_MEMBER_PREFIX_SIZE: usize = 16;
 pub(crate) const MAX_COORDINATOR_PARTICIPANTS: usize = 1_024;
+pub(crate) const MAX_GROUP_MEMBERS: usize = 1_024;
 const PARTICIPANT_SIZE: usize = 16;
 const MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE
     + SEQUENCED_PREFIX_SIZE
+    + MAX_GROUP_MEMBERS * GROUP_MEMBER_PREFIX_SIZE
     + MAX_COORDINATOR_PARTICIPANTS * PARTICIPANT_SIZE
     + SCHEMA_REFERENCE_SIZE;
 
@@ -36,6 +40,12 @@ const MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE
 pub(crate) struct CoordinatorParticipant {
     pub(crate) storage_id: StorageId,
     pub(crate) physical_txn_id: TxnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoordinatorGroupMember {
+    pub(crate) database_txn_id: DatabaseTxnId,
+    pub(crate) participants: Vec<CoordinatorParticipant>,
 }
 
 /// CORD v2 reference; the full schema remains in a separately synced NBSC.
@@ -99,6 +109,9 @@ pub(crate) struct CoordinatorLog {
     decision_sync_count: u64,
     checkpoint_sync_count: u64,
     combined_pipeline_sync_count: u64,
+    group_decision_sync_count: u64,
+    group_committed_transaction_count: u64,
+    combined_group_pipeline_sync_count: u64,
     #[cfg(test)]
     fail_next_decision_append: bool,
     #[cfg(test)]
@@ -135,6 +148,9 @@ impl CoordinatorLog {
             decision_sync_count: 0,
             checkpoint_sync_count: 0,
             combined_pipeline_sync_count: 0,
+            group_decision_sync_count: 0,
+            group_committed_transaction_count: 0,
+            combined_group_pipeline_sync_count: 0,
             #[cfg(test)]
             fail_next_decision_append: false,
             #[cfg(test)]
@@ -182,6 +198,9 @@ impl CoordinatorLog {
             decision_sync_count: 0,
             checkpoint_sync_count: 0,
             combined_pipeline_sync_count: 0,
+            group_decision_sync_count: 0,
+            group_committed_transaction_count: 0,
+            combined_group_pipeline_sync_count: 0,
             #[cfg(test)]
             fail_next_decision_append: false,
             #[cfg(test)]
@@ -289,6 +308,18 @@ impl CoordinatorLog {
         self.combined_pipeline_sync_count
     }
 
+    pub(crate) const fn group_decision_sync_count(&self) -> u64 {
+        self.group_decision_sync_count
+    }
+
+    pub(crate) const fn group_committed_transaction_count(&self) -> u64 {
+        self.group_committed_transaction_count
+    }
+
+    pub(crate) const fn combined_group_pipeline_sync_count(&self) -> u64 {
+        self.combined_group_pipeline_sync_count
+    }
+
     pub(crate) fn byte_len(&self) -> Result<u64, CoordinatorLogError> {
         Ok(self.file_ref()?.metadata()?.len())
     }
@@ -390,6 +421,132 @@ impl CoordinatorLog {
         }
         self.sync_decision(combined_checkpoint)?;
         Ok(commit_seq)
+    }
+
+    /// Records one checksummed, all-or-none decision for an ordered group.
+    pub(crate) fn sequenced_group_commit_decision(
+        &mut self,
+        members: &[CoordinatorGroupMember],
+    ) -> Result<Vec<DatabaseCommitSeq>, CoordinatorLogError> {
+        if !self.global_visibility {
+            return Err(CoordinatorLogError::GlobalVisibilityNotEnabled);
+        }
+        if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
+            return Err(CoordinatorLogError::InvalidGroupMemberCount {
+                offset: 0,
+                count: members.len(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        let checkpoint_high_water = self.checkpoint.map_or(DatabaseTxnId(0), |checkpoint| {
+            checkpoint.database_txn_id_high_water
+        });
+        let mut canonical = Vec::with_capacity(members.len());
+        let mut total_participants = 0_usize;
+        for member in members {
+            if member.database_txn_id <= checkpoint_high_water
+                || !seen.insert(member.database_txn_id)
+            {
+                return Err(CoordinatorLogError::InvalidGroupMember {
+                    offset: 0,
+                    database_txn_id: member.database_txn_id,
+                });
+            }
+            let participants =
+                canonical_participants(member.database_txn_id, &member.participants, false)?;
+            total_participants = total_participants
+                .checked_add(participants.len())
+                .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
+            if total_participants > MAX_COORDINATOR_PARTICIPANTS {
+                return Err(CoordinatorLogError::InvalidParticipantCount {
+                    offset: 0,
+                    count: total_participants,
+                });
+            }
+            canonical.push(CoordinatorGroupMember {
+                database_txn_id: member.database_txn_id,
+                participants,
+            });
+        }
+
+        let existing_sequences = canonical
+            .iter()
+            .map(|member| {
+                self.decisions
+                    .get(&member.database_txn_id)
+                    .and_then(|decision| decision.commit_seq)
+            })
+            .collect::<Option<Vec<_>>>();
+        let all_existing = existing_sequences.as_ref().is_some_and(|sequences| {
+            sequences.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1)
+                && canonical.iter().zip(sequences).all(|(member, sequence)| {
+                    self.decisions
+                        .get(&member.database_txn_id)
+                        .is_some_and(|decision| {
+                            decision.participants == member.participants
+                                && decision.commit_seq == Some(*sequence)
+                                && decision.schema.is_none()
+                        })
+                })
+        });
+        if all_existing {
+            let combined = !self.pending_complete_checkpoints.is_empty();
+            self.append_missing_pending_completes()?;
+            self.sync_group_decision(combined, canonical.len())?;
+            return existing_sequences.ok_or(CoordinatorLogError::ConflictingGroupDecision);
+        }
+        if canonical
+            .iter()
+            .any(|member| self.decisions.contains_key(&member.database_txn_id))
+        {
+            return Err(CoordinatorLogError::ConflictingGroupDecision);
+        }
+
+        let first = self.next_commit_seq()?;
+        let sequences = (0..canonical.len())
+            .map(|position| {
+                first
+                    .0
+                    .checked_add(position as u64)
+                    .map(DatabaseCommitSeq)
+                    .ok_or(CoordinatorLogError::CommitSequenceExhausted)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let combined = !self.pending_complete_checkpoints.is_empty();
+        self.append_missing_pending_completes()?;
+        let bytes = encode_group_record(first, &canonical)?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_decision_append) {
+            inject_partial_append_failure(self.file_mut()?, &bytes)?;
+        }
+        #[cfg(test)]
+        if crate::coordinator_crash::enabled("during-group-decision-append") {
+            self.file_mut()?.seek(SeekFrom::End(0))?;
+            self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
+            crate::coordinator_crash::maybe_crash("during-group-decision-append");
+        }
+        append_record(self.file_mut()?, &bytes)?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("after-group-decision-append");
+        for (member, commit_seq) in canonical.into_iter().zip(sequences.iter().copied()) {
+            self.decisions.insert(
+                member.database_txn_id,
+                CoordinatorDecision {
+                    database_txn_id: member.database_txn_id,
+                    commit_seq: Some(commit_seq),
+                    participants: member.participants,
+                    complete: false,
+                    schema: None,
+                },
+            );
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_decision_sync) {
+            return Err(injected_io_error("group decision sync").into());
+        }
+        self.sync_group_decision(combined, members.len())?;
+        Ok(sequences)
     }
 
     /// Appends a data transaction's recovery checkpoint without synchronizing
@@ -744,6 +901,31 @@ impl CoordinatorLog {
         Ok(())
     }
 
+    fn sync_group_decision(
+        &mut self,
+        combined_checkpoint: bool,
+        member_count: usize,
+    ) -> Result<(), CoordinatorLogError> {
+        if let Err(error) = self.file_ref()?.sync_data() {
+            let error = CoordinatorLogError::from(error);
+            if combined_checkpoint {
+                self.last_checkpoint_error = Some(error.to_string());
+            }
+            return Err(error);
+        }
+        self.group_decision_sync_count = self.group_decision_sync_count.saturating_add(1);
+        self.group_committed_transaction_count = self
+            .group_committed_transaction_count
+            .saturating_add(member_count as u64);
+        if combined_checkpoint {
+            self.combined_group_pipeline_sync_count =
+                self.combined_group_pipeline_sync_count.saturating_add(1);
+            self.mark_pending_completes_synced();
+        }
+        self.last_checkpoint_error = None;
+        Ok(())
+    }
+
     fn mark_pending_completes_synced(&mut self) {
         if let Some(last) = self
             .pending_complete_checkpoints
@@ -1025,7 +1207,9 @@ fn apply_decoded_record(
 ) -> Result<(), CoordinatorLogError> {
     let database_txn_id = DatabaseTxnId(read_u64(bytes, 16));
     let tag = bytes[6];
-    if database_txn_id.0 == 0 && !matches!(tag, GLOBAL_ENABLE_TAG | CHECKPOINT_TAG) {
+    if database_txn_id.0 == 0
+        && !matches!(tag, GLOBAL_ENABLE_TAG | CHECKPOINT_TAG | GROUP_DECISION_TAG)
+    {
         return Err(CoordinatorLogError::InvalidTransactionId { offset });
     }
     let participant_count = usize::try_from(read_u32(bytes, 24))
@@ -1074,6 +1258,123 @@ fn apply_decoded_record(
                 last_sequenced_decision,
                 database_txn_id_high_water,
             });
+        }
+        GROUP_DECISION_TAG => {
+            if !*global_visibility || database_txn_id.0 != 0 {
+                return Err(CoordinatorLogError::InvalidGroupDecision { offset });
+            }
+            if participant_count == 0 || participant_count > MAX_GROUP_MEMBERS {
+                return Err(CoordinatorLogError::InvalidGroupMemberCount {
+                    offset,
+                    count: participant_count,
+                });
+            }
+            let first_commit_seq = DatabaseCommitSeq(read_u64(bytes, RECORD_HEADER_SIZE));
+            let expected_first = decisions
+                .values()
+                .filter_map(|decision| decision.commit_seq)
+                .max()
+                .unwrap_or_else(|| {
+                    checkpoint.map_or(DatabaseCommitSeq(0), |checkpoint| {
+                        checkpoint.last_sequenced_decision
+                    })
+                })
+                .0
+                .checked_add(1)
+                .ok_or(CoordinatorLogError::CommitSequenceExhausted)?;
+            if first_commit_seq.0 == 0 || first_commit_seq.0 != expected_first {
+                return Err(CoordinatorLogError::NonConsecutiveCommitSequence {
+                    offset,
+                    expected: DatabaseCommitSeq(expected_first),
+                    actual: first_commit_seq,
+                });
+            }
+            let mut cursor = RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE;
+            let mut total_participants = 0_usize;
+            let mut seen_members = BTreeSet::new();
+            for position in 0..participant_count {
+                let member_end = cursor
+                    .checked_add(GROUP_MEMBER_PREFIX_SIZE)
+                    .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
+                if member_end > bytes.len() {
+                    return Err(CoordinatorLogError::InvalidGroupDecision { offset });
+                }
+                let member_id = DatabaseTxnId(read_u64(bytes, cursor));
+                let member_participant_count = usize::try_from(read_u32(bytes, cursor + 8))
+                    .map_err(|_| CoordinatorLogError::ParticipantCountOverflow { offset })?;
+                if bytes[cursor + 12..cursor + 16] != [0; 4] || !seen_members.insert(member_id) {
+                    return Err(CoordinatorLogError::InvalidGroupMember {
+                        offset,
+                        database_txn_id: member_id,
+                    });
+                }
+                cursor = member_end;
+                total_participants = total_participants
+                    .checked_add(member_participant_count)
+                    .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
+                if total_participants > MAX_COORDINATOR_PARTICIPANTS {
+                    return Err(CoordinatorLogError::InvalidParticipantCount {
+                        offset,
+                        count: total_participants,
+                    });
+                }
+                let participant_end = cursor
+                    .checked_add(
+                        member_participant_count
+                            .checked_mul(PARTICIPANT_SIZE)
+                            .ok_or(CoordinatorLogError::RecordSizeOverflow)?,
+                    )
+                    .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
+                if participant_end > bytes.len() {
+                    return Err(CoordinatorLogError::InvalidGroupDecision { offset });
+                }
+                let mut participants = Vec::with_capacity(member_participant_count);
+                while cursor < participant_end {
+                    participants.push(CoordinatorParticipant {
+                        storage_id: StorageId(read_u64(bytes, cursor)),
+                        physical_txn_id: TxnId(read_u64(bytes, cursor + 8)),
+                    });
+                    cursor += PARTICIPANT_SIZE;
+                }
+                let canonical = canonical_participants(member_id, &participants, false)?;
+                if participants != canonical {
+                    return Err(CoordinatorLogError::InvalidGroupDecision { offset });
+                }
+                let participants = canonical;
+                let commit_seq = DatabaseCommitSeq(
+                    first_commit_seq
+                        .0
+                        .checked_add(position as u64)
+                        .ok_or(CoordinatorLogError::CommitSequenceExhausted)?,
+                );
+                if let Some(checkpoint) = checkpoint {
+                    if member_id <= checkpoint.database_txn_id_high_water {
+                        return Err(CoordinatorLogError::CheckpointTransactionIdRegression {
+                            offset,
+                            high_water: checkpoint.database_txn_id_high_water,
+                            actual: member_id,
+                        });
+                    }
+                }
+                if decisions
+                    .insert(
+                        member_id,
+                        CoordinatorDecision {
+                            database_txn_id: member_id,
+                            commit_seq: Some(commit_seq),
+                            participants,
+                            complete: false,
+                            schema: None,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(CoordinatorLogError::ConflictingGroupDecision);
+                }
+            }
+            if cursor != bytes.len() {
+                return Err(CoordinatorLogError::InvalidGroupDecision { offset });
+            }
         }
         COMMIT_DECISION_TAG
         | SCHEMA_COMMIT_TAG
@@ -1440,12 +1741,73 @@ fn encode_record(
     Ok(bytes)
 }
 
+fn encode_group_record(
+    first_commit_seq: DatabaseCommitSeq,
+    members: &[CoordinatorGroupMember],
+) -> Result<Vec<u8>, CoordinatorLogError> {
+    if first_commit_seq.0 == 0 || members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
+        return Err(CoordinatorLogError::InvalidGroupDecision { offset: 0 });
+    }
+    let participant_count = members.iter().try_fold(0_usize, |count, member| {
+        count
+            .checked_add(member.participants.len())
+            .ok_or(CoordinatorLogError::RecordSizeOverflow)
+    })?;
+    if participant_count > MAX_COORDINATOR_PARTICIPANTS {
+        return Err(CoordinatorLogError::InvalidParticipantCount {
+            offset: 0,
+            count: participant_count,
+        });
+    }
+    let total_len = RECORD_HEADER_SIZE
+        .checked_add(SEQUENCED_PREFIX_SIZE)
+        .and_then(|length| length.checked_add(members.len() * GROUP_MEMBER_PREFIX_SIZE))
+        .and_then(|length| length.checked_add(participant_count * PARTICIPANT_SIZE))
+        .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
+    let mut bytes = Vec::with_capacity(total_len);
+    bytes.extend_from_slice(RECORD_MAGIC);
+    bytes.extend_from_slice(&5_u16.to_le_bytes());
+    bytes.push(GROUP_DECISION_TAG);
+    bytes.push(0);
+    bytes.extend_from_slice(
+        &u32::try_from(total_len)
+            .map_err(|_| CoordinatorLogError::RecordSizeOverflow)?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u64.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(members.len())
+            .map_err(|_| CoordinatorLogError::RecordSizeOverflow)?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&first_commit_seq.0.to_le_bytes());
+    for member in members {
+        bytes.extend_from_slice(&member.database_txn_id.0.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(member.participants.len())
+                .map_err(|_| CoordinatorLogError::RecordSizeOverflow)?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        for participant in &member.participants {
+            bytes.extend_from_slice(&participant.storage_id.0.to_le_bytes());
+            bytes.extend_from_slice(&participant.physical_txn_id.0.to_le_bytes());
+        }
+    }
+    let checksum = crc32c::crc32c(&bytes);
+    bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+    Ok(bytes)
+}
+
 fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorLogError> {
     let magic_len = bytes.len().min(RECORD_MAGIC.len());
     if bytes[..magic_len] != RECORD_MAGIC[..magic_len] {
         return Err(CoordinatorLogError::InvalidRecordMagic { offset });
     }
-    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1..=4) {
+    if bytes.len() >= 6 && !matches!(read_u16(bytes, 4), 1..=5) {
         return Err(CoordinatorLogError::UnsupportedRecordVersion {
             offset,
             version: read_u16(bytes, 4),
@@ -1464,6 +1826,7 @@ fn validate_partial_header(bytes: &[u8], offset: u64) -> Result<(), CoordinatorL
                         | SEQUENCED_COMPLETE_TAG
                 )
                 | (4, CHECKPOINT_TAG)
+                | (5, GROUP_DECISION_TAG)
         )
     {
         return Err(CoordinatorLogError::UnknownRecordTag {
@@ -1494,7 +1857,7 @@ fn validate_record_header(
         usize::try_from(read_u32(bytes, 8)).map_err(|_| CoordinatorLogError::RecordSizeOverflow)?;
     let count = usize::try_from(read_u32(bytes, 24))
         .map_err(|_| CoordinatorLogError::ParticipantCountOverflow { offset })?;
-    if count > MAX_COORDINATOR_PARTICIPANTS {
+    if count > MAX_GROUP_MEMBERS.max(MAX_COORDINATOR_PARTICIPANTS) {
         return Err(CoordinatorLogError::InvalidParticipantCount { offset, count });
     }
     let expected = match tag {
@@ -1520,6 +1883,16 @@ fn validate_record_header(
         COMPLETE_TAG | GLOBAL_ENABLE_TAG => Some(RECORD_HEADER_SIZE),
         SEQUENCED_COMPLETE_TAG => Some(RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE),
         CHECKPOINT_TAG => Some(RECORD_HEADER_SIZE + CHECKPOINT_PAYLOAD_SIZE),
+        GROUP_DECISION_TAG => {
+            if !(RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE..=MAX_RECORD_SIZE).contains(&total_len)
+            {
+                return Err(CoordinatorLogError::InvalidRecordLength {
+                    offset,
+                    length: total_len,
+                });
+            }
+            return u32::try_from(total_len).map_err(|_| CoordinatorLogError::RecordSizeOverflow);
+        }
         _ => None,
     }
     .ok_or(CoordinatorLogError::RecordSizeOverflow)?;
@@ -1692,6 +2065,18 @@ pub enum CoordinatorLogError {
         offset: u64,
         count: usize,
     },
+    InvalidGroupMemberCount {
+        offset: u64,
+        count: usize,
+    },
+    InvalidGroupMember {
+        offset: u64,
+        database_txn_id: DatabaseTxnId,
+    },
+    InvalidGroupDecision {
+        offset: u64,
+    },
+    ConflictingGroupDecision,
     InvalidParticipantIdentity {
         database_txn_id: DatabaseTxnId,
         storage_id: StorageId,
@@ -1855,6 +2240,25 @@ impl fmt::Display for CoordinatorLogError {
                 formatter,
                 "coordinator record at {offset} has invalid participant count {count}"
             ),
+            Self::InvalidGroupMemberCount { offset, count } => write!(
+                formatter,
+                "coordinator group record at {offset} has invalid member count {count}"
+            ),
+            Self::InvalidGroupMember {
+                offset,
+                database_txn_id,
+            } => write!(
+                formatter,
+                "coordinator group record at {offset} has invalid member transaction {}",
+                database_txn_id.0
+            ),
+            Self::InvalidGroupDecision { offset } => write!(
+                formatter,
+                "coordinator group decision at {offset} has an invalid payload"
+            ),
+            Self::ConflictingGroupDecision => {
+                formatter.write_str("coordinator group decision conflicts with existing decisions")
+            }
             Self::InvalidParticipantIdentity {
                 database_txn_id,
                 storage_id,
@@ -1924,9 +2328,11 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
 
     use super::{
-        CompactionFailureStage, CoordinatorLog, CoordinatorLogError, CoordinatorParticipant,
-        CoordinatorRecord, LOG_HEADER_SIZE, MAX_COORDINATOR_PARTICIPANTS, RECORD_CHECKSUM_OFFSET,
-        RECORD_HEADER_SIZE, encode_header, encode_record,
+        CHECKPOINT_PAYLOAD_SIZE, CompactionFailureStage, CoordinatorGroupMember, CoordinatorLog,
+        CoordinatorLogError, CoordinatorParticipant, CoordinatorRecord, GROUP_DECISION_TAG,
+        GROUP_MEMBER_PREFIX_SIZE, LOG_HEADER_SIZE, MAX_COORDINATOR_PARTICIPANTS, MAX_GROUP_MEMBERS,
+        PARTICIPANT_SIZE, RECORD_CHECKSUM_OFFSET, RECORD_HEADER_SIZE, SEQUENCED_COMMIT_TAG,
+        SEQUENCED_PREFIX_SIZE, encode_header, encode_record, read_u32,
     };
     use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId, TxnId};
 
@@ -1947,6 +2353,25 @@ mod tests {
             CoordinatorParticipant {
                 storage_id: StorageId(3),
                 physical_txn_id: TxnId(30),
+            },
+        ]
+    }
+
+    fn group_members() -> Vec<CoordinatorGroupMember> {
+        vec![
+            CoordinatorGroupMember {
+                database_txn_id: DatabaseTxnId(11),
+                participants: vec![CoordinatorParticipant {
+                    storage_id: StorageId(3),
+                    physical_txn_id: TxnId(31),
+                }],
+            },
+            CoordinatorGroupMember {
+                database_txn_id: DatabaseTxnId(12),
+                participants: vec![CoordinatorParticipant {
+                    storage_id: StorageId(9),
+                    physical_txn_id: TxnId(91),
+                }],
             },
         ]
     }
@@ -2003,6 +2428,230 @@ mod tests {
             0x70de_9acb
         );
         drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn group_decision_round_trips_as_one_v5_record_and_allocates_consecutive_sequences() {
+        let path = path("group-round-trip");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).unwrap();
+        log.enable_global_visibility().unwrap();
+        let sequences = log
+            .sequenced_group_commit_decision(&group_members())
+            .unwrap();
+        assert_eq!(sequences, vec![DatabaseCommitSeq(1), DatabaseCommitSeq(2)]);
+        assert_eq!(log.group_decision_sync_count(), 1);
+        assert_eq!(log.decision_sync_count(), 0);
+        drop(log);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let first_record_len = RECORD_HEADER_SIZE;
+        let group_offset = LOG_HEADER_SIZE + first_record_len;
+        assert_eq!(&bytes[group_offset..group_offset + 4], b"CORD");
+        assert_eq!(
+            u16::from_le_bytes(
+                bytes[group_offset + 4..group_offset + 6]
+                    .try_into()
+                    .unwrap()
+            ),
+            5
+        );
+        assert_eq!(bytes[group_offset + 6], GROUP_DECISION_TAG);
+        let reopened = CoordinatorLog::open(&path).unwrap();
+        let decisions = reopened.decisions().collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].commit_seq, Some(DatabaseCommitSeq(1)));
+        assert_eq!(decisions[1].commit_seq, Some(DatabaseCommitSeq(2)));
+        drop(reopened);
+
+        let mut corrupted = bytes.clone();
+        corrupted[group_offset + RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE + 1] ^= 1;
+        std::fs::write(&path, corrupted).unwrap();
+        assert!(matches!(
+            CoordinatorLog::open(&path),
+            Err(CoordinatorLogError::RecordChecksumMismatch { .. })
+        ));
+
+        let mut torn = bytes;
+        torn.truncate(torn.len() - 7);
+        std::fs::write(&path, torn).unwrap();
+        let reopened = CoordinatorLog::open(&path).unwrap();
+        assert_eq!(reopened.decisions().count(), 0);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn group_decision_rejects_malformed_bounded_and_noncanonical_payloads() {
+        let source = path("group-invalid-source");
+        let _ = std::fs::remove_file(&source);
+        let members = vec![
+            CoordinatorGroupMember {
+                database_txn_id: DatabaseTxnId(11),
+                participants: vec![
+                    CoordinatorParticipant {
+                        storage_id: StorageId(9),
+                        physical_txn_id: TxnId(91),
+                    },
+                    CoordinatorParticipant {
+                        storage_id: StorageId(3),
+                        physical_txn_id: TxnId(31),
+                    },
+                ],
+            },
+            CoordinatorGroupMember {
+                database_txn_id: DatabaseTxnId(12),
+                participants: vec![CoordinatorParticipant {
+                    storage_id: StorageId(7),
+                    physical_txn_id: TxnId(71),
+                }],
+            },
+        ];
+        let mut log = CoordinatorLog::create(&source).unwrap();
+        log.enable_global_visibility().unwrap();
+        log.sequenced_group_commit_decision(&members).unwrap();
+        drop(log);
+        let valid = std::fs::read(&source).unwrap();
+        let group_offset = LOG_HEADER_SIZE + RECORD_HEADER_SIZE;
+        let group_length = usize::try_from(read_u32(&valid, group_offset + 8)).unwrap();
+        let first_member = group_offset + RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE;
+        let first_participant = first_member + GROUP_MEMBER_PREFIX_SIZE;
+        let second_participant = first_participant + PARTICIPANT_SIZE;
+        let second_member = second_participant + PARTICIPANT_SIZE;
+
+        for case in [
+            "magic",
+            "version",
+            "tag",
+            "checksum",
+            "oversized-group",
+            "oversized-participants",
+            "truncated-member",
+            "zero-sequence",
+            "sequence-gap",
+            "zero-member",
+            "duplicate-member",
+            "duplicate-storage",
+            "noncanonical-participants",
+        ] {
+            let mut bytes = valid.clone();
+            match case {
+                "magic" => bytes[group_offset] ^= 1,
+                "version" => {
+                    bytes[group_offset + 4..group_offset + 6].copy_from_slice(&4_u16.to_le_bytes())
+                }
+                "tag" => bytes[group_offset + 6] = SEQUENCED_COMMIT_TAG,
+                "checksum" => bytes[group_offset + RECORD_CHECKSUM_OFFSET] ^= 1,
+                "oversized-group" => bytes[group_offset + 24..group_offset + 28]
+                    .copy_from_slice(&u32::try_from(MAX_GROUP_MEMBERS + 1).unwrap().to_le_bytes()),
+                "oversized-participants" => bytes[first_member + 8..first_member + 12]
+                    .copy_from_slice(
+                        &u32::try_from(MAX_COORDINATOR_PARTICIPANTS + 1)
+                            .unwrap()
+                            .to_le_bytes(),
+                    ),
+                "truncated-member" => {
+                    bytes[first_member + 8..first_member + 12].copy_from_slice(&4_u32.to_le_bytes())
+                }
+                "zero-sequence" => {
+                    bytes[group_offset + RECORD_HEADER_SIZE
+                        ..group_offset + RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE]
+                        .fill(0);
+                }
+                "sequence-gap" => bytes[group_offset + RECORD_HEADER_SIZE
+                    ..group_offset + RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE]
+                    .copy_from_slice(&2_u64.to_le_bytes()),
+                "zero-member" => bytes[first_member..first_member + 8].fill(0),
+                "duplicate-member" => {
+                    bytes[second_member..second_member + 8].copy_from_slice(&11_u64.to_le_bytes())
+                }
+                "duplicate-storage" => bytes[second_participant..second_participant + 8]
+                    .copy_from_slice(&3_u64.to_le_bytes()),
+                "noncanonical-participants" => {
+                    let first =
+                        bytes[first_participant..first_participant + PARTICIPANT_SIZE].to_vec();
+                    let second =
+                        bytes[second_participant..second_participant + PARTICIPANT_SIZE].to_vec();
+                    bytes[first_participant..first_participant + PARTICIPANT_SIZE]
+                        .copy_from_slice(&second);
+                    bytes[second_participant..second_participant + PARTICIPANT_SIZE]
+                        .copy_from_slice(&first);
+                }
+                _ => unreachable!(),
+            }
+            if case != "checksum" && !matches!(case, "magic" | "version" | "tag") {
+                rewrite_record_checksum(&mut bytes, group_offset, group_length);
+            }
+            let corrupted = path(case);
+            let _ = std::fs::remove_file(&corrupted);
+            std::fs::write(&corrupted, bytes).unwrap();
+            assert!(CoordinatorLog::open(&corrupted).is_err(), "case {case}");
+            let _ = std::fs::remove_file(corrupted);
+        }
+
+        let before_enable = path("group-before-enable");
+        let mut bytes = encode_header().to_vec();
+        bytes.extend_from_slice(&valid[group_offset..group_offset + group_length]);
+        std::fs::write(&before_enable, bytes).unwrap();
+        assert!(matches!(
+            CoordinatorLog::open(&before_enable),
+            Err(CoordinatorLogError::InvalidGroupDecision { .. })
+        ));
+
+        let too_many_members = vec![members[0].clone(); MAX_GROUP_MEMBERS + 1];
+        let mut log = CoordinatorLog::open(&source).unwrap();
+        assert!(matches!(
+            log.sequenced_group_commit_decision(&too_many_members),
+            Err(CoordinatorLogError::InvalidGroupMemberCount { .. })
+        ));
+        let too_many_participants =
+            vec![members[0].participants[0]; MAX_COORDINATOR_PARTICIPANTS + 1];
+        assert!(matches!(
+            log.sequenced_group_commit_decision(&[CoordinatorGroupMember {
+                database_txn_id: DatabaseTxnId(13),
+                participants: too_many_participants,
+            }]),
+            Err(CoordinatorLogError::InvalidParticipantCount { .. })
+        ));
+        drop(log);
+        let _ = std::fs::remove_file(before_enable);
+        let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn group_decision_after_checkpoint_requires_the_exact_next_sequence() {
+        let path = path("group-after-checkpoint");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).unwrap();
+        log.enable_global_visibility().unwrap();
+        let first = log
+            .sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+            .unwrap();
+        log.defer_complete_sequenced(DatabaseTxnId(1), first)
+            .unwrap();
+        log.compact().unwrap();
+        assert_eq!(
+            log.sequenced_group_commit_decision(&group_members())
+                .unwrap(),
+            [DatabaseCommitSeq(2), DatabaseCommitSeq(3)]
+        );
+        drop(log);
+        CoordinatorLog::open(&path).expect("valid group after checkpoint");
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let group_offset =
+            LOG_HEADER_SIZE + RECORD_HEADER_SIZE + RECORD_HEADER_SIZE + CHECKPOINT_PAYLOAD_SIZE;
+        let group_length = usize::try_from(read_u32(&bytes, group_offset + 8)).unwrap();
+        bytes[group_offset + RECORD_HEADER_SIZE
+            ..group_offset + RECORD_HEADER_SIZE + SEQUENCED_PREFIX_SIZE]
+            .copy_from_slice(&4_u64.to_le_bytes());
+        rewrite_record_checksum(&mut bytes, group_offset, group_length);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            CoordinatorLog::open(&path),
+            Err(CoordinatorLogError::NonConsecutiveCommitSequence { .. })
+        ));
         let _ = std::fs::remove_file(path);
     }
 

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -11,7 +11,9 @@ use netbadb_storage::{
 use netbadb_types::{ColumnId, IndexName};
 use netbadb_types::{DatabaseCommitSeq, DatabaseTxnId, StorageId};
 
-use crate::coordinator_log::{CoordinatorLog, CoordinatorLogError, CoordinatorParticipant};
+use crate::coordinator_log::{
+    CoordinatorGroupMember, CoordinatorLog, CoordinatorLogError, CoordinatorParticipant,
+};
 use crate::registry::{StorageRegistry, StorageRegistryError};
 use crate::schema_composition::SchemaCompositionState;
 use crate::schema_mutation::{SchemaMutation, SchemaMutationError};
@@ -76,7 +78,7 @@ pub(crate) struct PublishedVisibility {
 }
 
 impl PublishedVisibility {
-    fn publish_boundaries(
+    pub(crate) fn publish_boundaries(
         &mut self,
         commit_seq: DatabaseCommitSeq,
         updates: impl IntoIterator<Item = StorageVisibilityBoundary>,
@@ -99,6 +101,7 @@ pub enum TransactionState {
     Active,
     RollbackRequired,
     Preparing,
+    ParkedPrepared,
     DecisionPending,
     CommitDecided,
     ApplyingCommit,
@@ -202,6 +205,8 @@ pub struct DatabaseTransaction {
     pub(crate) preparation_scope: Rc<()>,
     pending_indexes: Vec<(StorageId, IndexDefinition)>,
     pending_index_drops: Vec<(StorageId, netbadb_types::IndexId)>,
+    group_barrier: Rc<Cell<Option<u64>>>,
+    group_id: Option<u64>,
 }
 
 impl DatabaseTransaction {
@@ -211,6 +216,7 @@ impl DatabaseTransaction {
         isolation_level: IsolationLevel,
         coordinator: Option<SharedCoordinatorLog>,
         published_visibility: Option<SharedPublishedVisibility>,
+        group_barrier: Rc<Cell<Option<u64>>>,
     ) -> Self {
         Self {
             owner,
@@ -229,6 +235,8 @@ impl DatabaseTransaction {
             preparation_scope: Rc::new(()),
             pending_indexes: Vec::new(),
             pending_index_drops: Vec::new(),
+            group_barrier,
+            group_id: None,
         }
     }
 
@@ -404,6 +412,11 @@ impl DatabaseTransaction {
         registry: &mut StorageRegistry,
     ) -> Result<&mut StorageTransaction, CoordinatorError> {
         self.ensure_active()?;
+        if let Some(active_group) = self.group_barrier.get() {
+            if self.group_id != Some(active_group) {
+                return Err(CoordinatorError::GroupCommitActive);
+            }
+        }
         if self.coordinator.is_none() {
             if let Some(existing) = self.write_participants.first().copied() {
                 if existing != storage_id {
@@ -427,6 +440,9 @@ impl DatabaseTransaction {
     }
 
     pub fn commit(&mut self) -> Result<(), CoordinatorError> {
+        if self.group_id.is_some() {
+            return Err(CoordinatorError::GroupCommitMemberRequiresGroup);
+        }
         if self.has_pending_schema_mutations() {
             return Err(CoordinatorError::SchemaMutationRequiresDatabaseCommit);
         }
@@ -515,6 +531,17 @@ impl DatabaseTransaction {
             || !self.pending_index_drops.is_empty()
     }
 
+    pub(crate) fn reject_group_structural_mutation(&self) -> Result<(), CoordinatorError> {
+        if self.group_id.is_some() {
+            return Err(CoordinatorError::GroupCommitStructuralMutation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_participant_count(&self) -> usize {
+        self.write_participants.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_pristine_for_schema_rewrite(&self) -> bool {
         self.state == TransactionState::Active
@@ -531,6 +558,238 @@ impl DatabaseTransaction {
             && self.schema_composition.is_none()
             && self.pending_indexes.is_empty()
             && self.pending_index_drops.is_empty()
+    }
+
+    pub(crate) fn assign_group(
+        &mut self,
+        group_id: u64,
+        base_snapshot: DatabaseSnapshot,
+    ) -> Result<(), CoordinatorError> {
+        self.ensure_active()?;
+        if self.group_barrier.get() != Some(group_id) {
+            return Err(CoordinatorError::InvalidGroupCommit);
+        }
+        self.group_id = Some(group_id);
+        self.repeatable_snapshot = Some(base_snapshot);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_and_park_group_member(&mut self) -> Result<(), CoordinatorError> {
+        self.ensure_active()?;
+        if self.group_id.is_none() || self.group_barrier.get() != self.group_id {
+            return Err(CoordinatorError::InvalidGroupCommit);
+        }
+        if self.has_pending_schema_mutations() {
+            return Err(CoordinatorError::GroupCommitStructuralMutation);
+        }
+        if self.write_participants.is_empty() {
+            return Err(CoordinatorError::GroupCommitMemberHasNoWrites);
+        }
+        self.state = TransactionState::Preparing;
+        for (storage_id, participant) in self
+            .participants
+            .iter_mut()
+            .filter(|(_, participant)| participant.mode == ParticipantMode::Read)
+        {
+            commit_participant(*storage_id, participant)?;
+        }
+        let write_order = self.write_participants.iter().copied().collect::<Vec<_>>();
+        for storage_id in write_order.iter().copied() {
+            let participant = self.participants.get_mut(&storage_id).ok_or(
+                CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "group write participant identity has no context",
+                },
+            )?;
+            if let Err(error) =
+                prepare_participant(self.id, storage_id, participant).and_then(|()| {
+                    participant
+                        .context
+                        .park_prepared(self.id)
+                        .map_err(CoordinatorError::from)
+                })
+            {
+                self.state = TransactionState::RollbackPending;
+                let _ = self.resolve_failed_group_member();
+                return Err(CoordinatorError::PrepareFailed {
+                    storage_id,
+                    source: Box::new(error),
+                });
+            }
+        }
+        self.state = TransactionState::ParkedPrepared;
+        Ok(())
+    }
+
+    pub(crate) fn resolve_failed_group_member(&mut self) -> Result<(), CoordinatorError> {
+        if self.state == TransactionState::RolledBack {
+            return Ok(());
+        }
+        if !matches!(
+            self.state,
+            TransactionState::Preparing | TransactionState::RollbackPending
+        ) {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        self.state = TransactionState::RollbackPending;
+        for (storage_id, participant) in self.participants.iter_mut().rev() {
+            if participant.mode == ParticipantMode::Read
+                && participant.context.state() == StorageTransactionState::CommitPending
+            {
+                commit_participant(*storage_id, participant)?;
+            }
+            rollback_participant(self.id, *storage_id, participant)?;
+        }
+        self.state = TransactionState::RolledBack;
+        self.release_visibility_pins();
+        Ok(())
+    }
+
+    pub(crate) fn coordinator_group_member(
+        &self,
+    ) -> Result<CoordinatorGroupMember, CoordinatorError> {
+        if self.state != TransactionState::ParkedPrepared {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        let participants = self
+            .write_participants
+            .iter()
+            .map(|storage_id| {
+                let participant = self.participants.get(storage_id).ok_or(
+                    CoordinatorError::ParticipantStateViolation {
+                        storage_id: *storage_id,
+                        reason: "parked participant identity has no context",
+                    },
+                )?;
+                Ok(CoordinatorParticipant {
+                    storage_id: *storage_id,
+                    physical_txn_id: participant.context.id(),
+                })
+            })
+            .collect::<Result<Vec<_>, CoordinatorError>>()?;
+        Ok(CoordinatorGroupMember {
+            database_txn_id: self.id,
+            participants,
+        })
+    }
+
+    pub(crate) fn apply_group_commit(
+        &mut self,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorError> {
+        if !matches!(
+            self.state,
+            TransactionState::ParkedPrepared
+                | TransactionState::CommitDecided
+                | TransactionState::ApplyingCommit
+                | TransactionState::FinalizePending
+        ) {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        self.pending_commit_seq = Some(commit_seq);
+        self.state = TransactionState::ApplyingCommit;
+        for (position, storage_id) in self.write_participants.iter().copied().enumerate() {
+            let participant = self.participants.get_mut(&storage_id).ok_or(
+                CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "group decided participant identity has no context",
+                },
+            )?;
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash_indexed(
+                "group-before-participant-commit",
+                position + 1,
+            );
+            commit_prepared_participant(self.id, storage_id, participant)?;
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash_indexed(
+                "group-after-participant-commit",
+                position + 1,
+            );
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        self.state = TransactionState::FinalizePending;
+        Ok(())
+    }
+
+    pub(crate) fn finish_group_complete(
+        &mut self,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorError> {
+        if self.state == TransactionState::Committed {
+            return Ok(());
+        }
+        if self.state != TransactionState::FinalizePending
+            || self.pending_commit_seq != Some(commit_seq)
+        {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("group-before-complete");
+        self.coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::CoordinatorBusy)?
+            .defer_complete_sequenced(self.id, commit_seq)?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("group-after-complete");
+        self.state = TransactionState::Committed;
+        self.release_visibility_pins();
+        Ok(())
+    }
+
+    pub(crate) fn mark_group_commit_decided(
+        &mut self,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorError> {
+        if self.state != TransactionState::ParkedPrepared {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        self.pending_commit_seq = Some(commit_seq);
+        self.state = TransactionState::CommitDecided;
+        Ok(())
+    }
+
+    pub(crate) fn abort_parked_group_member(&mut self) -> Result<(), CoordinatorError> {
+        if !matches!(
+            self.state,
+            TransactionState::ParkedPrepared | TransactionState::RollbackPending
+        ) {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        self.state = TransactionState::RollbackPending;
+        for storage_id in self.write_participants.iter().copied() {
+            let participant = self.participants.get_mut(&storage_id).ok_or(
+                CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "parked participant identity has no context",
+                },
+            )?;
+            rollback_participant(self.id, storage_id, participant)?;
+        }
+        self.state = TransactionState::RolledBack;
+        self.release_visibility_pins();
+        Ok(())
     }
 
     pub(crate) fn has_pending_index_creations(&self) -> bool {
@@ -1323,6 +1582,7 @@ fn commit_prepared_participant(
 ) -> Result<(), CoordinatorError> {
     match participant.context.state() {
         StorageTransactionState::Prepared
+        | StorageTransactionState::ParkedPrepared
         | StorageTransactionState::CommitPending
         | StorageTransactionState::Committed => participant
             .context
@@ -1343,7 +1603,9 @@ fn rollback_participant(
     match participant.context.state() {
         StorageTransactionState::RolledBack => Ok(()),
         StorageTransactionState::Committed if participant.mode == ParticipantMode::Read => Ok(()),
-        StorageTransactionState::PreparePending | StorageTransactionState::Prepared => participant
+        StorageTransactionState::PreparePending
+        | StorageTransactionState::Prepared
+        | StorageTransactionState::ParkedPrepared => participant
             .context
             .rollback_prepared(database_txn_id)
             .map_err(CoordinatorError::from),
@@ -1369,7 +1631,8 @@ fn storage_prepare_state_reason(state: StorageTransactionState) -> &'static str 
         StorageTransactionState::RolledBack => "participant is already rolled back",
         StorageTransactionState::Active
         | StorageTransactionState::PreparePending
-        | StorageTransactionState::Prepared => "invalid participant prepare state",
+        | StorageTransactionState::Prepared
+        | StorageTransactionState::ParkedPrepared => "invalid participant prepare state",
     }
 }
 
@@ -1382,7 +1645,9 @@ fn storage_commit_state_reason(state: StorageTransactionState) -> &'static str {
             "participant rollback is pending and cannot commit"
         }
         StorageTransactionState::PreparePending => "participant prepare is pending",
-        StorageTransactionState::Prepared => "participant requires a coordinator decision",
+        StorageTransactionState::Prepared | StorageTransactionState::ParkedPrepared => {
+            "participant requires a coordinator decision"
+        }
         StorageTransactionState::RolledBack => "participant is already rolled back",
         StorageTransactionState::Active
         | StorageTransactionState::CommitPending
@@ -1410,6 +1675,24 @@ pub enum CoordinatorError {
     CoordinatorBusy,
     PublishedVisibilityBusy,
     GlobalVisibilityNotEnabled,
+    GroupCommitRequiresGlobalVisibility,
+    GroupCommitActive,
+    InvalidGroupCommit,
+    GroupCommitAlreadyDecided,
+    GroupCommitStructuralMutation,
+    GroupCommitMemberHasNoWrites,
+    GroupPrepareResolutionRequired,
+    GroupPrepareResolutionNotRequired,
+    ResourceLimit {
+        resource: &'static str,
+        limit: usize,
+    },
+    EmptyGroupCommit,
+    GroupIdExhausted,
+    GroupCommitMemberRequiresGroup,
+    GroupCommitRequiresQuiescence {
+        outstanding: usize,
+    },
     GlobalEnableRequiresQuiescence {
         outstanding: usize,
     },
@@ -1482,6 +1765,46 @@ impl fmt::Display for CoordinatorError {
             Self::GlobalVisibilityNotEnabled => {
                 formatter.write_str("database-global visibility is not enabled")
             }
+            Self::GroupCommitRequiresGlobalVisibility => {
+                formatter.write_str("explicit group commit requires database-global visibility")
+            }
+            Self::GroupCommitActive => {
+                formatter.write_str("an explicit group commit is already active")
+            }
+            Self::InvalidGroupCommit => {
+                formatter.write_str("group commit handle is stale or belongs to another database")
+            }
+            Self::GroupCommitAlreadyDecided => {
+                formatter.write_str("group commit already has a durable commit decision")
+            }
+            Self::GroupCommitStructuralMutation => {
+                formatter.write_str("explicit group commit supports data mutations only")
+            }
+            Self::GroupCommitMemberHasNoWrites => {
+                formatter.write_str("group commit member has no data writes")
+            }
+            Self::GroupPrepareResolutionRequired => {
+                formatter.write_str("group member prepare outcome requires explicit resolution")
+            }
+            Self::GroupPrepareResolutionNotRequired => {
+                formatter.write_str("group has no unresolved member prepare outcome")
+            }
+            Self::ResourceLimit { resource, limit } => {
+                write!(
+                    formatter,
+                    "{resource} exceeds its resource limit of {limit}"
+                )
+            }
+            Self::EmptyGroupCommit => formatter.write_str("group commit has no parked members"),
+            Self::GroupIdExhausted => {
+                formatter.write_str("group commit identity space is exhausted")
+            }
+            Self::GroupCommitMemberRequiresGroup => formatter
+                .write_str("group member must be parked and resolved through its group commit"),
+            Self::GroupCommitRequiresQuiescence { outstanding } => write!(
+                formatter,
+                "group commit requires no pre-existing database transaction handles, found {outstanding}"
+            ),
             Self::GlobalEnableRequiresQuiescence { outstanding } => write!(
                 formatter,
                 "database-global visibility requires quiescence but {outstanding} database transaction handle(s) are outstanding"
@@ -1557,6 +1880,19 @@ impl Error for CoordinatorError {
             | Self::CoordinatorBusy
             | Self::PublishedVisibilityBusy
             | Self::GlobalVisibilityNotEnabled
+            | Self::GroupCommitRequiresGlobalVisibility
+            | Self::GroupCommitActive
+            | Self::InvalidGroupCommit
+            | Self::GroupCommitAlreadyDecided
+            | Self::GroupCommitStructuralMutation
+            | Self::GroupCommitMemberHasNoWrites
+            | Self::GroupPrepareResolutionRequired
+            | Self::GroupPrepareResolutionNotRequired
+            | Self::ResourceLimit { .. }
+            | Self::EmptyGroupCommit
+            | Self::GroupIdExhausted
+            | Self::GroupCommitMemberRequiresGroup
+            | Self::GroupCommitRequiresQuiescence { .. }
             | Self::GlobalEnableRequiresQuiescence { .. }
             | Self::CoordinatorCompactionRequiresGlobalVisibility
             | Self::CoordinatorCompactionRequiresQuiescence { .. }

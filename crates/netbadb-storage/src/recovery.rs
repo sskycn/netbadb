@@ -29,6 +29,8 @@ pub enum PreparedTransactionState {
 pub struct PreparedTransaction {
     pub database_txn_id: DatabaseTxnId,
     pub physical_txn_id: TxnId,
+    /// Monotonic WAL position used to reconstruct prepare/rollback stack order.
+    pub prepare_order: u64,
     pub state: PreparedTransactionState,
 }
 
@@ -55,6 +57,7 @@ pub(crate) fn inspect_prepared_transactions(records: &[WalRecord]) -> Vec<Prepar
                     PreparedTransaction {
                         database_txn_id,
                         physical_txn_id: record.txn_id,
+                        prepare_order: record.lsn.0,
                         state: PreparedTransactionState::Prepared,
                     },
                 );
@@ -77,7 +80,7 @@ pub(crate) fn inspect_prepared_transactions(records: &[WalRecord]) -> Vec<Prepar
         }
     }
     let mut inspected = transactions.into_values().collect::<Vec<_>>();
-    inspected.sort_unstable_by_key(|transaction| transaction.physical_txn_id.0);
+    inspected.sort_unstable_by_key(|transaction| transaction.prepare_order);
     inspected
 }
 

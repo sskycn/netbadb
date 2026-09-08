@@ -632,6 +632,13 @@ impl StorageTransaction {
         }
     }
 
+    pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.park_prepared(database_txn_id),
+            StorageTransactionKind::Lsm(txn) => txn.park_prepared(database_txn_id),
+        }
+    }
+
     pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
             StorageTransactionKind::Heap(txn) => txn.commit_prepared(database_txn_id),
@@ -685,6 +692,14 @@ impl From<LsmStorage> for TableStorage {
 }
 
 impl TableStorage {
+    #[must_use]
+    pub fn prepared_runtime_inspection(&self) -> crate::PreparedRuntimeInspection {
+        match self {
+            Self::Heap(storage) => storage.prepared_runtime_inspection(),
+            Self::Lsm(storage) => storage.prepared_runtime_inspection(),
+        }
+    }
+
     #[must_use]
     pub const fn kind(&self) -> StorageKind {
         match self {

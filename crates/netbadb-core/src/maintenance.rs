@@ -226,6 +226,9 @@ impl Database {
         &self,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceInspection, DatabaseError> {
+        if self.inspect_group_commit().is_some() {
+            return Err(crate::CoordinatorError::GroupCommitActive.into());
+        }
         let state = self.maintenance_state(budget)?;
         Ok(plan_maintenance(state, self.maintenance_cursor))
     }

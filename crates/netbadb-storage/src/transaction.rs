@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use netbadb_types::{
@@ -28,6 +28,8 @@ enum WriterState {
 struct TransactionRuntime {
     writer: Cell<WriterState>,
     outstanding: Cell<u64>,
+    parked_prepared: RefCell<VecDeque<TxnId>>,
+    prepared_write_conflict_count: Cell<u64>,
 }
 
 type SharedRuntime = Rc<TransactionRuntime>;
@@ -40,6 +42,7 @@ pub enum TransactionState {
     RollbackRequired,
     PreparePending,
     Prepared,
+    ParkedPrepared,
     CommitPending,
     RollbackPending,
     Committed,
@@ -211,12 +214,35 @@ impl Transaction {
         Ok(())
     }
 
+    /// Releases the mutable writer lease after durable prepare while retaining
+    /// this handle as the runtime owner of the prepared participant.
+    pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        self.validate_prepared_database_txn(database_txn_id)?;
+        if self.state == TransactionState::ParkedPrepared {
+            return Ok(());
+        }
+        if self.state != TransactionState::Prepared {
+            return Err(TransactionError::NotPrepared {
+                txn_id: self.id,
+                state: self.state,
+            }
+            .into());
+        }
+        self.runtime.parked_prepared.borrow_mut().push_back(self.id);
+        self.release_writer();
+        self.state = TransactionState::ParkedPrepared;
+        Ok(())
+    }
+
     /// Commits a prepared participant after Core has durably recorded the
     /// matching database-level commit decision.
     pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         self.validate_prepared_database_txn(database_txn_id)?;
         let commit_lsn = match self.state {
-            TransactionState::Prepared => {
+            TransactionState::Prepared | TransactionState::ParkedPrepared => {
+                if self.state == TransactionState::ParkedPrepared {
+                    self.acquire_parked_resolution(false)?;
+                }
                 let lsn = self
                     .wal
                     .try_borrow_mut()
@@ -276,7 +302,14 @@ impl Transaction {
                 self.rollback_start_lsn = Some(rollback_start_lsn);
                 self.state = TransactionState::RollbackPending;
             }
-            TransactionState::PreparePending | TransactionState::Prepared if allow_prepared => {
+            TransactionState::PreparePending
+            | TransactionState::Prepared
+            | TransactionState::ParkedPrepared
+                if allow_prepared =>
+            {
+                if self.state == TransactionState::ParkedPrepared {
+                    self.acquire_parked_resolution(true)?;
+                }
                 let rollback_start_lsn = self.last_lsn;
                 let abort_lsn = self
                     .wal
@@ -306,8 +339,8 @@ impl Transaction {
                 .try_borrow_mut()
                 .map_err(|_| TransactionError::StatusBusy)?
                 .record_aborted(self.id)?;
-            self.finish_rollback();
-            self.abandon_changes();
+            self.finish_rollback()?;
+            self.abandon_changes()?;
             return Ok(());
         }
 
@@ -354,8 +387,8 @@ impl Transaction {
             .try_borrow_mut()
             .map_err(|_| TransactionError::StatusBusy)?
             .record_aborted(self.id)?;
-        self.finish_rollback();
-        self.abandon_changes();
+        self.finish_rollback()?;
+        self.abandon_changes()?;
         Ok(())
     }
 
@@ -375,6 +408,7 @@ impl Transaction {
             self.buffer.invalidate_reuse_inventory();
         }
         self.release_writer();
+        self.remove_parked_resolution(false)?;
         self.unregister();
         Ok(())
     }
@@ -507,12 +541,13 @@ impl Transaction {
         Ok(())
     }
 
-    fn abandon_changes(&mut self) {
+    fn abandon_changes(&mut self) -> Result<(), StorageError> {
         if let Some(stream) = &self.change_stream {
-            stream.borrow_mut().abandon(self.id);
+            stream.borrow_mut().abandon(self.id)?;
         }
         self.changes.clear();
         self.prepared_change = None;
+        Ok(())
     }
 
     pub(crate) fn belongs_to(&self, wal: &SharedWal) -> bool {
@@ -666,6 +701,82 @@ impl Transaction {
         }
     }
 
+    fn acquire_parked_resolution(&self, abort: bool) -> Result<(), StorageError> {
+        let parked = self.runtime.parked_prepared.borrow();
+        let expected = if abort { parked.back() } else { parked.front() }
+            .copied()
+            .ok_or(TransactionError::NotPrepared {
+                txn_id: self.id,
+                state: self.state,
+            })?;
+        if expected != self.id {
+            return Err(TransactionError::PreparedResolutionOrder {
+                txn_id: self.id,
+                expected,
+            }
+            .into());
+        }
+        drop(parked);
+        match self.runtime.writer.get() {
+            WriterState::Idle => self.runtime.writer.set(WriterState::Active(self.id)),
+            WriterState::Active(txn_id) if txn_id == self.id => {}
+            WriterState::Active(txn_id) => {
+                return Err(TransactionError::WriterBusy { txn_id }.into());
+            }
+            WriterState::RecoveryRequired => {
+                return Err(TransactionError::RecoveryRequired.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_parked_resolution(&self, abort: bool) -> Result<(), StorageError> {
+        let mut parked = self.runtime.parked_prepared.borrow_mut();
+        let removed = if abort {
+            parked.pop_back()
+        } else {
+            parked.pop_front()
+        };
+        if let Some(actual) = removed {
+            if actual != self.id {
+                return Err(TransactionError::PreparedResolutionOrder {
+                    txn_id: self.id,
+                    expected: actual,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_no_prepared_write_conflict(
+        &self,
+        xmax: Option<TxnId>,
+    ) -> Result<(), StorageError> {
+        let Some(conflicting_txn_id) = xmax.filter(|id| *id != self.id) else {
+            return Ok(());
+        };
+        if self
+            .runtime
+            .parked_prepared
+            .borrow()
+            .contains(&conflicting_txn_id)
+        {
+            self.runtime.prepared_write_conflict_count.set(
+                self.runtime
+                    .prepared_write_conflict_count
+                    .get()
+                    .saturating_add(1),
+            );
+            return Err(TransactionError::PreparedWriteConflict {
+                txn_id: self.id,
+                conflicting_txn_id,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Reserve before publishing any pointer. Complete synced WAL records survive
     /// rollback; a failed reservation may consume a generation but never returns it.
     pub(crate) fn reserve_page_generation(
@@ -771,10 +882,14 @@ impl Transaction {
         self.repeatable_read_view = None;
     }
 
-    fn finish_rollback(&mut self) {
+    fn finish_rollback(&mut self) -> Result<(), StorageError> {
         self.state = TransactionState::RolledBack;
         self.release_writer();
+        if self.runtime.parked_prepared.borrow().contains(&self.id) {
+            self.remove_parked_resolution(true)?;
+        }
         self.unregister();
+        Ok(())
     }
 
     fn undo_records(
@@ -902,15 +1017,17 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         let owns_writer = self.runtime.writer.get() == WriterState::Active(self.id);
-        let recovery_required = owns_writer
-            && (matches!(
-                self.state,
-                TransactionState::RollbackRequired
-                    | TransactionState::PreparePending
-                    | TransactionState::Prepared
-                    | TransactionState::CommitPending
-                    | TransactionState::RollbackPending
-            ) || (self.state == TransactionState::Active && self.has_page_updates));
+        let is_parked = self.runtime.parked_prepared.borrow().contains(&self.id);
+        let recovery_required = is_parked
+            || (owns_writer
+                && (matches!(
+                    self.state,
+                    TransactionState::RollbackRequired
+                        | TransactionState::PreparePending
+                        | TransactionState::Prepared
+                        | TransactionState::CommitPending
+                        | TransactionState::RollbackPending
+                ) || (self.state == TransactionState::Active && self.has_page_updates)));
         if recovery_required {
             self.runtime.writer.set(WriterState::RecoveryRequired);
         } else if owns_writer && self.state == TransactionState::Active {
@@ -937,6 +1054,21 @@ pub(crate) struct TransactionManager {
 }
 
 impl TransactionManager {
+    pub(crate) fn prepared_runtime_inspection(&self) -> crate::PreparedRuntimeInspection {
+        let chain = self
+            .runtime
+            .parked_prepared
+            .borrow()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        crate::PreparedRuntimeInspection {
+            parked_prepared_count: chain.len(),
+            active_group_chain: chain,
+            prepared_write_conflict_count: self.runtime.prepared_write_conflict_count.get(),
+        }
+    }
+
     pub(crate) fn new(
         wal: SharedWal,
         buffer: BufferPool,
@@ -955,6 +1087,8 @@ impl TransactionManager {
             runtime: Rc::new(TransactionRuntime {
                 writer: Cell::new(WriterState::Idle),
                 outstanding: Cell::new(0),
+                parked_prepared: RefCell::new(VecDeque::new()),
+                prepared_write_conflict_count: Cell::new(0),
             }),
             statuses,
             change_stream,

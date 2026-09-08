@@ -29,11 +29,11 @@ mod schema_view;
 mod staged_index_evacuation_tests;
 mod transaction;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub use netbadb_compiler::ParameterTypeHint;
 use netbadb_compiler::{
@@ -95,8 +95,8 @@ pub use netbadb_storage::{
     ChangeStreamInspection, CommittedReadAnchor, HistoricalOrphanAdoptionReport, IndexDefinition,
     IndexMaintenanceReport, IndexReclaimReport, IndexStatistics, IndexTailReclaimReport,
     IsolationLevel, LsmInspection, LsmLevelInspection, LsmReadAmplification, LsmWriteAmplification,
-    PageReuseClass, PageReuseInspection, ReusablePageInspection, StorageChange, StorageError,
-    StorageKind, StorageVersionKey, TableStatistics,
+    PageReuseClass, PageReuseInspection, PreparedRuntimeInspection, ReusablePageInspection,
+    StorageChange, StorageError, StorageKind, StorageVersionKey, TableStatistics,
 };
 pub use netbadb_types::{
     ChangeStreamGeneration, SchemaGeneration, StorageDataVersion, TableSchemaVersion,
@@ -189,11 +189,58 @@ pub struct DatabaseVisibilityInspection {
     pub decision_sync_count: u64,
     pub checkpoint_sync_count: u64,
     pub combined_pipeline_sync_count: u64,
+    pub group_decision_sync_count: u64,
+    pub group_committed_transaction_count: u64,
+    pub combined_group_pipeline_sync_count: u64,
     pub coordinator_bytes: u64,
     pub checkpointed_through: Option<DatabaseCommitSeq>,
     pub retained_decision_count: usize,
     pub compaction_possible: bool,
     pub boundaries: Vec<VisibilityBoundaryInspection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupDecisionState {
+    Building,
+    PrepareResolutionRequired,
+    DecisionPending,
+    CommitDecided,
+    Applying,
+    CompletePending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCommitInspection {
+    pub group_id: u64,
+    pub base_published_commit_seq: DatabaseCommitSeq,
+    pub parked_member_count: usize,
+    pub member_transaction_ids: Vec<DatabaseTxnId>,
+    pub participating_storage_count: usize,
+    pub decision_state: GroupDecisionState,
+}
+
+#[derive(Debug)]
+struct ActiveGroupCommit {
+    inspection: GroupCommitInspection,
+}
+
+#[derive(Debug)]
+pub struct GroupCommitBatch {
+    owner: Weak<()>,
+    id: u64,
+    base_snapshot: DatabaseSnapshot,
+    members: Vec<Transaction>,
+    resolving_member: Option<Transaction>,
+    commit_sequences: Option<Vec<DatabaseCommitSeq>>,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCommitReport {
+    pub member_count: usize,
+    pub first_commit_seq: DatabaseCommitSeq,
+    pub last_commit_seq: DatabaseCommitSeq,
+    pub participating_storage_count: usize,
 }
 
 /// Result of one explicit, synchronous coordinator-history compaction.
@@ -1073,6 +1120,9 @@ pub struct Database {
     mutation_journal: Option<schema_mutation::SharedMutationJournal>,
     schema_writer: schema_mutation::SchemaWriter,
     maintenance_cursor: Option<maintenance::MaintenanceCursor>,
+    group_barrier: Rc<Cell<Option<u64>>>,
+    active_group: Option<ActiveGroupCommit>,
+    next_group_id: u64,
 }
 
 fn current_visibility_boundaries(
@@ -1141,6 +1191,9 @@ impl Database {
                 decision_sync_count: 0,
                 checkpoint_sync_count: 0,
                 combined_pipeline_sync_count: 0,
+                group_decision_sync_count: 0,
+                group_committed_transaction_count: 0,
+                combined_group_pipeline_sync_count: 0,
                 coordinator_bytes: 0,
                 checkpointed_through: None,
                 retained_decision_count: 0,
@@ -1175,6 +1228,9 @@ impl Database {
             decision_sync_count: coordinator.decision_sync_count(),
             checkpoint_sync_count: coordinator.checkpoint_sync_count(),
             combined_pipeline_sync_count: coordinator.combined_pipeline_sync_count(),
+            group_decision_sync_count: coordinator.group_decision_sync_count(),
+            group_committed_transaction_count: coordinator.group_committed_transaction_count(),
+            combined_group_pipeline_sync_count: coordinator.combined_group_pipeline_sync_count(),
             coordinator_bytes: coordinator.byte_len()?,
             checkpointed_through: coordinator
                 .checkpoint()
@@ -1194,6 +1250,13 @@ impl Database {
                 })
                 .collect(),
         })
+    }
+
+    #[must_use]
+    pub fn inspect_group_commit(&self) -> Option<GroupCommitInspection> {
+        self.active_group
+            .as_ref()
+            .map(|group| group.inspection.clone())
     }
 
     /// Irreversibly enables durable database-global snapshot publication.
@@ -1227,6 +1290,9 @@ impl Database {
     pub fn compact_coordinator_log(
         &mut self,
     ) -> Result<CoordinatorCompactionReport, DatabaseError> {
+        if self.active_group.is_some() {
+            return Err(CoordinatorError::GroupCommitActive.into());
+        }
         if self.visibility_mode() != DatabaseVisibilityMode::Global {
             return Err(CoordinatorError::CoordinatorCompactionRequiresGlobalVisibility.into());
         }
@@ -1908,6 +1974,9 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            group_barrier: Rc::new(std::cell::Cell::new(None)),
+            active_group: None,
+            next_group_id: 1,
         })
     }
 
@@ -1936,6 +2005,9 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            group_barrier: Rc::new(std::cell::Cell::new(None)),
+            active_group: None,
+            next_group_id: 1,
         })
     }
 
@@ -1981,6 +2053,9 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            group_barrier: Rc::new(std::cell::Cell::new(None)),
+            active_group: None,
+            next_group_id: 1,
         })
     }
 
@@ -2051,6 +2126,9 @@ impl Database {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            group_barrier: Rc::new(std::cell::Cell::new(None)),
+            active_group: None,
+            next_group_id: 1,
         })
     }
 
@@ -2079,6 +2157,331 @@ impl Database {
 
     pub fn begin_transaction(&mut self) -> Result<Transaction, DatabaseError> {
         self.begin_database_transaction(IsolationLevel::ReadCommitted)
+    }
+
+    /// Opens one explicit synchronous group-commit builder at the current
+    /// published database snapshot.
+    pub fn begin_group_commit(&mut self) -> Result<GroupCommitBatch, DatabaseError> {
+        if self.visibility_mode() != DatabaseVisibilityMode::Global {
+            return Err(CoordinatorError::GroupCommitRequiresGlobalVisibility.into());
+        }
+        if self.active_group.is_some() {
+            return Err(CoordinatorError::GroupCommitActive.into());
+        }
+        let outstanding = Rc::strong_count(&self.transaction_owner).saturating_sub(1);
+        if outstanding != 0 {
+            return Err(CoordinatorError::GroupCommitRequiresQuiescence { outstanding }.into());
+        }
+        let base_snapshot = self
+            .current_database_snapshot()?
+            .ok_or(CoordinatorError::GlobalVisibilityNotEnabled)?;
+        let id = self.next_group_id;
+        self.next_group_id = id
+            .checked_add(1)
+            .ok_or(CoordinatorError::GroupIdExhausted)?;
+        self.group_barrier.set(Some(id));
+        self.active_group = Some(ActiveGroupCommit {
+            inspection: GroupCommitInspection {
+                group_id: id,
+                base_published_commit_seq: base_snapshot.commit_seq(),
+                parked_member_count: 0,
+                member_transaction_ids: Vec::new(),
+                participating_storage_count: 0,
+                decision_state: GroupDecisionState::Building,
+            },
+        });
+        Ok(GroupCommitBatch {
+            owner: Rc::downgrade(&self.transaction_owner),
+            id,
+            base_snapshot,
+            members: Vec::new(),
+            resolving_member: None,
+            commit_sequences: None,
+            completed: false,
+        })
+    }
+
+    pub fn begin_group_member(
+        &mut self,
+        group: &GroupCommitBatch,
+    ) -> Result<Transaction, DatabaseError> {
+        self.validate_group(group)?;
+        if group.resolving_member.is_some() {
+            return Err(CoordinatorError::GroupPrepareResolutionRequired.into());
+        }
+        if group.members.len() >= coordinator_log::MAX_GROUP_MEMBERS {
+            return Err(CoordinatorError::ResourceLimit {
+                resource: "group commit member count",
+                limit: coordinator_log::MAX_GROUP_MEMBERS,
+            }
+            .into());
+        }
+        if group.commit_sequences.is_some() {
+            return Err(CoordinatorError::GroupCommitAlreadyDecided.into());
+        }
+        let mut transaction = self.begin_database_transaction(IsolationLevel::ReadCommitted)?;
+        transaction.assign_group(group.id, group.base_snapshot.clone())?;
+        Ok(transaction)
+    }
+
+    /// Durably prepares and consumes one member, then releases each physical
+    /// writer lease for the next member in this group.
+    pub fn park_group_member(
+        &mut self,
+        group: &mut GroupCommitBatch,
+        mut transaction: Transaction,
+    ) -> Result<(), DatabaseError> {
+        self.validate_group(group)?;
+        if group.resolving_member.is_some() {
+            return Err(CoordinatorError::GroupPrepareResolutionRequired.into());
+        }
+        if let Err(error) = transaction.validate_commit_owner(&self.transaction_owner) {
+            let _ = transaction.rollback();
+            return Err(error.into());
+        }
+        if group.members.len() >= coordinator_log::MAX_GROUP_MEMBERS {
+            if transaction.rollback().is_err() {
+                group.resolving_member = Some(transaction);
+                self.set_group_decision_state(GroupDecisionState::PrepareResolutionRequired)?;
+            }
+            return Err(CoordinatorError::ResourceLimit {
+                resource: "group commit member count",
+                limit: coordinator_log::MAX_GROUP_MEMBERS,
+            }
+            .into());
+        }
+        let parked_participants = group.members.iter().fold(0_usize, |total, member| {
+            total.saturating_add(member.write_participant_count())
+        });
+        if parked_participants
+            .checked_add(transaction.write_participant_count())
+            .is_none_or(|total| total > coordinator_log::MAX_COORDINATOR_PARTICIPANTS)
+        {
+            if transaction.rollback().is_err() {
+                group.resolving_member = Some(transaction);
+                self.set_group_decision_state(GroupDecisionState::PrepareResolutionRequired)?;
+            }
+            return Err(CoordinatorError::ResourceLimit {
+                resource: "group commit participant count",
+                limit: coordinator_log::MAX_COORDINATOR_PARTICIPANTS,
+            }
+            .into());
+        }
+        if let Err(error) = transaction.prepare_and_park_group_member() {
+            if transaction.state() == TransactionState::Active {
+                let _ = transaction.rollback();
+            }
+            if transaction.state() != TransactionState::RolledBack {
+                group.resolving_member = Some(transaction);
+                self.set_group_decision_state(GroupDecisionState::PrepareResolutionRequired)?;
+            }
+            return Err(error.into());
+        }
+        let member = transaction.coordinator_group_member()?;
+        group.members.push(transaction);
+        let active = self
+            .active_group
+            .as_mut()
+            .ok_or(CoordinatorError::InvalidGroupCommit)?;
+        active.inspection.parked_member_count = group.members.len();
+        active
+            .inspection
+            .member_transaction_ids
+            .push(member.database_txn_id);
+        let storages = group
+            .members
+            .iter()
+            .map(Transaction::coordinator_group_member)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flat_map(|member| {
+                member
+                    .participants
+                    .into_iter()
+                    .map(|participant| participant.storage_id)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        active.inspection.participating_storage_count = storages.len();
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash_indexed(
+            "group-after-member-park",
+            group.members.len(),
+        );
+        Ok(())
+    }
+
+    /// Retries cleanup of a member whose prepare or park failed uncertainly.
+    /// Success restores the group to Building without disturbing prior members.
+    pub fn resolve_group_member_prepare(
+        &mut self,
+        group: &mut GroupCommitBatch,
+    ) -> Result<(), DatabaseError> {
+        self.validate_group(group)?;
+        let member = group
+            .resolving_member
+            .as_mut()
+            .ok_or(CoordinatorError::GroupPrepareResolutionNotRequired)?;
+        member.resolve_failed_group_member()?;
+        group.resolving_member = None;
+        self.set_group_decision_state(GroupDecisionState::Building)?;
+        Ok(())
+    }
+
+    pub fn commit_group(
+        &mut self,
+        group: &mut GroupCommitBatch,
+    ) -> Result<GroupCommitReport, DatabaseError> {
+        self.validate_group(group)?;
+        if group.resolving_member.is_some() {
+            return Err(CoordinatorError::GroupPrepareResolutionRequired.into());
+        }
+        if group.members.is_empty() {
+            return Err(CoordinatorError::EmptyGroupCommit.into());
+        }
+        if group.commit_sequences.is_none() {
+            self.set_group_decision_state(GroupDecisionState::DecisionPending)?;
+            let members = group
+                .members
+                .iter()
+                .map(Transaction::coordinator_group_member)
+                .collect::<Result<Vec<_>, _>>()?;
+            let sequences = self
+                .coordinator
+                .as_ref()
+                .ok_or(CoordinatorError::DurableCoordinatorRequired)?
+                .try_borrow_mut()
+                .map_err(|_| CoordinatorError::CoordinatorBusy)?
+                .sequenced_group_commit_decision(&members)?;
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash("group-after-durable-decision");
+            for (member, sequence) in group.members.iter_mut().zip(sequences.iter().copied()) {
+                member.mark_group_commit_decided(sequence)?;
+            }
+            group.commit_sequences = Some(sequences);
+            self.set_group_decision_state(GroupDecisionState::CommitDecided)?;
+        }
+
+        self.set_group_decision_state(GroupDecisionState::Applying)?;
+        let sequences = group
+            .commit_sequences
+            .as_ref()
+            .ok_or(CoordinatorError::InvalidGroupCommit)?;
+        for (position, (member, sequence)) in group
+            .members
+            .iter_mut()
+            .zip(sequences.iter().copied())
+            .enumerate()
+        {
+            if member.state() == TransactionState::Committed {
+                continue;
+            }
+            member.apply_group_commit(sequence)?;
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash_indexed("group-after-member-apply", position + 1);
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("group-after-all-participant-commits");
+        self.set_group_decision_state(GroupDecisionState::CompletePending)?;
+        for (member, sequence) in group.members.iter_mut().zip(sequences.iter().copied()) {
+            member.finish_group_complete(sequence)?;
+        }
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("group-after-all-completes-before-publication");
+        let first_commit_seq = *sequences
+            .first()
+            .ok_or(CoordinatorError::EmptyGroupCommit)?;
+        let last_commit_seq = *sequences.last().ok_or(CoordinatorError::EmptyGroupCommit)?;
+        let final_snapshot = DatabaseSnapshot::new(
+            last_commit_seq,
+            current_visibility_boundaries(&self.registry)?,
+        )?;
+        self.published_visibility
+            .as_ref()
+            .ok_or(CoordinatorError::GlobalVisibilityNotEnabled)?
+            .try_borrow_mut()
+            .map_err(|_| CoordinatorError::PublishedVisibilityBusy)?
+            .snapshot = final_snapshot;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("group-after-publication-before-complete-sync");
+        let participating_storage_count = self
+            .active_group
+            .as_ref()
+            .ok_or(CoordinatorError::InvalidGroupCommit)?
+            .inspection
+            .participating_storage_count;
+        let member_count = group.members.len();
+        group.completed = true;
+        group.members.clear();
+        self.group_barrier.set(None);
+        self.active_group = None;
+        Ok(GroupCommitReport {
+            member_count,
+            first_commit_seq,
+            last_commit_seq,
+            participating_storage_count,
+        })
+    }
+
+    pub fn abort_group(&mut self, group: &mut GroupCommitBatch) -> Result<(), DatabaseError> {
+        self.validate_group(group)?;
+        if group.commit_sequences.is_some() {
+            return Err(CoordinatorError::GroupCommitAlreadyDecided.into());
+        }
+        if group.resolving_member.is_some() {
+            self.resolve_group_member_prepare(group)?;
+        }
+        for member in group.members.iter_mut().rev() {
+            member.abort_parked_group_member()?;
+        }
+        group.completed = true;
+        group.members.clear();
+        self.group_barrier.set(None);
+        self.active_group = None;
+        Ok(())
+    }
+
+    /// Aborts and removes only the most recently parked member.
+    pub fn abort_group_tail(
+        &mut self,
+        group: &mut GroupCommitBatch,
+    ) -> Result<DatabaseTxnId, DatabaseError> {
+        self.validate_group(group)?;
+        if group.resolving_member.is_some() {
+            return Err(CoordinatorError::GroupPrepareResolutionRequired.into());
+        }
+        if group.commit_sequences.is_some() {
+            return Err(CoordinatorError::GroupCommitAlreadyDecided.into());
+        }
+        let member = group
+            .members
+            .last_mut()
+            .ok_or(CoordinatorError::EmptyGroupCommit)?;
+        let id = member.id();
+        member.abort_parked_group_member()?;
+        group.members.pop();
+        let active = self
+            .active_group
+            .as_mut()
+            .ok_or(CoordinatorError::InvalidGroupCommit)?;
+        active.inspection.parked_member_count = group.members.len();
+        active.inspection.member_transaction_ids.pop();
+        let storages = group
+            .members
+            .iter()
+            .map(Transaction::coordinator_group_member)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flat_map(|member| {
+                member
+                    .participants
+                    .into_iter()
+                    .map(|participant| participant.storage_id)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        active.inspection.participating_storage_count = storages.len();
+        Ok(id)
     }
 
     pub fn begin_transaction_with_isolation(
@@ -2176,6 +2579,9 @@ impl Database {
 
     /// Flushes dirty pages and reports any write or sync failure.
     pub fn flush(&self) -> Result<(), DatabaseError> {
+        if self.active_group.is_some() {
+            return Err(CoordinatorError::GroupCommitActive.into());
+        }
         self.ensure_schema_available(None)?;
         for entry in self.registry.iter() {
             entry.storage.flush()?;
@@ -2205,6 +2611,9 @@ impl Database {
     }
 
     fn ensure_index_maintenance_quiescent(&self) -> Result<(), DatabaseError> {
+        if self.active_group.is_some() {
+            return Err(CoordinatorError::GroupCommitActive.into());
+        }
         let handles = Rc::strong_count(&self.transaction_owner) - 1;
         if handles != 0 {
             return Err(StorageError::from(
@@ -2541,6 +2950,7 @@ impl Database {
         table_id: TableId,
         id: netbadb_types::IndexId,
     ) -> Result<(), DatabaseError> {
+        transaction.reject_group_structural_mutation()?;
         if transaction.schema_composition.is_started() {
             return if transaction.schema_composition.is_sealed() {
                 Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
@@ -3833,6 +4243,7 @@ impl Database {
         transaction: &mut Transaction,
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
+        transaction.reject_group_structural_mutation()?;
         if transaction.schema_mutation.is_some() && !prepared.is_table_create() {
             return Err(DatabaseError::UnsupportedDdlCombination);
         }
@@ -4701,6 +5112,7 @@ impl Database {
             isolation_level,
             self.coordinator.as_ref().map(Rc::clone),
             self.published_visibility.as_ref().map(Rc::clone),
+            Rc::clone(&self.group_barrier),
         ))
     }
 
@@ -5175,6 +5587,32 @@ impl Database {
         transaction
             .validate_owner(&self.transaction_owner)
             .map_err(DatabaseError::from)
+    }
+
+    fn validate_group(&self, group: &GroupCommitBatch) -> Result<(), DatabaseError> {
+        if !group
+            .owner
+            .upgrade()
+            .is_some_and(|owner| Rc::ptr_eq(&self.transaction_owner, &owner))
+            || group.completed
+            || self.group_barrier.get() != Some(group.id)
+            || self
+                .active_group
+                .as_ref()
+                .is_none_or(|active| active.inspection.group_id != group.id)
+        {
+            return Err(CoordinatorError::InvalidGroupCommit.into());
+        }
+        Ok(())
+    }
+
+    fn set_group_decision_state(&mut self, state: GroupDecisionState) -> Result<(), DatabaseError> {
+        self.active_group
+            .as_mut()
+            .ok_or(CoordinatorError::InvalidGroupCommit)?
+            .inspection
+            .decision_state = state;
+        Ok(())
     }
 }
 
@@ -5914,6 +6352,10 @@ mod tests {
             .map(std::path::PathBuf::from)
             .expect("coordinator crash root");
         let case = std::env::var(crate::coordinator_crash::CASE_ENV).expect("crash case");
+        if case.starts_with("group:") {
+            group_crash_child(&root);
+            panic!("group crash child returned without reaching its crash point");
+        }
         if case.starts_with("mixed:") {
             mixed_crash_child(&root);
             panic!("mixed crash child returned without reaching its crash point");
@@ -6048,6 +6490,38 @@ mod tests {
         transaction
             .commit()
             .expect("commit until mixed crash point");
+    }
+
+    fn group_crash_child(root: &std::path::Path) {
+        let (_, _, coordinator) = mixed_crash_paths(root);
+        let mut database = Database::open_storages_with_coordinator(
+            mixed_open_specs(root),
+            DatabaseCoordinatorConfig::new(coordinator),
+        )
+        .expect("open group crash child database");
+        let mut group = database.begin_group_commit().expect("begin crash group");
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).expect("begin member");
+            database
+                .insert_into_in(
+                    TableId(1),
+                    &mut member,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text(format!("group-{id}")),
+                    ],
+                )
+                .expect("write Heap member");
+            database
+                .insert_into_in(TableId(2), &mut member, &[ScalarValue::Int64(id)])
+                .expect("write LSM member");
+            database
+                .park_group_member(&mut group, member)
+                .expect("park crash member");
+        }
+        database
+            .commit_group(&mut group)
+            .expect("commit until group crash point");
     }
 
     fn global_single_crash_child(root: &std::path::Path, table_id: TableId) {
@@ -7163,6 +7637,9 @@ mod tests {
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
+            group_barrier: Rc::new(std::cell::Cell::new(None)),
+            active_group: None,
+            next_group_id: 1,
         };
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
@@ -9413,6 +9890,605 @@ mod tests {
             DatabaseCommitSeq(5)
         );
         reopened.close().expect("close reopened database");
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn explicit_group_commit_parks_members_uses_one_decision_sync_and_publishes_as_block() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3c-group-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database = Database::create_tables_with_coordinator(tables.clone(), config.clone())
+            .expect("create global database");
+
+        let mut group = database.begin_group_commit().expect("begin group");
+        let ddl = database
+            .prepare_ddl_statement("CREATE INDEX group_ddl ON users (name)")
+            .expect("prepare DDL");
+        let mut structural = database
+            .begin_group_member(&group)
+            .expect("begin DDL member");
+        assert!(matches!(
+            database.execute_ddl_in(&mut structural, &ddl),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::GroupCommitStructuralMutation
+            ))
+        ));
+        structural
+            .rollback()
+            .expect("roll back rejected DDL member");
+        let read_only = database.begin_group_member(&group).unwrap();
+        assert!(matches!(
+            database.park_group_member(&mut group, read_only),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::GroupCommitMemberHasNoWrites
+            ))
+        ));
+        assert_eq!(
+            database.inspect_group_commit().unwrap().decision_state,
+            super::GroupDecisionState::Building
+        );
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).expect("begin member");
+            database
+                .insert_into_in(
+                    TableId(1),
+                    &mut member,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text(format!("user-{id}")),
+                    ],
+                )
+                .expect("write member");
+            database
+                .park_group_member(&mut group, member)
+                .expect("park member");
+            assert_eq!(
+                database
+                    .current_database_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .commit_seq(),
+                DatabaseCommitSeq(0)
+            );
+        }
+        let inspection = database.inspect_group_commit().expect("active inspection");
+        assert_eq!(inspection.parked_member_count, 3);
+        assert_eq!(inspection.participating_storage_count, 1);
+        database
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .inject_decision_sync_failure();
+        assert!(database.commit_group(&mut group).is_err());
+        assert_eq!(
+            database.inspect_group_commit().unwrap().decision_state,
+            super::GroupDecisionState::DecisionPending
+        );
+        let report = database.commit_group(&mut group).expect("commit group");
+        assert_eq!(report.first_commit_seq, DatabaseCommitSeq(1));
+        assert_eq!(report.last_commit_seq, DatabaseCommitSeq(3));
+        assert_eq!(database.inspect_group_commit(), None);
+        let visibility = database.inspect_global_visibility().unwrap();
+        assert_eq!(visibility.group_decision_sync_count, 1);
+        assert_eq!(visibility.decision_sync_count, 0);
+        assert_eq!(visibility.group_committed_transaction_count, 3);
+        assert_eq!(visibility.published_commit_seq, Some(DatabaseCommitSeq(3)));
+        assert_eq!(
+            database
+                .query("SELECT id FROM users ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![ScalarValue::Int64(1)],
+                vec![ScalarValue::Int64(2)],
+                vec![ScalarValue::Int64(3)],
+            ]
+        );
+        database.close().unwrap();
+        assert!(group.completed);
+        drop(group);
+
+        let reopened = Database::open_tables_with_coordinator(tables, config).unwrap();
+        assert_eq!(
+            reopened
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(3)
+        );
+        reopened.close().unwrap();
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn explicit_group_abort_is_reverse_order_and_dirty_write_conflicts() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3c-abort-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database = Database::create_tables_with_coordinator(tables, config).unwrap();
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'base')")
+            .unwrap();
+
+        let mut group = database.begin_group_commit().unwrap();
+        let mut first = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(&mut first, "UPDATE users SET name = 'first' WHERE id = 1")
+            .unwrap();
+        database.park_group_member(&mut group, first).unwrap();
+
+        let mut failed = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(
+                &mut failed,
+                "INSERT INTO users (id, name) VALUES (3, 'failed')",
+            )
+            .unwrap();
+        let storage_id = database.bindings.resolve_single(TableId(1)).unwrap();
+        failed
+            .force_participant_rollback_for_prepare_failure(storage_id)
+            .unwrap();
+        assert!(database.park_group_member(&mut group, failed).is_err());
+        let inspection = database.inspect_group_commit().unwrap();
+        assert_eq!(inspection.parked_member_count, 1);
+        assert_eq!(
+            inspection.decision_state,
+            super::GroupDecisionState::Building
+        );
+        assert!(database.resolve_group_member_prepare(&mut group).is_err());
+
+        let mut conflicting = database.begin_group_member(&group).unwrap();
+        let error = database
+            .execute_in(
+                &mut conflicting,
+                "UPDATE users SET name = 'conflict' WHERE id = 1",
+            )
+            .expect_err("dirty write must fail");
+        assert!(error.to_string().contains("parked prepared transaction"));
+        assert_eq!(conflicting.state(), TransactionState::RolledBack);
+        drop(conflicting);
+
+        let mut second = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(
+                &mut second,
+                "INSERT INTO users (id, name) VALUES (2, 'second')",
+            )
+            .unwrap();
+        database.park_group_member(&mut group, second).unwrap();
+        database.abort_group(&mut group).unwrap();
+        assert_eq!(
+            database
+                .query("SELECT id, name FROM users ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("base".into())
+            ]]
+        );
+        drop(group);
+        database.close().unwrap();
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn explicit_group_commit_supports_mixed_heap_lsm_members_and_lsm_conflicts() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3c-mixed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_storages_with_coordinator(mixed_create_specs(&root), config).unwrap();
+        database
+            .execute("INSERT INTO lsm_items (id) VALUES (10)")
+            .unwrap();
+
+        let mut group = database.begin_group_commit().unwrap();
+        let mut first = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(&mut first, "UPDATE lsm_items SET id = 11 WHERE id = 10")
+            .unwrap();
+        database
+            .execute_in(
+                &mut first,
+                "INSERT INTO users (id, name) VALUES (11, 'mixed')",
+            )
+            .unwrap();
+        database.park_group_member(&mut group, first).unwrap();
+
+        let mut conflict = database.begin_group_member(&group).unwrap();
+        let error = database
+            .execute_in(&mut conflict, "DELETE FROM lsm_items WHERE id = 10")
+            .expect_err("LSM dirty write must fail");
+        assert!(error.to_string().contains("parked prepared transaction"));
+        drop(conflict);
+
+        let mut second = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(&mut second, "INSERT INTO lsm_items (id) VALUES (20)")
+            .unwrap();
+        database.park_group_member(&mut group, second).unwrap();
+        let report = database.commit_group(&mut group).unwrap();
+        assert_eq!(report.member_count, 2);
+        assert_eq!(report.participating_storage_count, 2);
+        assert_eq!(
+            database
+                .query("SELECT id FROM lsm_items ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![vec![ScalarValue::Int64(11)], vec![ScalarValue::Int64(20)]]
+        );
+        drop(group);
+        database.close().unwrap();
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn explicit_group_recovery_aborts_without_decision_and_commits_whole_durable_group() {
+        for decided in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-phase3c-recovery-{decided}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            cleanup_mixed_crash_fixture(&root);
+            let (_, _, coordinator_path) = mixed_crash_paths(&root);
+            let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+            let mut database = Database::create_storages_with_coordinator(
+                mixed_create_specs(&root),
+                config.clone(),
+            )
+            .unwrap();
+            let mut group = database.begin_group_commit().unwrap();
+            for id in 1..=2_i64 {
+                let mut member = database.begin_group_member(&group).unwrap();
+                database
+                    .insert_into_in(
+                        TableId(1),
+                        &mut member,
+                        &[
+                            ScalarValue::Int64(id),
+                            ScalarValue::Text(format!("member-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                database
+                    .insert_into_in(TableId(2), &mut member, &[ScalarValue::Int64(id)])
+                    .unwrap();
+                database.park_group_member(&mut group, member).unwrap();
+            }
+            if decided {
+                let members = group
+                    .members
+                    .iter()
+                    .map(|member| member.coordinator_group_member())
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    database
+                        .coordinator
+                        .as_ref()
+                        .unwrap()
+                        .borrow_mut()
+                        .sequenced_group_commit_decision(&members)
+                        .unwrap(),
+                    [DatabaseCommitSeq(1), DatabaseCommitSeq(2)]
+                );
+            }
+            drop(group);
+            drop(database);
+
+            let mut reopened =
+                Database::open_storages_with_coordinator(mixed_open_specs(&root), config.clone())
+                    .unwrap();
+            let expected = if decided {
+                vec![vec![ScalarValue::Int64(1)], vec![ScalarValue::Int64(2)]]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                reopened
+                    .query("SELECT id FROM users ORDER BY id")
+                    .unwrap()
+                    .rows,
+                expected
+            );
+            assert_eq!(
+                reopened
+                    .query("SELECT id FROM lsm_items ORDER BY id")
+                    .unwrap()
+                    .rows,
+                expected
+            );
+            assert_eq!(
+                reopened
+                    .current_database_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .commit_seq(),
+                DatabaseCommitSeq(if decided { 2 } else { 0 })
+            );
+            reopened.close().unwrap();
+            cleanup_mixed_crash_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn subprocess_group_commit_crash_matrix_is_block_atomic_and_change_gap_free() {
+        let cases = [
+            ("group-after-member-park-1", false),
+            ("group-after-member-park-3", false),
+            ("during-group-decision-append", false),
+            ("after-group-decision-append", true),
+            ("group-after-durable-decision", true),
+            ("group-before-participant-commit-1", true),
+            ("group-after-participant-commit-1", true),
+            ("group-after-member-apply-1", true),
+            ("group-after-all-participant-commits", true),
+            ("group-before-complete", true),
+            ("group-after-complete", true),
+            ("group-after-all-completes-before-publication", true),
+            ("group-after-publication-before-complete-sync", true),
+        ];
+        for (point, committed) in cases {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-phase3c-crash-{point}-{}",
+                std::process::id()
+            ));
+            cleanup_mixed_crash_fixture(&root);
+            let (_, _, coordinator) = mixed_crash_paths(&root);
+            let mut initial = Database::create_storages_with_coordinator(
+                mixed_create_specs(&root),
+                DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility(),
+            )
+            .unwrap();
+            let heap_cursor = initial.enable_change_stream(TableId(1)).unwrap();
+            let lsm_cursor = initial.enable_change_stream(TableId(2)).unwrap();
+            initial.close().unwrap();
+
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("tests::coordinator_crash_child_entrypoint")
+                .arg("--nocapture");
+            crate::coordinator_crash::configure_child(
+                &mut command,
+                &format!("group:{point}"),
+                &root,
+                point,
+            );
+            let status = command.status().expect("start group crash child");
+            assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+
+            for pass in 0..2 {
+                let mut recovered = Database::open_storages_with_coordinator(
+                    mixed_open_specs(&root),
+                    DatabaseCoordinatorConfig::new(&coordinator),
+                )
+                .expect("recover group crash fixture");
+                let expected = if committed {
+                    vec![
+                        vec![ScalarValue::Int64(1)],
+                        vec![ScalarValue::Int64(2)],
+                        vec![ScalarValue::Int64(3)],
+                    ]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    recovered
+                        .query("SELECT id FROM users ORDER BY id")
+                        .unwrap()
+                        .rows,
+                    expected,
+                    "Heap pass {pass}, point {point}"
+                );
+                assert_eq!(
+                    recovered
+                        .query("SELECT id FROM lsm_items ORDER BY id")
+                        .unwrap()
+                        .rows,
+                    expected,
+                    "LSM pass {pass}, point {point}"
+                );
+                let heap = recovered
+                    .read_changes(TableId(1), heap_cursor, 10, 1_000_000)
+                    .unwrap();
+                let lsm = recovered
+                    .read_changes(TableId(2), lsm_cursor, 10, 1_000_000)
+                    .unwrap();
+                let batch_count = if committed { 3 } else { 0 };
+                assert_eq!(heap.batches.len(), batch_count, "Heap stream {point}");
+                assert_eq!(lsm.batches.len(), batch_count, "LSM stream {point}");
+                for batches in [&heap.batches, &lsm.batches] {
+                    assert!(
+                        batches
+                            .windows(2)
+                            .all(|pair| pair[0].after == pair[1].before),
+                        "change stream gap at {point}"
+                    );
+                }
+                assert_eq!(
+                    recovered
+                        .current_database_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .commit_seq(),
+                    DatabaseCommitSeq(if committed { 3 } else { 0 }),
+                    "published G pass {pass}, point {point}"
+                );
+                recovered.close().unwrap();
+            }
+            cleanup_mixed_crash_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn completed_group_compacts_to_checkpoint_and_next_group_continues_identities() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3c-compaction-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_tables_with_coordinator(tables.clone(), config.clone()).unwrap();
+
+        let mut group = database.begin_group_commit().unwrap();
+        for id in 1..=2_i64 {
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .execute_in(
+                    &mut member,
+                    &format!("INSERT INTO users (id, name) VALUES ({id}, 'before')"),
+                )
+                .unwrap();
+            database.park_group_member(&mut group, member).unwrap();
+        }
+        database.commit_group(&mut group).unwrap();
+        drop(group);
+        let compacted = database.compact_coordinator_log().unwrap();
+        assert!(compacted.compacted);
+        assert_eq!(compacted.checkpointed_through, DatabaseCommitSeq(2));
+        assert_eq!(compacted.database_txn_id_high_water, DatabaseTxnId(2));
+        assert_eq!(compacted.decisions_compacted, 2);
+
+        let mut next = database.begin_group_commit().unwrap();
+        let mut member = database.begin_group_member(&next).unwrap();
+        assert_eq!(member.id(), DatabaseTxnId(3));
+        database
+            .execute_in(
+                &mut member,
+                "INSERT INTO users (id, name) VALUES (3, 'after')",
+            )
+            .unwrap();
+        database.park_group_member(&mut next, member).unwrap();
+        let report = database.commit_group(&mut next).unwrap();
+        assert_eq!(report.first_commit_seq, DatabaseCommitSeq(3));
+        assert_eq!(report.last_commit_seq, DatabaseCommitSeq(3));
+        drop(next);
+        database.close().unwrap();
+
+        let reopened = Database::open_tables_with_coordinator(tables, config).unwrap();
+        assert_eq!(
+            reopened
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(3)
+        );
+        reopened.close().unwrap();
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn explicit_group_tail_abort_preserves_prior_heap_and_btree_page_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3c-btree-tail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database = Database::create_tables_with_coordinator(tables, config).unwrap();
+        database
+            .execute("INSERT INTO users (id, name) VALUES (1, 'one')")
+            .unwrap();
+        database
+            .execute("INSERT INTO users (id, name) VALUES (2, 'two')")
+            .unwrap();
+        database.create_index(TableId(1), ColumnId(2)).unwrap();
+
+        let mut group = database.begin_group_commit().unwrap();
+        let mut first = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(&mut first, "UPDATE users SET name = 'first' WHERE id = 1")
+            .unwrap();
+        database.park_group_member(&mut group, first).unwrap();
+        let mut second = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(&mut second, "UPDATE users SET name = 'second' WHERE id = 2")
+            .unwrap();
+        database.park_group_member(&mut group, second).unwrap();
+
+        database.abort_group_tail(&mut group).unwrap();
+        let report = database.commit_group(&mut group).unwrap();
+        assert_eq!(report.member_count, 1);
+        assert_eq!(
+            database
+                .query("SELECT id, name FROM users ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![ScalarValue::Int64(1), ScalarValue::Text("first".into())],
+                vec![ScalarValue::Int64(2), ScalarValue::Text("two".into())],
+            ]
+        );
+        drop(group);
+
+        let mut commit_all = database.begin_group_commit().unwrap();
+        for (id, name) in [(1, "first-all"), (2, "second-all")] {
+            let mut member = database.begin_group_member(&commit_all).unwrap();
+            database
+                .execute_in(
+                    &mut member,
+                    &format!("UPDATE users SET name = '{name}' WHERE id = {id}"),
+                )
+                .unwrap();
+            database.park_group_member(&mut commit_all, member).unwrap();
+        }
+        database.commit_group(&mut commit_all).unwrap();
+        drop(commit_all);
+
+        let mut abort_all = database.begin_group_commit().unwrap();
+        for (id, name) in [(1, "first-abort"), (2, "second-abort")] {
+            let mut member = database.begin_group_member(&abort_all).unwrap();
+            database
+                .execute_in(
+                    &mut member,
+                    &format!("UPDATE users SET name = '{name}' WHERE id = {id}"),
+                )
+                .unwrap();
+            database.park_group_member(&mut abort_all, member).unwrap();
+        }
+        database.abort_group(&mut abort_all).unwrap();
+        drop(abort_all);
+        assert_eq!(
+            database
+                .query("SELECT id, name FROM users ORDER BY id")
+                .unwrap()
+                .rows,
+            vec![
+                vec![ScalarValue::Int64(1), ScalarValue::Text("first-all".into())],
+                vec![
+                    ScalarValue::Int64(2),
+                    ScalarValue::Text("second-all".into())
+                ],
+            ]
+        );
+        database.close().unwrap();
         cleanup_coordinator_fixture(&root);
     }
 

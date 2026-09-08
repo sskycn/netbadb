@@ -718,6 +718,7 @@ fn wire_transaction_state(state: TransactionState) -> WireTransactionState {
         TransactionState::Active => WireTransactionState::Active,
         TransactionState::RollbackRequired => WireTransactionState::RollbackRequired,
         TransactionState::Preparing
+        | TransactionState::ParkedPrepared
         | TransactionState::DecisionPending
         | TransactionState::CommitDecided
         | TransactionState::ApplyingCommit

@@ -727,10 +727,23 @@ impl ChangeStreamManager {
         };
     }
 
-    pub(crate) fn abandon(&mut self, txn_id: TxnId) {
+    pub(crate) fn abandon(&mut self, txn_id: TxnId) -> Result<(), StorageError> {
         if let State::Enabled { unresolved, .. } = &mut self.state {
+            if let Some(record) = unresolved.get(&txn_id) {
+                let tail = unresolved
+                    .values()
+                    .max_by_key(|candidate| candidate.batch.sequence)
+                    .map(|candidate| candidate.batch.physical_txn_id);
+                if tail != Some(record.batch.physical_txn_id) {
+                    return Err(ChangeStreamError::InvalidRecord(
+                        "prepared reservation is not the chain tail",
+                    )
+                    .into());
+                }
+            }
             unresolved.remove(&txn_id);
         }
+        Ok(())
     }
 
     pub(crate) fn cursor(&self) -> Result<ChangeStreamCursor, StorageError> {
@@ -1058,7 +1071,13 @@ fn prepare_enabled(
     if let Some(record) = unresolved.get(&txn_id) {
         return Ok(Some(prepared_identity(&record.batch)));
     }
-    let before = effective_current(header, batches);
+    let before = unresolved
+        .values()
+        .max_by_key(|record| record.batch.sequence)
+        .map_or_else(
+            || effective_current(header, batches),
+            |record| record.batch.after,
+        );
     let after = StorageDataVersion(
         before
             .0
@@ -2411,6 +2430,53 @@ mod tests {
             validate_committed_chain(StorageDataVersion(11), &[first, second]),
             Err(ChangeStreamError::ChangeGap { .. })
         ));
+    }
+
+    #[test]
+    fn prepared_reservations_chain_and_require_head_publish_tail_abort() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-change-prepared-chain-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(&path, encode_header(&header())).unwrap();
+        let table = table();
+        let mut manager = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table,
+            |_| AuthoritativeOutcome::Unresolved,
+        )
+        .unwrap();
+        let first_change = batch().mutations[0].clone();
+        let mut second_change = first_change.clone();
+        if let StorageChange::Insert { new_version, .. } = &mut second_change {
+            *new_version = StorageVersionKey::Heap {
+                storage_id: StorageId(8),
+                row_id: RowId {
+                    page: PageId(3),
+                    slot: 1,
+                    generation: 1,
+                },
+            };
+        }
+        let first = manager
+            .prepare(TxnId(5), Some(DatabaseTxnId(50)), &[first_change])
+            .unwrap()
+            .unwrap();
+        let second = manager
+            .prepare(TxnId(6), Some(DatabaseTxnId(60)), &[second_change])
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.before, first.after);
+        assert!(manager.publish(TxnId(6), second, None).is_err());
+        assert!(manager.abandon(TxnId(5)).is_err());
+        manager.abandon(TxnId(6)).unwrap();
+        manager.publish(TxnId(5), first, None).unwrap();
+        assert_eq!(manager.inspection().prepared_unresolved_count, 0);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

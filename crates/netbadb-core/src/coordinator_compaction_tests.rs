@@ -191,6 +191,7 @@ fn checkpoint_requires_tail_evidence_for_any_still_prepared_participant() {
     let prepared = netbadb_storage::PreparedTransaction {
         database_txn_id: netbadb_types::DatabaseTxnId(9),
         physical_txn_id: netbadb_types::TxnId(90),
+        prepare_order: 1,
         state: netbadb_storage::PreparedTransactionState::Prepared,
     };
     assert!(matches!(

@@ -1,5 +1,21 @@
 # NetbaDB roadmap
 
+## Explicit synchronous group commit (Phase 3C complete)
+
+- added a Global-only embedded group builder with consumed parked members, one
+  active-group barrier, a shared base snapshot, and data-DML-only admission;
+- added runtime ordered prepared chains, Heap/LSM dirty-write conflict checks,
+  reverse pre-decision abort, and chained NBCL reservations;
+- added a bounded checksummed CORD v5 group decision that binds independent
+  transactions to consecutive G values with one coordinator sync and one final
+  block publication;
+- retained NBCO v1, CORD v1-v4 recovery, ordinary Phase 3B commits, and the
+  existing per-transaction Complete pipeline;
+- added group/storage inspection, exact sync accounting, deterministic Heap,
+  LSM and mixed tests, and the `global_group_commit_phase3c` benchmark matrix.
+
+See [`phase3c-explicit-group-commit.md`](phase3c-explicit-group-commit.md).
+
 ## Cross-physical CAST and atomic shadow conversion audit (Round 59 complete)
 
 - selected the existing typed `ExprKind::Cast` plus the deferred shadow-column

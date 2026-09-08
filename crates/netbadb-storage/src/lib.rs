@@ -410,6 +410,14 @@ pub enum TransactionError {
         txn_id: netbadb_types::TxnId,
         state: TransactionState,
     },
+    PreparedWriteConflict {
+        txn_id: netbadb_types::TxnId,
+        conflicting_txn_id: netbadb_types::TxnId,
+    },
+    PreparedResolutionOrder {
+        txn_id: netbadb_types::TxnId,
+        expected: netbadb_types::TxnId,
+    },
     WriterBusy {
         txn_id: netbadb_types::TxnId,
     },
@@ -429,6 +437,13 @@ pub enum TransactionError {
     },
     #[cfg(test)]
     RollbackInterrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRuntimeInspection {
+    pub parked_prepared_count: usize,
+    pub active_group_chain: Vec<netbadb_types::TxnId>,
+    pub prepared_write_conflict_count: u64,
 }
 
 impl fmt::Display for TransactionError {
@@ -462,6 +477,19 @@ impl fmt::Display for TransactionError {
                 formatter,
                 "physical transaction {} is {state:?}, not prepared",
                 txn_id.0
+            ),
+            Self::PreparedWriteConflict {
+                txn_id,
+                conflicting_txn_id,
+            } => write!(
+                formatter,
+                "transaction {} conflicts with parked prepared transaction {}",
+                txn_id.0, conflicting_txn_id.0
+            ),
+            Self::PreparedResolutionOrder { txn_id, expected } => write!(
+                formatter,
+                "parked prepared transaction {} cannot resolve before transaction {}",
+                txn_id.0, expected.0
             ),
             Self::WriterBusy { txn_id } => {
                 write!(formatter, "transaction {} is the active writer", txn_id.0)

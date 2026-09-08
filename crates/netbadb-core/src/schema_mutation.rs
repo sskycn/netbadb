@@ -1328,6 +1328,7 @@ impl Database {
         transaction: &mut Transaction,
         target: DropTableTarget,
     ) -> Result<(), DatabaseError> {
+        transaction.reject_group_structural_mutation()?;
         self.compose_drop_table_in(transaction, target)
     }
 
@@ -1958,6 +1959,7 @@ impl Database {
         transaction: &mut Transaction,
         spec: CreateTableSpec,
     ) -> Result<TableId, DatabaseError> {
+        transaction.reject_group_structural_mutation()?;
         self.compose_create_heap_table_in(transaction, spec)
     }
 

@@ -107,6 +107,13 @@ replacing a completed data-only history with one bounded CORD checkpoint.
 Compaction remains administrator-controlled; it is not automatic coordinator
 GC or group commit.
 
+[Phase 3C](docs/phase3c-explicit-group-commit.md) adds explicit synchronous
+group commit for Global databases. Callers park independently prepared data
+transactions in a stable order, one checksummed CORD v5 record durably binds
+their consecutive G range, and Core finishes all participants before one block
+publication. Per-storage parked chains preserve single-writer dirty-write
+exclusion and reverse Heap abort safety; no background worker or timer is used.
+
 [Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
 durable per-storage committed change stream for Heap and LSM, with exact
 row-version identities, transaction coalescing, bounded replay, gap detection,
