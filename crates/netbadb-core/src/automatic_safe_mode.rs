@@ -132,12 +132,18 @@ pub enum AutomaticSafeTrial {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutomaticSafeModeState {
     active_trial: Option<AutomaticSafeTrial>,
+    cross_lane_service: AutomaticCrossLaneServiceState,
 }
 
 impl AutomaticSafeModeState {
     #[must_use]
     pub const fn active_trial(self) -> Option<AutomaticSafeTrial> {
         self.active_trial
+    }
+
+    #[must_use]
+    pub const fn cross_lane_service(self) -> AutomaticCrossLaneServiceState {
+        self.cross_lane_service
     }
 }
 
@@ -257,6 +263,7 @@ pub struct AutomaticMultiSafeModeInput<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutomaticMultiSafeModePolicy {
     pub safe_mode: AutomaticSafeModePolicy,
+    pub cross_lane_service: AutomaticCrossLaneServicePolicy,
     pub max_candidate_tables: u64,
     pub max_calibration_classes: u64,
     pub max_fairness_entries: u64,
@@ -266,11 +273,37 @@ impl Default for AutomaticMultiSafeModePolicy {
     fn default() -> Self {
         Self {
             safe_mode: AutomaticSafeModePolicy::default(),
+            cross_lane_service: AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
             max_candidate_tables: 16,
             max_calibration_classes: 4,
             max_fairness_entries: 64,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutomaticCrossLaneServicePolicy {
+    #[default]
+    StrictPhysicalPriority,
+    BoundedColumnarBurst {
+        max_consecutive_columnar_admissions: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutomaticCrossLaneServiceState {
+    pub consecutive_columnar_admissions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticLaneSelectionReason {
+    ActiveTrial,
+    StrictPhysicalPriority,
+    ColumnarBurstAvailable,
+    CalibrationServiceDue,
+    OnlyColumnarReady,
+    OnlyCalibrationReady,
+    NoReadyCandidates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -317,12 +350,19 @@ pub struct AutomaticCandidateInspection {
 pub struct AutomaticCandidateInspectionReport {
     pub candidates: Vec<AutomaticCandidateInspection>,
     pub blocked_by_active_trial: Option<AutomaticSafeTrial>,
+    pub cross_lane_service_state: AutomaticCrossLaneServiceState,
+    pub preferred_lane: AutomaticSafeModeLane,
+    pub lane_selection_reason: AutomaticLaneSelectionReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutomaticMultiSafeModeReport {
     pub candidates: Vec<AutomaticCandidateInspection>,
     pub selected_candidate: Option<AutomaticCandidateKey>,
+    pub evidence_window_epoch: crate::AdaptiveEvidenceWindowEpoch,
+    pub cross_lane_service_before: AutomaticCrossLaneServiceState,
+    pub cross_lane_service_after: AutomaticCrossLaneServiceState,
+    pub lane_selection_reason: AutomaticLaneSelectionReason,
     pub action: AutomaticSafeModeReport,
 }
 
@@ -333,6 +373,7 @@ pub enum AutomaticSafeModeError {
     CalibrationMutation(PlannerCalibrationMutationError),
     MissingColumnarMeasurement,
     AdmissionScopeTooLarge,
+    InvalidCrossLaneServicePolicy,
 }
 
 impl fmt::Display for AutomaticSafeModeError {
@@ -347,6 +388,8 @@ impl fmt::Display for AutomaticSafeModeError {
             Self::AdmissionScopeTooLarge => {
                 formatter.write_str("automatic admission scope exceeds the configured bound")
             }
+            Self::InvalidCrossLaneServicePolicy => formatter
+                .write_str("bounded cross-lane service requires at least one Columnar admission"),
         }
     }
 }
@@ -357,7 +400,9 @@ impl Error for AutomaticSafeModeError {
             Self::Adaptive(error) => Some(error),
             Self::CalibrationAdvisor(error) => Some(error),
             Self::CalibrationMutation(error) => Some(error),
-            Self::MissingColumnarMeasurement | Self::AdmissionScopeTooLarge => None,
+            Self::MissingColumnarMeasurement
+            | Self::AdmissionScopeTooLarge
+            | Self::InvalidCrossLaneServicePolicy => None,
         }
     }
 }
@@ -422,6 +467,7 @@ struct CandidateAdmissionEntry {
 pub(crate) struct AutomaticSafeModeRuntimeState {
     active_trial: Option<ActiveAutomaticTrial>,
     admission: Vec<CandidateAdmissionEntry>,
+    cross_lane_service: AutomaticCrossLaneServiceState,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +504,7 @@ impl Database {
                 .automatic_safe_mode
                 .active_trial
                 .map(ActiveAutomaticTrial::summary),
+            cross_lane_service: self.automatic_safe_mode.cross_lane_service,
         }
     }
 
@@ -478,36 +525,50 @@ impl Database {
         policy: AutomaticMultiSafeModePolicy,
     ) -> Result<AutomaticCandidateInspectionReport, AutomaticSafeModeError> {
         validate_multi_scope(input.scope, policy)?;
+        let service_state = self.automatic_safe_mode.cross_lane_service;
         if let Some(active) = self.automatic_safe_mode_state().active_trial() {
+            let preferred_lane = match active {
+                AutomaticSafeTrial::Columnar(_) => AutomaticSafeModeLane::ActiveColumnarTrial,
+                AutomaticSafeTrial::PlannerCalibration(_) => {
+                    AutomaticSafeModeLane::ActivePlannerCalibrationTrial
+                }
+            };
             return Ok(AutomaticCandidateInspectionReport {
                 candidates: Vec::new(),
                 blocked_by_active_trial: Some(active),
+                cross_lane_service_state: service_state,
+                preferred_lane,
+                lane_selection_reason: AutomaticLaneSelectionReason::ActiveTrial,
             });
         }
-        let mut candidates = self.discover_columnar_candidates(
+        let columnar = self.discover_columnar_candidates(
             input.scope.table_ids,
             input.maintenance_budget,
             policy.safe_mode,
         )?;
-        if u64::try_from(candidates.len()).map_or(true, |count| count > policy.max_fairness_entries)
-        {
-            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
-        }
-        candidates.extend(self.discover_calibration_candidates(
+        validate_candidate_count(columnar.len(), 0, policy)?;
+        let calibration = self.discover_calibration_candidates(
             pool,
             input.scope.calibration_classes,
             policy.safe_mode,
-        )?);
-        if u64::try_from(candidates.len()).map_or(true, |count| count > policy.max_fairness_entries)
-        {
-            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
-        }
+        )?;
+        validate_candidate_count(columnar.len(), calibration.len(), policy)?;
+        let (preferred_lane, lane_selection_reason) = select_ready_lane(
+            &columnar,
+            &calibration,
+            policy.cross_lane_service,
+            service_state,
+        );
         Ok(AutomaticCandidateInspectionReport {
-            candidates: candidates
+            candidates: columnar
                 .into_iter()
+                .chain(calibration)
                 .map(|candidate| candidate.inspection)
                 .collect(),
             blocked_by_active_trial: None,
+            cross_lane_service_state: service_state,
+            preferred_lane,
+            lane_selection_reason,
         })
     }
 
@@ -522,6 +583,7 @@ impl Database {
     ) -> Result<AutomaticMultiSafeModeReport, AutomaticSafeModeError> {
         validate_multi_scope(input.scope, policy)?;
         let trial_before = self.automatic_safe_mode_state().active_trial();
+        let service_before = self.automatic_safe_mode.cross_lane_service;
         if let Some(trial) = self.automatic_safe_mode.active_trial {
             let action = match trial {
                 ActiveAutomaticTrial::Columnar { target } => {
@@ -586,6 +648,10 @@ impl Database {
             return Ok(AutomaticMultiSafeModeReport {
                 candidates: Vec::new(),
                 selected_candidate: None,
+                evidence_window_epoch: pool.window_epoch(),
+                cross_lane_service_before: service_before,
+                cross_lane_service_after: self.automatic_safe_mode.cross_lane_service,
+                lane_selection_reason: AutomaticLaneSelectionReason::ActiveTrial,
                 action,
             });
         }
@@ -595,57 +661,46 @@ impl Database {
             input.maintenance_budget,
             policy.safe_mode,
         )?;
-        if u64::try_from(columnar.len()).map_or(true, |count| count > policy.max_fairness_entries) {
-            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
-        }
-        let columnar_inspections = columnar
-            .iter()
-            .map(|candidate| candidate.inspection)
-            .collect::<Vec<_>>();
-        if let Some(selected_index) = select_columnar_candidate(&columnar) {
-            let key = columnar[selected_index].inspection.key;
-            self.advance_fairness(
-                &columnar,
-                key,
-                policy.max_fairness_entries,
-                AutomaticSafeModeLane::ColumnarMaintenance,
-            );
-            let selected = columnar.remove(selected_index);
-            let action =
-                self.execute_multi_candidate(selected, input.maintenance_budget, trial_before)?;
-            return Ok(AutomaticMultiSafeModeReport {
-                candidates: columnar_inspections,
-                selected_candidate: Some(key),
-                action,
-            });
-        }
-
+        validate_candidate_count(columnar.len(), 0, policy)?;
         let mut calibration = self.discover_calibration_candidates(
             pool,
             input.scope.calibration_classes,
             policy.safe_mode,
         )?;
-        if u64::try_from(columnar.len().saturating_add(calibration.len()))
-            .map_or(true, |count| count > policy.max_fairness_entries)
-        {
-            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
-        }
-        let mut inspections = columnar_inspections;
+        validate_candidate_count(columnar.len(), calibration.len(), policy)?;
+        let mut inspections = columnar
+            .iter()
+            .map(|candidate| candidate.inspection)
+            .collect::<Vec<_>>();
         inspections.extend(calibration.iter().map(|candidate| candidate.inspection));
-        if let Some(selected_index) = select_calibration_candidate(&calibration) {
-            let key = calibration[selected_index].inspection.key;
-            self.advance_fairness(
-                &calibration,
-                key,
-                policy.max_fairness_entries,
-                AutomaticSafeModeLane::PlannerCalibration,
-            );
-            let selected = calibration.remove(selected_index);
+        let (selected_lane, lane_selection_reason) = select_ready_lane(
+            &columnar,
+            &calibration,
+            policy.cross_lane_service,
+            service_before,
+        );
+        let selected = match selected_lane {
+            AutomaticSafeModeLane::ColumnarMaintenance => {
+                select_columnar_candidate(&columnar).map(|index| columnar.remove(index))
+            }
+            AutomaticSafeModeLane::PlannerCalibration => {
+                select_calibration_candidate(&calibration).map(|index| calibration.remove(index))
+            }
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            let key = selected.inspection.key;
+            self.advance_fairness(&inspections, key, policy.max_fairness_entries);
+            self.record_cross_lane_admission(selected_lane);
             let action =
                 self.execute_multi_candidate(selected, input.maintenance_budget, trial_before)?;
             return Ok(AutomaticMultiSafeModeReport {
                 candidates: inspections,
                 selected_candidate: Some(key),
+                evidence_window_epoch: pool.window_epoch(),
+                cross_lane_service_before: service_before,
+                cross_lane_service_after: self.automatic_safe_mode.cross_lane_service,
+                lane_selection_reason,
                 action,
             });
         }
@@ -661,6 +716,10 @@ impl Database {
         Ok(AutomaticMultiSafeModeReport {
             candidates: inspections,
             selected_candidate: None,
+            evidence_window_epoch: pool.window_epoch(),
+            cross_lane_service_before: service_before,
+            cross_lane_service_after: self.automatic_safe_mode.cross_lane_service,
+            lane_selection_reason,
             action: self.finish_automatic_report(
                 trial_before,
                 AutomaticSafeModeLane::None,
@@ -1041,19 +1100,15 @@ impl Database {
 
     fn advance_fairness(
         &mut self,
-        candidates: &[DiscoveredAutomaticCandidate],
+        candidates: &[AutomaticCandidateInspection],
         selected: AutomaticCandidateKey,
         maximum_entries: u64,
-        lane: AutomaticSafeModeLane,
     ) {
         let maximum = usize::try_from(maximum_entries).unwrap_or(usize::MAX);
         let ready = candidates
             .iter()
-            .filter(|candidate| {
-                candidate.inspection.lane == lane
-                    && candidate.inspection.readiness == AutomaticCandidateReadiness::Ready
-            })
-            .map(|candidate| candidate.inspection.key)
+            .filter(|candidate| candidate.readiness == AutomaticCandidateReadiness::Ready)
+            .map(|candidate| candidate.key)
             .collect::<Vec<_>>();
         self.automatic_safe_mode
             .admission
@@ -1079,6 +1134,26 @@ impl Database {
                         ready_age: u64::from(key != selected),
                     });
             }
+        }
+    }
+
+    fn record_cross_lane_admission(&mut self, lane: AutomaticSafeModeLane) {
+        match lane {
+            AutomaticSafeModeLane::ColumnarMaintenance => {
+                let consecutive = &mut self
+                    .automatic_safe_mode
+                    .cross_lane_service
+                    .consecutive_columnar_admissions;
+                *consecutive = consecutive.saturating_add(1);
+            }
+            AutomaticSafeModeLane::PlannerCalibration => {
+                self.automatic_safe_mode
+                    .cross_lane_service
+                    .consecutive_columnar_admissions = 0;
+            }
+            AutomaticSafeModeLane::None
+            | AutomaticSafeModeLane::ActiveColumnarTrial
+            | AutomaticSafeModeLane::ActivePlannerCalibrationTrial => {}
         }
     }
 
@@ -1463,6 +1538,14 @@ fn validate_multi_scope(
     scope: AutomaticAdmissionScope<'_>,
     policy: AutomaticMultiSafeModePolicy,
 ) -> Result<(), AutomaticSafeModeError> {
+    if matches!(
+        policy.cross_lane_service,
+        AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+            max_consecutive_columnar_admissions: 0
+        }
+    ) {
+        return Err(AutomaticSafeModeError::InvalidCrossLaneServicePolicy);
+    }
     if u64::try_from(scope.table_ids.len())
         .map_or(true, |count| count > policy.max_candidate_tables)
         || u64::try_from(scope.calibration_classes.len())
@@ -1471,6 +1554,63 @@ fn validate_multi_scope(
         return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
     }
     Ok(())
+}
+
+fn validate_candidate_count(
+    columnar: usize,
+    calibration: usize,
+    policy: AutomaticMultiSafeModePolicy,
+) -> Result<(), AutomaticSafeModeError> {
+    if u64::try_from(columnar.saturating_add(calibration))
+        .map_or(true, |count| count > policy.max_fairness_entries)
+    {
+        return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
+    }
+    Ok(())
+}
+
+fn select_ready_lane(
+    columnar: &[DiscoveredAutomaticCandidate],
+    calibration: &[DiscoveredAutomaticCandidate],
+    policy: AutomaticCrossLaneServicePolicy,
+    state: AutomaticCrossLaneServiceState,
+) -> (AutomaticSafeModeLane, AutomaticLaneSelectionReason) {
+    let columnar_ready = columnar
+        .iter()
+        .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
+    let calibration_ready = calibration
+        .iter()
+        .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
+    match (columnar_ready, calibration_ready) {
+        (true, false) => (
+            AutomaticSafeModeLane::ColumnarMaintenance,
+            AutomaticLaneSelectionReason::OnlyColumnarReady,
+        ),
+        (false, true) => (
+            AutomaticSafeModeLane::PlannerCalibration,
+            AutomaticLaneSelectionReason::OnlyCalibrationReady,
+        ),
+        (false, false) => (
+            AutomaticSafeModeLane::None,
+            AutomaticLaneSelectionReason::NoReadyCandidates,
+        ),
+        (true, true) => match policy {
+            AutomaticCrossLaneServicePolicy::StrictPhysicalPriority => (
+                AutomaticSafeModeLane::ColumnarMaintenance,
+                AutomaticLaneSelectionReason::StrictPhysicalPriority,
+            ),
+            AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+                max_consecutive_columnar_admissions,
+            } if state.consecutive_columnar_admissions >= max_consecutive_columnar_admissions => (
+                AutomaticSafeModeLane::PlannerCalibration,
+                AutomaticLaneSelectionReason::CalibrationServiceDue,
+            ),
+            AutomaticCrossLaneServicePolicy::BoundedColumnarBurst { .. } => (
+                AutomaticSafeModeLane::ColumnarMaintenance,
+                AutomaticLaneSelectionReason::ColumnarBurstAvailable,
+            ),
+        },
+    }
 }
 
 fn stable_unique_tables(table_ids: &[TableId]) -> Vec<TableId> {
@@ -1594,6 +1734,30 @@ mod admission_tests {
         }
     }
 
+    fn calibration(
+        class: PlannerCalibrationClass,
+        age: u64,
+        improvement: u64,
+    ) -> DiscoveredAutomaticCandidate {
+        DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key: AutomaticCandidateKey::PlannerCalibration {
+                    calibration_class: class,
+                },
+                lane: AutomaticSafeModeLane::PlannerCalibration,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank: AutomaticCandidateRankEvidence {
+                    ready_age: age,
+                    shadow_improvement_work_units: Some(improvement),
+                    distinct_query_shapes: Some(3),
+                    sample_count: Some(10),
+                    ..AutomaticCandidateRankEvidence::default()
+                },
+            },
+            authority: None,
+        }
+    }
+
     #[test]
     fn ready_age_precedes_merit_and_never_makes_blocked_ready() {
         let high = columnar(1, 1, 0, 10_000, 1);
@@ -1621,28 +1785,86 @@ mod admission_tests {
 
     #[test]
     fn calibration_rank_uses_age_then_shadow_improvement() {
-        let make = |class, age, improvement| DiscoveredAutomaticCandidate {
-            inspection: AutomaticCandidateInspection {
-                key: AutomaticCandidateKey::PlannerCalibration {
-                    calibration_class: class,
-                },
-                lane: AutomaticSafeModeLane::PlannerCalibration,
-                readiness: AutomaticCandidateReadiness::Ready,
-                rank: AutomaticCandidateRankEvidence {
-                    ready_age: age,
-                    shadow_improvement_work_units: Some(improvement),
-                    distinct_query_shapes: Some(3),
-                    sample_count: Some(10),
-                    ..AutomaticCandidateRankEvidence::default()
-                },
-            },
-            authority: None,
-        };
-        let columnar = make(PlannerCalibrationClass::Columnar, 0, 100);
-        let seq = make(PlannerCalibrationClass::SeqScan, 0, 500);
+        let columnar = calibration(PlannerCalibrationClass::Columnar, 0, 100);
+        let seq = calibration(PlannerCalibrationClass::SeqScan, 0, 500);
         assert_eq!(select_calibration_candidate(&[columnar, seq]), Some(1));
-        let aged = make(PlannerCalibrationClass::Columnar, 1, 1);
-        let stronger = make(PlannerCalibrationClass::SeqScan, 0, 500);
+        let aged = calibration(PlannerCalibrationClass::Columnar, 1, 1);
+        let stronger = calibration(PlannerCalibrationClass::SeqScan, 0, 500);
         assert_eq!(select_calibration_candidate(&[aged, stronger]), Some(0));
+    }
+
+    #[test]
+    fn cross_lane_service_is_opt_in_and_cannot_override_readiness() {
+        assert_eq!(
+            AutomaticMultiSafeModePolicy::default().cross_lane_service,
+            AutomaticCrossLaneServicePolicy::StrictPhysicalPriority
+        );
+        let columnar = vec![columnar(1, 1, 0, 1, 1)];
+        let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
+        let state = AutomaticCrossLaneServiceState {
+            consecutive_columnar_admissions: 2,
+        };
+        assert_eq!(
+            select_ready_lane(
+                &columnar,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
+                state,
+            ),
+            (
+                AutomaticSafeModeLane::ColumnarMaintenance,
+                AutomaticLaneSelectionReason::StrictPhysicalPriority,
+            )
+        );
+        assert_eq!(
+            select_ready_lane(
+                &columnar,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+                    max_consecutive_columnar_admissions: 2,
+                },
+                state,
+            ),
+            (
+                AutomaticSafeModeLane::PlannerCalibration,
+                AutomaticLaneSelectionReason::CalibrationServiceDue,
+            )
+        );
+        let mut blocked = calibration[0].clone();
+        blocked.inspection.readiness = AutomaticCandidateReadiness::CalibrationEvidenceUnavailable;
+        assert_eq!(
+            select_ready_lane(
+                &columnar,
+                &[blocked],
+                AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+                    max_consecutive_columnar_admissions: 2,
+                },
+                state,
+            ),
+            (
+                AutomaticSafeModeLane::ColumnarMaintenance,
+                AutomaticLaneSelectionReason::OnlyColumnarReady,
+            )
+        );
+    }
+
+    #[test]
+    fn zero_burst_is_a_typed_policy_error() {
+        let policy = AutomaticMultiSafeModePolicy {
+            cross_lane_service: AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+                max_consecutive_columnar_admissions: 0,
+            },
+            ..AutomaticMultiSafeModePolicy::default()
+        };
+        assert!(matches!(
+            validate_multi_scope(
+                AutomaticAdmissionScope {
+                    table_ids: &[],
+                    calibration_classes: &[],
+                },
+                policy,
+            ),
+            Err(AutomaticSafeModeError::InvalidCrossLaneServicePolicy)
+        ));
     }
 }

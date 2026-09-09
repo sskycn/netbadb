@@ -3,8 +3,9 @@ use netbadb_types::{ColumnarGeneration, ColumnarProjectionId, DatabaseCommitSeq,
 
 use crate::adaptive_workload_tests::{TimelineFixture, set_target_work, workload_target};
 use crate::{
-    AdaptiveEvidencePool, AdaptiveEvidencePoolLimits, AdaptiveEvidenceRecordError,
-    AdaptiveEvidenceRecordOutcome, AdaptiveTargetLineage, AdaptiveWorkloadLimits,
+    AdaptiveEvidencePool, AdaptiveEvidencePoolHealth, AdaptiveEvidencePoolLimits,
+    AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceWindowEpoch,
+    AdaptiveTargetLineage, AdaptiveWorkloadLimits,
 };
 
 fn feedback(fixture: &mut TimelineFixture) -> crate::ExecutionFeedbackReport {
@@ -187,6 +188,7 @@ fn schema_and_generation_rotation_are_forward_only() {
         .record_execution_feedback(&new_schema)
         .expect("schema rotation");
     assert_eq!(report.outcome, AdaptiveEvidenceRecordOutcome::SchemaRotated);
+    assert_eq!(pool.window_epoch(), AdaptiveEvidenceWindowEpoch(1));
     assert_eq!(
         pool.inspection().schema_generation,
         Some(new_schema.anchor.schema_generation)
@@ -238,6 +240,143 @@ fn out_of_order_is_atomic_and_capacity_is_typed_incomplete() {
         AdaptiveEvidenceRecordOutcome::RecordedWithCapacityRejection
     );
     assert!(pool.inspection().incomplete);
+    assert_eq!(
+        pool.inspection().health,
+        AdaptiveEvidencePoolHealth::RotationRecommended
+    );
+    let renewed = pool.rotate_window().expect("renew capacity-bound evidence");
+    assert!(renewed.was_incomplete);
+    assert!(renewed.was_truncated);
+    assert_eq!(
+        pool.inspection().health,
+        AdaptiveEvidencePoolHealth::Healthy
+    );
+    let mut fresh = report.clone();
+    fresh.anchor.global_commit_seq = Some(DatabaseCommitSeq(501));
+    pool.record_execution_feedback(&fresh)
+        .expect("known target can rebuild after renewal");
+    assert_eq!(pool.inspection().target_windows[0].sample_count, 1);
+    fixture.close();
+}
+
+#[test]
+fn explicit_rotation_renews_aggregates_but_preserves_g_and_physical_guards() {
+    let mut fixture = TimelineFixture::create("phase7-explicit-renewal");
+    let mut initial = feedback(&mut fixture);
+    initial.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_000));
+    let target = workload_target(&fixture.database);
+    let mut pool = AdaptiveEvidencePool::default();
+    pool.record_execution_feedback(&initial)
+        .expect("initial evidence");
+
+    let database_snapshot = fixture
+        .database
+        .current_database_snapshot()
+        .expect("global mode")
+        .expect("published snapshot");
+    let schema_generation = fixture.database.schema_generation();
+    let calibration_profile = fixture.database.planner_calibration_profile();
+    let rotation = pool.rotate_window().expect("explicit rotation");
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .expect("global mode")
+            .expect("published snapshot"),
+        database_snapshot
+    );
+    assert_eq!(fixture.database.schema_generation(), schema_generation);
+    assert_eq!(
+        fixture.database.planner_calibration_profile(),
+        calibration_profile
+    );
+    assert_eq!(workload_target(&fixture.database), target);
+    assert_eq!(
+        rotation.previous_window_epoch,
+        AdaptiveEvidenceWindowEpoch(0)
+    );
+    assert_eq!(rotation.new_window_epoch, AdaptiveEvidenceWindowEpoch(1));
+    assert_eq!(rotation.ordering_high_water, Some(DatabaseCommitSeq(1_000)));
+    assert_eq!(rotation.discarded_target_window_count, 1);
+    let inspection = pool.inspection();
+    assert!(inspection.target_windows.is_empty());
+    assert_eq!(inspection.recorded_reports, 0);
+    assert_eq!(inspection.health, AdaptiveEvidencePoolHealth::Healthy);
+
+    let mut older = initial.clone();
+    older.anchor.global_commit_seq = Some(DatabaseCommitSeq(999));
+    assert!(matches!(
+        pool.record_execution_feedback(&older),
+        Err(AdaptiveEvidenceRecordError::OutOfOrderVisibility { .. })
+    ));
+    let mut same_target = initial.clone();
+    same_target.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_000));
+    pool.record_execution_feedback(&same_target)
+        .expect("same target starts fresh evidence");
+    assert_eq!(pool.inspection().target_windows[0].sample_count, 1);
+
+    let mut next = initial.clone();
+    next.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_001));
+    set_generation(&mut next, ColumnarGeneration(target.generation.0 + 1));
+    set_storage(&mut next, StorageId(target.storage_id.0 + 1));
+    pool.record_execution_feedback(&next)
+        .expect("forward physical target");
+    pool.rotate_window().expect("second rotation");
+
+    let mut old_generation = initial.clone();
+    old_generation.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_002));
+    assert!(matches!(
+        pool.record_execution_feedback(&old_generation),
+        Err(AdaptiveEvidenceRecordError::StaleTargetGenerationEvidence { .. })
+            | Err(AdaptiveEvidenceRecordError::StaleTargetIdentityEvidence { .. })
+            | Err(AdaptiveEvidenceRecordError::RetiredTargetEvidence { .. })
+    ));
+    let mut old_storage = next.clone();
+    old_storage.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_003));
+    set_storage(&mut old_storage, target.storage_id);
+    assert!(matches!(
+        pool.record_execution_feedback(&old_storage),
+        Err(AdaptiveEvidenceRecordError::StaleTargetIdentityEvidence { .. })
+            | Err(AdaptiveEvidenceRecordError::RetiredTargetEvidence { .. })
+    ));
+    fixture.close();
+}
+
+#[test]
+fn query_shape_truncation_can_be_renewed_for_the_same_exact_target() {
+    let mut fixture = TimelineFixture::create("phase7-qv-renewal");
+    let target = workload_target(&fixture.database);
+    let mut first = feedback(&mut fixture);
+    first.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_200));
+    let (_, mut second) = fixture
+        .database
+        .query_with_feedback("SELECT id FROM events LIMIT 10")
+        .expect("second query shape");
+    second.anchor.global_commit_seq = Some(DatabaseCommitSeq(1_201));
+    set_target_work(&mut second, target, 10, 12, 20);
+    let mut pool = AdaptiveEvidencePool::new(AdaptiveEvidencePoolLimits {
+        workload_limits: AdaptiveWorkloadLimits::new(1, 1),
+        ..AdaptiveEvidencePoolLimits::default()
+    });
+    pool.record_execution_feedback(&first).expect("first shape");
+    pool.record_execution_feedback(&second)
+        .expect("typed target truncation");
+    assert_eq!(
+        pool.inspection().health,
+        AdaptiveEvidencePoolHealth::RotationRecommended
+    );
+
+    pool.rotate_window().expect("renew Q/V window");
+    pool.record_execution_feedback(&second)
+        .expect("same target fresh shape");
+    let window = &pool.inspection().target_windows[0];
+    assert_eq!(window.sample_count, 1);
+    assert!(!window.incomplete);
+    assert!(!window.truncated);
+    assert_eq!(
+        pool.inspection().health,
+        AdaptiveEvidencePoolHealth::Healthy
+    );
     fixture.close();
 }
 
@@ -278,5 +417,18 @@ fn calibration_epoch_retention_evicts_oldest_without_mutation() {
         fixture.database.planner_calibration_profile().epoch,
         PlannerCalibrationEpoch(0)
     );
+    pool.rotate_window().expect("renew latest epoch");
+    let mut stale_epoch = report.clone();
+    stale_epoch.anchor.global_commit_seq = Some(DatabaseCommitSeq(603));
+    set_epoch(&mut stale_epoch, PlannerCalibrationEpoch(1));
+    assert!(matches!(
+        pool.record_execution_feedback(&stale_epoch),
+        Err(AdaptiveEvidenceRecordError::StaleCalibrationEpochEvidence { .. })
+    ));
+    let mut current_epoch = report;
+    current_epoch.anchor.global_commit_seq = Some(DatabaseCommitSeq(603));
+    set_epoch(&mut current_epoch, PlannerCalibrationEpoch(2));
+    pool.record_execution_feedback(&current_epoch)
+        .expect("current epoch starts fresh aggregation");
     fixture.close();
 }

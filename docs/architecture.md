@@ -174,6 +174,15 @@ An active Phase 5 trial still preempts all admission; there is no implicit query
 capture, background scheduler, generic-maintenance lane, persistence, protocol
 surface, or Inspection JSON v7 change.
 
+[Adaptive Operations Phase 7](adaptive-operations-phase7.md) adds an opt-in
+bounded Columnar-burst service policy between the two existing proactive lanes
+while retaining strict physical priority as the default. It also adds explicit
+caller-controlled evidence-window renewal: aggregates can restart, but the
+same-schema G, target generation, and storage-identity safety high-waters do
+not. Active trials remain exclusive, existing proposals remain mutation
+authority, and no background action, persistent format, protocol, or Inspection
+JSON contract changes.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

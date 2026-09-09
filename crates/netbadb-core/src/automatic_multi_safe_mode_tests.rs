@@ -34,6 +34,7 @@ fn policy() -> AutomaticMultiSafeModePolicy {
                 maximum_tolerated_error_regression_work_units: 0,
             },
         },
+        cross_lane_service: crate::AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
         max_candidate_tables: 8,
         max_calibration_classes: 4,
         max_fairness_entries: 16,
@@ -50,6 +51,18 @@ fn input<'a>(
             calibration_classes: classes,
         },
         maintenance_budget: budget(),
+    }
+}
+
+fn set_epoch(report: &mut crate::ExecutionFeedbackReport, epoch: PlannerCalibrationEpoch) {
+    report.calibration_epoch = epoch;
+    for access in &mut report.accesses {
+        if let Some(planner) = &mut access.planner {
+            planner.calibration_epoch = epoch;
+        }
+        if let Some(calibration) = &mut access.calibration {
+            calibration.calibration_epoch = epoch;
+        }
     }
 }
 
@@ -181,6 +194,18 @@ fn active_columnar_trial_resolves_from_exact_pool_window_across_g() {
     };
     let target = trial.target();
     let mut pool = AdaptiveEvidencePool::default();
+    pool.rotate_window().expect("renew empty evidence");
+    let renewed_wait = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&tables, &[]), policy())
+        .expect("trial survives renewal");
+    assert_eq!(
+        renewed_wait.action.outcome,
+        AutomaticSafeModeOutcome::ColumnarTrialAwaiting(
+            AutomaticTrialAwaitingReason::MissingWorkloadWindow
+        )
+    );
+    assert!(renewed_wait.action.trial_after.is_some());
     for (offset, sql) in [
         "SELECT id FROM events",
         "SELECT id FROM events LIMIT 10",
@@ -217,6 +242,7 @@ fn calibration_candidate_uses_global_pool_and_starts_one_epoch_trial() {
     let mut fixture = TimelineFixture::create("phase6-calibration-admission");
     let target = workload_target(&fixture.database);
     let mut pool = AdaptiveEvidencePool::default();
+    let mut validation_reports = Vec::new();
     for (offset, sql) in [
         "SELECT id FROM events",
         "SELECT id FROM events LIMIT 10",
@@ -233,6 +259,7 @@ fn calibration_candidate_uses_global_pool_and_starts_one_epoch_trial() {
             800 + u64::try_from(offset).expect("offset"),
         ));
         set_target_work(&mut report, target, 10, 20, 30);
+        validation_reports.push(report.clone());
         pool.record_execution_feedback(&report)
             .expect("record calibration");
     }
@@ -258,6 +285,7 @@ fn calibration_candidate_uses_global_pool_and_starts_one_epoch_trial() {
         applied.action.trial_after,
         Some(AutomaticSafeTrial::PlannerCalibration(_))
     ));
+    pool.rotate_window().expect("renew calibration evidence");
     let old_epoch_only = fixture
         .database
         .automatic_safe_step_multi(&pool, input(&[], &classes), calibration_only)
@@ -272,6 +300,23 @@ fn calibration_candidate_uses_global_pool_and_starts_one_epoch_trial() {
         old_epoch_only.action.trial_after,
         Some(AutomaticSafeTrial::PlannerCalibration(_))
     ));
+    for (offset, mut report) in validation_reports.into_iter().enumerate() {
+        set_epoch(&mut report, PlannerCalibrationEpoch(1));
+        report.anchor.global_commit_seq = Some(DatabaseCommitSeq(
+            820 + u64::try_from(offset).expect("offset"),
+        ));
+        pool.record_execution_feedback(&report)
+            .expect("record renewed epoch");
+    }
+    let resolved = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&[], &classes), calibration_only)
+        .expect("resolve renewed calibration trial");
+    assert_eq!(
+        resolved.action.outcome,
+        AutomaticSafeModeOutcome::PlannerCalibrationTrialValidatedKeep
+    );
+    assert_eq!(resolved.action.trial_after, None);
     fixture.close();
 }
 
@@ -322,4 +367,159 @@ fn ready_columnar_lane_precedes_stronger_calibration_candidate() {
         PlannerCalibrationEpoch(0)
     );
     fixture.close();
+}
+
+#[test]
+fn bounded_cross_lane_service_waits_for_ready_calibration_then_services_it() {
+    let mut fixture = TimelineFixture::create("phase7-cross-lane-service");
+    let tables = [TABLE_ID];
+    let classes = [PlannerCalibrationClass::Columnar];
+    let empty = AdaptiveEvidencePool::default();
+    let mut bounded = policy();
+    bounded.cross_lane_service = crate::AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+        max_consecutive_columnar_admissions: 2,
+    };
+
+    for expected in 1..=3 {
+        fixture
+            .database
+            .execute("UPDATE events SET category = 3 WHERE id = 3")
+            .expect("keep Columnar ready");
+        let admitted = fixture
+            .database
+            .automatic_safe_step_multi(&empty, input(&tables, &classes), bounded)
+            .expect("Columnar admission while calibration is blocked");
+        assert_eq!(
+            admitted.action.selected_lane,
+            AutomaticSafeModeLane::ColumnarMaintenance
+        );
+        assert_eq!(
+            admitted
+                .cross_lane_service_after
+                .consecutive_columnar_admissions,
+            expected
+        );
+        fixture.database.abandon_automatic_safe_trial();
+    }
+    let idle = fixture
+        .database
+        .automatic_safe_step_multi(&empty, input(&tables, &classes), bounded)
+        .expect("idle round");
+    assert_eq!(idle.selected_candidate, None);
+    assert_eq!(
+        idle.cross_lane_service_after
+            .consecutive_columnar_admissions,
+        3
+    );
+
+    let target = workload_target(&fixture.database);
+    let mut pool = AdaptiveEvidencePool::default();
+    for (offset, sql) in [
+        "SELECT id FROM events",
+        "SELECT id FROM events LIMIT 10",
+        "SELECT id FROM events WHERE category = 1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (_, mut report) = fixture
+            .database
+            .query_with_feedback(sql)
+            .expect("calibration feedback");
+        report.anchor.global_commit_seq = Some(DatabaseCommitSeq(
+            1_100 + u64::try_from(offset).expect("offset"),
+        ));
+        set_target_work(&mut report, target, 10, 20, 30);
+        pool.record_execution_feedback(&report)
+            .expect("record calibration");
+    }
+    fixture
+        .database
+        .execute("UPDATE events SET category = 2 WHERE id = 2")
+        .expect("both lanes ready");
+    let before = fixture.database.automatic_safe_mode_state();
+    let inspected = fixture
+        .database
+        .inspect_automatic_candidates(&pool, input(&tables, &classes), bounded)
+        .expect("pure service inspection");
+    assert_eq!(
+        inspected.lane_selection_reason,
+        crate::AutomaticLaneSelectionReason::CalibrationServiceDue
+    );
+    assert_eq!(fixture.database.automatic_safe_mode_state(), before);
+
+    let calibration = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&tables, &classes), bounded)
+        .expect("due calibration admission");
+    assert_eq!(
+        calibration.action.selected_lane,
+        AutomaticSafeModeLane::PlannerCalibration
+    );
+    assert_eq!(
+        calibration.lane_selection_reason,
+        crate::AutomaticLaneSelectionReason::CalibrationServiceDue
+    );
+    assert_eq!(
+        calibration
+            .cross_lane_service_after
+            .consecutive_columnar_admissions,
+        0
+    );
+
+    let service_before_trial = fixture
+        .database
+        .automatic_safe_mode_state()
+        .cross_lane_service();
+    let awaiting = fixture
+        .database
+        .automatic_safe_step_multi(&empty, input(&tables, &classes), bounded)
+        .expect("active trial remains exclusive");
+    assert_eq!(
+        awaiting.lane_selection_reason,
+        crate::AutomaticLaneSelectionReason::ActiveTrial
+    );
+    assert_eq!(
+        fixture
+            .database
+            .automatic_safe_mode_state()
+            .cross_lane_service(),
+        service_before_trial
+    );
+    fixture.close();
+}
+
+#[test]
+fn reopen_resets_cross_lane_service_state() {
+    let mut fixture = TimelineFixture::create("phase7-service-reopen");
+    fixture
+        .database
+        .execute("UPDATE events SET category = 9 WHERE id = 9")
+        .expect("create ready Columnar candidate");
+    let pool = AdaptiveEvidencePool::default();
+    let admitted = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&[TABLE_ID], &[]), policy())
+        .expect("record proactive admission");
+    assert_eq!(
+        admitted
+            .cross_lane_service_after
+            .consecutive_columnar_admissions,
+        1
+    );
+
+    let root = fixture.root.clone();
+    let event_path = fixture.event_path.clone();
+    let clock_path = fixture.clock_path.clone();
+    fixture.database.close().expect("close database");
+    let reopened = crate::Database::open_catalog(root.join("catalog")).expect("reopen database");
+    assert_eq!(
+        reopened
+            .automatic_safe_mode_state()
+            .cross_lane_service()
+            .consecutive_columnar_admissions,
+        0
+    );
+    reopened.close().expect("close reopened database");
+    crate::adaptive_workload_tests::cleanup(&root, &[event_path, clock_path]);
 }

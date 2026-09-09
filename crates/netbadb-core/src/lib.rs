@@ -104,9 +104,10 @@ pub use adaptive::{
 };
 pub use adaptive_evidence_pool::{
     AdaptiveCalibrationEpochInspection, AdaptiveCalibrationGroupInspection, AdaptiveEvidencePool,
-    AdaptiveEvidencePoolInspection, AdaptiveEvidencePoolLimits, AdaptiveEvidenceRecordError,
-    AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceRecordReport, AdaptiveTargetLineage,
-    AdaptiveTargetWindowInspection,
+    AdaptiveEvidencePoolHealth, AdaptiveEvidencePoolInspection, AdaptiveEvidencePoolLimits,
+    AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceRecordReport,
+    AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport, AdaptiveEvidenceWindowEpoch,
+    AdaptiveTargetLineage, AdaptiveTargetWindowInspection,
 };
 pub use adaptive_workload::{
     AdaptivePlanVariantAggregate, AdaptiveQueryShapeAggregate, AdaptiveWorkloadEvaluationReport,
@@ -120,6 +121,7 @@ pub use automatic_safe_mode::{
     AutomaticCalibrationTrialPolicy, AutomaticCalibrationTrialStaleReason,
     AutomaticCandidateInspection, AutomaticCandidateInspectionReport, AutomaticCandidateKey,
     AutomaticCandidateRankEvidence, AutomaticCandidateReadiness, AutomaticColumnarTrial,
+    AutomaticCrossLaneServicePolicy, AutomaticCrossLaneServiceState, AutomaticLaneSelectionReason,
     AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticMultiSafeModeReport,
     AutomaticPlannerCalibrationTrial, AutomaticSafeModeError, AutomaticSafeModeInput,
     AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeNoAction,

@@ -43,6 +43,47 @@ pub struct AdaptiveTargetLineage {
     pub projection_id: ColumnarProjectionId,
 }
 
+/// Runtime aggregation lifetime. It is independent of schema, physical, and
+/// planner-calibration generations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AdaptiveEvidenceWindowEpoch(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveEvidencePoolHealth {
+    Healthy,
+    RotationRecommended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveEvidenceRotationError {
+    EvidenceWindowEpochExhausted,
+}
+
+impl fmt::Display for AdaptiveEvidenceRotationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EvidenceWindowEpochExhausted => {
+                formatter.write_str("adaptive evidence window epoch is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for AdaptiveEvidenceRotationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveEvidenceRotationReport {
+    pub previous_window_epoch: AdaptiveEvidenceWindowEpoch,
+    pub new_window_epoch: AdaptiveEvidenceWindowEpoch,
+    pub schema_generation: Option<SchemaGeneration>,
+    pub ordering_high_water: Option<DatabaseCommitSeq>,
+    pub discarded_target_window_count: u64,
+    pub discarded_calibration_epoch_count: u64,
+    pub discarded_query_shape_count: u64,
+    pub was_incomplete: bool,
+    pub was_truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptiveEvidenceRecordError {
     GlobalVisibilityRequired,
@@ -67,6 +108,11 @@ pub enum AdaptiveEvidenceRecordError {
     RetiredTargetEvidence {
         target: AdaptiveWorkloadTarget,
     },
+    StaleCalibrationEpochEvidence {
+        minimum: PlannerCalibrationEpoch,
+        received: PlannerCalibrationEpoch,
+    },
+    EvidenceWindowEpochExhausted,
 }
 
 impl fmt::Display for AdaptiveEvidenceRecordError {
@@ -111,6 +157,14 @@ impl fmt::Display for AdaptiveEvidenceRecordError {
                 "evidence targets retired physical identity {}/{}/{}/{}",
                 target.table_id.0, target.storage_id.0, target.projection_id.0, target.generation.0
             ),
+            Self::StaleCalibrationEpochEvidence { minimum, received } => write!(
+                formatter,
+                "calibration epoch {} is older than the renewed window floor {}",
+                received.0, minimum.0
+            ),
+            Self::EvidenceWindowEpochExhausted => {
+                formatter.write_str("adaptive evidence window epoch is exhausted")
+            }
         }
     }
 }
@@ -138,6 +192,13 @@ pub struct AdaptiveEvidenceRecordReport {
 struct TargetWindowEntry {
     lineage: AdaptiveTargetLineage,
     window: AdaptiveWorkloadWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetLineageState {
+    lineage: AdaptiveTargetLineage,
+    storage_id: StorageId,
+    generation: ColumnarGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +237,8 @@ pub struct AdaptiveCalibrationGroupInspection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdaptiveEvidencePoolInspection {
+    pub window_epoch: AdaptiveEvidenceWindowEpoch,
+    pub health: AdaptiveEvidencePoolHealth,
     pub schema_generation: Option<SchemaGeneration>,
     pub first_global_commit_seq: Option<DatabaseCommitSeq>,
     pub last_global_commit_seq: Option<DatabaseCommitSeq>,
@@ -193,13 +256,18 @@ pub struct AdaptiveEvidencePoolInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdaptiveEvidencePool {
     limits: AdaptiveEvidencePoolLimits,
+    window_epoch: AdaptiveEvidenceWindowEpoch,
     schema_generation: Option<SchemaGeneration>,
     first_global_commit_seq: Option<DatabaseCommitSeq>,
     last_global_commit_seq: Option<DatabaseCommitSeq>,
+    ordering_high_water: Option<DatabaseCommitSeq>,
     recorded_reports: u64,
+    target_lineages: Vec<TargetLineageState>,
     target_windows: Vec<TargetWindowEntry>,
     retired_targets: Vec<AdaptiveWorkloadTarget>,
     calibration_epochs: Vec<PlannerCalibrationEpoch>,
+    calibration_epoch_high_water: Option<PlannerCalibrationEpoch>,
+    calibration_epoch_floor: Option<PlannerCalibrationEpoch>,
     calibration_query_shapes: Vec<AdaptiveQueryShapeAggregate>,
     calibration_visibility: Vec<CalibrationVisibilityEvidence>,
     calibration_report_counts: Vec<CalibrationReportCount>,
@@ -214,13 +282,18 @@ impl AdaptiveEvidencePool {
     pub const fn new(limits: AdaptiveEvidencePoolLimits) -> Self {
         Self {
             limits,
+            window_epoch: AdaptiveEvidenceWindowEpoch(0),
             schema_generation: None,
             first_global_commit_seq: None,
             last_global_commit_seq: None,
+            ordering_high_water: None,
             recorded_reports: 0,
+            target_lineages: Vec::new(),
             target_windows: Vec::new(),
             retired_targets: Vec::new(),
             calibration_epochs: Vec::new(),
+            calibration_epoch_high_water: None,
+            calibration_epoch_floor: None,
             calibration_query_shapes: Vec::new(),
             calibration_visibility: Vec::new(),
             calibration_report_counts: Vec::new(),
@@ -241,8 +314,31 @@ impl AdaptiveEvidencePool {
         self.schema_generation
     }
 
+    #[must_use]
+    pub const fn window_epoch(&self) -> AdaptiveEvidenceWindowEpoch {
+        self.window_epoch
+    }
+
     pub fn clear(&mut self) {
         *self = Self::new(self.limits);
+    }
+
+    /// Starts an empty aggregation window while retaining same-schema
+    /// ordering and physical-identity rollback guards.
+    pub fn rotate_window(
+        &mut self,
+    ) -> Result<AdaptiveEvidenceRotationReport, AdaptiveEvidenceRotationError> {
+        let next = self
+            .window_epoch
+            .0
+            .checked_add(1)
+            .map(AdaptiveEvidenceWindowEpoch)
+            .ok_or(AdaptiveEvidenceRotationError::EvidenceWindowEpochExhausted)?;
+        let report = self.rotation_report(next);
+        self.window_epoch = next;
+        self.calibration_epoch_floor = self.calibration_epoch_high_water;
+        self.clear_aggregation_payload();
+        Ok(report)
     }
 
     pub fn remove_target(&mut self, lineage: AdaptiveTargetLineage) -> bool {
@@ -278,9 +374,11 @@ impl AdaptiveEvidencePool {
         deadband: u64,
     ) -> Option<PlannerCalibrationEvidence> {
         let schema_generation = self.schema_generation?;
-        if !self.calibration_epochs.contains(&epoch) {
-            return None;
-        }
+        let report_count = self
+            .calibration_report_counts
+            .iter()
+            .find(|count| count.class == class && count.epoch == epoch)
+            .map(|count| count.reports)?;
         let mut evidence = aggregate_calibration_evidence_parts(
             schema_generation,
             &self.calibration_query_shapes,
@@ -292,17 +390,25 @@ impl AdaptiveEvidencePool {
             epoch,
             deadband,
         );
-        evidence.sample_count = self
-            .calibration_report_counts
-            .iter()
-            .find(|count| count.class == class && count.epoch == epoch)
-            .map_or(0, |count| count.reports);
+        evidence.sample_count = report_count;
         Some(evidence)
     }
 
     #[must_use]
     pub fn inspection(&self) -> AdaptiveEvidencePoolInspection {
         AdaptiveEvidencePoolInspection {
+            window_epoch: self.window_epoch,
+            health: if self.calibration_truncated
+                || self.target_capacity_rejections != 0
+                || self
+                    .target_windows
+                    .iter()
+                    .any(|entry| entry.window.truncated)
+            {
+                AdaptiveEvidencePoolHealth::RotationRecommended
+            } else {
+                AdaptiveEvidencePoolHealth::Healthy
+            },
             schema_generation: self.schema_generation,
             first_global_commit_seq: self.first_global_commit_seq,
             last_global_commit_seq: self.last_global_commit_seq,
@@ -386,7 +492,17 @@ impl AdaptiveEvidencePool {
             _ => false,
         };
         if !schema_rotated {
-            if let Some(previous) = self.last_global_commit_seq {
+            if let Some(minimum) = self.calibration_epoch_floor {
+                if report.calibration_epoch < minimum {
+                    return Err(AdaptiveEvidenceRecordError::StaleCalibrationEpochEvidence {
+                        minimum,
+                        received: report.calibration_epoch,
+                    });
+                }
+            }
+        }
+        if !schema_rotated {
+            if let Some(previous) = self.ordering_high_water {
                 if global_commit_seq < previous {
                     return Err(AdaptiveEvidenceRecordError::OutOfOrderVisibility {
                         previous,
@@ -401,7 +517,7 @@ impl AdaptiveEvidencePool {
             self.validate_target_forward_progress(&targets)?;
         }
         if schema_rotated {
-            self.rotate_schema(report.anchor.schema_generation);
+            self.rotate_schema(report.anchor.schema_generation)?;
         } else if self.schema_generation.is_none() {
             self.schema_generation = Some(report.anchor.schema_generation);
         }
@@ -410,6 +526,16 @@ impl AdaptiveEvidencePool {
             self.first_global_commit_seq = Some(global_commit_seq);
         }
         self.last_global_commit_seq = Some(global_commit_seq);
+        self.ordering_high_water = Some(global_commit_seq);
+        self.calibration_epoch_high_water = Some(
+            self.calibration_epoch_high_water
+                .map_or(report.calibration_epoch, |current| {
+                    current.max(report.calibration_epoch)
+                }),
+        );
+        if self.calibration_epoch_floor.is_some() {
+            self.calibration_epoch_floor = self.calibration_epoch_high_water;
+        }
         if self.recorded_reports.checked_add(1).is_none() {
             self.calibration_overflowed = true;
             self.calibration_incomplete = true;
@@ -463,8 +589,13 @@ impl AdaptiveEvidencePool {
                     index
                 }
                 None => {
-                    if u64::try_from(self.target_windows.len())
-                        .map_or(true, |count| count >= self.limits.max_target_windows)
+                    let known_lineage = self
+                        .target_lineages
+                        .iter()
+                        .any(|state| state.lineage == lineage);
+                    if !known_lineage
+                        && u64::try_from(self.target_lineages.len())
+                            .map_or(true, |count| count >= self.limits.max_target_windows)
                     {
                         if let Some(next) = self.target_capacity_rejections.checked_add(1) {
                             self.target_capacity_rejections = next;
@@ -483,6 +614,7 @@ impl AdaptiveEvidencePool {
                     self.target_windows.len() - 1
                 }
             };
+            self.update_target_lineage(target);
             match self.target_windows[index].window.record(report) {
                 Ok(_) => recorded = recorded.saturating_add(1),
                 Err(AdaptiveWorkloadRecordError::GlobalVisibilityRequired) => {
@@ -529,10 +661,10 @@ impl AdaptiveEvidencePool {
                 projection_id: target.projection_id,
             };
             if let Some(current) = self
-                .target_windows
+                .target_lineages
                 .iter()
-                .find(|entry| entry.lineage == lineage)
-                .map(|entry| entry.window.target)
+                .find(|state| state.lineage == lineage)
+                .copied()
             {
                 if target.generation < current.generation {
                     return Err(AdaptiveEvidenceRecordError::StaleTargetGenerationEvidence {
@@ -553,10 +685,81 @@ impl AdaptiveEvidencePool {
         Ok(())
     }
 
-    fn rotate_schema(&mut self, schema_generation: SchemaGeneration) {
+    fn update_target_lineage(&mut self, target: AdaptiveWorkloadTarget) {
+        let lineage = AdaptiveTargetLineage {
+            table_id: target.table_id,
+            projection_id: target.projection_id,
+        };
+        if let Some(current) = self
+            .target_lineages
+            .iter_mut()
+            .find(|state| state.lineage == lineage)
+        {
+            current.storage_id = target.storage_id;
+            current.generation = target.generation;
+        } else {
+            self.target_lineages.push(TargetLineageState {
+                lineage,
+                storage_id: target.storage_id,
+                generation: target.generation,
+            });
+        }
+    }
+
+    fn rotation_report(
+        &self,
+        new_window_epoch: AdaptiveEvidenceWindowEpoch,
+    ) -> AdaptiveEvidenceRotationReport {
+        let target_query_shapes = self.target_windows.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(u64::try_from(entry.window.query_shapes.len()).unwrap_or(u64::MAX))
+        });
+        AdaptiveEvidenceRotationReport {
+            previous_window_epoch: self.window_epoch,
+            new_window_epoch,
+            schema_generation: self.schema_generation,
+            ordering_high_water: self.ordering_high_water,
+            discarded_target_window_count: u64::try_from(self.target_windows.len())
+                .unwrap_or(u64::MAX),
+            discarded_calibration_epoch_count: u64::try_from(self.calibration_epochs.len())
+                .unwrap_or(u64::MAX),
+            discarded_query_shape_count: target_query_shapes.saturating_add(
+                u64::try_from(self.calibration_query_shapes.len()).unwrap_or(u64::MAX),
+            ),
+            was_incomplete: self.inspection().incomplete,
+            was_truncated: self.inspection().truncated,
+        }
+    }
+
+    fn clear_aggregation_payload(&mut self) {
+        self.first_global_commit_seq = None;
+        self.last_global_commit_seq = None;
+        self.recorded_reports = 0;
+        self.target_windows.clear();
+        self.calibration_epochs.clear();
+        self.calibration_query_shapes.clear();
+        self.calibration_visibility.clear();
+        self.calibration_report_counts.clear();
+        self.calibration_overflowed = false;
+        self.calibration_incomplete = false;
+        self.calibration_truncated = false;
+        self.target_capacity_rejections = 0;
+    }
+
+    fn rotate_schema(
+        &mut self,
+        schema_generation: SchemaGeneration,
+    ) -> Result<(), AdaptiveEvidenceRecordError> {
+        let window_epoch = self
+            .window_epoch
+            .0
+            .checked_add(1)
+            .map(AdaptiveEvidenceWindowEpoch)
+            .ok_or(AdaptiveEvidenceRecordError::EvidenceWindowEpochExhausted)?;
         let limits = self.limits;
         *self = Self::new(limits);
+        self.window_epoch = window_epoch;
         self.schema_generation = Some(schema_generation);
+        Ok(())
     }
 
     fn remember_retired_target(&mut self, target: AdaptiveWorkloadTarget) {
