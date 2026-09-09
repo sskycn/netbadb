@@ -183,6 +183,16 @@ not. Active trials remain exclusive, existing proposals remain mutation
 authority, and no background action, persistent format, protocol, or Inspection
 JSON contract changes.
 
+[Adaptive Operations Phase 8](adaptive-operations-phase8.md) adds opt-in
+automatic compaction for an existing fresh incremental Columnar projection.
+It reuses the production maintenance candidate, estimate, budget bound, writer,
+and physical report; exact source/projection evidence is revalidated before one
+mutation. A valid new generation enters the existing Columnar workload trial,
+while regression suppresses that exact result rather than restoring physical
+history. Catch-up and compaction remain in the Columnar lane, default behavior
+stays disabled, and no LSM/GC automation, persistent format, protocol, or
+Inspection JSON contract changes.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

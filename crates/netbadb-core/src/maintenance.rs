@@ -40,13 +40,27 @@ impl MaintenanceBudget {
         }
     }
 
-    fn remaining(self, consumed: MaintenanceConsumption) -> Self {
+    pub(crate) fn remaining(self, consumed: MaintenanceConsumption) -> Self {
         Self {
             max_work_units: self.max_work_units.saturating_sub(consumed.work_units),
             max_read_bytes: self.max_read_bytes.saturating_sub(consumed.read_bytes),
             max_write_bytes: self.max_write_bytes.saturating_sub(consumed.write_bytes),
             max_actions: self.max_actions.saturating_sub(consumed.actions),
         }
+    }
+
+    pub(crate) const fn admits(self, estimate: MaintenanceEstimate) -> bool {
+        self.max_actions != 0
+            && estimate.work_units <= self.max_work_units
+            && estimate.read_bytes <= self.max_read_bytes
+            && estimate.write_bytes <= self.max_write_bytes
+    }
+
+    pub(crate) const fn contains(self, consumed: MaintenanceConsumption) -> bool {
+        consumed.actions <= self.max_actions
+            && consumed.work_units <= self.max_work_units
+            && consumed.read_bytes <= self.max_read_bytes
+            && consumed.write_bytes <= self.max_write_bytes
     }
 }
 
@@ -233,6 +247,27 @@ impl Database {
         Ok(plan_maintenance(state, self.maintenance_cursor))
     }
 
+    /// Returns the production compaction candidate for every projection on one
+    /// table without consulting or changing the manual-maintenance cursor.
+    pub(crate) fn inspect_columnar_compaction_candidates(
+        &self,
+        table_id: TableId,
+        budget: MaintenanceBudget,
+    ) -> Vec<MaintenanceCandidate> {
+        let busy = Rc::strong_count(&self.transaction_owner) != 1
+            || self.inspect_group_commit().is_some()
+            || self.schema_writer.get().is_some();
+        self.inspect_columnar_projections()
+            .into_iter()
+            .filter(|projection| projection.table_id == table_id)
+            .filter_map(|projection| {
+                projection.projection_id.map(|projection_id| {
+                    columnar_compaction_candidate(&projection, projection_id, busy, budget)
+                })
+            })
+            .collect()
+    }
+
     /// Executes at most one caller-driven synchronous maintenance action.
     pub fn maintenance_step(
         &mut self,
@@ -365,50 +400,9 @@ impl Database {
                 budget,
             ));
 
-            let compact_action = MaintenanceAction::CompactColumnar { projection_id };
-            let compact_estimate = MaintenanceEstimate {
-                work_units: projection
-                    .row_count
-                    .unwrap_or(0)
-                    .saturating_add(projection.delta_mutations.unwrap_or(0))
-                    .max(1),
-                read_bytes: projection
-                    .segment_bytes
-                    .unwrap_or(0)
-                    .saturating_add(projection.delta_bytes.unwrap_or(0)),
-                write_bytes: projection
-                    .segment_bytes
-                    .unwrap_or(0)
-                    .saturating_add(projection.delta_bytes.unwrap_or(0)),
-            };
-            let compact_blocker = if projection.health == ColumnarProjectionHealth::Unavailable {
-                Some(MaintenanceBlocker::Unavailable)
-            } else if projection.health == ColumnarProjectionHealth::RebuildRequired {
-                Some(MaintenanceBlocker::RebuildRequired)
-            } else if projection.mode != Some("incremental") {
-                Some(MaintenanceBlocker::SnapshotProjection)
-            } else {
-                match projection.health {
-                    ColumnarProjectionHealth::Fresh => {
-                        (projection.delta_segment_count.unwrap_or(0) == 0)
-                            .then_some(MaintenanceBlocker::NoDelta)
-                    }
-                    ColumnarProjectionHealth::Lagging => {
-                        Some(MaintenanceBlocker::ProjectionLagging)
-                    }
-                    ColumnarProjectionHealth::RebuildRequired => {
-                        Some(MaintenanceBlocker::RebuildRequired)
-                    }
-                    ColumnarProjectionHealth::Unavailable => Some(MaintenanceBlocker::Unavailable),
-                    ColumnarProjectionHealth::Stale => Some(MaintenanceBlocker::SnapshotProjection),
-                }
-            };
-            candidates.push(candidate(
-                compact_action,
-                MaintenanceReason::ColumnarDeltaCost,
-                MaintenanceBound::EstimateGatedAtomic,
-                compact_estimate,
-                compact_blocker,
+            candidates.push(columnar_compaction_candidate(
+                projection,
+                projection_id,
                 busy,
                 budget,
             ));
@@ -495,13 +489,8 @@ impl Database {
                 Ok((MaintenanceActionReport::AdvanceColumnar(report), consumed))
             }
             MaintenanceAction::CompactColumnar { projection_id } => {
-                let report = self.compact_columnar_projection(projection_id)?;
-                let consumed = MaintenanceConsumption {
-                    work_units: decision.estimated.work_units,
-                    read_bytes: report.bytes_before,
-                    write_bytes: report.bytes_after,
-                    actions: 1,
-                };
+                let (report, consumed) =
+                    self.execute_columnar_compaction(projection_id, decision.estimated)?;
                 Ok((MaintenanceActionReport::CompactColumnar(report), consumed))
             }
             MaintenanceAction::GcChangeStream {
@@ -603,6 +592,72 @@ impl Database {
             }
         }
     }
+
+    /// Executes one already-admitted exact Columnar compaction through the
+    /// production writer. It intentionally does not update the manual cursor.
+    pub(crate) fn execute_columnar_compaction(
+        &mut self,
+        projection_id: ColumnarProjectionId,
+        estimated: MaintenanceEstimate,
+    ) -> Result<(ColumnarCompactionReport, MaintenanceConsumption), DatabaseError> {
+        let report = self.compact_columnar_projection(projection_id)?;
+        let consumed = MaintenanceConsumption {
+            work_units: estimated.work_units,
+            read_bytes: report.bytes_before,
+            write_bytes: report.bytes_after,
+            actions: 1,
+        };
+        Ok((report, consumed))
+    }
+}
+
+fn columnar_compaction_candidate(
+    projection: &crate::ColumnarProjectionInspection,
+    projection_id: ColumnarProjectionId,
+    busy: bool,
+    budget: MaintenanceBudget,
+) -> MaintenanceCandidate {
+    let action = MaintenanceAction::CompactColumnar { projection_id };
+    let estimate = MaintenanceEstimate {
+        work_units: projection
+            .row_count
+            .unwrap_or(0)
+            .saturating_add(projection.delta_mutations.unwrap_or(0))
+            .max(1),
+        read_bytes: projection
+            .segment_bytes
+            .unwrap_or(0)
+            .saturating_add(projection.delta_bytes.unwrap_or(0)),
+        write_bytes: projection
+            .segment_bytes
+            .unwrap_or(0)
+            .saturating_add(projection.delta_bytes.unwrap_or(0)),
+    };
+    let blocker = if projection.health == ColumnarProjectionHealth::Unavailable {
+        Some(MaintenanceBlocker::Unavailable)
+    } else if projection.health == ColumnarProjectionHealth::RebuildRequired {
+        Some(MaintenanceBlocker::RebuildRequired)
+    } else if projection.mode != Some("incremental") {
+        Some(MaintenanceBlocker::SnapshotProjection)
+    } else {
+        match projection.health {
+            ColumnarProjectionHealth::Fresh => (projection.delta_segment_count.unwrap_or(0) == 0)
+                .then_some(MaintenanceBlocker::NoDelta),
+            ColumnarProjectionHealth::Lagging => Some(MaintenanceBlocker::ProjectionLagging),
+            ColumnarProjectionHealth::RebuildRequired => Some(MaintenanceBlocker::RebuildRequired),
+            ColumnarProjectionHealth::Unavailable => Some(MaintenanceBlocker::Unavailable),
+            ColumnarProjectionHealth::Stale => Some(MaintenanceBlocker::SnapshotProjection),
+        }
+    };
+    candidate(
+        action,
+        MaintenanceReason::ColumnarDeltaCost,
+        MaintenanceBound::EstimateGatedAtomic,
+        estimate,
+        blocker,
+        busy,
+        budget,
+    )
 }
 
 fn bounded_advance(

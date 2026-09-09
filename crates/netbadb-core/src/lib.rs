@@ -1,6 +1,9 @@
 //! Native synchronous embedded API for NetbaDB.
 
 mod adaptive;
+mod adaptive_columnar_compaction;
+#[cfg(test)]
+mod adaptive_columnar_compaction_tests;
 mod adaptive_evidence_pool;
 #[cfg(test)]
 mod adaptive_evidence_pool_tests;
@@ -101,6 +104,14 @@ pub use adaptive::{
     AdaptiveError, AdaptiveExecutionReport, AdaptiveMaintenanceOutcome,
     AdaptiveMaintenanceProposal, AdaptiveNoAction, AdaptiveNoActionReason, AdaptiveObservation,
     AdaptiveObservationAnchor, AdaptivePlannerEvidence, AdaptivePolicy, AdaptiveSourceObservation,
+};
+pub use adaptive_columnar_compaction::{
+    AdaptiveColumnarCompactionAbortReason, AdaptiveColumnarCompactionDecision,
+    AdaptiveColumnarCompactionError, AdaptiveColumnarCompactionExecutionReport,
+    AdaptiveColumnarCompactionMeasurement, AdaptiveColumnarCompactionNoAction,
+    AdaptiveColumnarCompactionNoActionReason, AdaptiveColumnarCompactionObservation,
+    AdaptiveColumnarCompactionOutcome, AdaptiveColumnarCompactionPolicy,
+    AdaptiveColumnarCompactionProposal,
 };
 pub use adaptive_evidence_pool::{
     AdaptiveCalibrationEpochInspection, AdaptiveCalibrationGroupInspection, AdaptiveEvidencePool,

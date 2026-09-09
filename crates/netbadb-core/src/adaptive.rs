@@ -439,7 +439,7 @@ fn decide_projection(
         read_bytes: max_change_bytes,
         write_bytes,
     };
-    if !fits_budget(estimated_cost, budget) {
+    if !budget.admits(estimated_cost) {
         return no_action(Some(id), AdaptiveNoActionReason::InsufficientBudgetEstimate);
     }
     AdaptiveDecision::Proposal(AdaptiveMaintenanceProposal {
@@ -588,7 +588,7 @@ impl Database {
         proposal: &AdaptiveMaintenanceProposal,
         budget: MaintenanceBudget,
     ) -> Result<AdaptiveExecutionReport, AdaptiveError> {
-        if !fits_budget(proposal.estimated_cost, budget) {
+        if !budget.admits(proposal.estimated_cost) {
             return Ok(aborted_report(
                 proposal,
                 budget,
@@ -637,7 +637,7 @@ impl Database {
         let mut after_change = state_for(&after_observation, proposal.projection_id).ok_or(
             DatabaseError::ColumnarProjectionNotFound(proposal.projection_id),
         )?;
-        let cost_bound_exceeded = !consumption_fits(consumed, budget);
+        let cost_bound_exceeded = !budget.contains(consumed);
         let outcome = if cost_bound_exceeded {
             self.adaptive_runtime
                 .suppress(proposal.projection_id, after_change.projection_generation);
@@ -686,7 +686,7 @@ impl Database {
             proposal: proposal.clone(),
             budget_before: budget,
             consumed,
-            budget_remaining: remaining_budget(budget, consumed),
+            budget_remaining: budget.remaining(consumed),
             measurement: Some(measurement),
             outcome,
         })
@@ -765,32 +765,6 @@ fn conservative_columnar_write_bound(
         )?
         .checked_add(mutations.checked_mul(128)?)?
         .checked_add(batches.checked_mul(64)?)
-}
-
-fn fits_budget(estimate: MaintenanceEstimate, budget: MaintenanceBudget) -> bool {
-    budget.max_actions != 0
-        && estimate.work_units <= budget.max_work_units
-        && estimate.read_bytes <= budget.max_read_bytes
-        && estimate.write_bytes <= budget.max_write_bytes
-}
-
-fn consumption_fits(consumed: MaintenanceConsumption, budget: MaintenanceBudget) -> bool {
-    consumed.actions <= budget.max_actions
-        && consumed.work_units <= budget.max_work_units
-        && consumed.read_bytes <= budget.max_read_bytes
-        && consumed.write_bytes <= budget.max_write_bytes
-}
-
-fn remaining_budget(
-    budget: MaintenanceBudget,
-    consumed: MaintenanceConsumption,
-) -> MaintenanceBudget {
-    MaintenanceBudget::new(
-        budget.max_work_units.saturating_sub(consumed.work_units),
-        budget.max_read_bytes.saturating_sub(consumed.read_bytes),
-        budget.max_write_bytes.saturating_sub(consumed.write_bytes),
-        budget.max_actions.saturating_sub(consumed.actions),
-    )
 }
 
 fn state_for(

@@ -2,15 +2,19 @@ use std::error::Error;
 use std::fmt;
 
 use netbadb_planner::{CalibrationRatio, PlannerCalibrationClass, PlannerCalibrationEpoch};
-use netbadb_types::{ColumnarProjectionId, SchemaGeneration, TableId};
+use netbadb_types::{ColumnarGeneration, ColumnarProjectionId, SchemaGeneration, TableId};
 
 use crate::planner_calibration::{aggregate_calibration_evidence, replay_calibration_ratio_errors};
 use crate::{
-    AdaptiveCycleReport, AdaptiveDecision, AdaptiveError, AdaptiveEvidencePool,
-    AdaptiveMaintenanceOutcome, AdaptiveNoActionReason, AdaptivePolicy,
-    AdaptiveWorkloadEvaluationReport, AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome,
-    AdaptiveWorkloadPolicy, AdaptiveWorkloadStaleReason, AdaptiveWorkloadTarget,
-    AdaptiveWorkloadWindow, Database, MaintenanceBudget, PlannerCalibrationAdvisorError,
+    AdaptiveColumnarCompactionDecision, AdaptiveColumnarCompactionError,
+    AdaptiveColumnarCompactionExecutionReport, AdaptiveColumnarCompactionNoActionReason,
+    AdaptiveColumnarCompactionObservation, AdaptiveColumnarCompactionOutcome,
+    AdaptiveColumnarCompactionPolicy, AdaptiveColumnarCompactionProposal, AdaptiveCycleReport,
+    AdaptiveDecision, AdaptiveError, AdaptiveEvidencePool, AdaptiveMaintenanceOutcome,
+    AdaptiveNoActionReason, AdaptivePolicy, AdaptiveWorkloadEvaluationReport,
+    AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy,
+    AdaptiveWorkloadStaleReason, AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, Database,
+    MaintenanceAction, MaintenanceBudget, PlannerCalibrationAdvisorError,
     PlannerCalibrationDecision, PlannerCalibrationEvidence, PlannerCalibrationMutationError,
     PlannerCalibrationNoAction, PlannerCalibrationPolicy, PlannerCalibrationProposal,
     PlannerCalibrationReceipt, PlannerCalibrationShadowDecision, PlannerCalibrationShadowReport,
@@ -161,6 +165,11 @@ pub enum AutomaticSafeModeMutation {
     ColumnarAdvance {
         projection_id: ColumnarProjectionId,
     },
+    ColumnarCompaction {
+        projection_id: ColumnarProjectionId,
+        old_generation: ColumnarGeneration,
+        new_generation: ColumnarGeneration,
+    },
     ColumnarSuppression {
         target: AdaptiveWorkloadTarget,
     },
@@ -205,6 +214,10 @@ pub enum AutomaticSafeModeNoAction {
 pub enum AutomaticSafeModeOutcome {
     NoAction(AutomaticSafeModeNoAction),
     ColumnarMutationCompleted,
+    ColumnarCompactionCompleted,
+    ColumnarCompactionRevertedInsufficientMeasuredBenefit,
+    ColumnarCompactionAborted,
+    ColumnarCompactionInconclusive,
     ColumnarTrialValidatedKeep,
     ColumnarTrialReverted,
     ColumnarTrialResolvedSuppressed,
@@ -240,6 +253,7 @@ pub struct AutomaticSafeModeReport {
     pub selected_lane: AutomaticSafeModeLane,
     pub mutation: Option<AutomaticSafeModeMutation>,
     pub columnar_cycle: Option<Box<AdaptiveCycleReport>>,
+    pub columnar_compaction: Option<Box<AdaptiveColumnarCompactionExecutionReport>>,
     pub workload_evaluation: Option<AdaptiveWorkloadEvaluationReport>,
     pub calibration_decision: Option<PlannerCalibrationDecision>,
     pub calibration_shadow: Option<PlannerCalibrationShadowDecision>,
@@ -263,6 +277,8 @@ pub struct AutomaticMultiSafeModeInput<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutomaticMultiSafeModePolicy {
     pub safe_mode: AutomaticSafeModePolicy,
+    pub allow_columnar_compaction: bool,
+    pub columnar_compaction_policy: AdaptiveColumnarCompactionPolicy,
     pub cross_lane_service: AutomaticCrossLaneServicePolicy,
     pub max_candidate_tables: u64,
     pub max_calibration_classes: u64,
@@ -273,6 +289,8 @@ impl Default for AutomaticMultiSafeModePolicy {
     fn default() -> Self {
         Self {
             safe_mode: AutomaticSafeModePolicy::default(),
+            allow_columnar_compaction: false,
+            columnar_compaction_policy: AdaptiveColumnarCompactionPolicy::default(),
             cross_lane_service: AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
             max_candidate_tables: 16,
             max_calibration_classes: 4,
@@ -312,6 +330,10 @@ pub enum AutomaticCandidateKey {
         table_id: TableId,
         projection_id: Option<ColumnarProjectionId>,
     },
+    ColumnarCompaction {
+        table_id: TableId,
+        projection_id: ColumnarProjectionId,
+    },
     PlannerCalibration {
         calibration_class: PlannerCalibrationClass,
     },
@@ -321,6 +343,7 @@ pub enum AutomaticCandidateKey {
 pub enum AutomaticCandidateReadiness {
     Ready,
     ColumnarBlocked(AdaptiveNoActionReason),
+    ColumnarCompactionBlocked(AdaptiveColumnarCompactionNoActionReason),
     CalibrationBlocked(PlannerCalibrationNoAction),
     CalibrationEvidenceUnavailable,
     StaleEvidence,
@@ -333,6 +356,10 @@ pub struct AutomaticCandidateRankEvidence {
     pub maintenance_work_units: Option<u64>,
     pub read_bytes: Option<u64>,
     pub write_bytes: Option<u64>,
+    pub delta_segment_count: Option<u64>,
+    pub delta_bytes: Option<u64>,
+    pub delta_mutations: Option<u64>,
+    pub suppressed_versions: Option<u64>,
     pub shadow_improvement_work_units: Option<u64>,
     pub distinct_query_shapes: Option<u64>,
     pub sample_count: Option<u64>,
@@ -369,17 +396,20 @@ pub struct AutomaticMultiSafeModeReport {
 #[derive(Debug)]
 pub enum AutomaticSafeModeError {
     Adaptive(AdaptiveError),
+    ColumnarCompaction(AdaptiveColumnarCompactionError),
     CalibrationAdvisor(PlannerCalibrationAdvisorError),
     CalibrationMutation(PlannerCalibrationMutationError),
     MissingColumnarMeasurement,
     AdmissionScopeTooLarge,
     InvalidCrossLaneServicePolicy,
+    InvalidColumnarCompactionPolicy,
 }
 
 impl fmt::Display for AutomaticSafeModeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Adaptive(error) => error.fmt(formatter),
+            Self::ColumnarCompaction(error) => error.fmt(formatter),
             Self::CalibrationAdvisor(error) => error.fmt(formatter),
             Self::CalibrationMutation(error) => error.fmt(formatter),
             Self::MissingColumnarMeasurement => formatter.write_str(
@@ -390,6 +420,9 @@ impl fmt::Display for AutomaticSafeModeError {
             }
             Self::InvalidCrossLaneServicePolicy => formatter
                 .write_str("bounded cross-lane service requires at least one Columnar admission"),
+            Self::InvalidColumnarCompactionPolicy => formatter.write_str(
+                "automatic Columnar compaction requires at least one non-zero pressure threshold",
+            ),
         }
     }
 }
@@ -398,11 +431,13 @@ impl Error for AutomaticSafeModeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Adaptive(error) => Some(error),
+            Self::ColumnarCompaction(error) => Some(error),
             Self::CalibrationAdvisor(error) => Some(error),
             Self::CalibrationMutation(error) => Some(error),
             Self::MissingColumnarMeasurement
             | Self::AdmissionScopeTooLarge
-            | Self::InvalidCrossLaneServicePolicy => None,
+            | Self::InvalidCrossLaneServicePolicy
+            | Self::InvalidColumnarCompactionPolicy => None,
         }
     }
 }
@@ -410,6 +445,12 @@ impl Error for AutomaticSafeModeError {
 impl From<AdaptiveError> for AutomaticSafeModeError {
     fn from(error: AdaptiveError) -> Self {
         Self::Adaptive(error)
+    }
+}
+
+impl From<AdaptiveColumnarCompactionError> for AutomaticSafeModeError {
+    fn from(error: AdaptiveColumnarCompactionError) -> Self {
+        Self::ColumnarCompaction(error)
     }
 }
 
@@ -473,6 +514,7 @@ pub(crate) struct AutomaticSafeModeRuntimeState {
 #[derive(Debug, Clone)]
 enum AutomaticCandidateAuthority {
     Columnar(Box<ColumnarCandidateAuthority>),
+    ColumnarCompaction(Box<ColumnarCompactionCandidateAuthority>),
     PlannerCalibration(Box<CalibrationCandidateAuthority>),
 }
 
@@ -480,6 +522,11 @@ enum AutomaticCandidateAuthority {
 struct ColumnarCandidateAuthority {
     observation: crate::AdaptiveObservation,
     proposal: crate::AdaptiveMaintenanceProposal,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnarCompactionCandidateAuthority {
+    proposal: AdaptiveColumnarCompactionProposal,
 }
 
 #[derive(Debug, Clone)]
@@ -544,7 +591,7 @@ impl Database {
         let columnar = self.discover_columnar_candidates(
             input.scope.table_ids,
             input.maintenance_budget,
-            policy.safe_mode,
+            policy,
         )?;
         validate_candidate_count(columnar.len(), 0, policy)?;
         let calibration = self.discover_calibration_candidates(
@@ -659,7 +706,7 @@ impl Database {
         let mut columnar = self.discover_columnar_candidates(
             input.scope.table_ids,
             input.maintenance_budget,
-            policy.safe_mode,
+            policy,
         )?;
         validate_candidate_count(columnar.len(), 0, policy)?;
         let mut calibration = self.discover_calibration_candidates(
@@ -707,6 +754,7 @@ impl Database {
 
         self.automatic_safe_mode.admission.clear();
         let no_action = if !policy.safe_mode.allow_columnar_maintenance
+            && !policy.allow_columnar_compaction
             && !policy.safe_mode.allow_planner_calibration
         {
             AutomaticSafeModeNoAction::AutomaticActionsDisabled
@@ -918,63 +966,114 @@ impl Database {
         &self,
         table_ids: &[TableId],
         budget: MaintenanceBudget,
-        policy: AutomaticSafeModePolicy,
+        policy: AutomaticMultiSafeModePolicy,
     ) -> Result<Vec<DiscoveredAutomaticCandidate>, AutomaticSafeModeError> {
-        if !policy.allow_columnar_maintenance {
+        if !policy.safe_mode.allow_columnar_maintenance && !policy.allow_columnar_compaction {
             return Ok(Vec::new());
         }
         let mut output = Vec::new();
         for table_id in stable_unique_tables(table_ids) {
-            let observation = self.observe_adaptive_columnar(table_id)?;
-            for decision in observation.decisions(policy.adaptive_policy, budget) {
-                match decision {
-                    AdaptiveDecision::Proposal(proposal) => {
-                        let key = AutomaticCandidateKey::Columnar {
-                            table_id,
-                            projection_id: Some(proposal.projection_id),
-                        };
-                        output.push(DiscoveredAutomaticCandidate {
-                            inspection: AutomaticCandidateInspection {
-                                key,
-                                lane: AutomaticSafeModeLane::ColumnarMaintenance,
-                                readiness: AutomaticCandidateReadiness::Ready,
-                                rank: AutomaticCandidateRankEvidence {
-                                    ready_age: self.ready_age(key),
-                                    expected_benefit_work_units: Some(
-                                        proposal.expected_planner.benefit_work_units,
-                                    ),
-                                    maintenance_work_units: Some(
-                                        proposal.estimated_cost.work_units,
-                                    ),
-                                    read_bytes: Some(proposal.estimated_cost.read_bytes),
-                                    write_bytes: Some(proposal.estimated_cost.write_bytes),
-                                    ..AutomaticCandidateRankEvidence::default()
+            if policy.safe_mode.allow_columnar_maintenance {
+                let observation = self.observe_adaptive_columnar(table_id)?;
+                for decision in observation.decisions(policy.safe_mode.adaptive_policy, budget) {
+                    match decision {
+                        AdaptiveDecision::Proposal(proposal) => {
+                            let key = AutomaticCandidateKey::Columnar {
+                                table_id,
+                                projection_id: Some(proposal.projection_id),
+                            };
+                            output.push(DiscoveredAutomaticCandidate {
+                                inspection: AutomaticCandidateInspection {
+                                    key,
+                                    lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                                    readiness: AutomaticCandidateReadiness::Ready,
+                                    rank: AutomaticCandidateRankEvidence {
+                                        ready_age: self.ready_age(key),
+                                        expected_benefit_work_units: Some(
+                                            proposal.expected_planner.benefit_work_units,
+                                        ),
+                                        maintenance_work_units: Some(
+                                            proposal.estimated_cost.work_units,
+                                        ),
+                                        read_bytes: Some(proposal.estimated_cost.read_bytes),
+                                        write_bytes: Some(proposal.estimated_cost.write_bytes),
+                                        ..AutomaticCandidateRankEvidence::default()
+                                    },
                                 },
-                            },
-                            authority: Some(AutomaticCandidateAuthority::Columnar(Box::new(
-                                ColumnarCandidateAuthority {
-                                    observation: observation.clone(),
-                                    proposal,
+                                authority: Some(AutomaticCandidateAuthority::Columnar(Box::new(
+                                    ColumnarCandidateAuthority {
+                                        observation: observation.clone(),
+                                        proposal,
+                                    },
+                                ))),
+                            });
+                        }
+                        AdaptiveDecision::NoAction(no_action) => {
+                            let key = AutomaticCandidateKey::Columnar {
+                                table_id,
+                                projection_id: no_action.projection_id,
+                            };
+                            output.push(DiscoveredAutomaticCandidate {
+                                inspection: AutomaticCandidateInspection {
+                                    key,
+                                    lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                                    readiness: AutomaticCandidateReadiness::ColumnarBlocked(
+                                        no_action.reason,
+                                    ),
+                                    rank: AutomaticCandidateRankEvidence::default(),
                                 },
-                            ))),
-                        });
+                                authority: None,
+                            });
+                        }
                     }
-                    AdaptiveDecision::NoAction(no_action) => {
-                        let key = AutomaticCandidateKey::Columnar {
-                            table_id,
-                            projection_id: no_action.projection_id,
-                        };
-                        output.push(DiscoveredAutomaticCandidate {
-                            inspection: AutomaticCandidateInspection {
-                                key,
-                                lane: AutomaticSafeModeLane::ColumnarMaintenance,
-                                readiness: AutomaticCandidateReadiness::ColumnarBlocked(
-                                    no_action.reason,
-                                ),
-                                rank: AutomaticCandidateRankEvidence::default(),
-                            },
-                            authority: None,
-                        });
+                }
+            }
+            if policy.allow_columnar_compaction {
+                for observation in self.observe_adaptive_columnar_compactions(table_id, budget)? {
+                    let MaintenanceAction::CompactColumnar { projection_id } =
+                        observation.maintenance_candidate.action
+                    else {
+                        continue;
+                    };
+                    let key = AutomaticCandidateKey::ColumnarCompaction {
+                        table_id,
+                        projection_id,
+                    };
+                    let mut rank =
+                        compaction_rank_evidence(self.ready_age(key), projection_id, &observation);
+                    match observation.decide(
+                        policy.columnar_compaction_policy,
+                        policy.safe_mode.adaptive_policy,
+                    )? {
+                        AdaptiveColumnarCompactionDecision::Proposal(proposal) => {
+                            rank.expected_benefit_work_units =
+                                Some(proposal.expected_planner.benefit_work_units);
+                            output.push(DiscoveredAutomaticCandidate {
+                                inspection: AutomaticCandidateInspection {
+                                    key,
+                                    lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                                    readiness: AutomaticCandidateReadiness::Ready,
+                                    rank,
+                                },
+                                authority: Some(AutomaticCandidateAuthority::ColumnarCompaction(
+                                    Box::new(ColumnarCompactionCandidateAuthority { proposal }),
+                                )),
+                            });
+                        }
+                        AdaptiveColumnarCompactionDecision::NoAction(no_action) => {
+                            output.push(DiscoveredAutomaticCandidate {
+                                inspection: AutomaticCandidateInspection {
+                                    key,
+                                    lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                                    readiness:
+                                        AutomaticCandidateReadiness::ColumnarCompactionBlocked(
+                                            no_action.reason,
+                                        ),
+                                    rank,
+                                },
+                                authority: None,
+                            });
+                        }
                     }
                 }
             }
@@ -1207,6 +1306,67 @@ impl Database {
                     AutomaticSafeModeOutcome::ColumnarMutationCompleted,
                 ))
             }
+            Some(AutomaticCandidateAuthority::ColumnarCompaction(authority)) => {
+                let ColumnarCompactionCandidateAuthority { proposal } = *authority;
+                let execution = self.execute_adaptive_columnar_compaction(&proposal, budget)?;
+                let mutation = execution
+                    .physical
+                    .as_ref()
+                    .filter(|physical| physical.compacted)
+                    .map(|physical| AutomaticSafeModeMutation::ColumnarCompaction {
+                        projection_id: physical.projection_id,
+                        old_generation: physical.old_generation,
+                        new_generation: physical.new_generation,
+                    });
+                if execution.outcome == AdaptiveColumnarCompactionOutcome::Completed {
+                    let measurement = execution
+                        .measurement
+                        .as_ref()
+                        .ok_or(AutomaticSafeModeError::MissingColumnarMeasurement)?;
+                    let physical = execution
+                        .physical
+                        .as_ref()
+                        .ok_or(AutomaticSafeModeError::MissingColumnarMeasurement)?;
+                    self.automatic_safe_mode.active_trial = Some(ActiveAutomaticTrial::Columnar {
+                        target: AdaptiveWorkloadTarget {
+                            table_id: proposal.table_id,
+                            storage_id: proposal.storage_id,
+                            projection_id: proposal.projection_id,
+                            generation: physical.new_generation,
+                            schema_generation: measurement.schema_generation_after,
+                        },
+                    });
+                }
+                let outcome = match execution.outcome {
+                    AdaptiveColumnarCompactionOutcome::Completed => {
+                        AutomaticSafeModeOutcome::ColumnarCompactionCompleted
+                    }
+                    AdaptiveColumnarCompactionOutcome::RevertedInsufficientMeasuredBenefit => {
+                        AutomaticSafeModeOutcome::ColumnarCompactionRevertedInsufficientMeasuredBenefit
+                    }
+                    AdaptiveColumnarCompactionOutcome::Aborted(_) => {
+                        AutomaticSafeModeOutcome::ColumnarCompactionAborted
+                    }
+                    AdaptiveColumnarCompactionOutcome::InconclusiveNoWork
+                    | AdaptiveColumnarCompactionOutcome::InconclusiveCostBoundExceeded
+                    | AdaptiveColumnarCompactionOutcome::InconclusivePostconditionsChanged => {
+                        AutomaticSafeModeOutcome::ColumnarCompactionInconclusive
+                    }
+                };
+                let mut report = self.finish_automatic_report(
+                    trial_before,
+                    AutomaticSafeModeLane::ColumnarMaintenance,
+                    mutation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    outcome,
+                );
+                report.columnar_compaction = Some(Box::new(execution));
+                Ok(report)
+            }
             Some(AutomaticCandidateAuthority::PlannerCalibration(authority)) => {
                 let CalibrationCandidateAuthority {
                     decision,
@@ -1268,6 +1428,7 @@ impl Database {
             selected_lane,
             mutation,
             columnar_cycle,
+            columnar_compaction: None,
             workload_evaluation,
             calibration_decision,
             calibration_shadow,
@@ -1538,6 +1699,9 @@ fn validate_multi_scope(
     scope: AutomaticAdmissionScope<'_>,
     policy: AutomaticMultiSafeModePolicy,
 ) -> Result<(), AutomaticSafeModeError> {
+    if policy.allow_columnar_compaction && !policy.columnar_compaction_policy.is_valid() {
+        return Err(AutomaticSafeModeError::InvalidColumnarCompactionPolicy);
+    }
     if matches!(
         policy.cross_lane_service,
         AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
@@ -1613,6 +1777,29 @@ fn select_ready_lane(
     }
 }
 
+fn compaction_rank_evidence(
+    ready_age: u64,
+    projection_id: ColumnarProjectionId,
+    observation: &AdaptiveColumnarCompactionObservation,
+) -> AutomaticCandidateRankEvidence {
+    let projection = observation
+        .observation
+        .projections
+        .iter()
+        .find(|target| target.projection.projection_id == Some(projection_id));
+    AutomaticCandidateRankEvidence {
+        ready_age,
+        maintenance_work_units: Some(observation.maintenance_candidate.estimate.work_units),
+        read_bytes: Some(observation.maintenance_candidate.estimate.read_bytes),
+        write_bytes: Some(observation.maintenance_candidate.estimate.write_bytes),
+        delta_segment_count: projection.and_then(|target| target.projection.delta_segment_count),
+        delta_bytes: projection.and_then(|target| target.projection.delta_bytes),
+        delta_mutations: projection.and_then(|target| target.projection.delta_mutations),
+        suppressed_versions: projection.and_then(|target| target.projection.suppressed_versions),
+        ..AutomaticCandidateRankEvidence::default()
+    }
+}
+
 fn stable_unique_tables(table_ids: &[TableId]) -> Vec<TableId> {
     let mut output = Vec::new();
     for table_id in table_ids {
@@ -1651,20 +1838,58 @@ fn compare_columnar_rank(
     left.rank
         .ready_age
         .cmp(&right.rank.ready_age)
-        .then_with(|| {
-            left.rank
-                .expected_benefit_work_units
-                .cmp(&right.rank.expected_benefit_work_units)
-        })
-        .then_with(|| {
-            right
+        .then_with(|| columnar_class_priority(left.key).cmp(&columnar_class_priority(right.key)))
+        .then_with(|| match (left.key, right.key) {
+            (AutomaticCandidateKey::Columnar { .. }, AutomaticCandidateKey::Columnar { .. }) => {
+                left.rank
+                    .expected_benefit_work_units
+                    .cmp(&right.rank.expected_benefit_work_units)
+                    .then_with(|| {
+                        right
+                            .rank
+                            .maintenance_work_units
+                            .cmp(&left.rank.maintenance_work_units)
+                    })
+                    .then_with(|| right.rank.read_bytes.cmp(&left.rank.read_bytes))
+                    .then_with(|| right.rank.write_bytes.cmp(&left.rank.write_bytes))
+            }
+            (
+                AutomaticCandidateKey::ColumnarCompaction { .. },
+                AutomaticCandidateKey::ColumnarCompaction { .. },
+            ) => left
                 .rank
-                .maintenance_work_units
-                .cmp(&left.rank.maintenance_work_units)
+                .delta_bytes
+                .cmp(&right.rank.delta_bytes)
+                .then_with(|| {
+                    left.rank
+                        .delta_segment_count
+                        .cmp(&right.rank.delta_segment_count)
+                })
+                .then_with(|| {
+                    left.rank
+                        .suppressed_versions
+                        .cmp(&right.rank.suppressed_versions)
+                })
+                .then_with(|| left.rank.delta_mutations.cmp(&right.rank.delta_mutations))
+                .then_with(|| {
+                    right
+                        .rank
+                        .maintenance_work_units
+                        .cmp(&left.rank.maintenance_work_units)
+                })
+                .then_with(|| right.rank.read_bytes.cmp(&left.rank.read_bytes))
+                .then_with(|| right.rank.write_bytes.cmp(&left.rank.write_bytes)),
+            _ => std::cmp::Ordering::Equal,
         })
-        .then_with(|| right.rank.read_bytes.cmp(&left.rank.read_bytes))
-        .then_with(|| right.rank.write_bytes.cmp(&left.rank.write_bytes))
         .then_with(|| right.key.cmp(&left.key))
+}
+
+const fn columnar_class_priority(key: AutomaticCandidateKey) -> u8 {
+    match key {
+        AutomaticCandidateKey::Columnar { .. } => 1,
+        AutomaticCandidateKey::ColumnarCompaction { .. } => 0,
+        AutomaticCandidateKey::PlannerCalibration { .. } => 0,
+    }
 }
 
 fn select_calibration_candidate(candidates: &[DiscoveredAutomaticCandidate]) -> Option<usize> {
@@ -1734,6 +1959,37 @@ mod admission_tests {
         }
     }
 
+    fn compaction(
+        table: u64,
+        projection: u64,
+        age: u64,
+        delta_bytes: u64,
+        delta_segments: u64,
+    ) -> DiscoveredAutomaticCandidate {
+        DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key: AutomaticCandidateKey::ColumnarCompaction {
+                    table_id: TableId(table),
+                    projection_id: ColumnarProjectionId(projection),
+                },
+                lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank: AutomaticCandidateRankEvidence {
+                    ready_age: age,
+                    maintenance_work_units: Some(20),
+                    read_bytes: Some(30),
+                    write_bytes: Some(40),
+                    delta_segment_count: Some(delta_segments),
+                    delta_bytes: Some(delta_bytes),
+                    delta_mutations: Some(10),
+                    suppressed_versions: Some(2),
+                    ..AutomaticCandidateRankEvidence::default()
+                },
+            },
+            authority: None,
+        }
+    }
+
     fn calibration(
         class: PlannerCalibrationClass,
         age: u64,
@@ -1791,6 +2047,24 @@ mod admission_tests {
         let aged = calibration(PlannerCalibrationClass::Columnar, 1, 1);
         let stronger = calibration(PlannerCalibrationClass::SeqScan, 0, 500);
         assert_eq!(select_calibration_candidate(&[aged, stronger]), Some(0));
+    }
+
+    #[test]
+    fn columnar_rank_uses_age_then_class_then_class_local_evidence() {
+        let catch_up = columnar(1, 1, 0, 10, 1);
+        let compact = compaction(2, 2, 0, 10_000, 8);
+        assert_eq!(select_columnar_candidate(&[catch_up, compact]), Some(0));
+
+        let catch_up = columnar(1, 1, 0, 10_000, 1);
+        let aged_compaction = compaction(2, 2, 1, 1, 1);
+        assert_eq!(
+            select_columnar_candidate(&[catch_up, aged_compaction]),
+            Some(1)
+        );
+
+        let small = compaction(1, 1, 0, 100, 10);
+        let large = compaction(2, 2, 0, 200, 1);
+        assert_eq!(select_columnar_candidate(&[small, large]), Some(1));
     }
 
     #[test]
@@ -1865,6 +2139,25 @@ mod admission_tests {
                 policy,
             ),
             Err(AutomaticSafeModeError::InvalidCrossLaneServicePolicy)
+        ));
+    }
+
+    #[test]
+    fn enabled_compaction_requires_a_nonzero_pressure_threshold() {
+        let policy = AutomaticMultiSafeModePolicy {
+            allow_columnar_compaction: true,
+            columnar_compaction_policy: AdaptiveColumnarCompactionPolicy::new(0, 0),
+            ..AutomaticMultiSafeModePolicy::default()
+        };
+        assert!(matches!(
+            validate_multi_scope(
+                AutomaticAdmissionScope {
+                    table_ids: &[],
+                    calibration_classes: &[],
+                },
+                policy,
+            ),
+            Err(AutomaticSafeModeError::InvalidColumnarCompactionPolicy)
         ));
     }
 }
