@@ -13,7 +13,7 @@ use netbadb_types::{
 
 use crate::{AdaptiveError, Database, ExecutionFeedbackReport};
 
-const MAX_CALIBRATION_EPOCH_CLASS_GROUPS: usize = 32;
+pub(crate) const MAX_CALIBRATION_EPOCH_CLASS_GROUPS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdaptiveWorkloadTarget {
@@ -67,7 +67,7 @@ pub struct AggregatedCalibrationEvidence {
 }
 
 impl AggregatedCalibrationEvidence {
-    fn new(
+    pub(crate) fn new(
         calibration_class: PlannerCalibrationClass,
         calibration_epoch: PlannerCalibrationEpoch,
     ) -> Self {
@@ -388,43 +388,13 @@ impl AdaptiveWorkloadWindow {
         report: &ExecutionFeedbackReport,
         global_commit_seq: DatabaseCommitSeq,
     ) {
-        let mut seen = Vec::new();
-        for access in &report.accesses {
-            let (Some(planner), Some(sample)) = (&access.planner, access.calibration) else {
-                continue;
-            };
-            let key = (planner.kind.calibration_class(), sample.calibration_epoch);
-            if seen.contains(&key) {
-                continue;
-            }
-            seen.push(key);
-            let index = self.calibration_visibility.iter().position(|evidence| {
-                evidence.calibration_class == key.0 && evidence.calibration_epoch == key.1
-            });
-            match index {
-                Some(index) => {
-                    let evidence = &mut self.calibration_visibility[index];
-                    if evidence.last_global_commit_seq != global_commit_seq {
-                        let overflowed =
-                            checked_accumulate(&mut evidence.distinct_visibility_points, 1);
-                        evidence.overflowed |= overflowed;
-                        evidence.last_global_commit_seq = global_commit_seq;
-                    }
-                }
-                None if self.calibration_visibility.len() < MAX_CALIBRATION_EPOCH_CLASS_GROUPS => {
-                    self.calibration_visibility
-                        .push(CalibrationVisibilityEvidence {
-                            calibration_class: key.0,
-                            calibration_epoch: key.1,
-                            first_global_commit_seq: global_commit_seq,
-                            last_global_commit_seq: global_commit_seq,
-                            distinct_visibility_points: 1,
-                            overflowed: false,
-                        });
-                }
-                None => self.calibration_truncated = true,
-            }
-        }
+        record_calibration_visibility_parts(
+            &mut self.calibration_visibility,
+            &mut self.calibration_truncated,
+            report,
+            global_commit_seq,
+            MAX_CALIBRATION_EPOCH_CLASS_GROUPS,
+        );
     }
 
     fn mark_truncated(&mut self, global_commit_seq: DatabaseCommitSeq) {
@@ -548,7 +518,10 @@ fn record_target_group(group: &mut AdaptivePlanVariantAggregate, target: &Target
     group.target_incomplete |= target.incomplete || overflowed;
 }
 
-fn record_calibration(group: &mut AdaptivePlanVariantAggregate, report: &ExecutionFeedbackReport) {
+pub(crate) fn record_calibration(
+    group: &mut AdaptivePlanVariantAggregate,
+    report: &ExecutionFeedbackReport,
+) {
     for access in &report.accesses {
         let (Some(planner), Some(calibration)) = (&access.planner, access.calibration) else {
             continue;
@@ -575,6 +548,116 @@ fn record_calibration(group: &mut AdaptivePlanVariantAggregate, report: &Executi
         if let Some(aggregate) = group.calibration.get_mut(index) {
             aggregate.record(calibration);
             aggregate.incomplete |= calibration.calibration_epoch != report.calibration_epoch;
+        }
+    }
+}
+
+/// Records one report into calibration-only Q/V storage. Phase 3 and the
+/// Phase 6 global pool share this path so one report has one aggregation
+/// meaning regardless of its number of adaptive targets.
+pub(crate) fn record_calibration_report(
+    query_shapes: &mut Vec<AdaptiveQueryShapeAggregate>,
+    calibration_visibility: &mut Vec<CalibrationVisibilityEvidence>,
+    calibration_truncated: &mut bool,
+    limits: AdaptiveWorkloadLimits,
+    report: &ExecutionFeedbackReport,
+    global_commit_seq: DatabaseCommitSeq,
+) -> bool {
+    let shape_index = query_shapes
+        .iter()
+        .position(|group| group.query_shape == report.query_shape);
+    let shape_index = match shape_index {
+        Some(index) => index,
+        None => {
+            if u64::try_from(query_shapes.len())
+                .map_or(true, |count| count >= limits.max_query_shapes)
+            {
+                *calibration_truncated = true;
+                return false;
+            }
+            query_shapes.push(AdaptiveQueryShapeAggregate {
+                query_shape: report.query_shape.clone(),
+                plan_variants: Vec::new(),
+            });
+            query_shapes.len() - 1
+        }
+    };
+    let variant_index = query_shapes[shape_index]
+        .plan_variants
+        .iter()
+        .position(|group| group.plan_variant == report.plan_variant);
+    let variant_index = match variant_index {
+        Some(index) => index,
+        None => {
+            let variants = &mut query_shapes[shape_index].plan_variants;
+            if u64::try_from(variants.len())
+                .map_or(true, |count| count >= limits.max_plan_variants_per_shape)
+            {
+                *calibration_truncated = true;
+                return false;
+            }
+            variants.push(AdaptivePlanVariantAggregate::new(
+                report.plan_variant.clone(),
+            ));
+            variants.len() - 1
+        }
+    };
+
+    record_calibration_visibility_parts(
+        calibration_visibility,
+        calibration_truncated,
+        report,
+        global_commit_seq,
+        MAX_CALIBRATION_EPOCH_CLASS_GROUPS,
+    );
+    let group = &mut query_shapes[shape_index].plan_variants[variant_index];
+    let overflowed = checked_accumulate(&mut group.report_count, 1);
+    group.calibration_truncated |= overflowed;
+    record_calibration(group, report);
+    true
+}
+
+pub(crate) fn record_calibration_visibility_parts(
+    calibration_visibility: &mut Vec<CalibrationVisibilityEvidence>,
+    calibration_truncated: &mut bool,
+    report: &ExecutionFeedbackReport,
+    global_commit_seq: DatabaseCommitSeq,
+    max_groups: usize,
+) {
+    let mut seen = Vec::new();
+    for access in &report.accesses {
+        let (Some(planner), Some(sample)) = (&access.planner, access.calibration) else {
+            continue;
+        };
+        let key = (planner.kind.calibration_class(), sample.calibration_epoch);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let index = calibration_visibility.iter().position(|evidence| {
+            evidence.calibration_class == key.0 && evidence.calibration_epoch == key.1
+        });
+        match index {
+            Some(index) => {
+                let evidence = &mut calibration_visibility[index];
+                if evidence.last_global_commit_seq != global_commit_seq {
+                    let overflowed =
+                        checked_accumulate(&mut evidence.distinct_visibility_points, 1);
+                    evidence.overflowed |= overflowed;
+                    evidence.last_global_commit_seq = global_commit_seq;
+                }
+            }
+            None if calibration_visibility.len() < max_groups => {
+                calibration_visibility.push(CalibrationVisibilityEvidence {
+                    calibration_class: key.0,
+                    calibration_epoch: key.1,
+                    first_global_commit_seq: global_commit_seq,
+                    last_global_commit_seq: global_commit_seq,
+                    distinct_visibility_points: 1,
+                    overflowed: false,
+                });
+            }
+            None => *calibration_truncated = true,
         }
     }
 }
@@ -654,6 +737,29 @@ pub struct AdaptiveWorkloadEvaluationReport {
 }
 
 impl Database {
+    pub(crate) fn adaptive_workload_stale_reason(
+        &self,
+        target: AdaptiveWorkloadTarget,
+    ) -> Option<AdaptiveWorkloadStaleReason> {
+        if self.schema_generation() != target.schema_generation {
+            return Some(AdaptiveWorkloadStaleReason::SchemaChanged);
+        }
+        let Some(projection) = self
+            .projections
+            .iter()
+            .find(|entry| entry.identity.id == target.projection_id)
+            .and_then(|entry| entry.projection.as_ref())
+        else {
+            return Some(AdaptiveWorkloadStaleReason::TargetIdentityChanged);
+        };
+        let metadata = projection.metadata();
+        if metadata.table_id != target.table_id || metadata.source_storage_id != target.storage_id {
+            return Some(AdaptiveWorkloadStaleReason::TargetIdentityChanged);
+        }
+        (metadata.generation != target.generation)
+            .then_some(AdaptiveWorkloadStaleReason::TargetGenerationChanged)
+    }
+
     /// Applies deterministic workload hysteresis to one caller-owned window.
     /// Current G is intentionally not compared with historical sample Gs.
     pub fn evaluate_adaptive_workload(
@@ -664,43 +770,12 @@ impl Database {
         self.current_database_snapshot()?
             .ok_or(AdaptiveError::GlobalVisibilityRequired)?;
         let target = window.target;
-        if self.schema_generation() != target.schema_generation {
+        if let Some(reason) = self.adaptive_workload_stale_reason(target) {
             return Ok(workload_report(
                 window,
-                AdaptiveWorkloadOutcome::StaleWindow(AdaptiveWorkloadStaleReason::SchemaChanged),
+                AdaptiveWorkloadOutcome::StaleWindow(reason),
             ));
         }
-        let Some(projection) = self
-            .projections
-            .iter()
-            .find(|entry| entry.identity.id == target.projection_id)
-            .and_then(|entry| entry.projection.as_ref())
-        else {
-            return Ok(workload_report(
-                window,
-                AdaptiveWorkloadOutcome::StaleWindow(
-                    AdaptiveWorkloadStaleReason::TargetIdentityChanged,
-                ),
-            ));
-        };
-        let metadata = projection.metadata();
-        if metadata.table_id != target.table_id || metadata.source_storage_id != target.storage_id {
-            return Ok(workload_report(
-                window,
-                AdaptiveWorkloadOutcome::StaleWindow(
-                    AdaptiveWorkloadStaleReason::TargetIdentityChanged,
-                ),
-            ));
-        }
-        if metadata.generation != target.generation {
-            return Ok(workload_report(
-                window,
-                AdaptiveWorkloadOutcome::StaleWindow(
-                    AdaptiveWorkloadStaleReason::TargetGenerationChanged,
-                ),
-            ));
-        }
-
         let insufficient = window.overflowed
             || window.incomplete
             || window.truncated

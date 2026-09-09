@@ -322,12 +322,38 @@ impl Database {
             });
         }
         let profile = self.planner_calibration;
-        let mut evidence = aggregate_calibration_evidence(
+        let evidence = aggregate_calibration_evidence(
             window,
             calibration_class,
             profile.epoch,
             policy.error_deadband_work_units,
         );
+        self.advise_planner_calibration_evidence(evidence, policy)
+    }
+
+    /// Applies the Phase 4 advisor to already-aggregated runtime evidence.
+    /// The evidence remains explanatory input; apply still revalidates schema,
+    /// epoch, ratio, and the accepted shadow before mutation.
+    pub fn advise_planner_calibration_evidence(
+        &self,
+        mut evidence: PlannerCalibrationEvidence,
+        policy: PlannerCalibrationPolicy,
+    ) -> Result<PlannerCalibrationDecision, PlannerCalibrationAdvisorError> {
+        validate_policy(policy)?;
+        let schema_generation = self.schema_generation();
+        if evidence.schema_generation != schema_generation {
+            return Err(PlannerCalibrationAdvisorError::SchemaChanged {
+                evidence: evidence.schema_generation,
+                current: schema_generation,
+            });
+        }
+        let calibration_class = evidence.calibration_class;
+        let profile = self.planner_calibration;
+        if evidence.calibration_epoch != profile.epoch {
+            return Ok(PlannerCalibrationDecision::NoAction(
+                PlannerCalibrationNoAction::InsufficientEvidence,
+            ));
+        }
         if evidence.overflowed || evidence.incomplete || evidence.truncated {
             return Ok(PlannerCalibrationDecision::NoAction(
                 PlannerCalibrationNoAction::IncompleteEvidence,
@@ -568,10 +594,35 @@ pub(crate) fn aggregate_calibration_evidence(
     epoch: PlannerCalibrationEpoch,
     deadband: u64,
 ) -> PlannerCalibrationEvidence {
+    aggregate_calibration_evidence_parts(
+        window.target.schema_generation,
+        &window.query_shapes,
+        &window.calibration_visibility,
+        window.overflowed,
+        window.incomplete,
+        window.truncated || window.calibration_truncated,
+        class,
+        epoch,
+        deadband,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate_calibration_evidence_parts(
+    schema_generation: SchemaGeneration,
+    query_shapes: &[crate::AdaptiveQueryShapeAggregate],
+    calibration_visibility: &[crate::CalibrationVisibilityEvidence],
+    overflowed: bool,
+    incomplete: bool,
+    truncated: bool,
+    class: PlannerCalibrationClass,
+    epoch: PlannerCalibrationEpoch,
+    deadband: u64,
+) -> PlannerCalibrationEvidence {
     let mut output = PlannerCalibrationEvidence {
         calibration_class: class,
         calibration_epoch: epoch,
-        schema_generation: window.target.schema_generation,
+        schema_generation,
         sample_count: 0,
         total_base_estimated_work_units: 0,
         total_effective_estimated_work_units: 0,
@@ -582,17 +633,17 @@ pub(crate) fn aggregate_calibration_evidence(
         overestimated_query_shapes: 0,
         within_deadband_query_shapes: 0,
         query_shapes: Vec::new(),
-        overflowed: window.overflowed,
-        incomplete: window.incomplete,
-        truncated: window.truncated || window.calibration_truncated,
+        overflowed,
+        incomplete,
+        truncated,
     };
-    if let Some(visibility) = window.calibration_visibility.iter().find(|visibility| {
+    if let Some(visibility) = calibration_visibility.iter().find(|visibility| {
         visibility.calibration_class == class && visibility.calibration_epoch == epoch
     }) {
         output.distinct_visibility_points = visibility.distinct_visibility_points;
         output.overflowed |= visibility.overflowed;
     }
-    for shape in &window.query_shapes {
+    for shape in query_shapes {
         let mut shape_evidence = PlannerCalibrationQueryShapeEvidence {
             query_shape: shape.query_shape.clone(),
             sample_count: 0,

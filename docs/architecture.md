@@ -165,6 +165,15 @@ until Keep, Revert, Stale, or explicit abandon resolves it. The coordinator has
 no background execution, automatic workload collection, generic-maintenance
 lane, persistence, protocol surface, or Inspection JSON change.
 
+[Adaptive Operations Phase 6](adaptive-operations-phase6.md) adds a caller-owned
+bounded evidence pool, forward-only schema/physical window rotation, explicit
+multi-target operator scope, and read-only candidate discovery. Admission uses
+fixed Columnar-before-calibration tiers, lane-specific integer ranking, and
+bounded ready-age fairness to select one existing Phase 1/4 proposal authority.
+An active Phase 5 trial still preempts all admission; there is no implicit query
+capture, background scheduler, generic-maintenance lane, persistence, protocol
+surface, or Inspection JSON v7 change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

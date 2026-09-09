@@ -295,35 +295,57 @@ impl AdaptiveObservation {
     /// Pure read-only advisor. It consults only this immutable snapshot.
     #[must_use]
     pub fn decide(&self, policy: AdaptivePolicy, budget: MaintenanceBudget) -> AdaptiveDecision {
+        let decisions = self.decisions(policy, budget);
+        decisions
+            .iter()
+            .find(|decision| matches!(decision, AdaptiveDecision::Proposal(_)))
+            .cloned()
+            .or_else(|| decisions.into_iter().next())
+            .unwrap_or_else(|| {
+                adaptive_no_action(self, None, AdaptiveNoActionReason::NoColumnarProjection)
+            })
+    }
+
+    /// Returns one pure decision per existing projection. Table-wide blockers
+    /// remain one typed decision. Phase 1 keeps its first-proposal behavior;
+    /// Phase 6 uses the complete list for read-only discovery.
+    pub(crate) fn decisions(
+        &self,
+        policy: AdaptivePolicy,
+        budget: MaintenanceBudget,
+    ) -> Vec<AdaptiveDecision> {
         if self.structural_mutation_active {
-            return adaptive_no_action(
+            return vec![adaptive_no_action(
                 self,
                 None,
                 AdaptiveNoActionReason::StructuralMutationActive,
-            );
+            )];
         }
         if self.active_transaction_handles != 0 || self.group_commit_active {
-            return adaptive_no_action(self, None, AdaptiveNoActionReason::MaintenanceBusy);
+            return vec![adaptive_no_action(
+                self,
+                None,
+                AdaptiveNoActionReason::MaintenanceBusy,
+            )];
         }
         let Some(source) = &self.source else {
-            return adaptive_no_action(self, None, AdaptiveNoActionReason::UnsupportedSource);
+            return vec![adaptive_no_action(
+                self,
+                None,
+                AdaptiveNoActionReason::UnsupportedSource,
+            )];
         };
         if self.projections.is_empty() {
-            return adaptive_no_action(self, None, AdaptiveNoActionReason::NoColumnarProjection);
+            return vec![adaptive_no_action(
+                self,
+                None,
+                AdaptiveNoActionReason::NoColumnarProjection,
+            )];
         }
-        let mut first_no_action = None;
-        for target in &self.projections {
-            let decision = decide_projection(self, source, target, policy, budget);
-            if matches!(decision, AdaptiveDecision::Proposal(_)) {
-                return decision;
-            }
-            if first_no_action.is_none() {
-                first_no_action = Some(decision);
-            }
-        }
-        first_no_action.unwrap_or_else(|| {
-            adaptive_no_action(self, None, AdaptiveNoActionReason::NoColumnarProjection)
-        })
+        self.projections
+            .iter()
+            .map(|target| decide_projection(self, source, target, policy, budget))
+            .collect()
     }
 }
 
@@ -581,7 +603,10 @@ impl Database {
                 AdaptiveAbortReason::StaleObservation,
             ));
         }
-        if current.decide(proposal.policy, budget) != AdaptiveDecision::Proposal(proposal.clone()) {
+        if !current
+            .decisions(proposal.policy, budget)
+            .contains(&AdaptiveDecision::Proposal(proposal.clone()))
+        {
             return Ok(aborted_report(
                 proposal,
                 budget,

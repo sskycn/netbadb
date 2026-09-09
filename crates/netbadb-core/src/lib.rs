@@ -1,11 +1,16 @@
 //! Native synchronous embedded API for NetbaDB.
 
 mod adaptive;
+mod adaptive_evidence_pool;
+#[cfg(test)]
+mod adaptive_evidence_pool_tests;
 #[cfg(test)]
 mod adaptive_tests;
 mod adaptive_workload;
 #[cfg(test)]
 mod adaptive_workload_tests;
+#[cfg(test)]
+mod automatic_multi_safe_mode_tests;
 mod automatic_safe_mode;
 #[cfg(test)]
 mod automatic_safe_mode_tests;
@@ -97,6 +102,12 @@ pub use adaptive::{
     AdaptiveMaintenanceProposal, AdaptiveNoAction, AdaptiveNoActionReason, AdaptiveObservation,
     AdaptiveObservationAnchor, AdaptivePlannerEvidence, AdaptivePolicy, AdaptiveSourceObservation,
 };
+pub use adaptive_evidence_pool::{
+    AdaptiveCalibrationEpochInspection, AdaptiveCalibrationGroupInspection, AdaptiveEvidencePool,
+    AdaptiveEvidencePoolInspection, AdaptiveEvidencePoolLimits, AdaptiveEvidenceRecordError,
+    AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceRecordReport, AdaptiveTargetLineage,
+    AdaptiveTargetWindowInspection,
+};
 pub use adaptive_workload::{
     AdaptivePlanVariantAggregate, AdaptiveQueryShapeAggregate, AdaptiveWorkloadEvaluationReport,
     AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy,
@@ -105,12 +116,15 @@ pub use adaptive_workload::{
     CalibrationVisibilityEvidence,
 };
 pub use automatic_safe_mode::{
-    AutomaticCalibrationTrialEvaluationReport, AutomaticCalibrationTrialPolicy,
-    AutomaticCalibrationTrialStaleReason, AutomaticColumnarTrial, AutomaticPlannerCalibrationTrial,
-    AutomaticSafeModeError, AutomaticSafeModeInput, AutomaticSafeModeLane,
-    AutomaticSafeModeMutation, AutomaticSafeModeNoAction, AutomaticSafeModeOutcome,
-    AutomaticSafeModePolicy, AutomaticSafeModeReport, AutomaticSafeModeState, AutomaticSafeTrial,
-    AutomaticTrialAwaitingReason,
+    AutomaticAdmissionScope, AutomaticCalibrationTrialEvaluationReport,
+    AutomaticCalibrationTrialPolicy, AutomaticCalibrationTrialStaleReason,
+    AutomaticCandidateInspection, AutomaticCandidateInspectionReport, AutomaticCandidateKey,
+    AutomaticCandidateRankEvidence, AutomaticCandidateReadiness, AutomaticColumnarTrial,
+    AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticMultiSafeModeReport,
+    AutomaticPlannerCalibrationTrial, AutomaticSafeModeError, AutomaticSafeModeInput,
+    AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeNoAction,
+    AutomaticSafeModeOutcome, AutomaticSafeModePolicy, AutomaticSafeModeReport,
+    AutomaticSafeModeState, AutomaticSafeTrial, AutomaticTrialAwaitingReason,
 };
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,

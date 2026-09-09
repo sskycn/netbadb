@@ -6,13 +6,14 @@ use netbadb_types::{ColumnarProjectionId, SchemaGeneration, TableId};
 
 use crate::planner_calibration::{aggregate_calibration_evidence, replay_calibration_ratio_errors};
 use crate::{
-    AdaptiveCycleReport, AdaptiveDecision, AdaptiveError, AdaptiveMaintenanceOutcome,
-    AdaptivePolicy, AdaptiveWorkloadEvaluationReport, AdaptiveWorkloadLimits,
-    AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy, AdaptiveWorkloadStaleReason,
-    AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, Database, MaintenanceBudget,
-    PlannerCalibrationAdvisorError, PlannerCalibrationDecision, PlannerCalibrationMutationError,
-    PlannerCalibrationNoAction, PlannerCalibrationPolicy, PlannerCalibrationReceipt,
-    PlannerCalibrationShadowDecision,
+    AdaptiveCycleReport, AdaptiveDecision, AdaptiveError, AdaptiveEvidencePool,
+    AdaptiveMaintenanceOutcome, AdaptiveNoActionReason, AdaptivePolicy,
+    AdaptiveWorkloadEvaluationReport, AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome,
+    AdaptiveWorkloadPolicy, AdaptiveWorkloadStaleReason, AdaptiveWorkloadTarget,
+    AdaptiveWorkloadWindow, Database, MaintenanceBudget, PlannerCalibrationAdvisorError,
+    PlannerCalibrationDecision, PlannerCalibrationEvidence, PlannerCalibrationMutationError,
+    PlannerCalibrationNoAction, PlannerCalibrationPolicy, PlannerCalibrationProposal,
+    PlannerCalibrationReceipt, PlannerCalibrationShadowDecision, PlannerCalibrationShadowReport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,12 +242,97 @@ pub struct AutomaticSafeModeReport {
     pub trial_after: Option<AutomaticSafeTrial>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AutomaticAdmissionScope<'a> {
+    pub table_ids: &'a [TableId],
+    pub calibration_classes: &'a [PlannerCalibrationClass],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AutomaticMultiSafeModeInput<'a> {
+    pub scope: AutomaticAdmissionScope<'a>,
+    pub maintenance_budget: MaintenanceBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutomaticMultiSafeModePolicy {
+    pub safe_mode: AutomaticSafeModePolicy,
+    pub max_candidate_tables: u64,
+    pub max_calibration_classes: u64,
+    pub max_fairness_entries: u64,
+}
+
+impl Default for AutomaticMultiSafeModePolicy {
+    fn default() -> Self {
+        Self {
+            safe_mode: AutomaticSafeModePolicy::default(),
+            max_candidate_tables: 16,
+            max_calibration_classes: 4,
+            max_fairness_entries: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AutomaticCandidateKey {
+    Columnar {
+        table_id: TableId,
+        projection_id: Option<ColumnarProjectionId>,
+    },
+    PlannerCalibration {
+        calibration_class: PlannerCalibrationClass,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticCandidateReadiness {
+    Ready,
+    ColumnarBlocked(AdaptiveNoActionReason),
+    CalibrationBlocked(PlannerCalibrationNoAction),
+    CalibrationEvidenceUnavailable,
+    StaleEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutomaticCandidateRankEvidence {
+    pub ready_age: u64,
+    pub expected_benefit_work_units: Option<u64>,
+    pub maintenance_work_units: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub shadow_improvement_work_units: Option<u64>,
+    pub distinct_query_shapes: Option<u64>,
+    pub sample_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutomaticCandidateInspection {
+    pub key: AutomaticCandidateKey,
+    pub lane: AutomaticSafeModeLane,
+    pub readiness: AutomaticCandidateReadiness,
+    pub rank: AutomaticCandidateRankEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticCandidateInspectionReport {
+    pub candidates: Vec<AutomaticCandidateInspection>,
+    pub blocked_by_active_trial: Option<AutomaticSafeTrial>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticMultiSafeModeReport {
+    pub candidates: Vec<AutomaticCandidateInspection>,
+    pub selected_candidate: Option<AutomaticCandidateKey>,
+    pub action: AutomaticSafeModeReport,
+}
+
 #[derive(Debug)]
 pub enum AutomaticSafeModeError {
     Adaptive(AdaptiveError),
     CalibrationAdvisor(PlannerCalibrationAdvisorError),
     CalibrationMutation(PlannerCalibrationMutationError),
     MissingColumnarMeasurement,
+    AdmissionScopeTooLarge,
 }
 
 impl fmt::Display for AutomaticSafeModeError {
@@ -258,6 +344,9 @@ impl fmt::Display for AutomaticSafeModeError {
             Self::MissingColumnarMeasurement => formatter.write_str(
                 "a kept automatic Columnar mutation did not return its measured target state",
             ),
+            Self::AdmissionScopeTooLarge => {
+                formatter.write_str("automatic admission scope exceeds the configured bound")
+            }
         }
     }
 }
@@ -268,7 +357,7 @@ impl Error for AutomaticSafeModeError {
             Self::Adaptive(error) => Some(error),
             Self::CalibrationAdvisor(error) => Some(error),
             Self::CalibrationMutation(error) => Some(error),
-            Self::MissingColumnarMeasurement => None,
+            Self::MissingColumnarMeasurement | Self::AdmissionScopeTooLarge => None,
         }
     }
 }
@@ -323,9 +412,42 @@ impl ActiveAutomaticTrial {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateAdmissionEntry {
+    key: AutomaticCandidateKey,
+    ready_age: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AutomaticSafeModeRuntimeState {
     active_trial: Option<ActiveAutomaticTrial>,
+    admission: Vec<CandidateAdmissionEntry>,
+}
+
+#[derive(Debug, Clone)]
+enum AutomaticCandidateAuthority {
+    Columnar(Box<ColumnarCandidateAuthority>),
+    PlannerCalibration(Box<CalibrationCandidateAuthority>),
+}
+
+#[derive(Debug, Clone)]
+struct ColumnarCandidateAuthority {
+    observation: crate::AdaptiveObservation,
+    proposal: crate::AdaptiveMaintenanceProposal,
+}
+
+#[derive(Debug, Clone)]
+struct CalibrationCandidateAuthority {
+    decision: PlannerCalibrationDecision,
+    proposal: PlannerCalibrationProposal,
+    shadow: PlannerCalibrationShadowDecision,
+    accepted_shadow: PlannerCalibrationShadowReport,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredAutomaticCandidate {
+    inspection: AutomaticCandidateInspection,
+    authority: Option<AutomaticCandidateAuthority>,
 }
 
 impl Database {
@@ -345,6 +467,212 @@ impl Database {
             .active_trial
             .take()
             .map(ActiveAutomaticTrial::summary)
+    }
+
+    /// Discovers every candidate in the explicit operator scope without
+    /// changing evidence, fairness age, trial state, G, or physical state.
+    pub fn inspect_automatic_candidates(
+        &self,
+        pool: &AdaptiveEvidencePool,
+        input: AutomaticMultiSafeModeInput<'_>,
+        policy: AutomaticMultiSafeModePolicy,
+    ) -> Result<AutomaticCandidateInspectionReport, AutomaticSafeModeError> {
+        validate_multi_scope(input.scope, policy)?;
+        if let Some(active) = self.automatic_safe_mode_state().active_trial() {
+            return Ok(AutomaticCandidateInspectionReport {
+                candidates: Vec::new(),
+                blocked_by_active_trial: Some(active),
+            });
+        }
+        let mut candidates = self.discover_columnar_candidates(
+            input.scope.table_ids,
+            input.maintenance_budget,
+            policy.safe_mode,
+        )?;
+        if u64::try_from(candidates.len()).map_or(true, |count| count > policy.max_fairness_entries)
+        {
+            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
+        }
+        candidates.extend(self.discover_calibration_candidates(
+            pool,
+            input.scope.calibration_classes,
+            policy.safe_mode,
+        )?);
+        if u64::try_from(candidates.len()).map_or(true, |count| count > policy.max_fairness_entries)
+        {
+            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
+        }
+        Ok(AutomaticCandidateInspectionReport {
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| candidate.inspection)
+                .collect(),
+            blocked_by_active_trial: None,
+        })
+    }
+
+    /// Performs one multi-target admission round. Active probation owns the
+    /// call; otherwise exactly one ready candidate can reach an existing
+    /// Phase 1 or Phase 4 mutation authority.
+    pub fn automatic_safe_step_multi(
+        &mut self,
+        pool: &AdaptiveEvidencePool,
+        input: AutomaticMultiSafeModeInput<'_>,
+        policy: AutomaticMultiSafeModePolicy,
+    ) -> Result<AutomaticMultiSafeModeReport, AutomaticSafeModeError> {
+        validate_multi_scope(input.scope, policy)?;
+        let trial_before = self.automatic_safe_mode_state().active_trial();
+        if let Some(trial) = self.automatic_safe_mode.active_trial {
+            let action = match trial {
+                ActiveAutomaticTrial::Columnar { target } => {
+                    if let Some(window) = pool.target_window(target) {
+                        self.evaluate_automatic_columnar_trial(
+                            target,
+                            Some(window),
+                            policy.safe_mode.workload_policy,
+                            trial_before,
+                        )?
+                    } else if let Some(reason) = self.adaptive_workload_stale_reason(target) {
+                        self.automatic_safe_mode.active_trial = None;
+                        self.finish_automatic_report(
+                            trial_before,
+                            AutomaticSafeModeLane::ActiveColumnarTrial,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            AutomaticSafeModeOutcome::ColumnarTrialStale(reason),
+                        )
+                    } else {
+                        self.finish_automatic_report(
+                            trial_before,
+                            AutomaticSafeModeLane::ActiveColumnarTrial,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            AutomaticSafeModeOutcome::ColumnarTrialAwaiting(
+                                AutomaticTrialAwaitingReason::MissingWorkloadWindow,
+                            ),
+                        )
+                    }
+                }
+                ActiveAutomaticTrial::PlannerCalibration {
+                    receipt,
+                    schema_generation,
+                } => {
+                    let evidence = pool.calibration_evidence(
+                        receipt.calibration_class(),
+                        receipt.applied_epoch(),
+                        0,
+                    );
+                    let schema_matches = pool
+                        .schema_generation()
+                        .is_none_or(|schema| schema == schema_generation);
+                    self.evaluate_automatic_calibration_trial_evidence(
+                        receipt,
+                        schema_generation,
+                        evidence,
+                        schema_matches,
+                        policy.safe_mode.calibration_trial_policy,
+                        trial_before,
+                    )?
+                }
+            };
+            return Ok(AutomaticMultiSafeModeReport {
+                candidates: Vec::new(),
+                selected_candidate: None,
+                action,
+            });
+        }
+
+        let mut columnar = self.discover_columnar_candidates(
+            input.scope.table_ids,
+            input.maintenance_budget,
+            policy.safe_mode,
+        )?;
+        if u64::try_from(columnar.len()).map_or(true, |count| count > policy.max_fairness_entries) {
+            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
+        }
+        let columnar_inspections = columnar
+            .iter()
+            .map(|candidate| candidate.inspection)
+            .collect::<Vec<_>>();
+        if let Some(selected_index) = select_columnar_candidate(&columnar) {
+            let key = columnar[selected_index].inspection.key;
+            self.advance_fairness(
+                &columnar,
+                key,
+                policy.max_fairness_entries,
+                AutomaticSafeModeLane::ColumnarMaintenance,
+            );
+            let selected = columnar.remove(selected_index);
+            let action =
+                self.execute_multi_candidate(selected, input.maintenance_budget, trial_before)?;
+            return Ok(AutomaticMultiSafeModeReport {
+                candidates: columnar_inspections,
+                selected_candidate: Some(key),
+                action,
+            });
+        }
+
+        let mut calibration = self.discover_calibration_candidates(
+            pool,
+            input.scope.calibration_classes,
+            policy.safe_mode,
+        )?;
+        if u64::try_from(columnar.len().saturating_add(calibration.len()))
+            .map_or(true, |count| count > policy.max_fairness_entries)
+        {
+            return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
+        }
+        let mut inspections = columnar_inspections;
+        inspections.extend(calibration.iter().map(|candidate| candidate.inspection));
+        if let Some(selected_index) = select_calibration_candidate(&calibration) {
+            let key = calibration[selected_index].inspection.key;
+            self.advance_fairness(
+                &calibration,
+                key,
+                policy.max_fairness_entries,
+                AutomaticSafeModeLane::PlannerCalibration,
+            );
+            let selected = calibration.remove(selected_index);
+            let action =
+                self.execute_multi_candidate(selected, input.maintenance_budget, trial_before)?;
+            return Ok(AutomaticMultiSafeModeReport {
+                candidates: inspections,
+                selected_candidate: Some(key),
+                action,
+            });
+        }
+
+        self.automatic_safe_mode.admission.clear();
+        let no_action = if !policy.safe_mode.allow_columnar_maintenance
+            && !policy.safe_mode.allow_planner_calibration
+        {
+            AutomaticSafeModeNoAction::AutomaticActionsDisabled
+        } else {
+            AutomaticSafeModeNoAction::ColumnarNoAction
+        };
+        Ok(AutomaticMultiSafeModeReport {
+            candidates: inspections,
+            selected_candidate: None,
+            action: self.finish_automatic_report(
+                trial_before,
+                AutomaticSafeModeLane::None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                AutomaticSafeModeOutcome::NoAction(no_action),
+            ),
+        })
     }
 
     /// Performs one explicit synchronous safe-mode control step. A live trial
@@ -527,6 +855,326 @@ impl Database {
         ))
     }
 
+    fn discover_columnar_candidates(
+        &self,
+        table_ids: &[TableId],
+        budget: MaintenanceBudget,
+        policy: AutomaticSafeModePolicy,
+    ) -> Result<Vec<DiscoveredAutomaticCandidate>, AutomaticSafeModeError> {
+        if !policy.allow_columnar_maintenance {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        for table_id in stable_unique_tables(table_ids) {
+            let observation = self.observe_adaptive_columnar(table_id)?;
+            for decision in observation.decisions(policy.adaptive_policy, budget) {
+                match decision {
+                    AdaptiveDecision::Proposal(proposal) => {
+                        let key = AutomaticCandidateKey::Columnar {
+                            table_id,
+                            projection_id: Some(proposal.projection_id),
+                        };
+                        output.push(DiscoveredAutomaticCandidate {
+                            inspection: AutomaticCandidateInspection {
+                                key,
+                                lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                                readiness: AutomaticCandidateReadiness::Ready,
+                                rank: AutomaticCandidateRankEvidence {
+                                    ready_age: self.ready_age(key),
+                                    expected_benefit_work_units: Some(
+                                        proposal.expected_planner.benefit_work_units,
+                                    ),
+                                    maintenance_work_units: Some(
+                                        proposal.estimated_cost.work_units,
+                                    ),
+                                    read_bytes: Some(proposal.estimated_cost.read_bytes),
+                                    write_bytes: Some(proposal.estimated_cost.write_bytes),
+                                    ..AutomaticCandidateRankEvidence::default()
+                                },
+                            },
+                            authority: Some(AutomaticCandidateAuthority::Columnar(Box::new(
+                                ColumnarCandidateAuthority {
+                                    observation: observation.clone(),
+                                    proposal,
+                                },
+                            ))),
+                        });
+                    }
+                    AdaptiveDecision::NoAction(no_action) => {
+                        let key = AutomaticCandidateKey::Columnar {
+                            table_id,
+                            projection_id: no_action.projection_id,
+                        };
+                        output.push(DiscoveredAutomaticCandidate {
+                            inspection: AutomaticCandidateInspection {
+                                key,
+                                lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                                readiness: AutomaticCandidateReadiness::ColumnarBlocked(
+                                    no_action.reason,
+                                ),
+                                rank: AutomaticCandidateRankEvidence::default(),
+                            },
+                            authority: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn discover_calibration_candidates(
+        &self,
+        pool: &AdaptiveEvidencePool,
+        classes: &[PlannerCalibrationClass],
+        policy: AutomaticSafeModePolicy,
+    ) -> Result<Vec<DiscoveredAutomaticCandidate>, AutomaticSafeModeError> {
+        if !policy.allow_planner_calibration {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        for class in stable_unique_classes(classes) {
+            let key = AutomaticCandidateKey::PlannerCalibration {
+                calibration_class: class,
+            };
+            let Some(evidence) = pool.calibration_evidence(
+                class,
+                self.planner_calibration.epoch,
+                policy.planner_calibration_policy.error_deadband_work_units,
+            ) else {
+                output.push(DiscoveredAutomaticCandidate {
+                    inspection: AutomaticCandidateInspection {
+                        key,
+                        lane: AutomaticSafeModeLane::PlannerCalibration,
+                        readiness: AutomaticCandidateReadiness::CalibrationEvidenceUnavailable,
+                        rank: AutomaticCandidateRankEvidence::default(),
+                    },
+                    authority: None,
+                });
+                continue;
+            };
+            let decision = match self
+                .advise_planner_calibration_evidence(evidence, policy.planner_calibration_policy)
+            {
+                Ok(decision) => decision,
+                Err(PlannerCalibrationAdvisorError::SchemaChanged { .. }) => {
+                    output.push(DiscoveredAutomaticCandidate {
+                        inspection: AutomaticCandidateInspection {
+                            key,
+                            lane: AutomaticSafeModeLane::PlannerCalibration,
+                            readiness: AutomaticCandidateReadiness::StaleEvidence,
+                            rank: AutomaticCandidateRankEvidence::default(),
+                        },
+                        authority: None,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let proposal = match &decision {
+                PlannerCalibrationDecision::NoAction(reason) => {
+                    output.push(DiscoveredAutomaticCandidate {
+                        inspection: AutomaticCandidateInspection {
+                            key,
+                            lane: AutomaticSafeModeLane::PlannerCalibration,
+                            readiness: AutomaticCandidateReadiness::CalibrationBlocked(*reason),
+                            rank: AutomaticCandidateRankEvidence::default(),
+                        },
+                        authority: None,
+                    });
+                    continue;
+                }
+                PlannerCalibrationDecision::Proposal(proposal) => proposal.as_ref().clone(),
+            };
+            let shadow = self.shadow_planner_calibration(&proposal);
+            let accepted_shadow = match &shadow {
+                PlannerCalibrationShadowDecision::Accepted(report) => report.clone(),
+                PlannerCalibrationShadowDecision::Rejected { reason, .. } => {
+                    output.push(DiscoveredAutomaticCandidate {
+                        inspection: AutomaticCandidateInspection {
+                            key,
+                            lane: AutomaticSafeModeLane::PlannerCalibration,
+                            readiness: AutomaticCandidateReadiness::CalibrationBlocked(*reason),
+                            rank: AutomaticCandidateRankEvidence::default(),
+                        },
+                        authority: None,
+                    });
+                    continue;
+                }
+            };
+            let evidence = proposal.evidence();
+            output.push(DiscoveredAutomaticCandidate {
+                inspection: AutomaticCandidateInspection {
+                    key,
+                    lane: AutomaticSafeModeLane::PlannerCalibration,
+                    readiness: AutomaticCandidateReadiness::Ready,
+                    rank: AutomaticCandidateRankEvidence {
+                        ready_age: self.ready_age(key),
+                        shadow_improvement_work_units: Some(
+                            accepted_shadow.improvement_work_units(),
+                        ),
+                        distinct_query_shapes: Some(evidence.distinct_query_shapes),
+                        sample_count: Some(evidence.sample_count),
+                        ..AutomaticCandidateRankEvidence::default()
+                    },
+                },
+                authority: Some(AutomaticCandidateAuthority::PlannerCalibration(Box::new(
+                    CalibrationCandidateAuthority {
+                        decision,
+                        proposal,
+                        shadow,
+                        accepted_shadow,
+                    },
+                ))),
+            });
+        }
+        Ok(output)
+    }
+
+    fn ready_age(&self, key: AutomaticCandidateKey) -> u64 {
+        self.automatic_safe_mode
+            .admission
+            .iter()
+            .find(|entry| entry.key == key)
+            .map_or(0, |entry| entry.ready_age)
+    }
+
+    fn advance_fairness(
+        &mut self,
+        candidates: &[DiscoveredAutomaticCandidate],
+        selected: AutomaticCandidateKey,
+        maximum_entries: u64,
+        lane: AutomaticSafeModeLane,
+    ) {
+        let maximum = usize::try_from(maximum_entries).unwrap_or(usize::MAX);
+        let ready = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.inspection.lane == lane
+                    && candidate.inspection.readiness == AutomaticCandidateReadiness::Ready
+            })
+            .map(|candidate| candidate.inspection.key)
+            .collect::<Vec<_>>();
+        self.automatic_safe_mode
+            .admission
+            .retain(|entry| ready.contains(&entry.key));
+        self.automatic_safe_mode.admission.truncate(maximum);
+        for key in ready.into_iter().take(maximum) {
+            if let Some(entry) = self
+                .automatic_safe_mode
+                .admission
+                .iter_mut()
+                .find(|entry| entry.key == key)
+            {
+                entry.ready_age = if key == selected {
+                    0
+                } else {
+                    entry.ready_age.saturating_add(1)
+                };
+            } else {
+                self.automatic_safe_mode
+                    .admission
+                    .push(CandidateAdmissionEntry {
+                        key,
+                        ready_age: u64::from(key != selected),
+                    });
+            }
+        }
+    }
+
+    fn execute_multi_candidate(
+        &mut self,
+        candidate: DiscoveredAutomaticCandidate,
+        budget: MaintenanceBudget,
+        trial_before: Option<AutomaticSafeTrial>,
+    ) -> Result<AutomaticSafeModeReport, AutomaticSafeModeError> {
+        match candidate.authority {
+            Some(AutomaticCandidateAuthority::Columnar(authority)) => {
+                let ColumnarCandidateAuthority {
+                    observation,
+                    proposal,
+                } = *authority;
+                let execution = self.execute_adaptive_columnar(&proposal, budget)?;
+                let mutation = (execution.consumed.actions != 0).then_some(
+                    AutomaticSafeModeMutation::ColumnarAdvance {
+                        projection_id: proposal.projection_id,
+                    },
+                );
+                if execution.outcome == AdaptiveMaintenanceOutcome::Kept {
+                    let measurement = execution
+                        .measurement
+                        .as_ref()
+                        .ok_or(AutomaticSafeModeError::MissingColumnarMeasurement)?;
+                    self.automatic_safe_mode.active_trial = Some(ActiveAutomaticTrial::Columnar {
+                        target: AdaptiveWorkloadTarget {
+                            table_id: proposal.table_id,
+                            storage_id: proposal.storage_id,
+                            projection_id: proposal.projection_id,
+                            generation: measurement.after_outcome.projection_generation,
+                            schema_generation: measurement.schema_generation_after,
+                        },
+                    });
+                }
+                let cycle = AdaptiveCycleReport {
+                    observation,
+                    decision: AdaptiveDecision::Proposal(proposal),
+                    execution: Some(execution),
+                };
+                Ok(self.finish_automatic_report(
+                    trial_before,
+                    AutomaticSafeModeLane::ColumnarMaintenance,
+                    mutation,
+                    Some(Box::new(cycle)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    AutomaticSafeModeOutcome::ColumnarMutationCompleted,
+                ))
+            }
+            Some(AutomaticCandidateAuthority::PlannerCalibration(authority)) => {
+                let CalibrationCandidateAuthority {
+                    decision,
+                    proposal,
+                    shadow,
+                    accepted_shadow,
+                } = *authority;
+                let schema_generation = self.schema_generation();
+                let receipt = self.apply_planner_calibration(&proposal, &accepted_shadow)?;
+                self.automatic_safe_mode.active_trial =
+                    Some(ActiveAutomaticTrial::PlannerCalibration {
+                        receipt,
+                        schema_generation,
+                    });
+                Ok(self.finish_automatic_report(
+                    trial_before,
+                    AutomaticSafeModeLane::PlannerCalibration,
+                    Some(AutomaticSafeModeMutation::PlannerCalibrationApply {
+                        calibration_class: receipt.calibration_class(),
+                        applied_epoch: receipt.applied_epoch(),
+                    }),
+                    None,
+                    None,
+                    Some(decision),
+                    Some(shadow),
+                    None,
+                    AutomaticSafeModeOutcome::PlannerCalibrationApplied,
+                ))
+            }
+            None => Ok(self.finish_automatic_report(
+                trial_before,
+                AutomaticSafeModeLane::None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                AutomaticSafeModeOutcome::NoAction(AutomaticSafeModeNoAction::ColumnarNoAction),
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish_automatic_report(
         &self,
@@ -636,6 +1284,36 @@ impl Database {
         policy: AutomaticCalibrationTrialPolicy,
         trial_before: Option<AutomaticSafeTrial>,
     ) -> Result<AutomaticSafeModeReport, AutomaticSafeModeError> {
+        let evidence = window.map(|window| {
+            aggregate_calibration_evidence(
+                window,
+                receipt.calibration_class(),
+                receipt.applied_epoch(),
+                0,
+            )
+        });
+        let evidence_schema_matches =
+            window.is_none_or(|window| window.target.schema_generation == schema_generation);
+        self.evaluate_automatic_calibration_trial_evidence(
+            receipt,
+            schema_generation,
+            evidence,
+            evidence_schema_matches,
+            policy,
+            trial_before,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_automatic_calibration_trial_evidence(
+        &mut self,
+        receipt: PlannerCalibrationReceipt,
+        schema_generation: SchemaGeneration,
+        evidence: Option<PlannerCalibrationEvidence>,
+        evidence_schema_matches: bool,
+        policy: AutomaticCalibrationTrialPolicy,
+        trial_before: Option<AutomaticSafeTrial>,
+    ) -> Result<AutomaticSafeModeReport, AutomaticSafeModeError> {
         let current = self.planner_calibration_profile();
         let stale = if self.schema_generation() != schema_generation {
             Some(AutomaticCalibrationTrialStaleReason::SchemaChanged)
@@ -660,7 +1338,7 @@ impl Database {
                 AutomaticSafeModeOutcome::PlannerCalibrationTrialStale(reason),
             ));
         }
-        let Some(window) = window else {
+        let Some(evidence) = evidence else {
             return Ok(self.finish_automatic_report(
                 trial_before,
                 AutomaticSafeModeLane::ActivePlannerCalibrationTrial,
@@ -675,7 +1353,7 @@ impl Database {
                 ),
             ));
         };
-        if window.target.schema_generation != schema_generation {
+        if !evidence_schema_matches || evidence.schema_generation != schema_generation {
             return Ok(self.finish_automatic_report(
                 trial_before,
                 AutomaticSafeModeLane::ActivePlannerCalibrationTrial,
@@ -690,12 +1368,6 @@ impl Database {
                 ),
             ));
         }
-        let evidence = aggregate_calibration_evidence(
-            window,
-            receipt.calibration_class(),
-            receipt.applied_epoch(),
-            0,
-        );
         let replay = replay_calibration_ratio_errors(
             &evidence,
             receipt.previous_ratio(),
@@ -784,5 +1456,193 @@ impl Database {
             Some(report),
             outcome,
         ))
+    }
+}
+
+fn validate_multi_scope(
+    scope: AutomaticAdmissionScope<'_>,
+    policy: AutomaticMultiSafeModePolicy,
+) -> Result<(), AutomaticSafeModeError> {
+    if u64::try_from(scope.table_ids.len())
+        .map_or(true, |count| count > policy.max_candidate_tables)
+        || u64::try_from(scope.calibration_classes.len())
+            .map_or(true, |count| count > policy.max_calibration_classes)
+    {
+        return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
+    }
+    Ok(())
+}
+
+fn stable_unique_tables(table_ids: &[TableId]) -> Vec<TableId> {
+    let mut output = Vec::new();
+    for table_id in table_ids {
+        if !output.contains(table_id) {
+            output.push(*table_id);
+        }
+    }
+    output
+}
+
+fn stable_unique_classes(classes: &[PlannerCalibrationClass]) -> Vec<PlannerCalibrationClass> {
+    let mut output = Vec::new();
+    for class in classes {
+        if !output.contains(class) {
+            output.push(*class);
+        }
+    }
+    output
+}
+
+fn select_columnar_candidate(candidates: &[DiscoveredAutomaticCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.inspection.readiness == AutomaticCandidateReadiness::Ready
+        })
+        .max_by(|(_, left), (_, right)| compare_columnar_rank(&left.inspection, &right.inspection))
+        .map(|(index, _)| index)
+}
+
+fn compare_columnar_rank(
+    left: &AutomaticCandidateInspection,
+    right: &AutomaticCandidateInspection,
+) -> std::cmp::Ordering {
+    left.rank
+        .ready_age
+        .cmp(&right.rank.ready_age)
+        .then_with(|| {
+            left.rank
+                .expected_benefit_work_units
+                .cmp(&right.rank.expected_benefit_work_units)
+        })
+        .then_with(|| {
+            right
+                .rank
+                .maintenance_work_units
+                .cmp(&left.rank.maintenance_work_units)
+        })
+        .then_with(|| right.rank.read_bytes.cmp(&left.rank.read_bytes))
+        .then_with(|| right.rank.write_bytes.cmp(&left.rank.write_bytes))
+        .then_with(|| right.key.cmp(&left.key))
+}
+
+fn select_calibration_candidate(candidates: &[DiscoveredAutomaticCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.inspection.readiness == AutomaticCandidateReadiness::Ready
+        })
+        .max_by(|(_, left), (_, right)| {
+            left.inspection
+                .rank
+                .ready_age
+                .cmp(&right.inspection.rank.ready_age)
+                .then_with(|| {
+                    left.inspection
+                        .rank
+                        .shadow_improvement_work_units
+                        .cmp(&right.inspection.rank.shadow_improvement_work_units)
+                })
+                .then_with(|| {
+                    left.inspection
+                        .rank
+                        .distinct_query_shapes
+                        .cmp(&right.inspection.rank.distinct_query_shapes)
+                })
+                .then_with(|| {
+                    left.inspection
+                        .rank
+                        .sample_count
+                        .cmp(&right.inspection.rank.sample_count)
+                })
+                .then_with(|| right.inspection.key.cmp(&left.inspection.key))
+        })
+        .map(|(index, _)| index)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn columnar(
+        table: u64,
+        projection: u64,
+        age: u64,
+        benefit: u64,
+        work: u64,
+    ) -> DiscoveredAutomaticCandidate {
+        DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key: AutomaticCandidateKey::Columnar {
+                    table_id: TableId(table),
+                    projection_id: Some(ColumnarProjectionId(projection)),
+                },
+                lane: AutomaticSafeModeLane::ColumnarMaintenance,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank: AutomaticCandidateRankEvidence {
+                    ready_age: age,
+                    expected_benefit_work_units: Some(benefit),
+                    maintenance_work_units: Some(work),
+                    read_bytes: Some(10),
+                    write_bytes: Some(10),
+                    ..AutomaticCandidateRankEvidence::default()
+                },
+            },
+            authority: None,
+        }
+    }
+
+    #[test]
+    fn ready_age_precedes_merit_and_never_makes_blocked_ready() {
+        let high = columnar(1, 1, 0, 10_000, 1);
+        let low_aged = columnar(2, 2, 1, 1, 100);
+        let mut blocked = columnar(3, 3, u64::MAX, u64::MAX, 0);
+        blocked.inspection.readiness = AutomaticCandidateReadiness::ColumnarBlocked(
+            AdaptiveNoActionReason::InsufficientBudgetEstimate,
+        );
+        let candidates = vec![high, low_aged, blocked];
+        assert_eq!(select_columnar_candidate(&candidates), Some(1));
+    }
+
+    #[test]
+    fn columnar_merit_and_identity_ties_are_deterministic() {
+        let high_cost = columnar(1, 1, 0, 100, 10);
+        let low_cost_later = columnar(2, 2, 0, 100, 5);
+        assert_eq!(
+            select_columnar_candidate(&[high_cost, low_cost_later]),
+            Some(1)
+        );
+        let later_id = columnar(2, 2, 0, 100, 5);
+        let earlier_id = columnar(1, 1, 0, 100, 5);
+        assert_eq!(select_columnar_candidate(&[later_id, earlier_id]), Some(1));
+    }
+
+    #[test]
+    fn calibration_rank_uses_age_then_shadow_improvement() {
+        let make = |class, age, improvement| DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key: AutomaticCandidateKey::PlannerCalibration {
+                    calibration_class: class,
+                },
+                lane: AutomaticSafeModeLane::PlannerCalibration,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank: AutomaticCandidateRankEvidence {
+                    ready_age: age,
+                    shadow_improvement_work_units: Some(improvement),
+                    distinct_query_shapes: Some(3),
+                    sample_count: Some(10),
+                    ..AutomaticCandidateRankEvidence::default()
+                },
+            },
+            authority: None,
+        };
+        let columnar = make(PlannerCalibrationClass::Columnar, 0, 100);
+        let seq = make(PlannerCalibrationClass::SeqScan, 0, 500);
+        assert_eq!(select_calibration_candidate(&[columnar, seq]), Some(1));
+        let aged = make(PlannerCalibrationClass::Columnar, 1, 1);
+        let stronger = make(PlannerCalibrationClass::SeqScan, 0, 500);
+        assert_eq!(select_calibration_candidate(&[aged, stronger]), Some(0));
     }
 }
