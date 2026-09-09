@@ -4,6 +4,13 @@ use netbadb_types::{
     ColumnId, ExprType, ParameterId, RelationBindingId, ScalarValue, SemanticType, TableId,
 };
 
+mod query_shape;
+pub use query_shape::{
+    AggregateInputShape, AggregateOutputShape, CanonicalBindingOrdinal, LiteralShape,
+    LogicalQueryShape, QueryColumnShape, QueryExpressionShape, QueryExpressionShapeKind,
+    QueryProjectedExpressionShape, QueryShapeCanonicalizer, QueryShapeError, QuerySortKeyShape,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
     pub binding_id: RelationBindingId,
@@ -64,18 +71,18 @@ impl OutputField {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JoinKind {
     Inner,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SortDirection {
     Asc,
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NullOrder {
     First,
     Last,
@@ -88,7 +95,7 @@ pub struct SortKey {
     pub null_order: NullOrder,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggregateFunction {
     Count,
     Sum,
@@ -139,7 +146,7 @@ impl AggregateOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Eq,
     NotEq,
@@ -151,7 +158,7 @@ pub enum BinaryOp {
     Or,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Not,
 }

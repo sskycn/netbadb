@@ -688,6 +688,8 @@ fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
         | DatabaseError::Transaction(_)
         | DatabaseError::CoordinatorLog(_)
         | DatabaseError::Partition(_)
+        | DatabaseError::QueryShape(_)
+        | DatabaseError::PlanVariant(_)
         | DatabaseError::EmptyCatalog
         | DatabaseError::TableSelectionRequired
         | DatabaseError::DuplicateStoragePath(_)

@@ -2,9 +2,10 @@ use netbadb_executor::{
     ExecutionAccessKind, ExecutionAccessSample, ExecutionFilterSample, ExecutionStatistics,
 };
 use netbadb_planner::{
-    PlannerAccessEstimate, PlannerAccessKind, PlannerActualAccessEvidence,
+    PlanVariant, PlannerAccessEstimate, PlannerAccessKind, PlannerActualAccessEvidence,
     PlannerCalibrationSample, PlannerColumnarExecutionEvidence, evaluate_actual_access_work,
 };
+use netbadb_rel::LogicalQueryShape;
 use netbadb_types::{
     ColumnarGeneration, ColumnarProjectionId, DatabaseCommitSeq, SchemaGeneration, StorageId,
     TableId,
@@ -30,6 +31,8 @@ pub struct AccessExecutionFeedback {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionFeedbackReport {
     pub anchor: ExecutionFeedbackAnchor,
+    pub query_shape: LogicalQueryShape,
+    pub plan_variant: PlanVariant,
     pub accesses: Vec<AccessExecutionFeedback>,
     pub filters: Vec<ExecutionFilterSample>,
     pub overflowed: bool,
@@ -89,6 +92,8 @@ pub struct AdaptiveExecutionFeedbackReport {
 
 pub(crate) fn correlate_execution_feedback(
     anchor: ExecutionFeedbackAnchor,
+    query_shape: LogicalQueryShape,
+    plan_variant: PlanVariant,
     estimates: &[PlannerAccessEstimate],
     statistics: ExecutionStatistics,
 ) -> ExecutionFeedbackReport {
@@ -114,6 +119,8 @@ pub(crate) fn correlate_execution_feedback(
         .collect();
     ExecutionFeedbackReport {
         anchor,
+        query_shape,
+        plan_variant,
         accesses,
         filters: statistics.filters,
         overflowed: statistics.overflowed,

@@ -12,17 +12,17 @@ use crate::{
     cleanup_created_table_files,
 };
 
-static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
-const TABLE_ID: TableId = TableId(88_001);
+pub(super) static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+pub(super) const TABLE_ID: TableId = TableId(88_001);
 
-struct Fixture {
-    root: PathBuf,
-    source: PathBuf,
-    database: Database,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) source: PathBuf,
+    pub(super) database: Database,
 }
 
 impl Fixture {
-    fn create(name: &str, projection: bool) -> Self {
+    pub(super) fn create(name: &str, projection: bool) -> Self {
         let suffix = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "netbadb-execution-feedback-{name}-{}-{suffix}",
@@ -72,7 +72,7 @@ impl Fixture {
         }
     }
 
-    fn close(self) {
+    pub(super) fn close(self) {
         self.database.close().expect("close feedback fixture");
         cleanup_root(&self.root, &self.source);
     }

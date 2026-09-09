@@ -3,6 +3,9 @@
 mod adaptive;
 #[cfg(test)]
 mod adaptive_tests;
+mod adaptive_workload;
+#[cfg(test)]
+mod adaptive_workload_tests;
 mod columnar;
 #[cfg(test)]
 mod columnar_tests;
@@ -87,6 +90,12 @@ pub use adaptive::{
     AdaptiveMaintenanceProposal, AdaptiveNoAction, AdaptiveNoActionReason, AdaptiveObservation,
     AdaptiveObservationAnchor, AdaptivePlannerEvidence, AdaptivePolicy, AdaptiveSourceObservation,
 };
+pub use adaptive_workload::{
+    AdaptivePlanVariantAggregate, AdaptiveQueryShapeAggregate, AdaptiveWorkloadEvaluationReport,
+    AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy,
+    AdaptiveWorkloadRecordError, AdaptiveWorkloadRecordOutcome, AdaptiveWorkloadStaleReason,
+    AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, AggregatedCalibrationEvidence,
+};
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
     ColumnarProjectionCatalogInspection, ColumnarProjectionHealth, ColumnarProjectionInspection,
@@ -109,8 +118,12 @@ pub use netbadb_executor::{
 };
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_planner::{
-    PlanNodeOrdinal, PlannerAccessEstimate, PlannerAccessKind, PlannerCalibrationSample,
-    PlannerEstimateDirection, PlannerWorkModel,
+    PlanNodeOrdinal, PlanVariant, PlanVariantError, PlannerAccessEstimate, PlannerAccessKind,
+    PlannerCalibrationSample, PlannerEstimateDirection, PlannerWorkModel,
+};
+pub use netbadb_rel::{
+    CanonicalBindingOrdinal, LiteralShape, LogicalQueryShape, QueryColumnShape,
+    QueryExpressionShape, QueryExpressionShapeKind, QueryShapeError,
 };
 pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
@@ -665,6 +678,8 @@ pub enum DatabaseError {
     Transaction(CoordinatorError),
     CoordinatorLog(CoordinatorLogError),
     Partition(PartitionError),
+    QueryShape(QueryShapeError),
+    PlanVariant(PlanVariantError),
     ExpectedQuery,
     EmptyCatalog,
     TableSelectionRequired,
@@ -838,6 +853,8 @@ impl DatabaseError {
             | Self::Registry(_)
             | Self::CoordinatorLog(_)
             | Self::Partition(_)
+            | Self::QueryShape(_)
+            | Self::PlanVariant(_)
             | Self::DuplicateStoragePath(_)
             | Self::CoordinatorPathConflictsWithStorage(_)
             | Self::CreateTablesRollback { .. } => DatabaseErrorKind::Operational,
@@ -889,6 +906,8 @@ impl fmt::Display for DatabaseError {
             Self::Transaction(error) => error.fmt(formatter),
             Self::CoordinatorLog(error) => error.fmt(formatter),
             Self::Partition(error) => error.fmt(formatter),
+            Self::QueryShape(error) => error.fmt(formatter),
+            Self::PlanVariant(error) => error.fmt(formatter),
             Self::ExpectedQuery => formatter.write_str("statement does not return query rows"),
             Self::EmptyCatalog => formatter.write_str("database requires at least one table"),
             Self::TableSelectionRequired => formatter
@@ -1019,6 +1038,8 @@ impl Error for DatabaseError {
             Self::Transaction(error) => Some(error),
             Self::CoordinatorLog(error) => Some(error),
             Self::Partition(error) => Some(error),
+            Self::QueryShape(error) => Some(error),
+            Self::PlanVariant(error) => Some(error),
             Self::CreateTablesRollback { creation, .. } => Some(creation),
             Self::ExpectedQuery
             | Self::EmptyCatalog
@@ -1112,6 +1133,18 @@ impl From<CoordinatorLogError> for DatabaseError {
 impl From<PartitionError> for DatabaseError {
     fn from(error: PartitionError) -> Self {
         Self::Partition(error)
+    }
+}
+
+impl From<QueryShapeError> for DatabaseError {
+    fn from(error: QueryShapeError) -> Self {
+        Self::QueryShape(error)
+    }
+}
+
+impl From<PlanVariantError> for DatabaseError {
+    fn from(error: PlanVariantError) -> Self {
+        Self::PlanVariant(error)
     }
 }
 
@@ -3944,6 +3977,11 @@ impl Database {
         let PhysicalStatement::Query(plan) = physical else {
             return Err(DatabaseError::ExpectedQuery);
         };
+        let netbadb_rel::LogicalStatement::Query(logical) = &compiled.logical_statement else {
+            return Err(DatabaseError::ExpectedQuery);
+        };
+        let query_shape = LogicalQueryShape::from_plan(logical)?;
+        let plan_variant = PlanVariant::from_plan(&plan)?;
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
         let anchor = ExecutionFeedbackAnchor {
@@ -3954,17 +3992,31 @@ impl Database {
         match self.execute_query_plan(&plan, &view, None, None, Some(&mut statistics)) {
             Ok(result) => Ok((
                 result,
-                execution_feedback::correlate_execution_feedback(anchor, &estimates, statistics),
+                execution_feedback::correlate_execution_feedback(
+                    anchor,
+                    query_shape,
+                    plan_variant,
+                    &estimates,
+                    statistics,
+                ),
             )),
             Err(error) => {
                 let Some((projection_id, detail)) = columnar_read_failure(&error) else {
                     return Err(error);
                 };
                 self.projections.quarantine(projection_id, detail);
-                let (_, retry, retry_estimates) = self.compile_and_plan_with_estimates(source)?;
+                let (retry_compiled, retry, retry_estimates) =
+                    self.compile_and_plan_with_estimates(source)?;
                 let PhysicalStatement::Query(retry) = retry else {
                     return Err(DatabaseError::ExpectedQuery);
                 };
+                let netbadb_rel::LogicalStatement::Query(retry_logical) =
+                    &retry_compiled.logical_statement
+                else {
+                    return Err(DatabaseError::ExpectedQuery);
+                };
+                let retry_query_shape = LogicalQueryShape::from_plan(retry_logical)?;
+                let retry_plan_variant = PlanVariant::from_plan(&retry)?;
                 statistics = ExecutionStatistics::default();
                 let result =
                     self.execute_query_plan(&retry, &view, None, None, Some(&mut statistics))?;
@@ -3972,6 +4024,8 @@ impl Database {
                     result,
                     execution_feedback::correlate_execution_feedback(
                         anchor,
+                        retry_query_shape,
+                        retry_plan_variant,
                         &retry_estimates,
                         statistics,
                     ),

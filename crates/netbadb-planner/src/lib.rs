@@ -12,6 +12,12 @@ use netbadb_types::{
     RelationBindingId, ScalarValue, StorageId, TableId,
 };
 
+mod plan_variant;
+pub use plan_variant::{
+    PlanIndexBoundShape, PlanIndexRangeShape, PlanPartitionAccessVariant, PlanPartitionVariant,
+    PlanScalarShape, PlanVariant, PlanVariantError,
+};
+
 /// Executable operations advertised by one physical access path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccessPathCapabilities {

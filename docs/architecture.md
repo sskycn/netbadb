@@ -139,6 +139,14 @@ outcome can validate or runtime-suppress only the exact Columnar generation;
 feedback never publishes user data, mutates cost coefficients, or changes
 Inspection JSON v7.
 
+[Adaptive Operations Phase 3](adaptive-operations-phase3.md) derives
+collision-safe logical Query Shapes and physical Plan Variants from typed IR,
+then aggregates explicit execution reports in a bounded caller-owned window.
+DatabaseCommitSeq orders workload evidence but ordinary G advancement does not
+expire it; schema or exact physical-target changes do. Deterministic integer
+hysteresis can validate, hold, or runtime-suppress only the existing Columnar
+generation and never persists history or calibrates planner coefficients.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
