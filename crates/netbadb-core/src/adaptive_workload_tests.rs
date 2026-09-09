@@ -173,6 +173,30 @@ pub(super) fn cleanup(root: &Path, storage_paths: &[PathBuf]) {
 }
 
 #[test]
+fn columnar_raw_values_use_the_shared_production_cast_semantics() {
+    let mut fixture = TimelineFixture::create("columnar-production-cast");
+    let expected = fixture
+        .database
+        .query("SELECT id FROM events")
+        .expect("authoritative Heap result")
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [ScalarValue::Int64(value)] => vec![ScalarValue::Text(value.to_string())],
+            _ => panic!("unexpected Heap row"),
+        })
+        .collect::<Vec<_>>();
+    let (casted, statistics) = fixture
+        .database
+        .query_with_columnar_statistics("SELECT id::TEXT FROM events")
+        .expect("Columnar cast query");
+    assert_eq!(casted.rows, expected);
+    assert!(statistics.projection_id.is_some());
+    assert!(statistics.scan.row_groups_read > 0);
+    fixture.close();
+}
+
+#[test]
 fn logical_query_shape_normalizes_literals_aliases_and_bindings_but_keeps_structure() {
     let schema = Schema::new(vec![
         TableDef::new(

@@ -252,6 +252,23 @@ impl PhysicalType {
         self.is_integer() || self.is_float()
     }
 
+    /// Returns whether an explicit SQL cast between two resolved physical
+    /// scalar types is part of the production conversion contract.
+    ///
+    /// This is the shared pair authority for the compiler and executor. It
+    /// deliberately excludes implicit coercion policy and conversion details.
+    #[must_use]
+    pub fn supports_explicit_cast_to(self, target: Self) -> bool {
+        self == target
+            || (self.is_integer() && target.is_integer())
+            || (matches!(self, Self::Text) && target.is_integer())
+            || (self.is_integer() && matches!(target, Self::Text))
+            || matches!(
+                (self, target),
+                (Self::Bool, Self::Text) | (Self::Text, Self::Bool)
+            )
+    }
+
     /// Every foundational scalar has a deterministic database total order.
     #[must_use]
     pub const fn is_orderable(self) -> bool {
@@ -830,6 +847,45 @@ mod tests {
             SemanticType::named("TinyId", PhysicalType::Int8).sql_name(),
             "TinyId"
         );
+    }
+
+    #[test]
+    fn explicit_cast_capability_exhaustively_matches_the_production_matrix() {
+        let types = [
+            PhysicalType::Bool,
+            PhysicalType::Int8,
+            PhysicalType::Int16,
+            PhysicalType::Int32,
+            PhysicalType::Int64,
+            PhysicalType::Int128,
+            PhysicalType::UInt8,
+            PhysicalType::UInt16,
+            PhysicalType::UInt32,
+            PhysicalType::UInt64,
+            PhysicalType::UInt128,
+            PhysicalType::Float32,
+            PhysicalType::Float64,
+            PhysicalType::Text,
+            PhysicalType::Bytes,
+        ];
+        for source in types {
+            for target in types {
+                let expected = source == target
+                    || (source.is_integer() && target.is_integer())
+                    || (source == PhysicalType::Text && target.is_integer())
+                    || (source.is_integer() && target == PhysicalType::Text)
+                    || matches!(
+                        (source, target),
+                        (PhysicalType::Bool, PhysicalType::Text)
+                            | (PhysicalType::Text, PhysicalType::Bool)
+                    );
+                assert_eq!(
+                    source.supports_explicit_cast_to(target),
+                    expected,
+                    "unexpected explicit cast capability for {source} -> {target}"
+                );
+            }
+        }
     }
 
     #[test]

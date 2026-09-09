@@ -83,6 +83,27 @@ as exact source text until contextual range checking. Uncontextualized integers
 choose Int64, then Int128, then UInt128. `X'00ff'` is the native lossless Bytes
 literal; it requires an even number of hexadecimal digits.
 
+## Explicit CAST
+
+Postfix `expression::TYPE` has one bounded, deterministic production matrix:
+all 15 identity casts; every checked ordered conversion among the ten integer
+types; Text to/from every integer; and Bool to/from Text. Bool/numeric, every
+cross-physical Float conversion (including Float32/Float64), Float/Text and
+every nonidentity Bytes conversion are unsupported. `CAST(expression AS TYPE)`
+is not syntax, and this explicit matrix does not introduce implicit widening.
+
+The child retains its real source type: `'42'::BIGINT` converts Text to Int64,
+and `256::UINT8` converts the uncontextualized Int64 literal and reports a range
+error. NULL is preserved. An untyped parameter uses the cast target as context;
+a declared Text parameter remains Text and converts at execution.
+
+Text-to-integer accepts only ASCII decimal digits, plus one optional leading
+`-` for signed targets. It does not trim or accept `+`, separators, fractions,
+exponents or Unicode digits. Integer-to-Text is canonical base-10. Bool/Text
+uses only the exact lowercase tokens `true` and `false`. See
+[Round 60](deferred-type-conversion-round60.md) for typed errors, optimizer
+boundaries and atomic shadow migration. Durable encodings are unchanged.
+
 ## PostgreSQL and Go boundaries
 
 The pgwire adapter publishes only lossless mappings. Signed Int8/Int16 use

@@ -2,7 +2,7 @@ use netbadb_core::{
     CoordinatorError, Database, DatabaseError, DatabaseErrorKind, ExecutionResult, TransactionState,
 };
 use netbadb_executor::ExecutionError;
-use netbadb_inspect::{PlanNodeInspection, StatementPlanInspection};
+use netbadb_inspect::{ExpressionKindInspection, PlanNodeInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
 use netbadb_storage::{PageError, StorageError};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
@@ -60,6 +60,198 @@ fn contains_nested_loop_join(plan: &PlanNodeInspection) -> bool {
         | PlanNodeInspection::RangeIndexScan { .. } => false,
         PlanNodeInspection::PartitionedScan { .. } | PlanNodeInspection::OneRow => false,
     }
+}
+
+fn contains_index_access(plan: &PlanNodeInspection) -> bool {
+    match plan {
+        PlanNodeInspection::IndexScan { .. } | PlanNodeInspection::RangeIndexScan { .. } => true,
+        PlanNodeInspection::HashJoin { left, right, .. }
+        | PlanNodeInspection::NestedLoopJoin { left, right, .. } => {
+            contains_index_access(left) || contains_index_access(right)
+        }
+        PlanNodeInspection::IndexNestedLoopJoin { .. } => true,
+        PlanNodeInspection::Filter { input, .. }
+        | PlanNodeInspection::Sort { input, .. }
+        | PlanNodeInspection::Project { input, .. }
+        | PlanNodeInspection::ScalarProject { input, .. }
+        | PlanNodeInspection::Aggregate { input, .. }
+        | PlanNodeInspection::Limit { input, .. } => contains_index_access(input),
+        PlanNodeInspection::OneRow
+        | PlanNodeInspection::SeqScan { .. }
+        | PlanNodeInspection::ColumnarScan { .. }
+        | PlanNodeInspection::PartitionedScan { .. } => false,
+    }
+}
+
+fn cast_values() -> TableDef {
+    TableDef::new(
+        TableId(60),
+        "cast_values",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                ColumnId(2),
+                "legacy",
+                TypeSpec::Physical(PhysicalType::Text),
+            ),
+            ColumnDef::new(ColumnId(3), "flag", TypeSpec::Physical(PhysicalType::Bool)),
+        ],
+    )
+}
+
+#[test]
+fn production_casts_cover_queries_dml_parameters_joins_errors_and_inspection() {
+    let path = std::env::temp_dir().join(format!("netbadb-production-cast-{}", std::process::id()));
+    cleanup(&path);
+    let mut database = Database::create(&path, cast_values()).expect("create cast database");
+    for statement in [
+        "INSERT INTO cast_values VALUES ('1'::BIGINT, '1', true)",
+        "INSERT INTO cast_values VALUES (2, '2', false)",
+        "CREATE INDEX cast_values_legacy_idx ON cast_values(legacy)",
+    ] {
+        database
+            .execute(statement)
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+
+    let selected = database
+        .query(
+            "SELECT legacy::BIGINT, id::TEXT, flag::TEXT, 'false'::BOOL, NULL::BIGINT \
+             FROM cast_values WHERE id < 3 ORDER BY id",
+        )
+        .expect("execute supported casts");
+    assert_eq!(selected.columns[0].data_type.physical, PhysicalType::Int64);
+    assert_eq!(
+        selected.rows,
+        vec![
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("1".into()),
+                ScalarValue::Text("true".into()),
+                ScalarValue::Bool(false),
+                ScalarValue::Null,
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::Text("2".into()),
+                ScalarValue::Text("false".into()),
+                ScalarValue::Bool(false),
+                ScalarValue::Null,
+            ],
+        ]
+    );
+    assert_eq!(
+        database
+            .query(
+                "SELECT t.id, i.id FROM cast_values t JOIN cast_values i \
+                 ON t.id < 3 AND t.legacy::BIGINT = i.id AND i.id < 3 ORDER BY t.id",
+            )
+            .expect("execute cast join")
+            .rows,
+        vec![
+            vec![ScalarValue::Int64(1), ScalarValue::Int64(1)],
+            vec![ScalarValue::Int64(2), ScalarValue::Int64(2)],
+        ]
+    );
+    database
+        .execute("INSERT INTO cast_values VALUES (3, 'bad', true)")
+        .expect("insert invalid conversion payload");
+    assert!(
+        database
+            .query("SELECT id FROM cast_values WHERE id < 0 AND legacy::BIGINT > 0")
+            .expect("unevaluated cast branch must not fail")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        database
+            .execute("UPDATE cast_values SET id = legacy::BIGINT WHERE id = 2")
+            .expect("explicit cast assignment"),
+        ExecutionResult::AffectedRows(1)
+    );
+    assert_eq!(
+        database
+            .execute("INSERT INTO cast_values VALUES ('4'::BIGINT, '4', false)")
+            .expect("explicit cast insert"),
+        ExecutionResult::AffectedRows(1)
+    );
+    assert_eq!(
+        database
+            .execute("UPDATE cast_values SET id = legacy WHERE id = 1")
+            .expect_err("implicit cross-physical assignment remains closed")
+            .kind(),
+        DatabaseErrorKind::DatatypeMismatch
+    );
+
+    let untyped = database
+        .prepare_statement("SELECT $1::BIGINT", &[])
+        .expect("prepare target-context parameter");
+    let ExecutionResult::Query(result) = database
+        .execute_prepared(&untyped, &[ScalarValue::Int64(7)])
+        .expect("execute target-context parameter")
+    else {
+        panic!("expected query")
+    };
+    assert_eq!(result.rows, vec![vec![ScalarValue::Int64(7)]]);
+    let declared_text = database
+        .prepare_statement("SELECT $1::BIGINT", &[Some(PhysicalType::Text)])
+        .expect("prepare declared Text parameter");
+    let ExecutionResult::Query(result) = database
+        .execute_prepared(&declared_text, &[ScalarValue::Text("8".into())])
+        .expect("execute declared Text conversion")
+    else {
+        panic!("expected query")
+    };
+    assert_eq!(result.rows, vec![vec![ScalarValue::Int64(8)]]);
+
+    assert_eq!(
+        database
+            .query("SELECT 'bad'::BIGINT")
+            .expect_err("invalid text")
+            .kind(),
+        DatabaseErrorKind::InvalidTextRepresentation
+    );
+    assert_eq!(
+        database
+            .query("SELECT 256::UINT8")
+            .expect_err("range failure")
+            .kind(),
+        DatabaseErrorKind::NumericValueOutOfRange
+    );
+    assert_eq!(
+        database
+            .query("SELECT true::BIGINT")
+            .expect_err("unsupported pair")
+            .kind(),
+        DatabaseErrorKind::CannotCoerce
+    );
+
+    let inspection = database
+        .inspect_statement("SELECT legacy::BIGINT FROM cast_values WHERE id = 1")
+        .expect("inspect cast query");
+    let StatementPlanInspection::Query { root } = inspection.plan else {
+        panic!("expected query plan")
+    };
+    let PlanNodeInspection::ScalarProject { expressions, .. } = root else {
+        panic!("expected scalar project")
+    };
+    assert!(matches!(
+        expressions[0].kind,
+        ExpressionKindInspection::Cast {
+            source: PhysicalType::Text,
+            target: PhysicalType::Int64,
+            ..
+        }
+    ));
+    assert!(!contains_index_access(inspected_query_root(
+        &database
+            .inspect_statement("SELECT id FROM cast_values WHERE legacy::BIGINT = 1")
+            .expect("inspect cast predicate")
+            .plan,
+    )));
+
+    database.close().expect("close");
+    cleanup(&path);
 }
 
 #[test]

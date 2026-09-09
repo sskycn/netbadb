@@ -539,6 +539,17 @@ IndexFinalizing. The existing finalizer chooses one S1-to-S2 rewrite or an
 honest same-S1 index delta; Round 52 admission, CORD recovery, Phase 3A
 publication and Phase 3B structural Complete synchronization are unchanged.
 
+[Round 60](deferred-type-conversion-round60.md) makes typed postfix Cast a
+production expression and lets the same deferred program populate a fresh-ID
+shadow column across a physical type boundary. `netbadb-types` owns the bounded
+pair capability; HIR resolves the real source and target; the executor owns one
+checked scalar kernel used by ordinary, Columnar-fed and deferred evaluation.
+The planner does not look through cross-physical Cast for B+Tree, zone-map,
+partition or join-key inference. Repair, Cast backfill, terminal index
+evacuation, DROP/RENAME and fresh index creation still produce one final S2 and
+one structural publication. No migration interpreter, durable opcode, wire
+change or `ALTER COLUMN TYPE` syntax is introduced.
+
 [Phase 3B](phase3b-global-commit-pipeline.md) preserves that one-G publication
 model while moving only a pure data transaction's Complete sync out of its
 foreground path. Decision sync remains the irreversible commit point;
@@ -2990,12 +3001,14 @@ for the same Canonical Schema and index registry across connections and
 restarts; names and OIDs are not persistent contracts across schema/index
 changes.
 
-The generic compiler did gain two ordinary SQL expression capabilities exposed
-by the real client: postfix casts for the lossless BOOL/INT64/TEXT family and
-qualified projection aliases. Cast validation occurs in typed HIR and retains
-contextual nominal types, then binding removes the proven no-op cast so the
-planner still sees concrete values. PostgreSQL-only `regclass`, `regtype`, OID,
-array, and catalog function semantics remain confined to the adapter.
+The generic compiler exposes postfix casts and qualified projection aliases.
+HIR retains the child's real source type, validates the shared explicit pair
+matrix, and emits a typed Cast that survives parameter binding and inspection.
+The executor provides checked integer-to-integer, Text/integer and Bool/Text
+conversion; all other cross-physical pairs are rejected. Planner access,
+zone-map and partition inference does not look through a cross-physical Cast.
+PostgreSQL-only `regclass`, `regtype`, OID, array, and catalog function
+semantics remain confined to the adapter.
 
 Native and PostgreSQL sessions both use the private synchronous
 `DatabaseSession` for the optional database transaction, execute/commit/

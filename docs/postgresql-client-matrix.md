@@ -46,6 +46,8 @@ production or build dependencies.
 | psql `\di` | yes | compatibility PK and real secondary indexes, plus name patterns |
 | psql `CREATE INDEX` | yes | transactional commit/rollback; `\d` and `\di` refresh immediately |
 | psql `DROP INDEX` / `IF EXISTS` | yes | implicit and explicit commit/rollback; `\di` / `\d` removal |
+| psql production postfix CAST | yes, bounded | identity, checked integers, Text/integer and Bool/Text; `22P02`/`22003`/`42846` pinned |
+| psql atomic shadow type migration | yes, explicit workflow | repair, Cast backfill, DROP/RENAME/fresh index, one structural commit; `ALTER TYPE` remains unsupported |
 | SQLAlchemy ↔ existing psql connection | yes | both directions see committed removal without reconnect |
 | DROP legacy synthetic name | yes | adapter resolution to generic identity; durable retirement |
 | Basic Heap CREATE TABLE | partial | BIGINT/TEXT/BOOLEAN, NULL/NOT NULL; transactional native + PG |
@@ -223,3 +225,13 @@ swap and table rename through unmodified psql Simple Query, pins indexed-source
 `2BP01`, and verifies every outcome across three catalog-only reopens. Core
 server tests additionally cover exact Extended Parse/Bind stale dependency
 ordering and fresh post-terminal `25000` behavior.
+
+Round 60 reproduction from the repository root:
+`python3 scripts/test-type-conversion-round60-sql.py`. It uses PostgreSQL 17.11
+and the ICU path above, exercises production Simple Query Casts and their exact
+SQLSTATEs, runs the explicit Text-to-BIGINT shadow/index swap, confirms
+`ALTER COLUMN TYPE` remains `0A000`, and verifies final typed rows and fresh
+identities across three catalog-only reopens. Server tests separately pin
+Extended Parse/Describe/Bind/Execute/Sync for both undeclared and declared Text
+parameters. PostgreSQL result reflection remains lossless-only, so UINT64 and
+128-bit integer outputs are not claimed.

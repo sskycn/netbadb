@@ -2949,6 +2949,9 @@ fn map_create_index_error(error: &DatabaseError) -> ErrorResponse {
         DatabaseErrorKind::Syntax
         | DatabaseErrorKind::AmbiguousColumn
         | DatabaseErrorKind::DatatypeMismatch
+        | DatabaseErrorKind::InvalidTextRepresentation
+        | DatabaseErrorKind::NumericValueOutOfRange
+        | DatabaseErrorKind::CannotCoerce
         | DatabaseErrorKind::IndeterminateDatatype
         | DatabaseErrorKind::ParameterCount
         | DatabaseErrorKind::NotNullViolation
@@ -4687,6 +4690,9 @@ fn map_database_error(error: &DatabaseError) -> ErrorResponse {
         DatabaseErrorKind::UndefinedColumn => ("42703", Some(error.to_string())),
         DatabaseErrorKind::AmbiguousColumn => ("42702", Some(error.to_string())),
         DatabaseErrorKind::DatatypeMismatch => ("42804", Some(error.to_string())),
+        DatabaseErrorKind::InvalidTextRepresentation => ("22P02", Some(error.to_string())),
+        DatabaseErrorKind::NumericValueOutOfRange => ("22003", Some(error.to_string())),
+        DatabaseErrorKind::CannotCoerce => ("42846", Some(error.to_string())),
         DatabaseErrorKind::IndeterminateDatatype => ("42P18", Some(error.to_string())),
         DatabaseErrorKind::ParameterCount => ("08P01", Some(error.to_string())),
         DatabaseErrorKind::NotNullViolation => ("23502", Some(error.to_string())),

@@ -172,6 +172,13 @@ column DROP, imported/bootstrap Heap, LSM, range partition, online ALTER, multip
 schema mutations per transaction, automatic GC, and full multi-operation Alembic
 migration transactions.
 
+Round 60 does not change this grammar: `ALTER COLUMN TYPE` and `USING` remain
+unsupported. Physical replacement is nevertheless possible as an explicit,
+bounded transaction using nullable shadow ADD, repair DML, postfix
+`old_column::TARGET`, NOT NULL validation, index evacuation, old-column DROP,
+shadow RENAME and a fresh index. That workflow allocates a new ColumnId and is
+documented in [the Round 60 contract](deferred-type-conversion-round60.md).
+
 ## Real client evidence
 
 The dedicated fresh fixture uses psql 17.11, psycopg 3.2.13, SQLAlchemy 2.0.52,

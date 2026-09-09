@@ -167,6 +167,7 @@ fn expression_uses_physical_types_v2(expression: &ExpressionInspection) -> bool 
             ExpressionKindInspection::Column(column) => column_uses_physical_types_v2(column),
             ExpressionKindInspection::Literal(value) => scalar_uses_physical_types_v2(value),
             ExpressionKindInspection::Parameter(_) => false,
+            ExpressionKindInspection::Cast { .. } => true,
             ExpressionKindInspection::Binary { left, right, .. } => {
                 expression_uses_physical_types_v2(left) || expression_uses_physical_types_v2(right)
             }
@@ -1209,6 +1210,11 @@ enum ExpressionKindJson<'a> {
     Parameter {
         id: u32,
     },
+    Cast {
+        source: &'static str,
+        target: &'static str,
+        expression: Box<ExpressionJson<'a>>,
+    },
     Binary {
         operator: &'static str,
         left: Box<ExpressionJson<'a>>,
@@ -1234,6 +1240,15 @@ impl<'a> From<&'a ExpressionKindInspection> for ExpressionKindJson<'a> {
                 value: ScalarJson::from(value),
             },
             ExpressionKindInspection::Parameter(id) => Self::Parameter { id: id.0 },
+            ExpressionKindInspection::Cast {
+                source,
+                target,
+                expression,
+            } => Self::Cast {
+                source: physical_type(*source),
+                target: physical_type(*target),
+                expression: Box::new(ExpressionJson::from(expression.as_ref())),
+            },
             ExpressionKindInspection::Binary {
                 operator,
                 left,
@@ -1688,6 +1703,41 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
         assert_eq!(value["version"], 7);
+    }
+
+    #[test]
+    fn cast_expression_is_retained_in_statement_json_v7() {
+        let cast = expression(
+            ExpressionKindInspection::Cast {
+                source: PhysicalType::Text,
+                target: PhysicalType::Int64,
+                expression: Box::new(literal(ScalarValue::Text("42".into()), PhysicalType::Text)),
+            },
+            PhysicalType::Int64,
+        );
+        let inspection = statement(
+            PlanNodeInspection::ScalarProject {
+                expressions: vec![cast],
+                input: Box::new(PlanNodeInspection::OneRow),
+            },
+            vec![ResultFieldInspection {
+                name: "value".into(),
+                data_type: SemanticType::physical(PhysicalType::Int64),
+                nullable: false,
+                source: None,
+            }],
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&render_statement(&inspection).unwrap()).unwrap();
+        let cast = &value["statement"]["plan"]["root"]["expressions"][0];
+        assert_eq!(value["version"], 7);
+        assert_eq!(cast["kind"], "cast");
+        assert_eq!(cast["source"], "text");
+        assert_eq!(cast["target"], "int64");
+        assert_eq!(cast["data_type"]["physical"], "int64");
+        assert_eq!(cast["expression"]["kind"], "literal");
+        assert_eq!(cast["expression"]["data_type"]["physical"], "text");
     }
 
     fn join_statement(hash: bool) -> StatementInspection {

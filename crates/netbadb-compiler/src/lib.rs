@@ -112,6 +112,7 @@ pub enum CompileErrorKind {
     UndefinedColumn,
     AmbiguousColumn,
     DatatypeMismatch,
+    CannotCoerce,
     IndeterminateDatatype,
     NotNullViolation,
     FeatureNotSupported,
@@ -141,6 +142,7 @@ impl CompileError {
                 HirError::AmbiguousColumn { .. } | HirError::DuplicateRelationName { .. } => {
                     CompileErrorKind::AmbiguousColumn
                 }
+                HirError::UnsupportedCast { .. } => CompileErrorKind::CannotCoerce,
                 HirError::NullNotAllowed { .. } | HirError::MissingRequiredColumn { .. } => {
                     CompileErrorKind::NotNullViolation
                 }
@@ -732,7 +734,6 @@ fn bind_expr(expression: &mut Expr, values: &[ScalarValue]) {
         }
         ExprKind::Cast { expression: inner } => {
             bind_expr(inner, values);
-            *expression = (**inner).clone();
         }
         ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. } => {
             bind_expr(expression, values);
@@ -744,7 +745,7 @@ fn bind_expr(expression: &mut Expr, values: &[ScalarValue]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ParameterTypeHint, bind_statement, compile, compile_statement,
+        CompileErrorKind, ParameterTypeHint, bind_statement, compile, compile_statement,
         compile_statement_with_parameter_hints, compile_statement_with_parameters,
     };
     use netbadb_rel::{
@@ -1211,6 +1212,85 @@ mod tests {
                 netbadb_hir::HirError::ParameterTypeConflict { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn explicit_cast_resolves_real_literal_and_parameter_source_types() {
+        let empty = Schema::new(Vec::new()).expect("empty schema");
+        let literal = compile_statement(&empty, "SELECT '42'::BIGINT, 256::UINT8, NULL::BIGINT")
+            .expect("compile explicit casts");
+        let LogicalStatement::Query(LogicalPlan::ScalarProject { expressions, .. }) =
+            literal.logical_statement
+        else {
+            panic!("expected scalar projection")
+        };
+        let expected = [
+            (PhysicalType::Text, PhysicalType::Int64),
+            (PhysicalType::Int64, PhysicalType::UInt8),
+            (PhysicalType::Int64, PhysicalType::Int64),
+        ];
+        for (projected, (source, target)) in expressions.iter().zip(expected) {
+            let ExprKind::Cast { expression } = &projected.expression.kind else {
+                panic!("expected retained cast")
+            };
+            assert_eq!(expression.expr_type.data_type.physical, source);
+            assert_eq!(projected.expression.expr_type.data_type.physical, target);
+        }
+
+        let untyped = compile_statement_with_parameters(&empty, "SELECT $1::BIGINT", &[])
+            .expect("target provides untyped parameter context");
+        assert_eq!(
+            untyped.parameters[0].data_type.physical,
+            PhysicalType::Int64
+        );
+
+        let declared = compile_statement_with_parameter_hints(
+            &empty,
+            "SELECT $1::BIGINT",
+            &[Some(ParameterTypeHint::Fallback(PhysicalType::Text))],
+        )
+        .expect("declared Text remains the cast source");
+        assert_eq!(
+            declared.parameters[0].data_type.physical,
+            PhysicalType::Text
+        );
+        let bound = bind_statement(&declared, &[ScalarValue::Text("42".into())])
+            .expect("bind declared Text");
+        let LogicalStatement::Query(LogicalPlan::ScalarProject { expressions, .. }) = bound else {
+            panic!("expected scalar projection")
+        };
+        let ExprKind::Cast { expression } = &expressions[0].expression.kind else {
+            panic!("bound expression must retain cast")
+        };
+        assert!(matches!(
+            expression.kind,
+            ExprKind::Literal(ScalarValue::Text(_))
+        ));
+        assert_eq!(
+            expressions[0].expression.expr_type.data_type.physical,
+            PhysicalType::Int64
+        );
+    }
+
+    #[test]
+    fn unsupported_explicit_cast_has_a_transport_neutral_category() {
+        let empty = Schema::new(Vec::new()).expect("empty schema");
+        for sql in [
+            "SELECT true::BIGINT",
+            "SELECT 1::BOOL",
+            "SELECT 1::FLOAT64",
+            "SELECT 1.0::TEXT",
+            "SELECT X'00ff'::TEXT",
+        ] {
+            let error = compile_statement(&empty, sql)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} unexpectedly compiled"));
+            assert_eq!(error.kind(), CompileErrorKind::CannotCoerce, "{sql}");
+            assert!(matches!(
+                error,
+                super::CompileError::Hir(netbadb_hir::HirError::UnsupportedCast { .. })
+            ));
+        }
     }
 
     #[test]

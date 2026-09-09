@@ -800,6 +800,9 @@ pub enum DatabaseErrorKind {
     UndefinedColumn,
     AmbiguousColumn,
     DatatypeMismatch,
+    InvalidTextRepresentation,
+    NumericValueOutOfRange,
+    CannotCoerce,
     IndeterminateDatatype,
     ParameterCount,
     NotNullViolation,
@@ -824,6 +827,7 @@ impl DatabaseError {
                 CompileErrorKind::UndefinedColumn => DatabaseErrorKind::UndefinedColumn,
                 CompileErrorKind::AmbiguousColumn => DatabaseErrorKind::AmbiguousColumn,
                 CompileErrorKind::DatatypeMismatch => DatabaseErrorKind::DatatypeMismatch,
+                CompileErrorKind::CannotCoerce => DatabaseErrorKind::CannotCoerce,
                 CompileErrorKind::IndeterminateDatatype => DatabaseErrorKind::IndeterminateDatatype,
                 CompileErrorKind::NotNullViolation => DatabaseErrorKind::NotNullViolation,
                 CompileErrorKind::FeatureNotSupported => DatabaseErrorKind::FeatureNotSupported,
@@ -837,6 +841,15 @@ impl DatabaseError {
             Self::Storage(StorageError::TypeMismatch { .. })
             | Self::Execution(ExecutionError::Storage(StorageError::TypeMismatch { .. })) => {
                 DatabaseErrorKind::DatatypeMismatch
+            }
+            Self::Execution(ExecutionError::InvalidCastText { .. }) => {
+                DatabaseErrorKind::InvalidTextRepresentation
+            }
+            Self::Execution(ExecutionError::CastOutOfRange { .. }) => {
+                DatabaseErrorKind::NumericValueOutOfRange
+            }
+            Self::Execution(ExecutionError::UnsupportedCast { .. }) => {
+                DatabaseErrorKind::CannotCoerce
             }
             Self::Storage(StorageError::Index(
                 netbadb_index::IndexError::IndexAlreadyExists { .. }
@@ -11239,7 +11252,7 @@ mod deferred_index_evacuation_tests;
 #[cfg(test)]
 mod deferred_terminal_structural_tests;
 #[cfg(test)]
-mod deferred_type_conversion_audit_tests;
+mod deferred_type_conversion_tests;
 #[cfg(test)]
 mod deferred_virtual_row_tests;
 #[cfg(test)]

@@ -5,6 +5,10 @@ does not open the production SQL/HIR gate. The winning primitive is the existing
 typed `ExprKind::Cast`, evaluated as one deterministic scalar conversion and
 consumed by the existing deferred shadow-column program.
 
+Round 60 has now productionized this selected design. This document remains
+the historical audit record; current semantics and verification are in
+[`deferred-type-conversion-round60.md`](deferred-type-conversion-round60.md).
+
 The audit started from `origin/main` `9e8c65dd0264d0286aac5de28b29a4ae45515a11`.
 That is later than the requested planning baseline: Round 58 is
 `2d4dcc8a53c46716b04126b0e561c5c120267433`, Phase 3B.5 is
@@ -236,10 +240,10 @@ The crash matrix covers repair acceptance, conversion acceptance, terminal
 index evacuation, DROP, RENAME, new index reservation, tag-25 intent, tag-35
 intent, mid-copy, prepare, Decision and Complete/publication.
 
-The real PostgreSQL 17 client fixture is
-`python3 scripts/test-type-conversion-round59-sql.py`. It pins the same-physical
-positive controls, `42804`, `0A000`, explicit-transaction `25P02`, ROLLBACK,
-unchanged rows/index identity, and three catalog-only reopens.
+The historical PostgreSQL 17 audit fixture was superseded by
+`python3 scripts/test-type-conversion-round60-sql.py`, which exercises the
+production cross-physical CAST path and the same atomic shadow-migration and
+three-reopen boundary.
 
 ## Global recovery and CORD v4 finding
 
@@ -299,10 +303,10 @@ passed. The real PostgreSQL 17.11 fixture passed. Dynamic fuzz inventory found
 `wal_recovery`); each passed 1,000 runs with seed 59. No parser/decoder changed,
 so no new fuzz target was added.
 
-Round 60 should productionize the exact selected matrix through normal HIR,
-route every evaluator path through the one kernel, retain conservative
-optimizer fallback, add transport-neutral conversion error kinds and PostgreSQL
-mapping, and expose manual atomic shadow migration. It should keep
+Round 60 productionized the exact selected matrix through normal HIR, routed
+every evaluator path through the one kernel, retained conservative optimizer
+fallback, added transport-neutral conversion error kinds and PostgreSQL
+mapping, and exposed manual atomic shadow migration. It keeps
 `ALTER COLUMN TYPE ... USING` absent.
 
 Round 61 or later may add that syntax as ergonomic lowering. It must explicitly

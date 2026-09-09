@@ -49,3 +49,29 @@ even-length lowercase hexadecimal string and are never interpreted as UTF-8:
 
 The v1-v6 documents remain historical contracts and do not gain these values
 retroactively.
+
+## Typed Cast expressions
+
+Round 60 retains production Cast semantics in statement inspection. Any
+statement containing Cast uses the existing v7 envelope, including when source
+and target are legacy physical types. The expression kind is structural and
+keeps both physical identities plus the recursively typed child:
+
+```json
+{
+  "kind": "cast",
+  "source": "text",
+  "target": "int64",
+  "expression": {
+    "kind": "literal",
+    "value": {"kind":"text","value":"42"},
+    "data_type": {"physical":"text","semantic_name":null},
+    "nullable": false
+  },
+  "data_type": {"physical":"int64","semantic_name":null},
+  "nullable": false
+}
+```
+
+No Inspection JSON v8 is introduced. Older v1-v6 outputs and existing v7
+goldens are unchanged when no Cast occurs.

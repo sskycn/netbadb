@@ -8,8 +8,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
-#[cfg(test)]
-use netbadb_executor::evaluate_typed_row_expression_round59_audit;
 use netbadb_executor::{evaluate_typed_row_expression, typed_row_predicate_matches};
 use netbadb_rel::{
     Assignment, BinaryOp, Expr, ExprKind, LogicalPlan, LogicalStatement, OutputField,
@@ -260,7 +258,6 @@ struct DeferredBackfillAction {
     assignments: Vec<DeferredAssignment>,
     expected: ActionObservation,
     semantic_digest: [u8; 32],
-    round59_audit_cross_physical_cast: bool,
 }
 
 impl DeferredBackfillAction {
@@ -268,8 +265,6 @@ impl DeferredBackfillAction {
         &self,
         target_values: &[ScalarValue],
     ) -> Result<Option<EvaluatedAssignments>, DatabaseError> {
-        #[cfg(not(test))]
-        debug_assert!(!self.round59_audit_cross_physical_cast);
         let values = self.layout.values(target_values)?;
         if let Some(predicate) = &self.predicate {
             if !typed_row_predicate_matches(predicate, &self.layout.fields, &values)? {
@@ -280,17 +275,6 @@ impl DeferredBackfillAction {
             .assignments
             .iter()
             .map(|assignment| {
-                #[cfg(test)]
-                let value = if self.round59_audit_cross_physical_cast {
-                    evaluate_typed_row_expression_round59_audit(
-                        &assignment.value,
-                        &self.layout.fields,
-                        &values,
-                    )?
-                } else {
-                    evaluate_typed_row_expression(&assignment.value, &self.layout.fields, &values)?
-                };
-                #[cfg(not(test))]
                 let value =
                     evaluate_typed_row_expression(&assignment.value, &self.layout.fields, &values)?;
                 if matches!(value, ScalarValue::Null) {
@@ -759,7 +743,6 @@ fn build_action(
     base: &TableDef,
     target: &TableDef,
     reserved: &BTreeSet<ColumnId>,
-    round59_audit_cross_physical_cast: bool,
 ) -> Result<Option<DeferredBackfillAction>, DatabaseError> {
     let LogicalStatement::Update {
         input,
@@ -885,7 +868,6 @@ fn build_action(
             result_digest: [0; 32],
         },
         semantic_digest: semantic.finalize().into(),
-        round59_audit_cross_physical_cast,
     }))
 }
 
@@ -950,21 +932,8 @@ pub(crate) fn try_execute_adopted_update(
     transaction: &mut Transaction,
     statement: &LogicalStatement,
 ) -> Result<Option<u64>, DatabaseError> {
-    try_execute_adopted_update_inner(database, transaction, statement, false)
+    try_execute_adopted_update_inner(database, transaction, statement)
         .map(|accepted| accepted.map(|accepted| accepted.affected_rows))
-}
-
-#[cfg(test)]
-pub(crate) fn try_execute_adopted_update_for_round59_audit(
-    database: &mut Database,
-    transaction: &mut Transaction,
-    statement: &LogicalStatement,
-) -> Result<Option<u64>, DatabaseError> {
-    let accepted = try_execute_adopted_update_inner(database, transaction, statement, true)?;
-    if accepted.is_some() {
-        schema_mutation::crash("round59-conversion-accepted");
-    }
-    Ok(accepted.map(|accepted| accepted.affected_rows))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,7 +945,6 @@ fn try_execute_adopted_update_inner(
     database: &mut Database,
     transaction: &mut Transaction,
     statement: &LogicalStatement,
-    round59_audit_cross_physical_cast: bool,
 ) -> Result<Option<AcceptedAction>, DatabaseError> {
     if !matches!(
         transaction.schema_composition,
@@ -986,13 +954,7 @@ fn try_execute_adopted_update_inner(
         return Ok(None);
     }
     let parts = adopted_parts(transaction)?;
-    let Some(mut action) = build_action(
-        statement,
-        &parts.base,
-        &parts.target,
-        &parts.reserved,
-        round59_audit_cross_physical_cast,
-    )?
+    let Some(mut action) = build_action(statement, &parts.base, &parts.target, &parts.reserved)?
     else {
         return Ok(None);
     };

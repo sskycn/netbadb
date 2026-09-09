@@ -83,3 +83,46 @@ fn native_worker_authorizes_typed_ddl_and_transaction_local_dml() {
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn native_protocol_executes_production_casts_without_new_error_tags() {
+    let (root, mut db) = seed("native-round60-cast");
+    let mut admin = session(true, &mut db);
+    let result = run(
+        &mut admin,
+        &mut db,
+        sql(
+            "SELECT '42'::BIGINT, 42::TEXT, true::TEXT, 'false'::BOOL, '18446744073709551615'::UINT64",
+        ),
+    );
+    assert!(result.iter().any(|message| matches!(
+        message,
+        ServerMessage::QueryRow { values }
+            if values == &vec![
+                ScalarValue::Int64(42),
+                ScalarValue::Text("42".into()),
+                ScalarValue::Text("true".into()),
+                ScalarValue::Bool(false),
+                ScalarValue::UInt64(u64::MAX),
+            ]
+    )));
+
+    let invalid = admin.handle(&mut db, 3, sql("SELECT 'bad'::BIGINT"));
+    assert!(invalid.batch.messages.iter().any(|message| matches!(
+        message,
+        ServerMessage::Error {
+            code: netbadb_protocol::ProtocolErrorCode::Execution,
+            ..
+        }
+    )));
+    let unsupported = admin.handle(&mut db, 4, sql("SELECT true::BIGINT"));
+    assert!(unsupported.batch.messages.iter().any(|message| matches!(
+        message,
+        ServerMessage::Error {
+            code: netbadb_protocol::ProtocolErrorCode::Compile,
+            ..
+        }
+    )));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

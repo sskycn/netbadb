@@ -4329,6 +4329,19 @@ mod tests {
         }
     }
 
+    fn cast_expr(expression: Expr, target: PhysicalType) -> Expr {
+        let nullable = expression.expr_type.nullable;
+        Expr {
+            kind: ExprKind::Cast {
+                expression: Box::new(expression),
+            },
+            expr_type: ExprType {
+                data_type: SemanticType::physical(target),
+                nullable,
+            },
+        }
+    }
+
     fn literal(value: ScalarValue) -> Expr {
         let nullable = matches!(value, ScalarValue::Null);
         Expr {
@@ -4364,6 +4377,41 @@ mod tests {
             }),
             predicate,
         }
+    }
+
+    #[test]
+    fn cross_physical_cast_does_not_create_index_zone_or_partition_constraints() {
+        let mut legacy = test_column(1, "legacy", false);
+        legacy.data_type = SemanticType::physical(PhysicalType::Text);
+        let predicate = binary(
+            BinaryOp::Eq,
+            cast_expr(column_expr(&legacy), PhysicalType::Int64),
+            literal(ScalarValue::Int64(42)),
+        );
+
+        assert!(
+            super::find_point_constraint(
+                &predicate,
+                legacy.binding_id,
+                legacy.table_id,
+                legacy.column_id,
+            )
+            .is_none()
+        );
+        let mut columnar = Vec::new();
+        super::collect_columnar_constraints(&predicate, &mut columnar);
+        assert!(columnar.is_empty());
+
+        let mut partition = super::PartitionConstraint::default();
+        super::collect_partition_constraint(
+            &predicate,
+            legacy.binding_id,
+            legacy.table_id,
+            legacy.column_id,
+            &mut partition,
+        );
+        assert!(partition.lower.is_none());
+        assert!(partition.upper.is_none());
     }
 
     fn access_path(column_id: u32, page_id: u64) -> AccessPath {

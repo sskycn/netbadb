@@ -9,7 +9,7 @@ use std::fmt::{self, Write};
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
     AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, IndexName, ParameterId,
-    PartitionId, RelationBindingId, ScalarValue, SemanticType, StorageId, TableId,
+    PartitionId, PhysicalType, RelationBindingId, ScalarValue, SemanticType, StorageId, TableId,
 };
 
 /// One declaration-ordered snapshot of the visible canonical catalog.
@@ -180,6 +180,11 @@ pub enum ExpressionKindInspection {
     Column(ColumnReferenceInspection),
     Literal(ScalarValue),
     Parameter(ParameterId),
+    Cast {
+        source: PhysicalType,
+        target: PhysicalType,
+        expression: Box<ExpressionInspection>,
+    },
     Binary {
         operator: BinaryOpInspection,
         left: Box<ExpressionInspection>,
@@ -1012,6 +1017,16 @@ fn expression_text(expression: &ExpressionInspection) -> String {
         ExpressionKindInspection::Column(column) => column_reference_text(column),
         ExpressionKindInspection::Literal(value) => scalar_text(value),
         ExpressionKindInspection::Parameter(id) => format!("${}", id.0 + 1),
+        ExpressionKindInspection::Cast {
+            source,
+            target,
+            expression,
+        } => format!(
+            "Cast[{}->{}]({})",
+            source.sql_name(),
+            target.sql_name(),
+            expression_text(expression)
+        ),
         ExpressionKindInspection::Binary {
             operator,
             left,

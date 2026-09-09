@@ -512,12 +512,14 @@ queries. FROM-less scalar SELECT is implemented generically in parser, HIR,
 relational IR, planner, and executor through `OneRow` plus `ScalarProject`;
 `SELECT 1` is not a PostgreSQL-session string special case.
 
-Normal SQLAlchemy Core/ORM statements also use generic postfix casts
-(`::BOOL`, `::BIGINT`/`::INT8`, and `::TEXT`/`::VARCHAR`) and qualified column
-projection aliases. Casts are validated in typed HIR, preserve an expected
-nominal semantic type such as `UserId`, and are erased only after successful
-binding as lossless no-ops. PostgreSQL-only `regclass` and `regtype` casts are
-not added to the user type system; they remain catalog-adapter details.
+Normal SQLAlchemy Core/ORM statements also use generic postfix casts and
+qualified column projection aliases. Casts are validated in typed HIR and
+remain typed nodes after binding. Production cross-physical support is bounded
+to checked integer-to-integer, Text/integer and Bool/Text conversions; Float,
+Bool/numeric and nonidentity Bytes pairs return `42846`. Text/integer uses
+NetbaDB's strict ASCII grammar, not PostgreSQL's broader cast rules.
+PostgreSQL-only `regclass` and `regtype` casts are not added to the user type
+system; they remain catalog-adapter details.
 
 ## Types and formats
 
@@ -560,6 +562,14 @@ mislabeled as text.
 Nominal semantic types remain attached to NetbaDB HIR and are never weakened;
 the PostgreSQL client sees only their supported physical representation.
 
+A declared Text parameter in `SELECT $1::BIGINT` remains Text and is converted
+by the shared executor kernel; an undeclared parameter uses BIGINT as its SQL
+context. ParameterDescription reports the source carrier and RowDescription
+reports the target. Invalid Text returns `22P02`, range failure returns `22003`,
+and an unsupported pair returns `42846`. UInt64/Int128/UInt128 conversions can
+succeed inside Core while their result columns still return `0A000` at this
+lossless pgwire boundary.
+
 RowDescription uses the real output name and type. Source table OID and column
 attribute number are `0`, and type modifier is `-1`, which are the allowed
 unknown/default values; the adapter does not fabricate PostgreSQL catalog IDs.
@@ -573,6 +583,7 @@ The adapter maps stable core diagnostic categories to SQLSTATE, including:
 - `42703` undefined column;
 - `42702` ambiguous column;
 - `42804` datatype mismatch;
+- `42846` unsupported explicit cast pair;
 - `42P18` indeterminate parameter datatype;
 - `08P01` malformed protocol counts, framing, and format cardinality;
 - `22P02` invalid text representation;

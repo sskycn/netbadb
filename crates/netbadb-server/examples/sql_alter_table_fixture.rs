@@ -38,7 +38,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round54_probe = std::env::var("NETBADB_ROUND54_PROBE").ok();
     let round56_probe = std::env::var("NETBADB_ROUND56_PROBE").ok();
     let round58_probe = std::env::var("NETBADB_ROUND58_PROBE").ok();
-    let round59_probe = std::env::var("NETBADB_ROUND59_PROBE").ok();
+    let round60_probe = std::env::var("NETBADB_ROUND60_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -60,7 +60,15 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    if round56_probe.is_some() || round58_probe.is_some() {
+    if round60_probe.is_some() {
+        db.execute(
+            "CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT NOT NULL, flag BOOLEAN)",
+        )?;
+        db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
+        db.execute("INSERT INTO projects VALUES (1, '42', true)")?;
+        db.execute("INSERT INTO projects VALUES (2, '-7', false)")?;
+        db.execute("INSERT INTO projects VALUES (3, 'bad', NULL)")?;
+    } else if round56_probe.is_some() || round58_probe.is_some() {
         db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, flag BOOLEAN)")?;
         if round56_probe.as_deref() == Some("indexed-drop")
             || round58_probe.as_deref() == Some("indexed-swap")
@@ -154,7 +162,13 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("runtime storage path is not UTF-8")?;
 
     let manifest = root.join("server.json");
-    let project_columns = if round56_probe.is_some() || round58_probe.is_some() {
+    let project_columns = if round60_probe.is_some() {
+        json!([
+            {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
+            {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": false, "primary_key": false},
+            {"id": 3, "name": "flag", "physical_type": "bool", "semantic_type": null, "nullable": true, "primary_key": false}
+        ])
+    } else if round56_probe.is_some() || round58_probe.is_some() {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
             {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": true, "primary_key": false},
@@ -202,33 +216,56 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
     }
-    if let Some(probe) = round59_probe {
-        if probe != "cast-negative" {
-            return Err(format!("unknown Round 59 probe {probe}").into());
+    if let Some(probe) = round60_probe {
+        if probe != "cast-migration" {
+            return Err(format!("unknown Round 60 probe {probe}").into());
         }
         for _ in 0..3 {
             let mut reopened = Database::open_catalog(&catalog)?;
             let projects = reopened
                 .schema()
                 .table("projects")
-                .ok_or("Round 59 source table absent")?;
+                .ok_or("Round 60 converted table absent")?;
             let indexes = reopened.indexes(TableId(2))?;
-            if projects.columns.len() != 2
-                || projects
-                    .column("name")
-                    .is_none_or(|column| column.id != ColumnId(2) || !column.nullable)
+            if projects.columns.len() != 3
+                || projects.column("legacy").is_none_or(|column| {
+                    column.id != ColumnId(4)
+                        || column.nullable
+                        || column.semantic_type().physical != PhysicalType::Int64
+                })
+                || projects.column_by_id(ColumnId(2)).is_some()
+                || reopened.next_storage_id()
+                    != Some(netbadb_types::StorageId(target_storage.0 + 1))
                 || indexes.len() != 1
-                || indexes[0].id != old_index_id
-                || indexes[0].column_id != ColumnId(2)
-                || reopened.query("SELECT id, name FROM projects")?.rows
-                    != [vec![ScalarValue::Int64(1), ScalarValue::Text("one".into())]]
+                || indexes[0].id != netbadb_types::IndexId(old_index_id.0 + 1)
+                || indexes[0].column_id != ColumnId(4)
+                || reopened
+                    .query("SELECT id, legacy, flag FROM projects ORDER BY id")?
+                    .rows
+                    != vec![
+                        vec![
+                            ScalarValue::Int64(1),
+                            ScalarValue::Int64(43),
+                            ScalarValue::Bool(true),
+                        ],
+                        vec![
+                            ScalarValue::Int64(3),
+                            ScalarValue::Int64(0),
+                            ScalarValue::Null,
+                        ],
+                        vec![
+                            ScalarValue::Int64(4),
+                            ScalarValue::Int64(99),
+                            ScalarValue::Bool(true),
+                        ],
+                    ]
             {
-                return Err("Round 59 negative cast probe changed source authority".into());
+                return Err("Round 60 production cast migration authority mismatch".into());
             }
             reopened.close()?;
         }
         println!(
-            "REOPEN PASS: Round 59 cross-physical CAST and ALTER TYPE remained closed across three catalog-only opens; manifest unchanged"
+            "REOPEN PASS: Round 60 production CAST migration survived three catalog-only opens; ALTER TYPE remained closed; manifest unchanged"
         );
         return Ok(());
     }

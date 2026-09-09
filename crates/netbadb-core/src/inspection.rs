@@ -188,7 +188,11 @@ fn expression(expression: &Expr) -> ExpressionInspection {
         ExprKind::Column(column) => ExpressionKindInspection::Column(column_reference(column)),
         ExprKind::Literal(value) => ExpressionKindInspection::Literal(value.clone()),
         ExprKind::Parameter(id) => ExpressionKindInspection::Parameter(*id),
-        ExprKind::Cast { expression } => return self::expression(expression),
+        ExprKind::Cast { expression: child } => ExpressionKindInspection::Cast {
+            source: child.expr_type.data_type.physical,
+            target: expression.expr_type.data_type.physical,
+            expression: Box::new(self::expression(child)),
+        },
         ExprKind::Binary {
             operator,
             left,

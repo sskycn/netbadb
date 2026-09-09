@@ -1887,27 +1887,35 @@ fn pg_alter_permission_errors_unsupported_forms_and_sqlstates_fail_closed() {
 }
 
 #[test]
-fn pg_round59_keeps_cross_physical_cast_and_alter_type_closed() {
-    let (root, mut db) = project("pg-round59-cast-negative");
+fn pg_round60_production_casts_and_sqlstates_keep_alter_type_closed() {
+    let (root, mut db) = project("pg-round60-production-cast");
     let mut admin = session(&db, true);
 
     for supported in [
         "SELECT 42::BIGINT",
-        "SELECT '42'::TEXT",
-        "SELECT true::BOOL",
+        "SELECT '42'::BIGINT",
+        "SELECT 42::TEXT",
+        "SELECT true::TEXT",
+        "SELECT 'false'::BOOL",
     ] {
         ok(&sql(&mut admin, &mut db, supported));
     }
-    state(&sql(&mut admin, &mut db, "SELECT '42'::BIGINT"), "42804");
+    state(&sql(&mut admin, &mut db, "SELECT 'bad'::BIGINT"), "22P02");
+    state(&sql(&mut admin, &mut db, "SELECT 256::UINT8"), "22003");
+    state(&sql(&mut admin, &mut db, "SELECT true::BIGINT"), "42846");
+    state(
+        &sql(&mut admin, &mut db, "SELECT '18446744073709551615'::UINT64"),
+        "0A000",
+    );
 
     ok(&sql(&mut admin, &mut db, "BEGIN"));
     state(
         &sql(
             &mut admin,
             &mut db,
-            "UPDATE projects SET id = name::BIGINT WHERE name IS NOT NULL",
+            "SELECT name::BIGINT FROM projects WHERE name IS NOT NULL",
         ),
-        "42804",
+        "22P02",
     );
     state(&sql(&mut admin, &mut db, "SELECT * FROM projects"), "25P02");
     ok(&sql(&mut admin, &mut db, "ROLLBACK"));
@@ -1924,6 +1932,89 @@ fn pg_round59_keeps_cross_physical_cast_and_alter_type_closed() {
     state(&sql(&mut admin, &mut db, "SELECT * FROM projects"), "25P02");
     ok(&sql(&mut admin, &mut db, "ROLLBACK"));
 
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round60_extended_declared_text_parameter_casts_to_bigint() {
+    let (root, mut db) = project("pg-round60-extended-cast");
+    let mut admin = session(&db, true);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "cast-text".into(),
+                query: "SELECT $1::BIGINT".into(),
+                parameter_types: vec![PostgresType::Text.oid()],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    let description = admin.handle(
+        &mut db,
+        FrontendMessage::Describe {
+            target: DescribeTarget::Statement,
+            name: "cast-text".into(),
+        },
+    );
+    assert_eq!(
+        description[0],
+        BackendMessage::ParameterDescription(vec![PostgresType::Text.oid()])
+    );
+    assert!(matches!(
+        &description[1],
+        BackendMessage::RowDescription(fields)
+            if fields.len() == 1 && fields[0].data_type == PostgresType::Int8
+    ));
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "cast-text".into(),
+                statement: "cast-text".into(),
+                parameter_formats: vec![],
+                parameters: vec![Some(b"42".to_vec())],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    let executed = admin.handle(
+        &mut db,
+        FrontendMessage::Execute {
+            portal: "cast-text".into(),
+            max_rows: 0,
+        },
+    );
+    ok(&executed);
+    assert!(executed.contains(&BackendMessage::DataRow(vec![Some(b"42".to_vec())])));
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
+
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "cast-bad".into(),
+                statement: "cast-text".into(),
+                parameter_formats: vec![],
+                parameters: vec![Some(b"bad".to_vec())],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    state(
+        &admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "cast-bad".into(),
+                max_rows: 0,
+            },
+        ),
+        "22P02",
+    );
+    ok(&admin.handle(&mut db, FrontendMessage::Sync));
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

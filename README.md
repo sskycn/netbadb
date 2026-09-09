@@ -178,6 +178,13 @@ identity is exact—there is no implicit numeric widening—and durable tags are
 append-only so the original Bool/Int64/UInt64/Text/NULL bytes remain stable.
 See [Physical Types v2](docs/physical-types-v2.md) for the SQL, storage,
 protocol, pgwire and SDK contract.
+NetbaDB supports explicit deterministic cross-physical casts for checked integer
+families, Text/integer conversion and Bool/Text conversion. These casts can
+populate a late shadow column inside the bounded adopted-source migration
+pipeline, enabling an atomic physical-type replacement through the existing
+DROP/RENAME/index lifecycle. Float conversion, general PostgreSQL cast
+compatibility and `ALTER COLUMN TYPE` are not implied. See the
+[Round 60 production contract](docs/deferred-type-conversion-round60.md).
 Heap/LSM metadata validates that fingerprint against the persisted logical schema.
 The [Round 17 runtime schema catalog](docs/runtime-schema-catalog-round17.md)
 installs a full database schema snapshot once at create or explicit legacy import.
@@ -708,6 +715,10 @@ declaration order. With an explicit list, omitted nullable columns
 become NULL, while omitted non-nullable columns are rejected. UPDATE evaluates
 all right-hand sides against the original row, and UPDATE/DELETE reuse the
 SELECT predicate evaluator, so FALSE and UNKNOWN do not mutate a row.
+Postfix `expression::TYPE` retains a typed Cast node and supports only identity,
+checked integer-to-integer, Text/integer and Bool/Text pairs. Text conversion
+uses strict ASCII grammar, integer conversion never wraps, and cross-physical
+casts remain explicit: an uncast Text assignment to BIGINT is still invalid.
 
 Basic SQL table creation uses the same typed DDL boundary as CREATE/DROP INDEX:
 

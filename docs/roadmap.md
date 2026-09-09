@@ -16,6 +16,20 @@
 
 See [`phase3c-explicit-group-commit.md`](phase3c-explicit-group-commit.md).
 
+## Production cross-physical CAST and atomic shadow migration (Round 60 complete)
+
+- productionized one typed CAST semantics across HIR, relational binding,
+  executor paths, native Protocol v2, PostgreSQL and deferred backfill;
+- centralized the exact 15-type pair matrix, retained real literal/parameter
+  source types, and separated invalid text, range and unsupported-pair errors;
+- retained Cast in inspection while keeping B+Tree, zone-map and partition
+  extraction conservative;
+- proved the real repair/shadow conversion/NOT NULL/index evacuation/DROP/
+  RENAME/fresh-index workflow, one S2/one G and pre/post-Decision recovery;
+- changed no durable or wire format and kept `ALTER COLUMN TYPE` absent.
+
+See [`deferred-type-conversion-round60.md`](deferred-type-conversion-round60.md).
+
 ## Cross-physical CAST and atomic shadow conversion audit (Round 59 complete)
 
 - selected the existing typed `ExprKind::Cast` plus the deferred shadow-column

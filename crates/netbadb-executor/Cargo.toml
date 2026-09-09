@@ -5,11 +5,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[features]
-# Non-default executable architecture probe for Round 59. This does not open
-# the SQL/HIR gate for cross-physical casts.
-round59-audit = []
-
 [dependencies]
 netbadb-planner = { path = "../netbadb-planner" }
 netbadb-rel = { path = "../netbadb-rel" }

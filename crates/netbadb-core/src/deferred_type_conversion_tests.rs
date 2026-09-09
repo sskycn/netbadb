@@ -1,18 +1,10 @@
-//! Round 59 executable architecture probe.
-//!
-//! Production SQL/HIR remains closed. Tests replace the RHS of an otherwise
-//! normally compiled UPDATE with manually constructed typed relational IR and
-//! opt into the non-default executor conversion semantics.
+//! Production cross-physical CAST and atomic shadow type migration tests.
 
 use super::*;
-use crate::deferred_backfill::try_execute_adopted_update_for_round59_audit;
 use crate::schema_composition::SchemaCompositionState;
 use crate::schema_mutation_journal::{SchemaIndexTablePlan, heap_rewrite_indexes_digest};
-use netbadb_rel::{ColumnRef, Expr, ExprKind, LogicalPlan, LogicalStatement};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_types::{
-    ColumnId, ExprType, IndexId, PhysicalType, ScalarValue, SemanticType, StorageId, TableId,
-};
+use netbadb_types::{ColumnId, IndexId, PhysicalType, ScalarValue, StorageId, TableId};
 use std::path::{Path, PathBuf};
 
 const USERS: TableId = TableId(2);
@@ -22,7 +14,7 @@ const SHADOW: ColumnId = ColumnId(4);
 
 fn root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "netbadb-round59-{name}-{}-{:?}",
+        "netbadb-round60-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -80,75 +72,19 @@ fn adopt(database: &mut Database) -> Transaction {
     transaction
 }
 
-fn source_column(plan: &LogicalPlan, column_id: ColumnId) -> ColumnRef {
-    match plan {
-        LogicalPlan::Scan { columns, .. } => columns
-            .iter()
-            .find(|column| column.column_id == column_id)
-            .cloned()
-            .unwrap(),
-        LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Project { input, .. }
-        | LogicalPlan::ScalarProject { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => source_column(input, column_id),
-        LogicalPlan::Join { .. } | LogicalPlan::OneRow => panic!("expected one-table UPDATE"),
-    }
-}
-
-fn audit_update(
-    database: &Database,
-    transaction: &Transaction,
-    template: &str,
-    source: ColumnId,
-    target: PhysicalType,
-) -> LogicalStatement {
-    let PreparedSqlStatement::Relational(prepared) = database
-        .prepare_sql_statement_in(transaction, template, &[])
-        .unwrap()
-    else {
-        panic!("expected relational UPDATE")
-    };
-    let mut statement = prepared.compiled.logical_statement.clone();
-    let LogicalStatement::Update {
-        input, assignments, ..
-    } = &mut statement
-    else {
-        panic!("expected UPDATE")
-    };
-    let child = source_column(input, source);
-    assignments[0].value = Expr {
-        kind: ExprKind::Cast {
-            expression: Box::new(Expr {
-                kind: ExprKind::Column(child.clone()),
-                expr_type: ExprType {
-                    data_type: child.data_type,
-                    nullable: child.nullable,
-                },
-            }),
-        },
-        expr_type: ExprType {
-            data_type: SemanticType::physical(target),
-            nullable: child.nullable,
-        },
-    };
-    statement
-}
-
 fn convert_legacy(
     database: &mut Database,
     transaction: &mut Transaction,
 ) -> Result<u64, DatabaseError> {
-    let statement = audit_update(
-        database,
+    match database.execute_in(
         transaction,
-        "UPDATE users SET shadow = 0 WHERE shadow IS NULL AND legacy IS NOT NULL",
-        OLD_LEGACY,
-        PhysicalType::Int64,
-    );
-    try_execute_adopted_update_for_round59_audit(database, transaction, &statement)?
-        .ok_or(SchemaMutationError::Corrupt("Round 59 audit UPDATE was not accepted").into())
+        "UPDATE users SET shadow = legacy::BIGINT WHERE shadow IS NULL AND legacy IS NOT NULL",
+    )? {
+        ExecutionResult::AffectedRows(rows) => Ok(rows),
+        ExecutionResult::Query(_) => {
+            Err(SchemaMutationError::Corrupt("conversion UPDATE returned wrong result").into())
+        }
+    }
 }
 
 fn source_index_digest(database: &mut Database, storage: StorageId) -> [u8; 32] {
@@ -452,17 +388,14 @@ fn later_conversion_action_reads_prior_converted_virtual_value() {
         .column("echo")
         .unwrap()
         .id;
-    let statement = audit_update(
-        &database,
-        &transaction,
-        "UPDATE users SET echo = '' WHERE echo IS NULL AND shadow IS NOT NULL",
-        SHADOW,
-        PhysicalType::Text,
-    );
     assert_eq!(
-        try_execute_adopted_update_for_round59_audit(&mut database, &mut transaction, &statement,)
+        database
+            .execute_in(
+                &mut transaction,
+                "UPDATE users SET echo = shadow::TEXT WHERE echo IS NULL AND shadow IS NOT NULL",
+            )
             .unwrap(),
-        Some(3)
+        ExecutionResult::AffectedRows(3)
     );
     assert_eq!(
         transaction
@@ -482,7 +415,6 @@ fn later_conversion_action_reads_prior_converted_virtual_value() {
 fn digest_case(
     path: &Path,
     target_sql: &str,
-    target: PhysicalType,
     source: ColumnId,
     predicate_ids: &[i64],
 ) -> (Vec<[u8; 32]>, [u8; 32]) {
@@ -523,23 +455,21 @@ fn digest_case(
         )
         .unwrap();
     for predicate_id in predicate_ids {
-        let template = format!(
-            "UPDATE sources SET shadow = {} WHERE id = {predicate_id}",
-            if target == PhysicalType::Bool {
-                "false"
-            } else {
-                "0"
-            }
-        );
-        let statement = audit_update(&database, &transaction, &template, source, target);
+        let source_name = if source == ColumnId(2) {
+            "source_a"
+        } else {
+            "source_b"
+        };
         assert_eq!(
-            try_execute_adopted_update_for_round59_audit(
-                &mut database,
-                &mut transaction,
-                &statement,
-            )
-            .unwrap(),
-            Some(0)
+            database
+                .execute_in(
+                    &mut transaction,
+                    &format!(
+                        "UPDATE sources SET shadow = {source_name}::{target_sql} WHERE id = {predicate_id}"
+                    ),
+                )
+                .unwrap(),
+            ExecutionResult::AffectedRows(0)
         );
     }
     let plan = transaction.schema_composition.plan().unwrap();
@@ -555,49 +485,27 @@ fn digest_case(
 #[test]
 fn conversion_target_source_literal_and_action_order_change_digests() {
     let cases = [
-        (
-            "int",
-            "BIGINT",
-            PhysicalType::Int64,
-            OLD_LEGACY,
-            vec![998, 999],
-        ),
-        (
-            "bool",
-            "BOOLEAN",
-            PhysicalType::Bool,
-            OLD_LEGACY,
-            vec![998, 999],
-        ),
-        (
-            "source",
-            "BIGINT",
-            PhysicalType::Int64,
-            ColumnId(3),
-            vec![998, 999],
-        ),
-        (
-            "literal",
-            "BIGINT",
-            PhysicalType::Int64,
-            OLD_LEGACY,
-            vec![997, 999],
-        ),
-        (
-            "order",
-            "BIGINT",
-            PhysicalType::Int64,
-            OLD_LEGACY,
-            vec![999, 998],
-        ),
+        ("int", "BIGINT", OLD_LEGACY, vec![998, 999]),
+        ("bool", "BOOLEAN", OLD_LEGACY, vec![998, 999]),
+        ("source", "BIGINT", ColumnId(3), vec![998, 999]),
+        ("literal", "BIGINT", OLD_LEGACY, vec![997, 999]),
+        ("order", "BIGINT", OLD_LEGACY, vec![999, 998]),
     ];
     let mut results = Vec::new();
-    for (name, sql, target, source, predicates) in cases {
+    for (name, sql, source, predicates) in cases {
         let path = root(&format!("digest-{name}"));
-        results.push(digest_case(&path, sql, target, source, &predicates));
+        results.push(digest_case(&path, sql, source, &predicates));
         std::fs::remove_dir_all(path).unwrap();
     }
     let baseline = &results[0];
+    assert_eq!(
+        baseline.0[0],
+        [
+            0x54, 0x5a, 0xaf, 0xf9, 0x4f, 0x66, 0x0c, 0x75, 0x07, 0xe3, 0x30, 0x79, 0x03, 0x1e,
+            0x32, 0x1d, 0xdf, 0x2f, 0x54, 0xaf, 0xc0, 0x86, 0x61, 0xbd, 0xa0, 0x29, 0xd3, 0x36,
+            0x15, 0x5e, 0xdb, 0xd6,
+        ]
+    );
     assert_ne!(baseline.0[0], results[1].0[0]);
     assert_ne!(baseline.0[0], results[2].0[0]);
     assert_ne!(baseline.0[0], results[3].0[0]);
@@ -605,8 +513,8 @@ fn conversion_target_source_literal_and_action_order_change_digests() {
 }
 
 #[test]
-fn round59_conversion_crash_child() {
-    let Ok(path) = std::env::var("NETBADB_ROUND59_CRASH_ROOT") else {
+fn production_conversion_crash_child() {
+    let Ok(path) = std::env::var("NETBADB_ROUND60_CRASH_ROOT") else {
         return;
     };
     let mut database = Database::open_catalog(Path::new(&path).join("catalog")).unwrap();
@@ -626,7 +534,7 @@ fn round59_conversion_crash_child() {
         .unwrap();
     finish_swap(&mut database, &mut transaction);
     database.commit_transaction(&mut transaction).unwrap();
-    panic!("configured Round 59 crash point was not reached");
+    panic!("configured production conversion crash point was not reached");
 }
 
 fn assert_no_stage(path: &Path) {
@@ -688,7 +596,6 @@ fn assert_recovered_conversion(database: &mut Database, source: StorageId, winne
 fn conversion_crash_matrix_reopens_without_replaying_text_conversion() {
     let cases = [
         ("deferred-backfill-accepted", false, false),
-        ("round59-conversion-accepted", false, false),
         ("round58-after-logical-index-evacuation", false, false),
         ("round56-after-terminal-drop", false, false),
         ("round56-after-terminal-rename", false, false),
@@ -709,10 +616,10 @@ fn conversion_crash_matrix_reopens_without_replaying_text_conversion() {
         command
             .args([
                 "--exact",
-                "deferred_type_conversion_audit_tests::round59_conversion_crash_child",
+                "deferred_type_conversion_tests::production_conversion_crash_child",
                 "--nocapture",
             ])
-            .env("NETBADB_ROUND59_CRASH_ROOT", &path);
+            .env("NETBADB_ROUND60_CRASH_ROOT", &path);
         if coordinator {
             crate::coordinator_crash::configure_child(&mut command, point, &path, point);
         } else {
@@ -883,13 +790,13 @@ fn cord_v4_checkpoint_and_conversion_decision_crash_preserve_both_frontiers() {
     command
         .args([
             "--exact",
-            "deferred_type_conversion_audit_tests::round59_conversion_crash_child",
+            "deferred_type_conversion_tests::production_conversion_crash_child",
             "--nocapture",
         ])
-        .env("NETBADB_ROUND59_CRASH_ROOT", &path);
+        .env("NETBADB_ROUND60_CRASH_ROOT", &path);
     crate::coordinator_crash::configure_child(
         &mut command,
-        "round59-cord-v4-tail",
+        "round60-cord-v4-tail",
         &path,
         "after-durable-decision",
     );
@@ -955,14 +862,14 @@ fn enabled_change_stream_blocks_conversion_replacement_before_s2() {
 }
 
 #[test]
-fn production_hir_negatives_remain_exact_and_do_not_append_a_program() {
+fn production_hir_cast_is_open_and_static_unsupported_pairs_do_not_append_a_program() {
     let path = root("production-negatives");
     let mut database = seed(&path, false, "bad");
-    let error = database
-        .prepare_sql_statement("SELECT '42'::BIGINT", &[])
-        .unwrap_err();
-    assert_eq!(error.kind(), DatabaseErrorKind::DatatypeMismatch);
-    assert_eq!(error.to_string(), "expected INT64, found TEXT");
+    assert!(
+        database
+            .prepare_sql_statement("SELECT '42'::BIGINT", &[])
+            .is_ok()
+    );
 
     let mut transaction = adopt(&mut database);
     let before = transaction
@@ -974,11 +881,11 @@ fn production_hir_negatives_remain_exact_and_do_not_append_a_program() {
     let error = database
         .execute_in(
             &mut transaction,
-            "UPDATE users SET shadow = legacy::BIGINT WHERE shadow IS NULL",
+            "UPDATE users SET shadow = flag::BIGINT WHERE shadow IS NULL",
         )
         .unwrap_err();
-    assert_eq!(error.kind(), DatabaseErrorKind::DatatypeMismatch);
-    assert_eq!(error.to_string(), "expected INT64, found TEXT");
+    assert_eq!(error.kind(), DatabaseErrorKind::CannotCoerce);
+    assert_eq!(error.to_string(), "cannot cast BOOL to INT64");
     let plan = transaction.schema_composition.plan().unwrap();
     assert_eq!(plan.action_evidence, before);
     assert_eq!(plan.deferred_backfill.len(), 0);

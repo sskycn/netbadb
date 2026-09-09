@@ -583,6 +583,11 @@ pub enum HirError {
         right: SemanticType,
         span: Span,
     },
+    UnsupportedCast {
+        source: PhysicalType,
+        target: PhysicalType,
+        span: Span,
+    },
     CannotInferNullType {
         span: Span,
     },
@@ -659,6 +664,7 @@ impl HirError {
             | Self::TooManyRelations { span }
             | Self::TypeMismatch { span, .. }
             | Self::IncompatibleComparison { span, .. }
+            | Self::UnsupportedCast { span, .. }
             | Self::CannotInferNullType { span }
             | Self::InvalidLiteral { span, .. }
             | Self::CannotInferParameterType { span, .. }
@@ -720,6 +726,14 @@ impl fmt::Display for HirError {
                     "cannot compare {} with {}",
                     left.sql_name(),
                     right.sql_name()
+                )
+            }
+            Self::UnsupportedCast { source, target, .. } => {
+                write!(
+                    formatter,
+                    "cannot cast {} to {}",
+                    source.sql_name(),
+                    target.sql_name()
                 )
             }
             Self::CannotInferNullType { .. } => {
@@ -873,6 +887,13 @@ impl ParameterContext {
         }
         self.inferred[index] = Some(required.clone());
         Ok(required)
+    }
+
+    fn has_source_type(&self, id: ParameterId) -> bool {
+        usize::try_from(id.0).ok().is_some_and(|index| {
+            self.hints.get(index).is_some_and(Option::is_some)
+                || self.inferred.get(index).is_some_and(Option::is_some)
+        })
     }
 
     fn finish(self) -> Result<Vec<ParameterMetadata>, HirError> {
@@ -1733,15 +1754,33 @@ fn lower_expr_in_scope(
                 AstSqlTypeName::Text => PhysicalType::Text,
                 AstSqlTypeName::Bytes => PhysicalType::Bytes,
             };
-            // A typed parameter cast may adopt an already-resolved nominal
-            // context, while raw literals remain physical-only in
-            // `lower_literal` and therefore cannot mint that identity.
+            // A same-physical cast may adopt an already-resolved nominal
+            // context. Cross-physical admissibility is determined solely by
+            // the resolved physical source and target pair.
             let target = expected
                 .filter(|expected| expected.physical == physical)
                 .cloned()
                 .unwrap_or_else(|| SemanticType::physical(physical));
-            let expression = lower_expr_in_scope(scope, expression, Some(&target), parameters)?;
-            require_type(&expression, &target)?;
+            let source_context = match expression.as_ref() {
+                AstExpr::Literal {
+                    value: Literal::Null,
+                    ..
+                } => Some(&target),
+                AstExpr::Parameter { id, .. } if !parameters.has_source_type(*id) => Some(&target),
+                _ => None,
+            };
+            let expression = lower_expr_in_scope(scope, expression, source_context, parameters)?;
+            let source = expression.expr_type.data_type.physical;
+            if !source.supports_explicit_cast_to(physical) {
+                return Err(HirError::UnsupportedCast {
+                    source,
+                    target: physical,
+                    span: *span,
+                });
+            }
+            if source == physical {
+                require_type(&expression, &target)?;
+            }
             Ok(TypedExpr {
                 expr_type: ExprType {
                     data_type: target,
@@ -2126,11 +2165,11 @@ mod tests {
     }
 
     #[test]
-    fn contextual_literals_preserve_width_and_reject_integer_boundaries() {
+    fn explicit_cast_literals_preserve_uncontextualized_source_width() {
         let empty = Schema::new(vec![]).expect("empty schema");
         let cases = [
-            ("SELECT -128::TINYINT", ScalarValue::Int8(i8::MIN)),
-            ("SELECT 255::UINT8", ScalarValue::UInt8(u8::MAX)),
+            ("SELECT -128::TINYINT", ScalarValue::Int64(-128)),
+            ("SELECT 255::UINT8", ScalarValue::Int64(255)),
             (
                 "SELECT 170141183460469231731687303715884105727::INT128",
                 ScalarValue::Int128(i128::MAX),
@@ -2146,9 +2185,6 @@ mod tests {
             assert_eq!(only_literal(&typed), &expected, "{sql}");
         }
         for sql in [
-            "SELECT -129::TINYINT",
-            "SELECT 256::UINT8",
-            "SELECT -1::UINT8",
             "SELECT 340282366920938463463374607431768211456::UINT128",
             "SELECT 1e400::FLOAT64",
         ] {
