@@ -1264,6 +1264,27 @@ impl LsmStorage {
             .read(cursor, max_batches, max_bytes)
     }
 
+    pub(crate) fn acquire_change_stream_retention_pin(
+        &self,
+        cursor: crate::ChangeStreamCursor,
+    ) -> Result<crate::ChangeStreamRetentionPin, StorageError> {
+        self.shared
+            .borrow()
+            .change_stream
+            .acquire_retention_pin(cursor)
+    }
+
+    pub(crate) fn advance_change_stream_retention_pin(
+        &self,
+        pin: &mut crate::ChangeStreamRetentionPin,
+        frontier: netbadb_types::StorageDataVersion,
+    ) -> Result<(), StorageError> {
+        self.shared
+            .borrow()
+            .change_stream
+            .advance_retention_pin(pin, frontier)
+    }
+
     pub(crate) fn gc_change_stream(
         &mut self,
         frontier: netbadb_types::StorageDataVersion,

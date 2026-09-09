@@ -1023,6 +1023,27 @@ impl TableStorage {
         }
     }
 
+    pub fn acquire_change_stream_retention_pin(
+        &self,
+        cursor: crate::ChangeStreamCursor,
+    ) -> Result<crate::ChangeStreamRetentionPin, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.acquire_change_stream_retention_pin(cursor),
+            Self::Lsm(storage) => storage.acquire_change_stream_retention_pin(cursor),
+        }
+    }
+
+    pub fn advance_change_stream_retention_pin(
+        &self,
+        pin: &mut crate::ChangeStreamRetentionPin,
+        frontier: netbadb_types::StorageDataVersion,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Heap(storage) => storage.advance_change_stream_retention_pin(pin, frontier),
+            Self::Lsm(storage) => storage.advance_change_stream_retention_pin(pin, frontier),
+        }
+    }
+
     pub fn gc_change_stream(
         &mut self,
         frontier: netbadb_types::StorageDataVersion,

@@ -2,8 +2,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use netbadb_storage::{
-    ChangeBatchMaintenanceInspection, ChangeStreamMaintenanceInspection, ChangeStreamStatus,
-    LsmMaintenanceCostInspection, StorageKind,
+    ChangeBatchMaintenanceInspection, ChangeStreamStatus, LsmMaintenanceCostInspection, StorageKind,
 };
 use netbadb_types::{ColumnarProjectionId, StorageId, TableId};
 
@@ -97,6 +96,9 @@ pub enum MaintenanceBound {
     /// The existing operation is atomic and starts only when its complete
     /// structural estimate fits the budget.
     EstimateGatedAtomic,
+    /// The complete structural input and exact production rewrite output are
+    /// known and admitted before an irreversible mutation begins.
+    HardBoundedRewrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,11 +412,11 @@ impl Database {
 
         for (storage_id, table_id, maintenance) in &stream_inspections {
             if maintenance.stream.status == ChangeStreamStatus::Enabled {
+                let assessment = self.assess_change_stream_retention(*table_id)?;
                 candidates.push(change_stream_gc_candidate(
                     *table_id,
                     *storage_id,
-                    maintenance,
-                    &projection_inspections,
+                    &assessment,
                     busy,
                     budget,
                 ));
@@ -736,8 +738,7 @@ fn bounded_advance(
 fn change_stream_gc_candidate(
     table_id: TableId,
     storage_id: StorageId,
-    maintenance: &ChangeStreamMaintenanceInspection,
-    projections: &[crate::ColumnarProjectionInspection],
+    assessment: &crate::adaptive_change_stream_gc::ChangeStreamRetentionAssessment,
     busy: bool,
     budget: MaintenanceBudget,
 ) -> MaintenanceCandidate {
@@ -745,112 +746,44 @@ fn change_stream_gc_candidate(
         table_id,
         storage_id,
     };
-    let Some(generation) = maintenance.stream.generation else {
-        return candidate(
-            action,
-            MaintenanceReason::ChangeHistoryReclaim,
-            MaintenanceBound::EstimateGatedAtomic,
-            zero_estimate(),
-            Some(MaintenanceBlocker::RetentionUnsafe),
-            busy,
-            budget,
-        );
-    };
-    let relevant = projections
-        .iter()
-        .filter(|projection| projection.source_storage_id == Some(storage_id))
-        .collect::<Vec<_>>();
-    if relevant.iter().any(|projection| {
-        projection.managed && projection.health == ColumnarProjectionHealth::Unavailable
-    }) || relevant.iter().any(|projection| {
-        projection.mode == Some("incremental")
-            && projection.stream_generation == Some(generation)
-            && !projection.managed
-    }) {
-        return candidate(
-            action,
-            MaintenanceReason::ChangeHistoryReclaim,
-            MaintenanceBound::EstimateGatedAtomic,
-            zero_estimate(),
-            Some(MaintenanceBlocker::RetentionUnsafe),
-            busy,
-            budget,
-        );
-    }
-    let safe = relevant
-        .iter()
-        .filter(|projection| {
-            projection.managed
-                && projection.mode == Some("incremental")
-                && projection.stream_generation == Some(generation)
+    let blocker = assessment.observation.blocker.map(|blocker| match blocker {
+        crate::AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved => {
+            MaintenanceBlocker::Busy
+        }
+        crate::AdaptiveChangeStreamGcSafetyBlocker::NoRetentionConsumer => {
+            MaintenanceBlocker::NoRetentionConsumer
+        }
+        crate::AdaptiveChangeStreamGcSafetyBlocker::NoReclaimableHistory => {
+            MaintenanceBlocker::NoReclaimableHistory
+        }
+        crate::AdaptiveChangeStreamGcSafetyBlocker::HistoryUnavailable => {
+            MaintenanceBlocker::HistoryUnavailable
+        }
+        crate::AdaptiveChangeStreamGcSafetyBlocker::StreamUnavailable
+        | crate::AdaptiveChangeStreamGcSafetyBlocker::ProjectionCatalogUnavailable
+        | crate::AdaptiveChangeStreamGcSafetyBlocker::ManagedProjectionUnavailable
+        | crate::AdaptiveChangeStreamGcSafetyBlocker::UnmanagedIncrementalProjection
+        | crate::AdaptiveChangeStreamGcSafetyBlocker::RetentionFrontierInvalid
+        | crate::AdaptiveChangeStreamGcSafetyBlocker::ArithmeticOverflow => {
+            MaintenanceBlocker::RetentionUnsafe
+        }
+    });
+    let estimate = assessment
+        .observation
+        .reclaimable_prefix
+        .map(|prefix| {
+            crate::adaptive_change_stream_gc::exact_rewrite_estimate(
+                &assessment.observation,
+                prefix,
+            )
         })
-        .filter_map(|projection| projection.applied_frontier)
-        .min_by_key(|frontier| frontier.0);
-    let Some(safe) = safe else {
-        return candidate(
-            action,
-            MaintenanceReason::ChangeHistoryReclaim,
-            MaintenanceBound::EstimateGatedAtomic,
-            zero_estimate(),
-            Some(MaintenanceBlocker::NoRetentionConsumer),
-            busy,
-            budget,
-        );
-    };
-    let Some(earliest) = maintenance.stream.earliest_available_frontier else {
-        return candidate(
-            action,
-            MaintenanceReason::ChangeHistoryReclaim,
-            MaintenanceBound::EstimateGatedAtomic,
-            zero_estimate(),
-            Some(MaintenanceBlocker::RetentionUnsafe),
-            busy,
-            budget,
-        );
-    };
-    if safe.0 < earliest.0 || safe.0 > maintenance.stream.current_data_version.0 {
-        return candidate(
-            action,
-            MaintenanceReason::ChangeHistoryReclaim,
-            MaintenanceBound::EstimateGatedAtomic,
-            zero_estimate(),
-            Some(MaintenanceBlocker::RetentionUnsafe),
-            busy,
-            budget,
-        );
-    }
-    if safe == earliest {
-        return candidate(
-            action,
-            MaintenanceReason::ChangeHistoryReclaim,
-            MaintenanceBound::EstimateGatedAtomic,
-            zero_estimate(),
-            Some(MaintenanceBlocker::NoReclaimableHistory),
-            busy,
-            budget,
-        );
-    }
-    let first_retained = maintenance
-        .batches
-        .iter()
-        .position(|batch| batch.after.0 > safe.0)
-        .unwrap_or(maintenance.batches.len());
-    let removed_bytes = maintenance.batches[..first_retained]
-        .iter()
-        .map(|batch| batch.retained_file_bytes)
-        .sum::<u64>();
-    let retained_batches = maintenance.batches.len().saturating_sub(first_retained) as u64;
-    let estimate = MaintenanceEstimate {
-        work_units: retained_batches.saturating_add(1),
-        read_bytes: maintenance.stream.file_bytes,
-        write_bytes: maintenance.stream.file_bytes.saturating_sub(removed_bytes),
-    };
+        .unwrap_or_else(zero_estimate);
     candidate(
         action,
         MaintenanceReason::ChangeHistoryReclaim,
-        MaintenanceBound::EstimateGatedAtomic,
+        MaintenanceBound::HardBoundedRewrite,
         estimate,
-        None,
+        blocker,
         busy,
         budget,
     )

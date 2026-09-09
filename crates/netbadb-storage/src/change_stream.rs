@@ -63,6 +63,87 @@ pub struct ChangeStreamCursor {
     pub frontier: StorageDataVersion,
 }
 
+/// An explicit, runtime-only promise that history at `frontier` remains
+/// readable for this exact stream incarnation.
+///
+/// Unlike [`ChangeStreamCursor`], a pin participates in reclamation safety.
+/// Dropping or explicitly releasing it removes that authority. Pins are never
+/// persisted and therefore do not survive process restart.
+pub struct ChangeStreamRetentionPin {
+    storage_id: StorageId,
+    generation: ChangeStreamGeneration,
+    frontier: StorageDataVersion,
+    id: u64,
+    registry: Rc<RefCell<RetentionPinRegistry>>,
+    active: bool,
+}
+
+impl fmt::Debug for ChangeStreamRetentionPin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChangeStreamRetentionPin")
+            .field("storage_id", &self.storage_id)
+            .field("generation", &self.generation)
+            .field("frontier", &self.frontier)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl ChangeStreamRetentionPin {
+    #[must_use]
+    pub const fn cursor(&self) -> ChangeStreamCursor {
+        ChangeStreamCursor {
+            storage_id: self.storage_id,
+            generation: self.generation,
+            frontier: self.frontier,
+        }
+    }
+
+    #[must_use]
+    pub const fn frontier(&self) -> StorageDataVersion {
+        self.frontier
+    }
+
+    /// Releases this runtime retention authority before the handle is dropped.
+    pub fn release(mut self) {
+        self.unregister();
+    }
+
+    fn unregister(&mut self) {
+        if self.active {
+            self.registry.borrow_mut().pins.remove(&self.id);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ChangeStreamRetentionPin {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeStreamRetentionPinInspection {
+    pub storage_id: StorageId,
+    pub generation: ChangeStreamGeneration,
+    pub frontier: StorageDataVersion,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetentionPinEntry {
+    storage_id: StorageId,
+    generation: ChangeStreamGeneration,
+    frontier: StorageDataVersion,
+}
+
+#[derive(Debug, Default)]
+struct RetentionPinRegistry {
+    next_id: u64,
+    pins: BTreeMap<u64, RetentionPinEntry>,
+}
+
 /// Identity of one committed physical row version within its owning storage.
 /// It is not a logical row identity and does not survive layout migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,6 +292,9 @@ pub struct ChangeBatchMaintenanceInspection {
 pub struct ChangeStreamMaintenanceInspection {
     pub stream: ChangeStreamInspection,
     pub batches: Vec<ChangeBatchMaintenanceInspection>,
+    pub retention_pins: Vec<ChangeStreamRetentionPinInspection>,
+    /// Exact encoded header size produced by the current production rewrite.
+    pub rewrite_header_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +336,15 @@ pub enum ChangeStreamError {
     },
     Disabled,
     Busy,
+    RetentionPinned {
+        requested: StorageDataVersion,
+        pinned: StorageDataVersion,
+    },
+    RetentionPinFrontierRegression {
+        current: StorageDataVersion,
+        requested: StorageDataVersion,
+    },
+    RetentionPinUnavailable,
     Unavailable(String),
     VersionExhausted,
 }
@@ -285,6 +378,19 @@ impl fmt::Display for ChangeStreamError {
             ),
             Self::Disabled => f.write_str("change stream is disabled"),
             Self::Busy => f.write_str("change stream has unresolved prepared changes"),
+            Self::RetentionPinned { requested, pinned } => write!(
+                f,
+                "change-stream reclamation through {} is blocked by a retention pin at {}",
+                requested.0, pinned.0
+            ),
+            Self::RetentionPinFrontierRegression { current, requested } => write!(
+                f,
+                "retention pin cannot move backward from {} to {}",
+                current.0, requested.0
+            ),
+            Self::RetentionPinUnavailable => {
+                f.write_str("change-stream retention pin is no longer registered")
+            }
             Self::Unavailable(reason) => write!(f, "change stream is unavailable: {reason}"),
             Self::VersionExhausted => f.write_str("change-stream version space is exhausted"),
         }
@@ -468,6 +574,7 @@ pub(crate) struct ChangeStreamManager {
     fingerprint: SchemaFingerprint,
     state: State,
     sync_count: u64,
+    retention_pins: Rc<RefCell<RetentionPinRegistry>>,
 }
 
 impl ChangeStreamManager {
@@ -487,6 +594,7 @@ impl ChangeStreamManager {
                 generation: ChangeStreamGeneration(0),
             },
             sync_count: 0,
+            retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
         })
     }
 
@@ -521,6 +629,7 @@ impl ChangeStreamManager {
                 fingerprint,
                 state,
                 sync_count: 0,
+                retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
             });
         }
         let state = match load_file(&path, table, &outcome, true) {
@@ -582,6 +691,7 @@ impl ChangeStreamManager {
             fingerprint,
             state,
             sync_count: 0,
+            retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
         })
     }
 
@@ -854,6 +964,87 @@ impl ChangeStreamManager {
         })
     }
 
+    pub(crate) fn acquire_retention_pin(
+        &self,
+        cursor: ChangeStreamCursor,
+    ) -> Result<ChangeStreamRetentionPin, StorageError> {
+        let State::Enabled {
+            header, batches, ..
+        } = &self.state
+        else {
+            return match &self.state {
+                State::Disabled { .. } => Err(ChangeStreamError::Disabled.into()),
+                State::Unavailable { reason, .. } => {
+                    Err(ChangeStreamError::Unavailable(reason.clone()).into())
+                }
+                State::Enabled { .. } => unreachable!(),
+            };
+        };
+        validate_cursor_identity_and_frontier(header, batches, cursor)?;
+        let mut registry = self.retention_pins.borrow_mut();
+        let id = registry.next_id;
+        registry.next_id = id
+            .checked_add(1)
+            .ok_or(ChangeStreamError::VersionExhausted)?;
+        registry.pins.insert(
+            id,
+            RetentionPinEntry {
+                storage_id: cursor.storage_id,
+                generation: cursor.generation,
+                frontier: cursor.frontier,
+            },
+        );
+        drop(registry);
+        Ok(ChangeStreamRetentionPin {
+            storage_id: cursor.storage_id,
+            generation: cursor.generation,
+            frontier: cursor.frontier,
+            id,
+            registry: Rc::clone(&self.retention_pins),
+            active: true,
+        })
+    }
+
+    pub(crate) fn advance_retention_pin(
+        &self,
+        pin: &mut ChangeStreamRetentionPin,
+        frontier: StorageDataVersion,
+    ) -> Result<(), StorageError> {
+        if frontier.0 < pin.frontier.0 {
+            return Err(ChangeStreamError::RetentionPinFrontierRegression {
+                current: pin.frontier,
+                requested: frontier,
+            }
+            .into());
+        }
+        let cursor = ChangeStreamCursor {
+            storage_id: pin.storage_id,
+            generation: pin.generation,
+            frontier,
+        };
+        let State::Enabled {
+            header, batches, ..
+        } = &self.state
+        else {
+            return Err(ChangeStreamError::StreamIdentityMismatch.into());
+        };
+        validate_cursor_identity_and_frontier(header, batches, cursor)?;
+        if !Rc::ptr_eq(&pin.registry, &self.retention_pins) || !pin.active {
+            return Err(ChangeStreamError::RetentionPinUnavailable.into());
+        }
+        let mut registry = self.retention_pins.borrow_mut();
+        let entry = registry
+            .pins
+            .get_mut(&pin.id)
+            .ok_or(ChangeStreamError::RetentionPinUnavailable)?;
+        if entry.storage_id != pin.storage_id || entry.generation != pin.generation {
+            return Err(ChangeStreamError::RetentionPinUnavailable.into());
+        }
+        entry.frontier = frontier;
+        pin.frontier = frontier;
+        Ok(())
+    }
+
     pub(crate) fn gc_through(
         &mut self,
         frontier: StorageDataVersion,
@@ -884,6 +1075,24 @@ impl ChangeStreamManager {
         };
         if !unresolved.is_empty() {
             return Err(ChangeStreamError::Busy.into());
+        }
+        if let Some(pinned) = self
+            .retention_pins
+            .borrow()
+            .pins
+            .values()
+            .filter(|pin| {
+                pin.storage_id == header.storage_id && pin.generation == header.generation
+            })
+            .map(|pin| pin.frontier)
+            .min_by_key(|value| value.0)
+            .filter(|pinned| frontier.0 > pinned.0)
+        {
+            return Err(ChangeStreamError::RetentionPinned {
+                requested: frontier,
+                pinned,
+            }
+            .into());
         }
         let current = effective_current(header, batches);
         if frontier.0 < header.earliest.0 || frontier.0 > current.0 {
@@ -1061,8 +1270,42 @@ impl ChangeStreamManager {
                 .collect(),
             State::Disabled { .. } | State::Unavailable { .. } => Vec::new(),
         };
-        ChangeStreamMaintenanceInspection { stream, batches }
+        let retention_pins = self
+            .retention_pins
+            .borrow()
+            .pins
+            .values()
+            .map(|pin| ChangeStreamRetentionPinInspection {
+                storage_id: pin.storage_id,
+                generation: pin.generation,
+                frontier: pin.frontier,
+            })
+            .collect();
+        ChangeStreamMaintenanceInspection {
+            stream,
+            batches,
+            retention_pins,
+            rewrite_header_bytes: V2_HEADER_SIZE as u64,
+        }
     }
+}
+
+fn validate_cursor_identity_and_frontier(
+    header: &Header,
+    batches: &[ChangeBatch],
+    cursor: ChangeStreamCursor,
+) -> Result<(), ChangeStreamError> {
+    if cursor.storage_id != header.storage_id {
+        return Err(ChangeStreamError::ContextMismatch);
+    }
+    if cursor.generation != header.generation {
+        return Err(ChangeStreamError::StreamIdentityMismatch);
+    }
+    let current = effective_current(header, batches);
+    if cursor.frontier.0 < header.earliest.0 || cursor.frontier.0 > current.0 {
+        return Err(ChangeStreamError::HistoryUnavailable);
+    }
+    Ok(())
 }
 
 fn prepare_enabled(

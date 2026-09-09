@@ -6,6 +6,9 @@ use netbadb_types::{ColumnarGeneration, ColumnarProjectionId, SchemaGeneration, 
 
 use crate::planner_calibration::{aggregate_calibration_evidence, replay_calibration_ratio_errors};
 use crate::{
+    AdaptiveChangeStreamGcDecision, AdaptiveChangeStreamGcExecutionReport,
+    AdaptiveChangeStreamGcNoActionReason, AdaptiveChangeStreamGcOutcome,
+    AdaptiveChangeStreamGcPolicy, AdaptiveChangeStreamGcProposal,
     AdaptiveColumnarCompactionDecision, AdaptiveColumnarCompactionError,
     AdaptiveColumnarCompactionExecutionReport, AdaptiveColumnarCompactionNoActionReason,
     AdaptiveColumnarCompactionObservation, AdaptiveColumnarCompactionOutcome,
@@ -14,11 +17,12 @@ use crate::{
     AdaptiveNoActionReason, AdaptivePolicy, AdaptiveWorkloadEvaluationReport,
     AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy,
     AdaptiveWorkloadStaleReason, AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, Database,
-    MaintenanceAction, MaintenanceBudget, PlannerCalibrationAdvisorError,
+    DatabaseError, MaintenanceAction, MaintenanceBudget, PlannerCalibrationAdvisorError,
     PlannerCalibrationDecision, PlannerCalibrationEvidence, PlannerCalibrationMutationError,
     PlannerCalibrationNoAction, PlannerCalibrationPolicy, PlannerCalibrationProposal,
     PlannerCalibrationReceipt, PlannerCalibrationShadowDecision, PlannerCalibrationShadowReport,
 };
+use netbadb_types::{StorageDataVersion, StorageId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutomaticCalibrationTrialPolicy {
@@ -157,6 +161,7 @@ pub enum AutomaticSafeModeLane {
     ActiveColumnarTrial,
     ActivePlannerCalibrationTrial,
     ColumnarMaintenance,
+    ChangeStreamReclamation,
     PlannerCalibration,
 }
 
@@ -172,6 +177,10 @@ pub enum AutomaticSafeModeMutation {
     },
     ColumnarSuppression {
         target: AdaptiveWorkloadTarget,
+    },
+    ChangeStreamReclamation {
+        storage_id: StorageId,
+        new_earliest_frontier: StorageDataVersion,
     },
     PlannerCalibrationApply {
         calibration_class: PlannerCalibrationClass,
@@ -208,6 +217,7 @@ pub enum AutomaticSafeModeNoAction {
     ColumnarNoAction,
     CalibrationAdvisorNoAction(PlannerCalibrationNoAction),
     CalibrationShadowRejected(PlannerCalibrationNoAction),
+    ChangeStreamGcNoAction(AdaptiveChangeStreamGcNoActionReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +240,9 @@ pub enum AutomaticSafeModeOutcome {
     PlannerCalibrationTrialHeld,
     PlannerCalibrationTrialAwaiting(AutomaticTrialAwaitingReason),
     PlannerCalibrationTrialStale(AutomaticCalibrationTrialStaleReason),
+    ChangeStreamGcCompleted,
+    ChangeStreamGcAborted,
+    ChangeStreamGcInconclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +267,7 @@ pub struct AutomaticSafeModeReport {
     pub mutation: Option<AutomaticSafeModeMutation>,
     pub columnar_cycle: Option<Box<AdaptiveCycleReport>>,
     pub columnar_compaction: Option<Box<AdaptiveColumnarCompactionExecutionReport>>,
+    pub change_stream_gc: Option<Box<AdaptiveChangeStreamGcExecutionReport>>,
     pub workload_evaluation: Option<AdaptiveWorkloadEvaluationReport>,
     pub calibration_decision: Option<PlannerCalibrationDecision>,
     pub calibration_shadow: Option<PlannerCalibrationShadowDecision>,
@@ -278,6 +292,8 @@ pub struct AutomaticMultiSafeModeInput<'a> {
 pub struct AutomaticMultiSafeModePolicy {
     pub safe_mode: AutomaticSafeModePolicy,
     pub allow_columnar_compaction: bool,
+    pub allow_change_stream_gc: bool,
+    pub change_stream_gc_policy: AdaptiveChangeStreamGcPolicy,
     pub columnar_compaction_policy: AdaptiveColumnarCompactionPolicy,
     pub cross_lane_service: AutomaticCrossLaneServicePolicy,
     pub max_candidate_tables: u64,
@@ -290,6 +306,8 @@ impl Default for AutomaticMultiSafeModePolicy {
         Self {
             safe_mode: AutomaticSafeModePolicy::default(),
             allow_columnar_compaction: false,
+            allow_change_stream_gc: false,
+            change_stream_gc_policy: AdaptiveChangeStreamGcPolicy::default(),
             columnar_compaction_policy: AdaptiveColumnarCompactionPolicy::default(),
             cross_lane_service: AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
             max_candidate_tables: 16,
@@ -321,6 +339,8 @@ pub enum AutomaticLaneSelectionReason {
     CalibrationServiceDue,
     OnlyColumnarReady,
     OnlyCalibrationReady,
+    OnlyReclamationReady,
+    ReclamationPriority,
     NoReadyCandidates,
 }
 
@@ -337,6 +357,10 @@ pub enum AutomaticCandidateKey {
     PlannerCalibration {
         calibration_class: PlannerCalibrationClass,
     },
+    ChangeStreamGc {
+        table_id: TableId,
+        storage_id: StorageId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +370,7 @@ pub enum AutomaticCandidateReadiness {
     ColumnarCompactionBlocked(AdaptiveColumnarCompactionNoActionReason),
     CalibrationBlocked(PlannerCalibrationNoAction),
     CalibrationEvidenceUnavailable,
+    ChangeStreamGcBlocked(AdaptiveChangeStreamGcNoActionReason),
     StaleEvidence,
 }
 
@@ -361,6 +386,10 @@ pub struct AutomaticCandidateRankEvidence {
     pub delta_mutations: Option<u64>,
     pub suppressed_versions: Option<u64>,
     pub shadow_improvement_work_units: Option<u64>,
+    pub reclaimable_batches: Option<u64>,
+    pub reclaimable_mutations: Option<u64>,
+    pub reclaimable_bytes: Option<u64>,
+    pub safe_reclaim_frontier: Option<StorageDataVersion>,
     pub distinct_query_shapes: Option<u64>,
     pub sample_count: Option<u64>,
 }
@@ -403,6 +432,8 @@ pub enum AutomaticSafeModeError {
     AdmissionScopeTooLarge,
     InvalidCrossLaneServicePolicy,
     InvalidColumnarCompactionPolicy,
+    InvalidChangeStreamGcPolicy,
+    Database(DatabaseError),
 }
 
 impl fmt::Display for AutomaticSafeModeError {
@@ -423,6 +454,10 @@ impl fmt::Display for AutomaticSafeModeError {
             Self::InvalidColumnarCompactionPolicy => formatter.write_str(
                 "automatic Columnar compaction requires at least one non-zero pressure threshold",
             ),
+            Self::InvalidChangeStreamGcPolicy => formatter.write_str(
+                "automatic change-stream GC requires a non-zero batch or byte threshold",
+            ),
+            Self::Database(error) => error.fmt(formatter),
         }
     }
 }
@@ -434,10 +469,12 @@ impl Error for AutomaticSafeModeError {
             Self::ColumnarCompaction(error) => Some(error),
             Self::CalibrationAdvisor(error) => Some(error),
             Self::CalibrationMutation(error) => Some(error),
+            Self::Database(error) => Some(error),
             Self::MissingColumnarMeasurement
             | Self::AdmissionScopeTooLarge
             | Self::InvalidCrossLaneServicePolicy
-            | Self::InvalidColumnarCompactionPolicy => None,
+            | Self::InvalidColumnarCompactionPolicy
+            | Self::InvalidChangeStreamGcPolicy => None,
         }
     }
 }
@@ -463,6 +500,12 @@ impl From<PlannerCalibrationAdvisorError> for AutomaticSafeModeError {
 impl From<PlannerCalibrationMutationError> for AutomaticSafeModeError {
     fn from(error: PlannerCalibrationMutationError) -> Self {
         Self::CalibrationMutation(error)
+    }
+}
+
+impl From<DatabaseError> for AutomaticSafeModeError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
     }
 }
 
@@ -516,6 +559,7 @@ enum AutomaticCandidateAuthority {
     Columnar(Box<ColumnarCandidateAuthority>),
     ColumnarCompaction(Box<ColumnarCompactionCandidateAuthority>),
     PlannerCalibration(Box<CalibrationCandidateAuthority>),
+    ChangeStreamGc(Box<ChangeStreamGcCandidateAuthority>),
 }
 
 #[derive(Debug, Clone)]
@@ -535,6 +579,11 @@ struct CalibrationCandidateAuthority {
     proposal: PlannerCalibrationProposal,
     shadow: PlannerCalibrationShadowDecision,
     accepted_shadow: PlannerCalibrationShadowReport,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeStreamGcCandidateAuthority {
+    proposal: AdaptiveChangeStreamGcProposal,
 }
 
 #[derive(Debug, Clone)]
@@ -593,15 +642,21 @@ impl Database {
             input.maintenance_budget,
             policy,
         )?;
-        validate_candidate_count(columnar.len(), 0, policy)?;
+        let reclamation = self.discover_change_stream_gc_candidates(
+            input.scope.table_ids,
+            input.maintenance_budget,
+            policy,
+        )?;
+        validate_candidate_count(columnar.len(), reclamation.len(), 0, policy)?;
         let calibration = self.discover_calibration_candidates(
             pool,
             input.scope.calibration_classes,
             policy.safe_mode,
         )?;
-        validate_candidate_count(columnar.len(), calibration.len(), policy)?;
+        validate_candidate_count(columnar.len(), reclamation.len(), calibration.len(), policy)?;
         let (preferred_lane, lane_selection_reason) = select_ready_lane(
             &columnar,
+            &reclamation,
             &calibration,
             policy.cross_lane_service,
             service_state,
@@ -609,6 +664,7 @@ impl Database {
         Ok(AutomaticCandidateInspectionReport {
             candidates: columnar
                 .into_iter()
+                .chain(reclamation)
                 .chain(calibration)
                 .map(|candidate| candidate.inspection)
                 .collect(),
@@ -708,20 +764,27 @@ impl Database {
             input.maintenance_budget,
             policy,
         )?;
-        validate_candidate_count(columnar.len(), 0, policy)?;
+        let mut reclamation = self.discover_change_stream_gc_candidates(
+            input.scope.table_ids,
+            input.maintenance_budget,
+            policy,
+        )?;
+        validate_candidate_count(columnar.len(), reclamation.len(), 0, policy)?;
         let mut calibration = self.discover_calibration_candidates(
             pool,
             input.scope.calibration_classes,
             policy.safe_mode,
         )?;
-        validate_candidate_count(columnar.len(), calibration.len(), policy)?;
+        validate_candidate_count(columnar.len(), reclamation.len(), calibration.len(), policy)?;
         let mut inspections = columnar
             .iter()
             .map(|candidate| candidate.inspection)
             .collect::<Vec<_>>();
+        inspections.extend(reclamation.iter().map(|candidate| candidate.inspection));
         inspections.extend(calibration.iter().map(|candidate| candidate.inspection));
         let (selected_lane, lane_selection_reason) = select_ready_lane(
             &columnar,
+            &reclamation,
             &calibration,
             policy.cross_lane_service,
             service_before,
@@ -729,6 +792,9 @@ impl Database {
         let selected = match selected_lane {
             AutomaticSafeModeLane::ColumnarMaintenance => {
                 select_columnar_candidate(&columnar).map(|index| columnar.remove(index))
+            }
+            AutomaticSafeModeLane::ChangeStreamReclamation => {
+                select_reclamation_candidate(&reclamation).map(|index| reclamation.remove(index))
             }
             AutomaticSafeModeLane::PlannerCalibration => {
                 select_calibration_candidate(&calibration).map(|index| calibration.remove(index))
@@ -755,6 +821,7 @@ impl Database {
         self.automatic_safe_mode.admission.clear();
         let no_action = if !policy.safe_mode.allow_columnar_maintenance
             && !policy.allow_columnar_compaction
+            && !policy.allow_change_stream_gc
             && !policy.safe_mode.allow_planner_calibration
         {
             AutomaticSafeModeNoAction::AutomaticActionsDisabled
@@ -1189,6 +1256,72 @@ impl Database {
         Ok(output)
     }
 
+    fn discover_change_stream_gc_candidates(
+        &self,
+        table_ids: &[TableId],
+        budget: MaintenanceBudget,
+        policy: AutomaticMultiSafeModePolicy,
+    ) -> Result<Vec<DiscoveredAutomaticCandidate>, AutomaticSafeModeError> {
+        if !policy.allow_change_stream_gc {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        for table_id in stable_unique_tables(table_ids) {
+            let observation = self.observe_change_stream_reclamation(table_id)?;
+            let key = AutomaticCandidateKey::ChangeStreamGc {
+                table_id,
+                storage_id: observation.storage_id,
+            };
+            let mut rank = AutomaticCandidateRankEvidence {
+                ready_age: self.ready_age(key),
+                safe_reclaim_frontier: observation.safe_reclaim_through.map(|safe| safe.frontier()),
+                ..AutomaticCandidateRankEvidence::default()
+            };
+            if let Some(prefix) = observation.reclaimable_prefix {
+                rank.reclaimable_batches = Some(prefix.batches);
+                rank.reclaimable_mutations = Some(prefix.mutations);
+                rank.reclaimable_bytes = Some(prefix.reclaimed_file_bytes);
+                rank.maintenance_work_units = Some(prefix.rewrite_work_units);
+                rank.read_bytes = Some(observation.file_bytes);
+                rank.write_bytes = Some(prefix.rewrite_bytes);
+            }
+            match self.advise_change_stream_reclamation(
+                &observation,
+                policy.change_stream_gc_policy,
+                budget,
+            ) {
+                Ok(AdaptiveChangeStreamGcDecision::Proposal(proposal)) => {
+                    output.push(DiscoveredAutomaticCandidate {
+                        inspection: AutomaticCandidateInspection {
+                            key,
+                            lane: AutomaticSafeModeLane::ChangeStreamReclamation,
+                            readiness: AutomaticCandidateReadiness::Ready,
+                            rank,
+                        },
+                        authority: Some(AutomaticCandidateAuthority::ChangeStreamGc(Box::new(
+                            ChangeStreamGcCandidateAuthority {
+                                proposal: *proposal,
+                            },
+                        ))),
+                    });
+                }
+                Ok(AdaptiveChangeStreamGcDecision::NoAction(reason)) => {
+                    output.push(DiscoveredAutomaticCandidate {
+                        inspection: AutomaticCandidateInspection {
+                            key,
+                            lane: AutomaticSafeModeLane::ChangeStreamReclamation,
+                            readiness: AutomaticCandidateReadiness::ChangeStreamGcBlocked(reason),
+                            rank,
+                        },
+                        authority: None,
+                    });
+                }
+                Err(_) => return Err(AutomaticSafeModeError::InvalidChangeStreamGcPolicy),
+            }
+        }
+        Ok(output)
+    }
+
     fn ready_age(&self, key: AutomaticCandidateKey) -> u64 {
         self.automatic_safe_mode
             .admission
@@ -1250,6 +1383,7 @@ impl Database {
                     .cross_lane_service
                     .consecutive_columnar_admissions = 0;
             }
+            AutomaticSafeModeLane::ChangeStreamReclamation => {}
             AutomaticSafeModeLane::None
             | AutomaticSafeModeLane::ActiveColumnarTrial
             | AutomaticSafeModeLane::ActivePlannerCalibrationTrial => {}
@@ -1367,6 +1501,45 @@ impl Database {
                 report.columnar_compaction = Some(Box::new(execution));
                 Ok(report)
             }
+            Some(AutomaticCandidateAuthority::ChangeStreamGc(authority)) => {
+                let ChangeStreamGcCandidateAuthority { proposal } = *authority;
+                let execution = self.execute_change_stream_reclamation(&proposal, budget)?;
+                let mutation = execution.actual.as_ref().and_then(|actual| {
+                    (execution.outcome == AdaptiveChangeStreamGcOutcome::Completed).then_some(
+                        AutomaticSafeModeMutation::ChangeStreamReclamation {
+                            storage_id: actual.storage_id,
+                            new_earliest_frontier: actual.new_earliest_frontier,
+                        },
+                    )
+                });
+                let outcome = match execution.outcome {
+                    AdaptiveChangeStreamGcOutcome::Completed => {
+                        AutomaticSafeModeOutcome::ChangeStreamGcCompleted
+                    }
+                    AdaptiveChangeStreamGcOutcome::Aborted(_) => {
+                        AutomaticSafeModeOutcome::ChangeStreamGcAborted
+                    }
+                    AdaptiveChangeStreamGcOutcome::InconclusiveAlreadyReclaimed
+                    | AdaptiveChangeStreamGcOutcome::InconclusiveNoWork
+                    | AdaptiveChangeStreamGcOutcome::InconclusiveCostBoundExceeded
+                    | AdaptiveChangeStreamGcOutcome::InconclusivePostconditionsChanged => {
+                        AutomaticSafeModeOutcome::ChangeStreamGcInconclusive
+                    }
+                };
+                let mut report = self.finish_automatic_report(
+                    trial_before,
+                    AutomaticSafeModeLane::ChangeStreamReclamation,
+                    mutation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    outcome,
+                );
+                report.change_stream_gc = Some(Box::new(execution));
+                Ok(report)
+            }
             Some(AutomaticCandidateAuthority::PlannerCalibration(authority)) => {
                 let CalibrationCandidateAuthority {
                     decision,
@@ -1429,6 +1602,7 @@ impl Database {
             mutation,
             columnar_cycle,
             columnar_compaction: None,
+            change_stream_gc: None,
             workload_evaluation,
             calibration_decision,
             calibration_shadow,
@@ -1702,6 +1876,9 @@ fn validate_multi_scope(
     if policy.allow_columnar_compaction && !policy.columnar_compaction_policy.is_valid() {
         return Err(AutomaticSafeModeError::InvalidColumnarCompactionPolicy);
     }
+    if policy.allow_change_stream_gc && !policy.change_stream_gc_policy.is_valid() {
+        return Err(AutomaticSafeModeError::InvalidChangeStreamGcPolicy);
+    }
     if matches!(
         policy.cross_lane_service,
         AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
@@ -1722,11 +1899,16 @@ fn validate_multi_scope(
 
 fn validate_candidate_count(
     columnar: usize,
+    reclamation: usize,
     calibration: usize,
     policy: AutomaticMultiSafeModePolicy,
 ) -> Result<(), AutomaticSafeModeError> {
-    if u64::try_from(columnar.saturating_add(calibration))
-        .map_or(true, |count| count > policy.max_fairness_entries)
+    if u64::try_from(
+        columnar
+            .saturating_add(reclamation)
+            .saturating_add(calibration),
+    )
+    .map_or(true, |count| count > policy.max_fairness_entries)
     {
         return Err(AutomaticSafeModeError::AdmissionScopeTooLarge);
     }
@@ -1735,6 +1917,7 @@ fn validate_candidate_count(
 
 fn select_ready_lane(
     columnar: &[DiscoveredAutomaticCandidate],
+    reclamation: &[DiscoveredAutomaticCandidate],
     calibration: &[DiscoveredAutomaticCandidate],
     policy: AutomaticCrossLaneServicePolicy,
     state: AutomaticCrossLaneServiceState,
@@ -1745,20 +1928,35 @@ fn select_ready_lane(
     let calibration_ready = calibration
         .iter()
         .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
-    match (columnar_ready, calibration_ready) {
-        (true, false) => (
+    let reclamation_ready = reclamation
+        .iter()
+        .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
+    match (columnar_ready, reclamation_ready, calibration_ready) {
+        (true, false, false) => (
             AutomaticSafeModeLane::ColumnarMaintenance,
             AutomaticLaneSelectionReason::OnlyColumnarReady,
         ),
-        (false, true) => (
+        (false, false, true) => (
             AutomaticSafeModeLane::PlannerCalibration,
             AutomaticLaneSelectionReason::OnlyCalibrationReady,
         ),
-        (false, false) => (
+        (false, true, false) => (
+            AutomaticSafeModeLane::ChangeStreamReclamation,
+            AutomaticLaneSelectionReason::OnlyReclamationReady,
+        ),
+        (false, true, true) => (
+            AutomaticSafeModeLane::ChangeStreamReclamation,
+            AutomaticLaneSelectionReason::ReclamationPriority,
+        ),
+        (false, false, false) => (
             AutomaticSafeModeLane::None,
             AutomaticLaneSelectionReason::NoReadyCandidates,
         ),
-        (true, true) => match policy {
+        (true, _, false) => (
+            AutomaticSafeModeLane::ColumnarMaintenance,
+            AutomaticLaneSelectionReason::StrictPhysicalPriority,
+        ),
+        (true, _, true) => match policy {
             AutomaticCrossLaneServicePolicy::StrictPhysicalPriority => (
                 AutomaticSafeModeLane::ColumnarMaintenance,
                 AutomaticLaneSelectionReason::StrictPhysicalPriority,
@@ -1888,8 +2086,45 @@ const fn columnar_class_priority(key: AutomaticCandidateKey) -> u8 {
     match key {
         AutomaticCandidateKey::Columnar { .. } => 1,
         AutomaticCandidateKey::ColumnarCompaction { .. } => 0,
-        AutomaticCandidateKey::PlannerCalibration { .. } => 0,
+        AutomaticCandidateKey::PlannerCalibration { .. }
+        | AutomaticCandidateKey::ChangeStreamGc { .. } => 0,
     }
+}
+
+fn select_reclamation_candidate(candidates: &[DiscoveredAutomaticCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.inspection.readiness == AutomaticCandidateReadiness::Ready
+        })
+        .max_by(|(_, left), (_, right)| {
+            left.inspection
+                .rank
+                .ready_age
+                .cmp(&right.inspection.rank.ready_age)
+                .then_with(|| {
+                    left.inspection
+                        .rank
+                        .reclaimable_bytes
+                        .cmp(&right.inspection.rank.reclaimable_bytes)
+                })
+                .then_with(|| {
+                    left.inspection
+                        .rank
+                        .reclaimable_batches
+                        .cmp(&right.inspection.rank.reclaimable_batches)
+                })
+                .then_with(|| {
+                    right
+                        .inspection
+                        .rank
+                        .write_bytes
+                        .cmp(&left.inspection.rank.write_bytes)
+                })
+                .then_with(|| right.inspection.key.cmp(&left.inspection.key))
+        })
+        .map(|(index, _)| index)
 }
 
 fn select_calibration_candidate(candidates: &[DiscoveredAutomaticCandidate]) -> Option<usize> {
@@ -2014,6 +2249,27 @@ mod admission_tests {
         }
     }
 
+    fn reclamation(table: u64, storage: u64, age: u64, bytes: u64) -> DiscoveredAutomaticCandidate {
+        DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key: AutomaticCandidateKey::ChangeStreamGc {
+                    table_id: TableId(table),
+                    storage_id: StorageId(storage),
+                },
+                lane: AutomaticSafeModeLane::ChangeStreamReclamation,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank: AutomaticCandidateRankEvidence {
+                    ready_age: age,
+                    reclaimable_batches: Some(2),
+                    reclaimable_bytes: Some(bytes),
+                    write_bytes: Some(10),
+                    ..AutomaticCandidateRankEvidence::default()
+                },
+            },
+            authority: None,
+        }
+    }
+
     #[test]
     fn ready_age_precedes_merit_and_never_makes_blocked_ready() {
         let high = columnar(1, 1, 0, 10_000, 1);
@@ -2081,6 +2337,7 @@ mod admission_tests {
         assert_eq!(
             select_ready_lane(
                 &columnar,
+                &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
                 state,
@@ -2093,6 +2350,7 @@ mod admission_tests {
         assert_eq!(
             select_ready_lane(
                 &columnar,
+                &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
                     max_consecutive_columnar_admissions: 2,
@@ -2109,6 +2367,7 @@ mod admission_tests {
         assert_eq!(
             select_ready_lane(
                 &columnar,
+                &[],
                 &[blocked],
                 AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
                     max_consecutive_columnar_admissions: 2,
@@ -2120,6 +2379,69 @@ mod admission_tests {
                 AutomaticLaneSelectionReason::OnlyColumnarReady,
             )
         );
+    }
+
+    #[test]
+    fn reclamation_has_explicit_priority_without_reinterpreting_bounded_burst() {
+        let columnar = vec![columnar(1, 1, 0, 1, 1)];
+        let reclamation = vec![reclamation(2, 2, 0, 100)];
+        let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
+        let state = AutomaticCrossLaneServiceState {
+            consecutive_columnar_admissions: 2,
+        };
+        assert_eq!(
+            select_ready_lane(
+                &columnar,
+                &reclamation,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
+                state,
+            ),
+            (
+                AutomaticSafeModeLane::ColumnarMaintenance,
+                AutomaticLaneSelectionReason::StrictPhysicalPriority,
+            )
+        );
+        assert_eq!(
+            select_ready_lane(
+                &[],
+                &reclamation,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
+                state,
+            ),
+            (
+                AutomaticSafeModeLane::ChangeStreamReclamation,
+                AutomaticLaneSelectionReason::ReclamationPriority,
+            )
+        );
+        assert_eq!(
+            select_ready_lane(
+                &columnar,
+                &reclamation,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+                    max_consecutive_columnar_admissions: 2,
+                },
+                state,
+            ),
+            (
+                AutomaticSafeModeLane::PlannerCalibration,
+                AutomaticLaneSelectionReason::CalibrationServiceDue,
+            )
+        );
+    }
+
+    #[test]
+    fn reclamation_ranking_is_age_then_pressure_cost_and_identity() {
+        let large = reclamation(2, 2, 0, 200);
+        let small_aged = reclamation(3, 3, 1, 1);
+        assert_eq!(
+            select_reclamation_candidate(&[large.clone(), small_aged]),
+            Some(1)
+        );
+        let small = reclamation(1, 1, 0, 100);
+        assert_eq!(select_reclamation_candidate(&[small, large]), Some(1));
     }
 
     #[test]

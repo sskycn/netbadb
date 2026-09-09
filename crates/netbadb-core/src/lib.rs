@@ -1,6 +1,9 @@
 //! Native synchronous embedded API for NetbaDB.
 
 mod adaptive;
+mod adaptive_change_stream_gc;
+#[cfg(test)]
+mod adaptive_change_stream_gc_tests;
 mod adaptive_columnar_compaction;
 #[cfg(test)]
 mod adaptive_columnar_compaction_tests;
@@ -106,6 +109,14 @@ pub use adaptive::{
     AdaptiveMaintenanceProposal, AdaptiveNoAction, AdaptiveNoActionReason, AdaptiveObservation,
     AdaptiveObservationAnchor, AdaptivePlannerEvidence, AdaptivePolicy, AdaptiveSourceObservation,
 };
+pub use adaptive_change_stream_gc::{
+    AdaptiveChangeStreamGcAbortReason, AdaptiveChangeStreamGcAdvisorError,
+    AdaptiveChangeStreamGcDecision, AdaptiveChangeStreamGcExecutionReport,
+    AdaptiveChangeStreamGcNoActionReason, AdaptiveChangeStreamGcObservation,
+    AdaptiveChangeStreamGcOutcome, AdaptiveChangeStreamGcPolicy, AdaptiveChangeStreamGcProposal,
+    AdaptiveChangeStreamGcSafetyBlocker, ChangeStreamReclaimPrefix, ChangeStreamRetentionConsumer,
+    SafeReclaimThrough,
+};
 pub use adaptive_columnar_compaction::{
     AdaptiveColumnarCompactionAbortReason, AdaptiveColumnarCompactionDecision,
     AdaptiveColumnarCompactionError, AdaptiveColumnarCompactionExecutionReport,
@@ -174,9 +185,10 @@ pub use netbadb_rel::{
 pub use netbadb_schema::DropTableTarget;
 pub use netbadb_storage::{
     ChangeBatch, ChangeBatchInspection, ChangeBatchMaintenanceInspection, ChangeReadResult,
-    ChangeStreamCursor, ChangeStreamError, ChangeStreamInspection, CommittedReadAnchor,
-    HistoricalOrphanAdoptionReport, IndexDefinition, IndexMaintenanceReport, IndexReclaimReport,
-    IndexStatistics, IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
+    ChangeStreamCursor, ChangeStreamError, ChangeStreamInspection, ChangeStreamRetentionPin,
+    ChangeStreamRetentionPinInspection, CommittedReadAnchor, HistoricalOrphanAdoptionReport,
+    IndexDefinition, IndexMaintenanceReport, IndexReclaimReport, IndexStatistics,
+    IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
     LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
     PreparedRuntimeInspection, ReusablePageInspection, StorageChange, StorageCommitBatchReport,
     StorageError, StorageKind, StorageSnapshotToken, StorageVersionKey, TableStatistics,
@@ -3758,6 +3770,37 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Acquires an explicit runtime-only retention authority for an existing
+    /// cursor. Ordinary cursors remain stateless and do not pin history.
+    pub fn pin_change_stream(
+        &self,
+        table_id: TableId,
+        cursor: ChangeStreamCursor,
+    ) -> Result<ChangeStreamRetentionPin, DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        self.registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .acquire_change_stream_retention_pin(cursor)
+            .map_err(Into::into)
+    }
+
+    /// Advances an existing retention authority without permitting it to move
+    /// backward and reacquire already-released history.
+    pub fn advance_change_stream_retention_pin(
+        &self,
+        table_id: TableId,
+        pin: &mut ChangeStreamRetentionPin,
+        frontier: StorageDataVersion,
+    ) -> Result<(), DatabaseError> {
+        let storage_id = self.bindings.resolve_single(table_id)?;
+        self.registry
+            .get(storage_id)
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
+            .advance_change_stream_retention_pin(pin, frontier)
+            .map_err(Into::into)
+    }
+
     pub fn committed_read_anchor(
         &self,
         table_id: TableId,
@@ -3789,96 +3832,33 @@ impl Database {
         table_id: TableId,
     ) -> Result<ChangeStreamGcReport, DatabaseError> {
         self.projections.ensure_retention_catalog_available()?;
-        let storage_id = self.bindings.resolve_single(table_id)?;
-        let stream = self
-            .registry
-            .get(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-            .inspect_change_stream();
-        let generation = stream
-            .generation
+        let assessment = self.assess_change_stream_retention(table_id)?;
+        let storage_id = assessment.observation.storage_id;
+        if assessment.observation.blocker
+            == Some(AdaptiveChangeStreamGcSafetyBlocker::NoRetentionConsumer)
+        {
+            return Err(DatabaseError::ChangeStreamGcNoRetentionConsumer(storage_id));
+        }
+        if let Some(blocker) = assessment.observation.blocker {
+            if blocker == AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved {
+                return Err(StorageError::from(ChangeStreamError::Busy).into());
+            }
+            if blocker != AdaptiveChangeStreamGcSafetyBlocker::NoReclaimableHistory {
+                return Err(DatabaseError::ChangeStreamGcUnsafe {
+                    storage_id,
+                    reason: format!("retention safety is blocked: {blocker:?}"),
+                });
+            }
+        }
+        let frontier = assessment
+            .observation
+            .safe_reclaim_through
             .ok_or_else(|| DatabaseError::ChangeStreamGcUnsafe {
                 storage_id,
-                reason: "active stream generation is unavailable".into(),
-            })?;
-        if stream.status != netbadb_storage::ChangeStreamStatus::Enabled {
-            return Err(DatabaseError::ChangeStreamGcUnsafe {
-                storage_id,
-                reason: format!("change stream status is {:?}", stream.status),
-            });
-        }
-        let mut consumers = Vec::new();
-        for entry in self
-            .projections
-            .iter()
-            .filter(|entry| entry.identity.source_storage_id == storage_id)
-        {
-            let Some(projection) = &entry.projection else {
-                if entry.managed {
-                    return Err(DatabaseError::ChangeStreamGcUnsafe {
-                        storage_id,
-                        reason: format!(
-                            "managed projection {} metadata is unavailable",
-                            entry.identity.id.0
-                        ),
-                    });
-                }
-                continue;
-            };
-            let Some(incremental) = &projection.metadata().incremental else {
-                continue;
-            };
-            if !entry.managed {
-                return Err(DatabaseError::ChangeStreamGcUnsafe {
-                    storage_id,
-                    reason: format!(
-                        "unmanaged incremental projection {} may require retained history",
-                        entry.identity.id.0
-                    ),
-                });
-            }
-            if incremental.stream_generation != generation {
-                continue;
-            }
-            if incremental.applied_frontier.0 > stream.current_data_version.0 {
-                return Err(DatabaseError::ChangeStreamGcUnsafe {
-                    storage_id,
-                    reason: format!(
-                        "projection {} applied frontier is ahead of the source",
-                        entry.identity.id.0
-                    ),
-                });
-            }
-            consumers.push((entry.identity.id, incremental.applied_frontier));
-        }
-        let safe_frontier = consumers
-            .iter()
-            .map(|(_, frontier)| *frontier)
-            .min_by_key(|frontier| frontier.0)
-            .ok_or(DatabaseError::ChangeStreamGcNoRetentionConsumer(storage_id))?;
-        let mut limiting_projection_ids = consumers
-            .iter()
-            .filter_map(|(id, frontier)| (*frontier == safe_frontier).then_some(*id))
-            .collect::<Vec<_>>();
-        limiting_projection_ids.sort_by_key(|id| id.0);
-        let reclaimed = self
-            .registry
-            .get_mut(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-            .gc_change_stream(safe_frontier)?;
-        Ok(ChangeStreamGcReport {
-            storage_id: reclaimed.storage_id,
-            generation: reclaimed.generation,
-            previous_earliest_frontier: reclaimed.previous_earliest_frontier,
-            new_earliest_frontier: reclaimed.new_earliest_frontier,
-            current_frontier: reclaimed.current_frontier,
-            limiting_projection_ids,
-            batches_removed: reclaimed.batches_removed,
-            mutations_removed: reclaimed.mutations_removed,
-            bytes_before: reclaimed.bytes_before,
-            bytes_after: reclaimed.bytes_after,
-            bytes_reclaimed: reclaimed.bytes_reclaimed,
-        })
+                reason: "safe reclaim frontier is unavailable".into(),
+            })?
+            .frontier();
+        self.gc_change_stream_through(table_id, frontier)
     }
 
     #[must_use]

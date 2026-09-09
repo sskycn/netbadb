@@ -36,6 +36,8 @@ fn policy() -> AutomaticMultiSafeModePolicy {
             },
         },
         allow_columnar_compaction: false,
+        allow_change_stream_gc: false,
+        change_stream_gc_policy: crate::AdaptiveChangeStreamGcPolicy::default(),
         columnar_compaction_policy: crate::AdaptiveColumnarCompactionPolicy::default(),
         cross_lane_service: crate::AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
         max_candidate_tables: 8,

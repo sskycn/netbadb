@@ -25,7 +25,8 @@ pub use change_stream::{
     CHANGE_LOG_MAX_RECORD_BYTES, CHANGE_LOG_MAX_ROW_BYTES, ChangeBatch, ChangeBatchInspection,
     ChangeBatchMaintenanceInspection, ChangeReadResult, ChangeStorageKind, ChangeStreamCursor,
     ChangeStreamError, ChangeStreamGcStorageReport, ChangeStreamInspection,
-    ChangeStreamMaintenanceInspection, ChangeStreamStatus, StorageChange, StorageVersionKey,
+    ChangeStreamMaintenanceInspection, ChangeStreamRetentionPin,
+    ChangeStreamRetentionPinInspection, ChangeStreamStatus, StorageChange, StorageVersionKey,
     change_stream_guard_path, heap_change_log_path, lsm_change_log_path, validate_change_log_file,
 };
 pub use columnar::{
